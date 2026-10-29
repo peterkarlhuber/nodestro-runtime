@@ -752,6 +752,7 @@ class RunManager:
         run.finished_at = now()
         _fail(run, problem("run.cancelled", "The run was cancelled"))
         self.store.put("runs", run.id, run)
+        self._forget_events(run.id)
         self._notify(run)
 
     def _notify(self, run: Run) -> None:
@@ -909,6 +910,16 @@ class RunManager:
                 output=run.output,
                 usage=run.usage.model_dump(mode="json"),
             )
+            if not paused:
+                self._forget_events(run.id)
+
+    def _forget_events(self, run_id: str) -> None:
+        """Drop the event history of a run that finished: streams only replay events of live runs.
+
+        A paused run keeps its history, so that its events continue numbering when it resumes.
+        """
+        self._events.pop(run_id, None)
+        self._subscribers.pop(run_id, None)
 
     def _conclude(self, context: _RunContext) -> None:
         run = context.run

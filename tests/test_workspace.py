@@ -159,9 +159,21 @@ async def test_an_approval_waits_for_a_person(make: Make) -> None:
     )
     paused = await run(workspace, flow)
     assert paused.status == "paused" and paused.nodes["check"].status == "awaiting_approval"
+    # The paused run keeps its event history: the events continue numbering when it resumes.
+    assert workspace.runs._events[paused.id]
     workspace.decide(paused.id, "check", "approved", "ok")
     done = await workspace.wait(paused.id, timeout=20)
     assert done.status == "succeeded" and done.output == "Final"
+
+
+async def test_finished_runs_release_their_event_history(make: Make) -> None:
+    workspace = make({"ONE": [text("eins")]})
+    done = await run(
+        workspace, workflow([{"id": "start", "type": "start"}, agent("one", "ONE")], [edge("start", "one")])
+    )
+    assert done.status == "succeeded"
+    # A long-running server starts many runs: nothing of a finished run stays in memory.
+    assert done.id not in workspace.runs._events and done.id not in workspace.runs._subscribers
 
 
 async def test_a_running_run_can_be_cancelled(make: Make) -> None:
