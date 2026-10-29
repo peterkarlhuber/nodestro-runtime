@@ -1,0 +1,405 @@
+"""The workspace: one Nodestro data directory with every runtime service, usable from Python.
+
+A :class:`Workspace` owns the database (``<data_dir>/nodestro.db``), the tool library, the
+knowledge base, the memory spaces, the Python environments of tools, the input and result
+files and the run manager (the one workflow engine). It reads the same settings and the same
+data as the studio, so a script and a running Nodestro see the same workflows, agents,
+providers and runs::
+
+    from nodestro_runtime.workspace import Workspace
+    from nodestro_runtime.schemas import RunIn
+
+    workspace = Workspace("~/.nodestro")
+    workflow = workspace.workflow("wf_...")
+    run = await workspace.run(workflow, RunIn(input="..."))
+    finished = await workspace.wait(run.id)
+
+No HTTP server and no interface are started. The HTTP API (``nodestro-api``) builds its
+application context on top of this class and adds the studio services (architect,
+assistant, publishing, automation); it never runs workflows in another way.
+
+Provider access: a key from the environment wins over a stored one; stored keys are never
+returned by any method meant for display (:meth:`settings`).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Iterable
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any, Literal
+
+from orkexa.dynamic import DockerSandbox
+from orkexa.providers.base import redact
+
+from .agent_builder import AgentBuilder
+from .agent_test import AgentTester
+from .catalog import models
+from .engine import RunManager
+from .extensions import Extensions, Integration, discover
+from .input_files import FileCatalog, InputFiles
+from .knowledge import KnowledgeBase
+from .launcher import launch
+from .memory_spaces import MemorySpaces
+from .problems import NodestroError
+from .providers import (
+    PROVIDERS,
+    Connection,
+    MissingApiKeyError,
+    check_base_url,
+    check_capabilities,
+    check_model,
+    env_key,
+    provider_of,
+    provider_status,
+    qualify,
+)
+from .python_envs import PythonEnvironments
+from .python_tools import EnvironmentGate
+from .reports import ResultFiles
+from .resume import PublishedRuns
+from .resume import resume as resume_run
+from .schemas import (
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_ASSISTANT_MODEL,
+    LANGUAGES,
+    Run,
+    RunIn,
+    RunTrigger,
+    Settings,
+    SettingsIn,
+    Workflow,
+    WorkflowIn,
+)
+from .storage import Store
+from .tool_drafts import ToolDrafts
+from .tool_library import ToolLibrary, make_sandbox
+from .usage_log import UsageLog
+from .versions import WorkflowVersions
+
+#: The database file inside the data directory (unchanged since Nodestro 0.1).
+DATABASE = "nodestro.db"
+
+
+class Workspace:
+    """Every runtime service of one data directory; one instance per process and directory."""
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        *,
+        client_factory: Callable[[str], Any] | None = None,
+        python_runner: Any | None = None,
+        ocr_runner: Any | None = None,
+        integrations: Iterable[Integration] | None = None,
+    ) -> None:
+        """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
+        OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`)."""
+        data_dir = Path(data_dir).expanduser()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = data_dir
+        self.extensions = Extensions(discover() if integrations is None else integrations)
+        database = data_dir / DATABASE
+        self.store = Store(database)
+        self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
+        self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
+        self.memory = MemorySpaces(database)
+        sandbox = make_sandbox(self._stored("sandbox") or "subprocess")
+        self.tools = ToolLibrary(data_dir / "tools", sandbox=sandbox, extra_tools=self.extensions.tools())
+        self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
+        self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
+        self._client_factory = client_factory
+        self._docker: bool | None = None
+        self.runs = RunManager(
+            self.store,
+            self.builder,
+            connect=self.connection,
+            default_budget=lambda: self.settings().default_budget_usd,
+            assistant_model=lambda: self.settings().assistant_model,
+        )
+        self.tester = AgentTester(
+            self.builder, connect=self.connection, default_budget=lambda: self.settings().default_budget_usd
+        )
+        self.usage_log = UsageLog(self.store)
+        self.versions = WorkflowVersions(self.store)
+        self.tool_drafts = ToolDrafts(self.store, self.tools)
+        self.python = PythonEnvironments(
+            self.store,
+            data_dir / "python",
+            self.tools,
+            runner=python_runner,
+            sandbox_kind=lambda: self._stored("sandbox") or "subprocess",
+            workflow_exists=lambda workflow_id: self.store.get_raw("workflows", workflow_id) is not None,
+        )
+        self.tools.dependencies = EnvironmentGate(self.python)
+        self.tool_drafts.python = self.python
+        self.runs.tool_sandbox = self.python.workflow_sandbox
+        self.tester.tool_sandbox = self.python.workflow_sandbox
+        self.runs.resolve_workflow = self.resolve_workflow
+        self.runs.tool_marker = self.tool_marker
+        # Files uploaded as run inputs: own storage, never knowledge by themselves (see input_files.py).
+        self.inputs = InputFiles(self.store, data_dir / "inputs", ocr=self._input_ocr)
+        self.runs.inputs = self.inputs
+        self.runs.file_names = self.file_catalog
+        self.files = ResultFiles(self.store)
+        self.runs.after_run = self.files.write_outputs
+        #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
+        self.published: PublishedRuns | None = None
+        self.compose()
+        # Runs that were executing when Nodestro stopped can never finish; they become continuable.
+        self.runs.recover()
+        # Uploads nobody used (e.g. a run dialog that was closed) are removed after a day.
+        try:
+            self.inputs.cleanup()
+        except Exception:  # cleaning up is housekeeping; it never stops Nodestro from starting
+            logging.getLogger(__name__).exception("Cleaning up input files failed")
+
+    def compose(self) -> None:
+        """Add services before interrupted runs are recovered; applications built on the runtime override it."""
+
+    def file_catalog(self) -> FileCatalog:
+        """Every file a run can reference (input files and knowledge files)."""
+        return FileCatalog(self.inputs, self.knowledge.store)
+
+    def _input_ocr(self) -> Any:
+        """The OCR for scanned PDFs among the input files, when it is switched on and available."""
+        if not self._stored("ocr_enabled"):
+            return None
+        return self.knowledge.runner()
+
+    def close(self) -> None:
+        self.knowledge.close()
+        self.memory.close()
+        self.store.close()
+
+    # ---- settings ----------------------------------------------------------------
+
+    def _stored(self, key: str) -> Any:
+        values = self.store.get_raw("settings", "app") or {}
+        return values.get(key)
+
+    def _providers(self, values: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+        """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key."""
+        values = values if values is not None else (self.store.get_raw("settings", "app") or {})
+        providers: dict[str, dict[str, Any]] = {
+            name: dict(item) for name, item in (values.get("providers") or {}).items() if isinstance(item, dict)
+        }
+        legacy = values.get("api_key")
+        if legacy and not providers.get("anthropic", {}).get("api_key"):
+            providers.setdefault("anthropic", {})["api_key"] = legacy
+        return providers
+
+    def settings(self) -> Settings:
+        values = self.store.get_raw("settings", "app") or {}
+        budget = values.get("default_budget_usd", 2.0)
+        stored = self._providers(values)
+        default_model = values.get("default_model") or DEFAULT_AGENT_MODEL
+        return Settings(
+            providers=[provider_status(name, stored.get(name, {})) for name in PROVIDERS],
+            default_provider=provider_of(default_model),
+            default_model=default_model,
+            assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
+            default_budget_usd=budget,
+            sandbox=values.get("sandbox") or "subprocess",
+            docker_available=self._docker_available(),
+            language=values.get("language") if values.get("language") in LANGUAGES else None,
+            architect_budget_usd=values.get("architect_budget_usd", 2.0),
+            architect_max_repairs=int(values.get("architect_max_repairs") or 0)
+            if values.get("architect_max_repairs") is not None
+            else 2,
+            ocr_enabled=bool(values.get("ocr_enabled")),
+            ocr_available=self.knowledge.ocr_available(),
+        )
+
+    def _docker_available(self) -> bool:
+        if self._docker is None:
+            self._docker = DockerSandbox.available()
+        return self._docker
+
+    def update_settings(self, update: SettingsIn) -> Settings:
+        values = self.store.get_raw("settings", "app") or {}
+        changes = update.model_dump(exclude_unset=True)
+        # A top-level ``api_key`` is Anthropic's key; it moves into the provider settings (once, idempotent).
+        providers = self._providers(values)
+        values.pop("api_key", None)
+        requested = changes.pop("providers", None) or {}
+        legacy = changes.pop("api_key", None)
+        if legacy is not None:
+            requested.setdefault("anthropic", {}).setdefault("api_key", legacy)
+        for name, change in requested.items():
+            if name not in PROVIDERS:
+                raise NodestroError("provider.unknown", f"Unknown provider {name!r}", provider=name)
+            entry = providers.setdefault(name, {})
+            for key in ("api_key", "base_url"):
+                if change.get(key) is None:
+                    continue
+                if key == "base_url" and entry.get(key) and change[key].strip() == redact(entry[key]):
+                    continue  # the shown (redacted) URL sent back unchanged keeps the stored one
+                text = check_base_url(change[key]) if key == "base_url" else change[key].strip()
+                if text:
+                    entry[key] = text
+                else:
+                    entry.pop(key, None)
+            if change.get("capabilities") is not None:
+                entry["capabilities"] = check_capabilities(change["capabilities"])
+        values["providers"] = {name: entry for name, entry in providers.items() if entry}
+        for key in ("default_model", "assistant_model"):
+            if changes.get(key):
+                changes[key] = check_model(changes[key])
+        values.update(changes)
+        self.store.put_raw("settings", "app", values)
+        if changes.get("sandbox"):
+            self.tools.set_sandbox(make_sandbox(changes["sandbox"]))
+        return self.settings()
+
+    def reload_after_restore(self) -> None:
+        """Pick up restored data that is cached in memory: the tool registry and its sandbox."""
+        self.tools.reload(make_sandbox(self._stored("sandbox") or "subprocess"))
+        self.inputs.forget()
+
+    # ---- workflows ------------------------------------------------------------------
+
+    def workflow(self, workflow_id: str) -> Workflow:
+        """A saved workflow as it is now; raises :class:`KeyError` when there is none."""
+        found = self.store.get("workflows", workflow_id, Workflow)
+        if found is None:
+            raise KeyError(workflow_id)
+        return found
+
+    def save_workflow(self, workflow: Workflow | WorkflowIn) -> Workflow:
+        """Store a workflow (a :class:`WorkflowIn` becomes a new one) and record its version, as the studio does."""
+        saved = workflow if isinstance(workflow, Workflow) else Workflow(**workflow.model_dump())
+        self.store.put("workflows", saved.id, saved)
+        self.versions.record(saved)
+        return saved
+
+    def resolve_workflow(self, workflow_id: str, version: int | None) -> tuple[Workflow, int | None]:
+        """A saved workflow in one of its versions (``None``: the latest), with the version's number.
+
+        Sub-workflows run in a fixed version, so later changes never alter a run that started.
+        """
+        current = self.store.get("workflows", workflow_id, Workflow)
+        if current is None:
+            raise KeyError(workflow_id)
+        if version is None:
+            versions = self.versions.all(workflow_id)
+            if not versions:
+                return current, None
+            chosen = versions[-1]
+        else:
+            chosen = self.versions.get(workflow_id, version)
+        workflow = Workflow(
+            **chosen.snapshot.model_dump(), id=workflow_id, created_at=current.created_at, updated_at=chosen.created_at
+        )
+        return workflow, chosen.number
+
+    def current_version(self, workflow: Workflow) -> int | None:
+        """The number of the saved version equal to ``workflow`` (``None`` for unsaved changes)."""
+        found = next((item for item in self.versions.summaries(workflow) if item.current), None)
+        return found.number if found is not None else None
+
+    def tool_marker(self, name: str) -> str:
+        """What identifies the current code of a tool; changes when the tool changes."""
+        if name in self.tools.builtin:
+            return f"builtin:{name}"
+        try:
+            info = self.tools.get(name)
+        except KeyError:
+            return f"{name}:missing"
+        digest = hashlib.sha256((info.code or "").encode()).hexdigest()[:12]
+        return f"{name}:v{info.version}:{digest}"
+
+    # ---- running ----------------------------------------------------------------------
+
+    async def run(self, workflow: Workflow, request: RunIn, *, trigger: RunTrigger = "manual") -> Run:
+        """Start a run the way the studio does (pre-check, providers, approved libraries).
+
+        Returns the queued run at once; :meth:`wait` waits for it to stop.
+        """
+        return await launch(self, workflow, request, trigger=trigger)
+
+    async def wait(self, run_id: str, *, timeout: float | None = None) -> Run:
+        """The run once it finished or paused (waiting for a person); raises :class:`KeyError` for an unknown id."""
+        found = await asyncio.wait_for(self.runs.wait(run_id), timeout)
+        if found is None:
+            raise KeyError(run_id)
+        return found
+
+    def decide(self, run_id: str, node_id: str, decision: str, comment: str = "") -> Run:
+        """Decide a waiting approval (``approved`` or ``rejected``); the run continues by itself."""
+        return self.runs.decide(run_id, node_id, decision, comment)
+
+    def cancel(self, run_id: str) -> bool:
+        """Ask a running run to stop; ``False`` when it is not running."""
+        return self.runs.cancel(run_id)
+
+    async def resume(
+        self, run_id: str, *, mode: Literal["continue", "restart"] = "continue", confirm: bool = False
+    ) -> Run:
+        """Continue a failed or cancelled run, reusing every result that is still valid."""
+        return await resume_run(self, run_id, mode=mode, confirm=confirm)
+
+    # ---- providers ------------------------------------------------------------------
+
+    def connection(self, provider: str) -> Connection:
+        """How agents of ``provider`` reach it; raises :class:`MissingApiKeyError` when it is not configured.
+
+        A key from the environment wins over a stored one.
+        """
+        info = PROVIDERS.get(provider)
+        if info is None:
+            raise NodestroError("provider.unknown", f"Unknown provider {provider!r}", provider=provider)
+        stored = self._providers().get(provider, {})
+        key = env_key(provider)[0] or stored.get("api_key") or None
+        base_url = stored.get("base_url") or None
+        client = self._client_factory(provider) if self._client_factory is not None else None
+        if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
+            raise MissingApiKeyError(provider)
+        return Connection(
+            provider=provider,
+            api_key=key,
+            base_url=base_url if info.base_url else None,
+            capabilities=dict(stored.get("capabilities") or {}),
+            client=client,
+        )
+
+    def provider_settings(self, provider: str) -> dict[str, Any]:
+        """The stored settings of one provider (may contain its key: never return it from an endpoint)."""
+        return dict(self._providers().get(provider, {}))
+
+    def secret_keys(self) -> list[str]:
+        """Every API key Nodestro knows (environment and settings), e.g. to mask them in snapshots."""
+        stored = self._providers()
+        keys = [env_key(name)[0] or "" for name in PROVIDERS]
+        keys += [str(item.get("api_key") or "") for item in stored.values()]
+        return [key for key in dict.fromkeys(keys) if key]
+
+    def connect_model(self, model: str) -> Connection:
+        """The connection of a model's provider."""
+        return self.connection(provider_of(model))
+
+    def allowed_models(self) -> list[str]:
+        """The models the assistants may choose for new agents: the defaults and the suggested models
+        of every configured provider (qualified names)."""
+        settings = self.settings()
+        configured = {item.id for item in settings.providers if self._reachable(item.id)}
+        found = [qualify(settings.default_model)]
+        found += [info.id for info in models() if info.recommended and info.provider in configured]
+        return list(dict.fromkeys(found))
+
+    def _reachable(self, provider: str) -> bool:
+        try:
+            self.connection(provider)
+        except NodestroError:
+            return False
+        return True
+
+    def require_providers(self, wanted: set[str]) -> None:
+        """Fail fast before work starts: every provider of ``models`` must be configured."""
+        for provider in sorted({provider_of(model) for model in wanted}):
+            self.connection(provider)
+
+
+__all__ = ["DATABASE", "MissingApiKeyError", "Workspace"]
