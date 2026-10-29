@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nodestro-runtime"
+version = "0.2.0"
+description = "Nodestro Runtime – the multi-agent workflow engine of Nodestro, built on Orkexa, usable without server or interface."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Peter Karlhuber" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
+    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@cbf6df3d6f727b96924f1ae66e60b469eeef58e6",
+    "pydantic>=2.6,<3",
+    # Builds the Python environments of tools with third-party libraries (see python_envs.py).
+    "uv>=0.5",
+    "packaging>=23",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5",
+    "ruff>=0.8",
+]
+
+[project.urls]
+Repository = "https://github.com/peterkarlhuber/nodestro-runtime"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nodestro_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Office Open XML parts with their long namespace and relationship URIs.
+"src/nodestro_runtime/office.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["nodestro_runtime"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["nodestro_runtime"]
+mypy_path = "src"
