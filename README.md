@@ -40,22 +40,34 @@ from nodestro_runtime.schemas import RunIn, WorkflowIn
 from nodestro_runtime.workspace import Workspace
 
 workspace = Workspace(Path("~/.nodestro").expanduser())
-workflow = workspace.save_workflow(WorkflowIn.model_validate({
-    "name": "Angebot",
-    "nodes": [
-        {"id": "start", "type": "start"},
-        {"id": "writer", "type": "agent", "label": "Autor",
-         "agent": {"name": "Autor", "system_prompt": "Schreibe ein kurzes Angebot."}},
-        {"id": "out", "type": "output"},
-    ],
-    "edges": [{"id": "e1", "source": "start", "target": "writer"},
-              {"id": "e2", "source": "writer", "target": "out"}],
-}))
+workflow = workspace.save_workflow(
+    WorkflowIn.model_validate(
+        {
+            "name": "Angebot",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {
+                    "id": "writer",
+                    "type": "agent",
+                    "label": "Autor",
+                    "agent": {"name": "Autor", "system_prompt": "Schreibe ein kurzes Angebot."},
+                },
+                {"id": "out", "type": "output"},
+            ],
+            "edges": [
+                {"id": "e1", "source": "start", "target": "writer"},
+                {"id": "e2", "source": "writer", "target": "out"},
+            ],
+        }
+    )
+)
+
 
 async def main() -> None:
     run = await workspace.run(workflow, RunIn(input="10 Stück bis Freitag"))
     done = await workspace.wait(run.id, timeout=300)
     print(done.status, done.output)
+
 
 asyncio.run(main())
 ```
