@@ -20,6 +20,10 @@ Platform integration fixes (found while testing all six repositories together):
 - New check `check.input_form_only`: an agent that reads a start node with a form through `{{input}}` gets the
   form values only, without the additional free text; the check recommends `{{run.input}}`.
 - The OCR note says "1 page" and "1 word" in the singular.
+- One process per data directory is now enforced: a `Workspace` locks `<data_dir>/nodestro.lock` while it is open,
+  and a second one is refused with `workspace.in_use`. Before, starting `nodestro` and `nodestro-api` on the same
+  data directory marked the other process's running runs as interrupted, removed its installation staging
+  directories and ran every schedule twice.
 
 Reliability round: execution, streaming, recovery, storage and security. No data migration; stored workflows,
 runs, settings and memory stay compatible, and the public Python API is unchanged (only additions).

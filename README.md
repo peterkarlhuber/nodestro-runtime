@@ -98,7 +98,10 @@ studio and the API.
 
 ## Using the runtime
 
-**Lifecycle.** A `Workspace` owns one data directory; open one per process and directory. Runs execute as
+**Lifecycle.** A `Workspace` owns one data directory; open one per process and directory. The workspace holds
+a lock on `<data_dir>/nodestro.lock` until it is closed: a second workspace on the same directory, in this or
+another process, is refused with `workspace.in_use` (it would mark the first one's runs as interrupted and run
+its schedules a second time). Runs execute as
 tasks of the asyncio event loop that started them, so start runs from async code. `async with Workspace(...)`
 (or `await workspace.aclose()`) cancels the runs of this process, waits until each one has stored its final
 state and closes the database. `close()` does the same without waiting. Paused runs are not affected: they

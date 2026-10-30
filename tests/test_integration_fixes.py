@@ -351,3 +351,33 @@ def test_the_check_points_out_input_after_a_form(make: Make) -> None:
         }
     )
     assert "check.input_form_only" not in {item.code for item in preflight(workspace, plain).problems}
+
+
+# ---- one process per data directory --------------------------------------------------------------
+
+
+def test_a_data_directory_is_used_by_one_workspace_at_a_time(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    from nodestro_runtime.problems import NodestroError
+
+    first = Workspace(tmp_path / "data", integrations=[])
+    try:
+        with pytest.raises(NodestroError) as raised:
+            Workspace(tmp_path / "data", integrations=[])
+        assert raised.value.code == "workspace.in_use"
+        # Another process is refused the same way, before it touches any run.
+        script = (
+            "import sys\nfrom nodestro_runtime.workspace import Workspace\nfrom nodestro_runtime.problems import "
+            "NodestroError\ntry:\n    Workspace(sys.argv[1], integrations=[])\nexcept NodestroError as error:\n"
+            "    print(error.code)\n"
+        )
+        other = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "data")], capture_output=True, text=True, timeout=120
+        )
+        assert other.stdout.strip() == "workspace.in_use", other.stderr
+    finally:
+        first.close()
+    # Closed: the directory is free again.
+    Workspace(tmp_path / "data", integrations=[]).close()

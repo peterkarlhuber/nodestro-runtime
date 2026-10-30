@@ -34,6 +34,7 @@ from collections.abc import Callable, Iterable
 import hashlib
 import logging
 from pathlib import Path
+import sys
 from typing import Any, Literal
 
 from orkexa.dynamic import DockerSandbox
@@ -87,6 +88,44 @@ from .versions import WorkflowVersions
 
 #: The database file inside the data directory (unchanged since Nodestro 0.1).
 DATABASE = "nodestro.db"
+#: Held while a workspace is open: a second process on the same data directory would mark the first
+#: one's runs as interrupted, clean up its installations and run every schedule a second time.
+LOCK_FILE = "nodestro.lock"
+
+
+class DataDirectoryLock:
+    """An exclusive advisory lock on a data directory (released by :meth:`release` or when the process ends)."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / LOCK_FILE
+        handle = open(self.path, "a+b")  # noqa: SIM115 - kept open while the lock is held
+        try:
+            _lock(handle.fileno())
+        except OSError:
+            handle.close()
+            raise NodestroError(
+                "workspace.in_use",
+                f"The data directory {data_dir} is used by another Nodestro process; stop it first or choose "
+                "another data directory",
+                path=str(data_dir),
+            ) from None
+        self._handle: Any = handle
+
+    def release(self) -> None:
+        if self._handle is not None:
+            self._handle.close()  # closing the file releases the lock
+            self._handle = None
+
+
+def _lock(descriptor: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class Workspace:
@@ -106,6 +145,7 @@ class Workspace:
         data_dir = Path(data_dir).expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
+        self._directory_lock = DataDirectoryLock(data_dir)
         # Installed integrations are optional: one that does not fit is left out (and logged) instead
         # of stopping the runtime; integrations passed explicitly must fit.
         self.extensions = Extensions(
@@ -205,6 +245,7 @@ class Workspace:
         self.knowledge.close()
         self.memory.close()
         self.store.close()
+        self._directory_lock.release()
 
     async def aclose(self) -> None:
         """Cancel the runs of this process, wait until they stored their final state, then :meth:`close`."""
