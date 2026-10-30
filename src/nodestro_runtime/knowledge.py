@@ -33,6 +33,10 @@ _MAX_CANDIDATES = 20_000
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
 
 
+def _is_pdf(name: str, media_type: str | None) -> bool:
+    return Path(name).suffix.lower() == ".pdf" or (media_type or "").lower() == "application/pdf"
+
+
 class KnowledgeFile(BaseModel):
     id: str
     name: str
@@ -228,6 +232,8 @@ class KnowledgeBase:
         if collection.strip():
             metadata["collection"] = collection.strip()[:120]
         converted = documents.convert(data, name)
+        if converted is None and _is_pdf(name, media_type):
+            documents.check_pdf(data, name)
         if converted is not None:
             data = converted.text.encode("utf-8")
             media_type = "text/markdown"
@@ -235,26 +241,34 @@ class KnowledgeBase:
             metadata.update({f"note_{key}": value for key, value in converted.notes.items()})
         with self._lock:
             entry = self.store.add(data, name=name, description=description, media_type=media_type, metadata=metadata)
-            if converted is not None:
-                self.index.delete(entry.id)
-                self.index.add(converted.text, source=entry.id, title=name, file_id=entry.id)
-            elif entry.media_type == "application/pdf":
-                with tempfile.TemporaryDirectory(prefix="nodestro-upload-") as directory:
-                    path = Path(directory) / "upload.pdf"
-                    path.write_bytes(data)
-                    # A PDF without a text layer is stored but not searchable (see OCR).
-                    with suppress(ValueError, ImportError):
-                        self.index.add_file(path, source=entry.id, title=name)
-                    self._attach_file_id(entry.id)
-            elif Path(name).suffix.lower() in _INDEXED_SUFFIXES or entry.media_type.startswith("text/"):
-                with suppress(UnicodeDecodeError):
-                    self.index.delete(entry.id)
-                    self.index.add(data.decode("utf-8"), source=entry.id, title=name, file_id=entry.id)
-            if entry.media_type == "application/pdf" and not documents.pdf_has_text(data):
-                self._mark(entry.id, scanned="yes")
-                if self.ocr_enabled():
-                    self.recognise(entry.id)
+            try:
+                self._index_new(entry, data, name, converted)
+            except BaseException:
+                # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
+                self.delete(entry.id)
+                raise
         return self.get(entry.id)
+
+    def _index_new(self, entry: StoredFile, data: bytes, name: str, converted: documents.Converted | None) -> None:
+        if converted is not None:
+            self.index.delete(entry.id)
+            self.index.add(converted.text, source=entry.id, title=name, file_id=entry.id)
+        elif entry.media_type == "application/pdf":
+            with tempfile.TemporaryDirectory(prefix="nodestro-upload-") as directory:
+                path = Path(directory) / "upload.pdf"
+                path.write_bytes(data)
+                # A PDF without a text layer is stored but not searchable (see OCR).
+                with suppress(ValueError, ImportError):
+                    self.index.add_file(path, source=entry.id, title=name)
+                self._attach_file_id(entry.id)
+        elif Path(name).suffix.lower() in _INDEXED_SUFFIXES or entry.media_type.startswith("text/"):
+            with suppress(UnicodeDecodeError):
+                self.index.delete(entry.id)
+                self.index.add(data.decode("utf-8"), source=entry.id, title=name, file_id=entry.id)
+        if entry.media_type == "application/pdf" and not documents.pdf_has_text(data):
+            self._mark(entry.id, scanned="yes")
+            if self.ocr_enabled():
+                self.recognise(entry.id)
 
     def _attach_file_id(self, file_id: str) -> None:
         """Let every chunk of a file point to it (an agent can then load the whole file after a hit)."""

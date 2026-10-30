@@ -147,8 +147,11 @@ the exact versions of every package (`python_envs`), into a separate environment
   credential.
 - `uv` (package resolution and installation) runs with an allowlist of environment variables: system paths,
   locale, temporary directories, proxy and certificate settings, `UV_*` and compiler settings. Provider keys,
-  tokens and other secrets are not passed on. Note that resolving a package that has no wheel may build it
-  from source, which runs that package's build code before the approval overview is shown.
+  tokens and other secrets are not passed on. Resolving a package that has no wheel builds it from source,
+  which runs that package's build script before the approval overview is shown. Nodestro therefore resolves
+  the libraries of generated tools with `--no-build` (such a package is reported as `deps.build_required`);
+  only a plan a person asks for (*Review and approve*) may build from source. uv is not a sandbox: a build
+  script runs with the rights of the Nodestro process.
 - Workflows can contain approval nodes for human oversight; every decision is stored with the run, as are
   the prompts, tool calls, results and costs of every step, and each run records the workflow version it ran.
 - Sanitized exports (`sanitize`) replace credentials and personal data by placeholders.
