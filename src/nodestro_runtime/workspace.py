@@ -9,10 +9,10 @@ providers and runs::
     from nodestro_runtime.workspace import Workspace
     from nodestro_runtime.schemas import RunIn
 
-    workspace = Workspace("~/.nodestro")
-    workflow = workspace.workflow("wf_...")
-    run = await workspace.run(workflow, RunIn(input="..."))
-    finished = await workspace.wait(run.id)
+    async with Workspace("~/.nodestro") as workspace:
+        workflow = workspace.workflow("wf_...")
+        run = await workspace.run(workflow, RunIn(input="..."))
+        finished = await workspace.wait(run.id)
 
 No HTTP server and no interface are started. The HTTP API (``nodestro-api``) builds its
 application context on top of this class and adds the studio services (architect,
@@ -20,6 +20,11 @@ assistant, publishing, automation); it never runs workflows in another way.
 
 Provider access: a key from the environment wins over a stored one; stored keys are never
 returned by any method meant for display (:meth:`settings`).
+
+Lifecycle: runs execute as tasks of the event loop that started them. :meth:`aclose` (or
+``async with``) cancels the runs of this process, waits until each has stored its final state
+and then closes the database; :meth:`close` does the same without waiting. Paused runs stay
+paused in the database and continue after the next start.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from orkexa.providers.base import redact
 
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
+from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
@@ -100,7 +106,13 @@ class Workspace:
         data_dir = Path(data_dir).expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
-        self.extensions = Extensions(discover() if integrations is None else integrations)
+        # Installed integrations are optional: one that does not fit is left out (and logged) instead
+        # of stopping the runtime; integrations passed explicitly must fit.
+        self.extensions = Extensions(
+            discover() if integrations is None else integrations,
+            strict=integrations is not None,
+            reserved={tool.name for tool in BUILTIN_TOOLS if tool.name},
+        )
         database = data_dir / DATABASE
         self.store = Store(database)
         self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
@@ -150,6 +162,11 @@ class Workspace:
         self.compose()
         # Runs that were executing when Nodestro stopped can never finish; they become continuable.
         self.runs.recover()
+        # The same for installations of Python environments (the last working environment is kept).
+        try:
+            self.python.recover()
+        except Exception:  # housekeeping; it never stops Nodestro from starting
+            logging.getLogger(__name__).exception("Recovering interrupted Python installations failed")
         # Uploads nobody used (e.g. a run dialog that was closed) are removed after a day.
         try:
             self.inputs.cleanup()
@@ -170,9 +187,42 @@ class Workspace:
         return self.knowledge.runner()
 
     def close(self) -> None:
+        """Release the database connections; closing twice is harmless.
+
+        Runs still executing are asked to stop first; they cannot store their final state once
+        the database is closed, so they are marked interrupted at the next start. Prefer
+        :meth:`aclose`, which waits for them.
+        """
+        if self.store.closed:
+            return
+        live = [run_id for run_id in list(self.runs._contexts) if self.runs.is_live(run_id)]
+        if live:
+            logging.getLogger(__name__).warning(
+                "Closing the workspace while %d runs are executing; they are cancelled", len(live)
+            )
+            for run_id in live:
+                self.runs.cancel(run_id)
         self.knowledge.close()
         self.memory.close()
         self.store.close()
+
+    async def aclose(self) -> None:
+        """Cancel the runs of this process, wait until they stored their final state, then :meth:`close`."""
+        if not self.store.closed:
+            await self.runs.shutdown()
+        self.close()
+
+    def __enter__(self) -> Workspace:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    async def __aenter__(self) -> Workspace:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
 
     # ---- settings ----------------------------------------------------------------
 
@@ -271,8 +321,12 @@ class Workspace:
     def save_workflow(self, workflow: Workflow | WorkflowIn) -> Workflow:
         """Store a workflow (a :class:`WorkflowIn` becomes a new one) and record its version, as the studio does."""
         saved = workflow if isinstance(workflow, Workflow) else Workflow(**workflow.model_dump())
-        self.store.put("workflows", saved.id, saved)
-        self.versions.record(saved)
+        # The workflow and its version are stored together: a crash in between never leaves a
+        # saved workflow without its version.
+        with self.store.transaction():
+            previous = self.store.get("workflows", saved.id, Workflow)
+            self.store.put("workflows", saved.id, saved)
+            self.versions.record(saved, previous=previous)
         return saved
 
     def resolve_workflow(self, workflow_id: str, version: int | None) -> tuple[Workflow, int | None]:

@@ -539,13 +539,14 @@ class ToolLibrary:
                     builder.test_sandbox = outcome.sandbox
                     job.dependencies = outcome.packages
                     return proposal
+                # Cleared before the job asks, so the answer to this round is never taken for an old one.
+                decision.dependencies.clear()
                 job.dependency_plan = outcome.plan
                 job.status = "awaiting_dependencies"
                 _step(
                     job,
                     problem("job.awaiting_dependencies", "The tool needs third-party libraries. Please review them."),
                 )
-                decision.dependencies.clear()
                 if not decision.dependencies.wait(_APPROVAL_TIMEOUT_SECONDS):
                     _step(job, problem("job.timeout", "No decision within an hour; rejected."))
                     raise ApprovalDeniedError("No decision about the libraries")
@@ -621,11 +622,13 @@ class ToolLibrary:
             decision = self._decisions.get(job_id)
         if job is None or decision is None:
             raise KeyError(job_id)
-        if job.status != "awaiting_approval":
-            raise NodestroError("job.not_awaiting", "This job is not waiting for a decision")
-        decision.approved = approved
+        with self._lock:
+            # Decided once: a second decision (e.g. a double click) never overrides the first.
+            if job.status != "awaiting_approval" or decision.event.is_set():
+                raise NodestroError("job.not_awaiting", "This job is not waiting for a decision")
+            decision.approved = approved
+            decision.event.set()
         _step(job, problem("job.deciding", "Applying the decision"))
-        decision.event.set()
         return job
 
     def decide_dependencies(self, job_id: str, choice: DependencyChoice) -> ToolJob:
@@ -635,11 +638,12 @@ class ToolLibrary:
             decision = self._decisions.get(job_id)
         if job is None or decision is None:
             raise KeyError(job_id)
-        if job.status != "awaiting_dependencies":
-            raise NodestroError("job.not_awaiting", "This job is not waiting for a decision")
-        decision.dependency_choice = choice
+        with self._lock:
+            if job.status != "awaiting_dependencies" or decision.dependencies.is_set():
+                raise NodestroError("job.not_awaiting", "This job is not waiting for a decision")
+            decision.dependency_choice = choice
+            decision.dependencies.set()
         _step(job, problem("job.deciding", "Applying the decision"))
-        decision.dependencies.set()
         return job
 
     def list_jobs(self) -> list[ToolJob]:

@@ -244,7 +244,8 @@ def xlsx_sheets(data: bytes, name: str = "workbook.xlsx", *, max_rows: int = _MA
             if row_index >= max_rows:
                 sheet.truncated = True
                 break
-            number = int(row.get("r") or row_index + 1)
+            reference = row.get("r") or ""
+            number = int(reference) if reference.isdigit() else row_index + 1
             for position, cell in enumerate(row.findall(f"{_S}c")):
                 column = _column_index(cell.get("r") or "") if cell.get("r") else position
                 if column >= _MAX_COLUMNS:

@@ -190,6 +190,7 @@ class AnswerAll:
         model = request.get("output_format")
         if model is not None:
             return Parsed(text("{}"), sample_instance(model, request))
+        # Sample answers are test data; tests of other components assert this exact text.
         return text("Ergebnis des Agenten.")
 
     def create(self, **request: Any) -> Any:

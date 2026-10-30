@@ -70,6 +70,7 @@ class AgentTestResult(BaseModel):
 def task_prompt(config: AgentConfig, task: str, *, raw: bool = False) -> str:
     """The message the agent gets in a test: the task template filled with the test task."""
     if raw:
+        # The same fallback task as a run's (see engine.render_task); part of existing prompts.
         return task.strip() or "Bitte beginne."
     return render_task(config.task_template, run_input=task, inputs=[])
 

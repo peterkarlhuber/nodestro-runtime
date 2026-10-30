@@ -28,6 +28,8 @@ from . import documents
 from .extensions import OcrEngine
 from .schemas import KnowledgeConfig
 
+#: The most chunks a scoped search looks at in the shared index.
+_MAX_CANDIDATES = 20_000
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
 
 
@@ -110,9 +112,15 @@ class ScopedIndex(Index):
         raise PermissionError("This view is read-only")
 
     def search(self, query: str, k: int = 5) -> list[Hit]:
-        # Over-fetch from the shared index, then keep the assigned files only.
-        hits = self.base.search(query, min(max(k * 20, 50), 500))
-        return [hit for hit in hits if hit.source in self.file_ids][:k]
+        # Over-fetch from the shared index and keep the assigned files only; widen the search while
+        # other files fill the results, so a large knowledge base never hides the assigned files.
+        limit = max(k * 20, 50)
+        while True:
+            hits = self.base.search(query, limit)
+            found = [hit for hit in hits if hit.source in self.file_ids]
+            if len(found) >= k or len(hits) < limit or limit >= _MAX_CANDIDATES:
+                return found[:k]
+            limit = min(limit * 4, _MAX_CANDIDATES)
 
 
 class KnowledgeBase:
