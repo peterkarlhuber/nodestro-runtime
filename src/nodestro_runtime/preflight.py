@@ -198,6 +198,8 @@ def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
                     "values, without the additional text; use {{run.input}} for both",
                     node_id=node.id,
                     name=label,
+                    input="{{input}}",
+                    run_input="{{run.input}}",
                 )
             )
         if has_output and not successors[node.id]:
