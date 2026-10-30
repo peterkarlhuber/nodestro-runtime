@@ -397,8 +397,21 @@ class UvRunner:
             raise UvError(redact(output))
         return completed.stdout
 
-    def compile(self, requirements: list[str], *, python: str, previous: str, log: Callable[[str], None]) -> str:
-        """Resolve exact versions of all packages; ``previous`` pins are kept where possible."""
+    def compile(
+        self,
+        requirements: list[str],
+        *,
+        python: str,
+        previous: str,
+        log: Callable[[str], None],
+        builds: bool = True,
+    ) -> str:
+        """Resolve exact versions of all packages; ``previous`` pins are kept where possible.
+
+        Resolving a package that has no wheel builds its source distribution, which runs that
+        package's build script. ``builds=False`` (``--no-build``) forbids that: such a package
+        then fails with :data:`_WHEELS_REQUIRED` instead.
+        """
         with tempfile.TemporaryDirectory(prefix="nodestro-resolve-") as directory:
             source = Path(directory) / "requirements.in"
             output = Path(directory) / "requirements.txt"
@@ -417,6 +430,7 @@ class UvRunner:
                     python,
                     "--no-header",
                     "--quiet",
+                    *([] if builds else ["--no-build"]),
                 ],
                 log,
             )
@@ -711,8 +725,13 @@ class PythonEnvironments:
 
     # ---- plans -------------------------------------------------------------------------
 
-    def plan(self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "") -> Plan:
-        """Resolve all versions for the approval overview; nothing is installed."""
+    def plan(self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "", builds: bool = True) -> Plan:
+        """Resolve all versions for the approval overview; nothing is installed.
+
+        A package without a wheel is built from source to read its dependencies, which runs its
+        build script. Plans a person asked for allow that (``builds``); plans made without one
+        (a generated tool's libraries) do not, and report ``deps.build_required`` instead.
+        """
         scope = scope_of(kind, ref)
         plan = Plan(
             scope=scope, kind=kind, ref=ref, label=label, requirements=needed.requirements, issues=needed.issues
@@ -731,7 +750,9 @@ class PythonEnvironments:
         lines = [item.line() for item in needed.requirements] + _runtime_requirements()
         log: list[str] = []
         try:
-            plan.lock = self.runner.compile(lines, python=current_python_version(), previous=previous, log=log.append)
+            plan.lock = self.runner.compile(
+                lines, python=current_python_version(), previous=previous, log=log.append, builds=builds
+            )
         except UvError as exc:
             plan.error = explain_uv_error(exc.output)
             return plan
@@ -1244,6 +1265,8 @@ def verify_imports(interpreter: Path, modules: Iterable[str]) -> list[str]:
     return [str(name) for name in missing] if isinstance(missing, list) else names
 
 
+#: uv's hint when ``--no-build`` stopped the build of a package that has no wheel.
+_WHEELS_REQUIRED = re.compile(r"Wheels are required for `(?P<name>[A-Za-z0-9._-]+)` because building from source")
 _NOT_FOUND = re.compile(r"Because (?P<name>[A-Za-z0-9._-]+) was not found in the package registry")
 _NO_VERSION = re.compile(r"there is no version of (?P<name>[A-Za-z0-9._-]+)(?P<spec>[^\s,]*)")
 
@@ -1253,6 +1276,13 @@ def explain_uv_error(output: str) -> Problem:
     text = output.strip()
     if text == "uv is not available":
         return problem("deps.uv_missing", "uv was not found; reinstall Nodestro or install uv")
+    source_only = _WHEELS_REQUIRED.search(text)
+    if source_only:
+        return problem(
+            "deps.build_required",
+            f"{source_only.group('name')} is only available as source code; resolving it would run its build script",
+            name=source_only.group("name"),
+        )
     match = _NOT_FOUND.search(text)
     if match:
         return problem("deps.not_found", text, name=match.group("name"))

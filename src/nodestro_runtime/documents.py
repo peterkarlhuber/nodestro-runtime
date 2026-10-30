@@ -345,6 +345,27 @@ def pdf_pages(data: bytes) -> list[str]:
     return _pdf_pages(data)
 
 
+def check_pdf(data: bytes, name: str) -> None:
+    """Raise :class:`DocumentError` unless the PDF opens and its pages can be counted.
+
+    Runs before a PDF is stored, so a damaged, truncated, empty or password-protected file
+    is refused with a clear code instead of leaving a half-stored entry behind.
+    """
+    from pypdf import PdfReader
+    from pypdf.errors import FileNotDecryptedError
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if not reader.pages:
+            raise ValueError("no pages")
+    except FileNotDecryptedError:
+        raise DocumentError(
+            "document.encrypted", f"{name} is protected by a password and cannot be read", name=name
+        ) from None
+    except Exception:  # pypdf raises many types for damaged files; all mean the same here
+        raise DocumentError("document.unreadable", f"{name} is not a readable PDF", name=name) from None
+
+
 def pdf_has_text(data: bytes) -> bool:
     """Whether a PDF has a text layer (a scan without OCR has none)."""
     from pypdf import PdfReader
@@ -372,7 +393,9 @@ OcrRunner = Callable[[bytes, str], OcrResult]
 
 
 def ocr_intro(result: OcrResult) -> str:
+    pages = "1 page" if result.pages == 1 else f"{result.pages} pages"
+    words = "1 word" if result.words == 1 else f"{result.words} words"
     return (
-        f"Text recognised by OCR ({result.pages} pages, {result.uncertain} of {result.words} words uncertain, "
+        f"Text recognised by OCR ({pages}, {result.uncertain} of {words} uncertain, "
         "marked [?word]). Check important passages against the original."
     )

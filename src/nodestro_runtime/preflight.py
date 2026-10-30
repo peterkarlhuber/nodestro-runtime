@@ -71,6 +71,7 @@ def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
             predecessors[edge.target].append(edge.source)
             successors[edge.source].append(edge.target)
     has_start = any(node.type == "start" for node in workflow.nodes)
+    form_starts = {node.id for node in workflow.nodes if node.type == "start" and node.start and node.start.fields}
     has_output = any(node.type == "output" for node in workflow.nodes)
 
     agent_labels: dict[str, list[str]] = {}
@@ -181,6 +182,24 @@ def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
                     f"{label} has no incoming connection and gets the run input directly",
                     node_id=node.id,
                     name=label,
+                )
+            )
+        template = config.task_template or ""
+        uses_input = not template.strip() or any(
+            match.group(1).strip().lower() == "input" for match in _PLACEHOLDER.finditer(template)
+        )
+        if uses_input and form_starts & set(data_sources(workflow, node.id)):
+            # A filled-in form makes the start node's result the form values alone; the additional
+            # free text then reaches the agent only through {{run.input}}.
+            found.append(
+                _issue(
+                    "check.input_form_only",
+                    f"{label} reads the start node with {{{{input}}}}: with a filled-in form that is only the form "
+                    "values, without the additional text; use {{run.input}} for both",
+                    node_id=node.id,
+                    name=label,
+                    input="{{input}}",
+                    run_input="{{run.input}}",
                 )
             )
         if has_output and not successors[node.id]:

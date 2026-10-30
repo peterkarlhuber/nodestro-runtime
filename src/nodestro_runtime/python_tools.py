@@ -156,7 +156,8 @@ class EnvironmentGate(DependencyGate):
                 extra_imports=sorted(environment.extra_imports),
                 packages=[item.name for item in environment.needed.requirements],
             )
-        plan = self.python.plan("tool", name, environment.needed, label=name)
+        # Generated code chose these packages, no person did yet: never run a package's build script here.
+        plan = self.python.plan("tool", name, environment.needed, label=name, builds=False)
         return DependencyOutcome(plan=plan.model_dump(mode="json", exclude={"lock"}))
 
     def install(self, plan_id: str, log: Callable[[str], None]) -> None:

@@ -229,11 +229,22 @@ class FakeUv:
         self.compiles: list[list[str]] = []
         self.syncs = 0
         self.fail_sync: str | None = None
+        #: Packages without a wheel: resolving them with ``builds=False`` fails like ``uv --no-build``.
+        self.source_only: set[str] = set()
+        self.builds: list[bool] = []
 
     def version(self) -> str | None:
         return "0.0-fake" if self.binary else None
 
-    def compile(self, requirements: list[str], *, python: str, previous: str, log: Callable[[str], None]) -> str:
+    def compile(
+        self,
+        requirements: list[str],
+        *,
+        python: str,
+        previous: str,
+        log: Callable[[str], None],
+        builds: bool = True,
+    ) -> str:
         import re
 
         from packaging.specifiers import SpecifierSet
@@ -241,6 +252,7 @@ class FakeUv:
         from .python_envs import UvError, parse_lock
 
         self.compiles.append(list(requirements))
+        self.builds.append(builds)
         pins = {item.key: item.version for item in parse_lock(previous)}
         chosen: dict[str, tuple[str, list[str]]] = {}
         via: dict[str, list[str]] = {}
@@ -256,6 +268,11 @@ class FakeUv:
                 continue
             if name not in self.index:
                 raise UvError(f"No solution found: Because {name} was not found in the package registry")
+            if not builds and name in self.source_only:
+                raise UvError(
+                    f"No solution found: hint: Wheels are required for `{name}` because building from source "
+                    "is disabled for all packages (i.e., with `--no-build`)"
+                )
             versions = [v for v in self.index[name] if v[0] in SpecifierSet(spec)]
             if name in chosen:
                 if chosen[name][0] not in SpecifierSet(spec):

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+Platform integration fixes (found while testing all six repositories together):
+
+- Approvals: an approval's comment reaches later agents and sub-workflows as before, but no longer result
+  nodes or decisions. Before, a comment became an extra entry of the result node (the result changed shape)
+  and ended up in result files (Markdown, PDF, DOCX ...) and published API answers; a decision right after an
+  approval with a comment evaluated a dictionary instead of the result. The comment stays in the approval
+  record and the `approval_decided` event.
+- Knowledge: a damaged, truncated, empty or password-protected PDF is refused before it is stored
+  (`document.unreadable`, new `document.encrypted`) instead of failing with an unhandled error and leaving a
+  half-stored entry. Any other failure while indexing a new file removes the file again.
+- Events: the event counter of a paused run is stored (collection `run_event_seq`), so its numbering continues
+  after a restart instead of starting at 1 again; clients reconnecting with `Last-Event-ID` no longer miss events.
+- Python libraries: the libraries of a generated tool are resolved with `uv --no-build`, so no package build
+  script runs before a person has seen the plan; a package without a wheel is reported as
+  `deps.build_required`. Plans a person asks for resolve as before.
+- New check `check.input_form_only`: an agent that reads a start node with a form through `{{input}}` gets the
+  form values only, without the additional free text; the check recommends `{{run.input}}`.
+- The OCR note says "1 page" and "1 word" in the singular.
+- One process per data directory is now enforced: a `Workspace` locks `<data_dir>/nodestro.lock` while it is open,
+  and a second one is refused with `workspace.in_use`. Before, starting `nodestro` and `nodestro-api` on the same
+  data directory marked the other process's running runs as interrupted, removed its installation staging
+  directories and ran every schedule twice.
+
 Reliability round: execution, streaming, recovery, storage and security. No data migration; stored workflows,
 runs, settings and memory stay compatible, and the public Python API is unchanged (only additions).
 

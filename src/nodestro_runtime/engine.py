@@ -90,6 +90,8 @@ _PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 #: Events of a live run kept for late subscribers; beyond it ``text`` and ``thinking`` deltas are
 #: no longer kept (they are still published, and the node state holds the whole text).
 _MAX_EVENT_HISTORY = 5000
+#: The ``seq`` of the last event of each paused run (store collection), kept across restarts.
+_EVENT_SEQ = "run_event_seq"
 #: Events a subscriber may fall behind; a subscriber that stops reading is ended instead of
 #: growing without limit (the client then loads the run once more, see ``subscribe``).
 _MAX_SUBSCRIBER_BACKLOG = 10_000
@@ -956,7 +958,12 @@ class RunManager:
                 loop.call_soon_threadsafe(self._publish, context.run.id, kind, node_id, data)
 
     def _publish(self, run_id: str, kind: str, node_id: str | None, data: dict[str, Any]) -> None:
-        seq = self._seq.get(run_id, 0) + 1
+        if run_id not in self._seq:
+            # A run paused by an earlier process continues its numbering, so a client reconnecting
+            # with Last-Event-ID never mistakes the new events for ones it has already seen.
+            stored = self.store.get_raw(_EVENT_SEQ, run_id)
+            self._seq[run_id] = stored if isinstance(stored, int) else 0
+        seq = self._seq[run_id] + 1
         self._seq[run_id] = seq
         event = RunEvent(seq=seq, run_id=run_id, type=kind, node_id=node_id, data=data)
         events = self._events.setdefault(run_id, [])
@@ -1046,8 +1053,10 @@ class RunManager:
                 usage=run.usage.model_dump(mode="json"),
             )
             if paused:
-                # Its numbering continues when it resumes; its history is not needed for that.
+                # Its numbering continues when it resumes, also after a restart; its history is not needed.
                 self._events.pop(run.id, None)
+                if run.id in self._seq:
+                    self.store.put_raw(_EVENT_SEQ, run.id, self._seq[run.id])
             else:
                 self._forget_events(run.id)
 
@@ -1056,6 +1065,8 @@ class RunManager:
         self._events.pop(run_id, None)
         self._seq.pop(run_id, None)
         self._subscribers.pop(run_id, None)
+        if not self.store.closed:
+            self.store.delete(_EVENT_SEQ, run_id)
 
     def _conclude(self, context: _RunContext) -> None:
         run = context.run
@@ -1187,8 +1198,16 @@ class RunManager:
             return PAUSED
         return BLOCKED
 
-    def _inputs(self, run: Run, node_id: str) -> tuple[list[tuple[str, Any]], set[str]]:
-        """The results arriving at a node over active connections, and the names of skipped ones."""
+    def _inputs(
+        self, run: Run, node_id: str, *, approval_comments: bool = True
+    ) -> tuple[list[tuple[str, Any]], set[str]]:
+        """The results arriving at a node over active connections, and the names of skipped ones.
+
+        With ``approval_comments`` (agents, sub-workflows, approvals), a decided approval's comment
+        arrives under the approval's name. Result and decision nodes get the results only: a
+        reviewer's internal comment must not become part of the run's result, its result files or
+        its published answer, and must not change what a decision evaluates.
+        """
         nodes = {node.id: node for node in run.workflow.nodes}
         incoming = graph.predecessors(run.workflow)
         found: list[tuple[str, Any]] = []
@@ -1204,14 +1223,16 @@ class RunManager:
                 state = run.nodes[source.id]
                 if source.type in TRANSPARENT:
                     visit(source.id)
-                    if source.type == "approval" and state.approval is not None and state.approval.comment:
+                    if source.type != "approval" or not approval_comments:
+                        continue
+                    if state.approval is not None and state.approval.comment:
                         found.append(
                             (
                                 node_label(source),
                                 {"decision": state.approval.decision, "comment": state.approval.comment},
                             )
                         )
-                    elif source.type == "approval":
+                    else:
                         # Decided without a comment: its placeholder reads "-" like a skipped result.
                         silent.add(node_label(source).strip().lower())
                 else:
@@ -1329,7 +1350,7 @@ class RunManager:
     async def _run_node(self, context: _RunContext, node: Node) -> None:
         run = context.run
         state = run.nodes[node.id]
-        inputs, absent = self._inputs(run, node.id)
+        inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
         state.started_at = now()
         if node.type == "start":
             state.status = "succeeded"
