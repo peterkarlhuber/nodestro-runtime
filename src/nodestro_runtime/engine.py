@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+import concurrent.futures
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -30,7 +31,7 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from orkexa import (
     ContentBlock,
@@ -48,6 +49,7 @@ from orkexa import (
     refine,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
+from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
@@ -74,7 +76,6 @@ from .schemas import (
     Run,
     RunEvent,
     RunIn,
-    RunSummary,
     RunTrigger,
     ToolCallRecord,
     Usage,
@@ -86,7 +87,16 @@ from .storage import Store
 logger = logging.getLogger(__name__)
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+#: Events of a live run kept for late subscribers; beyond it ``text`` and ``thinking`` deltas are
+#: no longer kept (they are still published, and the node state holds the whole text).
 _MAX_EVENT_HISTORY = 5000
+#: Events a subscriber may fall behind; a subscriber that stops reading is ended instead of
+#: growing without limit (the client then loads the run once more, see ``subscribe``).
+_MAX_SUBSCRIBER_BACKLOG = 10_000
+#: How long :meth:`RunManager.shutdown` waits for runs to stop by themselves.
+_SHUTDOWN_GRACE_SECONDS = 5.0
+
+T = TypeVar("T")
 
 
 class RunCancelled(Exception):
@@ -257,6 +267,20 @@ def check_workflow(workflow: Workflow) -> list[CheckIssue]:
     """
     problems: list[CheckIssue] = []
     nodes = {node.id: node for node in workflow.nodes}
+    if len(nodes) != len(workflow.nodes):
+        # The second node of an id would silently replace the first one in every run.
+        seen: set[str] = set()
+        for node in workflow.nodes:
+            if node.id in seen:
+                problems.append(
+                    CheckIssue(
+                        code="workflow.node_duplicate",
+                        message=f"Two nodes have the id {node.id}",
+                        params={"id": node.id},
+                        node_id=node.id,
+                    )
+                )
+            seen.add(node.id)
     for edge in workflow.edges:
         if edge.source not in nodes or edge.target not in nodes:
             problems.append(
@@ -310,6 +334,11 @@ def check_workflow(workflow: Workflow) -> list[CheckIssue]:
 
 
 def node_label(node: Node) -> str:
+    """The name of a node in prompts, placeholders and results.
+
+    The defaults of unnamed nodes are German for compatibility: they are keys of stored run
+    outputs and names in the prompts of existing workflows, so they do not change.
+    """
     if node.label:
         return node.label
     if node.agent is not None:
@@ -403,6 +432,8 @@ def render_task(
         return match.group(0)
 
     text = _PLACEHOLDER.sub(replace, template or "")
+    # The heading of appended inputs and the fallback task are part of the prompts of existing
+    # workflows (and of their tests in other repositories); they stay as they are.
     if not append:
         return text.strip()
     rest = [(name, value) for name, value in inputs if name.lower() not in used]
@@ -514,6 +545,8 @@ class _RunContext:
         #: Set when a rejection ended the run.
         self.stop: Problem | None = None
         self.fingerprints: dict[str, str] = {}
+        #: The event loop the run executes on (events from worker threads are handed to it).
+        self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
 
     def check(self) -> None:
         if self.cancelled.is_set():
@@ -525,7 +558,17 @@ def _no_workflow(workflow_id: str, _version: int | None) -> tuple[Workflow, int 
 
 
 class RunManager:
-    """Starts runs, keeps their live event streams and persists their results."""
+    """Starts runs, keeps their live event streams and persists their results.
+
+    Runs execute as ``asyncio`` tasks on the event loop that started them; agents run in worker
+    threads and hand their events to that loop. :meth:`start`, :meth:`resume`, :meth:`decide`
+    and :meth:`cancel` may also be called from another thread while that loop runs (e.g. an
+    application that runs its loop in a background thread): the call is carried out on the loop.
+
+    Event stream contract: every event of a run has a ``seq`` one higher than the event before,
+    also beyond the history limit and across a pause in the same process. A run's history is
+    dropped when it finishes or pauses; a paused run keeps only its counter.
+    """
 
     def __init__(
         self,
@@ -562,9 +605,35 @@ class RunManager:
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
+        #: The ``seq`` of the last event of each live or paused run.
+        self._seq: dict[str, int] = {}
         self._subscribers: dict[str, list[asyncio.Queue[RunEvent | None]]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        #: The loop of the most recently started run (calls from other threads are carried out there).
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _on_loop(self, call: Callable[[], T]) -> T | None:
+        """Carry out ``call`` on the runs' event loop when it is called from a thread without a loop.
+
+        Returns ``None`` when the call may run right here: this thread runs an event loop (runs it
+        starts execute on that loop), or no loop runs at all.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running() or loop.is_closed():
+            return None
+        with suppress(RuntimeError):
+            asyncio.get_running_loop()
+            return None
+        done: concurrent.futures.Future[T] = concurrent.futures.Future()
+
+        def execute() -> None:
+            try:
+                done.set_result(call())
+            except BaseException as exc:
+                done.set_exception(exc)
+
+        loop.call_soon_threadsafe(execute)
+        return done.result()
 
     # ---- public API ----------------------------------------------------------------
 
@@ -587,6 +656,23 @@ class RunManager:
         ``release_id`` marks a run of a published API: it executes with its release's
         environment (see :attr:`environments`).
         """
+        elsewhere = self._on_loop(
+            lambda: self.start(
+                workflow,
+                request,
+                trigger=trigger,
+                trigger_ref=trigger_ref,
+                version=version,
+                resumed_from=resumed_from,
+                preset=preset,
+                release_id=release_id,
+                release_number=release_number,
+                api_key_id=api_key_id,
+            )
+        )
+        if elsewhere is not None:
+            return elsewhere
+        _require_loop()
         problems = check_workflow(workflow)
         if problems:
             raise WorkflowError(
@@ -647,24 +733,28 @@ class RunManager:
         return pinned
 
     def _launch(self, run: Run) -> Run:
+        loop = _require_loop()
         workflow = run.workflow
         budget = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
         if budget is not None:
-            spent = run.usage.estimated_cost_usd or 0.0
-            budget = max(budget - spent, 0.0)
+            budget = max(budget - _known_cost(run), 0.0)
         context = _RunContext(
             run, BudgetTracker(Decimal(str(budget)) if budget is not None else None), self.environment(run)
         )
+        context.loop = loop
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
         self._subscribers.setdefault(run.id, [])
         self.store.put("runs", run.id, run)
-        self._loop = asyncio.get_running_loop()
-        self._tasks[run.id] = asyncio.create_task(self._execute(context), name=f"run-{run.id}")
+        self._loop = loop
+        self._tasks[run.id] = loop.create_task(self._execute(context), name=f"run-{run.id}")
         return run
 
     def resume(self, run_id: str) -> Run:
         """Continue a paused run in place (after an approval decision), also after a restart."""
+        elsewhere = self._on_loop(lambda: self.resume(run_id))
+        if elsewhere is not None:
+            return elsewhere
         context = self._contexts.get(run_id)
         if context is not None:
             context.root.resume_requested = True
@@ -691,8 +781,12 @@ class RunManager:
         """Record a person's decision at an approval node and let the run continue.
 
         Returns the top-level run. Nothing is decided without this call: a pending approval
-        stays pending through restarts, test series and scheduled runs.
+        stays pending through restarts, test series and scheduled runs. A decision is recorded
+        once: a second one for the same approval is refused.
         """
+        elsewhere = self._on_loop(lambda: self.decide(run_id, node_id, decision, comment, decided_by=decided_by))
+        if elsewhere is not None:
+            return elsewhere
         run = self.get(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -708,6 +802,9 @@ class RunManager:
         text = comment.strip()[:4000] if config.allow_comment else ""
         if decision == REJECTED and config.require_comment_on_reject and not text:
             raise NodestroError("approval.comment_required", "Please give a reason for the rejection")
+        if self._contexts.get(self.root_of(run).id) is None:
+            # The run continues on an event loop: refuse before anything is recorded.
+            _require_loop()
         state.approval = ApprovalRecord(decision=decision, comment=text, decided_by=decided_by)  # type: ignore[arg-type]
         context = self._contexts.get(run_id)
         if context is not None:
@@ -719,6 +816,10 @@ class RunManager:
         return self.get(root.id) or root
 
     def cancel(self, run_id: str) -> bool:
+        """Stop a running or paused run (its top-level run); ``False`` when it is neither."""
+        elsewhere = self._on_loop(lambda: self.cancel(run_id))
+        if elsewhere is not None:
+            return elsewhere
         run = self.get(run_id)
         if run is None:
             return False
@@ -766,13 +867,12 @@ class RunManager:
         """After a restart: runs that were executing when Nodestro stopped are marked interrupted.
 
         Paused runs stay paused (their approvals are stored). Interrupted runs can be continued.
+        Every stored run is considered, however many there are; runs executing in this process
+        are left alone.
         """
         count = 0
-        for summary in self.store.list("runs", RunSummary, limit=5000):
-            if summary.status not in ("queued", "running") or summary.imported_at is not None:
-                continue
-            run = self.store.get("runs", summary.id, Run)
-            if run is None:
+        for run in self.store.find("runs", "status", ("queued", "running"), Run):
+            if run.imported_at is not None or run.id in self._contexts:
                 continue
             for state in run.nodes.values():
                 if state.status == "running":
@@ -822,35 +922,62 @@ class RunManager:
             await asyncio.shield(task)
         return self.get(run_id)
 
-    async def shutdown(self) -> None:
-        for context in self._contexts.values():
+    async def shutdown(self, *, timeout: float = _SHUTDOWN_GRACE_SECONDS) -> None:
+        """Cancel every run of this process and wait until each one has stored its final state.
+
+        Runs get ``timeout`` seconds to stop by themselves (an agent stops at its next model
+        response or tool call); a run that does not is stopped at once and stored as cancelled.
+        Paused runs are not affected: they wait in the database for their approval.
+        """
+        for context in list(self._contexts.values()):
             context.cancelled.set()
-        for task in list(self._tasks.values()):
-            with suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(task, timeout=5)
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
 
     # ---- events --------------------------------------------------------------------
 
     def _emit(self, context: _RunContext, kind: str, node_id: str | None = None, **data: Any) -> None:
         """Record and publish an event; safe to call from worker threads."""
-        loop = self._loop
+        loop = context.root.loop or self._loop
         if loop is None:
+            # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens.
             return
         if _in_loop(loop):
             self._publish(context.run.id, kind, node_id, data)
         else:
-            loop.call_soon_threadsafe(self._publish, context.run.id, kind, node_id, data)
+            # A closed loop (the application stopped) has no listeners left.
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._publish, context.run.id, kind, node_id, data)
 
     def _publish(self, run_id: str, kind: str, node_id: str | None, data: dict[str, Any]) -> None:
+        seq = self._seq.get(run_id, 0) + 1
+        self._seq[run_id] = seq
+        event = RunEvent(seq=seq, run_id=run_id, type=kind, node_id=node_id, data=data)
         events = self._events.setdefault(run_id, [])
-        event = RunEvent(seq=len(events) + 1, run_id=run_id, type=kind, node_id=node_id, data=data)
         if len(events) < _MAX_EVENT_HISTORY or kind not in ("text", "thinking"):
             events.append(event)
         for queue in list(self._subscribers.get(run_id, [])):
-            queue.put_nowait(event)
+            if queue.qsize() >= _MAX_SUBSCRIBER_BACKLOG:
+                self._drop_subscriber(run_id, queue)
+            else:
+                queue.put_nowait(event)
         if kind in ("run_finished", "run_paused"):
             for queue in list(self._subscribers.get(run_id, [])):
                 queue.put_nowait(None)
+
+    def _drop_subscriber(self, run_id: str, queue: asyncio.Queue[RunEvent | None]) -> None:
+        """End the stream of a subscriber that stopped reading: its queue is emptied and closed."""
+        logger.warning("A subscriber of run %s fell %d events behind; its stream ends", run_id, queue.qsize())
+        self.unsubscribe(run_id, queue)
+        while not queue.empty():
+            queue.get_nowait()
+        queue.put_nowait(None)
 
     def _save(self, context: _RunContext) -> None:
         with context.lock:
@@ -863,6 +990,9 @@ class RunManager:
         run = context.run
         try:
             await self._execute_body(context)
+        except asyncio.CancelledError:
+            # Stopped from outside (shutdown): the final state is already stored.
+            pass
         finally:
             self._contexts.pop(run.id, None)
             self._tasks.pop(run.id, None)
@@ -884,6 +1014,11 @@ class RunManager:
                     continue
                 break
             self._conclude(context)
+        except asyncio.CancelledError:
+            # The task itself was cancelled (shutdown): the run must not stay "running" in the database.
+            context.cancelled.set()
+            _abandon(run)
+            raise
         except Exception as exc:
             logger.exception("Run %s failed", run.id)
             run.status = "failed"
@@ -910,15 +1045,16 @@ class RunManager:
                 output=run.output,
                 usage=run.usage.model_dump(mode="json"),
             )
-            if not paused:
+            if paused:
+                # Its numbering continues when it resumes; its history is not needed for that.
+                self._events.pop(run.id, None)
+            else:
                 self._forget_events(run.id)
 
     def _forget_events(self, run_id: str) -> None:
-        """Drop the event history of a run that finished: streams only replay events of live runs.
-
-        A paused run keeps its history, so that its events continue numbering when it resumes.
-        """
+        """Drop the event history of a run that finished: streams only replay events of live runs."""
         self._events.pop(run_id, None)
+        self._seq.pop(run_id, None)
         self._subscribers.pop(run_id, None)
 
     def _conclude(self, context: _RunContext) -> None:
@@ -1620,11 +1756,15 @@ def execute_agent(
 
 
 def node_problem(exc: BaseException) -> Problem:
-    """What went wrong in a node, as a code for the UI and the technical text."""
+    """What went wrong in a node, as a code for the UI and the technical text.
+
+    The text is stored with the run and streamed to clients, so anything that looks like a
+    credential (keys, tokens, passwords in URLs) is removed from it first.
+    """
     if isinstance(exc, NodestroError):
         return exc.problem
     kind = type(exc).__name__
-    text = f"{kind}: {exc}" if str(exc) else kind
+    text = redact(f"{kind}: {exc}" if str(exc) else kind)
     if isinstance(exc, BudgetExceededError):
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
@@ -1644,6 +1784,38 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
 
 def _is_paused(run: Run) -> bool:
     return run.status == "paused"
+
+
+def _abandon(run: Run) -> None:
+    """A run whose task was stopped from outside: it and its unfinished nodes end as cancelled."""
+    for state in run.nodes.values():
+        if state.status == "running":
+            state.status = "cancelled"
+            state.finished_at = now()
+            _fail(state, problem("run.node_cancelled", "Cancelled"))
+    run.status = "cancelled"
+    _fail(run, problem("run.cancelled", "The run was cancelled"))
+
+
+def _known_cost(run: Run) -> float:
+    """What a run already spent, as far as it is known: the run's cost, or the sum of its nodes' known costs.
+
+    Used for the remaining budget of a continued run; an unknown total never counts as zero when
+    parts of it are known.
+    """
+    if run.usage.estimated_cost_usd is not None:
+        return run.usage.estimated_cost_usd
+    return sum(state.usage.estimated_cost_usd or 0.0 for state in run.nodes.values())
+
+
+def _require_loop() -> asyncio.AbstractEventLoop:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        raise NodestroError(
+            "run.no_event_loop",
+            "Runs execute on an asyncio event loop: call this from async code (e.g. inside asyncio.run())",
+        ) from None
 
 
 def _in_loop(loop: asyncio.AbstractEventLoop) -> bool:

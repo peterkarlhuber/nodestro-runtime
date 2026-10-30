@@ -61,6 +61,14 @@ def total_cost(costs: Iterable[float | None]) -> float | None:
 
 
 class _Model(BaseModel):
+    """Base of the shared models: unknown fields are ignored on purpose.
+
+    Stored documents of older versions, exports and the studio's editor state carry fields these
+    models do not (or no longer) know; rejecting them would make stored data unreadable. Invalid
+    values of known fields are still rejected, and :mod:`nodestro_runtime.preflight` checks what a
+    run needs.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
 
@@ -341,6 +349,7 @@ class Edge(_Model):
 
 
 class WorkflowIn(_Model):
+    #: The default name is part of the published API schema (OpenAPI) and of stored workflows; it stays German.
     name: str = "Neuer Workflow"
     description: str = ""
     nodes: list[Node] = Field(default_factory=list)

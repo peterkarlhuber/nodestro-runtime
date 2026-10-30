@@ -90,31 +90,32 @@ class UsageLog:
             model = f"{record.provider}:{record.model}" if record.provider else record.model
             by_model.setdefault(model, []).append(record)
         entries = []
-        for model, group in by_model.items():
-            summary = summarize_usage(group)
-            cost = summary.estimated_cost_usd
-            entry = UsageEntry(
-                source=source,
-                label=label[:120],
-                model=model,
-                ref=ref,
-                detail=detail,
-                request=request,
-                estimated=estimated,
-                usage=Usage(
-                    requests=summary.requests,
-                    input_tokens=summary.input_tokens,
-                    output_tokens=summary.output_tokens,
-                    cache_read_input_tokens=summary.cache_read_input_tokens,
-                    cache_creation_input_tokens=summary.cache_creation_input_tokens,
-                    thinking_tokens=summary.thinking_tokens,
-                    web_search_requests=summary.web_search_requests,
-                    total_tokens=summary.total_tokens,
-                    estimated_cost_usd=float(cost) if cost is not None else None,
-                ),
-            )
-            self.store.put(_COLLECTION, entry.id, entry)
-            entries.append(entry)
+        with self.store.transaction():  # one operation: all of its entries or none
+            for model, group in by_model.items():
+                summary = summarize_usage(group)
+                cost = summary.estimated_cost_usd
+                entry = UsageEntry(
+                    source=source,
+                    label=label[:120],
+                    model=model,
+                    ref=ref,
+                    detail=detail,
+                    request=request,
+                    estimated=estimated,
+                    usage=Usage(
+                        requests=summary.requests,
+                        input_tokens=summary.input_tokens,
+                        output_tokens=summary.output_tokens,
+                        cache_read_input_tokens=summary.cache_read_input_tokens,
+                        cache_creation_input_tokens=summary.cache_creation_input_tokens,
+                        thinking_tokens=summary.thinking_tokens,
+                        web_search_requests=summary.web_search_requests,
+                        total_tokens=summary.total_tokens,
+                        estimated_cost_usd=float(cost) if cost is not None else None,
+                    ),
+                )
+                self.store.put(_COLLECTION, entry.id, entry)
+                entries.append(entry)
         return entries
 
     def entries(self, since: datetime | None = None) -> list[UsageEntry]:

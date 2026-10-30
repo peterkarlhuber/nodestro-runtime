@@ -74,6 +74,31 @@ class ExtensionError(NodestroError):
     """An integration that cannot be used (wrong contract version, duplicate tool names)."""
 
 
+def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list[str]:
+    """The tool names of ``item``; raises when it cannot be used next to the integrations before it."""
+    if item.contract != CONTRACT:
+        raise ExtensionError(
+            "extension.contract",
+            f"Integration {item.name!r} was written for contract {item.contract}, the runtime offers {CONTRACT}",
+            name=item.name,
+            contract=item.contract,
+        )
+    found: list[str] = []
+    for tool in item.tools:
+        if tool.name is None:
+            raise ExtensionError("extension.tool_name", f"A tool of {item.name!r} has no name", name=item.name)
+        owner = names.get(tool.name) or ("the runtime" if tool.name in reserved else None)
+        if owner is not None or tool.name in found:
+            raise ExtensionError(
+                "extension.tool_duplicate",
+                f"Tool {tool.name!r} of {item.name!r} is already provided by {owner or item.name!r}",
+                name=item.name,
+                tool=tool.name,
+            )
+        found.append(tool.name)
+    return found
+
+
 def _load(entry: metadata.EntryPoint) -> Integration:
     value = entry.load()
     if callable(value) and not isinstance(value, Integration):
@@ -106,31 +131,28 @@ def discover(
 
 
 class Extensions:
-    """The integrations of one workspace, checked once."""
+    """The integrations of one workspace, checked once.
 
-    def __init__(self, integrations: Iterable[Integration] = ()) -> None:
+    With ``strict`` (the default) an integration that does not fit raises :class:`ExtensionError`.
+    Without it, such an integration is logged and left out, so an optional installed extension
+    never stops the runtime. ``reserved`` names tools the runtime already has (the built-in tools).
+    """
+
+    def __init__(
+        self, integrations: Iterable[Integration] = (), *, strict: bool = True, reserved: Iterable[str] = ()
+    ) -> None:
         self.integrations: list[Integration] = []
+        taken = set(reserved)
         names: dict[str, str] = {}
         for item in integrations:
-            if item.contract != CONTRACT:
-                raise ExtensionError(
-                    "extension.contract",
-                    f"Integration {item.name!r} was written for contract {item.contract}, "
-                    f"the runtime offers {CONTRACT}",
-                    name=item.name,
-                    contract=item.contract,
-                )
-            for tool in item.tools:
-                if tool.name is None:
-                    raise ExtensionError("extension.tool_name", f"A tool of {item.name!r} has no name", name=item.name)
-                if tool.name in names:
-                    raise ExtensionError(
-                        "extension.tool_duplicate",
-                        f"Tool {tool.name!r} of {item.name!r} is already provided by {names[tool.name]!r}",
-                        name=item.name,
-                        tool=tool.name,
-                    )
-                names[tool.name] = item.name
+            try:
+                tools = _check(item, names, taken)
+            except ExtensionError:
+                if strict:
+                    raise
+                logger.exception("Integration %r is left out", item.name)
+                continue
+            names.update(dict.fromkeys(tools, item.name))
             self.integrations.append(item)
 
     def tools(self) -> list[Tool]:

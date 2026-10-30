@@ -23,7 +23,7 @@ Python installation is never changed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 import contextlib
 from datetime import datetime, timedelta
 import hashlib
@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from orkexa.dynamic import Sandbox, SubprocessSandbox
+from orkexa.providers.base import redact
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
@@ -59,6 +60,42 @@ _COLLECTION = "python_envs"
 _PLAN_TTL = timedelta(hours=1)
 _MAX_LOG_LINES = 300
 _MARKER = "nodestro-env.json"
+
+#: Variables uv receives from Nodestro's environment (everything else, such as provider keys and
+#: tokens, stays out: building a package from source runs that package's own code). Kept are what
+#: a package manager legitimately needs: system paths, locale, temporary directories, proxies,
+#: certificates, uv's own configuration (``UV_*``: index URLs and their credentials) and the usual
+#: compiler settings for source builds.
+UV_ENV_ALLOWED = frozenset(
+    {
+        # system
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ",
+        "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+        # Windows
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+        "COMMONPROGRAMFILES", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+        # network
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NETRC",
+        # source builds
+        "CC", "CXX", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "PKG_CONFIG_PATH", "MACOSX_DEPLOYMENT_TARGET",
+        "SDKROOT", "DEVELOPER_DIR",
+    }
+)  # fmt: skip
+UV_ENV_PREFIXES = ("UV_", "LC_")
+
+
+def uv_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment of a uv process: the allowed variables of ``source`` (``os.environ``) only."""
+    environ = os.environ if source is None else source
+    allowed = {name.upper() for name in UV_ENV_ALLOWED}
+    return {
+        key: value
+        for key, value in environ.items()
+        if key.upper() in allowed or key.upper().startswith(UV_ENV_PREFIXES)
+    }
+
 
 #: Numerical libraries start one thread per core; the sandbox allows no extra processes.
 SANDBOX_ENV = {
@@ -323,11 +360,13 @@ class UvRunner:
         return output.stdout.strip().removeprefix("uv ").split(" ")[0] or None
 
     def _environment(self) -> dict[str, str]:
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONPATH", "PYTHONHOME", "ANTHROPIC_API_KEY")
-        }
+        """An allowlist of Nodestro's environment (see :data:`UV_ENV_ALLOWED`) plus uv's settings.
+
+        Secrets such as provider keys or tokens never reach uv, its build backends or the code of
+        the packages they build. ``VIRTUAL_ENV``, ``PYTHONPATH`` and the like are not on the list,
+        so Nodestro's own environment never leaks into the tool environments.
+        """
+        environment = uv_environment()
         environment.update({"UV_CACHE_DIR": str(self.cache_dir), "NO_COLOR": "1", "UV_NO_PROGRESS": "1"})
         return environment
 
@@ -348,11 +387,14 @@ class UvRunner:
             raise UvError(f"uv did not finish within {timeout:g} seconds") from exc
         except OSError as exc:
             raise UvError(f"uv could not be started: {exc}") from exc
+        # uv's output is shown in the installation log and stored with the environment: credentials
+        # (e.g. of a private index URL) are removed from it.
         for line in completed.stderr.splitlines():
             if line.strip():
-                log(line)
+                log(redact(line))
         if completed.returncode != 0:
-            raise UvError(completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}")
+            output = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            raise UvError(redact(output))
         return completed.stdout
 
     def compile(self, requirements: list[str], *, python: str, previous: str, log: Callable[[str], None]) -> str:
@@ -785,6 +827,33 @@ class PythonEnvironments:
         plan, needed = self.get_plan(plan_id)
         if plan.error is not None or not plan.lock:
             raise NodestroError("deps.plan_invalid", "This overview has nothing to approve")
+        with self._lock:
+            env = self._begin_install(plan.scope, approve=(plan, needed))
+        if wait:
+            self._install(env.scope, needed.all_modules(), log)
+            return self.get(env.scope) or env
+        threading.Thread(
+            target=self._install,
+            args=(env.scope, needed.all_modules(), log),
+            name=f"python-env-{env.scope}",
+            daemon=True,
+        ).start()
+        return env
+
+    def _begin_install(self, scope: str, *, approve: tuple[Plan, Needed] | None = None) -> PythonEnvironment:
+        """Mark the scope as installing (after storing an approved plan); refuses a second installation.
+
+        Called with ``_lock`` held, so two requests at the same time never both start one.
+        """
+        if approve is None:
+            env = self.get(scope)
+            assert env is not None
+            if env.install.status == "installing":
+                raise NodestroError("deps.installing", "An installation is already running for this environment")
+            env.install = InstallState(status="installing", step="deps.step.queued", started_at=now())
+            self._put(env)
+            return env
+        plan, needed = approve
         env = self.get(plan.scope) or PythonEnvironment(scope=plan.scope, kind=plan.kind, ref=plan.ref)
         if env.install.status == "installing":
             raise NodestroError("deps.installing", "An installation is already running for this environment")
@@ -820,15 +889,6 @@ class PythonEnvironments:
         env.history.append(EnvChange(kind="approved", details=details or ["confirmed"]))
         env.install = InstallState(status="installing", step="deps.step.queued", started_at=now())
         self._put(env)
-        if wait:
-            self._install(env.scope, needed.all_modules(), log)
-            return self.get(env.scope) or env
-        threading.Thread(
-            target=self._install,
-            args=(env.scope, needed.all_modules(), log),
-            name=f"python-env-{env.scope}",
-            daemon=True,
-        ).start()
         return env
 
     # ---- installation ----------------------------------------------------------------
@@ -846,10 +906,8 @@ class PythonEnvironments:
                 f"Approval needed first: {', '.join(missing) or 'Python version changed'}",
                 packages=", ".join(missing),
             )
-        if env.install.status == "installing":
-            raise NodestroError("deps.installing", "An installation is already running for this environment")
-        env.install = InstallState(status="installing", step="deps.step.queued", started_at=now())
-        self._put(env)
+        with self._lock:
+            env = self._begin_install(scope)
         if wait:
             self._install(scope, modules, None)
             return self.get(scope) or env
@@ -876,6 +934,7 @@ class PythonEnvironments:
 
             target = self.env_dir(scope)
             staging = target.with_name(target.name + ".staging")
+            _restore_swap(target)
             try:
                 shutil.rmtree(staging, ignore_errors=True)
                 staging.parent.mkdir(parents=True, exist_ok=True)
@@ -925,6 +984,38 @@ class PythonEnvironments:
             latest.install = state
             latest.history.append(EnvChange(kind=kind, details=details))
             self._put(latest)
+
+    def recover(self) -> int:
+        """After a restart: finish what an interrupted installation left behind.
+
+        An environment that was being replaced when Nodestro stopped is put back (the last
+        working one), leftover staging directories are removed, and an installation that was
+        still marked as running is marked as failed, so it can be started again. Returns the
+        number of installations marked as interrupted.
+        """
+        envs_root = self.root / "envs"
+        if envs_root.is_dir():
+            for directory in sorted(envs_root.iterdir()):
+                if directory.name.endswith(".old"):
+                    _restore_swap(directory.with_name(directory.name.removesuffix(".old")))
+                elif directory.name.endswith(".staging"):
+                    shutil.rmtree(directory, ignore_errors=True)
+        count = 0
+        for env in self.all():
+            if env.install.status != "installing":
+                continue
+            with self._lock:
+                lock = self._scope_lock(env.scope)
+            if lock.locked():
+                continue  # an installation of this process is running
+            env.install.status = "failed"
+            env.install.finished_at = now()
+            env.install.error = problem("deps.install_interrupted", "Nodestro stopped during the installation")
+            env.install.lock_sha = _sha(env.lock)
+            env.history.append(EnvChange(kind="install_failed", details=["interrupted"]))
+            self._put(env)
+            count += 1
+        return count
 
     def _update_install(self, scope: str, state: InstallState) -> None:
         env = self.get(scope)
@@ -1070,6 +1161,20 @@ class PythonEnvironments:
             except UvError:
                 logger.warning("Pruning the uv cache failed", exc_info=True)
         return removed
+
+
+def _restore_swap(target: Path) -> None:
+    """Put back the previous environment when a replacement was interrupted between its two renames."""
+    old = target.with_name(target.name + ".old")
+    if old.is_dir() and not target.exists():
+        try:
+            old.replace(target)
+        except OSError:
+            logger.warning("Restoring the environment %s failed", target, exc_info=True)
+            return
+        logger.info("Restored the environment %s after an interrupted installation", target)
+    elif old.is_dir():
+        shutil.rmtree(old, ignore_errors=True)
 
 
 class _InstallProblem(Exception):

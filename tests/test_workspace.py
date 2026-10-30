@@ -159,11 +159,15 @@ async def test_an_approval_waits_for_a_person(make: Make) -> None:
     )
     paused = await run(workspace, flow)
     assert paused.status == "paused" and paused.nodes["check"].status == "awaiting_approval"
-    # The paused run keeps its event history: the events continue numbering when it resumes.
-    assert workspace.runs._events[paused.id]
+    # A paused run keeps only its event counter: the events continue numbering when it resumes.
+    assert paused.id not in workspace.runs._events
+    before = workspace.runs._seq[paused.id]
     workspace.decide(paused.id, "check", "approved", "ok")
+    history, queue = workspace.runs.subscribe(paused.id)
+    assert all(event.seq > before for event in history)
     done = await workspace.wait(paused.id, timeout=20)
     assert done.status == "succeeded" and done.output == "Final"
+    workspace.runs.unsubscribe(paused.id, queue)
 
 
 async def test_finished_runs_release_their_event_history(make: Make) -> None:
