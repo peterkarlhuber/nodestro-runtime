@@ -35,7 +35,7 @@ Requires Python 3.10 or newer (CI tests 3.10 and 3.13).
 pip install "nodestro-runtime @ git+https://github.com/peterkarlhuber/nodestro-runtime.git@<commit>"
 ```
 
-Orkexa is installed with it, pinned to commit `cbf6df3d6f727b96924f1ae66e60b469eeef58e6` (Orkexa has no
+Orkexa is installed with it, pinned to commit `76883f700e68f10240f744a4af3ed37f5ec54674` (Orkexa has no
 tags). Both repositories are private, so pip needs read access, for example through
 `git config url."https://<token>@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"`.
 The tested combination of all Nodestro components is recorded in `nodestro-studio/platform/versions.json`.

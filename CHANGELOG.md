@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Orkexa pricing engine (PRICING-1, phase N0):
+
+- Orkexa pinned to `76883f700e68f10240f744a4af3ed37f5ec54674` (orkexa PR #13: versioned price snapshots, price
+  resolver, itemized cost breakdowns, price policies for budgets). It also removes Orkexa's claude-agent
+  compatibility layer, which Nodestro never used.
+- Nodestro still uses only `resolve_pricing` and `MODEL_PRICING`, which keep their behavior. Prices change where
+  Orkexa corrected them: Claude Sonnet 5.5 cache reads cost $0.10 per million tokens (was $0.20), and Anthropic
+  fast mode and US data residency are now priced. OpenAI and compatible responses with a non-standard
+  `service_tier`, and requests with unpriced fees (for example hosted web search), now have an unknown cost
+  instead of a standard-rate one.
+
 Built-in sandbox prototype (M6 PR-13, ADR-0006 point 7):
 
 - `nodestro_runtime.builtin_sandbox.BubblewrapSandbox`: a Linux x86-64 candidate built on bubblewrap. Each call gets
