@@ -53,6 +53,7 @@ from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
 from .memory_spaces import MemorySpaces, MemoryTables
+from .pricing import PricingService
 from .problems import NodestroError
 from .profile import RuntimeProfile
 from .providers import (
@@ -183,6 +184,9 @@ class WorkspaceStorage:
     #: The model endpoints (origins) the operator allows for the endpoint providers (``compatible``, ``ollama``,
     #: ``vllm``); any other base URL is refused, so a tenant cannot make the server reach internal services.
     endpoints: tuple[str, ...] = ()
+    #: The server's reference prices (shared by every tenant, written only by the server's price sync). ``None``:
+    #: the tenant sees Orkexa's built-in prices until the server provides them. Tenants never write to it.
+    price_reference: DocumentStore | None = None
 
 
 class Workspace:
@@ -300,6 +304,14 @@ class Workspace:
             self.builder, connect=self.connection, default_budget=lambda: self.settings().default_budget_usd
         )
         self.usage_log = UsageLog(self.store)
+        # The price catalog: on a desktop reference prices and overrides live in this database; a server tenant
+        # reads the server's reference prices and keeps only its own overrides (PRICING-1, see pricing.py).
+        self.pricing = PricingService(
+            self.store,
+            reference_store=None if storage is None else storage.price_reference,
+            reference_writable=storage is None,
+            known_providers=PROVIDERS,
+        )
         self.versions = WorkflowVersions(self.store)
         self.tool_drafts = ToolDrafts(self.store, self.tools)
         self.tools.untrusted_sources = lambda: [draft.code for draft in self.tool_drafts.pending()]
