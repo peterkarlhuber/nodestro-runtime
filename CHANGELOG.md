@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Adaptive Orchestration M2 (time and parallel limits):
+
+- New `Workflow.limits` (`WorkflowLimits`): `max_parallel` (1 to 32 nodes of a run executing at the same time;
+  further ready nodes wait for a free slot) and `max_duration_s` (the longest active execution time of a run, at
+  most 7 days). Both default to `None` (no limit, as before) and are enforced by the `orkexa.flow` kernel.
+- The kernel's clock is the run's active time, stored as `Run.active_seconds`: waiting for an approval does not
+  count. When the time limit is reached, the kernel stops the flow, running nodes are cancelled and the run fails
+  with `run.time_limit` (`max_duration_s`). Known limitation: a model request or tool call that is already running
+  finishes first (agents and tools stop at their next cancellation check), so the run can end later than the limit
+  by the length of that call.
+
 Adaptive Orchestration M2 (budget reservations, AO-12):
 
 - **Behavior change: requests reserve their most expensive outcome before they are sent** (Orkexa

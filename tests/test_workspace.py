@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 from orkexa import Agent
@@ -323,3 +324,71 @@ def test_the_runtime_needs_no_http_server_or_interface() -> None:
         "assert not bad, bad\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+async def test_a_parallel_limit_lets_branches_wait_for_a_free_slot(make: Make) -> None:
+    running, most = 0, 0
+    lock = threading.Lock()
+
+    def slow(answer: str) -> Callable[[dict[str, Any]], Any]:
+        def respond(request: dict[str, Any]) -> Any:
+            nonlocal running, most
+            with lock:
+                running += 1
+                most = max(most, running)
+            time.sleep(0.2)
+            with lock:
+                running -= 1
+            return text(answer)
+
+        return respond
+
+    workspace = make({"LEFT": [slow("l")], "RIGHT": [slow("r")], "MERGE": [text("m")]})
+    flow = workflow(
+        [{"id": "start", "type": "start"}, agent("left", "LEFT"), agent("right", "RIGHT"), agent("merge", "MERGE")],
+        [edge("start", "left"), edge("start", "right"), edge("left", "merge"), edge("right", "merge")],
+        limits={"max_parallel": 1},
+    )
+    done = await run(workspace, flow)
+    assert done.status == "succeeded", done.error
+    assert most == 1
+
+
+async def test_a_time_limit_stops_a_run_and_cancels_its_running_nodes(make: Make) -> None:
+    def slow(request: dict[str, Any]) -> Any:
+        time.sleep(1.0)
+        return text("late")
+
+    workspace = make({"SLOW": [slow], "NEXT": [text("never")]})
+    flow = workflow(
+        [{"id": "start", "type": "start"}, agent("slow", "SLOW"), agent("next", "NEXT")],
+        [edge("start", "slow"), edge("slow", "next")],
+        limits={"max_duration_s": 0.3},
+    )
+    done = await run(workspace, flow)
+    assert done.status == "failed"
+    assert done.error_code == "run.time_limit"
+    assert done.error_params == {"max_duration_s": 0.3}
+    assert done.nodes["next"].status != "succeeded"
+    assert 0.3 <= done.active_seconds < 5
+
+
+async def test_waiting_for_an_approval_does_not_count_against_the_time_limit(make: Make) -> None:
+    workspace = make({"DRAFT": [text("Entwurf")], "SEND": [text("Gesendet")]})
+    flow = workflow(
+        [
+            {"id": "start", "type": "start"},
+            agent("draft", "DRAFT"),
+            {"id": "check", "type": "approval", "label": "Prüfen", "approval": {"instructions": "ok?"}},
+            agent("send", "SEND"),
+        ],
+        [edge("start", "draft"), edge("draft", "check"), edge("check", "send", "approved")],
+        limits={"max_duration_s": 0.5},
+    )
+    paused = await run(workspace, flow)
+    assert paused.status == "paused", paused.error
+    await asyncio.sleep(0.7)  # longer than the limit, but nobody is working
+    workspace.decide(paused.id, "check", "approved")
+    done = await workspace.wait(paused.id, timeout=20)
+    assert done.status == "succeeded", done.error
+    assert done.active_seconds < 0.5
