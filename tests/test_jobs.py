@@ -450,3 +450,76 @@ def test_every_schedule_slot_fires_once(connect: Callable[[], PostgresDatabase])
     assert ScheduleFirings(connect(), "beta").claim("daily", slot)  # each tenant has its own schedules
     with pytest.raises(ValueError):
         firings.claim("daily", datetime(2026, 10, 31, 9, 0))
+
+
+# ---- API processes follow runs that workers execute ------------------------------------------
+
+
+async def test_an_api_process_streams_and_waits_for_a_workers_run(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
+) -> None:
+    release, started_call = threading.Event(), threading.Event()
+    api_db, worker_db = connect(), connect()
+    api = processes(api_db)
+    worker = processes(worker_db, {"WRITE": [blocking(release, started_call)]})
+    queue = JobQueue(api_db)
+    started = await api_start(api, queue, "alpha", simple_flow())
+    runs = api("alpha").runs
+    runs.remote_poll = 0.02
+    assert runs.is_live(started.id)  # queued in the database, not in this process
+    history, stream = runs.subscribe(started.id)
+    assert history == []
+    waiting = asyncio.ensure_future(runs.wait(started.id))
+    executing = asyncio.ensure_future(RunWorker(JobQueue(worker_db), worker, name="w1", flush=0.02).run_once())
+    try:
+        await asyncio.to_thread(started_call.wait, 10)
+        await asyncio.sleep(0.1)
+        assert not waiting.done()
+    finally:
+        release.set()
+    received: list[RunEvent] = []
+    while (event := await asyncio.wait_for(stream.get(), 10)) is not None:
+        received.append(event)
+    runs.unsubscribe(started.id, stream)
+    await asyncio.wait_for(executing, 10)
+    done = await asyncio.wait_for(waiting, 10)
+    assert done is not None and done.status == "succeeded"
+    assert received[0].type == "run_started" and received[-1].type == "run_finished"
+    assert [event.seq for event in received] == list(range(1, len(received) + 1))
+    assert not runs.is_live(started.id)
+
+
+async def test_a_stream_of_a_withdrawn_run_ends(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
+) -> None:
+    api_db = connect()
+    api = processes(api_db)
+    started = await api_start(api, JobQueue(api_db), "alpha", simple_flow())
+    runs = api("alpha").runs
+    runs.remote_poll = 0.02
+    _history, stream = runs.subscribe(started.id)
+    assert runs.cancel(started.id)
+    assert await asyncio.wait_for(stream.get(), 10) is None
+    runs.unsubscribe(started.id, stream)
+    assert runs._followers == {}
+
+
+async def test_a_decided_run_is_queued_again_and_waited_for(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
+) -> None:
+    api_db, worker_db = connect(), connect()
+    api = processes(api_db)
+    worker = processes(worker_db, {"DRAFT": [text("draft")], "SEND": [text("sent")]})
+    runner = RunWorker(JobQueue(worker_db), worker, name="w1")
+    started = await api_start(api, JobQueue(api_db), "alpha", approval_flow())
+    runs = api("alpha").runs
+    runs.remote_poll = 0.02
+    await runner.run_once()
+    decided = api("alpha").decide(started.id, "check", "approved")
+    assert decided.status == "queued" and runs.is_live(started.id)
+    waiting = asyncio.ensure_future(runs.wait(started.id))
+    await asyncio.sleep(0.1)
+    assert not waiting.done()
+    await runner.run_once()
+    done = await asyncio.wait_for(waiting, 10)
+    assert done is not None and done.status == "succeeded"

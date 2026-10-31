@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Following worker runs from API processes (M5 PR-10, ADR-0004). Nothing changes for the desktop:
+
+- `RunManager.remote_events` (set by `jobs.QueuedRuns.attach`): `subscribe` and `is_live` follow a run that a
+  worker executes through `nodestro_run_events`, and `wait` waits for its stored state. A stream ends with the run's
+  `run_finished` or `run_paused` event, or when the run stops being queued or running (withdrawn, interrupted).
+- In queue execution, a paused run whose decision was recorded is stored as `queued` again until a worker takes it.
+
 Jobs and workers (M5 PR-10, ADR-0004). Nothing changes for the desktop:
 
 - Migration `0004`: `nodestro_jobs` (at most one queued or running job per piece of work), `nodestro_run_events`

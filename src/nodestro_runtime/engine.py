@@ -612,6 +612,13 @@ class RunManager:
         self.remote_cancel: Callable[[Run], bool] | None = None
         #: Receives every event of the runs executing in this process (the server's event table).
         self.event_sink: Callable[[RunEvent], None] | None = None
+        #: Reads the stored events of a run executing in another process: ``(run_id, after_seq)`` -> the next
+        #: events in order (the server's event table). With it, :meth:`subscribe` and :meth:`is_live` follow such
+        #: runs, and :meth:`wait` waits for them.
+        self.remote_events: Callable[[str, int], list[RunEvent]] | None = None
+        #: How often a run of another process is looked at (seconds).
+        self.remote_poll = 0.25
+        self._followers: dict[int, asyncio.Task[None]] = {}
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
         #: The ``seq`` of the last event of each live or paused run.
@@ -743,7 +750,9 @@ class RunManager:
 
     def _launch(self, run: Run, *, local: bool = False) -> Run:
         if self.dispatch is not None and not local:
-            # Queue execution: the run is stored and a worker executes it (ADR-0004).
+            # Queue execution: the run is stored and a worker executes it (ADR-0004). A paused run whose decision
+            # was recorded is queued again, so everybody waiting for it sees that it goes on.
+            run.status = "queued"
             self.store.put("runs", run.id, run)
             self.dispatch(run)
             return run
@@ -947,7 +956,14 @@ class RunManager:
 
     def is_live(self, run_id: str) -> bool:
         context = self._contexts.get(run_id)
-        return context is not None and context.run.status in ("queued", "running")
+        if context is not None:
+            return context.run.status in ("queued", "running")
+        return self.remote_events is not None and self._remote_active(run_id)
+
+    def _remote_active(self, run_id: str) -> bool:
+        """A run of another process (a worker) that is queued or executing."""
+        stored = self.store.get("runs", run_id, Run) if not self.store.closed else None
+        return stored is not None and stored.status in ("queued", "running")
 
     def has_live_runs(self) -> bool:
         return any(self.is_live(run_id) for run_id in list(self._contexts))
@@ -961,18 +977,62 @@ class RunManager:
     def subscribe(self, run_id: str) -> tuple[list[RunEvent], asyncio.Queue[RunEvent | None]]:
         """Past events of a live run plus a queue for the next ones (``None`` ends the stream)."""
         queue: asyncio.Queue[RunEvent | None] = asyncio.Queue()
+        if run_id not in self._contexts and self.remote_events is not None and self._remote_active(run_id):
+            # The run executes in a worker: its events come from the event table (from the first one on).
+            self._followers[id(queue)] = asyncio.get_running_loop().create_task(
+                self._follow(run_id, queue), name=f"follow-{run_id}"
+            )
+            return [], queue
         self._subscribers.setdefault(run_id, []).append(queue)
         return list(self._events.get(run_id, [])), queue
 
     def unsubscribe(self, run_id: str, queue: asyncio.Queue[RunEvent | None]) -> None:
+        follower = self._followers.pop(id(queue), None)
+        if follower is not None:
+            follower.cancel()
         with suppress(ValueError, KeyError):
             self._subscribers[run_id].remove(queue)
 
+    async def _follow(self, run_id: str, queue: asyncio.Queue[RunEvent | None]) -> None:
+        """Feed ``queue`` with the stored events of a run of another process until it ends or pauses."""
+        read = self.remote_events
+        assert read is not None
+        last = 0
+        try:
+            while True:
+                events = await asyncio.to_thread(read, run_id, last)
+                for event in events:
+                    last = event.seq
+                    queue.put_nowait(event)
+                    if event.type in ("run_finished", "run_paused"):
+                        queue.put_nowait(None)
+                        return
+                if not events and not await asyncio.to_thread(self._remote_active, run_id):
+                    # Ended without a final event (e.g. withdrawn from the queue or interrupted): read once more.
+                    for event in await asyncio.to_thread(read, run_id, last):
+                        queue.put_nowait(event)
+                    queue.put_nowait(None)
+                    return
+                if queue.qsize() >= _MAX_SUBSCRIBER_BACKLOG:
+                    queue.put_nowait(None)
+                    return
+                await asyncio.sleep(self.remote_poll)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Following the events of run %s failed", run_id)
+            queue.put_nowait(None)
+
     async def wait(self, run_id: str) -> Run | None:
-        """Wait until a run has finished or paused (used by tests, test series and batches)."""
+        """Wait until a run has finished or paused (used by tests, test series and batches).
+
+        A run that a worker executes (queue execution) is waited for by looking at its stored state."""
         task = self._tasks.get(run_id)
         if task is not None:
             await asyncio.shield(task)
+        elif self.dispatch is not None:
+            while await asyncio.to_thread(self._remote_active, run_id):
+                await asyncio.sleep(self.remote_poll)
         return self.get(run_id)
 
     async def shutdown(self, *, timeout: float = _SHUTDOWN_GRACE_SECONDS) -> None:
