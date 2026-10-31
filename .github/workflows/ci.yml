@@ -56,6 +56,35 @@ jobs:
       - run: mypy
       - run: pytest
 
+  docker:
+    # Tools with libraries in the Docker sandbox (ADR-0006 point 6): a real image is built from a hashed lock file and
+    # a tool runs in it without network. A missing Docker fails this job instead of skipping the tests.
+    runs-on: ubuntu-latest
+    env:
+      NODESTRO_DOCKER_TESTS: "1"
+      NODESTRO_REQUIRE_DOCKER: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
+      - name: Grant read access to the private repositories
+        env:
+          NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
+        run: |
+          if [ -z "$NODESTRO_READ" ]; then
+            echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
+      - run: pip install -e ".[dev]"
+      - run: docker info
+      - run: pytest tests/test_container_images.py
+
   package:
     # The wheel installs on its own and contains what the package needs at run time.
     runs-on: ubuntu-latest

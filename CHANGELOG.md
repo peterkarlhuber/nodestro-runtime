@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Libraries in the Docker sandbox (M6 PR-11, ADR-0006 point 6):
+
+- New `container_images.ContainerImages`: an approved lock file becomes the image `nodestro-env:<key>` (key: SHA-256
+  of lock, Python version and base image). Two-stage build: `pip download --require-hashes --only-binary=:all:
+  --no-deps`, then an offline `pip install --no-index --require-hashes`; the image runs as `nobody` and carries the
+  label `org.nodestro.lock-sha256`. Proxy and certificate settings reach the download stage only; the docker CLI
+  gets no provider keys. Build failures are explained as `deps.wheels_required`, `deps.hash_mismatch`,
+  `sandbox.unavailable` or `deps.image_failed`.
+- `PythonEnvironments` with the Docker sandbox: the installation builds the image and verifies the needed modules in
+  it (`deps.module_missing` removes the image); `sandbox()` returns a container sandbox for the image
+  (`LocalImageSandbox`, `docker run --pull never`) and never a host process. `deps.docker_unsupported` is gone:
+  untrusted tools may use libraries in the Docker sandbox. `isolation()` is `container` there.
+- Locks are compiled with `--generate-hashes`; `parse_lock` reads multi-line entries. An environment approved
+  without hashes needs a new approval in the Docker sandbox (reason `hashes`, error `deps.lock_without_hashes`).
+- Removing an environment also removes its image.
+- CI job `docker`: builds a real image and runs a tool in it without network.
+
 Following worker runs from API processes (M5 PR-10, ADR-0004). Nothing changes for the desktop:
 
 - `RunManager.remote_events` (set by `jobs.QueuedRuns.attach`): `subscribe` and `is_live` follow a run that a

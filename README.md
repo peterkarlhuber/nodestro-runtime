@@ -168,9 +168,25 @@ executed. There is no setting, environment variable or confirmation that lifts t
 tool generation does not start, tool drafts cannot be tested or approved, and agents that use untrusted tools fail
 the workflow check before a run starts. Provenance is stored per tool (`tool_provenance`); editing an untrusted tool,
 re-creating it under the same name or copying its code into a new tool keeps it untrusted, tools stored before this
-release are untrusted, and a restored backup makes every restored tool untrusted. Untrusted tools cannot use
-third-party libraries yet (`sandbox.libraries_need_isolation`), because the library environments run as host
-processes; containers with libraries are planned. In the server profile, only containers run tool code.
+release are untrusted, and a restored backup makes every restored tool untrusted. In the process sandbox, untrusted
+tools cannot use third-party libraries (`sandbox.libraries_need_isolation`), because the library environments run as
+host processes. In the Docker sandbox they can: there an approved environment is a container image (see below). In
+the server profile, only containers run tool code.
+
+**Libraries in the Docker sandbox (ADR-0006 point 6).** With the Docker sandbox, `nodestro_runtime.container_images`
+turns an approved lock file into an image `nodestro-env:<key>`, where the key is the SHA-256 of the lock, the Python
+version and the base image (`python:<version>-slim`). Locks are compiled with `--generate-hashes`. The build
+downloads exactly the locked wheels with `pip download --require-hashes --only-binary=:all:` (no source builds, so
+no package code runs; a package without a Linux wheel fails with `deps.wheels_required`), then installs them
+offline with `--no-index --require-hashes` into a final image that runs as `nobody` and keeps no download cache,
+certificate or proxy setting. Installing an environment means building its image and checking in it, without
+network, that every needed module can be found; no host virtual environment is created. Tool calls run in the
+image with Orkexa's container flags (no network, read-only file system, no capabilities, resource limits) and
+`docker run --pull never`, so a missing image is never looked for in a registry. If Docker or the image is missing,
+the call fails; there is never a fallback to a host process. An environment approved before this release has no
+hashes and must be approved again (reason `hashes`). The download stage gets `HTTP(S)_PROXY`/`NO_PROXY` as build
+arguments and the certificate authority in `NODESTRO_BUILD_CA_FILE` (or `SSL_CERT_FILE`);
+`NODESTRO_DOCKER_BUILD_NETWORK` chooses the build network. The docker CLI gets no provider keys.
 
 **Storage.** Every component stores its documents through the `DocumentStore` protocol
 (`nodestro_runtime.storage`); `SQLiteStore` (still importable as `Store`) implements it on the table
@@ -226,6 +242,10 @@ ruff check . && ruff format --check . && mypy && pytest
 The tests never call a paid provider, need no API key and no network. `tests/test_architecture.py` checks that the runtime
 imports neither the API nor the studio and uses nothing of claude-agent; `tests/test_readme.py` runs the
 quickstart above.
+
+`tests/test_container_images.py` builds a real image and runs a tool in it when `NODESTRO_DOCKER_TESTS=1` (needs
+Docker and network); `NODESTRO_REQUIRE_DOCKER=1` makes a missing Docker fail instead of skip, as in the CI job
+`docker`.
 
 CI needs the repository secret `NODESTRO_READ` (read access to Orkexa and the Nodestro repositories).
 
