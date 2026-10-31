@@ -98,7 +98,14 @@ from .schemas import (
 )
 from .server_settings import SecretBox, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
-from .tool_approvals import ToolApprovals, ToolGate, ToolPreGrants, approvals_enabled
+from .tool_approvals import (
+    ToolApprovalEvent,
+    ToolApprovals,
+    ToolGate,
+    ToolPreGrants,
+    approvals_enabled,
+    record_audit,
+)
 from .tool_drafts import ToolDrafts
 from .tool_legacy import LegacyReport, keep_only_inherited, stamp_workflow
 from .tool_library import ToolLibrary, make_sandbox
@@ -634,7 +641,12 @@ class Workspace:
             self.versions.record(saved, previous=previous)
         return saved
 
-    def stamp_legacy_tool_bindings(self) -> LegacyReport:
+    def legacy_tool_bindings(self) -> LegacyReport | None:
+        """What the activation step stamped (``None``: approvals were never activated in this workspace)."""
+        raw = self.store.get_raw("tool_approvals_activation", "legacy")
+        return None if raw is None else LegacyReport.model_validate(raw)
+
+    def stamp_legacy_tool_bindings(self, *, by: str = "system") -> LegacyReport:
         """The activation step of per-call tool approvals (S-2, D10b): every existing tool binding of every stored
         workflow and workflow version becomes a visible legacy exemption, bound to the tool's current version.
 
@@ -666,6 +678,18 @@ class Workspace:
                         for item in found
                     )
             self.store.put_raw("tool_approvals_activation", "legacy", report.model_dump(mode="json"))
+            record_audit(
+                self.store,
+                ToolApprovalEvent(
+                    kind="legacy_stamped",
+                    actor=by,
+                    details={
+                        "bindings": len(report.bindings),
+                        "workflows": report.workflows,
+                        "versions": report.versions,
+                    },
+                ),
+            )
         return report
 
     def resolve_workflow(self, workflow_id: str, version: int | None) -> tuple[Workflow, int | None]:

@@ -175,6 +175,7 @@ class ToolPreGrant(BaseModel):
     granted_at: datetime
     expires_at: datetime | None = None
     revoked_at: datetime | None = None
+    revoked_by: str | None = None
 
 
 class CallContext(BaseModel):

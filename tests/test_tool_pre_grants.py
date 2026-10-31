@@ -72,10 +72,10 @@ def test_a_pre_grant_is_stored_per_scope_and_revocable(workspace: Workspace) -> 
     assert grant.granted_by == "usr_1" and grant.version == info.version
     assert grants.of_scope("benchmark", "suite_1") == [grant]
     assert grants.of_scope("benchmark", "suite_2") == []
-    revoked = grants.revoke("benchmark", "suite_1", grant.id)
+    revoked = grants.revoke("benchmark", "suite_1", grant.id, by="usr_1")
     assert revoked.revoked_at is not None
     with pytest.raises(NodestroError):
-        grants.revoke("benchmark", "suite_1", "tpg_missing")
+        grants.revoke("benchmark", "suite_1", "tpg_missing", by="usr_1")
 
 
 async def test_an_unattended_run_uses_a_matching_pre_grant_until_it_is_revoked(workspace: Workspace) -> None:
@@ -113,6 +113,6 @@ async def test_an_unattended_run_uses_a_matching_pre_grant_until_it_is_revoked(w
     assert allowed.status == "allowed" and allowed.pre_grant_id == grant.id  # type: ignore[attr-defined]
     other = await approval("sch_2")  # another schedule: no grant
     assert other.status == "denied" and other.code == "tool.approval_unattended"  # type: ignore[attr-defined]
-    grants.revoke("schedule", "sch_1", grant.id)
+    grants.revoke("schedule", "sch_1", grant.id, by="usr_1")
     revoked = await approval("sch_1")
     assert revoked.status == "denied" and revoked.code == "tool.approval_unattended"  # type: ignore[attr-defined]
