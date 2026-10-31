@@ -33,6 +33,7 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import logging
 from pathlib import Path
@@ -47,6 +48,7 @@ from .agent_test import AgentTester
 from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
 from .container_images import ContainerImages, RuntimeImageSandbox
+from .cost_tracking import PricedTracker, PriceMode
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
@@ -312,6 +314,9 @@ class Workspace:
             reference_writable=storage is None,
             known_providers=PROVIDERS,
         )
+        for priced in (self.runs, self.tester):
+            priced.pricing = self.pricing
+            priced.price_mode = self.price_mode
         self.versions = WorkflowVersions(self.store)
         self.tool_drafts = ToolDrafts(self.store, self.tools)
         self.tools.untrusted_sources = lambda: [draft.code for draft in self.tool_drafts.pending()]
@@ -491,6 +496,17 @@ class Workspace:
             else 2,
             ocr_enabled=bool(values.get("ocr_enabled")),
             ocr_available=self.knowledge.ocr_available(),
+            price_mode="strict" if values.get("price_mode") == "strict" else "standard",
+        )
+
+    def price_mode(self) -> PriceMode:
+        """``standard`` (unknown and stale prices only warn) or ``strict`` (see :mod:`.cost_tracking`)."""
+        return self.settings().price_mode
+
+    def tracker(self, budget: float | None = None) -> PricedTracker:
+        """A usage tracker for one AI operation of this workspace, priced with its catalog and price mode."""
+        return PricedTracker(
+            Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode()
         )
 
     def _docker_available(self) -> bool:

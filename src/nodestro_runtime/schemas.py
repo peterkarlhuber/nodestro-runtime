@@ -394,7 +394,26 @@ class Usage(_Model):
     thinking_tokens: int = 0
     web_search_requests: int = 0
     total_tokens: int = 0
+    #: The complete cost; ``None`` when part of it is unknown (see ``known_cost_usd``), never 0 for "unknown".
     estimated_cost_usd: float | None = 0.0
+    # Price references (PRICING-1). Usage stored before they existed has the defaults: ``cost_complete`` is then
+    # ``None`` ("not recorded"), and the cost is read from ``estimated_cost_usd`` alone.
+    #: The part of the cost that is known: a lower bound when ``cost_complete`` is ``False``.
+    known_cost_usd: float | None = None
+    #: Whether every request was fully priced; ``None`` for usage recorded before price references existed.
+    cost_complete: bool | None = None
+    #: Requests whose cost is unknown or incomplete.
+    unpriced_requests: int = 0
+    #: Requests priced with a price that was stale (not checked for ``warn_after``) at the time.
+    stale_price_requests: int = 0
+    #: Cost components that could not be priced (``input:openai:gpt-x``, ``fee:web_search_call``, ...).
+    missing_cost_components: list[str] = Field(default_factory=list)
+    #: The price snapshot versions the requests were priced with.
+    pricing_versions: list[str] = Field(default_factory=list)
+    #: The sources of the prices used (``builtin``, ``litellm``, an override's source).
+    pricing_sources: list[str] = Field(default_factory=list)
+    #: The lowest quality among the prices used (``verified``, ``contract``, ``unverified``, ``estimated``).
+    pricing_quality: str | None = None
 
 
 class ToolCallRecord(_Model):
@@ -622,6 +641,8 @@ class SettingsIn(_Model):
     architect_max_repairs: int | None = Field(default=None, ge=0, le=5)
     #: Recognise scanned PDFs with local OCR when they are uploaded.
     ocr_enabled: bool | None = None
+    #: ``standard`` or ``strict``: whether requests without a known (or with a long unchecked) price are refused.
+    price_mode: Literal["standard", "strict"] | None = None
 
 
 class Settings(_Model):
@@ -640,3 +661,5 @@ class Settings(_Model):
     ocr_enabled: bool = False
     #: Whether tesseract and pdftoppm are installed.
     ocr_available: bool = False
+    #: How unknown and stale prices are treated (PRICING-1): ``standard`` warns, ``strict`` refuses.
+    price_mode: Literal["standard", "strict"] = "standard"

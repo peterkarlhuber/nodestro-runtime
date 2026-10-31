@@ -11,9 +11,11 @@ Each finding names the node or connection it belongs to, so the editor can mark 
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
-from orkexa.pricing import resolve_pricing
+from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
 from pydantic import BaseModel
 
 from . import graph
@@ -60,7 +62,9 @@ def _connection_issues(workflow: Workflow) -> list[CheckIssue]:
     return found
 
 
-def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
+def _node_issues(
+    workflow: Workflow, known_files: set[str], priced: Callable[[str], bool] | None = None
+) -> list[CheckIssue]:
     found: list[CheckIssue] = []
     nodes = {node.id: node for node in workflow.nodes}
     labels = {node.id: node_label(node) for node in workflow.nodes}
@@ -269,7 +273,7 @@ def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
         if config.quality.enabled:
             models.add(config.quality.judge_model)
         for model in sorted(models):
-            if not _priced(model):
+            if not (priced or _priced)(model):
                 found.append(
                     _issue(
                         "check.model_unpriced",
@@ -285,10 +289,10 @@ def _node_issues(workflow: Workflow, known_files: set[str]) -> list[CheckIssue]:
 PROVIDER_CHECKS = ("check.api_key_missing", "check.provider_not_configured")
 
 
-def _priced(model: str) -> bool:
-    """Whether Orkexa knows prices for a model (only Anthropic's are built in)."""
+def _priced(model: str, snapshot: PriceSnapshot = BUILTIN_SNAPSHOT) -> bool:
+    """Whether ``snapshot`` (default: Orkexa's built-in prices) has a price for a model."""
     try:
-        return resolve_pricing(model_id(model), provider=provider_of(model)) is not None
+        return snapshot.lookup(provider_of(model), model_id(model)).found
     except NodestroError:
         return True  # an invalid name is reported by the agent's own check
 
@@ -609,7 +613,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
     problems: list[CheckIssue] = [
         *check_workflow(workflow),
         *_connection_issues(workflow),
-        *_node_issues(workflow, known_files),
+        *_node_issues(workflow, known_files, partial(_priced, snapshot=nodestro.pricing.effective_snapshot())),
         *_flow_issues(workflow),
         *_subworkflow_issues(nodestro, workflow),
     ]
