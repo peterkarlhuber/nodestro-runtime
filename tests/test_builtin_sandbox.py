@@ -78,8 +78,11 @@ def host_secret() -> Iterator[Path]:
 def test_files_outside_the_call_cannot_be_read(sandbox: BubblewrapSandbox, host_secret: Path) -> None:
     result = run(sandbox, "return 'READ: ' + open(target).read()", str(host_secret))
     assert result.startswith("BLOCKED: FileNotFoundError"), result
-    home = run(sandbox, "import os\nreturn 'LISTED: ' + str(os.listdir(os.path.expanduser(target)))", str(Path.home()))
+    listing = "import os\nreturn 'LISTED: ' + str(os.listdir(target))"
+    home = run(sandbox, listing, str(host_secret.parent))
     assert home.startswith("BLOCKED"), home
+    if not str(Path.home()).startswith("/tmp"):  # inside, /tmp is the sandbox's own scratch directory
+        assert run(sandbox, listing, str(Path.home())).startswith("BLOCKED")
 
 
 @needs_bwrap
@@ -158,12 +161,18 @@ def test_no_other_programs_and_no_child_processes(sandbox: BubblewrapSandbox) ->
 
 
 @needs_bwrap
-def test_threads_still_work(sandbox: BubblewrapSandbox) -> None:
+def test_new_threads_are_limited_as_in_the_container_sandbox(sandbox: BubblewrapSandbox) -> None:
+    """Orkexa's runner sets ``RLIMIT_NPROC`` to 0, which also stops new threads for an ordinary user (in the Docker
+    sandbox as well). Root is exempt from that limit; the seccomp filter still lets threads through then."""
     body = (
         "import threading\nout = []\nt = threading.Thread(target=lambda: out.append(target))\nt.start()\nt.join()\n"
         "return 'THREAD: ' + out[0]"
     )
-    assert run(sandbox, body, "ok") == "THREAD: ok"
+    result = run(sandbox, body, "ok")
+    if os.geteuid() == 0:
+        assert result == "THREAD: ok", result
+    else:
+        assert result == "BLOCKED: RuntimeError: can't start new thread", result
 
 
 @needs_bwrap
