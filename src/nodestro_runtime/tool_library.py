@@ -45,15 +45,16 @@ from orkexa.dynamic import (
 )
 from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .mcp_access import is_mcp_tool
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
-from .sandbox_policy import SandboxPolicy, TrustClass
+from .sandbox_policy import Isolation, SandboxPolicy, TrustClass, isolation_of
 from .schemas import new_id, now
+from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
 
 if TYPE_CHECKING:
@@ -132,8 +133,17 @@ class ToolInfo(BaseModel):
     server_name: str | None = None
     mcp_name: str | None = None
     definition_hash: str | None = None
-    #: The capability statement (shared model S-1): ``access``, ``reach``, ``source``; set for MCP tools.
-    capability: dict[str, str] | None = None
+    #: What the tool may do (shared model S-1, :mod:`nodestro_runtime.tool_policy`). Set for every tool; without a
+    #: statement ``write`` + ``external``. Information for people and for the approval rules, not proof of behavior.
+    capability: ToolCapability = UNKNOWN
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_capability(cls, data: Any) -> Any:
+        # Created without a statement (older callers): what the kind and name alone allow, never more.
+        if isinstance(data, dict) and data.get("capability") is None:
+            data = {**data, "capability": capability_of(name=str(data.get("name", "")), kind=str(data.get("kind")))}
+        return data
 
 
 class TestResult(BaseModel):
@@ -370,11 +380,14 @@ class ToolLibrary:
                 description=record.description,
                 input_schema=record.input_schema,
                 created_at=record.created_at,
+                capability=capability_of(name=record.name, kind="builtin"),
             )
+        kind: ToolKind = "generated" if record.requirement else "custom"
+        trust = self.trust(name)
         return ToolInfo(
             name=record.name,
-            kind="generated" if record.requirement else "custom",
-            trust=self.trust(name),
+            kind=kind,
+            trust=trust,
             description=record.description,
             input_schema=record.input_schema,
             version=record.version,
@@ -383,7 +396,18 @@ class ToolLibrary:
             code=record.code,
             tests=record.tests,
             requirement=record.requirement,
+            capability=capability_of(name=record.name, kind=kind, isolation=self.isolation(trust, name)),
         )
+
+    def isolation(self, trust: TrustClass, name: str = "") -> Isolation | None:
+        """How the library's sandbox would isolate code of class ``trust``; ``None`` when it may not run here.
+
+        A workflow can choose another environment, so this is the library's default; the rules before a call
+        (S-2) look at the sandbox of that call."""
+        try:
+            return isolation_of(self._require(trust, self.registry.sandbox, name))
+        except NodestroError:
+            return None
 
     # ---- provenance ---------------------------------------------------------------------
 
