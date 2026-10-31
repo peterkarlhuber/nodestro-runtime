@@ -8,19 +8,27 @@ session behind.
 
 The hub runs its own event loop in a background thread; agents (which run in worker threads) call it through the
 synchronous methods, the API through the ``a``-prefixed coroutines.
+
+Limits (WP-7, :class:`McpLimits`): calls per tenant and process run at most ``max_parallel`` at a time and wait at
+most ``queue_seconds`` for a free slot (``mcp.overloaded``); each server takes at most ``calls_per_minute`` calls
+(``mcp.rate_limited``); after ``breaker_failures`` failed calls in a row a server rests for ``breaker_seconds``
+(``mcp.cooling_down``) so a dead service cannot tie up the workers. A connection test always runs and ends a rest
+when it succeeds.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
+from collections import deque
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 import concurrent.futures
 from dataclasses import dataclass, field
 import json
 import logging
+import os
 import threading
 import time
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from ..problems import NodestroError
 from .models import McpServer, ToolDefinition, clean_definition
@@ -34,6 +42,75 @@ T = TypeVar("T")
 MAX_TOOLS = 500
 MAX_PAGES = 20
 _SSE_EVENT_LIMIT = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class McpLimits:
+    """Operational limits of one hub (see the module documentation); set by the operator through the environment."""
+
+    max_servers: int = 25
+    max_parallel: int = 8
+    queue_seconds: float = 10.0
+    calls_per_minute: int = 120
+    breaker_failures: int = 5
+    breaker_seconds: float = 60.0
+
+    ENV: ClassVar[dict[str, str]] = {
+        "max_servers": "NODESTRO_MCP_MAX_SERVERS",
+        "max_parallel": "NODESTRO_MCP_MAX_PARALLEL",
+        "queue_seconds": "NODESTRO_MCP_QUEUE_SECONDS",
+        "calls_per_minute": "NODESTRO_MCP_CALLS_PER_MINUTE",
+        "breaker_failures": "NODESTRO_MCP_BREAKER_FAILURES",
+        "breaker_seconds": "NODESTRO_MCP_BREAKER_SECONDS",
+    }
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> McpLimits:
+        environ = os.environ if environ is None else environ
+        values: dict[str, Any] = {}
+        for name, variable in cls.ENV.items():
+            raw = environ.get(variable, "").strip()
+            if not raw:
+                continue
+            default = getattr(cls, name)
+            try:
+                value = type(default)(raw)
+            except ValueError:
+                raise NodestroError(
+                    "mcp.limits_invalid", f"{variable} must be a number, not {raw!r}", variable=variable
+                ) from None
+            if value <= 0:
+                raise NodestroError("mcp.limits_invalid", f"{variable} must be greater than 0", variable=variable)
+            values[name] = value
+        return cls(**values)
+
+
+@dataclass
+class ServerHealth:
+    """What the hub knows about one server since the process started (no secrets, no arguments)."""
+
+    calls: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    cooling_until: float | None = None
+    last_duration_ms: int | None = None
+    last_error_code: str | None = None
+    recent: deque[float] = field(default_factory=deque)
+
+    def view(self, now: float) -> dict[str, Any]:
+        resting = self.cooling_until is not None and self.cooling_until > now
+        return {
+            "calls": self.calls,
+            "failures": self.failures,
+            "consecutive_failures": self.consecutive_failures,
+            "cooling_down_seconds": round(self.cooling_until - now, 1) if resting and self.cooling_until else 0,
+            "last_duration_ms": self.last_duration_ms,
+            "last_error_code": self.last_error_code,
+        }
+
+
+#: Failures that say something about the server's health (not about one call's arguments or a refusal by policy).
+_HEALTH_FAILURES = frozenset({"mcp.unreachable", "mcp.timeout", "mcp.http_error", "mcp.protocol_error"})
 
 
 def sdk_available() -> bool:
@@ -71,6 +148,9 @@ class CallResult:
     definition: ToolDefinition | None
     duration_ms: int
     truncated: bool = False
+    #: False when the call was not sent: the tool was missing or its listed definition did not match the expected
+    #: hash (the comparison happens on the same connection, before the request).
+    sent: bool = True
 
 
 def _find(exc: BaseException, kind: type[BaseException]) -> BaseException | None:
@@ -160,10 +240,23 @@ def _content_text(content: list[Any]) -> str:
 class McpHub:
     """Remote MCP operations for one workspace (see the module documentation)."""
 
-    def __init__(self, policy: EgressPolicy, *, resolver: Resolver | None = None, verify: Any = True) -> None:
+    def __init__(
+        self,
+        policy: EgressPolicy,
+        *,
+        resolver: Resolver | None = None,
+        verify: Any = True,
+        limits: McpLimits | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.policy = policy
         self.resolver = resolver
         self.verify = verify
+        self.limits = limits or McpLimits()
+        self.clock = clock
+        self.health: dict[str, ServerHealth] = {}
+        self.active_calls = 0
+        self._tenant_slots: asyncio.Semaphore | None = None
         #: Tokens kept only in this process (no secure key store, D-3): server id -> token.
         self.session_tokens: dict[str, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -194,7 +287,12 @@ class McpHub:
             return self._loop
 
     def _submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
-        return asyncio.run_coroutine_threadsafe(coro, self._ensure_loop())
+        try:
+            loop = self._ensure_loop()
+        except BaseException:
+            coro.close()  # never started: close it so it is not reported as "never awaited"
+            raise
+        return asyncio.run_coroutine_threadsafe(coro, loop)
 
     def run(
         self,
@@ -225,11 +323,95 @@ class McpHub:
         return await asyncio.wrap_future(self._submit(coro))
 
     def close(self) -> None:
+        """Stop the hub: running operations are cancelled, the loop thread ends; later calls raise ``mcp.closed``."""
         with self._lock:
             self._closed = True
             loop, self._loop = self._loop, None
-        if loop is not None:
-            loop.call_soon_threadsafe(loop.stop)
+            thread, self._thread = self._thread, None
+        if loop is None:
+            return
+
+        def stop() -> None:
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+            loop.call_soon(loop.stop)
+
+        loop.call_soon_threadsafe(stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+    # ---- limits and health (WP-7) ----------------------------------------------------------
+
+    def _health(self, server: McpServer) -> ServerHealth:
+        return self.health.setdefault(server.id, ServerHealth())
+
+    def _admit(self, server: McpServer) -> None:
+        """Refuse a call to a resting or busy server before any connection is opened."""
+        health = self._health(server)
+        now = self.clock()
+        if health.cooling_until is not None and health.cooling_until > now:
+            raise NodestroError(
+                "mcp.cooling_down",
+                f"{server.name} failed {health.consecutive_failures} times in a row; calls pause for "
+                f"{health.cooling_until - now:.0f} seconds",
+                server=server.name,
+                seconds=round(health.cooling_until - now),
+            )
+        while health.recent and health.recent[0] <= now - 60:
+            health.recent.popleft()
+        if len(health.recent) >= self.limits.calls_per_minute:
+            raise NodestroError(
+                "mcp.rate_limited",
+                f"{server.name} already received {self.limits.calls_per_minute} calls in the last minute",
+                server=server.name,
+                limit=self.limits.calls_per_minute,
+            )
+        health.recent.append(now)
+
+    def _record(self, server: McpServer, error: NodestroError | None, duration_ms: int | None = None) -> None:
+        health = self._health(server)
+        health.calls += 1
+        health.last_duration_ms = duration_ms
+        if error is None or error.code not in _HEALTH_FAILURES:
+            health.consecutive_failures = 0
+            health.cooling_until = None
+            health.last_error_code = error.code if error is not None else None
+            return
+        health.failures += 1
+        health.consecutive_failures += 1
+        health.last_error_code = error.code
+        if health.consecutive_failures >= self.limits.breaker_failures:
+            health.cooling_until = self.clock() + self.limits.breaker_seconds
+            logger.warning(
+                "MCP server %s failed %d times in a row; pausing calls for %gs",
+                server.id,
+                health.consecutive_failures,
+                self.limits.breaker_seconds,
+            )
+
+    def stats(self) -> dict[str, Any]:
+        """Operational state for administrators: active calls, limits and per-server health (no secrets)."""
+        now = self.clock()
+        return {
+            "active_calls": self.active_calls,
+            "limits": {name: getattr(self.limits, name) for name in McpLimits.ENV},
+            "servers": {server_id: health.view(now) for server_id, health in self.health.items()},
+        }
+
+    async def _slot(self, server: McpServer) -> asyncio.Semaphore:
+        if self._tenant_slots is None:
+            self._tenant_slots = asyncio.Semaphore(self.limits.max_parallel)
+        slots = self._tenant_slots
+        try:
+            await asyncio.wait_for(slots.acquire(), timeout=self.limits.queue_seconds)
+        except asyncio.TimeoutError:
+            raise NodestroError(
+                "mcp.overloaded",
+                f"All {self.limits.max_parallel} MCP call slots stayed busy for {self.limits.queue_seconds:g} seconds",
+                server=server.name,
+                limit=self.limits.max_parallel,
+            ) from None
+        return slots
 
     # ---- connections ---------------------------------------------------------------------
 
@@ -315,20 +497,39 @@ class McpHub:
                 skipped=skipped,
             )
 
-        return await self._session(server, token, operation)
+        try:
+            found = await self._session(server, token, operation)
+        except NodestroError as exc:
+            self._health(server).last_error_code = exc.code
+            raise
+        health = self._health(server)
+        health.consecutive_failures, health.cooling_until, health.last_error_code = 0, None, None
+        return found
 
     def discover(self, server: McpServer, token: str | None) -> Discovery:
         return self.run(self.adiscover(server, token), timeout=server.timeout_seconds * 2 + 5)
 
     async def acall_tool(
-        self, server: McpServer, token: str | None, name: str, arguments: dict[str, Any]
+        self,
+        server: McpServer,
+        token: str | None,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        expected_hash: str | None = None,
     ) -> CallResult:
+        """List, compare and call on one connection. With ``expected_hash`` the request is sent only when the tool's
+        listed definition has exactly that hash (an approval never covers a definition changed since)."""
+        from .models import definition_hash
+
         async def operation(client: Any) -> CallResult:
             started = time.monotonic()
             tools, _skipped = await self._list(client)
             definition = next((tool for tool in tools if tool.name == name), None)
             if definition is None:
-                return CallResult("", True, client.protocol_version, None, 0)
+                return CallResult("", True, client.protocol_version, None, 0, sent=False)
+            if expected_hash is not None and definition_hash(definition) != expected_hash:
+                return CallResult("", True, client.protocol_version, definition, 0, sent=False)
             result = await client.call_tool(name, arguments, read_timeout_seconds=server.timeout_seconds)
             text = _content_text(list(result.content))
             if not text and result.structured_content is not None:
@@ -345,7 +546,20 @@ class McpHub:
                 truncated=truncated,
             )
 
-        return await self._session(server, token, operation)
+        self._admit(server)
+        slots = await self._slot(server)
+        self.active_calls += 1
+        started = time.monotonic()
+        try:
+            found = await self._session(server, token, operation)
+        except NodestroError as exc:
+            self._record(server, exc)
+            raise
+        finally:
+            self.active_calls -= 1
+            slots.release()
+        self._record(server, None, int((time.monotonic() - started) * 1000))
+        return found
 
     def call_tool(
         self,
@@ -354,11 +568,12 @@ class McpHub:
         name: str,
         arguments: dict[str, Any],
         *,
+        expected_hash: str | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> CallResult:
         return self.run(
-            self.acall_tool(server, token, name, arguments),
-            timeout=server.timeout_seconds * 2 + 5,
+            self.acall_tool(server, token, name, arguments, expected_hash=expected_hash),
+            timeout=server.timeout_seconds * 2 + self.limits.queue_seconds + 5,
             cancelled=cancelled,
         )
 

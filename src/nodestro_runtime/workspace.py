@@ -55,7 +55,7 @@ from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
-from .mcp.hub import McpHub
+from .mcp.hub import McpHub, McpLimits
 from .mcp.netguard import EgressPolicy
 from .mcp.service import McpService
 from .mcp.vault import TokenVault, vault_box_from_env
@@ -301,7 +301,10 @@ class Workspace:
         # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.
         self.mcp = McpService(
             self.store,
-            McpHub(EgressPolicy.from_env(server=storage is not None, loopback=self.profile.kind == "desktop")),
+            McpHub(
+                EgressPolicy.from_env(server=storage is not None, loopback=self.profile.kind == "desktop"),
+                limits=McpLimits.from_env(),
+            ),
             TokenVault(storage.secrets if storage is not None else vault_box_from_env(), self.tenant_id),
         )
         self.tools.mcp = self.mcp

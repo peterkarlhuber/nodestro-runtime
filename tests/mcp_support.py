@@ -76,6 +76,7 @@ def serve(
     token: str | None = None,
     legacy_only: bool = False,
     ssl: tuple[str, str] | None = None,
+    port: int | None = None,
 ) -> LoopbackServer:
     import uvicorn
 
@@ -83,7 +84,7 @@ def serve(
     if legacy_only:
         server._lowlevel_server._request_handlers.pop("server/discover", None)
     app = server.streamable_http_app()
-    port = free_port()
+    port = port or free_port()
     scheme = "https" if ssl else "http"
     handle = LoopbackServer(url=f"{scheme}://127.0.0.1:{port}/mcp", port=port, mcp=server)
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+MCP operations (ADR-0007, work package WP-7):
+
+- `McpLimits` (`NODESTRO_MCP_MAX_SERVERS`, `_MAX_PARALLEL`, `_QUEUE_SECONDS`, `_CALLS_PER_MINUTE`,
+  `_BREAKER_FAILURES`, `_BREAKER_SECONDS`; invalid values raise `mcp.limits_invalid`): servers per tenant
+  (`mcp.too_many_servers`), parallel calls per tenant with a bounded wait (`mcp.overloaded`), a rate limit per server
+  (`mcp.rate_limited`) and a circuit breaker that rests a server after repeated transport failures
+  (`mcp.cooling_down`; tool errors do not count, a successful discovery resets it). `McpHub.stats()` reports active
+  calls, limits and per-server health; `McpHub.close()` cancels open work and stops the hub's loop thread.
+- The definition hash is now compared on the same connection before the request is sent: a tool whose definition
+  changed after approval never receives the arguments (`CallResult.sent` is `False`).
+- `McpService.write_gate` is a plain flag (default `False`): `write`/`destructive` tools stay blocked until the
+  shared per-call approval (D10, S-2b) turns it on; there is no MCP-specific approval path.
+
 Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decision D10):
 
 - New module `nodestro_runtime.tool_policy`: `ToolCapability` (`access` read/write/destructive, `reach`
