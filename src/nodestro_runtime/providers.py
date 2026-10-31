@@ -13,7 +13,7 @@ an agent whose provider is not configured fails with :class:`MissingApiKeyError`
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import os
 from typing import Any, Literal
@@ -385,6 +385,41 @@ def check_base_url(url: str) -> str:
             "The base URL must not contain credentials: enter the key in the API key field",
         )
     return url.rstrip("/")
+
+
+def endpoint_origin(url: str) -> str:
+    """``scheme://host[:port]`` of a base URL, lower-case (how an allowlist of model endpoints names it)."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    scheme = parts.scheme.lower()
+    if (scheme, port) in (("http", 80), ("https", 443)):
+        port = None
+    return f"{scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def check_endpoint_allowed(url: str, allowed: Iterable[str] | None) -> None:
+    """Refuse a model endpoint the server's operator did not allow (``allowed``: origins; ``None``: any, desktop).
+
+    A server sends requests to a tenant's endpoint from inside its network; without this check a tenant could make
+    it reach internal services (server-side request forgery)."""
+    if allowed is None:
+        return
+    origins = {endpoint_origin(item) for item in allowed if item.strip()}
+    if endpoint_origin(url) not in origins:
+        shown = redact(url)
+        raise NodestroError(
+            "provider.endpoint_not_allowed",
+            f"The model endpoint {shown!r} is not allowed on this server; its operator lists the allowed endpoints",
+            url=shown,
+        )
 
 
 def check_capabilities(values: Mapping[str, str]) -> dict[str, str]:

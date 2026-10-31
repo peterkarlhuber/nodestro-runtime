@@ -351,10 +351,16 @@ def knowledge_tables(database: PostgresDatabase, tenant_id: str, *, namespace: s
     return KnowledgeTables(PostgresFileStore(database, tenant_id, namespace=namespace), index, index)
 
 
-def tenant_storage(database: PostgresDatabase, tenant_id: str, secrets: SecretBox | None = None) -> WorkspaceStorage:
+def tenant_storage(
+    database: PostgresDatabase,
+    tenant_id: str,
+    secrets: SecretBox | None = None,
+    endpoints: tuple[str, ...] = (),
+) -> WorkspaceStorage:
     """Everything a :class:`~nodestro_runtime.workspace.Workspace` stores, for one tenant of ``database``.
 
-    ``secrets`` encrypts the tenant's provider keys at rest (a server always passes its box)."""
+    ``secrets`` encrypts the tenant's provider keys at rest (a server always passes its box); ``endpoints`` are the
+    model endpoints the operator allows (none by default)."""
     from .workspace import WorkspaceStorage
 
     return WorkspaceStorage(
@@ -363,6 +369,7 @@ def tenant_storage(database: PostgresDatabase, tenant_id: str, secrets: SecretBo
         knowledge=knowledge_tables(database, tenant_id),
         memory=PostgresMemoryTables(database, tenant_id),
         secrets=secrets,
+        endpoints=tuple(endpoints),
     )
 
 

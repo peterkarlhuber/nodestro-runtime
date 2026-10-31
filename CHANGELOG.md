@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Model endpoints on a server (M5/M6 PR-12):
+
+- `WorkspaceStorage.endpoints` / `tenant_storage(..., endpoints=...)`: a tenant's endpoint providers (`compatible`,
+  `ollama`, `vllm`) reach only the origins the operator allows; others are refused when stored and when used
+  (`provider.endpoint_not_allowed`), so a tenant cannot make the server reach internal services. The desktop is
+  unchanged. New helpers `providers.endpoint_origin` and `providers.check_endpoint_allowed`.
+
 Server settings, tenant secrets and containers without bind mounts (M5/M6 PR-12, runtime part):
 
 - `profile.server_unavailable` is gone. `RuntimeProfile.validate(settings)` accepts the server profile with
