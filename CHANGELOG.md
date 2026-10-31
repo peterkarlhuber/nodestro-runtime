@@ -146,7 +146,9 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   (only their hash). `ToolApprovals.open()` lists the tenant's open requests of all runs (the approval inbox),
   `ToolPreGrants.all()` the pre-grants; `ToolPreGrant.revoked_by` and `ToolPreGrants.revoke(..., by=)` name who
   revoked; `Workspace.legacy_tool_bindings()` reads the activation report and `stamp_legacy_tool_bindings(by=)`
-  names who activated.
+  names who activated. `LegacyBinding.release` names a published release stamped by the API's activation step.
+  Fix: running the activation step again no longer replaces the stored report with an empty one;
+  `record_legacy_tool_bindings` adds to it, so earlier exemptions stay listed.
 - Changing MCP tools behind the gate (WP-5, D10c): with `NODESTRO_TOOL_APPROVALS=1` the workspace sets
   `McpService.write_gate`, so approved `write`/`destructive` MCP tools become usable, and every such call is asked,
   whatever the binding says (no `never`, no legacy exemption, no pre-grant). The approval binds the arguments and the

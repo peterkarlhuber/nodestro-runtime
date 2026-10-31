@@ -27,6 +27,8 @@ VersionOf = Callable[[str], int | None]
 class LegacyBinding(BaseModel):
     workflow_id: str | None = None
     workflow_version: int | None = None
+    #: A published release (``<publication id>:<number>``, stamped by the API's activation step); ``None``: studio.
+    release: str | None = None
     node_id: str
     tool: str
     bound_version: int

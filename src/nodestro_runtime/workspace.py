@@ -646,11 +646,23 @@ class Workspace:
         raw = self.store.get_raw("tool_approvals_activation", "legacy")
         return None if raw is None else LegacyReport.model_validate(raw)
 
+    def record_legacy_tool_bindings(self, added: LegacyReport) -> LegacyReport:
+        """Add newly stamped exemptions to the stored activation report (earlier ones stay listed) and return it."""
+        stored = self.legacy_tool_bindings() or LegacyReport()
+        combined = LegacyReport(
+            bindings=[*stored.bindings, *added.bindings],
+            workflows=stored.workflows + added.workflows,
+            versions=stored.versions + added.versions,
+        )
+        self.store.put_raw("tool_approvals_activation", "legacy", combined.model_dump(mode="json"))
+        return combined
+
     def stamp_legacy_tool_bindings(self, *, by: str = "system") -> LegacyReport:
         """The activation step of per-call tool approvals (S-2, D10b): every existing tool binding of every stored
         workflow and workflow version becomes a visible legacy exemption, bound to the tool's current version.
 
-        Idempotent (bindings that have an entry are left alone). Stored as ``tool_approvals_activation/legacy``.
+        Idempotent (bindings that have an entry are left alone). Returns what this call stamped; the stored report
+        ``tool_approvals_activation/legacy`` (:meth:`legacy_tool_bindings`) keeps every exemption stamped so far.
         Runs only when an administrator activates approvals; nothing calls it on its own."""
 
         def version_of(name: str) -> int | None:
@@ -677,7 +689,7 @@ class Workspace:
                         item.model_copy(update={"workflow_id": version.workflow_id, "workflow_version": version.number})
                         for item in found
                     )
-            self.store.put_raw("tool_approvals_activation", "legacy", report.model_dump(mode="json"))
+            self.record_legacy_tool_bindings(report)
             record_audit(
                 self.store,
                 ToolApprovalEvent(
