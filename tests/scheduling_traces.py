@@ -333,7 +333,8 @@ async def play(workspace: Workspace, scripted: Scripted, case: dict[str, Any]) -
         if node["type"] == "subworkflow":
             node = {**node, "subworkflow": {"workflow_id": children[node["subworkflow"]["workflow_id"]]}}
         nodes.append(node)
-    saved = workspace.save_workflow(WorkflowIn.model_validate({"name": case["name"], "nodes": nodes, "edges": case["edges"]}))
+    spec = {"name": case["name"], "nodes": nodes, "edges": case["edges"]}
+    saved = workspace.save_workflow(WorkflowIn.model_validate(spec))
     started = await workspace.run(saved, RunIn(input="topic"))
     scripted.run_ids[:] = [started.id]
     run = await workspace.wait(started.id, timeout=20)

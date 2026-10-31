@@ -11,12 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from scheduling_traces import GOLDEN, Scripted, play, scenarios
 
 from nodestro_runtime import engine
 from nodestro_runtime.testing import ScriptedClient
 from nodestro_runtime.workspace import Workspace
-
-from scheduling_traces import GOLDEN, Scripted, play, scenarios
 
 CASES = scenarios()
 
