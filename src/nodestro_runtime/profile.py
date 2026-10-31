@@ -1,10 +1,15 @@
 """Operating profiles: which product a runtime serves, decided once and validated before anything starts.
 
-Nodestro runs as two products on one runtime:
+Nodestro runs as three products on one runtime:
 
 - ``desktop`` (the default): one person, one data directory with SQLite, runs in this process. This is the
   behavior of every Nodestro release so far; :meth:`RuntimeProfile.desktop` and a :class:`Workspace` opened
   without a profile describe exactly that.
+- ``local-container`` (Nodestro Local Docker): one person and SQLite like the desktop, but the runtime runs in a
+  container that the person's browser reaches through a port on the host's loopback. The container is not the
+  person's computer: tool code that needs isolation runs only in sandbox containers (never in this container and
+  never in the built-in Linux sandbox, see :mod:`nodestro_runtime.sandbox_policy`), and the HTTP API requires an
+  access key (``nodestro_api``).
 - ``server``: many users, PostgreSQL, authentication (OpenID Connect), tenant isolation, persistent workers and a
   container sandbox. It starts only with complete :class:`~nodestro_runtime.server_settings.ServerSettings`
   (``nodestro-server`` reads them from the environment); :meth:`RuntimeProfile.validate` refuses it without them
@@ -34,9 +39,11 @@ from .problems import NodestroError
 if TYPE_CHECKING:
     from .server_settings import ServerSettings
 
-ProfileKind = Literal["desktop", "server"]
+ProfileKind = Literal["desktop", "server", "local-container"]
 #: Every profile, in the order they are named in messages.
 PROFILE_KINDS: tuple[ProfileKind, ...] = get_args(ProfileKind)
+#: The profiles of one person with one SQLite data directory (no tenants, no logins).
+SINGLE_USER_PROFILES: tuple[ProfileKind, ...] = ("desktop", "local-container")
 #: The profile used when none is chosen.
 DEFAULT_PROFILE: ProfileKind = "desktop"
 #: Environment variables read by :meth:`RuntimeProfile.from_env`.
@@ -47,6 +54,7 @@ DEFAULT_DATA_DIR = "~/.nodestro"
 #: What the server profile needs before it can start (checked by ``ServerSettings`` and the server's start-up).
 SERVER_REQUIREMENTS = ("authentication", "postgresql", "tenant_isolation", "persistent_workers", "container_sandbox")
 _READABLE_REQUIREMENTS = ", ".join(item.replace("_", " ") for item in SERVER_REQUIREMENTS)
+_CHOICES = ", ".join(PROFILE_KINDS[:-1]) + " or " + PROFILE_KINDS[-1]
 
 
 def _invalid(problems: list[dict[str, str]]) -> NodestroError:
@@ -94,7 +102,7 @@ class RuntimeProfile:
                 {
                     "field": "kind",
                     "value": repr(self.kind),
-                    "reason": f"unknown profile {self.kind!r} (choose {' or '.join(PROFILE_KINDS)})",
+                    "reason": f"unknown profile {self.kind!r} (choose {_CHOICES})",
                 }
             )
         data_dir = _data_dir(self.data_dir, "data_dir")
@@ -115,13 +123,14 @@ class RuntimeProfile:
         """The profile chosen by ``NODESTRO_PROFILE`` and ``NODESTRO_DATA_DIR`` (``environ``: ``os.environ``).
 
         A missing or empty variable means its default (``desktop``, ``~/.nodestro``); surrounding spaces
-        are ignored and the profile name is case-insensitive. Any other value is refused with
+        are ignored and the profile name is case-insensitive (``local-container`` may also be written
+        ``local_container``). Any other value is refused with
         ``profile.invalid``, listing every invalid variable at once; nothing falls back to a default.
         """
         environ = os.environ if environ is None else environ
         problems: list[dict[str, str]] = []
         raw_kind = environ.get(ENV_PROFILE, "")
-        name = raw_kind.strip().lower() or DEFAULT_PROFILE
+        name = raw_kind.strip().lower().replace("_", "-") or DEFAULT_PROFILE
         kind: ProfileKind = DEFAULT_PROFILE
         if name in PROFILE_KINDS:
             kind = name
@@ -130,7 +139,7 @@ class RuntimeProfile:
                 {
                     "field": ENV_PROFILE,
                     "value": raw_kind,
-                    "reason": f"{ENV_PROFILE}={raw_kind!r} is not a profile (choose {' or '.join(PROFILE_KINDS)})",
+                    "reason": f"{ENV_PROFILE}={raw_kind!r} is not a profile (choose {_CHOICES})",
                 }
             )
         raw_dir = environ.get(ENV_DATA_DIR, "")
@@ -163,7 +172,8 @@ class RuntimeProfile:
         return self
 
     def validate(self, server: ServerSettings | None = None) -> RuntimeProfile:
-        """This profile, if it can be started: the desktop always, the server only with its validated settings
+        """This profile, if it can be started: the desktop and the local container always, the server only with its
+        validated settings
         (:meth:`ServerSettings.from_env <nodestro_runtime.server_settings.ServerSettings.from_env>`)."""
         if self.kind == "server" and server is None:
             raise _invalid(
@@ -187,6 +197,7 @@ __all__ = [
     "ENV_PROFILE",
     "PROFILE_KINDS",
     "SERVER_REQUIREMENTS",
+    "SINGLE_USER_PROFILES",
     "ProfileKind",
     "RuntimeProfile",
     "same_directory",

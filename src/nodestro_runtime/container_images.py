@@ -158,6 +158,8 @@ class ContainerImages:
             "DOCKER_CONTEXT",
             "DOCKER_CERT_PATH",
             "DOCKER_TLS_VERIFY",
+            # 0 selects the classic builder (a sandbox gateway accepts no BuildKit sessions).
+            "DOCKER_BUILDKIT",
         )
         return {key: value for key, value in self.environ.items() if key in keep or key in _PROXY_VARIABLES}
 

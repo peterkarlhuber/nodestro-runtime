@@ -83,7 +83,7 @@ jobs:
           git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
       - run: pip install -e ".[dev]"
       - run: docker info
-      - run: pytest tests/test_container_images.py
+      - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py
 
   builtin-sandbox:
     # Security probes and compatibility checks of the built-in Linux sandbox (Landlock + seccomp, ADR-0006) as the
