@@ -1400,6 +1400,10 @@ class RunManager:
                     max_duration_s=limit,
                 ),
             )
+        elif context.flow_stop is not None and context.flow_stop.code == "flow.invocation_limit":
+            run.status = "failed"
+            steps = run.workflow.limits.max_steps
+            _fail(run, problem("run.step_limit", f"The run reached its limit of {steps} steps", max_steps=steps))
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))

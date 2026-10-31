@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Adaptive Orchestration M2 (step limit):
+
+- New `WorkflowLimits.max_steps` (1 to 10,000): the most node executions of a run. Every executed node counts,
+  start and result nodes included, and every round of a loop counts again. It maps to the kernel's
+  `max_invocations`; when the next execution would exceed it, the run fails with `run.step_limit` (`max_steps`).
+  Continued runs count the reused steps of the earlier run.
+
 Sandbox gateway hardening (Nodestro Local Docker, internal cross-check K1, K2, K4, D2, D4):
 
 - **Image limits (K1).** A build is refused with 507 once the daemon holds `NODESTRO_SANDBOX_MAX_IMAGES` (32)
