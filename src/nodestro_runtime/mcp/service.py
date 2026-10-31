@@ -11,8 +11,9 @@ Tools classified as ``write`` or ``destructive`` are usable only while the share
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 import logging
+import secrets
 import threading
 from typing import Any
 
@@ -21,7 +22,8 @@ from orkexa import Tool
 from ..problems import NodestroError
 from ..schemas import now
 from ..storage import DocumentStore
-from .hub import CallResult, Discovery, McpHub
+from . import oauth as oauth_flow
+from .hub import CallResult, Credential, Discovery, McpHub
 from .models import (
     EVENTS,
     SERVERS,
@@ -40,6 +42,7 @@ from .models import (
     make_slug,
     tool_key,
 )
+from .oauth import OAuthCredentials, PendingAuthorization
 from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
@@ -72,7 +75,7 @@ class McpService:
     def view(self, server: McpServer) -> McpServerView:
         tools = self.tools(server.id)
         return McpServerView(
-            **server.model_dump(exclude={"token_sealed"}),
+            **server.model_dump(exclude={"token_sealed", "oauth_pending_sealed", "oauth_state_digest"}),
             token_set=self.token(server) is not None,
             tools_total=len([tool for tool in tools if tool.status != "removed"]),
             tools_approved=len([tool for tool in tools if tool.status == "approved"]),
@@ -104,8 +107,41 @@ class McpService:
             return self.hub.session_tokens.get(server.id)
         return None
 
-    def add(self, data: McpServerIn, *, actor: str | None = None) -> McpServer:
+    def credential(self, server: McpServer) -> Credential:
+        """What a connection presents: a static token, or OAuth credentials for a signed-in OAuth server."""
+        token = self.token(server)
+        if server.auth != "oauth" or token is None:
+            return token if server.auth == "bearer" else None
+        return OAuthCredentials.loads(token)
+
+    def _keep_refreshed(self, server: McpServer, credential: Credential) -> None:
+        """Store tokens the hub refreshed during an operation (sealed, like the sign-in stored them)."""
+        if not isinstance(credential, OAuthCredentials) or not credential.changed:
+            return
+        with self._lock:
+            current = self.server(server.id)
+            if current.auth != "oauth" or current.token_storage == "none":
+                return  # signed out meanwhile
+            credential.changed = False
+            self._set_token(current, credential.dumps())
+            current.oauth = {**current.oauth, **credential.summary()}
+            self.store.put(SERVERS, current.id, current)
+            # The caller saves its copy of the record afterwards (the check result): keep it in step.
+            server.token_sealed, server.token_storage, server.oauth = (
+                current.token_sealed,
+                current.token_storage,
+                current.oauth,
+            )
+
+    def _check_input(self, data: McpServerIn) -> None:
         self.hub.policy.check_url(data.url, allow_loopback=data.allow_loopback)
+        if data.auth == "oauth" and data.token:
+            raise NodestroError(
+                "mcp.oauth_token_input", "An OAuth server gets its tokens from the sign-in, not from a pasted token"
+            )
+
+    def add(self, data: McpServerIn, *, actor: str | None = None) -> McpServer:
+        self._check_input(data)
         with self._lock:
             existing = self.servers()
             if len(existing) >= self.hub.limits.max_servers:
@@ -127,10 +163,15 @@ class McpService:
         return server
 
     def update(self, server_id: str, data: McpServerIn, *, actor: str | None = None) -> McpServer:
-        self.hub.policy.check_url(data.url, allow_loopback=data.allow_loopback)
+        self._check_input(data)
         with self._lock:
             server = self.server(server_id)
             moved = data.url != server.url
+            if moved or data.auth != server.auth:
+                # OAuth credentials belong to the address and the issuer they were granted for.
+                self._clear_oauth(server)
+                if server.auth == "oauth" and data.token is None and server.token_storage != "none":
+                    self._set_token(server, "")
             for key, value in data.model_dump(exclude={"token"}).items():
                 setattr(server, key, value)
             if moved:
@@ -156,6 +197,8 @@ class McpService:
             self.store.delete_prefix(TOOLS, f"{server.id}/")
             self.store.delete(SERVERS, server.id)
             self.hub.session_tokens.pop(server.id, None)
+            self.hub.session_tokens.pop(self._pending_key(server.id), None)
+            self.hub.forget_oauth(server.id)
         self.event("server_removed", actor=actor, server_id=server_id, name=server.name)
 
     # ---- discovery -------------------------------------------------------------------------
@@ -175,7 +218,11 @@ class McpService:
         """Connect, list the tools and update the stored records (new, changed, removed)."""
         server = self.server(server_id)
         try:
-            discovery = await self.hub.acall(self.hub.adiscover(server, self.token(server)))
+            credential = self.credential(server)
+            try:
+                discovery = await self.hub.acall(self.hub.adiscover(server, credential))
+            finally:
+                self._keep_refreshed(server, credential)
         except NodestroError as exc:
             self._record_check(server, None, exc)
             raise
@@ -185,7 +232,11 @@ class McpService:
         """:meth:`adiscover` for callers without an event loop of their own (scripts, worker threads)."""
         server = self.server(server_id)
         try:
-            discovery = self.hub.discover(server, self.token(server))
+            credential = self.credential(server)
+            try:
+                discovery = self.hub.discover(server, credential)
+            finally:
+                self._keep_refreshed(server, credential)
         except NodestroError as exc:
             self._record_check(server, None, exc)
             raise
@@ -396,14 +447,18 @@ class McpService:
     ) -> tuple[McpServer, McpTool, CallResult]:
         """Check the policy, call the tool and check the definition the server listed right before the call."""
         server, tool = self.check(tool_name)
-        result = self.hub.call_tool(
-            server,
-            self.token(server),
-            tool.name,
-            arguments,
-            expected_hash=tool.approved_hash,
-            cancelled=cancelled,
-        )
+        credential = self.credential(server)
+        try:
+            result = self.hub.call_tool(
+                server,
+                credential,
+                tool.name,
+                arguments,
+                expected_hash=tool.approved_hash,
+                cancelled=cancelled,
+            )
+        finally:
+            self._keep_refreshed(server, credential)
         if result.definition is None:
             self._mark(tool, "removed")
             raise NodestroError("mcp.tool_removed", f"{server.name} no longer offers {tool.name}", name=tool_name)
@@ -428,6 +483,188 @@ class McpService:
         with self._lock:
             tool.status = status
             self.store.put(TOOLS, tool.key, tool)
+
+    # ---- OAuth (WP-6) ----------------------------------------------------------------------
+
+    @staticmethod
+    def _pending_key(server_id: str) -> str:
+        return f"{server_id}:oauth-pending"
+
+    def _clear_oauth(self, server: McpServer) -> None:
+        server.oauth = {}
+        server.oauth_pending_sealed = None
+        server.oauth_state_digest = None
+        self.hub.session_tokens.pop(self._pending_key(server.id), None)
+        self.hub.forget_oauth(server.id)
+
+    def _oauth_server(self, server_id: str) -> McpServer:
+        server = self.server(server_id)
+        if server.auth != "oauth":
+            raise NodestroError("mcp.oauth_not_configured", f"{server.name} does not use OAuth", server=server.name)
+        self.hub.policy.check_url(server.url, allow_loopback=server.allow_loopback)
+        return server
+
+    def _begin_flow(
+        self, server_id: str, redirect_uri: str, actor: str | None, client_metadata_url: str | None
+    ) -> tuple[McpServer, Coroutine[Any, Any, tuple[str, PendingAuthorization]]]:
+        server = self._oauth_server(server_id)
+        previous = self.credential(server)
+        return server, oauth_flow.guarded(
+            oauth_flow.abegin(
+                self.hub.policy,
+                server,
+                redirect_uri,
+                previous=previous if isinstance(previous, OAuthCredentials) else None,
+                client_metadata_url=client_metadata_url,
+                resolver=self.hub.resolver,
+                verify=self.hub.verify,
+                actor=actor,
+            )
+        )
+
+    def _started(self, server_id: str, pending: PendingAuthorization, actor: str | None) -> None:
+        with self._lock:
+            server = self.server(server_id)
+            server.oauth_state_digest = oauth_flow.state_digest(pending.state)
+            server.oauth = {**server.oauth, "pending_until": pending.expires_at}
+            if self.vault.persistent:
+                server.oauth_pending_sealed = self.vault.seal(self._pending_key(server.id), pending.dumps())
+            else:
+                server.oauth_pending_sealed = None
+                self.hub.session_tokens[self._pending_key(server.id)] = pending.dumps()
+            self.store.put(SERVERS, server.id, server)
+        self.event("oauth_started", actor=actor, server_id=server_id, issuer=pending.issuer)
+
+    async def abegin_oauth(
+        self, server_id: str, redirect_uri: str, *, actor: str | None = None, client_metadata_url: str | None = None
+    ) -> str:
+        """Start a sign-in; returns the authorization URL the person opens in the browser."""
+        server, flow = self._begin_flow(server_id, redirect_uri, actor, client_metadata_url)
+        try:
+            url, pending = await self.hub.acall(flow)
+        except NodestroError as exc:
+            self.event("oauth_failed", actor=actor, server_id=server.id, code=exc.code, step="start")
+            raise
+        self._started(server.id, pending, actor)
+        return url
+
+    def begin_oauth(
+        self, server_id: str, redirect_uri: str, *, actor: str | None = None, client_metadata_url: str | None = None
+    ) -> str:
+        """:meth:`abegin_oauth` for callers without an event loop of their own."""
+        server, flow = self._begin_flow(server_id, redirect_uri, actor, client_metadata_url)
+        try:
+            url, pending = self.hub.run(flow, timeout=server.timeout_seconds * 4 + 5)
+        except NodestroError as exc:
+            self.event("oauth_failed", actor=actor, server_id=server.id, code=exc.code, step="start")
+            raise
+        self._started(server.id, pending, actor)
+        return url
+
+    def _pending(self, state: str) -> tuple[McpServer, PendingAuthorization]:
+        digest = oauth_flow.state_digest(state)
+        for server in self.servers():
+            if server.auth != "oauth" or not server.oauth_state_digest:
+                continue
+            if not secrets.compare_digest(server.oauth_state_digest, digest):
+                continue
+            if server.oauth_pending_sealed:
+                text = self.vault.open(self._pending_key(server.id), server.oauth_pending_sealed)
+            else:
+                text = self.hub.session_tokens.get(self._pending_key(server.id))
+            pending = PendingAuthorization.loads(text) if text else None
+            if pending is not None:
+                return server, pending
+        raise NodestroError("mcp.oauth_state_invalid", "The sign-in does not belong to a started request")
+
+    def _complete_flow(
+        self, state: str, code: str, iss: str | None
+    ) -> tuple[McpServer, PendingAuthorization, Coroutine[Any, Any, OAuthCredentials]]:
+        server, pending = self._pending(state)
+        flow = oauth_flow.guarded(
+            oauth_flow.acomplete(
+                self.hub.policy,
+                server,
+                pending,
+                state=state,
+                code=code,
+                iss=iss,
+                resolver=self.hub.resolver,
+                verify=self.hub.verify,
+            )
+        )
+        return server, pending, flow
+
+    def _completed(
+        self,
+        server: McpServer,
+        pending: PendingAuthorization,
+        credentials: OAuthCredentials | None,
+        error: NodestroError | None,
+        actor: str | None,
+    ) -> McpServer:
+        actor = actor or pending.actor
+        with self._lock:
+            current = self.server(server.id)
+            self._clear_pending(current)
+            if credentials is not None:
+                self.hub.forget_oauth(current.id)
+                self._set_token(current, credentials.dumps())
+                current.oauth = credentials.summary()
+                current.updated_at = now()
+            self.store.put(SERVERS, current.id, current)
+        if error is not None:
+            self.event("oauth_failed", actor=actor, server_id=server.id, code=error.code, step="callback")
+            raise error
+        assert credentials is not None
+        self.event(
+            "oauth_connected",
+            actor=actor,
+            server_id=server.id,
+            issuer=credentials.issuer,
+            scope=credentials.scope,
+            storage=current.token_storage,
+        )
+        return current
+
+    async def acomplete_oauth(
+        self, state: str, code: str, iss: str | None = None, *, actor: str | None = None
+    ) -> McpServer:
+        """The browser's callback: check it, exchange the code and store the credentials sealed.
+
+        A started sign-in is used once: it is discarded whether the exchange succeeds or fails."""
+        server, pending, flow = self._complete_flow(state, code, iss)
+        try:
+            credentials = await self.hub.acall(flow)
+        except NodestroError as exc:
+            return self._completed(server, pending, None, exc, actor)
+        return self._completed(server, pending, credentials, None, actor)
+
+    def complete_oauth(self, state: str, code: str, iss: str | None = None, *, actor: str | None = None) -> McpServer:
+        """:meth:`acomplete_oauth` for callers without an event loop of their own."""
+        server, pending, flow = self._complete_flow(state, code, iss)
+        try:
+            credentials = self.hub.run(flow, timeout=server.timeout_seconds * 2 + 5)
+        except NodestroError as exc:
+            return self._completed(server, pending, None, exc, actor)
+        return self._completed(server, pending, credentials, None, actor)
+
+    def _clear_pending(self, server: McpServer) -> None:
+        server.oauth_pending_sealed = None
+        server.oauth_state_digest = None
+        server.oauth.pop("pending_until", None)
+        self.hub.session_tokens.pop(self._pending_key(server.id), None)
+
+    def sign_out(self, server_id: str, *, actor: str | None = None) -> McpServer:
+        """Forget the OAuth credentials (the authorization server's grant stays until it expires or is revoked)."""
+        with self._lock:
+            server = self._oauth_server(server_id)
+            self._clear_oauth(server)
+            self._set_token(server, "")
+            server.updated_at = now()
+            self.store.put(SERVERS, server.id, server)
+        self.event("oauth_disconnected", actor=actor, server_id=server.id)
+        return server
 
     # ---- audit -----------------------------------------------------------------------------
 
