@@ -43,6 +43,7 @@ from .models import (
     tool_key,
 )
 from .oauth import OAuthCredentials, PendingAuthorization
+from .stdio import StdioLaunch, launch
 from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,11 @@ class McpService:
         #: True while the run engine asks for approval before every call that changes data (the shared tool gate,
         #: S-2/WP-5). False: MCP tools that change data are refused (``mcp.write_not_supported``).
         self.write_gate: bool = False
+        #: The workspace's Python environments (:class:`~nodestro_runtime.python_envs.PythonEnvironments`): the
+        #: approved packages and the container image of a local stdio server (WP-8). ``None``: stdio is refused.
+        self.python: Any = None
         self._lock = threading.RLock()
+        hub.stdio_launcher = self.stdio_launch
 
     # ---- servers ---------------------------------------------------------------------------
 
@@ -76,6 +81,7 @@ class McpService:
         tools = self.tools(server.id)
         return McpServerView(
             **server.model_dump(exclude={"token_sealed", "oauth_pending_sealed", "oauth_state_digest"}),
+            environment_state=self._environment_state(server),
             token_set=self.token(server) is not None,
             tools_total=len([tool for tool in tools if tool.status != "removed"]),
             tools_approved=len([tool for tool in tools if tool.status == "approved"]),
@@ -134,11 +140,43 @@ class McpService:
             )
 
     def _check_input(self, data: McpServerIn) -> None:
+        if data.transport == "stdio":
+            self._check_stdio(data)
+            return
+        if data.stdio is not None:
+            raise NodestroError("mcp.stdio_invalid", "Only a stdio server has a command")
+        if not data.url:
+            raise NodestroError("mcp.url_invalid", "The server needs an address", url="")
         self.hub.policy.check_url(data.url, allow_loopback=data.allow_loopback)
         if data.auth == "oauth" and data.token:
             raise NodestroError(
                 "mcp.oauth_token_input", "An OAuth server gets its tokens from the sign-in, not from a pasted token"
             )
+
+    def _check_stdio(self, data: McpServerIn) -> None:
+        if data.stdio is None:
+            raise NodestroError("mcp.stdio_invalid", "A stdio server needs a command (packages and module)")
+        if data.auth != "none" or data.token:
+            # A local server gets no credentials from Nodestro (there is nothing to protect on the way: no network).
+            raise NodestroError("mcp.stdio_invalid", "A local stdio server takes no token or sign-in")
+        if data.allow_loopback:
+            raise NodestroError("mcp.stdio_invalid", "A local stdio server has no address")
+        self.require_isolation()
+
+    def require_isolation(self) -> None:
+        """A local server runs only in a container (D-5, ADR-0006): refuse without the Docker sandbox."""
+        if self.python is None or not self.python.containers():
+            raise NodestroError(
+                "sandbox.isolation_required",
+                "A local MCP server runs only in an isolated container; switch on the Docker sandbox first",
+            )
+
+    @staticmethod
+    def _fields(data: McpServerIn) -> dict[str, Any]:
+        fields = data.model_dump(exclude={"token"})
+        if data.transport == "stdio" and data.stdio is not None:
+            fields["url"] = data.stdio.address()
+        return fields
 
     def add(self, data: McpServerIn, *, actor: str | None = None) -> McpServer:
         self._check_input(data)
@@ -151,10 +189,7 @@ class McpService:
                     limit=self.hub.limits.max_servers,
                 )
             taken = {item.slug for item in existing}
-            server = McpServer(
-                slug=make_slug(data.name, taken),
-                **data.model_dump(exclude={"token"}),
-            )
+            server = McpServer(slug=make_slug(data.name, taken), **self._fields(data))
             self._set_token(server, data.token)
             self.store.put(SERVERS, server.id, server)
         self.event("server_added", actor=actor, server_id=server.id, url=server.url, name=server.name)
@@ -166,14 +201,19 @@ class McpService:
         self._check_input(data)
         with self._lock:
             server = self.server(server_id)
-            moved = data.url != server.url
+            fields = self._fields(data)
+            # A changed command is another program: like a new address, it loses its approvals.
+            moved = fields["url"] != server.url or fields.get("stdio") != (
+                server.stdio.model_dump() if server.stdio is not None else None
+            )
             if moved or data.auth != server.auth:
                 # OAuth credentials belong to the address and the issuer they were granted for.
                 self._clear_oauth(server)
                 if server.auth == "oauth" and data.token is None and server.token_storage != "none":
                     self._set_token(server, "")
-            for key, value in data.model_dump(exclude={"token"}).items():
+            for key, value in fields.items():
                 setattr(server, key, value)
+            server.stdio = data.stdio
             if moved:
                 # A token belongs to its origin (threat model T9): a new address needs the token again.
                 if data.token is None and server.token_storage != "none":
@@ -199,7 +239,67 @@ class McpService:
             self.hub.session_tokens.pop(server.id, None)
             self.hub.session_tokens.pop(self._pending_key(server.id), None)
             self.hub.forget_oauth(server.id)
+        if server.transport == "stdio" and self.python is not None:
+            self.python.forget(self._scope(server.id))
         self.event("server_removed", actor=actor, server_id=server_id, name=server.name)
+
+    # ---- local stdio servers (WP-8) ---------------------------------------------------------
+
+    @staticmethod
+    def _scope(server_id: str) -> str:
+        return f"mcp:{server_id}"
+
+    def _needed(self, server: McpServer) -> Any:
+        from ..python_envs import needed_for_requirements
+
+        if server.transport != "stdio" or server.stdio is None:
+            raise NodestroError("mcp.stdio_invalid", "Only a stdio server has packages")
+        return needed_for_requirements(server.stdio.requirements, server.slug)
+
+    def _environment_state(self, server: McpServer) -> str:
+        if server.transport != "stdio" or self.python is None:
+            return ""
+        try:
+            return str(self.environment(server.id).state)
+        except NodestroError:
+            return "unsupported"
+
+    def environment(self, server_id: str) -> Any:
+        """The state of a stdio server's packages (:class:`~nodestro_runtime.python_envs.DependencyStatus`)."""
+        server = self.server(server_id)
+        needed = self._needed(server)
+        if self.python is None:
+            raise NodestroError("sandbox.isolation_required", "A local MCP server runs only in an isolated container")
+        return self.python.status("mcp", server.id, needed, label=server.name)
+
+    def plan_environment(self, server_id: str) -> Any:
+        """Resolve the hash-pinned versions of a stdio server's packages for the administrator's approval (the
+        approval and installation are the Python environments' own: ``approve(plan_id)``)."""
+        self.require_isolation()
+        server = self.server(server_id)
+        return self.python.plan("mcp", server.id, self._needed(server), label=server.name)
+
+    def stdio_launch(self, server: McpServer) -> StdioLaunch:
+        """How the hub starts a connection: the server's command in a container of its approved image."""
+        self.require_isolation()
+        if server.transport != "stdio" or server.stdio is None:
+            raise NodestroError("mcp.stdio_invalid", "Only a stdio server is started locally")
+        image = self.python.image(self._scope(server.id))
+        if image is None:
+            raise NodestroError(
+                "mcp.environment_not_ready",
+                f"The packages of {server.name} are not approved and installed yet",
+                server=server.name,
+            )
+        images = self.python.images
+        return launch(
+            image=image,
+            module=server.stdio.module,
+            args=list(server.stdio.args),
+            memory_mb=server.stdio.memory_mb,
+            docker=images.docker,
+            docker_env=images._cli_environment(),
+        )
 
     # ---- discovery -------------------------------------------------------------------------
 

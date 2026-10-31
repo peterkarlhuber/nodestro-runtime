@@ -52,6 +52,21 @@ Adaptive Orchestration M3 (teams: output contracts and capabilities):
 - `WorkflowSummary` gains `capabilities` and `contract` (the field names of the output contract), so lists can
   offer teams without loading every workflow.
 
+Local MCP servers over stdio in an isolated container (ADR-0007, work package WP-8):
+
+- `McpServer.transport` (`http` or `stdio`) and `McpServer.stdio` (`StdioCommand`: plain package requirements, a
+  module path, arguments, memory). A stdio server's address is `stdio:<module>`; it takes no token or sign-in.
+- Its packages go through the Python environments' approval (new scope kind `mcp`, `needed_for_requirements`,
+  `McpService.plan_environment` / `environment`, `PythonEnvironments.image`). Each connection runs `python -m <module>`
+  in a container of the approved image with the sandbox's flags (new `container_images.sandbox_run_args`, shared with
+  `StreamedSandbox`): no network, read-only, no capabilities, `nobody`, limits, `--pull never`, removed afterwards.
+- No host fallback: without the Docker sandbox a stdio server is refused (`sandbox.isolation_required`), without
+  installed packages it does not start (`mcp.environment_not_ready`). A relay (`nodestro_runtime.mcp.stdio`) bounds the
+  line length (8 MB) and removes the container; stderr is discarded. New codes `mcp.stdio_invalid`, `mcp.stdio_failed`.
+- Removing a stdio server forgets its environment; orphaned `mcp:` environments are cleaned up.
+- Tests: fake-docker end-to-end tests, and a real container test with `mcp-server-time` from PyPI through the sandbox
+  gateway (CI job `docker`).
+
 MCP OAuth 2.1 (ADR-0007, work package WP-6):
 
 - New module `nodestro_runtime.mcp.oauth`: sign-in for MCP servers with `auth="oauth"` following the MCP

@@ -56,6 +56,7 @@ from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
 from .mcp.hub import McpHub, McpLimits
+from .mcp.models import SERVERS as MCP_SERVERS
 from .mcp.netguard import EgressPolicy
 from .mcp.service import McpService
 from .mcp.vault import TokenVault, vault_box_from_env
@@ -363,7 +364,10 @@ class Workspace:
             runner=python_runner,
             sandbox_kind=self._sandbox_kind,
             workflow_exists=lambda workflow_id: self.store.get_raw("workflows", workflow_id) is not None,
+            mcp_exists=lambda server_id: self.store.get_raw(MCP_SERVERS, server_id) is not None,
         )
+        # Local MCP servers (WP-8) run in a container of their approved packages' image, never on the host.
+        self.mcp.python = self.python
         self.tools.dependencies = EnvironmentGate(self.python)
         self.tool_drafts.python = self.python
         self.runs.tool_sandbox = self.python.workflow_sandbox

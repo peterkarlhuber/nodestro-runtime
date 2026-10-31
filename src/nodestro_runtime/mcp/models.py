@@ -16,7 +16,7 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..mcp_access import TOOL_PREFIX, is_mcp_tool, unattended_mcp_enabled
 from ..schemas import new_id, now
@@ -43,10 +43,64 @@ ToolStatus = Literal["new", "approved", "rejected", "changed", "removed"]
 #: ``write`` creates or changes data (the default: annotations are hints, never a guarantee); ``destructive``
 #: deletes, pays, sends or cannot be undone.
 ToolAccess = Literal["read", "write", "destructive"]
+#: How Nodestro reaches a server: Streamable HTTP, or a local server started over stdio in an isolated container
+#: (WP-8, D-5: only in a container, never on the host).
+Transport = Literal["http", "stdio"]
+
+#: A Python module path (``package.module``) a stdio server is started with (``python -m``).
+_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,7}")
+#: One requirement line: a name, optional extras and a version specifier; no URLs, paths or options.
+_REQUIREMENT = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"  # name
+    r"(\[[A-Za-z0-9._,-]{1,100}\])?"  # extras
+    r"([<>=!~][<>=!~ 0-9A-Za-z.*+,-]{0,99})?"  # version specifier
+)
+#: A stdio server's address in the configuration (shown and audited like a URL; never contacted).
+STDIO_SCHEME = "stdio:"
 
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
+
+class StdioCommand(_Model):
+    """A local MCP server started over stdio (WP-8): Python packages from PyPI, installed only after an administrator
+    approved their hash-pinned versions, and run with ``python -m <module> <args>`` in a container of Nodestro's
+    sandbox image: no network, read-only root file system, no capabilities, user ``nobody``, memory/CPU/process
+    limits. Never on the host."""
+
+    #: The packages (``name[extras]<specifier>`` lines; no URLs, paths or pip options).
+    requirements: list[str] = Field(min_length=1, max_length=16)
+    module: str = Field(min_length=1, max_length=200)
+    args: list[str] = Field(default_factory=list, max_length=16)
+    memory_mb: int = Field(default=512, ge=128, le=2048)
+
+    @field_validator("requirements")
+    @classmethod
+    def _requirements(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        for item in cleaned:
+            if not _REQUIREMENT.fullmatch(item):
+                raise ValueError(f"not a plain package requirement: {item[:100]!r}")
+        return cleaned
+
+    @field_validator("module")
+    @classmethod
+    def _module(cls, value: str) -> str:
+        if not _MODULE.fullmatch(value):
+            raise ValueError("the module must be a Python module path such as package.server")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _args(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if len(item) > 200 or any(ord(char) < 32 for char in item):
+                raise ValueError("an argument is at most 200 printable characters")
+        return value
+
+    def address(self) -> str:
+        return f"{STDIO_SCHEME}{self.module}"
 
 
 class McpServer(_Model):
@@ -58,6 +112,9 @@ class McpServer(_Model):
     #: A desktop's consent to reach a local development server over loopback ``http``.
     allow_loopback: bool = False
     auth: AuthKind = "none"
+    transport: Transport = "http"
+    #: The command of a ``stdio`` server (``url`` is then ``stdio:<module>``).
+    stdio: StdioCommand | None = None
     token_storage: TokenStorage = "none"
     #: The encrypted token (``vault``); never returned by the API.
     token_sealed: str | None = Field(default=None, repr=False)
@@ -83,10 +140,13 @@ class McpServer(_Model):
 
 class McpServerIn(_Model):
     name: str = Field(min_length=1, max_length=80)
-    url: str = Field(min_length=1, max_length=2000)
+    #: The server's address; for ``stdio`` it is derived from the command (anything given is ignored).
+    url: str = Field(default="", max_length=2000)
     enabled: bool = True
     allow_loopback: bool = False
     auth: AuthKind = "none"
+    transport: Transport = "http"
+    stdio: StdioCommand | None = None
     #: Write-only. ``None`` keeps the stored token, ``""`` removes it.
     token: str | None = Field(default=None, repr=False, max_length=8192)
     timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
@@ -104,6 +164,11 @@ class McpServerView(_Model):
     enabled: bool
     allow_loopback: bool
     auth: AuthKind
+    transport: Transport = "http"
+    stdio: StdioCommand | None = None
+    #: A stdio server's package environment: ``approval_needed``, ``installing``, ``ready``, ... (see
+    #: :class:`~nodestro_runtime.python_envs.DependencyStatus`); empty for HTTP servers.
+    environment_state: str = ""
     token_set: bool
     token_storage: TokenStorage
     timeout_seconds: float

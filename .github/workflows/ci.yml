@@ -57,8 +57,9 @@ jobs:
       - run: pytest
 
   docker:
-    # Tools with libraries in the Docker sandbox (ADR-0006 point 6): a real image is built from a hashed lock file and
-    # a tool runs in it without network. A missing Docker fails this job instead of skipping the tests.
+    # Tools with libraries and local MCP servers (WP-8) in the Docker sandbox (ADR-0006 point 6): a real image is built
+    # from a hashed lock file and a tool or a stdio MCP server runs in it without network. A missing Docker fails this
+    # job instead of skipping the tests.
     runs-on: ubuntu-latest
     env:
       NODESTRO_DOCKER_TESTS: "1"
@@ -83,7 +84,7 @@ jobs:
           git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
       - run: pip install -e ".[dev]"
       - run: docker info
-      - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py
+      - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
 
   builtin-sandbox:
     # Security probes and compatibility checks of the built-in Linux sandbox (Landlock + seccomp, ADR-0006) as the
