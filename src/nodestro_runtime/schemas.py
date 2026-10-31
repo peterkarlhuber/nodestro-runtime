@@ -15,6 +15,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from .providers import ProviderSettingsIn, ProviderStatus
+from .tool_policy import ToolBinding
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 ThinkingMode = Literal["adaptive", "between_tools", "disabled"]
@@ -171,6 +172,9 @@ class AgentConfig(_Model):
     task_template: str = "{{input}}"
     messages: list[ExampleMessage] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
+    #: When the agent asks before calling a tool (S-2), by tool name; a tool without an entry is a new binding
+    #: (``auto``). Only applies while per-call approvals are switched on.
+    tool_policies: dict[str, ToolBinding] = Field(default_factory=dict)
     server_tools: list[str] = Field(default_factory=list)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
@@ -435,6 +439,27 @@ class Usage(_Model):
     pricing_quality: str | None = None
 
 
+class ToolCallApproval(_Model):
+    """What the per-call approval rules did with one call."""
+
+    #: ``allowed`` (no question), ``pending`` (waiting), ``approved``, ``rejected``, ``expired``, ``cancelled`` or
+    #: ``denied`` (refused without a question).
+    status: Literal["allowed", "pending", "approved", "rejected", "expired", "cancelled", "denied"]
+    #: The stored request (collection ``tool_approvals``) when a person was asked.
+    request_id: str | None = None
+    #: The denial's code (``tool.not_granted``, ``tool.approval_unattended``, ``tool.approval_capacity``,
+    #: ``tool.approval_rejected``, ``tool.approval_timeout``).
+    code: str | None = None
+    deadline: datetime | None = None
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+    comment: str | None = None
+    #: The pre-grant that allowed an unattended call.
+    pre_grant_id: str | None = None
+    #: The capability the rules saw (``access``, ``reach``, ``source``).
+    capability: dict[str, str] = Field(default_factory=dict)
+
+
 class ToolCallRecord(_Model):
     id: str
     name: str
@@ -446,6 +471,9 @@ class ToolCallRecord(_Model):
     #: Where the tool came from, for tools outside Nodestro (MCP: ``source``, ``server_id``, ``server_name``,
     #: ``qualified_name``, ``definition_hash``, ``access``, ``external_cost`` = ``unknown``); empty otherwise.
     provenance: dict[str, Any] = Field(default_factory=dict)
+    #: The per-call approval rules' verdict (S-2); ``None`` when no rule applied (approvals off, or Nodestro's own
+    #: run tools).
+    approval: ToolCallApproval | None = None
 
 
 class EvaluationRecord(_Model):

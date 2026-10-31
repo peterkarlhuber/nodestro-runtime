@@ -50,11 +50,12 @@ from orkexa import (
     refine,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
+from orkexa.memory import MEMORY_TOOL_NAME
 from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import flow_driver, graph
+from . import flow_driver, graph, tool_policy
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -81,12 +82,14 @@ from .schemas import (
     RunEvent,
     RunIn,
     RunTrigger,
+    ToolCallApproval,
     ToolCallRecord,
     Usage,
     Workflow,
     now,
 )
 from .storage import DocumentStore
+from .tool_approvals import ToolApprovals, ToolGate
 
 logger = logging.getLogger(__name__)
 
@@ -750,6 +753,8 @@ class RunManager:
         self.remote_events: Callable[[str, int], list[RunEvent]] | None = None
         #: How often a run of another process is looked at (seconds).
         self.remote_poll = 0.25
+        #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
+        self.tool_gate: ToolGate | None = None
         self._followers: dict[int, asyncio.Task[None]] = {}
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
@@ -951,6 +956,7 @@ class RunManager:
             return False
         _interrupt(run)
         self.store.put("runs", run.id, run)
+        self._expire_approvals(run.id)
         self._notify(run)
         return True
 
@@ -1081,6 +1087,7 @@ class RunManager:
                 continue
             _interrupt(run)
             self.store.put("runs", run.id, run)
+            self._expire_approvals(run.id)
             count += 1
         return count
 
@@ -1880,6 +1887,146 @@ class RunManager:
         )
         self._save(context)
 
+    def _gate_call(
+        self,
+        context: _RunContext,
+        node_id: str,
+        config: AgentConfig,
+        call: ToolCall,
+        record: ToolCallRecord,
+        gate: ToolGate,
+    ) -> str | None:
+        """Apply the per-call rules (S-2) to one call in the agent's thread: ``None`` runs it, a string denies it.
+
+        Asking waits here for a stored decision (at most the deadline); the run stays ``running``. An approval only
+        lets the call run as it would have without the question, in its sandbox (ADR-0006)."""
+        try:
+            info = context.env.builder.tools.get(call.name)
+            capability, version, kind, definition = info.capability, info.version, info.kind, info.definition_hash
+        except KeyError:
+            capability, version, kind, definition = tool_policy.UNKNOWN, None, "custom", None
+        root = context.root.run
+        scope: tuple[tool_policy.PreGrantScope, str] | None = None
+        if root.trigger in ("schedule", "batch", "benchmark") and root.trigger_ref:
+            scope = (root.trigger, root.trigger_ref)
+        situation = tool_policy.CallContext(
+            run_id=context.run.id,
+            node_id=node_id,
+            trigger=root.trigger,
+            attended=root.trigger not in UNATTENDED_TRIGGERS,
+            scope=scope,
+            pre_grants=tuple(gate.pre_grants(*scope)) if scope is not None else (),
+            mcp_unattended=gate.mcp_unattended(),
+        )
+        verdict = tool_policy.decide(
+            tool=call.name,
+            kind=kind,
+            capability=capability,
+            binding=config.tool_policies.get(call.name),
+            context=situation,
+            at=now(),
+            version=version,
+        )
+        shown = capability.model_dump()
+        if verdict.action == "allow":
+            record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            return None
+        if verdict.action == "deny":
+            return self._deny_call(
+                context, node_id, call, record, verdict.code or "tool.denied_by_policy", verdict.reason or "", shown
+            )
+        run_id = context.run.id
+        if not gate.slots.enter(run_id):
+            return self._deny_call(
+                context,
+                node_id,
+                call,
+                record,
+                "tool.approval_capacity",
+                "Too many runs are waiting for an approval right now, so this call was not made",
+                shown,
+            )
+        try:
+            request = gate.approvals.request(
+                run_id=run_id,
+                node_id=node_id,
+                iteration=context.run.nodes[node_id].iteration,
+                call_id=call.id,
+                tool=call.name,
+                arguments=call.input,
+                capability=capability,
+                version=version,
+                definition_hash=definition,
+            )
+            record.approval = ToolCallApproval(
+                status="pending", request_id=request.id, deadline=request.deadline, capability=shown
+            )
+            self._emit(
+                context,
+                "tool_approval_requested",
+                node_id,
+                id=call.id,
+                name=call.name,
+                request_id=request.id,
+                deadline=request.deadline.isoformat(),
+                arguments_hash=request.arguments_hash,
+            )
+            self._save(context)
+            try:
+                final = gate.approvals.wait(run_id, request.id, check=context.check)
+            except BaseException:
+                record.approval = record.approval.model_copy(update={"status": "cancelled"})
+                raise
+        finally:
+            gate.slots.leave(run_id)
+        code = {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+        record.approval = ToolCallApproval(
+            status=final.status,
+            request_id=final.id,
+            code=code,
+            deadline=final.deadline,
+            decided_by=final.decided_by,
+            decided_at=final.decided_at,
+            comment=final.comment,
+            capability=shown,
+        )
+        self._emit(
+            context,
+            "tool_approval_decided",
+            node_id,
+            id=call.id,
+            request_id=final.id,
+            status=final.status,
+            decided_by=final.decided_by,
+        )
+        self._save(context)
+        if final.status == "approved":
+            return None
+        if final.status == "rejected":
+            return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
+        if final.status == "expired":
+            return "Nobody approved this call in time, so it was not made"
+        context.check()
+        raise RunCancelled("The run was cancelled")
+
+    def _deny_call(
+        self,
+        context: _RunContext,
+        node_id: str,
+        call: ToolCall,
+        record: ToolCallRecord,
+        code: str,
+        reason: str,
+        shown: dict[str, str],
+    ) -> str:
+        record.approval = ToolCallApproval(status="denied", code=code, capability=shown)
+        self._emit(context, "tool_denied", node_id, id=call.id, name=call.name, code=code, reason=reason)
+        return reason
+
+    def _expire_approvals(self, run_id: str) -> None:
+        """A run stopped without its process (interrupted, crashed, lost lease): its open questions expire."""
+        ToolApprovals(self.store).expire_run(run_id)
+
     def _run_agent_sync(self, context: _RunContext, node: Node, prompt: str, with_run_files: bool) -> None:
         """Runs in a worker thread: build the agent, ask (or refine), record the result."""
         assert node.agent is not None
@@ -1902,7 +2049,7 @@ class RunManager:
             context.check()
             context.tracker.check()
 
-        def before_tool(call: ToolCall) -> None:
+        def before_tool(call: ToolCall) -> str | None:
             context.check()
             record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
             mcp = context.env.builder.tools.mcp
@@ -1911,7 +2058,12 @@ class RunManager:
             calls[call.id] = record
             with context.lock:
                 state.tool_calls.append(record)
+            denial = None
+            own = {tool.name for tool in extra_tools} | {MEMORY_TOOL_NAME}
+            if self.tool_gate is not None and call.name not in own:
+                denial = self._gate_call(context, node_id, config, call, record, self.tool_gate)
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
+            return denial
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             record = calls.get(call.id)
