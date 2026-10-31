@@ -121,6 +121,9 @@ async def test_strict_mode_refuses_requests_without_a_price(make: Make) -> None:
     done = await _run(workspace, _flow("anthropic:claude-unknown-9"))
     assert done.status == "failed"
     assert done.usage.requests == 0  # nothing was sent
+    # Not "budget used up": the refusal names the missing price.
+    assert done.nodes["a"].error_code == "pricing.price_unknown"
+    assert done.nodes["a"].error_params == {"model": "anthropic:claude-unknown-9"}
 
 
 async def test_stale_prices_are_counted_and_strict_mode_refuses_critical_ones(make: Make) -> None:
@@ -223,3 +226,18 @@ def test_the_pre_check_knows_the_workspaces_prices(make: Make) -> None:
         ModelPrice(provider="openai", model="gpt-custom", rates=TokenRates.of("1", "2"), source="custom")
     )
     assert not unpriced()
+
+
+def test_price_refusals_have_their_own_codes() -> None:
+    from orkexa.dynamic import BudgetExceededError, UnpricedModelError, UnreliablePriceError
+
+    from nodestro_runtime.engine import node_problem
+    from nodestro_runtime.problems import library_problem
+
+    unpriced = UnpricedModelError("No price known for openai:gpt-x (agent 'A'); the budget cannot be enforced.")
+    unreliable = UnreliablePriceError("Request of agent 'A' to openai:gpt-5.1-mini not sent: price is stale")
+    assert node_problem(unpriced).code == "pricing.price_unknown"
+    assert node_problem(unpriced).params == {"model": "openai:gpt-x"}
+    assert library_problem(unreliable).code == "pricing.price_unreliable"
+    assert library_problem(unreliable).params == {"model": "openai:gpt-5.1-mini"}
+    assert node_problem(BudgetExceededError("Budget used up")).code == "run.budget_exceeded"
