@@ -64,6 +64,24 @@ def test_a_tenant_workspace_has_no_sqlite_file(database: PostgresDatabase, tmp_p
         workspace.close()
 
 
+def test_tenant_tool_code_runs_only_in_containers(database: PostgresDatabase, tmp_path: Path) -> None:
+    from nodestro_runtime.schemas import SettingsIn
+
+    # Even a stored (for example imported) subprocess setting does not bring the host subprocess back.
+    database.store("alpha").put_raw("settings", "app", {"sandbox": "subprocess"})
+    workspace = _workspace(database, tmp_path, "alpha")
+    try:
+        assert workspace.sandbox_policy.profile == "server"
+        assert workspace.settings().sandbox == "docker"
+        assert type(workspace.tools.registry.sandbox).__name__ == "DockerSandbox"
+        with pytest.raises(NodestroError) as caught:
+            workspace.update_settings(SettingsIn.model_validate({"sandbox": "subprocess"}))
+        assert caught.value.code == "sandbox.unavailable"
+        assert workspace.store.get_raw("settings", "app") == {"sandbox": "subprocess"}  # unchanged
+    finally:
+        workspace.close()
+
+
 def test_the_desktop_is_the_local_tenant(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "desktop", integrations=[])
     try:

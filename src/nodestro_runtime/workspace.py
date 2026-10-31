@@ -238,8 +238,10 @@ class Workspace:
             self.knowledge = KnowledgeBase(storage.knowledge, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(storage.memory)
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
-        self.sandbox_policy = SandboxPolicy(self.profile.kind)
-        sandbox = make_sandbox(self._stored("sandbox") or "subprocess", self.sandbox_policy)
+        # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
+        # whatever the profile or a stored (for example imported) setting says (ADR-0006).
+        self.sandbox_policy = SandboxPolicy("server" if storage is not None else self.profile.kind)
+        sandbox = make_sandbox(self._sandbox_kind(), self.sandbox_policy)
         self.tools = ToolLibrary(
             data_dir / "tools",
             sandbox=sandbox,
@@ -270,7 +272,7 @@ class Workspace:
             data_dir / "python",
             self.tools,
             runner=python_runner,
-            sandbox_kind=lambda: self._stored("sandbox") or "subprocess",
+            sandbox_kind=self._sandbox_kind,
             workflow_exists=lambda workflow_id: self.store.get_raw("workflows", workflow_id) is not None,
         )
         self.tools.dependencies = EnvironmentGate(self.python)
@@ -374,6 +376,12 @@ class Workspace:
         values = self.store.get_raw("settings", "app") or {}
         return values.get(key)
 
+    def _sandbox_kind(self) -> Literal["subprocess", "docker"]:
+        """The sandbox setting in effect: the stored one, or ``docker`` wherever only containers may run code."""
+        if self.sandbox_policy.profile != "desktop" or self._stored("sandbox") == "docker":
+            return "docker"
+        return "subprocess"
+
     def _providers(self, values: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
         """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key."""
         values = values if values is not None else (self.store.get_raw("settings", "app") or {})
@@ -396,7 +404,7 @@ class Workspace:
             default_model=default_model,
             assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
             default_budget_usd=budget,
-            sandbox=values.get("sandbox") or "subprocess",
+            sandbox=self._sandbox_kind(),
             docker_available=self._docker_available(),
             language=values.get("language") if values.get("language") in LANGUAGES else None,
             architect_budget_usd=values.get("architect_budget_usd", 2.0),
@@ -415,6 +423,8 @@ class Workspace:
     def update_settings(self, update: SettingsIn) -> Settings:
         values = self.store.get_raw("settings", "app") or {}
         changes = update.model_dump(exclude_unset=True)
+        if changes.get("sandbox") and changes["sandbox"] != "docker":
+            self.sandbox_policy.check_construction("none")  # before anything is stored
         # A top-level ``api_key`` is Anthropic's key; it moves into the provider settings (once, idempotent).
         providers = self._providers(values)
         values.pop("api_key", None)
@@ -454,7 +464,7 @@ class Workspace:
         A backup can come from anywhere, so the provenance of its tools is unknown: every restored custom tool
         becomes ``untrusted`` (ADR-0006)."""
         self.tools.provenance.clear()
-        self.tools.reload(make_sandbox(self._stored("sandbox") or "subprocess", self.sandbox_policy))
+        self.tools.reload(make_sandbox(self._sandbox_kind(), self.sandbox_policy))
         self.inputs.forget()
 
     # ---- workflows ------------------------------------------------------------------

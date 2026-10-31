@@ -72,6 +72,8 @@ class LoginState(BaseModel):
     nonce: str
     code_verifier: str
     return_to: str
+    #: The tenant the person asked for (``None``: the only one they belong to).
+    tenant_id: str | None = None
     bootstrap_token: bool = False
     bootstrap_hash: bytes | None = None
 
@@ -230,19 +232,26 @@ class IdentityStore:
     # ---- login states --------------------------------------------------------------------------
 
     def create_login_state(
-        self, *, nonce: str, code_verifier: str, return_to: str, bootstrap_token: str | None = None
+        self,
+        *,
+        nonce: str,
+        code_verifier: str,
+        return_to: str,
+        tenant_id: str | None = None,
+        bootstrap_token: str | None = None,
     ) -> str:
         """The ``state`` of a login that is starting; the callback takes it back once."""
         state = secrets.token_urlsafe(32)
         self.database._write(
             "INSERT INTO nodestro_login_states"
-            " (state_hash, nonce, code_verifier, return_to, bootstrap_hash, expires_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s)",
+            " (state_hash, nonce, code_verifier, return_to, tenant_id, bootstrap_hash, expires_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
                 _hash(state),
                 nonce,
                 code_verifier,
                 return_to,
+                tenant_id,
                 None if bootstrap_token is None else _hash(bootstrap_token),
                 _now() + self.login_lifetime,
             ),
@@ -255,16 +264,17 @@ class IdentityStore:
             return None
         rows = self.database._query(
             "DELETE FROM nodestro_login_states WHERE state_hash = %s"
-            " RETURNING nonce, code_verifier, return_to, bootstrap_hash, expires_at > clock_timestamp()",
+            " RETURNING nonce, code_verifier, return_to, tenant_id, bootstrap_hash, expires_at > clock_timestamp()",
             (_hash(state),),
         )
-        if not rows or not rows[0][4]:
+        if not rows or not rows[0][5]:
             return None
-        nonce, verifier, return_to, bootstrap, _valid = rows[0]
+        nonce, verifier, return_to, tenant_id, bootstrap, _valid = rows[0]
         return LoginState(
             nonce=nonce,
             code_verifier=verifier,
             return_to=return_to,
+            tenant_id=tenant_id,
             bootstrap_token=bootstrap is not None,
             bootstrap_hash=None if bootstrap is None else bytes(bootstrap),
         )

@@ -137,9 +137,12 @@ def test_a_tenant_keeps_an_owner(identity: IdentityStore) -> None:
 
 
 def test_login_states_are_taken_once(identity: IdentityStore) -> None:
-    state = identity.create_login_state(nonce="n", code_verifier="v", return_to="/runs", bootstrap_token="boot")
+    state = identity.create_login_state(
+        nonce="n", code_verifier="v", return_to="/runs", tenant_id="acme", bootstrap_token="boot"
+    )
     taken = identity.take_login_state(state)
-    assert taken is not None and (taken.nonce, taken.code_verifier, taken.return_to) == ("n", "v", "/runs")
+    assert taken is not None
+    assert (taken.nonce, taken.code_verifier, taken.return_to, taken.tenant_id) == ("n", "v", "/runs", "acme")
     assert taken.bootstrap_hash == _hash("boot")
     assert identity.take_login_state(state) is None
     assert identity.take_login_state("unknown") is None

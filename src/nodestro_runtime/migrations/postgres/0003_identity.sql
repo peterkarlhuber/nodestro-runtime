@@ -45,6 +45,7 @@ CREATE TABLE nodestro_login_states (
     nonce text NOT NULL,
     code_verifier text NOT NULL,
     return_to text NOT NULL,
+    tenant_id text COLLATE "C",
     bootstrap_hash bytea,
     expires_at timestamptz NOT NULL
 );

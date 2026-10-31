@@ -8,6 +8,9 @@ Tenant workspaces and identity records (M3 PR-9, ADR-0003). Nothing changes for 
   own SQLite file; `postgres_tables.tenant_storage(database, tenant)` builds them. The data directory then holds only
   that tenant's files. `Workspace.tenant_id` is `local` on the desktop. `Workspace.store` is typed as
   `DocumentStore`; the SQLite file of the desktop is `Workspace.sqlite_store` (`storage.not_sqlite` for a tenant).
+- A workspace on handed-in storage uses the server sandbox policy: tool code runs only in containers, a stored
+  `subprocess` setting (for example from an imported desktop) is ignored, and changing it is refused before
+  anything is stored (`sandbox.unavailable`).
 - Migration `0003`: tenants, users (OpenID Connect issuer and subject), memberships with the roles `owner`,
   `admin`, `editor`, `operator` and `viewer`, sessions, login states and bootstrap tokens.
 - `identity_store.IdentityStore`: creates tenants and users (no default user, no passwords), keeps at least one
