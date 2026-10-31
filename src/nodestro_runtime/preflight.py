@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
 from pydantic import BaseModel
 
-from . import graph
+from . import contracts, graph
 from .agent_builder import ConfigIssue
 from .engine import _PLACEHOLDER, MAX_DEPTH, check_workflow, node_label, start_fields
 from .graph import BRANCHING, ancestors, comment_sources, data_sources
@@ -609,6 +609,16 @@ def _dependency_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIss
     return found
 
 
+def _contract_issues(workflow: Workflow) -> list[CheckIssue]:
+    """Result nodes whose contract the agents before them cannot be seen to fulfil."""
+    return [
+        _issue(code, message, node_id=node.id, **params)
+        for node in workflow.nodes
+        if node.type == "output"
+        for code, message, params in contracts.source_gaps(workflow, node)
+    ]
+
+
 def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str] | None = None) -> WorkflowCheck:
     """Everything that blocks or affects a run of ``workflow``; never calls the API.
 
@@ -621,6 +631,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
         *_node_issues(workflow, known_files, partial(_priced, snapshot=nodestro.pricing.effective_snapshot())),
         *_flow_issues(workflow),
         *_subworkflow_issues(nodestro, workflow),
+        *_contract_issues(workflow),
     ]
     budget = workflow.budget_usd if workflow.budget_usd is not None else nodestro.settings().default_budget_usd
     if budget is not None and budget <= 0:

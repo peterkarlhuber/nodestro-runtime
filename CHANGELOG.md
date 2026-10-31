@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Adaptive Orchestration M3 (teams: output contracts and capabilities):
+
+- New `OutputNodeConfig.contract` (list of `OutputField`, like an agent's structured output): the fields a workflow
+  promises to deliver. The result node checks its input against it (an object, or JSON text of one), keeps only
+  the contract's fields and fails with `run.output_contract` (`fields`) when a required field is missing or has
+  the wrong type. A parent that runs such a workflow as a sub-workflow therefore receives a checked object, and
+  decisions after it can rely on its fields. New module `nodestro_runtime.contracts` (`contract_of(workflow)`).
+- Workflow check: `workflow.contract_field_name` and `workflow.contract_field_duplicate` block a run. Pre-check
+  warnings: `check.contract_text_source` (an agent before the result answers in plain text) and
+  `check.contract_field_missing` (no structured agent before the result delivers a required field).
+- New `WorkflowIn.capabilities`: up to 20 tags (at most 40 characters each, trimmed, unique ignoring case) that
+  say what a workflow can do as a team. They travel with the workflow and grant nothing.
+
 Adaptive Orchestration M2 (step limit):
 
 - New `WorkflowLimits.max_steps` (1 to 10,000): the most node executions of a run. Every executed node counts,

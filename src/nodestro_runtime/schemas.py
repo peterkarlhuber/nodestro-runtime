@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .providers import ProviderSettingsIn, ProviderStatus
 from .tool_policy import ToolBinding
@@ -328,6 +328,8 @@ class ResultFileSpec(_Model):
 
 class OutputNodeConfig(_Model):
     files: list[ResultFileSpec] = Field(default_factory=list)
+    #: The fields the workflow promises to deliver (see :mod:`nodestro_runtime.contracts`); empty: no contract.
+    contract: list[OutputField] = Field(default_factory=list, max_length=50)
 
 
 class Node(_Model):
@@ -377,6 +379,9 @@ MAX_PARALLEL_LIMIT = 32
 MAX_DURATION_LIMIT_S = 7 * 24 * 3600
 #: Most node executions a workflow may allow for one run.
 MAX_STEPS_LIMIT = 10_000
+#: Most capability tags of a workflow, and the longest tag.
+MAX_CAPABILITIES = 20
+MAX_CAPABILITY_LENGTH = 40
 
 
 class WorkflowLimits(_Model):
@@ -401,6 +406,25 @@ class WorkflowIn(_Model):
     edges: list[Edge] = Field(default_factory=list)
     budget_usd: float | None = Field(default=None, ge=0)
     limits: WorkflowLimits = Field(default_factory=WorkflowLimits)
+    #: What the workflow can do as a team, e.g. ``research`` or ``translate`` (up to 20 short tags). They travel
+    #: with the workflow (versions, export) and help to find a fitting team; they grant nothing.
+    capabilities: list[str] = Field(default_factory=list, max_length=MAX_CAPABILITIES)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _clean_capabilities(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            tag = " ".join(item.split())
+            if not tag:
+                continue
+            if len(tag) > MAX_CAPABILITY_LENGTH:
+                raise ValueError(f"a capability has at most {MAX_CAPABILITY_LENGTH} characters")
+            if tag.casefold() not in seen:
+                seen.add(tag.casefold())
+                cleaned.append(tag)
+        return cleaned
 
 
 class Workflow(WorkflowIn):

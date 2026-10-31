@@ -55,7 +55,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import flow_driver, graph, tool_policy
+from . import contracts, flow_driver, graph, tool_policy
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -345,6 +345,9 @@ def _node_problems(node: Node, workflow: Workflow) -> list[CheckIssue]:
             add("condition.source_ambiguous", f"{label} receives several results; choose the one to evaluate")
     if node.type == "subworkflow" and (node.subworkflow is None or not node.subworkflow.workflow_id):
         add("workflow.subworkflow_missing", f"{label} has no workflow selected")
+    if node.type == "output" and node.output is not None:
+        for code, message, params in contracts.contract_problems(node.output.contract):
+            add(code, f"{label}: {message}", **params)
     return found
 
 
@@ -1791,10 +1794,36 @@ class RunManager:
             self._emit(context, "node_finished", node.id, status="succeeded", output=state.output)
             return
         if node.type == "output":
-            state.status = "succeeded"
-            state.output = inputs[0][1] if len(inputs) == 1 else {name: value for name, value in inputs}
+            contract = node.output.contract if node.output is not None else []
+            if contract:
+                try:
+                    state.output = contracts.apply_contract(contract, contracts.merged_input(inputs))
+                    state.status = "succeeded"
+                except contracts.ContractError as error:
+                    state.status = "failed"
+                    names = ", ".join(error.fields)
+                    _fail(
+                        state,
+                        problem(
+                            "run.output_contract",
+                            f"The result does not fulfil the workflow's contract: {names}",
+                            fields=names,
+                        ),
+                    )
+            else:
+                state.status = "succeeded"
+                state.output = inputs[0][1] if len(inputs) == 1 else {name: value for name, value in inputs}
             state.finished_at = now()
-            self._emit(context, "node_finished", node.id, status="succeeded", output=state.output)
+            self._emit(
+                context,
+                "node_finished",
+                node.id,
+                status=state.status,
+                output=state.output,
+                error=state.error,
+                error_code=state.error_code,
+                error_params=state.error_params,
+            )
             return
         if node.type == "condition":
             self._decide(context, node, inputs)
