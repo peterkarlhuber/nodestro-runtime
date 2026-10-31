@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decision D10):
+
+- New module `nodestro_runtime.tool_policy`: `ToolCapability` (`access` read/write/destructive, `reach`
+  internal/external, `source` nodestro/author/admin/derived/default) for every tool kind, the fixed statements of the
+  built-in and the provider's server tools, and `capability_of(...)`. A missing or invalid statement is `write` +
+  `external`; a stored statement can never claim another source; MCP tools always reach out; own and generated tools
+  in a sandbox without network (container, built-in Linux sandbox) count as `internal` (`derived`). Description only:
+  no behavior changes yet.
+- `DocumentStore.replace_if(collection, key, model, *, field, expected, live_until=None)`: replaces a document only
+  while its field still has the expected value and, with `live_until`, only while the time in that field lies in the
+  future (PostgreSQL: one conditional `UPDATE` against the database clock; SQLite: inside `BEGIN IMMEDIATE`). Exactly
+  one of several concurrent writers wins, also across processes and connections. Tool approval decisions will use it,
+  so that they never live in (and are never overwritten by saves of) the run document.
+
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
 - New package `nodestro_runtime.mcp`: remote MCP servers over Streamable HTTP through the official SDK (`mcp` 2.x,

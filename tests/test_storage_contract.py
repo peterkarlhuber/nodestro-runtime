@@ -613,3 +613,61 @@ def _imports_sqlite3(node: ast.Import | ast.ImportFrom) -> bool:
     if isinstance(node, ast.ImportFrom):
         return node.module == "sqlite3"
     return any(alias.name == "sqlite3" for alias in node.names)
+
+
+class Request(BaseModel):
+    id: str
+    status: str = "pending"
+    deadline: str | None = None
+    by: str = ""
+
+
+def _later(seconds: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def test_replace_if_changes_only_the_expected_state(store: DocumentStore) -> None:
+    store.put("requests", "r1", Request(id="r1", deadline=_later(60)))
+    approved = Request(id="r1", status="approved", deadline=_later(60), by="anna")
+    assert store.replace_if("requests", "r1", approved, field="status", expected="pending", live_until="deadline")
+    # The second decision finds the state changed and loses; nothing is overwritten.
+    rejected = Request(id="r1", status="rejected", by="ben")
+    assert not store.replace_if("requests", "r1", rejected, field="status", expected="pending")
+    assert store.get("requests", "r1", Request) == approved
+    assert not store.replace_if("requests", "missing", approved, field="status", expected="pending")
+
+
+def test_replace_if_respects_the_deadline(store: DocumentStore) -> None:
+    store.put("requests", "past", Request(id="past", deadline=_later(-1)))
+    store.put("requests", "none", Request(id="none"))
+    store.put_raw("requests", "bad", {"id": "bad", "status": "pending", "deadline": "soon"})
+    for key in ("past", "none", "bad"):
+        late = Request(id=key, status="approved")
+        assert not store.replace_if("requests", key, late, field="status", expected="pending", live_until="deadline")
+    # Without the deadline check the state transition itself (e.g. to "expired") still works.
+    expired = Request(id="past", status="expired")
+    assert store.replace_if("requests", "past", expired, field="status", expected="pending")
+
+
+def test_replace_if_has_one_winner_across_threads(store: DocumentStore) -> None:
+    store.put("requests", "r", Request(id="r", deadline=_later(60)))
+    wins: list[str] = []
+    barrier = threading.Barrier(8)
+
+    def decide(who: str) -> None:
+        barrier.wait()
+        if store.replace_if(
+            "requests", "r", Request(id="r", status="approved", by=who), field="status", expected="pending"
+        ):
+            wins.append(who)
+
+    threads = [threading.Thread(target=decide, args=(f"p{i}",)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(wins) == 1
+    stored = store.get("requests", "r", Request)
+    assert stored is not None and stored.by == wins[0]
