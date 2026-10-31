@@ -15,6 +15,11 @@ MCP operations (ADR-0007, work package WP-7):
 - `McpService.write_gate` is a plain flag (default `False`): `write`/`destructive` tools stay blocked until the
   shared per-call approval (D10, S-2b) turns it on; there is no MCP-specific approval path.
 
+Adaptive Orchestration M1 (loop placeholders in the check before a run):
+
+- `preflight` accepts `{{iteration}}`, `{{previous}}` and `{{feedback}}` in the tasks of nodes inside a loop; outside
+  loops they still get `check.placeholder_unknown`, because they stay as they are there.
+
 Sandbox gateway: no tool code without enforced resource limits (Nodestro Local Docker):
 
 - **Fixed: sandbox containers could run without memory, CPU and process limits.** Docker drops limits it cannot
