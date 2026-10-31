@@ -65,7 +65,7 @@ from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .orchestrator import DECISION_FIELDS, ORCHESTRATOR_PROMPT, decision_of, orchestrator_problems
+from .orchestrator import DECISION_FIELDS, ORCHESTRATOR_PROMPT, decision_of, orchestrator_problems, select_teams
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
@@ -726,6 +726,13 @@ def _no_workflow(workflow_id: str, _version: int | None) -> tuple[Workflow, int 
     raise KeyError(workflow_id)
 
 
+def _usable_team(workflow: Workflow) -> bool:
+    """Whether a selected workflow can run as a team: no errors and no approval steps."""
+    if any(node.type == "approval" for node in workflow.nodes):
+        return False
+    return not any(issue.level == "error" for issue in check_workflow(workflow))
+
+
 class RunManager:
     """Starts runs, keeps their live event streams and persists their results.
 
@@ -916,19 +923,36 @@ class RunManager:
 
     def pin_subworkflows(self, workflow: Workflow) -> Workflow:
         """A copy whose sub-workflow nodes name the exact version they will run."""
-        if not any(node.type in ("subworkflow", "orchestrator") for node in workflow.nodes):
+        selecting = [
+            node for node in workflow.nodes if node.orchestrator is not None and node.orchestrator.select is not None
+        ]
+        if not selecting and not any(graph.workflow_refs(node) for node in workflow.nodes):
             return workflow
         pinned = workflow.model_copy(deep=True)
         for node in pinned.nodes:
-            config = node.subworkflow
-            if config is not None and config.workflow_id and config.version is None:
-                with suppress(KeyError, NodestroError):
-                    config.version = self.resolve_workflow(config.workflow_id, None)[1]
-            for member in node.orchestrator.members if node.orchestrator is not None else []:
-                if member.workflow_id and member.version is None:
+            for ref in graph.workflow_refs(node):
+                if ref.version is None:
                     with suppress(KeyError, NodestroError):
-                        member.version = self.resolve_workflow(member.workflow_id, None)[1]
+                        ref.version = self.resolve_workflow(ref.workflow_id, None)[1]
+        if selecting:
+            candidates = self.team_candidates()
+            for node in pinned.nodes:
+                config = node.orchestrator
+                if config is not None and config.select is not None:
+                    config.members += select_teams(config, workflow.id, candidates, _usable_team)
         return pinned
+
+    def team_candidates(self) -> list[tuple[Workflow, int]]:
+        """Saved workflows with capabilities, in their latest saved version (for pool selection)."""
+        found: list[tuple[Workflow, int]] = []
+        for current in self.store.list("workflows", Workflow):
+            if not current.capabilities:
+                continue
+            with suppress(KeyError, NodestroError):
+                snapshot, version = self.resolve_workflow(current.id, None)
+                if version is not None and snapshot.capabilities:
+                    found.append((snapshot, version))
+        return found
 
     def _launch(self, run: Run, *, local: bool = False) -> Run:
         if self.dispatch is not None and not local:
@@ -2163,6 +2187,8 @@ class RunManager:
         members: list[orchestration.Member] = []
         for item in config.members:
             if item.workflow_id == context.run.workflow_id or item.workflow_id in context.stack:
+                if item.matched:
+                    continue  # selected by capability: a team that is already running is simply not offered
                 raise NodestroError(
                     "run.subworkflow_recursive", f"{label} would call a workflow that is already running", node=label
                 )
@@ -2185,6 +2211,13 @@ class RunManager:
                 )
             )
         if not members:
+            if config.select is not None and config.select.capabilities:
+                raise NodestroError(
+                    "run.orchestrator_no_match",
+                    f"No saved team of {label} has one of the capabilities it selects",
+                    node=label,
+                    capabilities=", ".join(config.select.capabilities),
+                )
             raise NodestroError("workflow.orchestrator_no_members", f"{label} has no teams to choose from", node=label)
         return orchestration.Pool(members=tuple(members)), teams
 
@@ -2296,6 +2329,10 @@ class RunManager:
             _fail(state, node_problem(exc))
         finally:
             state.usage = self._node_usage(context, node.id)
+            own = [record for record in context.tracker.records if record.agent == node.id]
+            state.decision_usage = usage_of(
+                summarize_usage(own), own, stale_requests=stale_requests(context.tracker, own)
+            )
             state.finished_at = now()
         self._emit(
             context,

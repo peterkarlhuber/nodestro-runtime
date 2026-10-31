@@ -324,6 +324,43 @@ class OrchestratorMember(_Model):
     workflow_id: str = ""
     #: The pinned version; ``None`` takes the latest version when the run starts.
     version: int | None = None
+    #: Filled in when the team was selected by capability (``OrchestratorConfig.select``): the matching tags.
+    matched: list[str] = Field(default_factory=list)
+
+
+def _clean_tags(value: list[str]) -> list[str]:
+    """Capability tags trimmed, without empty ones and unique ignoring case."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        tag = " ".join(item.split())
+        if not tag:
+            continue
+        if len(tag) > MAX_CAPABILITY_LENGTH:
+            raise ValueError(f"a capability has at most {MAX_CAPABILITY_LENGTH} characters")
+        if tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            cleaned.append(tag)
+    return cleaned
+
+
+class OrchestratorSelect(_Model):
+    """Pool selection by capability (AO M5): saved workflows whose capabilities match join the pool.
+
+    The selection is made when a run (or a published release) pins its workflows, so it is fixed and
+    visible in the run's snapshot: every selected member names the tags it matched. Teams are ordered
+    by the number of matching tags, then by name; no score is invented. Workflows with errors, with
+    approval steps (not supported inside an orchestrator) and the workflow itself are left out.
+    """
+
+    capabilities: list[str] = Field(default_factory=list, max_length=10)
+    #: At most this many selected teams (the explicit members come first and count towards ``MAX_POOL``).
+    max_teams: int = Field(default=5, ge=1, le=MAX_POOL)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _clean(cls, value: list[str]) -> list[str]:
+        return _clean_tags(value)
 
 
 class OrchestratorConfig(_Model):
@@ -343,6 +380,8 @@ class OrchestratorConfig(_Model):
     max_decisions: int = Field(default=8, ge=1, le=MAX_DECISIONS)
     #: How often one team may be chosen; ``None``: only ``max_decisions`` limits it.
     max_per_member: int | None = Field(default=None, ge=1, le=MAX_DECISIONS)
+    #: Add teams by capability when the run starts (AO M5); ``None``: only ``members``.
+    select: OrchestratorSelect | None = None
 
 
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
@@ -446,18 +485,7 @@ class WorkflowIn(_Model):
     @field_validator("capabilities")
     @classmethod
     def _clean_capabilities(cls, value: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for item in value:
-            tag = " ".join(item.split())
-            if not tag:
-                continue
-            if len(tag) > MAX_CAPABILITY_LENGTH:
-                raise ValueError(f"a capability has at most {MAX_CAPABILITY_LENGTH} characters")
-            if tag.casefold() not in seen:
-                seen.add(tag.casefold())
-                cleaned.append(tag)
-        return cleaned
+        return _clean_tags(value)
 
 
 class Workflow(WorkflowIn):
@@ -655,6 +683,8 @@ class NodeRun(_Model):
     #: and the child run of every delegation, in order.
     orchestration: dict[str, Any] | None = None
     child_run_ids: list[str] = Field(default_factory=list)
+    #: Orchestrator: the usage of its own decisions, without its teams (they are in ``usage`` as well).
+    decision_usage: Usage | None = None
     #: The result was taken over from this earlier run instead of executing the node again.
     reused_from: str | None = None
     #: Hash of everything the node's result depends on (configuration, inputs' sources, tools);

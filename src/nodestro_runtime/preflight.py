@@ -20,8 +20,9 @@ from pydantic import BaseModel
 
 from . import contracts, graph
 from .agent_builder import ConfigIssue
-from .engine import _PLACEHOLDER, MAX_DEPTH, check_workflow, node_label, start_fields
-from .graph import BRANCHING, ancestors, comment_sources, data_sources
+from .engine import _PLACEHOLDER, MAX_DEPTH, _usable_team, check_workflow, node_label, start_fields
+from .graph import BRANCHING, ancestors, comment_sources, data_sources, workflow_refs
+from .orchestrator import select_teams
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
@@ -148,7 +149,7 @@ def _node_issues(
                     )
                 )
             continue
-        if node.type == "subworkflow":
+        if node.type in ("subworkflow", "orchestrator"):
             if has_start and not predecessors[node.id]:
                 found.append(
                     _issue(
@@ -406,15 +407,7 @@ def _flow_issues(workflow: Workflow) -> list[CheckIssue]:
 
 def _called(workflow: Workflow) -> list[tuple[str, int | None]]:
     """The workflows (id, version) that ``workflow`` calls: sub-workflows and orchestrator teams."""
-    found: list[tuple[str, int | None]] = []
-    for item in workflow.nodes:
-        if item.type == "subworkflow" and item.subworkflow is not None and item.subworkflow.workflow_id:
-            found.append((item.subworkflow.workflow_id, item.subworkflow.version))
-        if item.type == "orchestrator" and item.orchestrator is not None:
-            found.extend(
-                (member.workflow_id, member.version) for member in item.orchestrator.members if member.workflow_id
-            )
-    return found
+    return [(ref.workflow_id, ref.version) for item in workflow.nodes for ref in workflow_refs(item)]
 
 
 def _calls_back(nodestro: Workspace, root: str, child: Workflow) -> bool:
@@ -444,6 +437,49 @@ def _orchestrator_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckI
         if node.type != "orchestrator" or node.orchestrator is None:
             continue
         label = node_label(node)
+        select = node.orchestrator.select
+        if select is not None and select.capabilities:
+            chosen = [member for member in node.orchestrator.members if member.matched]
+            chosen += select_teams(node.orchestrator, workflow.id, nodestro.runs.team_candidates(), _usable_team)
+            names: list[str] = []
+            for member in chosen:
+                try:
+                    names.append(nodestro.resolve_workflow(member.workflow_id, member.version)[0].name)
+                except KeyError:
+                    continue
+            if names:
+                found.append(
+                    _issue(
+                        "check.orchestrator_selected",
+                        f"{label} selects {len(names)} teams by capability: {', '.join(names)}",
+                        level="info",
+                        node_id=node.id,
+                        name=label,
+                        teams=", ".join(names),
+                        count=len(names),
+                    )
+                )
+            elif not node.orchestrator.members:
+                found.append(
+                    _issue(
+                        "check.orchestrator_no_match",
+                        f"{label}: no saved team has one of the capabilities {', '.join(select.capabilities)}",
+                        level="error",
+                        node_id=node.id,
+                        name=label,
+                        capabilities=", ".join(select.capabilities),
+                    )
+                )
+            else:
+                found.append(
+                    _issue(
+                        "check.orchestrator_no_match",
+                        f"{label}: no saved team has one of the capabilities {', '.join(select.capabilities)}",
+                        node_id=node.id,
+                        name=label,
+                        capabilities=", ".join(select.capabilities),
+                    )
+                )
         for member in node.orchestrator.members:
             if not member.workflow_id:
                 continue

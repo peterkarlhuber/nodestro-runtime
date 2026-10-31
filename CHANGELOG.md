@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Adaptive Orchestration M5 (pool selection):
+
+- New `OrchestratorConfig.select` (`capabilities`, up to 10 tags; `max_teams` 1..20, default 5): saved workflows
+  whose capabilities match join the pool. The selection happens when a run or a published release pins its
+  workflows, so it is fixed and visible in the run's snapshot: each selected `OrchestratorMember` has `matched`
+  (the tags it shares). Order: number of matching tags, then name and id; no score is invented. Workflows with
+  errors or approval steps, explicit members and the workflow itself are left out; a selected team that is already
+  running is not offered. `RunManager.team_candidates()` lists the saved teams; `graph.workflow_refs(node)` names
+  every workflow a node calls (sub-workflow or orchestrator teams).
+- Pre-check: `check.orchestrator_selected` (info: the teams the selection takes now) and
+  `check.orchestrator_no_match` (error without explicit members, else warning). At run time an empty pool after
+  selection fails with `run.orchestrator_no_match` (`node`, `capabilities`).
+- `NodeRun.decision_usage`: the orchestrator's own requests; usage per model counts them for its model and the
+  teams' requests for their agents' models.
+
 Adaptive Orchestration M4 (orchestrator node):
 
 - New node type `orchestrator` (`OrchestratorConfig`: `members` (up to 20 team workflows, optionally pinned to a

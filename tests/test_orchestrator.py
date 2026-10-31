@@ -245,3 +245,94 @@ def test_preflight_checks_the_teams_and_runs_pin_their_versions(make: Make) -> N
 
     pinned = workspace.runs.pin_subworkflows(saved)
     assert [member.version for member in pinned.nodes[1].orchestrator.members] == [1, 1, None]  # type: ignore[union-attr]
+
+
+async def test_costs_count_for_the_orchestrator_model_and_the_teams(make: Make) -> None:
+    from nodestro_runtime.run_views import models_of_run
+
+    ids: dict[str, str] = {}
+    workspace = make(
+        {
+            BOSS: [
+                parsed(lambda model: model(action="delegate", member=ids["t"], task="go")),
+                decision(action="finish", answer="done", reason="ok"),
+            ],
+            "TEAM": [text("result")],
+        }
+    )
+    member = team(workspace, "TEAM", "Team")
+    ids["t"] = member.id
+    flow = boss(member, model="anthropic:boss-model")
+    done = await run(workspace, flow)
+    assert done.status == "succeeded", done.error
+    lead = done.nodes["lead"]
+    assert lead.decision_usage is not None and lead.decision_usage.requests == 2
+    assert lead.usage.requests == 3
+    models = models_of_run(workspace, done)
+    assert models["anthropic:boss-model"].requests == 2
+    assert sum(usage.requests for usage in models.values()) == 3
+
+
+async def test_capability_selection_adds_matching_teams_to_the_pool(make: Make) -> None:
+    from nodestro_runtime.preflight import preflight
+
+    ids: dict[str, str] = {}
+    workspace = make(
+        {
+            BOSS: [
+                parsed(lambda model: model(action="delegate", member=ids["best"], task="go")),
+                decision(action="finish", answer="done", reason="ok"),
+            ],
+            "BEST": [text("best result")],
+        }
+    )
+    best = team(workspace, "BEST", "Best", capabilities=["Research", "summaries"])
+    ids["best"] = best.id
+    other = team(workspace, "OTHER", "Other", capabilities=["research"])
+    team(workspace, "NONE", "Unrelated", capabilities=["billing"])
+    team(
+        workspace,
+        "PAUSE",
+        "Pausing",
+        capabilities=["research"],
+        nodes=[{"id": "ok", "type": "approval", "label": "Check", "approval": {"instructions": "ok?"}}],
+        edges=[edge("w", "ok")],
+    )
+    flow = boss(select={"capabilities": ["research", "Summaries"], "max_teams": 5})
+    saved = workspace.save_workflow(flow)
+    assert not [issue for issue in check_workflow(saved) if issue.level == "error"]
+
+    pinned = workspace.runs.pin_subworkflows(saved)
+    members = pinned.nodes[1].orchestrator.members  # type: ignore[union-attr]
+    # Two matching tags first, then one; no approval team, no unrelated team; versions pinned.
+    assert [(member.workflow_id, member.matched) for member in members] == [
+        (best.id, ["research", "Summaries"]),
+        (other.id, ["research"]),
+    ]
+    assert all(member.version == 1 for member in members)
+    problems = preflight(workspace, saved).problems
+    selected = next(issue for issue in problems if issue.code == "check.orchestrator_selected")
+    assert selected.params["teams"] == "Best, Other"
+
+    done = await run(workspace, flow)
+    assert done.status == "succeeded", done.error
+    assert done.workflow.nodes[1].orchestrator.members[0].matched == ["research", "Summaries"]  # type: ignore[union-attr]
+
+    # No match: the check stops the start with its own code.
+    lonely = workspace.save_workflow(boss(select={"capabilities": ["astronomy"]}))
+    codes = [issue.code for issue in preflight(workspace, lonely).problems if issue.level == "error"]
+    assert "check.orchestrator_no_match" in codes
+
+
+def test_select_teams_respects_the_pool_size() -> None:
+    from nodestro_runtime.orchestrator import select_teams
+    from nodestro_runtime.schemas import OrchestratorConfig
+
+    config = OrchestratorConfig.model_validate(
+        {"members": [{"workflow_id": f"wf_{n}"} for n in range(18)], "select": {"capabilities": ["x"], "max_teams": 5}}
+    )
+    candidates = [
+        (Workflow.model_validate({"id": f"wf_c{n}", "name": f"C{n}", "capabilities": ["x"]}), 1) for n in range(5)
+    ]
+    chosen = select_teams(config, None, candidates, lambda _workflow: True)
+    assert [member.workflow_id for member in chosen] == ["wf_c0", "wf_c1"]

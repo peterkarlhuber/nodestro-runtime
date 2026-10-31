@@ -151,4 +151,15 @@ def models_of_run(ctx: Workspace, run: Run, depth: int = 0) -> dict[str, Usage]:
             if child is not None:
                 for model, usage in models_of_run(ctx, child, depth + 1).items():
                     found[model] = add_usage(found.get(model, Usage()), usage)
+        elif node.type == "orchestrator" and node.orchestrator is not None and depth < 6:
+            # Its own decisions count for its model; its teams' agents for theirs.
+            if state.decision_usage is not None and state.decision_usage.requests:
+                model = node.orchestrator.model
+                found[model] = add_usage(found.get(model, Usage()), state.decision_usage)
+            for child_id in state.child_run_ids:
+                team = ctx.store.get("runs", child_id, Run)
+                if team is None:
+                    continue
+                for model, usage in models_of_run(ctx, team, depth + 1).items():
+                    found[model] = add_usage(found.get(model, Usage()), usage)
     return found

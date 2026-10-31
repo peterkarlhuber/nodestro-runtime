@@ -34,7 +34,20 @@ import json
 from typing import Any, Literal
 
 from .conditions import APPROVED, DEFAULT_BRANCH, REJECTED
-from .schemas import Edge, Node, NodeRun, Workflow, WorkflowIn
+from .schemas import Edge, Node, NodeRun, OrchestratorMember, SubworkflowConfig, Workflow, WorkflowIn
+
+
+def workflow_refs(node: Node) -> list[SubworkflowConfig | OrchestratorMember]:
+    """The references to other workflows in ``node`` (a sub-workflow, or an orchestrator's teams).
+
+    Each has ``workflow_id`` and ``version``; changing ``version`` pins the reference.
+    """
+    if node.type == "subworkflow" and node.subworkflow is not None and node.subworkflow.workflow_id:
+        return [node.subworkflow]
+    if node.type == "orchestrator" and node.orchestrator is not None:
+        return [member for member in node.orchestrator.members if member.workflow_id]
+    return []
+
 
 #: Node types that pass the data arriving at them on to their successors.
 TRANSPARENT = frozenset({"condition", "approval"})
