@@ -605,6 +605,13 @@ class RunManager:
         self.listeners: list[Callable[[Run], None]] = []
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
+        #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
+        #: process; a worker executes them with :meth:`execute_claimed`. ``None``: in-process (the desktop).
+        self.dispatch: Callable[[Run], None] | None = None
+        #: Asks the worker of a queued or running run (of another process) to cancel it; ``True`` when asked.
+        self.remote_cancel: Callable[[Run], bool] | None = None
+        #: Receives every event of the runs executing in this process (the server's event table).
+        self.event_sink: Callable[[RunEvent], None] | None = None
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
         #: The ``seq`` of the last event of each live or paused run.
@@ -734,7 +741,12 @@ class RunManager:
                     config.version = self.resolve_workflow(config.workflow_id, None)[1]
         return pinned
 
-    def _launch(self, run: Run) -> Run:
+    def _launch(self, run: Run, *, local: bool = False) -> Run:
+        if self.dispatch is not None and not local:
+            # Queue execution: the run is stored and a worker executes it (ADR-0004).
+            self.store.put("runs", run.id, run)
+            self.dispatch(run)
+            return run
         loop = _require_loop()
         workflow = run.workflow
         budget = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
@@ -767,6 +779,43 @@ class RunManager:
         if run.status != "paused":
             raise NodestroError("run.not_paused", "Only a paused run can continue", status=run.status)
         return self._launch(run)
+
+    def execute_claimed(self, run_id: str) -> Run:
+        """Execute a run that a worker claimed from the queue, in this process (returns at once; see :meth:`wait`).
+
+        Only a queued run, or a paused run whose decision was recorded, is executed; anything else raises
+        ``run.not_executable`` (a claimed job never executes a run twice)."""
+        elsewhere = self._on_loop(lambda: self.execute_claimed(run_id))
+        if elsewhere is not None:
+            return elsewhere
+        if run_id in self._contexts:
+            raise NodestroError("run.not_executable", "This run is already executing here", status="running")
+        run = self.store.get("runs", run_id, Run)
+        if run is None:
+            raise KeyError(run_id)
+        if run.status not in ("queued", "paused"):
+            raise NodestroError("run.not_executable", "Only a queued or paused run can be executed", status=run.status)
+        return self._launch(run, local=True)
+
+    def interrupt(self, run_id: str) -> bool:
+        """Mark a run that stopped executing elsewhere (its worker died) as interrupted; it can be continued.
+
+        Returns ``False`` for a run that is not queued or running (nothing to do)."""
+        run = self.store.get("runs", run_id, Run)
+        if run is None or run.status not in ("queued", "running") or run.id in self._contexts:
+            return False
+        _interrupt(run)
+        self.store.put("runs", run.id, run)
+        self._notify(run)
+        return True
+
+    def cancel_unclaimed(self, run_id: str) -> bool:
+        """Cancel a stored run that no worker executes (its queued job was withdrawn); ``False`` otherwise."""
+        run = self.store.get("runs", run_id, Run)
+        if run is None or run.status not in ("queued", "paused") or run.id in self._contexts:
+            return False
+        self._cancel_stored(run)
+        return True
 
     def root_of(self, run: Run) -> Run:
         """The top run of a sub-workflow's run (the run itself otherwise)."""
@@ -832,13 +881,22 @@ class RunManager:
             self._emit(context, "run_cancelling")
             return True
         stored = self.store.get("runs", root.id, Run)
-        if stored is not None and stored.status == "paused":
+        if stored is None:
+            return False
+        # Queue execution: a worker may hold the run (also a paused run whose decision was just recorded).
+        if (
+            stored.status in ("queued", "running", "paused")
+            and self.remote_cancel is not None
+            and self.remote_cancel(stored)
+        ):
+            return True
+        if stored.status == "paused":
             self._cancel_stored(stored)
             return True
         return False
 
     def _cancel_stored(self, run: Run) -> None:
-        """Cancel a paused run that is not executing (its pending approvals end undecided)."""
+        """Cancel a paused or queued run that is not executing (its pending approvals end undecided)."""
         for node in run.workflow.nodes:
             state = run.nodes.get(node.id)
             if state is None:
@@ -876,14 +934,7 @@ class RunManager:
         for run in self.store.find("runs", "status", ("queued", "running"), Run):
             if run.imported_at is not None or run.id in self._contexts:
                 continue
-            for state in run.nodes.values():
-                if state.status == "running":
-                    state.status = "failed"
-                    state.finished_at = now()
-                    _fail(state, problem("run.interrupted", "Nodestro stopped while this ran"))
-            run.status = "failed"
-            run.finished_at = now()
-            _fail(run, problem("run.interrupted", "Nodestro stopped while this ran"))
+            _interrupt(run)
             self.store.put("runs", run.id, run)
             count += 1
         return count
@@ -966,6 +1017,11 @@ class RunManager:
         seq = self._seq[run_id] + 1
         self._seq[run_id] = seq
         event = RunEvent(seq=seq, run_id=run_id, type=kind, node_id=node_id, data=data)
+        if self.event_sink is not None:
+            try:
+                self.event_sink(event)
+            except Exception:  # the stream of another process misses it; the run itself goes on
+                logger.exception("Recording an event of run %s failed", run_id)
         events = self._events.setdefault(run_id, [])
         if len(events) < _MAX_EVENT_HISTORY or kind not in ("text", "thinking"):
             events.append(event)
@@ -1805,6 +1861,18 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
 
 def _is_paused(run: Run) -> bool:
     return run.status == "paused"
+
+
+def _interrupt(run: Run) -> None:
+    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable."""
+    for state in run.nodes.values():
+        if state.status == "running":
+            state.status = "failed"
+            state.finished_at = now()
+            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran"))
+    run.status = "failed"
+    run.finished_at = now()
+    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran"))
 
 
 def _abandon(run: Run) -> None:

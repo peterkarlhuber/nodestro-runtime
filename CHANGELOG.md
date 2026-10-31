@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Jobs and workers (M5 PR-10, ADR-0004). Nothing changes for the desktop:
+
+- Migration `0004`: `nodestro_jobs` (at most one queued or running job per piece of work), `nodestro_run_events`
+  (event JSON as text, so U+0000 survives) and `nodestro_schedule_firings`.
+- `jobs.JobQueue`: enqueue, claim with `FOR UPDATE SKIP LOCKED` and a lease, heartbeat, finish, cancel (a queued
+  job is withdrawn, a running one gets `cancel_requested`), reaping of expired leases (`interrupted`) and cleanup.
+- `jobs.RunWorker` executes claimed runs, renews leases, passes cancel requests to the run, stops a run whose lease
+  was lost, and writes the run's events through the buffered `jobs.PostgresEventLog`. `jobs.reap` marks the runs
+  of dead workers as `run.interrupted`; they are never executed again by themselves.
+- `jobs.QueuedRuns` connects an API process's `RunManager` to the queue. New `RunManager` hooks: `dispatch`,
+  `remote_cancel` and `event_sink`, plus `execute_claimed`, `interrupt` and `cancel_unclaimed`.
+- `jobs.LeaderLock` (session advisory lock, released when the leader's connection ends) and
+  `jobs.ScheduleFirings` (each schedule slot fires once per tenant).
+- A workspace on tenant storage no longer takes the data directory lock or recovers runs and Python installations
+  when it opens: other processes of the server work on the same tenant at the same time.
+- Only runs go through the queue so far. Batches, test series, assistant drafts and Python environment
+  installations still run in the process that started them.
+
 Tenant workspaces and identity records (M3 PR-9, ADR-0003). Nothing changes for the desktop:
 
 - `Workspace(data_dir, storage=WorkspaceStorage(...))` runs a workspace on the stores of one tenant instead of its
