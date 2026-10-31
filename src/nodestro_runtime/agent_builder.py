@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, create_model
 
 from .catalog import SERVER_TOOLS
 from .knowledge import KnowledgeBase
+from .mcp_access import check_unattended_mcp
 from .memory_spaces import MemorySpaces
 from .problems import NodestroError, library_problem
 from .providers import MAX_RETRIES, Connection, check_model, check_request_options, model_id, provider_of
@@ -197,12 +198,17 @@ class AgentBuilder:
         extra_context: list[ContentBlock] | None = None,
         sandbox: Sandbox | None = None,
         extra_tools: list[Tool] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        attended: bool = True,
     ) -> BuiltAgent:
         """Build the agent; raises ``ValueError``/``TypeError``/``KeyError`` for invalid settings.
 
         ``connection`` belongs to the provider of ``config.model`` (credentials, endpoint, declared
         capabilities). ``sandbox`` runs custom and generated tools, e.g. in the workflow's Python
         environment. ``extra_tools`` are tools of the run (the input files tool, knowledge proposals).
+        ``cancelled`` stops running MCP calls with the run; ``attended`` is false for runs without a person
+        (schedules, batches, test series, published APIs), which may use MCP tools only once the operator
+        enabled it after the MCP security acceptance (ADR-0007 D-7).
         """
         model = check_model(config.model)
         provider = provider_of(model)
@@ -218,7 +224,12 @@ class AgentBuilder:
             raise NodestroError(
                 "config.unknown_tools", f"Unknown tools: {', '.join(unknown)}", names=", ".join(unknown)
             )
-        tools = [self.tools.tool(tool_name, sandbox=sandbox) for tool_name in dict.fromkeys(config.tools)]
+        if not attended:
+            check_unattended_mcp(config.tools)
+        tools = [
+            self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled)
+            for tool_name in dict.fromkeys(config.tools)
+        ]
         taken = {tool.name for tool in tools}
         tools += [tool for tool in extra_tools or [] if tool.name not in taken]
         server_tools = []

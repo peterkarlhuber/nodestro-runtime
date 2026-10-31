@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+MCP client (ADR-0007, work packages WP-1 and WP-2):
+
+- New package `nodestro_runtime.mcp`: remote MCP servers over Streamable HTTP through the official SDK (`mcp` 2.x,
+  Python 3.11+, dependency with an environment marker; 3.10 reports `mcp.unavailable`). The SDK negotiates the
+  protocol version (2026-07-28 `server/discover`, fallback to the 2025-11-25/06-18/03-26 handshake); each operation
+  uses its own short connection. `Workspace.mcp` (`McpService`) stores servers, discovered tools, approvals and audit
+  events per tenant (`mcp_servers`, `mcp_tools`, `mcp_events`).
+- Network protection (`mcp.netguard`): the connection step checks the resolved address it connects to (no gap after
+  DNS, rebinding caught), IPv4/IPv6 with embedded IPv4, metadata endpoints, `https` only, redirects re-checked,
+  proxy variables ignored, TLS verifies the host name, operator list `NODESTRO_MCP_ENDPOINTS` (required on servers).
+- Tokens (`mcp.vault`): sealed with the tenant's `SecretBox` on servers and with `NODESTRO_VAULT_KEY` (from the OS
+  keychain, passed by the desktop app) on desktops; otherwise kept in memory for the session only.
+- Policy: tools are approved one by one by an administrator, classified `read`/`write`/`destructive` (annotations are
+  hints), pinned by definition hash, checked when an agent is built and right before every call (the client lists the
+  tools first); changed definitions are blocked (`mcp.tool_changed`); only `read` tools until per-call approvals
+  exist; unattended runs need `NODESTRO_MCP_UNATTENDED=1`. Timeouts, output limit, parallel-call limit, cancel with
+  the run; results are marked as external data.
+- Additive: `ToolInfo.kind` can be `mcp` (with `server_id`, `server_name`, `mcp_name`, `definition_hash`,
+  `capability`); `ToolCallRecord.provenance` (MCP calls carry `external_cost: "unknown"`); `AgentBuilder.build(...,
+  cancelled=, attended=)`; `ToolLibrary.tool(..., cancelled=)`. New error codes `mcp.*`.
+
 Adaptive Orchestration M1-4 (loop connections):
 
 - A connection can carry `loop` (`max_iterations` 2..20, required; `on_exhausted` `fail` or `continue`): it leads from

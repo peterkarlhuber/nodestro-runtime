@@ -22,7 +22,7 @@ import json
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa import Tool, ToolExecutionError, ToolInputError, ToolResultError, UsageTracker
 from orkexa.dynamic import (
@@ -49,15 +49,20 @@ from pydantic import BaseModel, Field
 
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
+from .mcp_access import is_mcp_tool
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
 from .sandbox_policy import SandboxPolicy, TrustClass
 from .schemas import new_id, now
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
 
+if TYPE_CHECKING:
+    from .mcp.models import McpTool
+    from .mcp.service import McpService
+
 logger = logging.getLogger(__name__)
 
-ToolKind = Literal["builtin", "custom", "generated"]
+ToolKind = Literal["builtin", "custom", "generated", "mcp"]
 _APPROVAL_TIMEOUT_SECONDS = 3600
 
 # Tools are technical artefacts: whatever language the requirement is written in, the code, the
@@ -122,6 +127,13 @@ class ToolInfo(BaseModel):
     code: str | None = None
     tests: str | None = None
     requirement: str | None = None
+    #: MCP tools (``kind == "mcp"``): the server, the server's own tool name and the approved definition's hash.
+    server_id: str | None = None
+    server_name: str | None = None
+    mcp_name: str | None = None
+    definition_hash: str | None = None
+    #: The capability statement (shared model S-1): ``access``, ``reach``, ``source``; set for MCP tools.
+    capability: dict[str, str] | None = None
 
 
 class TestResult(BaseModel):
@@ -332,6 +344,8 @@ class ToolLibrary:
         self._lock = threading.RLock()
         #: Code that is untrusted but not stored as a tool, e.g. pending tool drafts (set by the workspace).
         self.untrusted_sources: Callable[[], Iterable[str]] = lambda: ()
+        #: Tools of connected MCP servers (:mod:`nodestro_runtime.mcp`); ``None`` when MCP is not set up.
+        self.mcp: McpService | None = None
 
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
@@ -453,24 +467,61 @@ class ToolLibrary:
             protected=self.protected,
         )
 
+    def _mcp_info(self, tool: McpTool, server_name: str) -> ToolInfo:
+        definition = tool.approved_definition or tool.definition
+        return ToolInfo(
+            name=tool.tool_name,
+            kind="mcp",
+            trust="untrusted",
+            description=definition.description,
+            input_schema=definition.input_schema,
+            created_at=tool.approved_at.isoformat() if tool.approved_at else None,
+            server_id=tool.server_id,
+            server_name=server_name,
+            mcp_name=tool.name,
+            definition_hash=tool.approved_hash,
+            capability=tool.capability(),
+        )
+
+    def _mcp_tools(self) -> list[ToolInfo]:
+        if self.mcp is None:
+            return []
+        names = {server.id: server.name for server in self.mcp.servers()}
+        return [self._mcp_info(tool, names.get(tool.server_id, "")) for tool in self.mcp.usable()]
+
     def all(self) -> list[ToolInfo]:
-        return [self._info(name) for name in self.registry.names()]
+        """Every tool agents can be given: stored and built-in tools, and the approved, usable MCP tools."""
+        return [*(self._info(name) for name in self.registry.names()), *self._mcp_tools()]
 
     def get(self, name: str) -> ToolInfo:
+        if self.mcp is not None and is_mcp_tool(name):
+            found = self.mcp.find(name)
+            if found is None:
+                raise KeyError(name)
+            return self._mcp_info(found[1], found[0].name)
         try:
             return self._info(name)
         except RegistryError:
             raise KeyError(name) from None
 
     def __contains__(self, name: object) -> bool:
+        if isinstance(name, str) and is_mcp_tool(name):
+            return self.mcp is not None and self.mcp.find(name) is not None
         return name in self.registry
 
-    def tool(self, name: str, *, sandbox: Sandbox | None = None) -> Tool:
+    def tool(self, name: str, *, sandbox: Sandbox | None = None, cancelled: Callable[[], bool] | None = None) -> Tool:
         """A ready-to-use tool (generated ones run in the sandbox).
 
         ``sandbox`` replaces the registry's sandbox for custom and generated tools, e.g. one
         whose interpreter is a workflow's Python environment with approved libraries.
+
+        MCP tools are checked against the MCP policy (``mcp.*`` refusals); ``cancelled`` stops a running MCP call
+        when the run is cancelled.
         """
+        if is_mcp_tool(name):
+            if self.mcp is None:
+                raise KeyError(name)
+            return self.mcp.agent_tool(name, cancelled=cancelled)
         try:
             tool = self.registry.get_tool(name)
         except RegistryError:

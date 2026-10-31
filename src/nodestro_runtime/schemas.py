@@ -443,6 +443,9 @@ class ToolCallRecord(_Model):
     is_error: bool = False
     started_at: datetime = Field(default_factory=now)
     finished_at: datetime | None = None
+    #: Where the tool came from, for tools outside Nodestro (MCP: ``source``, ``server_id``, ``server_name``,
+    #: ``qualified_name``, ``definition_hash``, ``access``, ``external_cost`` = ``unknown``); empty otherwise.
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluationRecord(_Model):

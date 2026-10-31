@@ -55,6 +55,10 @@ from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
+from .mcp.hub import McpHub
+from .mcp.netguard import EgressPolicy
+from .mcp.service import McpService
+from .mcp.vault import TokenVault, vault_box_from_env
 from .memory_spaces import MemorySpaces, MemoryTables
 from .pricing import PricingService
 from .problems import NodestroError
@@ -293,6 +297,14 @@ class Workspace:
             policy=self.sandbox_policy,
             provenance=StoredProvenance(self.store),
         )
+        # MCP (ADR-0007): the egress policy is the operator's (process environment), tokens are sealed with the
+        # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.
+        self.mcp = McpService(
+            self.store,
+            McpHub(EgressPolicy.from_env(server=storage is not None, loopback=self.profile.kind == "desktop")),
+            TokenVault(storage.secrets if storage is not None else vault_box_from_env(), self.tenant_id),
+        )
+        self.tools.mcp = self.mcp
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
         self._client_factory = client_factory
@@ -405,6 +417,7 @@ class Workspace:
             )
             for run_id in live:
                 self.runs.cancel(run_id)
+        self.mcp.hub.close()
         self.knowledge.close()
         self.memory.close()
         self.store.close()
