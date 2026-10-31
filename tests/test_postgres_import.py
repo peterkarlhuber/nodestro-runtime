@@ -40,6 +40,15 @@ def desktop(tmp_path: Path) -> Path:
     try:
         workspace.store.put_raw("workflows", "wf-1", {"id": "wf-1", "name": "Angebot \x00 prüfen"})
         workspace.store.put_raw("settings", "main", {"theme": "dark"})
+        workspace.store.put_raw(
+            "settings",
+            "app",
+            {
+                "api_key": "sk-ant-legacy",
+                "default_budget_usd": 3.0,
+                "providers": {"openai": {"api_key": "sk-openai", "capabilities": {"tools": "yes"}}},
+            },
+        )
         workspace.store.put_raw("tool_provenance", "my_tool", {"name": "my_tool", "versions": [1]})
         workspace.knowledge.add("Die Haftung ist begrenzt. Café".encode(), name="vertrag.md")
         workspace.knowledge.add(b"\x89PNG\r\n\x1a\nimage", name="bild.png")
@@ -61,6 +70,12 @@ def test_a_desktop_database_moves_into_an_empty_tenant(desktop: Path, server: Po
     store = server.store("acme")
     assert store.get_raw("workflows", "wf-1") == {"id": "wf-1", "name": "Angebot \x00 prüfen"}
     assert store.get_raw("settings", "main") == {"theme": "dark"}
+    # Provider keys stay behind: a server stores keys only encrypted with its own key.
+    assert store.get_raw("settings", "app") == {
+        "default_budget_usd": 3.0,
+        "providers": {"openai": {"capabilities": {"tools": "yes"}}},
+    }
+    assert "provider keys (anthropic, openai): enter them again in the server's settings" in report.not_imported
     assert store.get_raw("tool_provenance", "my_tool") is None  # imported tools are untrusted
 
     knowledge = KnowledgeBase(knowledge_tables(server, "acme"))

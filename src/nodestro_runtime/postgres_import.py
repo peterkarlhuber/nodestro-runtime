@@ -8,6 +8,8 @@ What is not copied:
 
 - ``tool_provenance``: a server cannot verify where the desktop's records came from, so every imported tool is
   untrusted (like after restoring a backup) and runs only in an isolating sandbox.
+- Provider API keys in the settings: a server keeps keys only encrypted with its own key, so they are entered again
+  in the server's settings; :attr:`ImportReport.not_imported` names the providers.
 - Files beside the database (``tools``, ``python``, ``inputs`` in the data directory): the server keeps them
   elsewhere; :attr:`ImportReport.not_imported` names them.
 """
@@ -128,6 +130,8 @@ def _copy_documents(sqlite: sqlite3.Connection, db: Any, report: ImportReport) -
             if collection in SKIPPED_COLLECTIONS:
                 report.skipped[collection] = report.skipped.get(collection, 0) + 1
                 continue
+            if collection == "settings" and key == "app":
+                data = _without_provider_keys(data, report)
             encoded, raw = _encode(data)
             values.append((report.tenant_id, collection, key, encoded, raw, updated_at))
         with db.cursor() as out:
@@ -137,6 +141,26 @@ def _copy_documents(sqlite: sqlite3.Connection, db: Any, report: ImportReport) -
                 values,
             )
         report.documents += len(values)
+
+
+def _without_provider_keys(data: str, report: ImportReport) -> str:
+    """The desktop settings without API keys: a server stores keys only encrypted, so they are entered again."""
+    try:
+        values = json.loads(data)
+    except ValueError:
+        return data
+    if not isinstance(values, dict):
+        return data
+    removed = []
+    if values.pop("api_key", None):
+        removed.append("anthropic")
+    for name, entry in (values.get("providers") or {}).items():
+        if isinstance(entry, dict) and entry.pop("api_key", None):
+            removed.append(name)
+    if removed:
+        names = ", ".join(sorted(set(removed)))
+        report.not_imported.append(f"provider keys ({names}): enter them again in the server's settings")
+    return json.dumps(values)
 
 
 def _copy_files(sqlite: sqlite3.Connection, db: Any, report: ImportReport) -> None:

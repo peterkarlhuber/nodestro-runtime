@@ -30,6 +30,7 @@ from .memory_spaces import BrowsableMemory
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
 
 if TYPE_CHECKING:
+    from .server_settings import SecretBox
     from .workspace import WorkspaceStorage
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
@@ -350,8 +351,10 @@ def knowledge_tables(database: PostgresDatabase, tenant_id: str, *, namespace: s
     return KnowledgeTables(PostgresFileStore(database, tenant_id, namespace=namespace), index, index)
 
 
-def tenant_storage(database: PostgresDatabase, tenant_id: str) -> WorkspaceStorage:
-    """Everything a :class:`~nodestro_runtime.workspace.Workspace` stores, for one tenant of ``database``."""
+def tenant_storage(database: PostgresDatabase, tenant_id: str, secrets: SecretBox | None = None) -> WorkspaceStorage:
+    """Everything a :class:`~nodestro_runtime.workspace.Workspace` stores, for one tenant of ``database``.
+
+    ``secrets`` encrypts the tenant's provider keys at rest (a server always passes its box)."""
     from .workspace import WorkspaceStorage
 
     return WorkspaceStorage(
@@ -359,6 +362,7 @@ def tenant_storage(database: PostgresDatabase, tenant_id: str) -> WorkspaceStora
         store=database.store(tenant_id),
         knowledge=knowledge_tables(database, tenant_id),
         memory=PostgresMemoryTables(database, tenant_id),
+        secrets=secrets,
     )
 
 

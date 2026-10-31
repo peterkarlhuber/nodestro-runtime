@@ -30,7 +30,7 @@ paused in the database and continue after the next start.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -39,13 +39,14 @@ from pathlib import Path
 import sys
 from typing import Any, Literal
 
-from orkexa.dynamic import DockerSandbox
+from orkexa.dynamic import DockerSandbox, Sandbox
 from orkexa.providers.base import redact
 
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
+from .container_images import ContainerImages, RuntimeImageSandbox
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
@@ -84,6 +85,7 @@ from .schemas import (
     Workflow,
     WorkflowIn,
 )
+from .server_settings import SecretBox, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_drafts import ToolDrafts
 from .tool_library import ToolLibrary, make_sandbox
@@ -120,6 +122,14 @@ class DataDirectoryLock:
         if self._handle is not None:
             self._handle.close()  # closing the file releases the lock
             self._handle = None
+
+
+logger = logging.getLogger(__name__)
+
+
+def _key_field(provider: str) -> str:
+    """The name a provider key is bound to when encrypted (see :class:`~nodestro_runtime.server_settings.SecretBox`)."""
+    return f"providers.{provider}.api_key"
 
 
 def _lock(descriptor: int) -> None:
@@ -167,6 +177,8 @@ class WorkspaceStorage:
     store: DocumentStore
     knowledge: KnowledgeTables
     memory: MemoryTables
+    #: Encrypts the tenant's provider keys at rest (ADR-0003 point 6); ``None`` stores them as given (tests).
+    secrets: SecretBox | None = None
 
 
 class Workspace:
@@ -205,7 +217,19 @@ class Workspace:
             profile = RuntimeProfile.desktop(data_dir)
         elif data_dir is not None:
             profile.matches(data_dir)
-        self.profile = profile.validate()
+        if profile.kind == "server":
+            # A server's workspaces are its tenants: they run on handed-in storage, opened by the server after it
+            # validated its settings. A server workspace on a directory of its own does not exist.
+            if storage is None:
+                raise NodestroError(
+                    "profile.invalid",
+                    "Invalid runtime profile: a server workspace runs on a tenant's storage; start the server "
+                    "with the nodestro-server command",
+                    problems=[{"field": "storage", "value": "None", "reason": "a server workspace needs storage"}],
+                )
+            self.profile = profile
+        else:
+            self.profile = profile.validate()
         data_dir = profile.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
@@ -221,6 +245,7 @@ class Workspace:
         )
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
+        self._secrets: SecretBox | None = None
         if storage is None:
             database = data_dir / DATABASE
             self._sqlite = Store(database)
@@ -238,13 +263,16 @@ class Workspace:
         else:
             self.store = storage.store
             self.tenant_id = storage.tenant_id
+            self._secrets = storage.secrets
             self.knowledge = KnowledgeBase(storage.knowledge, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(storage.memory)
+        # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
+        self._environ: Mapping[str, str] | None = None if storage is None else {}
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
         self.sandbox_policy = SandboxPolicy("server" if storage is not None else self.profile.kind)
-        sandbox = make_sandbox(self._sandbox_kind(), self.sandbox_policy)
+        sandbox = make_sandbox(self._sandbox_kind(), self.sandbox_policy, self._container_sandbox())
         self.tools = ToolLibrary(
             data_dir / "tools",
             sandbox=sandbox,
@@ -383,14 +411,27 @@ class Workspace:
         values = self.store.get_raw("settings", "app") or {}
         return values.get(key)
 
+    def _container_sandbox(self) -> Callable[[], Sandbox] | None:
+        """On a server, tool code without libraries runs in Nodestro's runtime image (no bind mounts, no image an
+        operator builds by hand); the desktop keeps Orkexa's ``orkexa-sandbox`` image."""
+        if self.sandbox_policy.profile == "desktop":
+            return None
+        # The Python environments are created after the tool library; the image is resolved on the first call.
+        return lambda: RuntimeImageSandbox(
+            lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
+        )
+
     def _sandbox_kind(self) -> Literal["subprocess", "docker"]:
         """The sandbox setting in effect: the stored one, or ``docker`` wherever only containers may run code."""
         if self.sandbox_policy.profile != "desktop" or self._stored("sandbox") == "docker":
             return "docker"
         return "subprocess"
 
-    def _providers(self, values: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
-        """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key."""
+    def _providers(self, values: dict[str, Any] | None = None, *, sealed: bool = False) -> dict[str, dict[str, Any]]:
+        """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key.
+
+        With a secret box (server tenants), keys are stored encrypted and returned decrypted, unless ``sealed``. A key
+        that cannot be decrypted (or was stored in plain text) counts as missing: it has to be entered again."""
         values = values if values is not None else (self.store.get_raw("settings", "app") or {})
         providers: dict[str, dict[str, Any]] = {
             name: dict(item) for name, item in (values.get("providers") or {}).items() if isinstance(item, dict)
@@ -398,7 +439,20 @@ class Workspace:
         legacy = values.get("api_key")
         if legacy and not providers.get("anthropic", {}).get("api_key"):
             providers.setdefault("anthropic", {})["api_key"] = legacy
+        if self._secrets is not None and not sealed:
+            for name, entry in providers.items():
+                if entry.get("api_key"):
+                    try:
+                        entry["api_key"] = self._secrets.decrypt(self.tenant_id, _key_field(name), entry["api_key"])
+                    except NodestroError:
+                        logger.warning("The stored %s key of tenant %s is unreadable", name, self.tenant_id)
+                        entry.pop("api_key")
         return providers
+
+    def _seal(self, provider: str, key: str) -> str:
+        if self._secrets is None:
+            return key
+        return self._secrets.encrypt(self.tenant_id, _key_field(provider), key)
 
     def settings(self) -> Settings:
         values = self.store.get_raw("settings", "app") or {}
@@ -406,7 +460,7 @@ class Workspace:
         stored = self._providers(values)
         default_model = values.get("default_model") or DEFAULT_AGENT_MODEL
         return Settings(
-            providers=[provider_status(name, stored.get(name, {})) for name in PROVIDERS],
+            providers=[provider_status(name, stored.get(name, {}), self._environ) for name in PROVIDERS],
             default_provider=provider_of(default_model),
             default_model=default_model,
             assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
@@ -433,7 +487,11 @@ class Workspace:
         if changes.get("sandbox") and changes["sandbox"] != "docker":
             self.sandbox_policy.check_construction("none")  # before anything is stored
         # A top-level ``api_key`` is Anthropic's key; it moves into the provider settings (once, idempotent).
-        providers = self._providers(values)
+        providers = self._providers(values, sealed=True)
+        if self._secrets is not None:  # a key stored in plain text is never kept on a server (enter it again)
+            for entry in providers.values():
+                if entry.get("api_key") and not is_encrypted(entry["api_key"]):
+                    entry.pop("api_key")
         values.pop("api_key", None)
         requested = changes.pop("providers", None) or {}
         legacy = changes.pop("api_key", None)
@@ -450,7 +508,7 @@ class Workspace:
                     continue  # the shown (redacted) URL sent back unchanged keeps the stored one
                 text = check_base_url(change[key]) if key == "base_url" else change[key].strip()
                 if text:
-                    entry[key] = text
+                    entry[key] = self._seal(name, text) if key == "api_key" else text
                 else:
                     entry.pop(key, None)
             if change.get("capabilities") is not None:
@@ -462,7 +520,7 @@ class Workspace:
         values.update(changes)
         self.store.put_raw("settings", "app", values)
         if changes.get("sandbox"):
-            self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy))
+            self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy, self._container_sandbox()))
         return self.settings()
 
     def reload_after_restore(self) -> None:
@@ -471,7 +529,7 @@ class Workspace:
         A backup can come from anywhere, so the provenance of its tools is unknown: every restored custom tool
         becomes ``untrusted`` (ADR-0006)."""
         self.tools.provenance.clear()
-        self.tools.reload(make_sandbox(self._sandbox_kind(), self.sandbox_policy))
+        self.tools.reload(make_sandbox(self._sandbox_kind(), self.sandbox_policy, self._container_sandbox()))
         self.inputs.forget()
 
     # ---- workflows ------------------------------------------------------------------
@@ -571,7 +629,7 @@ class Workspace:
         if info is None:
             raise NodestroError("provider.unknown", f"Unknown provider {provider!r}", provider=provider)
         stored = self._providers().get(provider, {})
-        key = env_key(provider)[0] or stored.get("api_key") or None
+        key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
         client = self._client_factory(provider) if self._client_factory is not None else None
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
@@ -591,7 +649,7 @@ class Workspace:
     def secret_keys(self) -> list[str]:
         """Every API key Nodestro knows (environment and settings), e.g. to mask them in snapshots."""
         stored = self._providers()
-        keys = [env_key(name)[0] or "" for name in PROVIDERS]
+        keys = [env_key(name, self._environ)[0] or "" for name in PROVIDERS]
         keys += [str(item.get("api_key") or "") for item in stored.values()]
         return [key for key in dict.fromkeys(keys) if key]
 

@@ -119,9 +119,11 @@ run is never executed again by itself. `LeaderLock` and `ScheduleFirings` let ex
 schedule slot once. Only runs go through the queue so far.
 
 **Operating profile.** A workspace serves one of two profiles (`nodestro_runtime.profile`): `desktop`, the
-default and the behavior described here, or `server` (many users, PostgreSQL, workers), which is planned and
-refused with `profile.server_unavailable` in this version. `Workspace(data_dir)` always opens the desktop profile,
-whatever the environment says. `Workspace(profile=RuntimeProfile.from_env())` takes the profile from
+default and the behavior described here, or `server` (many users, PostgreSQL, OpenID Connect, workers, container
+sandbox). The server starts only with complete `server_settings.ServerSettings` (read from the environment by
+`ServerSettings.from_env`; `RuntimeProfile.validate(settings)`), and its workspaces are its tenants, opened on
+`tenant_storage(...)`; a server profile without settings, or a server workspace without tenant storage, is refused
+with `profile.invalid`. `Workspace(data_dir)` always opens the desktop profile, whatever the environment says. `Workspace(profile=RuntimeProfile.from_env())` takes the profile from
 `NODESTRO_PROFILE` (`desktop` or `server`, default `desktop`) and `NODESTRO_DATA_DIR` (default `~/.nodestro`);
 unknown values are refused with `profile.invalid` instead of falling back to a default. Given both a data
 directory and a profile, they must name the same directory. Every refusal happens before a file or the database is
@@ -172,6 +174,24 @@ release are untrusted, and a restored backup makes every restored tool untrusted
 tools cannot use third-party libraries (`sandbox.libraries_need_isolation`), because the library environments run as
 host processes. In the Docker sandbox they can: there an approved environment is a container image (see below). In
 the server profile, only containers run tool code.
+
+**Server settings and tenant secrets (plan step PR-12).** `ServerSettings.from_env` reads `NODESTRO_DATABASE_URL`,
+`NODESTRO_PUBLIC_ORIGIN` (`https://`; `http://` only for loopback), `NODESTRO_OIDC_ISSUER`,
+`NODESTRO_OIDC_CLIENT_ID`, `NODESTRO_OIDC_CLIENT_SECRET` and `NODESTRO_SECRET_KEY` (32 random bytes, base64); each
+secret may come from a file (`…_FILE`), never from both. Every missing or unsafe value is listed at once
+(`profile.invalid`); secrets never appear in `repr` or errors. A tenant's provider keys are stored encrypted
+(`SecretBox`: AES-256-GCM with a per-tenant key derived by HKDF-SHA256, bound to tenant and field, so a value copied
+elsewhere does not decrypt); a key that cannot be decrypted or was stored in plain text counts as missing. The
+server's own environment variables (`ANTHROPIC_API_KEY`, …) are never used for a tenant. The desktop import leaves
+provider keys behind. Changing `NODESTRO_SECRET_KEY` makes stored keys unreadable (no rotation yet). Needs the
+`postgres` extra (psycopg, cryptography).
+
+**Containers without bind mounts.** Images built by `container_images` contain Orkexa (`/opt/orkexa/orkexa`, part
+of the image key), and `StreamedSandbox` sends the tool's files on stdin into a `tmpfs` work directory instead of
+mounting host paths, so the Docker daemon may run on another host or in another container (`DOCKER_HOST`). On a
+server, tool code without libraries runs in the runtime image (Nodestro's runtime requirements only), built on first
+use (`RuntimeImageSandbox`); no image has to be built by hand. The desktop keeps Orkexa's `orkexa-sandbox` image for
+tools without libraries.
 
 **Libraries in the Docker sandbox (ADR-0006 point 6).** With the Docker sandbox, `nodestro_runtime.container_images`
 turns an approved lock file into an image `nodestro-env:<key>`, where the key is the SHA-256 of the lock, the Python

@@ -340,9 +340,13 @@ class ProviderStatus(BaseModel):
     capabilities: dict[str, str] = Field(default_factory=dict)
 
 
-def provider_status(provider: str, stored: Mapping[str, Any]) -> ProviderStatus:
+def provider_status(
+    provider: str, stored: Mapping[str, Any], environ: Mapping[str, str] | None = None
+) -> ProviderStatus:
+    """``environ``: where keys from the environment are looked for (default: ``os.environ``; a server's tenants
+    pass ``{}``, because the server's own variables belong to no tenant)."""
     info = PROVIDERS[provider]
-    key, variable = env_key(provider)
+    key, variable = env_key(provider, environ)
     stored_key = bool(stored.get("api_key"))
     if variable is not None:
         source: Literal["environment", "settings", "none", "not_needed"] = "environment"
