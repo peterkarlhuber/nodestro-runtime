@@ -11,6 +11,11 @@ processes (:class:`RunWorker`) claim jobs and execute them.
   automatically: model calls cost money and tools have side effects, so a person decides whether to continue.
 - **Cancelling** a queued job withdraws it at once; a running job gets ``cancel_requested``, which its worker reads
   with the next heartbeat and passes to the run.
+- A worker **holds** at most ``max_runs`` runs (default 2), of which at most ``max_waiting`` (default 1) may wait for a
+  tool approval (S-2). It claims a new job only while it holds fewer than ``max_runs`` runs and none of them
+  executes (every held run waits): with nothing waiting it executes one run at a time as before. An approved run
+  continues in the slot it already holds, so resuming never adds capacity; a run that would wait while the
+  worker's waiting capacity is used up is denied at once (``tool.approval_capacity``), never queued.
 - Every event of a run executing in a worker is written to ``nodestro_run_events`` (:class:`PostgresEventLog`), so
   any API process can stream it.
 - Exactly one process fires schedules (:class:`LeaderLock`), and every schedule slot fires at most once
@@ -24,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import suppress
 from datetime import datetime, timedelta
 import json
 import logging
@@ -40,12 +44,17 @@ from pydantic import BaseModel, Field
 from .problems import NodestroError
 from .schemas import Run, RunEvent
 from .storage_postgres import PostgresDatabase
+from .tool_approvals import WaitingSlots
 
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "done", "failed", "cancelled", "interrupted"]
 #: The job kind of a run (the only kind executed through the queue so far).
 RUN_JOB = "run"
+#: Runs a worker holds at the same time (executing or waiting for a tool approval), and how many of them may wait.
+DEFAULT_MAX_RUNS = 2
+DEFAULT_MAX_WAITING = 1
+
 #: The advisory lock of the schedule leader (any constant different from the migration lock).
 SCHEDULER_LOCK = 0x6E6F64657374726F
 
@@ -326,7 +335,16 @@ class RunWorker:
         heartbeat: float | None = None,
         poll: float = 1.0,
         flush: float = 0.25,
+        max_runs: int = DEFAULT_MAX_RUNS,
+        max_waiting: int = DEFAULT_MAX_WAITING,
     ) -> None:
+        check_capacity(max_runs, max_waiting)
+        self.max_runs = max_runs
+        #: The waiting capacity of this worker, shared by the tool gates of all tenants it executes runs of.
+        self.slots = WaitingSlots(max_waiting)
+        self._held: set[asyncio.Task[None]] = set()
+        #: The most runs held at the same time so far (for tests and monitoring).
+        self.peak_held = 0
         self.queue = queue
         self.workspaces = workspaces
         self.name = name or worker_name()
@@ -341,6 +359,9 @@ class RunWorker:
         if log is None:
             log = self._logs[tenant_id] = PostgresEventLog(self.queue.database, tenant_id)
         runs.event_sink = log.append
+        gate = getattr(runs, "tool_gate", None)
+        if gate is not None:
+            gate.slots = self.slots
         runs.dispatch = None
         runs.remote_cancel = None
         runs.remote_events = None
@@ -395,17 +416,65 @@ class RunWorker:
             status = "cancelled"
         self.queue.finish(job.id, self.name, status, run.error if run is not None else "run missing")
 
+    @property
+    def held(self) -> int:
+        return len(self._held)
+
+    @property
+    def executing(self) -> int:
+        """Held runs that do not wait for a tool approval."""
+        return max(0, len(self._held) - self.slots.waiting)
+
+    def can_claim(self) -> bool:
+        """Claim only below ``max_runs`` and only while every held run waits (none executes)."""
+        return len(self._held) < self.max_runs and self.executing == 0
+
+    async def claim_next(self) -> Job | None:
+        """Claim one job if :meth:`can_claim` and start executing it as a held run; ``None`` otherwise."""
+        if not self.can_claim():
+            return None
+        job = await asyncio.to_thread(self.queue.claim, self.name, (RUN_JOB,))
+        if job is None:
+            return None
+        task = asyncio.ensure_future(self._execute(job))
+        self._held.add(task)
+        self.peak_held = max(self.peak_held, len(self._held))
+        task.add_done_callback(self._release)
+        return job
+
+    def _release(self, task: asyncio.Task[None]) -> None:
+        self._held.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("A held job failed", exc_info=task.exception())
+
     async def serve(self, stop: asyncio.Event) -> None:
-        """Execute jobs one after another until ``stop`` is set (poll the queue while it is empty)."""
-        while not stop.is_set():
-            try:
-                job = await self.run_once()
-            except Exception:
-                logger.exception("The worker loop failed; retrying")
-                job = None
-            if job is None:
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=self.poll)
+        """Execute jobs until ``stop`` is set, holding up to ``max_runs`` runs (see the module documentation); then
+        wait for the held runs to end."""
+        try:
+            while not stop.is_set():
+                try:
+                    job = await self.claim_next()
+                except Exception:
+                    logger.exception("The worker loop failed; retrying")
+                    job = None
+                if job is not None:
+                    continue
+                waits: set[asyncio.Future[Any]] = {asyncio.ensure_future(stop.wait()), *self._held}
+                done, _ = await asyncio.wait(waits, timeout=self.poll, return_when=asyncio.FIRST_COMPLETED)
+                for future in waits - set(self._held):
+                    if future not in done:
+                        future.cancel()
+        finally:
+            if self._held:
+                await asyncio.gather(*self._held, return_exceptions=True)
+
+
+def check_capacity(max_runs: int, max_waiting: int) -> None:
+    """Refuse limits that would let a worker hold no run, or let every held run wait with none left to claim."""
+    if max_runs < 1:
+        raise ValueError("max_runs must be at least 1")
+    if not 0 <= max_waiting < max_runs:
+        raise ValueError("max_waiting must be at least 0 and less than max_runs")
 
 
 def _flush_quietly(log: PostgresEventLog) -> None:

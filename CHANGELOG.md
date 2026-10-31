@@ -15,6 +15,30 @@ MCP operations (ADR-0007, work package WP-7):
 - `McpService.write_gate` is a plain flag (default `False`): `write`/`destructive` tools stay blocked until the
   shared per-call approval (D10, S-2b) turns it on; there is no MCP-specific approval path.
 
+Sandbox gateway: no tool code without enforced resource limits (Nodestro Local Docker):
+
+- **Fixed: sandbox containers could run without memory, CPU and process limits.** Docker drops limits it cannot
+  apply and only warns, for example rootless Docker without cgroup v2 delegation (found in the rootless Docker end-to-end
+  run). The gateway now asks the daemon's `/info` before the first container create or image build and refuses both
+  with 503 until `MemoryLimit`, `PidsLimit`, `CpuCfsQuota` and `CpuCfsPeriod` are confirmed.
+
+Sandbox gateway security fixes (Nodestro Local Docker):
+
+- **Fixed: request smuggling to the Docker daemon.** A header value with a bare line feed (`User-Agent: x\n\nGET
+  /containers/json ...`) was passed on; the daemon's parser ended the header there and ran the rest as a second,
+  unchecked request, so a compromised studio container could reach the whole Docker API (host root on rootful
+  Docker). Request heads are now parsed strictly (`parse_head`): no control characters, bare CR or LF, folded
+  headers, unknown methods, fragments or non-path targets, and not `Content-Length` with `Transfer-Encoding`.
+- Every target sent to the daemon is rebuilt from the checked parts (ping, version and info without a query, image
+  inspect and remove from the checked name); before, those were passed through as written.
+- An attach passes the client's raw bytes on only after the daemon switched protocols (101); on any other answer
+  the connection ends, so a kept-alive daemon connection can never carry further unchecked requests.
+- The body limit is chosen by route before the body is read (1 MB, 64 MB for builds), and image builds get the
+  sandbox's memory and CPU limits. Sandbox containers state `IpcMode: private` and empty binds, mounts and devices
+  instead of relying on daemon defaults.
+- Adversarial tests: 12 ambiguous request heads, smuggling and target rewriting through the gateway, a
+  non-switched attach with a smuggled request, and the same raw attempts against a real daemon.
+
 Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decision D10):
 
 - New module `nodestro_runtime.tool_policy`: `ToolCapability` (`access` read/write/destructive, `reach`
@@ -56,7 +80,16 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   cancels its question; `recover()` and `interrupt()` expire the questions of interrupted runs. New events
   `tool_approval_requested`, `tool_approval_decided`, `tool_denied`. Additive schemas: `AgentConfig.tool_policies`
   (tool name -> `ToolBinding`), `ToolCallRecord.approval` (`ToolCallApproval`). Not yet: stamping existing bindings as
-  legacy exemptions (required before any activation), stored pre-grants, the server worker capacity.
+  legacy exemptions (required before any activation), stored pre-grants.
+- Server workers hold up to `max_runs` runs (default 2), of which up to `max_waiting` (default 1) may wait for a tool
+  approval (`RunWorker(max_runs=, max_waiting=)`, validated by `jobs.check_capacity`: `max_runs >= 1`,
+  `0 <= max_waiting < max_runs`). A worker claims only while it holds fewer than `max_runs` runs and none of them
+  executes, so without questions it still executes one run at a time; an approved run continues in its own slot
+  (never more than `max_runs` per worker); a run that would wait beyond `max_waiting` is denied at once
+  (`tool.approval_capacity`). The worker's waiting slots are shared by the gates of all tenants it serves. `serve`
+  waits for its held runs when stopped.
+- A question that an interruption expired (the reaper after a lost lease, a restart) stops the waiting execution
+  instead of letting it go on (`ToolApprovalRequest.closed_because`, `run.interrupted`).
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
