@@ -182,7 +182,10 @@ secret may come from a file (`…_FILE`), never from both. Every missing or unsa
 (`profile.invalid`); secrets never appear in `repr` or errors. A tenant's provider keys are stored encrypted
 (`SecretBox`: AES-256-GCM with a per-tenant key derived by HKDF-SHA256, bound to tenant and field, so a value copied
 elsewhere does not decrypt); a key that cannot be decrypted or was stored in plain text counts as missing. The
-server's own environment variables (`ANTHROPIC_API_KEY`, …) are never used for a tenant. The desktop import leaves
+server's own environment variables (`ANTHROPIC_API_KEY`, …) are never used for a tenant. Endpoint providers
+(`compatible`, `ollama`, `vllm`) reach only the model endpoints the operator allows (`WorkspaceStorage.endpoints`,
+origins); any other base URL is refused with `provider.endpoint_not_allowed`, so a tenant cannot make the server
+reach internal services. The desktop import leaves
 provider keys behind. Changing `NODESTRO_SECRET_KEY` makes stored keys unreadable (no rotation yet). Needs the
 `postgres` extra (psycopg, cryptography).
 

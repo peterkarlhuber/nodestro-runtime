@@ -127,3 +127,50 @@ def test_tenant_provider_keys_are_encrypted_and_server_variables_are_not_shared(
     finally:
         alpha.close()
         beta.close()
+
+
+def test_a_tenant_reaches_only_the_model_endpoints_the_operator_allows(
+    database: PostgresDatabase, tmp_path: Path
+) -> None:
+    from nodestro_runtime.providers import endpoint_origin
+    from nodestro_runtime.schemas import SettingsIn
+
+    assert endpoint_origin("HTTPS://Models.Example.com:443/v1/") == "https://models.example.com"
+    assert endpoint_origin("http://[::1]:8000/v1") == "http://[::1]:8000"
+    storage = tenant_storage(database, "alpha")
+    allowed = Workspace(
+        tmp_path / "alpha",
+        integrations=[],
+        storage=type(storage)(**{**storage.__dict__, "endpoints": ("https://models.example.com",)}),
+    )
+    try:
+        for url in ("http://postgres:5432/v1", "http://169.254.169.254/latest", "https://models.example.com.evil/v1"):
+            with pytest.raises(NodestroError) as caught:
+                allowed.update_settings(SettingsIn.model_validate({"providers": {"compatible": {"base_url": url}}}))
+            assert caught.value.code == "provider.endpoint_not_allowed"
+        assert "base_url" not in (allowed.store.get_raw("settings", "app") or {}).get("providers", {}).get(
+            "compatible", {}
+        )
+        allowed.update_settings(
+            SettingsIn.model_validate({"providers": {"compatible": {"base_url": "https://models.example.com:443/v1"}}})
+        )
+        assert allowed.connection("compatible").base_url == "https://models.example.com:443/v1"
+        # A URL stored before the operator changed the list (or written around Nodestro) is refused when used.
+        database.store("alpha").put_raw(
+            "settings", "app", {"providers": {"ollama": {"base_url": "http://localhost:11434/v1"}}}
+        )
+        with pytest.raises(NodestroError) as caught:
+            allowed.connection("ollama")
+        assert caught.value.code == "provider.endpoint_not_allowed"
+    finally:
+        allowed.close()
+
+
+def test_the_desktop_reaches_any_endpoint(tmp_path: Path) -> None:
+    from nodestro_runtime.schemas import SettingsIn
+
+    with Workspace(tmp_path / "desktop", integrations=[]) as desktop:
+        desktop.update_settings(
+            SettingsIn.model_validate({"providers": {"ollama": {"base_url": "http://localhost:11434/v1"}}})
+        )
+        assert desktop.connection("ollama").base_url == "http://localhost:11434/v1"

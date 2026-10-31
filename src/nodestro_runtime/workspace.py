@@ -61,6 +61,7 @@ from .providers import (
     MissingApiKeyError,
     check_base_url,
     check_capabilities,
+    check_endpoint_allowed,
     check_model,
     env_key,
     provider_of,
@@ -179,6 +180,9 @@ class WorkspaceStorage:
     memory: MemoryTables
     #: Encrypts the tenant's provider keys at rest (ADR-0003 point 6); ``None`` stores them as given (tests).
     secrets: SecretBox | None = None
+    #: The model endpoints (origins) the operator allows for the endpoint providers (``compatible``, ``ollama``,
+    #: ``vllm``); any other base URL is refused, so a tenant cannot make the server reach internal services.
+    endpoints: tuple[str, ...] = ()
 
 
 class Workspace:
@@ -268,6 +272,7 @@ class Workspace:
             self.memory = MemorySpaces(storage.memory)
         # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
         self._environ: Mapping[str, str] | None = None if storage is None else {}
+        self._endpoints: tuple[str, ...] | None = None if storage is None else storage.endpoints
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
@@ -507,6 +512,8 @@ class Workspace:
                 if key == "base_url" and entry.get(key) and change[key].strip() == redact(entry[key]):
                     continue  # the shown (redacted) URL sent back unchanged keeps the stored one
                 text = check_base_url(change[key]) if key == "base_url" else change[key].strip()
+                if text and key == "base_url":
+                    check_endpoint_allowed(text, self._endpoints)
                 if text:
                     entry[key] = self._seal(name, text) if key == "api_key" else text
                 else:
@@ -631,6 +638,8 @@ class Workspace:
         stored = self._providers().get(provider, {})
         key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
+        if base_url and info.base_url:
+            check_endpoint_allowed(base_url, self._endpoints)  # also a URL stored before the operator changed the list
         client = self._client_factory(provider) if self._client_factory is not None else None
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
             raise MissingApiKeyError(provider)
