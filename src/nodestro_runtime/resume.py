@@ -192,7 +192,7 @@ def plan(ctx: Workspace, run_id: str) -> ResumePlan:
                 )
                 missing_files = []
         result.nodes.append(entry)
-    working = [entry for entry in result.nodes if entry.type in ("agent", "subworkflow")]
+    working = [entry for entry in result.nodes if entry.type in ("agent", "subworkflow", "orchestrator")]
     result.reused = sum(entry.action == "reuse" for entry in working)
     result.rerun = sum(entry.action != "reuse" for entry in working)
     result.saved_cost_usd = total_cost(entry.saved_cost_usd for entry in result.nodes)
