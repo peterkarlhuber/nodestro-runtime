@@ -46,6 +46,17 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   checked in the same step (at most 15 minutes); the waiter reads the store, so a decision from another process
   reaches it; `expire_run` for stopped runs. New codes `tool.approval_stale`, `tool.approval_expired`,
   `tool.approval_decided`, `tool.approval_not_found`.
+- Per-call approvals in runs, **off by default** (`NODESTRO_TOOL_APPROVALS=1` switches them on; activation is a
+  separate step after the security acceptance). While on, `RunManager.tool_gate` (`ToolGate`) applies `decide` in
+  the engine's `before_tool` to every tool call except Nodestro's own run tools (memory, files, knowledge
+  proposals): a call that asks stores a request and waits in the agent's thread for a stored decision (the run stays
+  `running`; 15 minutes at most), then runs unchanged in its sandbox or is denied (`tool.approval_rejected` with the
+  comment, `tool.approval_timeout`); unattended runs deny it (`tool.approval_unattended`); a full waiting capacity
+  denies it at once (`tool.approval_capacity`; `WaitingSlots`, 3 runs per desktop process). Cancelling a waiting run
+  cancels its question; `recover()` and `interrupt()` expire the questions of interrupted runs. New events
+  `tool_approval_requested`, `tool_approval_decided`, `tool_denied`. Additive schemas: `AgentConfig.tool_policies`
+  (tool name -> `ToolBinding`), `ToolCallRecord.approval` (`ToolCallApproval`). Not yet: stamping existing bindings as
+  legacy exemptions (required before any activation), stored pre-grants, the server worker capacity.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 

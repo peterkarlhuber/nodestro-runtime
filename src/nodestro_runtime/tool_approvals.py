@@ -18,10 +18,12 @@ never matched to another call, and a request that is not ``pending`` any more ne
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 import hashlib
 import json
+import os
+import threading
 import time
 from typing import Any, Literal
 
@@ -30,7 +32,7 @@ from pydantic import BaseModel, Field
 from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
-from .tool_policy import ToolCapability
+from .tool_policy import PreGrantScope, ToolCapability, ToolPreGrant
 
 COLLECTION = "tool_approvals"
 #: The longest a call waits for a decision on a server (D10d; longer waits need an agent checkpoint).
@@ -57,8 +59,8 @@ class ToolApprovalRequest(BaseModel):
     id: str = Field(default_factory=lambda: new_id("tap"))
     run_id: str
     node_id: str
-    #: The node's loop iteration (Adaptive Orchestration loops run a node again).
-    iteration: int = 0
+    #: The node's loop iterations (``NodeRun.iteration``; Adaptive Orchestration loops run a node again).
+    iteration: list[int] = Field(default_factory=list)
     call_id: str
     tool: str
     #: The arguments exactly as they will be sent (shown to the person; never written to logs).
@@ -109,7 +111,7 @@ class ToolApprovals:
         node_id: str,
         call_id: str,
         tool: str,
-        iteration: int = 0,
+        iteration: Sequence[int] = (),
         arguments: dict[str, Any],
         capability: ToolCapability,
         version: int | None = None,
@@ -120,7 +122,7 @@ class ToolApprovals:
         found = ToolApprovalRequest(
             run_id=run_id,
             node_id=node_id,
-            iteration=iteration,
+            iteration=list(iteration),
             call_id=call_id,
             tool=tool,
             input=arguments,
@@ -237,14 +239,89 @@ class ToolApprovals:
             )
 
 
+# ---- the capacity for waiting runs and the switch ------------------------------------------------------------
+
+#: Switches per-call approvals on (``1``). Off by default: activating them is a separate, explicit step after the
+#: security acceptance (D10); while off, runs behave exactly as before S-2.
+ENABLE_ENV = "NODESTRO_TOOL_APPROVALS"
+#: How many runs of one process may wait for an approval at the same time (desktop default 3, D10 concept §2.4).
+DESKTOP_MAX_WAITING = 3
+
+
+def approvals_enabled() -> bool:
+    return os.environ.get(ENABLE_ENV, "").strip() == "1"
+
+
+class WaitingSlots:
+    """How many runs may wait for a tool approval at the same time; a run that cannot wait is denied at once
+    (``tool.approval_capacity``), never queued. Counted per run: parallel calls of one run share its slot.
+
+    The desktop uses one per process; a server worker supplies its own that also bounds its held runs (S-2a step 3).
+    """
+
+    def __init__(self, max_waiting: int = DESKTOP_MAX_WAITING) -> None:
+        if max_waiting < 1:
+            raise ValueError("max_waiting must be at least 1")
+        self.max_waiting = max_waiting
+        self._waiting: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def enter(self, run_id: str) -> bool:
+        with self._lock:
+            if run_id in self._waiting:
+                self._waiting[run_id] += 1
+                return True
+            if len(self._waiting) >= self.max_waiting:
+                return False
+            self._waiting[run_id] = 1
+            return True
+
+    def leave(self, run_id: str) -> None:
+        with self._lock:
+            left = self._waiting.get(run_id, 0) - 1
+            if left > 0:
+                self._waiting[run_id] = left
+            else:
+                self._waiting.pop(run_id, None)
+
+    @property
+    def waiting(self) -> int:
+        with self._lock:
+            return len(self._waiting)
+
+
+class ToolGate:
+    """Everything the engine needs to apply the per-call rules in one tenant (set on ``RunManager.tool_gate``)."""
+
+    def __init__(
+        self,
+        approvals: ToolApprovals,
+        *,
+        slots: WaitingSlots | None = None,
+        pre_grants: Callable[[PreGrantScope, str], Sequence[ToolPreGrant]] = lambda _scope, _ref: (),
+        mcp_unattended: Callable[[], bool] = lambda: False,
+    ) -> None:
+        self.approvals = approvals
+        self.slots = slots or WaitingSlots()
+        #: The pre-grants stored for one unattended scope (schedule, batch, test series); none until they are stored.
+        self.pre_grants = pre_grants
+        #: ADR-0007 D-7 (read-only MCP tools unattended), only after the MCP security acceptance.
+        self.mcp_unattended = mcp_unattended
+
+
 __all__ = [
     "COLLECTION",
     "DEFAULT_WAIT",
+    "DESKTOP_MAX_WAITING",
+    "ENABLE_ENV",
     "FINAL",
     "MAX_WAIT",
     "ApprovalStatus",
     "ToolApprovalRequest",
     "ToolApprovals",
+    "ToolGate",
+    "WaitingSlots",
+    "approvals_enabled",
     "arguments_hash",
     "request_key",
 ]
