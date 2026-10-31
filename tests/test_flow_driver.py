@@ -124,5 +124,9 @@ def test_the_engine_has_no_scheduler_of_its_own() -> None:
     for path in SOURCE.glob("*.py"):
         if path.name in ("engine.py", "flow_driver.py"):
             continue
-        source = path.read_text(encoding="utf-8")
-        assert "from orkexa import flow" not in source and "orkexa.flow" not in source, path.name
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module == "orkexa":
+                assert "flow" not in {alias.name for alias in node.names}, path.name
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+                assert not any(name.startswith("orkexa.flow") for name in modules), path.name
