@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Adaptive Orchestration M2 (sub-workflow budgets):
+
+- **Behavior change: the `budget_usd` of a sub-workflow is now enforced.** Before, a child run only counted against
+  the parent's budget and its own limit was ignored. Now the child stops at whichever comes first, its own remaining
+  budget or the parent's; the parent's limit still covers everything the child spends. The child uses the parent's
+  price mode, so strict mode refuses unpriced models in the child as well. Known limitation: in standard price mode a
+  request without a price is still sent and its cost stays unknown (not zero), so it is not counted against either
+  limit; the reservations of M2 make this visible.
+
 Adaptive Orchestration M1 (loop placeholders in the check before a run):
 
 - `preflight` accepts `{{iteration}}`, `{{previous}}` and `{{feedback}}` in the tasks of nodes inside a loop; outside
