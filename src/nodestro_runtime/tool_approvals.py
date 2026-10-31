@@ -41,6 +41,8 @@ MAX_WAIT = timedelta(minutes=15)
 POLL_SECONDS = 1.0
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired", "cancelled"]
+#: ``closed_because`` of the requests of a run that was stopped elsewhere.
+INTERRUPTED = "run.interrupted"
 FINAL: frozenset[str] = frozenset({"approved", "rejected", "expired", "cancelled"})
 
 
@@ -76,6 +78,9 @@ class ToolApprovalRequest(BaseModel):
     decided_by: str | None = None
     decided_at: datetime | None = None
     comment: str | None = None
+    #: Why a request was closed without a decision: ``deadline``, ``cancelled`` or ``run.interrupted`` (the run was
+    #: stopped elsewhere, e.g. by the reaper: the waiting run must not go on either).
+    closed_because: str | None = None
 
     @property
     def key(self) -> str:
@@ -148,13 +153,13 @@ class ToolApprovals:
             if found.status != "pending":
                 return found
             if self.clock() >= found.deadline:
-                self.close(run_id, request_id, "expired")
+                self.close(run_id, request_id, "expired", because="deadline")
                 continue
             if check is not None:
                 try:
                     check()
                 except BaseException:
-                    self.close(run_id, request_id, "cancelled")
+                    self.close(run_id, request_id, "cancelled", because="cancelled")
                     raise
             self.sleep(self.poll_seconds)
 
@@ -208,23 +213,25 @@ class ToolApprovals:
         # Lost the race: either somebody decided first, or the deadline passed (by the store's clock).
         current = self.get(run_id, request_id)
         if current is not None and current.status == "pending":
-            self.close(run_id, request_id, "expired")
+            self.close(run_id, request_id, "expired", because="deadline")
             current = self.get(run_id, request_id)
         assert current is not None
         self._refuse_final(current)
         raise AssertionError("unreachable: the request is final")  # pragma: no cover
 
-    def close(self, run_id: str, request_id: str, status: Literal["expired", "cancelled"]) -> bool:
+    def close(
+        self, run_id: str, request_id: str, status: Literal["expired", "cancelled"], *, because: str | None = None
+    ) -> bool:
         """Mark a pending request ``expired`` or ``cancelled``; ``False`` when it was not pending any more."""
         found = self.get(run_id, request_id)
         if found is None or found.status != "pending":
             return False
-        closed = found.model_copy(update={"status": status, "decided_at": self.clock()})
+        closed = found.model_copy(update={"status": status, "decided_at": self.clock(), "closed_because": because})
         return self.store.replace_if(COLLECTION, found.key, closed, field="status", expected="pending")
 
     def expire_run(self, run_id: str) -> int:
         """Expire every pending request of a run (the run stopped: interrupted, lost lease, crash, restart)."""
-        return sum(self.close(run_id, item.id, "expired") for item in self.pending(run_id))
+        return sum(self.close(run_id, item.id, "expired", because=INTERRUPTED) for item in self.pending(run_id))
 
     @staticmethod
     def _refuse_final(found: ToolApprovalRequest) -> None:
@@ -256,12 +263,13 @@ class WaitingSlots:
     """How many runs may wait for a tool approval at the same time; a run that cannot wait is denied at once
     (``tool.approval_capacity``), never queued. Counted per run: parallel calls of one run share its slot.
 
-    The desktop uses one per process; a server worker supplies its own that also bounds its held runs (S-2a step 3).
+    The desktop uses one per process; a server worker (:class:`~nodestro_runtime.jobs.RunWorker`) installs its own
+    into every tenant's gate, so the limit holds per worker across tenants. ``0`` lets no run wait.
     """
 
     def __init__(self, max_waiting: int = DESKTOP_MAX_WAITING) -> None:
-        if max_waiting < 1:
-            raise ValueError("max_waiting must be at least 1")
+        if max_waiting < 0:
+            raise ValueError("max_waiting must not be negative")
         self.max_waiting = max_waiting
         self._waiting: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -315,6 +323,7 @@ __all__ = [
     "DESKTOP_MAX_WAITING",
     "ENABLE_ENV",
     "FINAL",
+    "INTERRUPTED",
     "MAX_WAIT",
     "ApprovalStatus",
     "ToolApprovalRequest",

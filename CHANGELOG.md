@@ -43,7 +43,16 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   cancels its question; `recover()` and `interrupt()` expire the questions of interrupted runs. New events
   `tool_approval_requested`, `tool_approval_decided`, `tool_denied`. Additive schemas: `AgentConfig.tool_policies`
   (tool name -> `ToolBinding`), `ToolCallRecord.approval` (`ToolCallApproval`). Not yet: stamping existing bindings as
-  legacy exemptions (required before any activation), stored pre-grants, the server worker capacity.
+  legacy exemptions (required before any activation), stored pre-grants.
+- Server workers hold up to `max_runs` runs (default 2), of which up to `max_waiting` (default 1) may wait for a tool
+  approval (`RunWorker(max_runs=, max_waiting=)`, validated by `jobs.check_capacity`: `max_runs >= 1`,
+  `0 <= max_waiting < max_runs`). A worker claims only while it holds fewer than `max_runs` runs and none of them
+  executes, so without questions it still executes one run at a time; an approved run continues in its own slot
+  (never more than `max_runs` per worker); a run that would wait beyond `max_waiting` is denied at once
+  (`tool.approval_capacity`). The worker's waiting slots are shared by the gates of all tenants it serves. `serve`
+  waits for its held runs when stopped.
+- A question that an interruption expired (the reaper after a lost lease, a restart) stops the waiting execution
+  instead of letting it go on (`ToolApprovalRequest.closed_because`, `run.interrupted`).
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 

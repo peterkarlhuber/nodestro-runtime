@@ -89,7 +89,7 @@ from .schemas import (
     now,
 )
 from .storage import DocumentStore
-from .tool_approvals import ToolApprovals, ToolGate
+from .tool_approvals import INTERRUPTED, ToolApprovals, ToolGate
 
 logger = logging.getLogger(__name__)
 
@@ -1979,6 +1979,10 @@ class RunManager:
                 raise
         finally:
             gate.slots.leave(run_id)
+        if final.status == "expired" and final.closed_because == INTERRUPTED:
+            # Stopped elsewhere (the reaper after a lost lease, a restart): this execution must not go on.
+            record.approval = record.approval.model_copy(update={"status": "expired", "code": "run.interrupted"})
+            raise RunCancelled("The run was interrupted while it waited for an approval")
         code = {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
         record.approval = ToolCallApproval(
             status=final.status,
