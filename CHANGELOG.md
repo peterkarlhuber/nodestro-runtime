@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+MCP OAuth 2.1 (ADR-0007, work package WP-6):
+
+- New module `nodestro_runtime.mcp.oauth`: sign-in for MCP servers with `auth="oauth"` following the MCP
+  authorization specification, built on the official SDK (metadata models, discovery URLs, issuer checks, token
+  parsing, the refreshing `OAuthClientProvider`). `McpService.begin_oauth` / `abegin_oauth` discover the protected
+  resource metadata (RFC 9728) and the authorization server metadata (RFC 8414, issuer checked), register a client
+  (RFC 7591 or a client ID metadata document) and return the authorization URL (PKCE `S256` required, `state`,
+  `resource` per RFC 8707). `complete_oauth` / `acomplete_oauth` check `state`, expiry (10 minutes) and the issuer of
+  the response (RFC 9207), exchange the code once and store the credentials sealed (`SecretBox` per tenant or the
+  desktop keychain key; otherwise for the session only). `sign_out` forgets them.
+- Calls present the access token only to the MCP server and refresh it at the discovered token endpoint; one provider
+  per server serializes refreshes (rotating refresh tokens); refreshed tokens are stored sealed again. A lost grant
+  fails with `mcp.oauth_reauthorize`. Every request of the flow goes through the guarded HTTP client (address
+  checks, operator endpoint list). New error codes: `mcp.oauth_failed`, `mcp.oauth_not_required`,
+  `mcp.oauth_not_configured`, `mcp.oauth_state_invalid`, `mcp.oauth_expired`, `mcp.oauth_redirect_invalid`,
+  `mcp.oauth_registration_unsupported`, `mcp.oauth_token_input`, `mcp.oauth_reauthorize`; new events
+  `oauth_started`, `oauth_failed`.
+
 MCP operations (ADR-0007, work package WP-7):
 
 - `McpLimits` (`NODESTRO_MCP_MAX_SERVERS`, `_MAX_PARALLEL`, `_QUEUE_SECONDS`, `_CALLS_PER_MINUTE`,

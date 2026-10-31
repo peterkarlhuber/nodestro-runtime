@@ -33,6 +33,10 @@ from typing import Any, ClassVar, TypeVar
 from ..problems import NodestroError
 from .models import McpServer, ToolDefinition, clean_definition
 from .netguard import EgressPolicy, Resolver, guarded_client
+from .oauth import OAuthCredentials
+
+#: How a call authenticates: nothing, a static bearer token, or OAuth credentials (refreshed by the hub).
+Credential = str | OAuthCredentials | None
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +172,22 @@ def _find(exc: BaseException, kind: type[BaseException]) -> BaseException | None
     return None
 
 
+def _find_matching(exc: BaseException, predicate: Callable[[BaseException], bool]) -> BaseException | None:
+    """Like :func:`_find`, with a predicate (exception groups, causes and contexts included)."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if predicate(current):
+            return current
+        pending.extend(getattr(current, "exceptions", ()) or ())
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
+    return None
+
+
 def translate(exc: BaseException, server: McpServer, statuses: list[int] | None = None) -> NodestroError:
     """A stable Nodestro error for whatever the SDK, HTTP or the network raised.
 
@@ -259,6 +279,9 @@ class McpHub:
         self._tenant_slots: asyncio.Semaphore | None = None
         #: Tokens kept only in this process (no secure key store, D-3): server id -> token.
         self.session_tokens: dict[str, str] = {}
+        #: One refreshing OAuth provider per server, so that concurrent calls share one refresh (rotating refresh
+        #: tokens are valid once); keyed by server id, with the fingerprint of the credentials it was built from.
+        self._oauth: dict[str, tuple[str, Any]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -422,9 +445,36 @@ class McpHub:
             self._semaphores[server.id] = known
         return known[1]
 
-    def _client(self, server: McpServer, token: str | None) -> Any:
-        headers = {"Authorization": f"Bearer {token}"} if token else None
-        return guarded_client(
+    def _oauth_provider(self, server: McpServer, credentials: OAuthCredentials) -> Any:
+        from . import oauth
+
+        wanted = oauth.fingerprint(credentials)
+        cached = self._oauth.get(server.id)
+        if cached is not None:
+            built_from, provider = cached
+            storage = provider.context.storage
+            if wanted in (built_from, oauth.fingerprint(storage.credentials)):
+                if storage.credentials is not credentials:
+                    # The cached provider may have refreshed since: hand the newest tokens to the caller to store.
+                    if oauth.fingerprint(storage.credentials) != wanted:
+                        credentials.tokens = dict(storage.credentials.tokens)
+                        credentials.expires_at = storage.credentials.expires_at
+                        credentials.scope = storage.credentials.scope
+                        credentials.changed = True
+                    storage.credentials = credentials
+                return provider
+        provider = oauth.provider(server, credentials)
+        self._oauth[server.id] = (wanted, provider)
+        return provider
+
+    def forget_oauth(self, server_id: str) -> None:
+        """Drop the cached OAuth provider (new sign-in, sign-out, new address)."""
+        self._oauth.pop(server_id, None)
+
+    def _client(self, server: McpServer, token: str | OAuthCredentials | None) -> Any:
+        oauth = token if isinstance(token, OAuthCredentials) else None
+        headers = {"Authorization": f"Bearer {token}"} if isinstance(token, str) and token else None
+        client = guarded_client(
             self.policy,
             server.url,
             allow_loopback=server.allow_loopback,
@@ -433,8 +483,11 @@ class McpHub:
             resolver=self.resolver,
             verify=self.verify,
         )
+        if oauth is not None:
+            client.auth = self._oauth_provider(server, oauth)
+        return client
 
-    async def _session(self, server: McpServer, token: str | None, operation: Callable[[Any], Awaitable[T]]) -> T:
+    async def _session(self, server: McpServer, token: Credential, operation: Callable[[Any], Awaitable[T]]) -> T:
         require_sdk()
         from mcp import Client
         from mcp.client.streamable_http import streamable_http_client
@@ -462,6 +515,16 @@ class McpHub:
         except NodestroError:
             raise
         except Exception as exc:
+            if isinstance(token, OAuthCredentials):
+                from .oauth import is_oauth_failure
+
+                if _find_matching(exc, is_oauth_failure) is not None:
+                    self.forget_oauth(server.id)
+                    raise NodestroError(
+                        "mcp.oauth_reauthorize",
+                        f"{server.name} asks for a new sign-in",
+                        server=server.name,
+                    ) from None
             statuses = getattr(getattr(http, "nodestro_backend", None), "statuses", None)
             raise translate(exc, server, statuses) from None
 
@@ -485,7 +548,7 @@ class McpHub:
                 break
         return tools, skipped
 
-    async def adiscover(self, server: McpServer, token: str | None) -> Discovery:
+    async def adiscover(self, server: McpServer, token: Credential) -> Discovery:
         async def operation(client: Any) -> Discovery:
             tools, skipped = await self._list(client)
             info = client.server_info
@@ -506,13 +569,13 @@ class McpHub:
         health.consecutive_failures, health.cooling_until, health.last_error_code = 0, None, None
         return found
 
-    def discover(self, server: McpServer, token: str | None) -> Discovery:
+    def discover(self, server: McpServer, token: Credential) -> Discovery:
         return self.run(self.adiscover(server, token), timeout=server.timeout_seconds * 2 + 5)
 
     async def acall_tool(
         self,
         server: McpServer,
-        token: str | None,
+        token: Credential,
         name: str,
         arguments: dict[str, Any],
         *,
@@ -564,7 +627,7 @@ class McpHub:
     def call_tool(
         self,
         server: McpServer,
-        token: str | None,
+        token: Credential,
         name: str,
         arguments: dict[str, Any],
         *,
