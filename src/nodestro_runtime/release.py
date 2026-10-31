@@ -10,7 +10,9 @@ A release bundle holds everything a reproducible run needs and nothing secret:
 - references to data that is *not* versioned: knowledge files (name, size, SHA-256) and
   persistent memory spaces. They are live data of the installation; the bundle only names
   them, so later changes to them are visible, never hidden;
-- the request and result schemas and the runtime versions it was published with.
+- the request and result schemas and the runtime versions it was published with;
+- the MCP tools its agents use, frozen at their approved definitions (server id and slug, hash, classification);
+  never a server address or a token.
 
 API keys, the Anthropic key and settings are never part of a bundle. The bundle is used by
 Nodestro's direct API (:mod:`nodestro_api.publishing`) and is the ``workflow/release.json`` of an
@@ -24,7 +26,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from orkexa.dynamic import ToolRecord
 from pydantic import BaseModel, Field
@@ -35,6 +37,24 @@ from .tool_provenance import MemoryProvenance
 
 FORMAT = "nodestro-release"
 FORMAT_VERSION = 1
+
+
+class McpToolRef(BaseModel):
+    """An MCP tool frozen in a release bundle (WP-9): the approved definition the release was published with.
+
+    It names the server by id and slug only: no address, no token, no credentials. A release run uses the tool only
+    while the tenant still has the same server with this tool approved at exactly this hash and classification
+    (``mcp.release_tool_changed`` otherwise). Defined here, not in :mod:`nodestro_runtime.mcp`, so a runtime copy
+    without the MCP client (an exported project) can still read bundles."""
+
+    tool_name: str
+    server_id: str
+    server_slug: str
+    name: str
+    hash: str
+    access: Literal["read", "write", "destructive"]
+    #: The approved definition (name, title, description, schemas, annotations), for review and comparison.
+    definition: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubworkflowSnapshot(BaseModel):
@@ -99,6 +119,10 @@ class ReleaseBundle(BaseModel):
     tool_trust: dict[str, TrustClass] = Field(default_factory=dict)
     builtin_tools: list[str] = Field(default_factory=list)
     server_tools: list[str] = Field(default_factory=list)
+    #: Tools of connected MCP servers, frozen at the definition they were approved with (WP-9): server id and slug,
+    #: hash, classification, definition; never an address or a token. A run uses them only while the tenant's
+    #: approval still matches (:class:`~nodestro_runtime.mcp.pinned.PinnedMcp`).
+    mcp_tools: dict[str, McpToolRef] = Field(default_factory=dict)
     models: list[str] = Field(default_factory=list)
     python: list[PythonLock] = Field(default_factory=list)
     knowledge: list[KnowledgeRef] = Field(default_factory=list)
@@ -111,8 +135,13 @@ class ReleaseBundle(BaseModel):
     def digest(self) -> str:
         """SHA-256 of the content (without the creation time): equal bundles, equal digest.
 
-        An empty ``tool_trust`` is left out, so bundles published before it existed keep their digest."""
-        exclude = {"created_at"} if self.tool_trust else {"created_at", "tool_trust"}
+        An empty ``tool_trust`` or ``mcp_tools`` is left out, so bundles published before they existed keep their
+        digest."""
+        exclude = {"created_at"}
+        if not self.tool_trust:
+            exclude.add("tool_trust")
+        if not self.mcp_tools:
+            exclude.add("mcp_tools")
         data = self.model_dump(mode="json", exclude=exclude)
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -154,6 +183,9 @@ class ReleaseBundle(BaseModel):
 
     def tool_marker(self, name: str) -> str:
         record = self.tools.get(name)
+        pinned = self.mcp_tools.get(name)
+        if pinned is not None:
+            return f"{name}:mcp:{pinned.hash[:12]}"
         if record is None:
             return f"builtin:{name}" if name in self.builtin_tools else f"{name}:missing"
         return f"{name}:v{record.get('version')}:{str(record.get('sha256') or '')[:12]}"
