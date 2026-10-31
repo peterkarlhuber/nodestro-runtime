@@ -116,3 +116,54 @@ async def test_an_unattended_run_uses_a_matching_pre_grant_until_it_is_revoked(w
     grants.revoke("schedule", "sch_1", grant.id, by="usr_1")
     revoked = await approval("sch_1")
     assert revoked.status == "denied" and revoked.code == "tool.approval_unattended"  # type: ignore[attr-defined]
+
+
+async def test_a_new_tool_version_and_the_expiry_end_a_pre_grant(workspace: Workspace) -> None:
+    """Security acceptance (D10c): a pre-grant covers exactly the tool version it names, and only until it expires."""
+    import asyncio
+
+    from nodestro_runtime.launcher import launch
+
+    flow = WorkflowIn.model_validate(
+        {
+            "name": "Scheduled",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "a", "type": "agent", "agent": {"system_prompt": "AGENT", "tools": [TOOL]}},
+            ],
+            "edges": [{"id": "e", "source": "start", "target": "a"}],
+        }
+    )
+    saved = workspace.save_workflow(flow)
+    grants = ToolPreGrants(workspace.store)
+
+    def grant(**extra: object) -> None:
+        info = workspace.tools.get(TOOL)
+        grants.grant(
+            tool=TOOL,
+            kind=info.kind,
+            capability=info.capability,
+            version=info.version,
+            scope="schedule",
+            scope_id="sch_1",
+            by="usr_1",
+            **extra,  # type: ignore[arg-type]
+        )
+
+    async def approval() -> object:
+        started = await launch(workspace, saved, RunIn(input="x"), trigger="schedule", trigger_ref="sch_1")
+        done = await workspace.wait(started.id, timeout=20)
+        return done.nodes["a"].tool_calls[0].approval
+
+    grant()
+    code = CUSTOM_TOOL_TEMPLATE.replace("9 / 5", "1.8")
+    result, _ = workspace.tools.save_custom(
+        code, CUSTOM_TESTS_TEMPLATE, TOOL, trust=workspace.tools.editor_trust(TOOL, code)
+    )
+    assert result.ok
+    outdated = await approval()
+    assert outdated.status == "denied" and outdated.code == "tool.approval_unattended"  # type: ignore[attr-defined]
+    grant(expires_at=now() + timedelta(seconds=1))
+    await asyncio.sleep(1.2)
+    expired = await approval()
+    assert expired.status == "denied" and expired.code == "tool.approval_unattended"  # type: ignore[attr-defined]
