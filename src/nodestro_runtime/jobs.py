@@ -278,8 +278,9 @@ class PostgresEventLog:
 class QueuedRuns:
     """Connects one tenant's :class:`~nodestro_runtime.engine.RunManager` to the job queue (API processes).
 
-    After :meth:`attach`, starting or continuing a run stores it and queues a job instead of executing it, and
-    cancelling a run a worker holds goes through the queue."""
+    After :meth:`attach`, starting or continuing a run stores it and queues a job instead of executing it,
+    cancelling a run a worker holds goes through the queue, and event streams and waits follow the worker's run
+    through ``nodestro_run_events``."""
 
     def __init__(self, queue: JobQueue, tenant_id: str, runs: Any) -> None:
         self.queue = queue
@@ -287,8 +288,10 @@ class QueuedRuns:
         self.runs = runs
 
     def attach(self) -> None:
+        log = PostgresEventLog(self.queue.database, self.tenant_id)
         self.runs.dispatch = self.dispatch
         self.runs.remote_cancel = self.cancel
+        self.runs.remote_events = lambda run_id, after: log.events(run_id, after=after)
 
     def dispatch(self, run: Run) -> None:
         if self.queue.enqueue(self.tenant_id, RUN_JOB, run.id) is None:
@@ -340,6 +343,7 @@ class RunWorker:
         runs.event_sink = log.append
         runs.dispatch = None
         runs.remote_cancel = None
+        runs.remote_events = None
         return runs
 
     async def run_once(self) -> Job | None:
