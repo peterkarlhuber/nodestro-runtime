@@ -310,9 +310,13 @@ async def test_capability_selection_adds_matching_teams_to_the_pool(make: Make) 
         (other.id, ["research"]),
     ]
     assert all(member.version == 1 for member in members)
+    # Pinning the snapshot again (a team run, a release) never adds teams saved later.
+    team(workspace, "LATE", "Late", capabilities=["research"])
+    again = workspace.runs.pin_subworkflows(pinned)
+    assert [member.workflow_id for member in again.nodes[1].orchestrator.members] == [best.id, other.id]  # type: ignore[union-attr]
     problems = preflight(workspace, saved).problems
     selected = next(issue for issue in problems if issue.code == "check.orchestrator_selected")
-    assert selected.params["teams"] == "Best, Other"
+    assert selected.params["teams"] == "Best, Late, Other"  # the saved workflow selects anew
 
     done = await run(workspace, flow)
     assert done.status == "succeeded", done.error

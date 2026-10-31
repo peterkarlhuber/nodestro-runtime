@@ -356,6 +356,9 @@ class OrchestratorSelect(_Model):
     capabilities: list[str] = Field(default_factory=list, max_length=10)
     #: At most this many selected teams (the explicit members come first and count towards ``MAX_POOL``).
     max_teams: int = Field(default=5, ge=1, le=MAX_POOL)
+    #: Set in a pinned snapshot once the selection was made: pinning it again (a team started by a run, a
+    #: published release) keeps the selected members and never adds teams saved later.
+    done: bool = False
 
     @field_validator("capabilities")
     @classmethod

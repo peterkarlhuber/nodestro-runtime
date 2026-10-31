@@ -100,7 +100,7 @@ def select_teams(
     workflow itself and workflows ``usable`` refuses are skipped.
     """
     select = config.select
-    if select is None or not select.capabilities:
+    if select is None or not select.capabilities or select.done:
         return []
     wanted = {tag.casefold(): tag for tag in select.capabilities}
     taken = set(team_ids_of(config))

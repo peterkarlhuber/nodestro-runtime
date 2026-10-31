@@ -924,7 +924,11 @@ class RunManager:
     def pin_subworkflows(self, workflow: Workflow) -> Workflow:
         """A copy whose sub-workflow nodes name the exact version they will run."""
         selecting = [
-            node for node in workflow.nodes if node.orchestrator is not None and node.orchestrator.select is not None
+            node
+            for node in workflow.nodes
+            if node.orchestrator is not None
+            and node.orchestrator.select is not None
+            and not node.orchestrator.select.done
         ]
         if not selecting and not any(graph.workflow_refs(node) for node in workflow.nodes):
             return workflow
@@ -938,8 +942,9 @@ class RunManager:
             candidates = self.team_candidates()
             for node in pinned.nodes:
                 config = node.orchestrator
-                if config is not None and config.select is not None:
+                if config is not None and config.select is not None and not config.select.done:
                     config.members += select_teams(config, workflow.id, candidates, _usable_team)
+                    config.select.done = True
         return pinned
 
     def team_candidates(self) -> list[tuple[Workflow, int]]:

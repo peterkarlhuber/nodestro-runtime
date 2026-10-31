@@ -4,7 +4,7 @@
 
 Adaptive Orchestration M5 (pool selection):
 
-- New `OrchestratorConfig.select` (`capabilities`, up to 10 tags; `max_teams` 1..20, default 5): saved workflows
+- New `OrchestratorConfig.select` (`capabilities`, up to 10 tags; `max_teams` 1..20, default 5; `done`, set once a snapshot selected): saved workflows
   whose capabilities match join the pool. The selection happens when a run or a published release pins its
   workflows, so it is fixed and visible in the run's snapshot: each selected `OrchestratorMember` has `matched`
   (the tags it shares). Order: number of matching tags, then name and id; no score is invented. Workflows with
