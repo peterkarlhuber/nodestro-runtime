@@ -18,6 +18,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
@@ -43,6 +44,19 @@ MIGRATIONS: Mapping[int, Migration] = {}
 BeforeMigration = Callable[[int, int], None]
 
 
+def _in_future(value: Any) -> bool:
+    """Whether an ISO time stored in a document lies after now (a missing or unreadable time does not)."""
+    if not isinstance(value, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        return False
+    return moment > datetime.now(timezone.utc)
+
+
 @runtime_checkable
 class DocumentStore(Protocol):
     """JSON documents grouped into collections: the storage every Nodestro component uses.
@@ -58,6 +72,9 @@ class DocumentStore(Protocol):
       (ASCII letters compared without case), for scans that look into documents of several collections.
     - Every write is atomic. ``transaction`` groups writes: all of them are stored or none; it is reentrant,
       and other threads wait until it ends.
+    - ``replace_if`` replaces a document only while its top-level ``field`` still has the value ``expected`` (and,
+      with ``live_until``, while the time in that top-level field lies in the future by the store's clock), as one
+      atomic step that is safe across threads, processes and database connections. It returns whether it did.
     - ``close`` is idempotent; ``closed`` says whether it was called.
     """
 
@@ -71,6 +88,10 @@ class DocumentStore(Protocol):
     def put(self, collection: str, key: str, model: BaseModel) -> None: ...
 
     def put_raw(self, collection: str, key: str, value: Any) -> None: ...
+
+    def replace_if(
+        self, collection: str, key: str, model: BaseModel, *, field: str, expected: str, live_until: str | None = None
+    ) -> bool: ...
 
     def get_raw(self, collection: str, key: str) -> Any | None: ...
 
@@ -174,6 +195,30 @@ class SQLiteStore:
                 " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
                 (collection, key, data),
             )
+
+    def replace_if(
+        self, collection: str, key: str, model: BaseModel, *, field: str, expected: str, live_until: str | None = None
+    ) -> bool:
+        data = model.model_dump_json()
+        # BEGIN IMMEDIATE holds the database's write lock, so the check and the write are one step for every
+        # connection and process that uses this file.
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT data FROM nodestro_documents WHERE collection = ? AND id = ?", (collection, key)
+            ).fetchone()
+            if row is None:
+                return False
+            current = json.loads(row[0])
+            if not isinstance(current, dict) or current.get(field) != expected:
+                return False
+            if live_until is not None and not _in_future(current.get(live_until)):
+                return False
+            db.execute(
+                "UPDATE nodestro_documents SET data = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                " WHERE collection = ? AND id = ?",
+                (data, collection, key),
+            )
+            return True
 
     def put_raw(self, collection: str, key: str, value: Any) -> None:
         with self._transaction() as db:
