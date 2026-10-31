@@ -317,6 +317,74 @@ class ToolGate:
         self.mcp_unattended = mcp_unattended
 
 
+# ---- pre-grants (D10c) ------------------------------------------------------------------------------------------
+
+PRE_GRANTS = "tool_pre_grants"
+
+
+class ToolPreGrants:
+    """A person's stored advance approvals for unattended scopes (schedule, batch, test series) of one tenant.
+
+    Narrow (one tool, one version, one scope), traceable (who, when), revocable (checked at every call, so a
+    revocation applies at the next call) and enforced in the runtime (:func:`~nodestro_runtime.tool_policy.decide`).
+    Refused for ``destructive`` and MCP tools and for tools without a version."""
+
+    def __init__(self, store: DocumentStore, *, clock: Callable[[], datetime] = now) -> None:
+        self.store = store
+        self.clock = clock
+
+    def grant(
+        self,
+        *,
+        tool: str,
+        kind: str,
+        capability: ToolCapability,
+        version: int | None,
+        scope: PreGrantScope,
+        scope_id: str,
+        by: str,
+        expires_at: datetime | None = None,
+    ) -> ToolPreGrant:
+        if kind == "mcp":
+            raise NodestroError("tool.pre_grant_mcp", "MCP tools cannot be approved in advance", tool=tool)
+        if capability.access == "destructive":
+            raise NodestroError(
+                "tool.pre_grant_destructive", "Destructive tools cannot be approved in advance", tool=tool
+            )
+        if version is None:
+            raise NodestroError("tool.pre_grant_version", "Only a tool version can be approved in advance", tool=tool)
+        at = self.clock()
+        if expires_at is not None and expires_at <= at:
+            raise NodestroError("tool.pre_grant_expiry", "The expiry lies in the past", tool=tool)
+        found = ToolPreGrant(
+            id=new_id("tpg"),
+            tool=tool,
+            version=version,
+            scope=scope,
+            scope_id=scope_id,
+            granted_by=by,
+            granted_at=at,
+            expires_at=expires_at,
+        )
+        self.store.put(PRE_GRANTS, f"{scope}:{scope_id}:{found.id}", found)
+        return found
+
+    def of_scope(self, scope: PreGrantScope, scope_id: str) -> list[ToolPreGrant]:
+        """Every pre-grant stored for the scope, revoked and expired ones included (``decide`` filters them)."""
+        return self.store.list_prefix(PRE_GRANTS, f"{scope}:{scope_id}:", ToolPreGrant)
+
+    def revoke(self, scope: PreGrantScope, scope_id: str, grant_id: str) -> ToolPreGrant:
+        key = f"{scope}:{scope_id}:{grant_id}"
+        found = self.store.get(PRE_GRANTS, key, ToolPreGrant)
+        if found is None:
+            raise NodestroError("tool.pre_grant_not_found", "There is no such pre-grant", id=grant_id)
+        if found.revoked_at is not None:
+            return found
+        revoked = found.model_copy(update={"revoked_at": self.clock()})
+        self.store.put(PRE_GRANTS, key, revoked)
+        return revoked
+
+
 __all__ = [
     "COLLECTION",
     "DEFAULT_WAIT",
@@ -325,10 +393,12 @@ __all__ = [
     "FINAL",
     "INTERRUPTED",
     "MAX_WAIT",
+    "PRE_GRANTS",
     "ApprovalStatus",
     "ToolApprovalRequest",
     "ToolApprovals",
     "ToolGate",
+    "ToolPreGrants",
     "WaitingSlots",
     "approvals_enabled",
     "arguments_hash",

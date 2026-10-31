@@ -88,6 +88,10 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   stores the report (`tool_approvals_activation/legacy`), and is idempotent. `save_workflow` drops legacy entries the
   stored workflow did not already have for the same node, tool and version, so saving, copying, importing or an API
   client never creates one; a new tool version ends an exemption at the next call.
+- Stored pre-grants (D10c): `tool_approvals.ToolPreGrants` (collection `tool_pre_grants`) grants one tool version for
+  one schedule, batch or test series, with who and when, an optional expiry and revocation; refused for MCP and
+  `destructive` tools and for tools without a version (`tool.pre_grant_*`). The workspace's gate reads them per
+  call, so a revocation applies at the next call.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
