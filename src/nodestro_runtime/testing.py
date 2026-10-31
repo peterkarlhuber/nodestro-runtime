@@ -288,9 +288,14 @@ class FakeUv:
             version, needs, _module = (pinned or versions)[-1]
             chosen[name] = (version, needs)
             queue += [(need, name) for need in needs]
+        import hashlib
+
         lines = []
         for name in sorted(chosen):
-            lines.append(f"{name}=={chosen[name][0]}")
+            # Like ``uv pip compile --generate-hashes``: every package with the hash of its distribution.
+            digest = hashlib.sha256(f"{name}=={chosen[name][0]}".encode()).hexdigest()
+            lines.append(f"{name}=={chosen[name][0]} \\")
+            lines.append(f"    --hash=sha256:{digest}")
             sources = via[name]
             if len(sources) == 1:
                 lines.append(f"    # via {sources[0]}")

@@ -46,6 +46,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
+from .container_images import ContainerImages, lock_has_hashes
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
 from .sandbox_policy import Isolation
@@ -431,6 +432,8 @@ class UvRunner:
                     python,
                     "--no-header",
                     "--quiet",
+                    # Hashes of every distribution: container images install with --require-hashes (PR-11).
+                    "--generate-hashes",
                     *([] if builds else ["--no-build"]),
                 ],
                 log,
@@ -460,8 +463,7 @@ def parse_lock(lock: str) -> list[LockedPackage]:
     packages: list[LockedPackage] = []
     current: LockedPackage | None = None
     in_via = False
-    for raw in lock.splitlines():
-        line = raw.strip()
+    for line in _logical_lines(lock):
         match = _LOCK_LINE.match(line)
         if match:
             current = LockedPackage(
@@ -486,6 +488,27 @@ def parse_lock(lock: str) -> list[LockedPackage]:
     return packages
 
 
+def _logical_lines(lock: str) -> list[str]:
+    """The lines of a lock with continuations (``\\``) joined and ``--hash`` options removed."""
+    lines: list[str] = []
+    pending = ""
+    for raw in lock.splitlines():
+        line = raw.strip()
+        if pending:
+            line = f"{pending} {line}"
+        if line.endswith("\\"):
+            pending = line[:-1].strip()
+            continue
+        pending = ""
+        lines.append(_HASH_OPTION.sub("", line).strip())
+    if pending:
+        lines.append(_HASH_OPTION.sub("", pending).strip())
+    return lines
+
+
+_HASH_OPTION = re.compile(r"\s*--hash=\S+")
+
+
 def _add_via(package: LockedPackage, source: str) -> None:
     if source.startswith("-r ") or source.startswith("-c "):
         package.direct = True
@@ -508,8 +531,13 @@ class PythonEnvironments:
         runner: Any | None = None,
         sandbox_kind: Callable[[], str] = lambda: "subprocess",
         workflow_exists: Callable[[str], bool] = lambda _id: True,
+        images: ContainerImages | None = None,
     ) -> None:
+        """``images`` builds the container images of the Docker sandbox (tests pass a stand-in)."""
         self.store = store
+        self.images = images if images is not None else ContainerImages()
+        #: Image tag -> the lock hash it was found with (images are immutable, so a hit stays valid).
+        self._images_ready: dict[str, str] = {}
         self.root = root
         self.tools = tools
         self.runner = runner if runner is not None else UvRunner(root / "cache")
@@ -661,14 +689,6 @@ class PythonEnvironments:
         if needed.blocking:
             result.state = "unresolved"
             return result
-        if self.sandbox_kind() == "docker":
-            result.state = "unsupported"
-            result.problem = problem(
-                "deps.docker_unsupported",
-                "Tools with third-party libraries run in the subprocess sandbox only; "
-                "switch the sandbox in the settings",
-            )
-            return result
         if self.runner.binary is None:
             result.state = "unsupported"
             result.problem = problem("deps.uv_missing", "uv was not found; reinstall Nodestro or install uv")
@@ -681,7 +701,7 @@ class PythonEnvironments:
         assert env is not None
         if env.install.status == "installing":
             result.state = "installing"
-        elif self._installed_sha(scope) == _sha(env.lock):
+        elif self._ready(env):
             result.state = "ready"
         elif env.install.status == "failed" and env.install.lock_sha == _sha(env.lock):
             result.state = "failed"
@@ -722,6 +742,9 @@ class PythonEnvironments:
             foreign = any(item.installation != self.installation for item in env.approvals)
             reasons.add("other_installation" if foreign else "new")
             pending += [item.name for item in missing if item.name not in pending and item.direct]
+        if self.containers() and not lock_has_hashes(env.lock):
+            # Approved before container images existed: resolving again adds the hashes the image build needs.
+            reasons.add("hashes")
         return pending, sorted(reasons)
 
     # ---- plans -------------------------------------------------------------------------
@@ -954,6 +977,10 @@ class PythonEnvironments:
                 state.step = code
                 self._update_install(scope, state)
 
+            if self.containers():
+                self._build_image(scope, env, state, list(modules), write, step)
+                return
+
             target = self.env_dir(scope)
             staging = target.with_name(target.name + ".staging")
             _restore_swap(target)
@@ -1007,6 +1034,53 @@ class PythonEnvironments:
             latest.history.append(EnvChange(kind=kind, details=details))
             self._put(latest)
 
+    def _build_image(
+        self,
+        scope: str,
+        env: PythonEnvironment,
+        state: InstallState,
+        modules: list[str],
+        write: Callable[[str], None],
+        step: Callable[[str], None],
+    ) -> None:
+        """The Docker sandbox's installation: the container image of the lock (ADR-0006 point 6)."""
+        kind: ChangeKind
+        try:
+            step("deps.step.install")
+            tag = self.images.build(env.lock, env.python_version, log=write)
+            step("deps.step.verify")
+            missing = self.images.missing_modules(tag, [*modules, "pydantic"])
+            if missing:
+                # An image that fails verification is never used (like a discarded staging venv).
+                self._images_ready.pop(tag, None)
+                self.images.remove(tag)
+                raise _InstallProblem(
+                    problem(
+                        "deps.module_missing",
+                        f"After the installation these modules cannot be found: {', '.join(missing)}",
+                        modules=", ".join(missing),
+                    )
+                )
+            self._images_ready[tag] = _sha(env.lock)
+            state.status, state.step, state.error = "installed", None, None
+            kind, details = "installed", [f"{len(env.packages)} packages", f"image {tag}"]
+        except _InstallProblem as exc:
+            state.status, state.error = "failed", exc.problem
+            kind, details = "install_failed", [exc.problem.message]
+        except NodestroError as exc:
+            state.status, state.error = "failed", problem(exc.code, str(exc), **exc.params)
+            kind, details = "install_failed", [str(exc)[:300]]
+        except Exception as exc:  # any other failure must leave a usable state
+            logger.exception("Building the image of the environment %s failed", scope)
+            state.status, state.error = "failed", problem("deps.install_failed", f"{type(exc).__name__}: {exc}")
+            kind, details = "install_failed", [str(exc)[:300]]
+        state.lock_sha = _sha(env.lock)
+        state.finished_at = now()
+        latest = self.get(scope) or env
+        latest.install = state
+        latest.history.append(EnvChange(kind=kind, details=details))
+        self._put(latest)
+
     def recover(self) -> int:
         """After a restart: finish what an interrupted installation left behind.
 
@@ -1055,17 +1129,44 @@ class PythonEnvironments:
 
     # ---- sandbox ----------------------------------------------------------------------
 
+    def containers(self) -> bool:
+        """Whether environments are container images (the Docker sandbox) rather than virtual environments."""
+        return self.sandbox_kind() == "docker"
+
     def isolation(self) -> Isolation:
-        """How the environments' sandboxes isolate tool code: today a host subprocess with the environment's
-        interpreter (``none``), so only ``user-authored`` code may use third-party libraries (ADR-0006).
-        Container images per lock file come with plan step PR-11."""
-        return "none"
+        """How the environments' sandboxes isolate tool code (ADR-0006): with the Docker sandbox every environment is
+        a container image (``container``); otherwise a host subprocess with the environment's interpreter
+        (``none``), so only ``user-authored`` code may use third-party libraries there."""
+        return "container" if self.containers() else "none"
+
+    def _ready(self, env: PythonEnvironment) -> bool:
+        """Whether the approved lock of ``env`` is installed (as a virtual environment or a container image)."""
+        if not env.lock:
+            return False
+        if not self.containers():
+            return self._installed_sha(env.scope) == _sha(env.lock)
+        if not lock_has_hashes(env.lock):
+            return False
+        tag = self.images.tag(env.lock, env.python_version)
+        if self._images_ready.get(tag) == _sha(env.lock):
+            return True
+        try:
+            found = self.images.lock_of(tag)
+        except NodestroError:  # Docker is gone: nothing is ready
+            return False
+        if found == _sha(env.lock):
+            self._images_ready[tag] = found
+            return True
+        return False
 
     def sandbox(self, scope: str) -> Sandbox | None:
-        """A sandbox whose interpreter is the scope's environment, if it is installed."""
+        """A sandbox that runs tool code with the scope's environment, if it is installed: a container of its image
+        (Docker sandbox, no network) or a host subprocess with its interpreter."""
         env = self.get(scope)
-        if env is None or not env.lock or self._installed_sha(scope) != _sha(env.lock):
+        if env is None or not self._ready(env):
             return None
+        if self.containers():
+            return self.images.sandbox(self.images.tag(env.lock, env.python_version))
         return SubprocessSandbox(
             timeout=60.0,
             memory_mb=2048,
@@ -1083,6 +1184,7 @@ class PythonEnvironments:
         """Delete the installed environment; the approved definition stays and can be reinstalled."""
         with self._scope_lock(scope):
             shutil.rmtree(self.env_dir(scope), ignore_errors=True)
+            self._remove_image(scope)
         env = self.get(scope)
         if env is not None:
             env.install = InstallState()
@@ -1093,7 +1195,17 @@ class PythonEnvironments:
         """The owner is gone: delete the definition and the environment."""
         with self._scope_lock(scope):
             shutil.rmtree(self.env_dir(scope), ignore_errors=True)
+            self._remove_image(scope)
         self.store.delete(_COLLECTION, scope)
+
+    def _remove_image(self, scope: str) -> None:
+        """Drop the scope's container image (a cache; another scope with the same lock simply rebuilds it)."""
+        env = self.get(scope)
+        if env is None or not env.lock or not self.containers():
+            return
+        tag = self.images.tag(env.lock, env.python_version)
+        self._images_ready.pop(tag, None)
+        self.images.remove(tag)
 
     def export(self, scope: str) -> ExportedDefinition | None:
         env = self.get(scope)
