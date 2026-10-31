@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Built-in sandbox prototype (M6 PR-13, ADR-0006 point 7):
+
+- `nodestro_runtime.builtin_sandbox.BubblewrapSandbox`: a Linux x86-64 candidate built on bubblewrap. Each call gets
+  new user, PID, network, IPC, UTS and cgroup namespaces, a root file system with only the interpreter and its
+  libraries, an empty environment, a small private `/tmp`, and a seccomp filter. The filter refuses new processes,
+  non-`AF_UNIX` sockets, `ptrace`, mounts, namespaces and similar kernel interfaces.
+- `tests/test_builtin_sandbox.py` runs the acceptance tests of ADR-0006 against it; the new CI job
+  `builtin-sandbox` runs them with bubblewrap installed and fails instead of skipping.
+  `python -m nodestro_runtime.builtin_sandbox` prints the timings.
+- **Not isolating.** `isolation_of` still returns `"none"` for it, so untrusted code is refused exactly as before,
+  and no setting selects it. Nothing changes for the desktop or the server.
+
 Runs executed by a worker (M5/M6 PR-12, found by the server's end-to-end tests):
 
 - A run is stored as `running` when its execution starts, so other processes (the API of a server) no longer show
