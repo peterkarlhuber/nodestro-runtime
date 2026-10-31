@@ -17,6 +17,24 @@ Adaptive Orchestration M3 (teams: output contracts and capabilities):
 - `WorkflowSummary` gains `capabilities` and `contract` (the field names of the output contract), so lists can
   offer teams without loading every workflow.
 
+MCP OAuth 2.1 (ADR-0007, work package WP-6):
+
+- New module `nodestro_runtime.mcp.oauth`: sign-in for MCP servers with `auth="oauth"` following the MCP
+  authorization specification, built on the official SDK (metadata models, discovery URLs, issuer checks, token
+  parsing, the refreshing `OAuthClientProvider`). `McpService.begin_oauth` / `abegin_oauth` discover the protected
+  resource metadata (RFC 9728) and the authorization server metadata (RFC 8414, issuer checked), register a client
+  (RFC 7591 or a client ID metadata document) and return the authorization URL (PKCE `S256` required, `state`,
+  `resource` per RFC 8707). `complete_oauth` / `acomplete_oauth` check `state`, expiry (10 minutes) and the issuer of
+  the response (RFC 9207), exchange the code once and store the credentials sealed (`SecretBox` per tenant or the
+  desktop keychain key; otherwise for the session only). `sign_out` forgets them.
+- Calls present the access token only to the MCP server and refresh it at the discovered token endpoint; one provider
+  per server serializes refreshes (rotating refresh tokens); refreshed tokens are stored sealed again. A lost grant
+  fails with `mcp.oauth_reauthorize`. Every request of the flow goes through the guarded HTTP client (address
+  checks, operator endpoint list). New error codes: `mcp.oauth_failed`, `mcp.oauth_not_required`,
+  `mcp.oauth_not_configured`, `mcp.oauth_state_invalid`, `mcp.oauth_expired`, `mcp.oauth_redirect_invalid`,
+  `mcp.oauth_registration_unsupported`, `mcp.oauth_token_input`, `mcp.oauth_reauthorize`; new events
+  `oauth_started`, `oauth_failed`.
+
 Adaptive Orchestration M2 (step limit):
 
 - New `WorkflowLimits.max_steps` (1 to 10,000): the most node executions of a run. Every executed node counts,
@@ -180,6 +198,15 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   one schedule, batch or test series, with who and when, an optional expiry and revocation; refused for MCP and
   `destructive` tools and for tools without a version (`tool.pre_grant_*`). The workspace's gate reads them per
   call, so a revocation applies at the next call.
+- Approval audit trail (S-2b, D10): collection `tool_approval_audit` (`tool_approvals.ToolApprovalEvent`,
+  `record_audit`, `audit_events`, newest 5000 kept) records every decision, every refused decision with its problem
+  code, every pre-grant and revocation and the activation step, with actor and time, never the call's arguments
+  (only their hash). `ToolApprovals.open()` lists the tenant's open requests of all runs (the approval inbox),
+  `ToolPreGrants.all()` the pre-grants; `ToolPreGrant.revoked_by` and `ToolPreGrants.revoke(..., by=)` name who
+  revoked; `Workspace.legacy_tool_bindings()` reads the activation report and `stamp_legacy_tool_bindings(by=)`
+  names who activated. `LegacyBinding.release` names a published release stamped by the API's activation step.
+  Fix: running the activation step again no longer replaces the stored report with an empty one;
+  `record_legacy_tool_bindings` adds to it, so earlier exemptions stay listed.
 - Changing MCP tools behind the gate (WP-5, D10c): with `NODESTRO_TOOL_APPROVALS=1` the workspace sets
   `McpService.write_gate`, so approved `write`/`destructive` MCP tools become usable, and every such call is asked,
   whatever the binding says (no `never`, no legacy exemption, no pre-grant). The approval binds the arguments and the

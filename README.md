@@ -254,7 +254,9 @@ Access is the intersection of three decisions: the server is enabled, an adminis
 definition (pinned by its hash) and classified it, and the agent lists the tool. The check runs when an agent is built
 and right before every call, against the definition the server lists at that moment; a changed definition is blocked
 (`mcp.tool_changed`) until an administrator accepts it. Annotations such as `readOnlyHint` are shown as hints only.
-Until per-call approvals exist, only tools classified as `read` are usable (`mcp.write_not_supported`). Runs without a
+Tools classified as `write` or `destructive` are usable only while the shared per-call approval is active
+(`NODESTRO_TOOL_APPROVALS=1`, decision D10): every such call waits for a person; otherwise they are refused
+(`mcp.write_not_supported`). Runs without a
 person (schedules, batches, test series, published APIs) may use MCP tools only when the operator sets
 `NODESTRO_MCP_UNATTENDED=1` after the MCP security acceptance (`mcp.unattended_not_enabled`).
 
@@ -262,6 +264,30 @@ Calls have a timeout (default 60 s), an output limit (default 20,000 characters)
 server, and stop when the run is cancelled. Results reach the model marked as external data. Each call in a run
 records its provenance (`ToolCallRecord.provenance`: server, qualified name, definition hash, access) and
 `external_cost: "unknown"`: the cost of an external service is not known to Nodestro and is never counted as zero.
+
+Servers that use OAuth 2.1 (`auth="oauth"`) are signed in from a browser in two steps, so the callback may reach
+another process than the one that started it:
+
+```python
+url = workspace.mcp.begin_oauth(server.id, "https://nodestro.example.com/api/mcp/oauth/callback", actor="admin")
+# the person opens url, signs in, and the authorization server redirects to the callback with code, state and iss
+workspace.mcp.complete_oauth(state, code, iss)
+```
+
+`begin_oauth` asks the MCP server without credentials, discovers its protected resource metadata (RFC 9728) and the
+authorization server's metadata (RFC 8414, issuer checked), registers Nodestro (dynamic client registration, or a
+client ID metadata document) and builds the authorization URL with PKCE `S256`, `state` and the `resource` indicator
+(RFC 8707). `complete_oauth` checks `state` and the response's issuer (RFC 9207), exchanges the code once and stores
+the credentials sealed like every other token. Calls present the access token only to the MCP server and refresh it
+at the discovered token endpoint (rotating refresh tokens, one refresh per server at a time); when the grant is gone
+they fail with `mcp.oauth_reauthorize` instead of waiting for a browser. `sign_out` forgets the credentials; a new
+address or authentication kind forgets them as well.
+
+Operational limits (WP-7) come from the environment: `NODESTRO_MCP_MAX_SERVERS` (25 per tenant),
+`NODESTRO_MCP_MAX_PARALLEL` (8 parallel calls per tenant), `NODESTRO_MCP_QUEUE_SECONDS` (10),
+`NODESTRO_MCP_CALLS_PER_MINUTE` (120 per server), `NODESTRO_MCP_BREAKER_FAILURES` (5) and
+`NODESTRO_MCP_BREAKER_SECONDS` (60): after that many transport failures in a row a server rests
+(`mcp.cooling_down`). `workspace.mcp.hub.stats()` reports active calls, the limits and each server's health.
 
 ## Security and data protection
 
@@ -285,11 +311,14 @@ records its provenance (`ToolCallRecord.provenance`: server, qualified name, def
   to a checked one, so DNS rebinding cannot slip in between; private, loopback, link-local, shared, multicast,
   reserved and cloud metadata addresses are refused for IPv4 and IPv6 (embedded IPv4 included); TLS verifies the
   configured host name; redirects stay on the endpoint's origin and are checked again; proxy environment variables
-  are ignored. A server profile reaches only the origins in `NODESTRO_MCP_ENDPOINTS` (empty: none).
+  are ignored. A server profile reaches only the origins in `NODESTRO_MCP_ENDPOINTS` (empty: none). The same checks
+  apply to every request of an OAuth sign-in (metadata, registration, token endpoint), so on a server the list must
+  name the authorization server's origin too.
 - MCP tokens are stored only encrypted: on a server with the tenant's key derived from `NODESTRO_SECRET_KEY`, on a
   desktop with the keychain key the desktop app passes in `NODESTRO_VAULT_KEY`. Without such a key a token lives
   only in memory for the session; there is no plain-text fallback. Tokens are bound to their server's origin and
-  never appear in API views, events, logs or exports.
+  never appear in API views, events, logs or exports. OAuth credentials (tokens, client registration) and a started
+  sign-in (its PKCE verifier) are sealed the same way.
 
 These are technical measures. They do not by themselves make an application compliant with the GDPR, the EU
 AI Act or ISO/IEC 42001; that depends on how an operator uses and documents the system.
