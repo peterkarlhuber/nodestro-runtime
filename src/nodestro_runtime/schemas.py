@@ -645,6 +645,19 @@ class SettingsIn(_Model):
     price_mode: Literal["standard", "strict"] | None = None
 
 
+class BuiltinSandboxStatus(_Model):
+    """Whether the built-in Linux sandbox isolates AI-generated code on this computer (desktop profile only)."""
+
+    available: bool = False
+    #: Why not: ``platform``, ``untested-system``, ``landlock``, ``seccomp``, ``root``, ``paths``, ``verify``,
+    #: ``failed``, or ``server`` (a server runs tool code in containers only); empty when available.
+    reason: str = ""
+    #: The technical detail in English (for support), e.g. "Landlock not enabled in this kernel".
+    detail: str = ""
+    #: The distribution, e.g. "ubuntu 24.04".
+    system: str = ""
+
+
 class Settings(_Model):
     #: Every AI provider with its configuration state (never the keys themselves).
     providers: list[ProviderStatus] = Field(default_factory=list)
@@ -655,6 +668,8 @@ class Settings(_Model):
     default_budget_usd: float | None = 2.0
     sandbox: Literal["subprocess", "docker"] = "subprocess"
     docker_available: bool = False
+    #: The built-in Linux sandbox: with it, AI-generated code runs isolated without Docker.
+    builtin_sandbox: BuiltinSandboxStatus = Field(default_factory=BuiltinSandboxStatus)
     language: Language | None = None
     architect_budget_usd: float | None = 2.0
     architect_max_repairs: int = 2

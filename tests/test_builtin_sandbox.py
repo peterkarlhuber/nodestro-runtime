@@ -223,7 +223,7 @@ def test_a_tool_error_is_reported_and_the_next_call_works(sandbox: LinuxSandbox)
 @needs_sandbox
 def test_start_up_overhead_is_measured(sandbox: LinuxSandbox) -> None:
     timings = measure(sandbox, calls=5)
-    host = measure(SubprocessSandbox(acknowledge_unsafe=True), calls=5)
+    host = measure(SubprocessSandbox(acknowledge_unsafe=True), calls=5)  # trusted ping code only
     assert timings["mean_ms"] < 3000
     print(f"built-in sandbox {timings['mean_ms']:.0f} ms per call, host subprocess {host['mean_ms']:.0f} ms")
 

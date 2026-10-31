@@ -23,13 +23,13 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from typing import Any
 
-from orkexa.dynamic import SubprocessSandbox
 from orkexa.dynamic.errors import SandboxError
 
 from .builtin_sandbox import LinuxSandbox, measure
@@ -561,11 +561,17 @@ def compat_checks(env_python: str | None = None) -> list[Result]:
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"[:400]
         results.append(result)
-    host = measure(SubprocessSandbox(acknowledge_unsafe=True), calls=10)
+    # The comparison is a bare interpreter start (fixed code, no tool code on the host).
+    starts = []
+    for _ in range(10):
+        started = time.perf_counter()
+        subprocess.run([sys.executable, "-I", "-B", "-c", "import json"], check=True, env={})
+        starts.append((time.perf_counter() - started) * 1000)
     own = measure(LinuxSandbox(timeout=30.0), calls=10)
     results.append(Result("overhead", "performance", own["mean_ms"] < 2000, {
         "sandbox_first_ms": f"{own['first_ms']:.0f}", "sandbox_mean_ms": f"{own['mean_ms']:.0f}",
-        "sandbox_max_ms": f"{own['max_ms']:.0f}", "host_mean_ms": f"{host['mean_ms']:.0f}"}))  # fmt: skip
+        "sandbox_max_ms": f"{own['max_ms']:.0f}",
+        "interpreter_start_ms": f"{sum(starts) / len(starts):.0f}"}))  # fmt: skip
     return results
 
 
