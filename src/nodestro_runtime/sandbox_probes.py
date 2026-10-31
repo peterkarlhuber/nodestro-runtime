@@ -32,7 +32,8 @@ from typing import Any
 
 from orkexa.dynamic.errors import SandboxError
 
-from .builtin_sandbox import LinuxSandbox, measure
+from .builtin_sandbox import LinuxSandbox, SandboxStatus, measure
+from .sandbox_policy import SandboxPolicy
 
 _HEADER = '''
 import json, os, sys, socket, ctypes, errno, signal, subprocess, threading, resource
@@ -554,6 +555,7 @@ def compat_checks(env_python: str | None = None) -> list[Result]:
     long = LinuxSandbox(timeout=60.0)
     check("long-call", lambda: long.call(_tool("import time\ntime.sleep(5)\nreturn 'done'"), "probe", {"x": ""}),
           "done")  # fmt: skip
+    check("desktop-workspace", _workspace_check, ["untrusted", "212.0", "LinuxSandbox", "sandbox.isolation_required"])
     if env_python:
         env = LinuxSandbox(timeout=60.0, memory_mb=2048, python=env_python)
         result = Result("compiled-library", "compat", False)
@@ -576,6 +578,51 @@ def compat_checks(env_python: str | None = None) -> list[Result]:
         "sandbox_max_ms": f"{own['max_ms']:.0f}",
         "interpreter_start_ms": f"{sum(starts) / len(starts):.0f}"}))  # fmt: skip
     return results
+
+
+def _workspace_check() -> list[str]:
+    """A desktop workspace: an AI-generated tool is tested and runs in the built-in sandbox; the host subprocess
+    is never used for it (it would fail here), and without the built-in sandbox it is refused."""
+    from orkexa.dynamic import SubprocessSandbox
+
+    from .problems import NodestroError
+    from .tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
+    from .workspace import Workspace
+
+    def host(*_args: object) -> str:
+        raise AssertionError("untrusted code reached the host subprocess")
+
+    original = SubprocessSandbox._execute
+    SubprocessSandbox._execute = host  # type: ignore[method-assign, assignment]
+    try:
+        with tempfile.TemporaryDirectory(prefix="nodestro-workspace-") as directory:
+            workspace = Workspace(Path(directory) / "data", integrations=[])
+            try:
+                tools = workspace.tools
+                saved, info = tools.save_custom(
+                    CUSTOM_TOOL_TEMPLATE, CUSTOM_TESTS_TEMPLATE, "celsius_to_fahrenheit", requirement="Convert"
+                )
+                if info is None:
+                    return [f"not saved: {saved.errors}"]
+                result, _ = tools.run("celsius_to_fahrenheit", {"celsius": 100})
+                routed = tools._require("untrusted", tools.registry.sandbox, "celsius_to_fahrenheit")
+                down = SandboxPolicy("desktop")
+                refused = ""
+                original_status = LinuxSandbox.status
+                LinuxSandbox.status = staticmethod(  # type: ignore[method-assign]
+                    lambda refresh=False: SandboxStatus(False, "landlock", "simulated", "", 0)
+                )
+                try:
+                    down.require("untrusted", routed, name="x")
+                except NodestroError as exc:
+                    refused = exc.code
+                finally:
+                    LinuxSandbox.status = original_status  # type: ignore[method-assign]
+                return [info.trust, result, type(routed).__name__, refused]
+            finally:
+                workspace.close()
+    finally:
+        SubprocessSandbox._execute = original  # type: ignore[method-assign]
 
 
 def _error_then_ok(sandbox: LinuxSandbox) -> str:
