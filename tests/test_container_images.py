@@ -46,6 +46,7 @@ class FakeDocker:
         self.build_fails = False
         self.contexts: list[dict[str, str]] = []
         self.missing: list[str] = []
+        self.orkexa_files: list[str] = []
 
     def __call__(self, args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
@@ -58,7 +59,14 @@ class FakeDocker:
             return subprocess.CompletedProcess(args, 0, self.images[tag] + "\n", "")
         if command[0] == "build":
             context = Path(command[-1])
-            self.contexts.append({item.name: item.read_text() for item in context.iterdir()})
+            self.contexts.append(
+                {item.name: item.read_text() if item.is_file() else "<dir>" for item in context.iterdir()}
+            )
+            self.orkexa_files = (
+                sorted(str(path.relative_to(context)) for path in (context / "orkexa").rglob("*.py"))
+                if (context / "orkexa").is_dir()
+                else []
+            )
             if self.build_fails:
                 return subprocess.CompletedProcess(args, 1, "", self.build_output)
             lock = (context / "requirements.txt").read_text()
@@ -134,6 +142,9 @@ def test_the_image_downloads_with_hashes_and_installs_offline(docker: FakeDocker
     assert "--require-hashes" in download and "--only-binary=:all:" in download and "ca.pem" in download
     assert "--no-index" in final and "--require-hashes" in final and "ca.pem" not in final
     assert "USER 65534:65534" in final and LOCK_LABEL in final
+    # The image carries the Orkexa package this process runs (no bind mount of it at call time).
+    assert "COPY orkexa /opt/orkexa/orkexa" in final
+    assert "orkexa/dynamic/_sandbox_runner.py" in docker.orkexa_files
     # The docker CLI never gets provider keys.
     assert all("ANTHROPIC_API_KEY" not in environment for environment in docker.environments)
     # A second build of the same lock finds the image.
@@ -165,6 +176,22 @@ def test_the_sandbox_of_an_image_is_a_docker_sandbox(docker: FakeDocker) -> None
     assert command[command.index("--network") + 1] == "none" and "--read-only" in command
     assert command[command.index("--pull") + 1] == "never"
     assert command.index("--pull") < command.index("nodestro-env:abc")
+    # Nothing of the host is mounted: the files travel on stdin into a tmpfs.
+    assert "-v" not in command and "--volume" not in command
+    assert any(item.startswith("/work:") for item in command)
+
+
+def test_the_image_key_names_the_orkexa_package(docker: FakeDocker) -> None:
+    from nodestro_runtime import container_images
+
+    built = images(docker)
+    tag = built.tag(HASHED, "3.13")
+    original = container_images._FINGERPRINT
+    container_images._FINGERPRINT = "0" * 64
+    try:
+        assert built.tag(HASHED, "3.13") != tag  # another Orkexa means another image
+    finally:
+        container_images._FINGERPRINT = original
 
 
 # ---- environments in the Docker sandbox -------------------------------------------------------
@@ -348,3 +375,77 @@ def test_a_missing_image_fails_closed() -> None:
     with pytest.raises(ToolExecutionError) as raised:
         sandbox.call(REAL_TOOL, "probe", {"host": "pypi.org"})
     assert "pull access denied" not in str(raised.value)  # never looked for in a registry
+
+
+# ---- the runtime image of a server -------------------------------------------------------------
+
+
+def test_the_runtime_image_is_built_once_from_a_hashed_lock(tmp_path: Path, docker: FakeDocker) -> None:
+    from nodestro_runtime import python_envs
+
+    opened = Workspace(
+        tmp_path / "data", python_runner=FakeUv({"pydantic": [("2.0", [], "pydantic\n")]}), integrations=[]
+    )
+    try:
+        opened.python.images = images(docker)
+        python_envs._RUNTIME_IMAGES.clear()
+        tag = opened.python.runtime_image()
+        assert tag.startswith("nodestro-env:") and tag in docker.images
+        assert lock_has_hashes(docker.contexts[0]["requirements.txt"])
+        builds = [call for call in docker.calls if call[1] == "build"]
+        assert opened.python.runtime_image() == tag  # found, not built again
+        assert [call for call in docker.calls if call[1] == "build"] == builds
+        sandbox = opened.python.runtime_sandbox()
+        assert sandbox.isolated and sandbox.image == ""  # resolved on the first call
+    finally:
+        python_envs._RUNTIME_IMAGES.clear()
+        opened.close()
+
+
+def test_a_runtime_image_that_cannot_be_built_fails_the_call(docker: FakeDocker) -> None:
+    from nodestro_runtime.container_images import RuntimeImageSandbox
+
+    def refuse() -> str:
+        raise NodestroError("sandbox.unavailable", "Docker is not running")
+
+    sandbox = RuntimeImageSandbox(refuse)
+    with pytest.raises(ToolExecutionError) as raised:
+        sandbox.call("def f(x: int) -> int:\n    return x\n", "f", {"x": 1})
+    assert "Docker is not running" in str(raised.value)
+
+
+PLAIN_TOOL = '''def double(value: int) -> int:
+    """Double a number.
+
+    Args:
+        value: The number.
+
+    Returns:
+        Twice the number.
+    """
+    return value * 2
+'''
+
+PLAIN_TESTS = """from tool import double
+
+
+def test_double():
+    assert double(2) == 4
+"""
+
+
+def test_a_server_runs_plain_tools_in_its_runtime_image(tmp_path: Path) -> None:
+    _require_docker()
+    from nodestro_runtime import python_envs
+
+    opened = Workspace(tmp_path / "data", integrations=[])
+    try:
+        sandbox = opened.python.runtime_sandbox()
+        validation = sandbox.validate(PLAIN_TOOL, PLAIN_TESTS, "double")
+        assert validation.ok, validation.error
+        assert [test.ok for test in validation.tests] == [True]
+        assert sandbox.call(PLAIN_TOOL, "double", {"value": 21}) == "42"
+        assert sandbox.image.startswith("nodestro-env:")
+    finally:
+        ContainerImages().remove(python_envs._RUNTIME_IMAGES.pop(next(iter(python_envs._RUNTIME_IMAGES)), ""))
+        opened.close()

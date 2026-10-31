@@ -73,7 +73,8 @@ def test_tenant_tool_code_runs_only_in_containers(database: PostgresDatabase, tm
     try:
         assert workspace.sandbox_policy.profile == "server"
         assert workspace.settings().sandbox == "docker"
-        assert type(workspace.tools.registry.sandbox).__name__ == "DockerSandbox"
+        # Nodestro's runtime image, streamed (no bind mounts), built on first use.
+        assert type(workspace.tools.registry.sandbox).__name__ == "RuntimeImageSandbox"
         with pytest.raises(NodestroError) as caught:
             workspace.update_settings(SettingsIn.model_validate({"sandbox": "subprocess"}))
         assert caught.value.code == "sandbox.unavailable"
@@ -89,3 +90,40 @@ def test_the_desktop_is_the_local_tenant(tmp_path: Path) -> None:
         assert workspace.sqlite_store is workspace.store
     finally:
         workspace.close()
+
+
+def test_tenant_provider_keys_are_encrypted_and_server_variables_are_not_shared(
+    database: PostgresDatabase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("cryptography")
+    from nodestro_runtime.schemas import SettingsIn
+    from nodestro_runtime.server_settings import SecretBox, is_encrypted
+
+    # A key in the server's own environment belongs to no tenant.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-of-the-server")
+    box = SecretBox(b"s" * 32)
+    alpha = Workspace(tmp_path / "alpha", integrations=[], storage=tenant_storage(database, "alpha", box))
+    beta = Workspace(tmp_path / "beta", integrations=[], storage=tenant_storage(database, "beta", box))
+    try:
+        anthropic = next(item for item in beta.settings().providers if item.id == "anthropic")
+        assert not anthropic.configured and anthropic.key_source == "none" and anthropic.env_var is None
+        assert "sk-ant-of-the-server" not in beta.secret_keys()
+        alpha.update_settings(SettingsIn.model_validate({"providers": {"anthropic": {"api_key": "sk-ant-alpha"}}}))
+        stored = database.store("alpha").get_raw("settings", "app")
+        sealed = stored["providers"]["anthropic"]["api_key"]
+        assert is_encrypted(sealed) and "sk-ant-alpha" not in str(stored)
+        assert alpha.connection("anthropic").api_key == "sk-ant-alpha"
+        # Unrelated changes keep the sealed key as it is.
+        alpha.update_settings(SettingsIn.model_validate({"default_budget_usd": 3.0}))
+        assert database.store("alpha").get_raw("settings", "app")["providers"]["anthropic"]["api_key"] == sealed
+        # Copied into another tenant, it does not decrypt: the key counts as missing there.
+        database.store("beta").put_raw("settings", "app", {"providers": {"anthropic": {"api_key": sealed}}})
+        assert not next(item for item in beta.settings().providers if item.id == "anthropic").configured
+        # A key in plain text (e.g. written around Nodestro) is never used on a server.
+        database.store("beta").put_raw("settings", "app", {"providers": {"openai": {"api_key": "sk-plain"}}})
+        assert not next(item for item in beta.settings().providers if item.id == "openai").configured
+        beta.update_settings(SettingsIn.model_validate({"default_budget_usd": 1.0}))
+        assert "sk-plain" not in str(database.store("beta").get_raw("settings", "app"))
+    finally:
+        alpha.close()
+        beta.close()

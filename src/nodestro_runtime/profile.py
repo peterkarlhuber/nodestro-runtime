@@ -5,9 +5,11 @@ Nodestro runs as two products on one runtime:
 - ``desktop`` (the default): one person, one data directory with SQLite, runs in this process. This is the
   behavior of every Nodestro release so far; :meth:`RuntimeProfile.desktop` and a :class:`Workspace` opened
   without a profile describe exactly that.
-- ``server``: many users, PostgreSQL, authentication, tenant isolation, persistent workers and a container
-  sandbox. None of these exist yet, so :meth:`RuntimeProfile.validate` refuses the server profile with
-  ``profile.server_unavailable``. There is no switch that skips this check.
+- ``server``: many users, PostgreSQL, authentication (OpenID Connect), tenant isolation, persistent workers and a
+  container sandbox. It starts only with complete :class:`~nodestro_runtime.server_settings.ServerSettings`
+  (``nodestro-server`` reads them from the environment); :meth:`RuntimeProfile.validate` refuses it without them
+  (``profile.invalid``), and a :class:`Workspace` with the server profile needs a tenant's storage. There is no
+  switch that skips these checks.
 
 A profile is built once (from code with :meth:`RuntimeProfile.desktop`, or from the environment with
 :meth:`RuntimeProfile.from_env`) and validated before any file or database is touched::
@@ -16,7 +18,7 @@ A profile is built once (from code with :meth:`RuntimeProfile.desktop`, or from 
     workspace = Workspace(profile=profile)
 
 Problems are reported with stable codes: ``profile.invalid`` (a value that is not understood, or a data
-directory that contradicts the profile) and ``profile.server_unavailable``.
+directory that contradicts the profile, or a server profile without its settings).
 """
 
 from __future__ import annotations
@@ -25,9 +27,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from .problems import NodestroError
+
+if TYPE_CHECKING:
+    from .server_settings import ServerSettings
 
 ProfileKind = Literal["desktop", "server"]
 #: Every profile, in the order they are named in messages.
@@ -39,7 +44,7 @@ ENV_PROFILE = "NODESTRO_PROFILE"
 ENV_DATA_DIR = "NODESTRO_DATA_DIR"
 #: The data directory when none is given (unchanged since Nodestro 0.1).
 DEFAULT_DATA_DIR = "~/.nodestro"
-#: What the server profile needs before it can start; each item arrives with its own pull request.
+#: What the server profile needs before it can start (checked by ``ServerSettings`` and the server's start-up).
 SERVER_REQUIREMENTS = ("authentication", "postgresql", "tenant_isolation", "persistent_workers", "container_sandbox")
 _READABLE_REQUIREMENTS = ", ".join(item.replace("_", " ") for item in SERVER_REQUIREMENTS)
 
@@ -76,7 +81,7 @@ class RuntimeProfile:
     """The product a runtime serves and the data directory it works on; immutable.
 
     Construction checks the values (``profile.invalid``); :meth:`validate` additionally checks that the
-    profile can be started in this version (``profile.server_unavailable``).
+    profile can be started with what it is given (``profile.invalid``).
     """
 
     kind: ProfileKind
@@ -157,14 +162,20 @@ class RuntimeProfile:
             )
         return self
 
-    def validate(self) -> RuntimeProfile:
-        """This profile, if this version of Nodestro can start it; ``profile.server_unavailable`` otherwise."""
-        if self.kind == "server":
-            raise NodestroError(
-                "profile.server_unavailable",
-                f"The server profile cannot be started yet: it needs {_READABLE_REQUIREMENTS}, which this version "
-                "does not provide; use the desktop profile",
-                missing=list(SERVER_REQUIREMENTS),
+    def validate(self, server: ServerSettings | None = None) -> RuntimeProfile:
+        """This profile, if it can be started: the desktop always, the server only with its validated settings
+        (:meth:`ServerSettings.from_env <nodestro_runtime.server_settings.ServerSettings.from_env>`)."""
+        if self.kind == "server" and server is None:
+            raise _invalid(
+                [
+                    {
+                        "field": "kind",
+                        "value": "'server'",
+                        "reason": "the server profile starts only with its settings ("
+                        + _READABLE_REQUIREMENTS
+                        + "); start it with the nodestro-server command",
+                    }
+                ]
             )
         return self
 

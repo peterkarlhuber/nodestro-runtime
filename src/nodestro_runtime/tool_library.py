@@ -263,13 +263,16 @@ class DependencyGate:
         raise NotImplementedError
 
 
-def make_sandbox(kind: str, policy: SandboxPolicy | None = None) -> Sandbox:
+def make_sandbox(
+    kind: str, policy: SandboxPolicy | None = None, container: Callable[[], Sandbox] | None = None
+) -> Sandbox:
     """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess.
 
-    The subprocess sandbox runs only trusted and user-authored code; the policy refuses everything else in it
-    (and, in the server profile, refuses to create it at all)."""
+    ``container`` builds the container sandbox where Orkexa's default (``orkexa-sandbox`` image, bind mounts) does
+    not fit, as on a server. The subprocess sandbox runs only trusted and user-authored code; the policy refuses
+    everything else in it (and, in the server profile, refuses to create it at all)."""
     if kind == "docker":
-        return DockerSandbox()
+        return container() if container is not None else DockerSandbox()
     (policy or SandboxPolicy()).check_construction("none")
     return SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
 

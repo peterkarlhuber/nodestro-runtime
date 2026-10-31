@@ -56,15 +56,27 @@ def test_profile_values_are_checked_when_built(tmp_path: Path) -> None:
     assert error.value.code == "profile.invalid"
 
 
-def test_only_the_desktop_profile_can_start(tmp_path: Path) -> None:
+def test_the_server_profile_starts_only_with_its_settings(tmp_path: Path) -> None:
+    from nodestro_runtime.server_settings import ServerSettings
+
     desktop = RuntimeProfile.desktop(tmp_path)
     assert desktop.validate() is desktop
     server = RuntimeProfile(kind="server", data_dir=tmp_path)
     with pytest.raises(NodestroError) as error:
         server.validate()
-    assert error.value.code == "profile.server_unavailable"
-    assert error.value.params == {"missing": list(SERVER_REQUIREMENTS)}
-    assert "desktop profile" in str(error.value)
+    assert error.value.code == "profile.invalid"
+    assert _fields(error) == ["kind"]
+    assert "nodestro-server" in str(error.value)
+    assert all(item.replace("_", " ") in str(error.value) for item in SERVER_REQUIREMENTS)
+    settings = ServerSettings(
+        database_url="host=db",
+        public_origin="https://nodestro.example.com",
+        oidc_issuer="https://login.example.com",
+        oidc_client_id="nodestro",
+        oidc_client_secret="secret",
+        secret_key=b"k" * 32,
+    )
+    assert server.validate(settings) is server
     assert PROFILE_KINDS == ("desktop", "server")
 
 
@@ -183,11 +195,13 @@ def test_a_contradicting_data_directory_is_refused_before_anything_is_created(tm
     ],
     ids=["explicit", "environment"],
 )
-def test_the_server_profile_is_refused_without_side_effects(tmp_path: Path, make_profile: object) -> None:
+def test_a_server_workspace_without_tenant_storage_is_refused_without_side_effects(
+    tmp_path: Path, make_profile: object
+) -> None:
     profile = make_profile(tmp_path / "new")  # type: ignore[operator]
     with pytest.raises(NodestroError) as error:
         Workspace(profile=profile, integrations=[])
-    assert error.value.code == "profile.server_unavailable"
+    assert error.value.code == "profile.invalid" and _fields(error) == ["storage"]
     assert not (tmp_path / "new").exists()
 
     # On an existing desktop data directory nothing is touched either: no lock, no database change.
@@ -196,7 +210,7 @@ def test_the_server_profile_is_refused_without_side_effects(tmp_path: Path, make
     before = _snapshot(existing)
     with pytest.raises(NodestroError) as error:
         Workspace(existing, profile=make_profile(existing), integrations=[])  # type: ignore[operator]
-    assert error.value.code == "profile.server_unavailable"
+    assert error.value.code == "profile.invalid"
     assert _snapshot(existing) == before
     # The refused attempt held no lock: the desktop opens the directory right away.
     with Workspace(existing, integrations=[]) as workspace:

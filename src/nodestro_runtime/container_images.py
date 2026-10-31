@@ -36,8 +36,9 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any
+import uuid
 
-from orkexa.dynamic import DockerSandbox
+from orkexa.dynamic import DockerSandbox, SandboxError
 
 from .problems import NodestroError
 
@@ -61,6 +62,7 @@ COPY --from=download /build /build
 RUN python -m pip install --disable-pip-version-check --no-cache-dir --no-index --require-hashes --no-deps \\
         --find-links /build/wheels -r /build/requirements.txt \\
     && rm -rf /build /root/.cache
+COPY orkexa /opt/orkexa/orkexa
 LABEL {label}="{lock_sha}"
 USER 65534:65534
 WORKDIR /work
@@ -114,7 +116,7 @@ class ContainerImages:
     # ---- names --------------------------------------------------------------------------------
 
     def tag(self, lock: str, python_version: str) -> str:
-        key = _sha(json.dumps([_sha(lock), python_version, self.base(python_version)]))
+        key = _sha(json.dumps([_sha(lock), python_version, self.base(python_version), orkexa_fingerprint()]))
         return f"{IMAGE_REPOSITORY}:{key[:32]}"
 
     # ---- docker -------------------------------------------------------------------------------
@@ -191,6 +193,7 @@ class ContainerImages:
             ca = self._certificate_authority()
             if ca is not None:
                 shutil.copyfile(ca, context / "ca.pem")
+            _copy_orkexa(context / "orkexa")
             (context / "Dockerfile").write_text(
                 _DOCKERFILE.format(
                     base=self.base(python_version),
@@ -244,21 +247,172 @@ class ContainerImages:
         with contextlib.suppress(_DockerFailed, NodestroError):
             self._docker(["image", "rm", tag])
 
-    def sandbox(self, tag: str, *, timeout: float = 60.0, memory_mb: int = 2048) -> DockerSandbox:
+    def sandbox(self, tag: str, *, timeout: float = 60.0, memory_mb: int = 2048) -> StreamedSandbox:
         """A sandbox whose calls run in the image ``tag`` (Orkexa's container flags, no network, never pulled)."""
-        return LocalImageSandbox(image=tag, timeout=timeout, memory_mb=memory_mb, docker=self.docker)
+        return StreamedSandbox(
+            image=tag, timeout=timeout, memory_mb=memory_mb, docker=self.docker, environ=self._cli_environment()
+        )
 
 
-class LocalImageSandbox(DockerSandbox):
-    """Orkexa's Docker sandbox for a locally built image: ``docker run --pull never``.
+#: Runs first in the container: writes the tool files into the tmpfs ``/work`` and starts Orkexa's runner there.
+_BOOTSTRAP = (
+    "import io, json, os, runpy, sys\n"
+    "envelope = json.loads(sys.stdin.read())\n"
+    "for name, content in envelope['files'].items():\n"
+    "    if not name or '/' in name or name.startswith('.'):\n"
+    "        raise SystemExit('invalid file name')\n"
+    "    with open(os.path.join('/work', name), 'w', encoding='utf-8') as handle:\n"
+    "        handle.write(content)\n"
+    "os.chdir('/work')\n"
+    "runner = '/opt/orkexa/orkexa/dynamic/_sandbox_runner.py'\n"
+    "sys.stdin = io.StringIO(envelope['request'])\n"
+    "sys.argv = [runner]\n"
+    "sys.path.insert(0, os.path.dirname(runner))\n"
+    "runpy.run_path(runner, run_name='__main__')\n"
+)
 
-    Without it, a missing ``nodestro-env:<key>`` image would make Docker look for one with that name in a registry,
-    and run whatever it found there."""
+
+class StreamedSandbox(DockerSandbox):
+    """Orkexa's Docker sandbox for an image Nodestro built, without bind mounts.
+
+    Orkexa's :class:`~orkexa.dynamic.DockerSandbox` mounts the call's work directory and its own package from the host
+    into the container. That needs the Docker daemon to see the same file system as Nodestro, which is not the case
+    for a daemon on another host or in another container (a server's workers). Here the image already contains
+    Orkexa (``/opt/orkexa/orkexa``, copied in at build time), and the tool's files travel with the request on stdin
+    into a ``tmpfs`` work directory. The container flags are otherwise Orkexa's: no network, read-only root file
+    system, no capabilities, ``nobody``, memory/CPU/process limits; plus ``--pull never``, so a missing image is
+    never looked for in a registry (and whatever was found there never runs). The docker CLI gets only the variables
+    it needs to reach its daemon.
+    """
+
+    def __init__(self, *, environ: Mapping[str, str] | None = None, **options: Any) -> None:
+        super().__init__(**options)
+        self.environ = dict(environ) if environ is not None else None
 
     def command(self, workdir: Path, container_name: str) -> list[str]:
-        command = super().command(workdir, container_name)
-        position = command.index("run") + 1
-        return [*command[:position], "--pull", "never", *command[position:]]
+        return [
+            self.docker,
+            "run",
+            "--rm",
+            "-i",
+            "--pull",
+            "never",
+            "--name",
+            container_name,
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65534:65534",
+            "--pids-limit",
+            str(self.pids_limit),
+            "--memory",
+            f"{self.memory_mb}m",
+            "--memory-swap",
+            f"{self.memory_mb}m",
+            "--cpus",
+            str(self.cpus),
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=16m",
+            "--tmpfs",
+            "/work:rw,noexec,nosuid,size=16m,uid=65534,gid=65534,mode=0700",
+            "-w",
+            "/work",
+            self.image,
+            "python",
+            "-I",
+            "-B",
+            "-c",
+            _BOOTSTRAP,
+        ]
+
+    def _execute(self, workdir: Path, request: str) -> str:
+        files = {path.name: path.read_text(encoding="utf-8") for path in sorted(workdir.iterdir()) if path.is_file()}
+        envelope = json.dumps({"files": files, "request": request})
+        name = f"nodestro-sandbox-{uuid.uuid4().hex[:12]}"
+        try:
+            completed = subprocess.run(
+                self.command(workdir, name),
+                input=envelope,
+                capture_output=True,
+                text=True,
+                env=self.environ,
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
+            raise SandboxError(f"Timed out after {self.timeout:g} seconds") from exc
+        except OSError as exc:
+            raise SandboxError(f"Cannot start docker: {exc}") from exc
+        if not completed.stdout.strip():
+            raise SandboxError(f"Container exited with code {completed.returncode}: {completed.stderr[-1000:]}")
+        return completed.stdout
+
+
+class RuntimeImageSandbox(StreamedSandbox):
+    """A :class:`StreamedSandbox` whose image is found (or built) on first use by ``resolve``.
+
+    A server's tool code without third-party libraries runs in the image of Nodestro's own runtime requirements
+    (see :meth:`nodestro_runtime.python_envs.PythonEnvironments.runtime_image`). If it cannot be built, the call
+    fails; nothing runs anywhere else."""
+
+    def __init__(self, resolve: Callable[[], str], **options: Any) -> None:
+        super().__init__(image="", **options)
+        self._resolve = resolve
+
+    def _execute(self, workdir: Path, request: str) -> str:
+        if not self.image:
+            try:
+                self.image = self._resolve()
+            except NodestroError as exc:
+                raise SandboxError(f"The sandbox image is not available: {exc}") from exc
+        return super()._execute(workdir, request)
+
+
+#: Kept for code that imported the earlier name (PR-11).
+LocalImageSandbox = StreamedSandbox
+
+
+def _orkexa_dir() -> Path:
+    import orkexa
+
+    return Path(orkexa.__file__).resolve().parent
+
+
+def _orkexa_files() -> list[Path]:
+    root = _orkexa_dir()
+    return sorted(
+        path for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    )
+
+
+_FINGERPRINT: str | None = None
+
+
+def orkexa_fingerprint() -> str:
+    """The SHA-256 of the Orkexa package this process runs; part of every image key (the image carries a copy)."""
+    global _FINGERPRINT
+    if _FINGERPRINT is None:
+        root = _orkexa_dir()
+        digest = hashlib.sha256()
+        for path in _orkexa_files():
+            digest.update(str(path.relative_to(root)).encode("utf-8") + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+        _FINGERPRINT = digest.hexdigest()
+    return _FINGERPRINT
+
+
+def _copy_orkexa(target: Path) -> None:
+    root = _orkexa_dir()
+    for path in _orkexa_files():
+        destination = target / path.relative_to(root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, destination)
 
 
 class _DockerFailed(Exception):
@@ -284,4 +438,13 @@ def _explain(output: str) -> tuple[str, str]:
     return ("deps.image_failed", f"Building the container image failed: {output[-500:]}")
 
 
-__all__ = ["IMAGE_REPOSITORY", "LOCK_LABEL", "ContainerImages", "LocalImageSandbox", "lock_has_hashes"]
+__all__ = [
+    "IMAGE_REPOSITORY",
+    "LOCK_LABEL",
+    "ContainerImages",
+    "LocalImageSandbox",
+    "RuntimeImageSandbox",
+    "StreamedSandbox",
+    "lock_has_hashes",
+    "orkexa_fingerprint",
+]

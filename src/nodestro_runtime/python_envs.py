@@ -46,7 +46,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
-from .container_images import ContainerImages, lock_has_hashes
+from .container_images import ContainerImages, RuntimeImageSandbox, lock_has_hashes, orkexa_fingerprint
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
 from .sandbox_policy import Isolation
@@ -1175,6 +1175,35 @@ class PythonEnvironments:
             acknowledge_unsafe=True,
         )
 
+    def runtime_sandbox(self, *, timeout: float = 15.0) -> RuntimeImageSandbox:
+        """The container sandbox for tool code without third-party libraries on a server (image built on first use).
+
+        It needs no image an operator built by hand and no bind mount, so it also works with a Docker daemon on
+        another host (``DOCKER_HOST``)."""
+        return RuntimeImageSandbox(
+            self.runtime_image, timeout=timeout, docker=self.images.docker, environ=self.images._cli_environment()
+        )
+
+    def runtime_image(self) -> str:
+        """The image with only Nodestro's runtime requirements (pydantic) and Orkexa; built once per process."""
+        python = current_python_version()
+        key = (python, orkexa_fingerprint(), self.images.docker)
+        with _RUNTIME_IMAGES_LOCK:
+            tag = _RUNTIME_IMAGES.get(key)
+            if tag is not None and self.images.exists(tag):
+                return tag
+            log: list[str] = []
+            try:
+                lock = self.runner.compile(
+                    _runtime_requirements(), python=python, previous="", log=log.append, builds=False
+                )
+            except UvError as exc:
+                found = explain_uv_error(exc.output)
+                raise NodestroError(found.code, found.message, **found.params) from None
+            tag = self.images.build(lock, python)
+            _RUNTIME_IMAGES[key] = tag
+            return tag
+
     def workflow_sandbox(self, workflow_id: str) -> Sandbox | None:
         return self.sandbox(scope_of("workflow", workflow_id))
 
@@ -1321,6 +1350,11 @@ class _InstallProblem(Exception):
     def __init__(self, found: Problem) -> None:
         super().__init__(found.message)
         self.problem = found
+
+
+#: Runtime images per (Python version, Orkexa, docker CLI), shared by every tenant of a process.
+_RUNTIME_IMAGES: dict[tuple[str, str, str], str] = {}
+_RUNTIME_IMAGES_LOCK = threading.Lock()
 
 
 def _runtime_requirements() -> list[str]:

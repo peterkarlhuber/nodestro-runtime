@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Server settings, tenant secrets and containers without bind mounts (M5/M6 PR-12, runtime part):
+
+- `profile.server_unavailable` is gone. `RuntimeProfile.validate(settings)` accepts the server profile with
+  `server_settings.ServerSettings`; without them it is refused with `profile.invalid`, and so is a server
+  `Workspace` without tenant storage. Nothing about the desktop changes.
+- New `server_settings`: `ServerSettings.from_env` (database, public origin, OpenID Connect issuer, client and
+  secret, secret key; `…_FILE` variants; https required outside loopback; all problems listed at once) and
+  `SecretBox` (AES-256-GCM, per-tenant HKDF key, bound to tenant and field). New error code `secrets.unreadable`.
+- `WorkspaceStorage.secrets` / `tenant_storage(..., secrets)`: tenant provider keys are stored encrypted; plain-text
+  or undecryptable keys count as missing; the server's environment keys are not used for tenants
+  (`provider_status(..., environ)`).
+- `postgres_import` leaves provider keys behind and says so in `ImportReport.not_imported`.
+- `container_images.StreamedSandbox`: images carry Orkexa (part of the image key, `orkexa_fingerprint`), tool files
+  travel on stdin into a `tmpfs`; no bind mounts, so a remote Docker daemon works. `LocalImageSandbox` is an alias.
+- `RuntimeImageSandbox` and `PythonEnvironments.runtime_sandbox/runtime_image`: on a server, tool code without
+  libraries runs in an image of the runtime requirements, built on first use. `make_sandbox(..., container=...)`.
+- The `postgres` extra adds `cryptography`.
+
 Libraries in the Docker sandbox (M6 PR-11, ADR-0006 point 6):
 
 - New `container_images.ContainerImages`: an approved lock file becomes the image `nodestro-env:<key>` (key: SHA-256
