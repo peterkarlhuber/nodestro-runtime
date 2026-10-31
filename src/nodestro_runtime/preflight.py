@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from .workspace import Workspace
 
 _RUN_INPUT_NAMES = {"input", "run.input", "workflow.input"}
+#: Placeholders of a node inside a loop (see ``render_task``); outside loops they stay as they are.
+_LOOP_NAMES = {"iteration", "previous", "feedback"}
 
 
 class WorkflowCheck(BaseModel):
@@ -77,6 +79,7 @@ def _node_issues(
     has_start = any(node.type == "start" for node in workflow.nodes)
     form_starts = {node.id for node in workflow.nodes if node.type == "start" and node.start and node.start.fields}
     has_output = any(node.type == "output" for node in workflow.nodes)
+    looped: set[str] = set().union(*graph.loop_bodies(workflow).values())
 
     agent_labels: dict[str, list[str]] = {}
     for node in workflow.nodes:
@@ -225,6 +228,8 @@ def _node_issues(
             name = match.group(1).strip()
             lowered = name.lower()
             if lowered in _RUN_INPUT_NAMES or lowered in upstream or lowered == "form":
+                continue
+            if node.id in looped and lowered in _LOOP_NAMES:
                 continue
             if lowered.startswith("form."):
                 if lowered[5:].split(".")[0] not in fields:

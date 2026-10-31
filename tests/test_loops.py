@@ -238,3 +238,15 @@ def test_continuing_a_run_runs_a_whole_loop_again() -> None:
     assert actions["draft"] == ("rerun", "resume.in_loop")
     assert actions["gate"] == ("rerun", "resume.in_loop")
     assert actions["publish"] == ("rerun", "resume.upstream_changed")
+
+
+def test_the_check_before_a_run_knows_the_loop_placeholders() -> None:
+    from nodestro_runtime.preflight import _node_issues
+
+    workflow = Workflow.model_validate(quality_loop().model_dump() | {"id": "w"})
+    codes = {(issue.code, issue.params.get("placeholder")) for issue in _node_issues(workflow, set())}
+    assert not {code for code in codes if code[0] == "check.placeholder_unknown"}
+    # Outside a loop they stay as they are, and the check says so.
+    workflow.nodes[-1].agent.task_template = "{{feedback}}"  # type: ignore[union-attr]
+    codes = {(issue.code, issue.params.get("placeholder")) for issue in _node_issues(workflow, set())}
+    assert ("check.placeholder_unknown", "feedback") in codes

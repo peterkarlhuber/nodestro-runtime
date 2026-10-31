@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Adaptive Orchestration M1 (loop placeholders in the check before a run):
+
+- `preflight` accepts `{{iteration}}`, `{{previous}}` and `{{feedback}}` in the tasks of nodes inside a loop; outside
+  loops they still get `check.placeholder_unknown`, because they stay as they are there.
+
 Sandbox gateway security fixes (Nodestro Local Docker):
 
 - **Fixed: request smuggling to the Docker daemon.** A header value with a bare line feed (`User-Agent: x\n\nGET
