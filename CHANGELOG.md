@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Request options cannot add tools or a provider-hosted MCP server (security fix, MCP-0 finding F-1):
+
+- An agent's `request_options` could switch on a provider's own MCP connector and add tools past the tool library:
+  Anthropic `mcp_servers` with an MCP beta, `extra_body` with `tools` (e.g. an `mcp_toolset`) and an
+  `anthropic-beta` header, or OpenAI `extra_body.tools` with an `mcp` tool. Confirmed with SDK requests to a
+  loopback stub. `providers.check_request_options` now refuses `mcp_servers` and objects of an `mcp*` type wherever
+  they appear, MCP betas, the `anthropic-beta` header in `extra_headers`, and the fields that define the model, the
+  conversation or the tools inside any `extra_body`. Other options stay allowed (e.g. `extra_body` with provider
+  parameters, other headers, other betas). It runs in `AgentBuilder.build` (every run, agent test, published and
+  exported release) and in `Connection.options`; the inspector shows it. Refusals use the existing code
+  `config.reserved_request_options` with the refused paths in `keys`, so the studio's text and the Workflow
+  Architect's automatic fix apply unchanged.
+
 Price refusals with their own codes (PRICING-1, strict price mode):
 
 - A request refused because its model has no known price (Orkexa's `UnpricedModelError`) now fails with
