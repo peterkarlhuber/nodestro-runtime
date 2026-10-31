@@ -53,7 +53,11 @@ def flow_of(workflow: Workflow) -> flow.Flow:
             else None
         )
         edges.append(flow.Edge(id=ident, source=edge.source, target=edge.target, port=port, loop=loop))
-    limits = flow.Limits(max_parallel=workflow.limits.max_parallel, max_duration_s=workflow.limits.max_duration_s)
+    limits = flow.Limits(
+        max_parallel=workflow.limits.max_parallel,
+        max_duration_s=workflow.limits.max_duration_s,
+        max_invocations=workflow.limits.max_steps,
+    )
     return flow.Flow(nodes=tuple(nodes), edges=tuple(edges), limits=limits)
 
 
