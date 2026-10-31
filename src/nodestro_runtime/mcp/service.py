@@ -5,7 +5,8 @@ administrator approved this exact tool definition (pinned by its hash), and the 
 when an agent is built and again right before every call, against the definition the server lists at that moment
 (threat model T4): a changed definition is blocked (``changed``) until an administrator accepts it.
 
-Until per-call approvals exist (WP-5), only tools classified as ``read`` are usable.
+Tools classified as ``write`` or ``destructive`` are usable only while the shared per-call approval gate is active
+(``write_gate``, set by the workspace together with the run engine's tool gate; evolution plan S-2, WP-5).
 """
 
 from __future__ import annotations
@@ -52,8 +53,9 @@ class McpService:
         self.store = store
         self.hub = hub
         self.vault = vault
-        #: Per-call approval of tools that change data (WP-5). ``None``: such tools are not usable yet.
-        self.write_gate: Callable[[McpTool, dict[str, Any]], None] | None = None
+        #: True while the run engine asks for approval before every call that changes data (the shared tool gate,
+        #: S-2/WP-5). False: MCP tools that change data are refused (``mcp.write_not_supported``).
+        self.write_gate: bool = False
         self._lock = threading.RLock()
 
     # ---- servers ---------------------------------------------------------------------------
@@ -105,7 +107,14 @@ class McpService:
     def add(self, data: McpServerIn, *, actor: str | None = None) -> McpServer:
         self.hub.policy.check_url(data.url, allow_loopback=data.allow_loopback)
         with self._lock:
-            taken = {item.slug for item in self.servers()}
+            existing = self.servers()
+            if len(existing) >= self.hub.limits.max_servers:
+                raise NodestroError(
+                    "mcp.too_many_servers",
+                    f"At most {self.hub.limits.max_servers} MCP servers can be connected",
+                    limit=self.hub.limits.max_servers,
+                )
+            taken = {item.slug for item in existing}
             server = McpServer(
                 slug=make_slug(data.name, taken),
                 **data.model_dump(exclude={"token"}),
@@ -337,7 +346,7 @@ class McpService:
             raise NodestroError(
                 "mcp.tool_not_approved", f"{tool_name} is not approved by an administrator", name=tool_name
             )
-        if tool.access != "read" and self.write_gate is None:
+        if tool.access != "read" and not self.write_gate:
             raise NodestroError(
                 "mcp.write_not_supported",
                 f"{tool_name} changes data; such tools need per-call approval, which is not available yet",
@@ -387,16 +396,21 @@ class McpService:
     ) -> tuple[McpServer, McpTool, CallResult]:
         """Check the policy, call the tool and check the definition the server listed right before the call."""
         server, tool = self.check(tool_name)
-        if tool.access != "read" and self.write_gate is not None:
-            self.write_gate(tool, arguments)
-        result = self.hub.call_tool(server, self.token(server), tool.name, arguments, cancelled=cancelled)
+        result = self.hub.call_tool(
+            server,
+            self.token(server),
+            tool.name,
+            arguments,
+            expected_hash=tool.approved_hash,
+            cancelled=cancelled,
+        )
         if result.definition is None:
             self._mark(tool, "removed")
             raise NodestroError("mcp.tool_removed", f"{server.name} no longer offers {tool.name}", name=tool_name)
         live = definition_hash(result.definition)
         if live != tool.approved_hash:
-            # Too late to stop this call's request? No: the listing came first and the definition matched or not
-            # before the call was sent only when the server is honest. Record and block all further calls.
+            # The hub compared the listed definition with the approved hash on the same connection and did not send
+            # the request (result.sent is False). Record the change and block all further calls.
             tool.definition, tool.hash = result.definition, live
             self._mark(tool, "changed")
             self.event(
