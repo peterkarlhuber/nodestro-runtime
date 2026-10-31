@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import Any, Literal, TypeVar
 
 from orkexa import (
@@ -699,8 +700,10 @@ class _RunContext:
         self.resume_requested = False
         #: Set when a rejection ended the run.
         self.stop: Problem | None = None
-        #: Set when the flow kernel stopped the run (a loop ran out of iterations).
+        #: Set when the flow kernel stopped the run (a loop ran out of iterations, a limit was reached).
         self.flow_stop: flow.Stop | None = None
+        #: Set when the run's time limit was reached and its running nodes were cancelled.
+        self.timed_out = False
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
@@ -1386,6 +1389,17 @@ class RunManager:
                     max_iterations=limit,
                 ),
             )
+        elif context.timed_out or (context.flow_stop is not None and context.flow_stop.code == "flow.time_limit"):
+            run.status = "failed"
+            limit = run.workflow.limits.max_duration_s
+            _fail(
+                run,
+                problem(
+                    "run.time_limit",
+                    f"The run reached its time limit of {limit:g} seconds",
+                    max_duration_s=limit,
+                ),
+            )
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -1409,6 +1423,8 @@ class RunManager:
 
         The kernel decides; this method executes nodes and applies what the kernel settled on
         its own (skipped, blocked, cancelled) to the node states (:mod:`nodestro_runtime.flow_driver`).
+        The kernel's clock is the run's active time, so the workflow's ``limits.max_duration_s`` does not
+        count time spent waiting for approvals; when it is reached, running nodes are cancelled.
         """
         run = context.run
         workflow = run.workflow
@@ -1419,39 +1435,63 @@ class RunManager:
             run.nodes.setdefault(node.id, NodeRun(status="waiting"))
         if not context.fingerprints:
             context.fingerprints = self.fingerprints(run, context.env)
+        segment = time.monotonic()
+        base = run.active_seconds
+
+        def clock() -> float:
+            return base + (time.monotonic() - segment)
+
         state = flow_driver.state_of(workflow, run.nodes, run.flow_state)
-        for item in state.invocations:
-            if item.status == "running":
-                # Stopped mid-node with its process (the node is already marked failed): never run it twice.
-                failed = flow.Result(status="failed", error="run.interrupted")
-                state = self._kernel_step(context, flow.complete(spec, state, item.id, failed), item.id).state
-        if context.cancelled.is_set():
-            step = self._kernel_step(context, flow.cancel(spec, state, code="run.node_cancelled"))
-        elif any(item.status == "suspended" for item in state.invocations):
-            # Paused nodes are asked again: a decided approval succeeds, an open one stays paused.
-            step = self._kernel_step(context, flow.resume(spec, state))
-        else:
-            step = self._kernel_step(context, flow.advance(spec, state))
-        state = step.state
-        tasks: dict[asyncio.Task[flow.Result], str] = {}
-        actions = list(step.actions)
-        while True:
-            for action in actions:
-                node = nodes[action.invocation.node]
-                task = asyncio.ensure_future(self._invoke(context, node, action.invocation.path))
-                tasks[task] = action.invocation.id
-            actions = []
-            if not tasks:
-                break
-            finished, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in finished:
-                invocation_id = tasks.pop(task)
-                if context.cancelled.is_set() and state.stop is None:
-                    state = self._kernel_step(context, flow.cancel(spec, state, code="run.node_cancelled")).state
-                result = task.result()
-                step = self._kernel_step(context, flow.complete(spec, state, invocation_id, result), invocation_id)
-                state = step.state
-                actions.extend(step.actions)
+        try:
+            for item in state.invocations:
+                if item.status == "running":
+                    # Stopped mid-node with its process (the node is already marked failed): never run it twice.
+                    failed = flow.Result(status="failed", error="run.interrupted")
+                    state = self._kernel_step(
+                        context, flow.complete(spec, state, item.id, failed, now=clock()), item.id
+                    ).state
+            if context.cancelled.is_set():
+                step = self._kernel_step(context, flow.cancel(spec, state, code="run.node_cancelled", now=clock()))
+            elif any(item.status == "suspended" for item in state.invocations):
+                # Paused nodes are asked again: a decided approval succeeds, an open one stays paused.
+                step = self._kernel_step(context, flow.resume(spec, state, now=clock()))
+            else:
+                step = self._kernel_step(context, flow.advance(spec, state, now=clock()))
+            state = step.state
+            tasks: dict[asyncio.Task[flow.Result], str] = {}
+            actions = list(step.actions)
+            limit = workflow.limits.max_duration_s
+            while True:
+                for action in actions:
+                    node = nodes[action.invocation.node]
+                    task = asyncio.ensure_future(self._invoke(context, node, action.invocation.path))
+                    tasks[task] = action.invocation.id
+                actions = []
+                if not tasks:
+                    break
+                timeout = None if limit is None or state.stop is not None else max(limit - clock(), 0.0)
+                finished, _ = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                if not finished:
+                    # The time limit is reached while nodes still run: the kernel stops the flow, the
+                    # running nodes are cancelled and report back like any cancelled node.
+                    state = self._kernel_step(context, flow.advance(spec, state, now=clock())).state
+                    context.timed_out = True
+                    context.cancelled.set()  # running agents and tools stop at their next check
+                    continue
+                for task in finished:
+                    invocation_id = tasks.pop(task)
+                    if context.cancelled.is_set() and state.stop is None:
+                        state = self._kernel_step(
+                            context, flow.cancel(spec, state, code="run.node_cancelled", now=clock())
+                        ).state
+                    result = task.result()
+                    step = self._kernel_step(
+                        context, flow.complete(spec, state, invocation_id, result, now=clock()), invocation_id
+                    )
+                    state = step.state
+                    actions.extend(step.actions)
+        finally:
+            run.active_seconds = clock()
 
     def _kernel_step(self, context: _RunContext, step: flow.Step, reported: str | None = None) -> flow.Step:
         """Store the kernel's new state and apply the nodes it settled without executing them.
