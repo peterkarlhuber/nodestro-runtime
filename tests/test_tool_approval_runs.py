@@ -172,13 +172,16 @@ async def test_a_full_waiting_capacity_denies_at_once(make: Make) -> None:
 
 async def test_a_legacy_exemption_holds_for_its_tool_version_only(make: Make) -> None:
     workspace = make()
-    version = workspace.tools.get(TOOL).version
-    exempt = {TOOL: ToolBinding(ask="never", legacy=True, bound_version=version).model_dump()}
-    done = await workspace.wait((await start(workspace, tool_policies=exempt)).id, timeout=20)
+    saved = workspace.save_workflow(flow())
+    workspace.stamp_legacy_tool_bindings()  # the activation step (the only source of legacy exemptions)
+    started = await workspace.run(workspace.workflow(saved.id), RunIn(input="x"))
+    done = await workspace.wait(started.id, timeout=20)
     assert done.status == "succeeded", done.error
     assert call_of(done).approval.status == "allowed" and call_of(done).output == "212.0"
 
+    # An exemption for another tool version (here: forged in a save, so dropped) never applies.
     other = make(wait=timedelta(milliseconds=200))
+    version = other.tools.get(TOOL).version
     stale = {TOOL: ToolBinding(ask="never", legacy=True, bound_version=version + 1).model_dump()}
     done = await other.wait((await start(other, tool_policies=stale)).id, timeout=20)
     assert call_of(done).approval.status == "expired"
