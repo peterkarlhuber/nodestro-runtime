@@ -23,7 +23,8 @@ Nodestro Local Docker (the `local-container` profile and the sandbox gateway):
   with a lock of exact versions with hashes, the gateway's own Orkexa and the tag the runtime computes; only
   `nodestro-env:<key>` images can be inspected or removed. Everything else (exec, archives, pulls, volumes,
   networks, events, BuildKit sessions) is refused. Limits: `NODESTRO_SANDBOX_MAX_CONTAINERS`, `_MAX_MEMORY_MB`,
-  `_MAX_CPUS`, `_MAX_PIDS`, `_MAX_LIFETIME`, `_BUILD_NETWORK`, `_INSTANCE`. Tests: the policy on the requests docker
+  `_MAX_CPUS`, `_MAX_PIDS`, `_MAX_LIFETIME`, `_BUILD_NETWORK`, `_INSTANCE`. `ContainerImages` passes `DOCKER_BUILDKIT` to
+  the docker CLI (0 selects the classic builder, which the gateway checks). Tests: the policy on the requests docker
   29 really sends and on hostile ones, the protocol (including attach with half-close) against a stand-in daemon,
   and with `NODESTRO_DOCKER_TESTS=1` a real image build, a tool call without network or writable files, and refused
   escape attempts through the docker CLI.
