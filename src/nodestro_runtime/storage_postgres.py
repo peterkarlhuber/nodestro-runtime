@@ -329,6 +329,25 @@ class PostgresStore:
         self._check()
         self._put(collection, key, json.dumps(value), touch=False)
 
+    def replace_if(
+        self, collection: str, key: str, model: BaseModel, *, field: str, expected: str, live_until: str | None = None
+    ) -> bool:
+        """One conditional ``UPDATE``: atomic for every connection; ``live_until`` uses the database's clock."""
+        self._check()
+        data, raw = _encode(model.model_dump_json())
+        query = (
+            "UPDATE nodestro_documents SET data = %s::jsonb, raw = %s, updated_at = clock_timestamp()"
+            " WHERE tenant_id = %s AND collection = %s AND id = %s AND data->>%s = %s"
+        )
+        params: tuple[Any, ...] = (data, raw, self.tenant_id, collection, key, field, expected)
+        if live_until is not None:
+            query += " AND (data->>%s)::timestamptz > clock_timestamp()"
+            params += (live_until,)
+        try:
+            return self.database._write(query, params) == 1
+        except psycopg.DataError:  # the time is missing or unreadable: not live
+            return False
+
     def _put(self, collection: str, key: str, text: str, *, touch: bool) -> None:
         data, raw = _encode(text)
         self.database._write(

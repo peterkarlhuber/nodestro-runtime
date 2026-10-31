@@ -19,6 +19,38 @@ Sandbox gateway security fixes (Nodestro Local Docker):
 - Adversarial tests: 12 ambiguous request heads, smuggling and target rewriting through the gateway, a
   non-switched attach with a smuggled request, and the same raw attempts against a real daemon.
 
+Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decision D10):
+
+- New module `nodestro_runtime.tool_policy`: `ToolCapability` (`access` read/write/destructive, `reach`
+  internal/external, `source` nodestro/author/admin/derived/default) for every tool kind, the fixed statements of the
+  built-in and the provider's server tools, and `capability_of(...)`. A missing or invalid statement is `write` +
+  `external`; a stored statement can never claim another source; MCP tools always reach out; own and generated tools
+  in a sandbox without network (container, built-in Linux sandbox) count as `internal` (`derived`). Description only:
+  no behavior changes yet.
+- `DocumentStore.replace_if(collection, key, model, *, field, expected, live_until=None)`: replaces a document only
+  while its field still has the expected value and, with `live_until`, only while the time in that field lies in the
+  future (PostgreSQL: one conditional `UPDATE` against the database clock; SQLite: inside `BEGIN IMMEDIATE`). Exactly
+  one of several concurrent writers wins, also across processes and connections. Tool approval decisions will use it,
+  so that they never live in (and are never overwritten by saves of) the run document.
+- `ToolInfo.capability` is now a `ToolCapability` and set for every tool (it was a plain dict, for MCP tools only; the
+  JSON shape is unchanged): built-in tools carry Nodestro's statement, own and generated tools `write` + `external`
+  until their author states otherwise, `internal` (`derived`) when the library's sandbox has no network, MCP tools the
+  administrator's class. `ServerToolInfo.capability` shows what the provider's server tools do. `McpTool.capability()`
+  returns a `ToolCapability`; `ToolLibrary.isolation(trust)` tells how the library's sandbox isolates a trust class.
+- Per-call approval rules, not wired into runs yet: `tool_policy.ToolBinding` (`ask` `auto`/`always`/`never`; `never`
+  needs a reason for `write` tools, never applies to `destructive` tools; legacy exemptions hold only for the bound
+  tool version), `ToolPreGrant` (one tool version, one schedule, batch or test series, expiry, revocation; not for
+  destructive or MCP tools), `CallContext` and `decide(...)` -> allow / deny (`tool.not_granted`,
+  `tool.approval_unattended`) / ask. Orchestrator grants only narrow; unattended runs deny what would ask unless a
+  pre-grant matches; MCP tools unattended only as read-only with D-7.
+- `nodestro_runtime.tool_approvals.ToolApprovals`: stored approval requests (collection `tool_approvals`, key
+  `<run id>:<request id>`, a new id per question; node, loop iteration and call id recorded) bound to the exact
+  arguments and the tool version or definition hash
+  (`arguments_hash`); decisions, expiry and cancellation are compare-and-set from `pending` with the deadline
+  checked in the same step (at most 15 minutes); the waiter reads the store, so a decision from another process
+  reaches it; `expire_run` for stopped runs. New codes `tool.approval_stale`, `tool.approval_expired`,
+  `tool.approval_decided`, `tool.approval_not_found`.
+
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
 - New package `nodestro_runtime.mcp`: remote MCP servers over Streamable HTTP through the official SDK (`mcp` 2.x,
