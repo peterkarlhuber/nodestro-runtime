@@ -214,7 +214,9 @@ class Connection:
         return kwargs
 
     def options(self, request_options: Mapping[str, Any] | None = None) -> Any:
-        """The provider's default Orkexa options (with ``request_options``)."""
+        """The provider's default Orkexa options (with ``request_options``, checked by
+        :func:`check_request_options`)."""
+        check_request_options(request_options)
         extra = dict(request_options or {})
         if self.provider == "anthropic":
             return AnthropicOptions(request_options=extra)
@@ -429,3 +431,118 @@ def check_capabilities(values: Mapping[str, str]) -> dict[str, str]:
             "provider.capability_unknown", f"Unknown capabilities: {', '.join(unknown)}", names=", ".join(unknown)
         )
     return {name: value for name, value in values.items() if value != "unknown"}
+
+
+# ---- request options ---------------------------------------------------------------
+#
+# Which provider request options an agent may set.
+#
+# An agent's ``request_options`` are merged into every request to its provider (see ``orkexa`` options). They are
+# meant for provider parameters Nodestro has no setting for, such as ``output_config`` or ``context_management``.
+# They must not change which tools the model gets, or connect it to a provider-hosted MCP server: Nodestro decides
+# about tools (the tool library, the server tool catalog), and a provider's own MCP connector would run tools of a
+# remote server outside Nodestro's control, without its checks and records, with a token stored in the workflow.
+#
+# Orkexa already refuses the fields it manages at the top level (``tools``, ``tool_choice``, ...). The SDKs' escape
+# hatches reach further: ``extra_body`` is merged into the request body and ``extra_headers`` into its headers, and an
+# Anthropic beta switches on the MCP connector. :func:`check_request_options` therefore refuses, wherever they appear:
+#
+# - ``mcp_servers`` (Anthropic's MCP connector) and any object whose ``type`` starts with ``mcp`` (Anthropic's
+#   ``mcp_toolset``, OpenAI's ``mcp`` tool);
+# - MCP betas in ``betas`` and an ``anthropic-beta`` header in ``extra_headers`` (betas go through ``betas``);
+# - request fields that define the conversation or the tools inside an ``extra_body`` (``tools``, ``tool_choice``,
+#   ``messages``, ``system``, ...).
+#
+# Every other option stays allowed, including ``extra_body`` with provider parameters (``{"extra_body": {"top_k":
+# 20}}`` for an OpenAI-compatible server) and other ``extra_headers``. The check runs where every agent is built
+# (:mod:`nodestro_runtime.agent_builder`) and where provider options are made (:meth:`Connection.options`), so a
+# stored, imported, published or AI-generated workflow cannot bypass it. A refusal has the code
+# ``config.reserved_request_options`` with the refused paths in ``keys``.
+
+#: Request body fields that define the model, the conversation or the tools; never set through ``extra_body``.
+MANAGED_BODY_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "input",
+        "system",
+        "instructions",
+        "system_instruction",
+        "tools",
+        "tool_choice",
+        "tool_config",
+        "mcp_servers",
+        "betas",
+        "stream",
+    }
+)
+#: Headers that are never set through ``extra_headers`` (lower case).
+FORBIDDEN_HEADERS = frozenset({"anthropic-beta"})
+_MCP_KEY = "mcp_servers"
+
+
+def _is_mcp(value: Any) -> bool:
+    return isinstance(value, str) and "mcp" in value.lower()
+
+
+def forbidden_request_options(options: Mapping[str, Any] | None) -> list[str]:
+    """The paths of the options in ``options`` that an agent may not set (empty: all allowed)."""
+    found: list[str] = []
+
+    def add(path: str) -> None:
+        if path not in found:
+            found.append(path)
+
+    def walk(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            kind = value.get("type")
+            if isinstance(kind, str) and kind.lower().startswith("mcp"):
+                add(f"{path}.type={kind}" if path else f"type={kind}")
+            for key, child in value.items():
+                name = str(key)
+                where = f"{path}.{name}" if path else name
+                if name == _MCP_KEY:
+                    add(where)
+                elif name == "extra_body":
+                    if isinstance(child, Mapping):
+                        for field in child:
+                            if str(field) in MANAGED_BODY_FIELDS:
+                                add(f"{where}.{field}")
+                    elif child is not None:
+                        add(where)
+                elif name == "extra_headers":
+                    if isinstance(child, Mapping):
+                        for header in child:
+                            if str(header).lower() in FORBIDDEN_HEADERS:
+                                add(f"{where}.{header}")
+                    elif child is not None:
+                        add(where)
+                elif name == "betas":
+                    betas = child if isinstance(child, (list, tuple)) else [child]
+                    for beta in betas:
+                        if _is_mcp(beta):
+                            add(f"{where}={beta}")
+                walk(child, where)
+        elif isinstance(value, (list, tuple)):
+            for position, child in enumerate(value):
+                walk(child, f"{path}[{position}]")
+
+    walk(dict(options or {}), "")
+    return found
+
+
+def check_request_options(options: Mapping[str, Any] | None) -> None:
+    """Refuse request options that would add tools or a provider-hosted MCP server (see the module documentation).
+
+    Raises:
+        NodestroError: ``config.reserved_request_options`` with the refused paths in ``keys``.
+    """
+    found = forbidden_request_options(options)
+    if found:
+        keys = ", ".join(found)
+        raise NodestroError(
+            "config.reserved_request_options",
+            "These request options are not allowed; tools and MCP servers are managed by Nodestro, not through "
+            f"request options: {keys}",
+            keys=keys,
+        )
