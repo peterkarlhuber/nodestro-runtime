@@ -611,13 +611,15 @@ class _ChildTracker(PricedTracker):
     """A sub-workflow's usage: kept for the child run and, renamed, counted in the parent's budget.
 
     It prices with the parent's catalog and price mode, so a sub-workflow is priced exactly like its parent.
+    The sub-workflow's own budget (``limit_usd``) applies in addition: a request is sent only while both
+    the child's and every parent's budget allow it, so neither side can spend past the other's limit.
     """
 
-    def __init__(self, parent: BudgetTracker, prefix: str) -> None:
+    def __init__(self, parent: BudgetTracker, prefix: str, limit_usd: float | None = None) -> None:
         if isinstance(parent, PricedTracker):
-            super().__init__(None, pricing=parent.pricing, mode=parent.mode)
+            super().__init__(limit_usd, pricing=parent.pricing, mode=parent.mode)
         else:
-            super().__init__(None)
+            super().__init__(limit_usd)
             self.price_resolver = parent.price_resolver
         self.parent = parent
         self.prefix = prefix
@@ -626,11 +628,18 @@ class _ChildTracker(PricedTracker):
         self.note(record)
         UsageTracker.add(self, record)
         self.parent.add(replace(record, agent=f"{self.prefix}/{record.agent}"))
+        self.check()
 
     def check(self) -> None:
+        BudgetTracker.check(self)
         self.parent.check()
 
     def before_request(self, *, agent: str, provider: str, model: str, priced: bool) -> None:
+        if self.limit_usd is not None and self.spent_usd >= self.limit_usd:
+            raise BudgetExceededError(
+                f"Budget of the sub-workflow used up: spent ${self.spent_usd:.4f} of ${self.limit_usd:.4f}; "
+                f"request of agent {agent!r} to {provider}:{model} not sent"
+            )
         self.parent.before_request(agent=f"{self.prefix}/{agent}", provider=provider, model=model, priced=priced)
 
 
@@ -901,9 +910,7 @@ class RunManager:
             return run
         loop = _require_loop()
         workflow = run.workflow
-        budget = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
-        if budget is not None:
-            budget = max(budget - _known_cost(run), 0.0)
+        budget = _remaining(workflow.budget_usd if workflow.budget_usd is not None else self.default_budget(), run)
         context = _RunContext(run, self.tracker(budget), self.environment(run))
         context.loop = loop
         self._contexts[run.id] = context
@@ -1836,7 +1843,7 @@ class RunManager:
         self._save(context)
         child_context = _RunContext(
             child,
-            _ChildTracker(context.tracker, node.id),
+            _ChildTracker(context.tracker, node.id, _remaining(child.workflow.budget_usd, child)),
             context.env,
             cancelled=CancelFlag(context.cancelled),
             stack=(*context.stack, run.workflow_id),
@@ -2351,6 +2358,11 @@ def _abandon(run: Run) -> None:
             _fail(state, problem("run.node_cancelled", "Cancelled"))
     run.status = "cancelled"
     _fail(run, problem("run.cancelled", "The run was cancelled"))
+
+
+def _remaining(budget: float | None, run: Run) -> float | None:
+    """What is left of ``budget`` for a run that may already have spent part of it (a continued run)."""
+    return None if budget is None else max(budget - _known_cost(run), 0.0)
 
 
 def _known_cost(run: Run) -> float:

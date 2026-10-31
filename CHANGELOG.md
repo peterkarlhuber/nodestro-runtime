@@ -20,6 +20,15 @@ MCP OAuth 2.1 (ADR-0007, work package WP-6):
   `mcp.oauth_registration_unsupported`, `mcp.oauth_token_input`, `mcp.oauth_reauthorize`; new events
   `oauth_started`, `oauth_failed`.
 
+Adaptive Orchestration M2 (sub-workflow budgets):
+
+- **Behavior change: the `budget_usd` of a sub-workflow is now enforced.** Before, a child run only counted against
+  the parent's budget and its own limit was ignored. Now the child stops at whichever comes first, its own remaining
+  budget or the parent's; the parent's limit still covers everything the child spends. The child uses the parent's
+  price mode, so strict mode refuses unpriced models in the child as well. Known limitation: in standard price mode a
+  request without a price is still sent and its cost stays unknown (not zero), so it is not counted against either
+  limit; the reservations of M2 make this visible.
+
 MCP operations (ADR-0007, work package WP-7):
 
 - `McpLimits` (`NODESTRO_MCP_MAX_SERVERS`, `_MAX_PARALLEL`, `_QUEUE_SECONDS`, `_CALLS_PER_MINUTE`,
@@ -119,6 +128,14 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   stores the report (`tool_approvals_activation/legacy`), and is idempotent. `save_workflow` drops legacy entries the
   stored workflow did not already have for the same node, tool and version, so saving, copying, importing or an API
   client never creates one; a new tool version ends an exemption at the next call.
+- Stored pre-grants (D10c): `tool_approvals.ToolPreGrants` (collection `tool_pre_grants`) grants one tool version for
+  one schedule, batch or test series, with who and when, an optional expiry and revocation; refused for MCP and
+  `destructive` tools and for tools without a version (`tool.pre_grant_*`). The workspace's gate reads them per
+  call, so a revocation applies at the next call.
+- Changing MCP tools behind the gate (WP-5, D10c): with `NODESTRO_TOOL_APPROVALS=1` the workspace sets
+  `McpService.write_gate`, so approved `write`/`destructive` MCP tools become usable, and every such call is asked,
+  whatever the binding says (no `never`, no legacy exemption, no pre-grant). The approval binds the arguments and the
+  approved definition hash; unattended runs still deny them. Without the switch they stay refused as before.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 

@@ -219,3 +219,18 @@ async def test_an_unattended_run_denies_what_would_ask(make: Make) -> None:
     assert record.is_error and record.approval.status == "denied"
     assert record.approval.code == "tool.approval_unattended"
     assert ToolApprovals(workspace.store).of_run(done.id) == []
+
+
+def test_the_switch_opens_changing_mcp_tools_only_behind_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(ENABLE_ENV, raising=False)
+    closed = Workspace(tmp_path / "closed", integrations=[])
+    monkeypatch.setenv(ENABLE_ENV, "1")
+    opened = Workspace(tmp_path / "opened", integrations=[])
+    try:
+        assert closed.mcp.write_gate is False and closed.runs.tool_gate is None
+        assert opened.mcp.write_gate is True and opened.runs.tool_gate is not None
+    finally:
+        closed.close()
+        opened.close()

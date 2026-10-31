@@ -145,6 +145,63 @@ async def test_budget_limits_stop_the_run(make: Make) -> None:
     assert done.nodes["expensive"].error_code == "run.budget_exceeded"
 
 
+HUGE = {"input_tokens": 1_000_000, "output_tokens": 0}
+
+
+def subflow(node_id: str, workflow_id: str) -> dict[str, Any]:
+    return {"id": node_id, "type": "subworkflow", "label": node_id.title(), "subworkflow": {"workflow_id": workflow_id}}
+
+
+async def test_the_budget_of_a_sub_workflow_is_enforced(make: Make) -> None:
+    workspace = make({"EXPENSIVE": [text("a", usage=HUGE)], "NEXT": [text("b")]})
+    child = workspace.save_workflow(
+        workflow(
+            [{"id": "s", "type": "start"}, agent("expensive", "EXPENSIVE"), agent("next", "NEXT")],
+            [edge("s", "expensive"), edge("expensive", "next")],
+            budget_usd=0.5,
+        )
+    )
+    parent = workflow(
+        [{"id": "start", "type": "start"}, subflow("child", child.id)], [edge("start", "child")], budget_usd=1000.0
+    )
+    done = await run(workspace, parent)
+    assert done.status == "failed"
+    # The child stopped at its own limit, although the parent still had money left.
+    inner = workspace.runs.get(done.nodes["child"].child_run_id)
+    assert inner.nodes["expensive"].error_code == "run.budget_exceeded"
+    assert inner.nodes["next"].status != "succeeded"
+
+
+async def test_the_parent_budget_still_covers_the_sub_workflow(make: Make) -> None:
+    workspace = make({"EXPENSIVE": [text("a", usage=HUGE)], "NEXT": [text("b")]})
+    child = workspace.save_workflow(
+        workflow(
+            [{"id": "s", "type": "start"}, agent("expensive", "EXPENSIVE"), agent("next", "NEXT")],
+            [edge("s", "expensive"), edge("expensive", "next")],
+        )
+    )
+    parent = workflow(
+        [{"id": "start", "type": "start"}, subflow("child", child.id)], [edge("start", "child")], budget_usd=0.5
+    )
+    done = await run(workspace, parent)
+    assert done.status == "failed"
+    inner = workspace.runs.get(done.nodes["child"].child_run_id)
+    assert inner.nodes["expensive"].error_code == "run.budget_exceeded"
+
+
+async def test_a_cheap_sub_workflow_within_its_budget_succeeds(make: Make) -> None:
+    workspace = make({"CHEAP": [text("klein")]})
+    child = workspace.save_workflow(
+        workflow([{"id": "s", "type": "start"}, agent("cheap", "CHEAP")], [edge("s", "cheap")], budget_usd=0.5)
+    )
+    parent = workflow(
+        [{"id": "start", "type": "start"}, subflow("child", child.id), {"id": "out", "type": "output"}],
+        [edge("start", "child"), edge("child", "out")],
+    )
+    done = await run(workspace, parent)
+    assert done.status == "succeeded", done.error
+
+
 async def test_an_approval_waits_for_a_person(make: Make) -> None:
     workspace = make({"DRAFT": [text("Angebot 1000 EUR")], "SEND": [text("Final")]})
     flow = workflow(

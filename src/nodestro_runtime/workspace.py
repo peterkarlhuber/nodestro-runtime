@@ -98,7 +98,7 @@ from .schemas import (
 )
 from .server_settings import SecretBox, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
-from .tool_approvals import ToolApprovals, ToolGate, approvals_enabled
+from .tool_approvals import ToolApprovals, ToolGate, ToolPreGrants, approvals_enabled
 from .tool_drafts import ToolDrafts
 from .tool_legacy import LegacyReport, keep_only_inherited, stamp_workflow
 from .tool_library import ToolLibrary, make_sandbox
@@ -324,7 +324,13 @@ class Workspace:
         )
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
-            self.runs.tool_gate = ToolGate(ToolApprovals(self.store), mcp_unattended=unattended_mcp_enabled)
+            self.runs.tool_gate = ToolGate(
+                ToolApprovals(self.store),
+                pre_grants=ToolPreGrants(self.store).of_scope,
+                mcp_unattended=unattended_mcp_enabled,
+            )
+            # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
+            self.mcp.write_gate = True
         self.tester = AgentTester(
             self.builder, connect=self.connection, default_budget=lambda: self.settings().default_budget_usd
         )
