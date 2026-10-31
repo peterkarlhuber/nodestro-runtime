@@ -61,6 +61,8 @@ from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
+from .mcp.models import is_mcp_tool
+from .mcp.tools import describe_call
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
@@ -535,6 +537,10 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     return value
+
+
+#: Runs that start without a person watching (ADR-0007 D-7 limits MCP tools in them).
+UNATTENDED_TRIGGERS = frozenset({"schedule", "batch", "benchmark", "api"})
 
 
 class CancelFlag:
@@ -1754,6 +1760,9 @@ class RunManager:
         def before_tool(call: ToolCall) -> None:
             context.check()
             record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
+            mcp = context.env.builder.tools.mcp
+            if mcp is not None and is_mcp_tool(call.name):
+                record.provenance = describe_call(mcp, call.name)
             calls[call.id] = record
             with context.lock:
                 state.tool_calls.append(record)
@@ -1814,6 +1823,8 @@ class RunManager:
                 on_evaluation_start=lambda: self._emit(context, "evaluation_started", node_id),
                 sandbox=context.env.tool_sandbox(context.run.workflow_id),
                 extra_tools=extra_tools,
+                cancelled=context.cancelled.is_set,
+                attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
             )
             state.output = outcome.output
             state.memory = outcome.memory
@@ -1930,6 +1941,8 @@ def execute_agent(
     on_evaluation_start: Callable[[], None] | None = None,
     sandbox: Sandbox | None = None,
     extra_tools: list[Tool] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    attended: bool = True,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -1946,6 +1959,8 @@ def execute_agent(
         extra_context=extra_context,
         sandbox=sandbox,
         extra_tools=extra_tools,
+        cancelled=cancelled,
+        attended=attended,
     )
     agent = built.agent
     evaluation: EvaluationRecord | None = None

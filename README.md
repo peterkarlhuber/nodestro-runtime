@@ -234,6 +234,35 @@ test database (each test uses its own schema). Knowledge files, their search ind
 PostgreSQL backends too (`nodestro_runtime.postgres_tables`), and `nodestro_runtime.postgres_import` moves a
 desktop database into an empty tenant (without tool provenance: imported tools are untrusted).
 
+### MCP servers (external tools)
+
+`workspace.mcp` connects agents to the tools of remote MCP servers over Streamable HTTP (ADR-0007 in the studio
+repository; package `nodestro_runtime.mcp`). The official MCP SDK negotiates the protocol version: `server/discover`
+at 2026-07-28, otherwise the `initialize` handshake (2025-11-25 and older). It needs Python 3.11 or later; on 3.10
+servers cannot be reached (`mcp.unavailable`).
+
+```python
+from nodestro_runtime.mcp.models import McpServerIn
+
+server = workspace.mcp.add(McpServerIn(name="Docs", url="https://mcp.example.com/mcp", auth="bearer", token="..."))
+workspace.mcp.discover(server.id)              # lists the tools; each one starts as "new"
+workspace.mcp.decide(server.id, "search", approve=True, access="read", actor="admin")
+# agents can now list "mcp__docs__search" in AgentConfig.tools
+```
+
+Access is the intersection of three decisions: the server is enabled, an administrator approved this exact tool
+definition (pinned by its hash) and classified it, and the agent lists the tool. The check runs when an agent is built
+and right before every call, against the definition the server lists at that moment; a changed definition is blocked
+(`mcp.tool_changed`) until an administrator accepts it. Annotations such as `readOnlyHint` are shown as hints only.
+Until per-call approvals exist, only tools classified as `read` are usable (`mcp.write_not_supported`). Runs without a
+person (schedules, batches, test series, published APIs) may use MCP tools only when the operator sets
+`NODESTRO_MCP_UNATTENDED=1` after the MCP security acceptance (`mcp.unattended_not_enabled`).
+
+Calls have a timeout (default 60 s), an output limit (default 20,000 characters), a limit of parallel calls per
+server, and stop when the run is cancelled. Results reach the model marked as external data. Each call in a run
+records its provenance (`ToolCallRecord.provenance`: server, qualified name, definition hash, access) and
+`external_cost: "unknown"`: the cost of an external service is not known to Nodestro and is never counted as zero.
+
 ## Security and data protection
 
 - Everything is stored locally in `<data_dir>/nodestro.db` (SQLite, WAL mode) and below the data directory.
@@ -251,6 +280,16 @@ desktop database into an empty tenant (without tool provenance: imported tools a
 - Workflows can contain approval nodes for human oversight; every decision is stored with the run, as are
   the prompts, tool calls, results and costs of every step, and each run records the workflow version it ran.
 - Sanitized exports (`sanitize`) replace credentials and personal data by placeholders.
+- MCP connections (threat model T7 in the studio repository): `https` only (loopback `http` only on the desktop and
+  only with per-server consent); the connection step resolves the host name, checks every address and connects only
+  to a checked one, so DNS rebinding cannot slip in between; private, loopback, link-local, shared, multicast,
+  reserved and cloud metadata addresses are refused for IPv4 and IPv6 (embedded IPv4 included); TLS verifies the
+  configured host name; redirects stay on the endpoint's origin and are checked again; proxy environment variables
+  are ignored. A server profile reaches only the origins in `NODESTRO_MCP_ENDPOINTS` (empty: none).
+- MCP tokens are stored only encrypted: on a server with the tenant's key derived from `NODESTRO_SECRET_KEY`, on a
+  desktop with the keychain key the desktop app passes in `NODESTRO_VAULT_KEY`. Without such a key a token lives
+  only in memory for the session; there is no plain-text fallback. Tokens are bound to their server's origin and
+  never appear in API views, events, logs or exports.
 
 These are technical measures. They do not by themselves make an application compliant with the GDPR, the EU
 AI Act or ISO/IEC 42001; that depends on how an operator uses and documents the system.
