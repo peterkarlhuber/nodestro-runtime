@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+PostgreSQL document store (desktop and server plan, M3 PR-7, ADR-0002). Nothing changes for the desktop:
+
+- New `storage_postgres`: `PostgresDatabase` (one connection, reentrant transactions, schema migrations) and
+  `PostgresStore`, a `DocumentStore` for one tenant. Table `nodestro_documents` with `tenant_id` in the primary key;
+  every query filters on the tenant. Tenant ids are checked (`[a-z0-9][a-z0-9_-]{0,62}`).
+- Migrations are numbered SQL files in `nodestro_runtime/migrations/postgres` (package data), applied under an
+  advisory lock and recorded in `nodestro_schema_migrations`; backup required for a database with a schema, newer
+  databases refused, failing steps leave the database unchanged (`storage.*` codes as on SQLite).
+- Optional dependency `nodestro-runtime[postgres]` (psycopg 3); without it `storage.postgres_unavailable`.
+- The storage contract tests run on PostgreSQL too (`NODESTRO_TEST_POSTGRES`); CI uses a PostgreSQL 16 service and
+  fails when the database is missing (`NODESTRO_REQUIRE_POSTGRES=1`).
+
 Sandbox policy and trust classes (desktop and server plan, M1 PR-4, ADR-0006). **Changed behavior on purpose:**
 
 - New `sandbox_policy` (`TrustClass`, `SandboxPolicy`, `isolation_of`) and `tool_provenance` (records of the tool

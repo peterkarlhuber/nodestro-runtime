@@ -173,6 +173,17 @@ copies the database to `<data_dir>/backups/pre-migration-<from>-to-<to>-<time>.d
 database unchanged (`storage.backup_failed`, `storage.migration_failed`), and a database of a newer release is
 refused (`storage.schema_too_new`).
 
+**PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
+PostgreSQL; it needs the optional dependency `pip install "nodestro-runtime[postgres]"` (psycopg 3) and is not
+used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns one connection; `database.store(tenant_id)` gives
+the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store
+never reads or changes another tenant's documents. `database.migrate(before_migration=...)` applies the numbered SQL
+files in `nodestro_runtime/migrations/postgres` under an advisory lock (several processes may start at once) and
+records them in `nodestro_schema_migrations`; a database that already has a schema needs a backup first (operators:
+`pg_dump`), and the same error codes as on SQLite apply. Credentials come from the connection string, the `PG*`
+variables or `~/.pgpass`. The tests run the storage contract on PostgreSQL when `NODESTRO_TEST_POSTGRES` names a
+test database (each test uses its own schema).
+
 ## Security and data protection
 
 - Everything is stored locally in `<data_dir>/nodestro.db` (SQLite, WAL mode) and below the data directory.

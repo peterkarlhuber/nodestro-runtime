@@ -1,7 +1,7 @@
 """The storage contract: every DocumentStore operation, schema versions and migrations, and the SQL seams.
 
-The contract cases run against every implementation in ``STORES`` (today SQLite on a file and in memory); a
-second backend adds itself there and must pass the same cases.
+The contract cases run against every implementation in ``STORES``: SQLite on a file and in memory, and PostgreSQL
+(one tenant in a fresh schema) when ``NODESTRO_TEST_POSTGRES`` names a test database (see ``postgres_support``).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from orkexa import SQLiteIndex, SQLiteMemory
+import postgres_support
 from pydantic import BaseModel
 import pytest
 
@@ -33,24 +34,43 @@ class Doc(BaseModel):
     n: int = 0
 
 
-StoreFactory = Callable[[Path], DocumentStore]
+StoreFactory = Callable[[Path, list[Callable[[], None]]], DocumentStore]
+
+
+def _postgres_store(_tmp: Path, cleanup: list[Callable[[], None]]) -> DocumentStore:
+    from nodestro_runtime.storage_postgres import PostgresDatabase, PostgresStore
+
+    dsn = postgres_support.require_postgres()
+    schema = postgres_support.new_schema()
+    cleanup.append(lambda: postgres_support.drop_schema(schema))
+    database = PostgresDatabase(dsn, schema=schema)
+    database.migrate()
+    return PostgresStore(database, "local", owns_database=True)
+
+
 STORES: dict[str, StoreFactory] = {
-    "sqlite-file": lambda tmp: SQLiteStore(tmp / "documents.db"),
-    "sqlite-memory": lambda _tmp: SQLiteStore(":memory:"),
+    "sqlite-file": lambda tmp, _cleanup: SQLiteStore(tmp / "documents.db"),
+    "sqlite-memory": lambda _tmp, _cleanup: SQLiteStore(":memory:"),
+    "postgres": _postgres_store,
 }
 
 
 @pytest.fixture(params=list(STORES))
 def store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[DocumentStore]:
-    opened = STORES[request.param](tmp_path)
-    yield opened
-    opened.close()
+    cleanup: list[Callable[[], None]] = []
+    try:
+        opened = STORES[request.param](tmp_path, cleanup)
+        yield opened
+        opened.close()
+    finally:
+        for step in cleanup:
+            step()
 
 
 # ---- the DocumentStore contract ---------------------------------------------------------------
 
 
-def test_the_sqlite_store_implements_the_protocol(store: DocumentStore) -> None:
+def test_every_store_implements_the_protocol(store: DocumentStore) -> None:
     assert isinstance(store, DocumentStore)
     assert Store is SQLiteStore  # the name existing imports use
 
@@ -543,7 +563,7 @@ def test_memory_totals_and_clearing(tmp_path: Path) -> None:
 # ---- the seams: no SQL outside the storage modules ----------------------------------------------------
 
 #: Modules allowed to use a database connection: the document store and the SQL on Orkexa's tables.
-STORAGE_MODULES = {"storage.py", "sqlite_tables.py"}
+STORAGE_MODULES = {"storage.py", "sqlite_tables.py", "storage_postgres.py"}
 
 
 def test_no_module_outside_storage_touches_a_connection() -> None:

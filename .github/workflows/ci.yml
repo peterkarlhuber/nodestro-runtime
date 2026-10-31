@@ -16,6 +16,22 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.10", "3.13"]
+    # PostgreSQL storage (ADR-0002) runs the storage contract against a real server; a missing database fails.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: nodestro-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      NODESTRO_TEST_POSTGRES: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
+      NODESTRO_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -68,6 +84,8 @@ jobs:
           "$RUNNER_TEMP/wheel/bin/pip" install dist/*.whl
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wheel/bin/python" -c "import nodestro_runtime as p; print(p.__name__, p.__version__)"
+          # The PostgreSQL migrations are package data; the module imports without the optional driver.
+          "$RUNNER_TEMP/wheel/bin/python" -c "from nodestro_runtime.storage_postgres import postgres_migrations as m; assert m(), 'no migrations in the wheel'; print(sorted(m()))"
       # The quickstart of the README, run with the installed wheel outside the checkout (no sources on the path).
       - name: Run the README quickstart with the installed wheel
         run: |
