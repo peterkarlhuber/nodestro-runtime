@@ -578,7 +578,14 @@ def test_memory_totals_and_clearing(tmp_path: Path) -> None:
 # ---- the seams: no SQL outside the storage modules ----------------------------------------------------
 
 #: Modules allowed to use a database connection: the document store and the SQL on Orkexa's tables.
-STORAGE_MODULES = {"storage.py", "sqlite_tables.py", "storage_postgres.py", "postgres_tables.py", "postgres_import.py"}
+STORAGE_MODULES = {
+    "storage.py",
+    "sqlite_tables.py",
+    "storage_postgres.py",
+    "postgres_tables.py",
+    "postgres_import.py",
+    "identity_store.py",
+}
 
 
 def test_no_module_outside_storage_touches_a_connection() -> None:
