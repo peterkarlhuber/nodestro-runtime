@@ -25,7 +25,7 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from decimal import Decimal
 import json
 import logging
@@ -45,7 +45,6 @@ from orkexa import (
     ToolCall,
     UsageRecord,
     UsageSummary,
-    UsageTracker,
     flow,
     refine,
 )
@@ -136,7 +135,9 @@ def _merged(*lists: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(item for items in lists for item in items))[:_MAX_LISTED]
 
 
-def usage_of(summary: UsageSummary, records: Iterable[UsageRecord] = (), *, stale_requests: int = 0) -> Usage:
+def usage_of(
+    summary: UsageSummary, records: Iterable[UsageRecord] = (), *, stale_requests: int = 0, uncapped: int = 0
+) -> Usage:
     """Nodestro's usage of an Orkexa summary; ``records`` (the summarized requests) add the price references."""
     cost = summary.estimated_cost_usd
     used = list(records)
@@ -158,7 +159,22 @@ def usage_of(summary: UsageSummary, records: Iterable[UsageRecord] = (), *, stal
         pricing_versions=_merged([record.pricing_version for record in used if record.pricing_version]),
         pricing_sources=_merged([record.pricing_source for record in used if record.pricing_source]),
         pricing_quality=_lowest_quality(*(record.pricing_quality for record in used)),
+        uncapped_requests=uncapped,
     )
+
+
+def uncapped_requests(tracker: object) -> int:
+    """Requests ``tracker`` admitted without capping their cost (0 for trackers without a budget)."""
+    if not isinstance(tracker, BudgetTracker):
+        return 0
+    return tracker.unbounded_requests + tracker.oversized_requests
+
+
+def _hard_maximum(run: Run) -> bool | None:
+    """Whether the run's budget capped every request (``None`` without a budget)."""
+    if run.budget_usd is None:
+        return None
+    return run.usage.uncapped_requests == 0 and run.usage.unpriced_requests == 0
 
 
 def _cost_parts(usage: Usage) -> tuple[float, int, bool | None]:
@@ -199,6 +215,7 @@ def add_usage(first: Usage, second: Usage) -> Usage:
         "web_search_requests",
         "total_tokens",
         "stale_price_requests",
+        "uncapped_requests",
     )
     data = {name: getattr(first, name) + getattr(second, name) for name in counted}
     return Usage(
@@ -611,28 +628,25 @@ class _ChildTracker(PricedTracker):
     """A sub-workflow's usage: kept for the child run and, renamed, counted in the parent's budget.
 
     It prices with the parent's catalog and price mode, so a sub-workflow is priced exactly like its parent.
-    The sub-workflow's own budget (``limit_usd``) applies in addition: a request is sent only while both
-    the child's and every parent's budget allow it, so neither side can spend past the other's limit.
+    The sub-workflow's own budget (``limit_usd``) applies in addition: Orkexa passes every record, check and
+    reservation on to the parent (``parent=``), so a request is sent only while both the child's and every
+    parent's budget can hold its most expensive outcome, and neither side can spend past the other's limit.
     """
 
     def __init__(self, parent: BudgetTracker, prefix: str, limit_usd: float | None = None) -> None:
         if isinstance(parent, PricedTracker):
-            super().__init__(limit_usd, pricing=parent.pricing, mode=parent.mode)
+            # The parent warns about unpriced usage once; the child only rejects it in strict mode.
+            super().__init__(
+                limit_usd,
+                pricing=parent.pricing,
+                mode=parent.mode,
+                parent=parent,
+                prefix=prefix,
+                on_unpriced="reject" if parent.mode == "strict" else "ignore",
+            )
         else:
-            super().__init__(limit_usd)
+            super().__init__(limit_usd, parent=parent, prefix=prefix, on_unpriced="ignore")
             self.price_resolver = parent.price_resolver
-        self.parent = parent
-        self.prefix = prefix
-
-    def add(self, record: UsageRecord) -> None:
-        self.note(record)
-        UsageTracker.add(self, record)
-        self.parent.add(replace(record, agent=f"{self.prefix}/{record.agent}"))
-        self.check()
-
-    def check(self) -> None:
-        BudgetTracker.check(self)
-        self.parent.check()
 
     def before_request(self, *, agent: str, provider: str, model: str, priced: bool) -> None:
         if self.limit_usd is not None and self.spent_usd >= self.limit_usd:
@@ -640,7 +654,7 @@ class _ChildTracker(PricedTracker):
                 f"Budget of the sub-workflow used up: spent ${self.spent_usd:.4f} of ${self.limit_usd:.4f}; "
                 f"request of agent {agent!r} to {provider}:{model} not sent"
             )
-        self.parent.before_request(agent=f"{self.prefix}/{agent}", provider=provider, model=model, priced=priced)
+        super().before_request(agent=agent, provider=provider, model=model, priced=priced)
 
 
 @dataclass
@@ -910,7 +924,9 @@ class RunManager:
             return run
         loop = _require_loop()
         workflow = run.workflow
-        budget = _remaining(workflow.budget_usd if workflow.budget_usd is not None else self.default_budget(), run)
+        limit = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
+        run.budget_usd = limit
+        budget = _remaining(limit, run)
         context = _RunContext(run, self.tracker(budget), self.environment(run))
         context.loop = loop
         self._contexts[run.id] = context
@@ -1306,9 +1322,13 @@ class RunManager:
             run.usage = add_usage(
                 context.base_usage,
                 usage_of(
-                    context.tracker.usage, context.tracker.records, stale_requests=stale_requests(context.tracker)
+                    context.tracker.usage,
+                    context.tracker.records,
+                    stale_requests=stale_requests(context.tracker),
+                    uncapped=uncapped_requests(context.tracker),
                 ),
             )
+            run.budget_hard_maximum = _hard_maximum(run)
             paused = _is_paused(run)
             if not paused:
                 run.finished_at = now()
@@ -1841,6 +1861,7 @@ class RunManager:
         state.status = "running"
         self._emit(context, "node_started", node.id, child_run_id=child.id, version=state.child_version)
         self._save(context)
+        child.budget_usd = child.workflow.budget_usd
         child_context = _RunContext(
             child,
             _ChildTracker(context.tracker, node.id, _remaining(child.workflow.budget_usd, child)),

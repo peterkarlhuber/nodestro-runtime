@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Adaptive Orchestration M2 (budget reservations, AO-12):
+
+- **Behavior change: requests reserve their most expensive outcome before they are sent** (Orkexa
+  `BudgetTracker` reservations). Branches, sub-workflows and agents that run at the same time can no longer
+  spend past a run's budget together; a request that does not fit next to the requests in flight waits for
+  them. Sub-workflow trackers chain their reservations to the parent (`_ChildTracker` now uses Orkexa's
+  `parent=`), so neither budget can be bypassed through the other.
+- A request whose most expensive outcome is larger than the rest of the budget runs alone in standard price
+  mode and is refused before it is sent in strict mode (`run.budget_exceeded`).
+- New `Usage.uncapped_requests` (requests admitted without a capped cost: no price, native tools, images,
+  binary documents, or too large and admitted alone), `Run.budget_usd` (the budget the run started with) and
+  `Run.budget_hard_maximum` (`True` only when every request was capped and priced; `None` without a budget).
+  Unknown costs are never reserved as 0.
+- Orkexa pin: `b85133d53d58616dfba164d45ccdc035766d4144` (orkexa #15).
+
 Adaptive Orchestration M2 (sub-workflow budgets):
 
 - **Behavior change: the `budget_usd` of a sub-workflow is now enforced.** Before, a child run only counted against

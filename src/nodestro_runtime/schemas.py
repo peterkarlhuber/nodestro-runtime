@@ -437,6 +437,9 @@ class Usage(_Model):
     pricing_sources: list[str] = Field(default_factory=list)
     #: The lowest quality among the prices used (``verified``, ``contract``, ``unverified``, ``estimated``).
     pricing_quality: str | None = None
+    #: Requests a budget admitted without capping their cost (AO-12): no upper bound (no price, native tools,
+    #: images, binary documents) or one larger than the rest of the budget, admitted alone.
+    uncapped_requests: int = 0
 
 
 class ToolCallApproval(_Model):
@@ -619,6 +622,11 @@ class Run(_Model):
     #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
     flow_state: dict[str, Any] | None = None
     usage: Usage = Field(default_factory=Usage)
+    #: The budget the run started with in USD (``None``: no limit, or a run of an earlier version).
+    budget_usd: float | None = None
+    #: Whether the budget was a hard maximum: every request reserved its most expensive outcome in advance and
+    #: none was uncapped or unpriced. ``None`` without a budget.
+    budget_hard_maximum: bool | None = None
     created_at: datetime = Field(default_factory=now)
     started_at: datetime | None = None
     finished_at: datetime | None = None

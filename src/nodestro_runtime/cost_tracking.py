@@ -44,6 +44,8 @@ class PricedTracker(BudgetTracker):
     ) -> None:
         if mode == "strict":
             kwargs.setdefault("on_unpriced", "reject")
+            # Strict: a request whose most expensive outcome does not fit the rest of the budget is refused.
+            kwargs.setdefault("on_oversized", "reject")
         super().__init__(limit_usd, price_resolver=pricing.resolver() if pricing is not None else None, **kwargs)
         self.pricing = pricing
         self.mode: PriceMode = mode
