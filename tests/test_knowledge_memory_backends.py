@@ -204,3 +204,35 @@ def test_postgres_memory_refuses_nul_characters(backends: Backends) -> None:
     with pytest.raises(MemoryToolError):
         space.execute({"command": "create", "path": "/memories/a.md", "file_text": "x\x00y"})
     assert space.entries() == []
+
+
+# ---- search parity --------------------------------------------------------------------------------
+
+CORPUS = {
+    "invoice.txt": "Invoice 2026-114: refund of the deposit within 14 days after the cancellation.",
+    "vertrag.md": "Der Mietvertrag endet mit der Kündigung; die Kaution wird nach Übergabe erstattet.",
+    "recette.txt": "Recette: crème brûlée, sucre, œufs et vanille. Cuisson lente au four.",
+    "viaggio.md": "Itinerario del viaggio: Firenze, Siena e Pisa in treno, con prenotazione dell'hotel.",
+    "reuniao.txt": "Reunião de equipe: orçamento do projeto, prazos e próximos passos.",
+    "receta.md": "Receta de paella: arroz, azafrán, mariscos y caldo de pescado.",
+    "server.md": "PostgreSQL backups use pg_dump; restore them with pg_restore into an empty database.",
+    "hr.txt": "Recruiting: interview guide, salary range and onboarding checklist for new engineers.",
+}
+QUERIES = {
+    "refund deposit": "invoice.txt",
+    "kaution kündigung": "vertrag.md",
+    "creme brulee": "recette.txt",
+    "firenze treno": "viaggio.md",
+    "orcamento prazos": "reuniao.txt",
+    "azafran": "receta.md",
+    "pg_dump restore": "server.md",
+    "onboarding": "hr.txt",
+}
+
+
+def test_both_backends_find_the_same_best_document(backends: Backends) -> None:
+    knowledge = backends.knowledge("alpha")
+    ids = {name: knowledge.add(text.encode(), name=name).id for name, text in CORPUS.items()}
+    for query, expected in QUERIES.items():
+        hits = knowledge.search(query, k=3)
+        assert hits and hits[0].source == ids[expected], (backends.kind, query, [hit.title for hit in hits])
