@@ -86,11 +86,13 @@ jobs:
       - run: pytest tests/test_container_images.py
 
   builtin-sandbox:
-    # Acceptance tests of the built-in sandbox prototype (ADR-0006 point 7, plan PR-13) on Linux x86-64. A sandbox
-    # that cannot start fails this job instead of skipping the tests. The prototype stays non-isolating either way.
-    runs-on: ubuntu-latest
+    # Security probes and compatibility checks of the built-in Linux sandbox (Landlock + seccomp, ADR-0006) as the
+    # runner's normal user, with the runner's AppArmor restrictions as shipped. A sandbox that cannot start fails this
+    # job instead of skipping the tests. The real target systems (Ubuntu 24.04 and Debian 13 with their own kernels)
+    # are tested with the packaged desktop in nodestro-desktop's "Sandbox systems" workflow.
+    runs-on: ubuntu-24.04
     env:
-      NODESTRO_REQUIRE_BWRAP: "1"
+      NODESTRO_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -109,22 +111,20 @@ jobs:
             exit 1
           fi
           git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
-      # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor; the report records whether bwrap works
-      # as installed. Only if it does not, the restriction is lifted for this runner (never on a user's machine).
-      - name: Check that bwrap can create namespaces
-        run: |
-          bwrap --version
-          if bwrap --unshare-all --ro-bind / / true; then
-            echo "bwrap works as installed"
-          else
-            echo "::notice::bwrap cannot create user namespaces as installed; lifting the AppArmor restriction for this runner"
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-            bwrap --unshare-all --ro-bind / / true
-          fi
       - run: pip install -e ".[dev]"
-      - run: pytest -s tests/test_builtin_sandbox.py
-      - run: python -m nodestro_runtime.builtin_sandbox
+      - name: Kernel features
+        run: |
+          id; uname -r; cat /sys/kernel/security/lsm; echo
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+      - run: pytest -s tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+      - name: Python environment with a compiled library, installed offline from hash-pinned wheels
+        run: |
+          pip download --only-binary=:all: --no-deps --require-hashes -r tests/data/compiled-library.txt -d "$RUNNER_TEMP/wheels"
+          python -m venv "$RUNNER_TEMP/env"
+          "$RUNNER_TEMP/env/bin/pip" install --no-index --find-links "$RUNNER_TEMP/wheels" --require-hashes -r tests/data/compiled-library.txt
+          "$RUNNER_TEMP/env/bin/pip" install pydantic typing-extensions
+      - name: Security probes and compatibility checks
+        run: python -m nodestro_runtime.sandbox_probes --env-python "$RUNNER_TEMP/env/bin/python"
 
   package:
     # The wheel installs on its own and contains what the package needs at run time.

@@ -70,15 +70,19 @@ def libraries_problem(name: str) -> Problem:
     """Why code that needs isolation cannot use third-party libraries yet (ADR-0006)."""
     return problem(
         "sandbox.libraries_need_isolation",
-        f"The tool {name!r} is AI-generated or of unknown origin and needs third-party libraries; such tools "
-        "cannot run yet, because libraries are only available without isolation",
+        f"The tool {name!r} is AI-generated or of unknown origin and needs third-party libraries; such tools run "
+        "only in an isolating sandbox, and neither the built-in Linux sandbox nor Docker is available here",
         name=name,
     )
 
 
 def needs_isolated_libraries(tools: ToolLibrary, python: PythonEnvironments, trust: TrustClass, needed: Needed) -> bool:
     """Code of class ``trust`` needs libraries that would run without the isolation the policy requires."""
-    return bool(needed.requirements) and tools.policy.needs_isolation(trust) and python.isolation() == "none"
+    return (
+        bool(needed.requirements)
+        and tools.policy.needs_isolation(trust)
+        and not tools.policy.accepts(python.isolation())
+    )
 
 
 def check_with_dependencies(

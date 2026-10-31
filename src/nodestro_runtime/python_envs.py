@@ -46,6 +46,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
+from .builtin_sandbox import LinuxSandbox
 from .container_images import ContainerImages, RuntimeImageSandbox, lock_has_hashes, orkexa_fingerprint
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
@@ -1134,10 +1135,14 @@ class PythonEnvironments:
         return self.sandbox_kind() == "docker"
 
     def isolation(self) -> Isolation:
-        """How the environments' sandboxes isolate tool code (ADR-0006): with the Docker sandbox every environment is
-        a container image (``container``); otherwise a host subprocess with the environment's interpreter
-        (``none``), so only ``user-authored`` code may use third-party libraries there."""
-        return "container" if self.containers() else "none"
+        """How the environments' sandboxes can isolate tool code (ADR-0006): with the Docker sandbox every environment
+        is a container image (``container``); otherwise the environment's interpreter runs in a host subprocess,
+        which the tool library replaces with the built-in Linux sandbox for code that needs isolation where that
+        sandbox is available (``kernel``); without it only ``user-authored`` code may use third-party libraries
+        (``none``)."""
+        if self.containers():
+            return "container"
+        return "kernel" if LinuxSandbox.status().available else "none"
 
     def _ready(self, env: PythonEnvironment) -> bool:
         """Whether the approved lock of ``env`` is installed (as a virtual environment or a container image)."""
