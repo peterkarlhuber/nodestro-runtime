@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Price refusals with their own codes (PRICING-1, strict price mode):
+
+- A request refused because its model has no known price (Orkexa's `UnpricedModelError`) now fails with
+  `pricing.price_unknown`, one whose price failed the price policy (`UnreliablePriceError`) with
+  `pricing.price_unreliable`, both with the parameter `model`. Before, both read `run.budget_exceeded`, which said
+  the budget was used up when it was not. `problems.price_problem` maps them for runs and for agent tests.
+
 Built-in Linux sandbox (replaces the bubblewrap prototype of PR-13; ADR-0006 point 7):
 
 - New `nodestro_runtime.builtin_sandbox.LinuxSandbox`: runs tool code isolated without Docker, Bubblewrap or any

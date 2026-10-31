@@ -73,12 +73,36 @@ _LIBRARY_PATTERNS: list[tuple[re.Pattern[str], str, tuple[str, ...]]] = [
 ]
 
 
+_PRICED_MODEL = re.compile(r"\b(?:to|for) (?P<model>[\w.-]+:[\w./@-]+?)[\s;:,)]")
+
+
+def price_problem(exc: BaseException, message: str | None = None) -> Problem | None:
+    """The strict price mode's refusals (Orkexa's ``UnpricedModelError`` and ``UnreliablePriceError``).
+
+    They are subclasses of ``BudgetExceededError`` but are not about a used-up budget: the model has no known price,
+    or its price failed the price policy (for example a price that was not checked for too long).
+    """
+    from orkexa.dynamic import UnpricedModelError, UnreliablePriceError
+
+    if not isinstance(exc, UnpricedModelError):
+        return None
+    text = message if message is not None else str(exc)
+    match = _PRICED_MODEL.search(f"{exc} ")
+    model = match.group("model") if match else ""
+    if isinstance(exc, UnreliablePriceError):
+        return problem("pricing.price_unreliable", text, model=model)
+    return problem("pricing.price_unknown", text, model=model)
+
+
 def library_problem(exc: BaseException, *, code: str = "library") -> Problem:
     """A problem for an exception raised by orkexa (or a NodestroError)."""
     from orkexa import UnknownCapabilityError, UnsupportedCapabilityError
 
     if isinstance(exc, NodestroError):
         return exc.problem
+    priced = price_problem(exc)
+    if priced is not None:
+        return priced
     message = str(exc.args[0] if isinstance(exc, KeyError) and exc.args else exc)
     for pattern, matched_code, names in _LIBRARY_PATTERNS:
         match = pattern.search(message)

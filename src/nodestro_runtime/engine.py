@@ -62,7 +62,7 @@ from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
 from .pricing import PricingService
-from .problems import CheckIssue, NodestroError, Problem, library_problem, problem
+from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
@@ -1990,6 +1990,9 @@ def node_problem(exc: BaseException) -> Problem:
         return exc.problem
     kind = type(exc).__name__
     text = redact(f"{kind}: {exc}" if str(exc) else kind)
+    priced = price_problem(exc, text)
+    if priced is not None:
+        return priced
     if isinstance(exc, BudgetExceededError):
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
