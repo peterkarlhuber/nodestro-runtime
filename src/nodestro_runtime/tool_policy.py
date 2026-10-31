@@ -17,14 +17,18 @@ A missing or unknown statement means ``write`` + ``external`` (:data:`UNKNOWN`):
 a tool look harmless, never its own code, its description or a model. The statement is security information, not
 proof of harmless behavior: a ``read`` + ``external`` tool can still send data out through its arguments.
 
-This module only describes; it changes no behavior. Asking before a call (S-2) builds on it.
+Asking before a call (S-2) builds on it: a tool *binding* of an agent says when to ask (:class:`ToolBinding`), and
+:func:`decide` turns capability, binding and the run's situation into allow, deny or ask, without any I/O. Waiting
+for the answer is :mod:`nodestro_runtime.tool_approvals`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .sandbox_policy import Isolation
 
@@ -122,15 +126,191 @@ def server_tool_capability(key: str) -> ToolCapability:
     return SERVER_TOOL_CAPABILITIES.get(key, UNKNOWN)
 
 
+# ---- S-2: when to ask before a call ---------------------------------------------------------------------------
+
+AskMode = Literal["auto", "always", "never"]
+GateAction = Literal["allow", "deny", "ask"]
+#: The run triggers where a pre-grant can stand in for a person (the scopes of :class:`ToolPreGrant`).
+PreGrantScope = Literal["schedule", "batch", "benchmark"]
+
+
+class ToolBinding(BaseModel):
+    """When an agent asks before calling one of its tools.
+
+    - ``auto`` (every new binding): ask when the tool does more than read.
+    - ``always``: ask for every call.
+    - ``never``: do not ask. Counts only for ``read`` tools, for ``write`` tools with a ``reason`` and for legacy
+      exemptions; never for ``destructive`` tools. Otherwise it is treated as ``auto``.
+
+    A **legacy exemption** (``legacy``) is a binding that existed before S-2; it holds only for the tool version it
+    was bound to (``bound_version``): a new version of the tool ends it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    ask: AskMode = "auto"
+    reason: str | None = Field(default=None, min_length=10, max_length=500)
+    legacy: bool = False
+    bound_version: int | None = None
+
+
+#: A binding nobody configured: a new binding.
+NEW_BINDING = ToolBinding()
+
+
+class ToolPreGrant(BaseModel):
+    """A person's advance approval of one tool for one unattended scope (D10c): narrow, traceable, revocable.
+
+    Matches only the tool name, its version (own and generated tools) and the scope; voided by a new tool version,
+    by its expiry and by revocation. Never covers ``destructive`` or MCP tools."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    tool: str
+    version: int | None = None
+    scope: PreGrantScope
+    scope_id: str
+    granted_by: str
+    granted_at: datetime
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+
+class CallContext(BaseModel):
+    """Where a call happens."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    node_id: str
+    #: The trigger of the root run (a sub-workflow inherits its parent's).
+    trigger: str
+    #: A person can answer a question while the run waits.
+    attended: bool
+    #: The tools an orchestrator granted (AO-11); ``None``: no grant limits the agent.
+    grants: frozenset[str] | None = None
+    #: Who set ``grants`` (node id or orchestrator step), recorded with a ``tool.not_granted`` denial.
+    grant_scope: str | None = None
+    #: The unattended scope of the run (e.g. ``("schedule", "sch_1")``) and the pre-grants stored for it.
+    scope: tuple[PreGrantScope, str] | None = None
+    pre_grants: tuple[ToolPreGrant, ...] = ()
+    #: ADR-0007 D-7: approved read-only MCP tools may run unattended (only after the MCP security acceptance).
+    mcp_unattended: bool = False
+
+
+class GateDecision(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    action: GateAction
+    code: str | None = None
+    reason: str | None = None
+    #: The pre-grant that allowed an unattended call.
+    pre_grant_id: str | None = None
+
+
+ALLOW = GateDecision(action="allow")
+ASK = GateDecision(action="ask")
+
+
+def _deny(code: str, reason: str) -> GateDecision:
+    return GateDecision(action="deny", code=code, reason=reason)
+
+
+def wants_question(capability: ToolCapability, binding: ToolBinding | None, *, version: int | None = None) -> bool:
+    """Whether a person would be asked before this call (the binding's rule; see :class:`ToolBinding`)."""
+    binding = binding or NEW_BINDING
+    if binding.legacy and (binding.ask != "never" or binding.bound_version is None or binding.bound_version != version):
+        binding = NEW_BINDING  # an exemption never outlives the tool version it was bound to
+    if binding.ask == "always":
+        return True
+    if binding.ask == "never":
+        if capability.access == "destructive":
+            return True
+        # A write tool needs a recorded reason (or a legacy exemption) to go unasked.
+        return capability.access == "write" and not binding.legacy and binding.reason is None
+    return capability.access != "read"
+
+
+def matching_pre_grant(
+    pre_grants: Iterable[ToolPreGrant],
+    *,
+    tool: str,
+    version: int | None,
+    scope: tuple[PreGrantScope, str] | None,
+    at: datetime,
+) -> ToolPreGrant | None:
+    if scope is None:
+        return None
+    for grant in pre_grants:
+        if grant.tool != tool or (grant.scope, grant.scope_id) != scope:
+            continue
+        if grant.version is not None and grant.version != version:
+            continue
+        if version is not None and grant.version is None:
+            continue  # a grant for "any version" would survive a changed tool
+        if grant.revoked_at is not None and grant.revoked_at <= at:
+            continue
+        if grant.expires_at is not None and grant.expires_at <= at:
+            continue
+        return grant
+    return None
+
+
+def decide(
+    *,
+    tool: str,
+    kind: str,
+    capability: ToolCapability,
+    binding: ToolBinding | None,
+    context: CallContext,
+    at: datetime,
+    version: int | None = None,
+) -> GateDecision:
+    """Allow, deny or ask for one call (no I/O). The order: grants narrow first, then the binding decides whether to
+    ask; an unattended run cannot ask, so it denies unless a matching pre-grant exists. An approval never changes the
+    sandbox the call runs in."""
+    if context.grants is not None and tool not in context.grants:
+        scope = context.grant_scope or "orchestrator"
+        return _deny("tool.not_granted", f"The tool {tool} was not granted to this agent (by {scope})")
+    if kind == "mcp" and not context.attended and not (context.mcp_unattended and capability.reads_only):
+        return _deny("tool.approval_unattended", f"The MCP tool {tool} cannot run without a person watching")
+    if not wants_question(capability, binding, version=version):
+        return ALLOW
+    if context.attended:
+        return ASK
+    if kind != "mcp" and capability.access != "destructive":
+        grant = matching_pre_grant(context.pre_grants, tool=tool, version=version, scope=context.scope, at=at)
+        if grant is not None:
+            return GateDecision(action="allow", pre_grant_id=grant.id)
+    return _deny(
+        "tool.approval_unattended",
+        f"The tool {tool} needs a person's approval for each call, and nobody can answer in this run",
+    )
+
+
 __all__ = [
+    "ALLOW",
+    "ASK",
     "BUILTIN_CAPABILITIES",
+    "NEW_BINDING",
     "SERVER_TOOL_CAPABILITIES",
     "UNKNOWN",
     "Access",
+    "AskMode",
+    "CallContext",
     "CapabilitySource",
+    "GateAction",
+    "GateDecision",
+    "PreGrantScope",
     "Reach",
+    "ToolBinding",
     "ToolCapability",
+    "ToolPreGrant",
     "capability_of",
+    "decide",
+    "matching_pre_grant",
     "parse_capability",
     "server_tool_capability",
+    "wants_question",
 ]
