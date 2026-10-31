@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 import hashlib
 import logging
 from pathlib import Path
@@ -81,7 +82,7 @@ from .schemas import (
     Workflow,
     WorkflowIn,
 )
-from .storage import Store
+from .storage import BeforeMigration, SQLiteStore, Store
 from .tool_drafts import ToolDrafts
 from .tool_library import ToolLibrary, make_sandbox
 from .usage_log import UsageLog
@@ -129,6 +130,23 @@ def _lock(descriptor: int) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, target: int) -> Path:
+    """Copy the whole database to ``directory`` before migrating it from ``current`` to ``target``; the copy's path.
+
+    The copy is written under a temporary name and renamed when complete, so a backup that exists is whole."""
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target_path = directory / f"pre-migration-{current}-to-{target}-{stamp}.db"
+    partial = target_path.with_suffix(".db.partial")
+    try:
+        store.snapshot(partial)
+        partial.replace(target_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return target_path
+
+
 class Workspace:
     """Every runtime service of one data directory; one instance per process and directory."""
 
@@ -141,13 +159,20 @@ class Workspace:
         ocr_runner: Any | None = None,
         integrations: Iterable[Integration] | None = None,
         profile: RuntimeProfile | None = None,
+        before_migration: BeforeMigration | None = None,
     ) -> None:
         """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
         OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`).
 
         ``profile`` chooses the operating profile (:mod:`nodestro_runtime.profile`); without one, the desktop
         profile on ``data_dir`` is used, as before. Given both, ``data_dir`` must be the profile's data
-        directory. A profile that cannot be started is refused before any file or database is touched."""
+        directory. A profile that cannot be started is refused before any file or database is touched.
+
+        The database is brought to the schema version of this release before anything else uses it
+        (:meth:`~nodestro_runtime.storage.SQLiteStore.migrate`; nothing happens while the version is current).
+        ``before_migration`` writes the backup a migration needs first; without one, the database file is copied
+        to ``<data_dir>/backups/pre-migration-<from>-to-<to>-<time>.db``. A database of a newer release is refused
+        (``storage.schema_too_new``) and the workspace does not open."""
         if profile is None:
             if data_dir is None:
                 raise TypeError("Workspace needs a data directory or a profile")
@@ -168,6 +193,12 @@ class Workspace:
         )
         database = data_dir / DATABASE
         self.store = Store(database)
+        try:
+            self.store.migrate(before_migration=before_migration or self._backup_before_migration)
+        except BaseException:
+            self.store.close()
+            self._directory_lock.release()
+            raise
         self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         self.memory = MemorySpaces(database)
@@ -225,6 +256,10 @@ class Workspace:
             self.inputs.cleanup()
         except Exception:  # cleaning up is housekeeping; it never stops Nodestro from starting
             logging.getLogger(__name__).exception("Cleaning up input files failed")
+
+    def _backup_before_migration(self, current: int, target: int) -> None:
+        """Copy the database before a schema migration (the default ``before_migration``)."""
+        backup_migrated_database(self.store, self.data_dir / "backups", current, target)
 
     def compose(self) -> None:
         """Add services before interrupted runs are recovered; applications built on the runtime override it."""

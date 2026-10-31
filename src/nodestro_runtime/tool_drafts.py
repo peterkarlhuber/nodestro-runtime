@@ -23,7 +23,7 @@ from .problems import NodestroError, Problem
 from .python_envs import PythonEnvironments
 from .python_tools import check_with_dependencies, save_with_dependencies
 from .schemas import new_id, now
-from .storage import Store
+from .storage import DocumentStore
 from .tool_library import CheckResult, ToolInfo, ToolLibrary
 
 _COLLECTION = "tool_drafts"
@@ -57,7 +57,7 @@ class ToolDraft(BaseModel):
 class ToolDrafts:
     """Stores drafts in the Nodestro database and turns approved ones into registered tools."""
 
-    def __init__(self, store: Store, tools: ToolLibrary) -> None:
+    def __init__(self, store: DocumentStore, tools: ToolLibrary) -> None:
         self.store = store
         self.tools = tools
         #: Set by the application: tests with third-party libraries run in the tool's environment.

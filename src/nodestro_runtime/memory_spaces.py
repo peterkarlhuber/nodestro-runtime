@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-import sqlite3
 import threading
 
 from orkexa import SQLiteMemory
@@ -12,6 +11,7 @@ from orkexa.memory import MEMORY_ROOT
 from pydantic import BaseModel
 
 from .problems import NodestroError
+from .sqlite_tables import clear_memory, memory_totals
 
 _SPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}")
 _PREFIX = "nodestro:"
@@ -52,8 +52,7 @@ class MemorySpace(SQLiteMemory):
         self.delete(path)
 
     def clear(self) -> None:
-        with self._lock:
-            self._connection.execute("DELETE FROM memory_files WHERE namespace = ?", (self.namespace,))
+        clear_memory(self)
 
 
 def check_space_name(name: str) -> str:
@@ -89,21 +88,7 @@ class MemorySpaces:
             self._open.clear()
 
     def all(self) -> list[MemorySpaceInfo]:
-        connection = sqlite3.connect(self.database, timeout=30)
-        try:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS memory_files ("
-                " namespace TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL,"
-                " updated_at TEXT NOT NULL, PRIMARY KEY (namespace, path))"
-            )
-            rows = connection.execute(
-                "SELECT namespace, count(*), sum(length(CAST(content AS BLOB))) FROM memory_files"
-                " WHERE substr(namespace, 1, ?) = ? GROUP BY namespace ORDER BY namespace",
-                (len(_PREFIX), _PREFIX),
-            ).fetchall()
-        finally:
-            connection.close()
         return [
-            MemorySpaceInfo(name=str(namespace)[len(_PREFIX) :], files=int(count), size=int(size or 0))
-            for namespace, count, size in rows
+            MemorySpaceInfo(name=namespace[len(_PREFIX) :], files=count, size=size)
+            for namespace, count, size in memory_totals(self.database, _PREFIX)
         ]

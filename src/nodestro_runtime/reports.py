@@ -38,7 +38,7 @@ from .office import to_docx, to_xlsx
 from .problems import NodestroError
 from .sanitize import Sanitizer
 from .schemas import ReportFormat, ResultFileSpec, Run, new_id, now
-from .storage import Store
+from .storage import DocumentStore
 
 MEDIA_TYPES: dict[str, str] = {
     "md": "text/markdown; charset=utf-8",
@@ -569,7 +569,7 @@ def render(value: Any, fmt: ReportFormat, *, title: str, run: Run, sanitizer: Sa
 class ResultFiles:
     """The result files of runs."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: DocumentStore) -> None:
         self.store = store
 
     def list(self, run_id: str) -> list[ResultFile]:

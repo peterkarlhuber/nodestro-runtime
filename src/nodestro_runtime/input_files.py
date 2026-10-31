@@ -51,7 +51,7 @@ from .file_formats import (
     extract_member,
 )
 from .forms import FileRef
-from .storage import Store
+from .storage import DocumentStore
 
 COLLECTION = "input_files"
 PREFIX = "in_"
@@ -173,7 +173,7 @@ class InputFiles:
 
     def __init__(
         self,
-        store: Store,
+        store: DocumentStore,
         root: Path,
         *,
         ocr: Callable[[], documents.OcrRunner | None] = lambda: None,
@@ -326,15 +326,7 @@ class InputFiles:
     def references(self) -> dict[str, set[str]]:
         """Input file id -> what references it: ``run:<status>``, ``suite``, ``schedule``, ``batch:<status>``."""
         found: dict[str, set[str]] = {}
-        connection = self.store._connection
-        marks = ", ".join("?" for _ in _HOLDERS)
-        with self.store._lock:
-            rows = connection.execute(
-                f"SELECT collection, data FROM nodestro_documents WHERE collection IN ({marks})"
-                " AND data LIKE '%in\\_%' ESCAPE '\\'",
-                _HOLDERS,
-            ).fetchall()
-        for collection, raw in rows:
+        for collection, raw in self.store.search_raw(_HOLDERS, "in_"):
             ids = set(_REFERENCE.findall(raw))
             if not ids:
                 continue
