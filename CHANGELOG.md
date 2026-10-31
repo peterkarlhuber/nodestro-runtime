@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Automatic price updates (PRICING-1, phase N3):
+
+- New `nodestro_runtime.pricing_sync.PricingSyncService`. It asks each price source for a candidate and hands it
+  to `PricingService.submit`, which validates it and activates what may be activated. A failing source changes
+  nothing; the last valid prices stay active and the error is recorded (`PricingState.last_error`).
+- Sources: `OrkexaBuiltinSource` (Orkexa's verified Anthropic prices, no network), `SnapshotFileSource` (a
+  reviewed snapshot file an operator supplies), and `LiteLLMSource` (LiteLLM's community-maintained cost map:
+  OpenAI, Anthropic and Gemini text models with cache rates, long-context tiers and the flex, priority and batch
+  service tiers; quality `unverified`). The official price pages of the providers are HTML pages without a
+  stable machine-readable interface and are not scraped.
+- Downloads are HTTPS only, from allowed hosts, with timeouts, a 32 MB limit and three attempts with
+  exponential backoff. One sync runs at a time per process, and an optional lock covers several processes
+  (the server's worker). `due()` follows the refresh interval (24 hours); `run()` is the background loop: it
+  syncs at start when prices are due and then whenever they become due. Model requests never trigger a download.
+
 Managed model prices (PRICING-1, phases N1, N2 and N4):
 
 - New `nodestro_runtime.pricing.PricingService`, available as `Workspace.pricing`. It holds the workspace's
