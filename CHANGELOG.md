@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+Managed model prices (PRICING-1, phases N1, N2 and N4):
+
+- New `nodestro_runtime.pricing.PricingService`, available as `Workspace.pricing`. It holds the workspace's
+  price catalog: versioned reference snapshots in Orkexa's `orkexa.price-snapshot/1` format (collection
+  `price_snapshots`, one active version, switched atomically, old versions kept), individual prices in their
+  own collection (`price_overrides`), and a history (`price_events`). `resolver()` returns the Orkexa
+  `PriceResolver` with the overrides applied. The resolver is the same instance across changes and is
+  republished, so running requests keep their pinned prices.
+- Without a stored snapshot the catalog starts from Orkexa's built-in prices, so an offline or new installation
+  still prices Claude models. The last activated snapshot survives restarts. Nothing here touches the network.
+- `submit(candidate)` validates prices (provider and model ids, USD only, implausible rates, missing source)
+  and drops invalid ones. It rejects a candidate that is empty, mostly invalid or truncated, and the active
+  prices stay as they are. Rate changes above 20 % without official confirmation (quality `verified` or
+  `contract`) and models that vanish from their source are held back as `pending_review`; everything else is
+  activated. `approve()`/`reject()` decide a review.
+- Every price has a status (`current`, `stale`, `unknown`, `pending_review`, `custom`) and, separately,
+  Orkexa's quality and its source. Freshness defaults: a warning after 48 hours without a successful check and
+  `critical` after seven days (`PricingSettings`).
+- On a server, `WorkspaceStorage.price_reference` hands tenants the server's reference prices read-only; each
+  tenant's overrides and events stay in its own store. Without it, a tenant sees Orkexa's built-in prices.
+- `catalog.models(pricing)` takes prices, status, quality, source and version from the catalog. A model without
+  a price keeps `None` prices and gets the status `unknown`. No schema migration: the new collections use the
+  existing document tables of SQLite and PostgreSQL.
+
 Orkexa pricing engine (PRICING-1, phase N0):
 
 - Orkexa pinned to `76883f700e68f10240f744a4af3ed37f5ec54674` (orkexa PR #13: versioned price snapshots, price

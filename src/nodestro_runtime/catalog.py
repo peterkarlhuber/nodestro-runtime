@@ -3,18 +3,22 @@
 Texts here are English; the frontend shows its own translations by model id and tool key.
 
 The model list is a suggestion, not a limit: every provider accepts any model id
-(``provider:model``). Prices come from Orkexa's pricing table, which knows Anthropic's
-models; models of other providers have no known price, so their cost is shown as
-unknown, never as zero.
+(``provider:model``). Prices come from the workspace's :class:`~nodestro_runtime.pricing.PricingService`
+(reference prices plus overrides); without one, from Orkexa's built-in prices, which know only
+Anthropic's models. A model without a known price has no price fields and the status ``unknown``:
+its cost is shown as unknown, never as zero.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from orkexa import MODEL_PRICING
-from orkexa.pricing import resolve_pricing
+from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from .pricing import PricingService
 
 
 class ModelInfo(BaseModel):
@@ -33,6 +37,12 @@ class ModelInfo(BaseModel):
     cache_write_1h_usd_per_mtok: float | None = None
     cache_read_usd_per_mtok: float | None = None
     recommended: bool = False
+    #: ``current``, ``stale``, ``pending_review``, ``custom`` (an individual price) or ``unknown`` (no price).
+    price_status: str = "unknown"
+    #: Orkexa's quality of the price (``verified``, ``contract``, ``unverified``, ``estimated``).
+    price_quality: str | None = None
+    price_source: str | None = None
+    price_version: str | None = None
 
 
 _MODEL_TEXT: dict[str, tuple[str, str, str]] = {
@@ -67,8 +77,17 @@ _OTHER_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
-def _priced(provider: str, model_id: str, label: str, tier: str, description: str, recommended: bool) -> ModelInfo:
-    prices = resolve_pricing(model_id, provider=provider)
+def _priced(
+    provider: str,
+    model_id: str,
+    label: str,
+    tier: str,
+    description: str,
+    recommended: bool,
+    *,
+    snapshot: PriceSnapshot,
+    pricing: PricingService | None,
+) -> ModelInfo:
     info = ModelInfo(
         id=f"{provider}:{model_id}",
         provider=provider,
@@ -78,26 +97,57 @@ def _priced(provider: str, model_id: str, label: str, tier: str, description: st
         description=description,
         recommended=recommended,
     )
-    if prices is not None:
-        info.input_usd_per_mtok = float(prices.input)
-        info.output_usd_per_mtok = float(prices.output)
-        info.cache_write_5m_usd_per_mtok = float(prices.cache_write_5m)
-        info.cache_write_1h_usd_per_mtok = float(prices.cache_write_1h)
-        info.cache_read_usd_per_mtok = float(prices.cache_read)
+    price = snapshot.get(provider, model_id)
+    if price is None:
+        return info
+    rates = price.rates
+    info.input_usd_per_mtok = float(rates.input)
+    info.output_usd_per_mtok = float(rates.output)
+    if rates.cache_write_5m is not None:
+        info.cache_write_5m_usd_per_mtok = float(rates.cache_write_5m)
+    if rates.cache_write_1h is not None:
+        info.cache_write_1h_usd_per_mtok = float(rates.cache_write_1h)
+    if rates.cache_read is not None:
+        info.cache_read_usd_per_mtok = float(rates.cache_read)
+    info.price_quality = price.quality
+    info.price_source = price.source
+    if pricing is None:
+        info.price_status = "current"
+        info.price_version = snapshot.version
+        return info
+    entry = pricing.entry(provider, model_id)
+    if entry is not None:
+        info.price_status = entry.status
+        info.price_version = entry.version
     return info
 
 
-def models() -> list[ModelInfo]:
-    """The suggested models: Anthropic's (with prices, current generation first), then examples of others."""
+def models(pricing: PricingService | None = None) -> list[ModelInfo]:
+    """The suggested models: Anthropic's (current generation first), then examples of other providers.
+
+    Prices come from ``pricing`` (the workspace's catalog) or, without it, from Orkexa's built-in prices.
+    """
+    snapshot = pricing.effective_snapshot() if pricing is not None else BUILTIN_SNAPSHOT
     ordered = [*_RECOMMENDED, *(m for m in MODEL_PRICING if m not in _RECOMMENDED)]
     result = []
     for model_id in ordered:
         if model_id not in MODEL_PRICING:
             continue
         label, tier, description = _MODEL_TEXT.get(model_id, (model_id, "", ""))
-        result.append(_priced("anthropic", model_id, label, tier, description, model_id in _RECOMMENDED))
+        result.append(
+            _priced(
+                "anthropic",
+                model_id,
+                label,
+                tier,
+                description,
+                model_id in _RECOMMENDED,
+                snapshot=snapshot,
+                pricing=pricing,
+            )
+        )
     for provider, model_id, label, tier, description in _OTHER_MODELS:
-        result.append(_priced(provider, model_id, label, tier, description, True))
+        result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
     return result
 
 
