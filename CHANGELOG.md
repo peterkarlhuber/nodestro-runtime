@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Adaptive Orchestration M1-2 (the engine on the `orkexa.flow` kernel):
+
+- The engine no longer has a scheduler of its own: `RunManager` executes the nodes that the `orkexa.flow` kernel
+  (Orkexa ADR 0009) dispatches and applies what the kernel settles (skipped, blocked, cancelled). New module
+  `nodestro_runtime.flow_driver` maps a workflow to a flow (branching nodes declare their ports; a connection
+  without a valid port of a decision or approval gets the port `~unconnected`, which never opens) and derives the
+  flow state from the run's node states, so stored runs (also paused runs of earlier versions) continue without a
+  migration. The rules of `graph.py` are unchanged; `_settle` and the per-node `asyncio.gather` scheduler are gone.
+- Orkexa pin `456b92f8f0fe83aaaacf2c634b95e354064e315d` (adds `orkexa.flow`).
+- Tests: golden traces of 77 scenarios recorded with the previous scheduler (17 handwritten, 60 random workflows with
+  decisions, approvals, failures, cancellation and sub-workflows; statuses, error codes, outputs, prompts, decisions
+  and the events of every node in order) pass unchanged; every finished trace is a fixed point of the kernel; an
+  architecture test keeps the engine free of its own scheduling.
+
 Nodestro Local Docker (the `local-container` profile and the sandbox gateway):
 
 - New operating profile `local-container` (`NODESTRO_PROFILE=local-container`, also `local_container`): one person
