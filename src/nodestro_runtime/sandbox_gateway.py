@@ -70,6 +70,8 @@ logger = logging.getLogger("nodestro.sandbox_gateway")
 LABEL = "dev.nodestro.sandbox"
 #: The images a client may use, inspect, build and remove (see container_images.IMAGE_REPOSITORY).
 IMAGE = re.compile(r"^nodestro-env:[0-9a-f]{32}$")
+_IMAGE_REPOSITORY = "nodestro-env"
+_LOCK_LABEL = "org.nodestro.lock-sha256"  # container_images.LOCK_LABEL
 #: Container names a client may choose (orkexa/nodestro sandboxes use these prefixes).
 NAME = re.compile(r"^(?:nodestro|orkexa)-sandbox-[0-9a-z-]{1,64}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -110,15 +112,27 @@ class GatewayConfig:
     max_lifetime: float = 600.0
     #: The network of image builds (``default``; ``host`` only where the default network cannot reach the index).
     build_network: str = "default"
-    #: Concurrent image builds.
+    #: Concurrent image builds; a further build is refused (429), not queued.
     max_builds: int = 1
+    #: Environment images (``nodestro-env:*``) kept on the daemon, and their total size; a build beyond either is
+    #: refused (507) until images are removed (``docker image prune --filter label=org.nodestro.lock-sha256``).
+    max_images: int = 32
+    max_images_gb: float = 20.0
+    #: Client connections at once; more are refused (503).
+    max_connections: int = 32
+    #: Seconds a client may take to send a request head, and its body.
+    head_timeout: float = 10.0
+    body_timeout: float = 120.0
+    #: Entries of a build context (Nodestro's own context has a few dozen).
+    max_context_files: int = 2000
     #: Python versions (``major.minor``) whose ``python:<v>-slim`` base images may be built on.
     python_versions: tuple[str, ...] = field(default_factory=lambda: (f"{sys.version_info[0]}.{sys.version_info[1]}",))
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> GatewayConfig:
         """Limits from ``NODESTRO_SANDBOX_INSTANCE``, ``_MAX_CONTAINERS``, ``_MAX_MEMORY_MB``, ``_MAX_CPUS``,
-        ``_MAX_PIDS``, ``_MAX_LIFETIME`` and ``_BUILD_NETWORK``; a value that is not understood stops the gateway."""
+        ``_MAX_PIDS``, ``_MAX_LIFETIME``, ``_MAX_IMAGES``, ``_MAX_IMAGES_GB``, ``_MAX_CONNECTIONS`` and
+        ``_BUILD_NETWORK``; a value that is not understood stops the gateway."""
         environ = os.environ if environ is None else environ
         values: dict[str, Any] = {}
         numbers = {
@@ -127,6 +141,9 @@ class GatewayConfig:
             "max_cpus": float,
             "max_pids": int,
             "max_lifetime": float,
+            "max_images": int,
+            "max_images_gb": float,
+            "max_connections": int,
         }
         for name, kind in numbers.items():
             raw = environ.get(f"NODESTRO_SANDBOX_{name.upper()}", "").strip()
@@ -374,12 +391,37 @@ def _orkexa_files() -> dict[str, bytes]:
     return {str(PurePosixPath("orkexa", *path.relative_to(root).parts)): path.read_bytes() for path in _orkexa_files()}
 
 
+_PEM_BLOCK = re.compile(rb"-----BEGIN ([A-Z0-9 ]+)-----\r?\n([A-Za-z0-9+/=\r\n]+?)-----END \1-----")
+
+
+def check_ca_bundle(data: bytes) -> None:
+    """Refuse a ``ca.pem`` that is anything but one or more X.509 certificates in PEM (400)."""
+    import ssl
+
+    if len(data) > 1024 * 1024:
+        raise Refused("ca.pem is too large", 413)
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused("ca.pem must be ASCII PEM text", 400) from None
+    blocks = list(_PEM_BLOCK.finditer(data))
+    # Between certificates only blank lines and comments (``# Issuer: ...``, as in common bundles) are allowed.
+    rest = [line for line in _PEM_BLOCK.sub(b"", data).splitlines() if line.strip() and not line.startswith(b"#")]
+    if not blocks or rest or any(block.group(1) != b"CERTIFICATE" for block in blocks):
+        raise Refused("ca.pem must contain only PEM certificates", 400)
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cadata=text)
+    except (ssl.SSLError, ValueError) as exc:
+        raise Refused(f"ca.pem holds a certificate that cannot be read: {exc}", 400) from None
+
+
 def plan_build(query: dict[str, str], context: bytes, config: GatewayConfig) -> dict[str, str]:
     """The query of an image build the gateway forwards; ``context`` is the build's tar archive.
 
     Raises :class:`Refused` unless the context is exactly what :class:`ContainerImages.build
     <nodestro_runtime.container_images.ContainerImages.build>` writes for a hashed lock and its tag."""
-    from .container_images import _DOCKERFILE, LOCK_LABEL, ContainerImages
+    from .container_images import _DOCKERFILE, BASE_IMAGES, LOCK_LABEL, ContainerImages
 
     ignored = {"rm", "forcerm", "q", "nocache", "pull", "dockerfile", "version", "networkmode", "buildargs"}
     harmless_defaults = {
@@ -428,9 +470,17 @@ def plan_build(query: dict[str, str], context: bytes, config: GatewayConfig) -> 
         raise Refused("Build arguments must be single-line text")
 
     files: dict[str, bytes] = {}
+    unpacked = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(context), mode="r:*") as archive:
-            for member in archive:
+        # Uncompressed only (the docker CLI does not compress a context): a compressed archive could unpack to far more
+        # than the request limit. Members and their total size are counted before anything is read.
+        with tarfile.open(fileobj=io.BytesIO(context), mode="r:") as archive:
+            for count, member in enumerate(archive, start=1):
+                if count > config.max_context_files:
+                    raise Refused(f"The build context has more than {config.max_context_files} entries", 413)
+                unpacked += max(member.size, 0)
+                if unpacked > len(context):
+                    raise Refused("The build context unpacks to more than its own size", 413)
                 name = str(PurePosixPath(member.name.lstrip("./") if member.name != "." else "."))
                 if member.isdir():
                     continue
@@ -449,13 +499,15 @@ def plan_build(query: dict[str, str], context: bytes, config: GatewayConfig) -> 
         raise Refused("The build context needs a Dockerfile and requirements.txt")
     lock_text = lock.decode("utf-8", "replace")
     check_lock(lock_text)
-    if ca is not None and not ca.lstrip().startswith(b"-----BEGIN CERTIFICATE-----"):
-        raise Refused("ca.pem must be a PEM certificate bundle")
+    if ca is not None:
+        check_ca_bundle(ca)
     if files != _orkexa_files():
         raise Refused("The build context must contain exactly the Orkexa package the gateway runs")
     tag = query.get("t", "")
     for version in config.python_versions:
-        base = f"python:{version}-slim"
+        base = BASE_IMAGES.get(version)
+        if base is None:
+            raise Refused(f"No pinned base image for Python {version}; the gateway builds only on pinned ones")
         expected = _DOCKERFILE.format(
             base=base,
             label=LOCK_LABEL,
@@ -702,6 +754,7 @@ class Gateway:
         self._builds = asyncio.Semaphore(config.max_builds)
         self._creating = asyncio.Lock()
         self._limits_enforced = False
+        self._connections = 0
 
     # -- daemon access --
 
@@ -735,6 +788,15 @@ class Gateway:
             return
         status, info = await self.call("GET", "/info")
         missing = [name for name in _LIMIT_FEATURES if not (isinstance(info, dict) and info.get(name) is True)]
+        options = info.get("SecurityOptions") if isinstance(info, dict) else None
+        seccomp = [str(item) for item in options or [] if str(item).startswith("name=seccomp")]
+        if status == 200 and not missing and (not seccomp or any("profile=unconfined" in item for item in seccomp)):
+            # A daemon-wide unconfined (or missing) seccomp profile would weaken every sandbox container.
+            raise Refused(
+                "The Docker daemon runs containers without its seccomp profile, so no tool code is run "
+                "(remove seccomp-profile=unconfined from the daemon configuration)",
+                503,
+            )
         if status != 200 or missing:
             raise Refused(
                 "The Docker daemon cannot enforce the sandbox's resource limits "
@@ -743,6 +805,25 @@ class Gateway:
                 503,
             )
         self._limits_enforced = True
+
+    async def require_image_space(self, *, tag: str) -> None:
+        """Refuse a build (507) when the environment images already reach :attr:`GatewayConfig.max_images` or
+        :attr:`GatewayConfig.max_images_gb`; rebuilding an existing tag is always allowed."""
+        filters = quote(json.dumps({"reference": [f"{_IMAGE_REPOSITORY}:*"]}))
+        status, listed = await self.call("GET", f"/images/json?filters={filters}")
+        if status != 200 or not isinstance(listed, list):
+            raise Refused(f"The environment images cannot be counted (HTTP {status})", 503)
+        tags = {str(name) for item in listed if isinstance(item, dict) for name in item.get("RepoTags") or []}
+        if tag in tags:
+            return
+        size = sum(int(item.get("Size") or 0) for item in listed if isinstance(item, dict))
+        if len(listed) >= self.config.max_images or size >= self.config.max_images_gb * 1024**3:
+            raise Refused(
+                f"There are already {len(listed)} environment images ({size / 1024**3:.1f} GB; limits: "
+                f"{self.config.max_images} images, {self.config.max_images_gb:g} GB). Remove unused ones: "
+                f"docker image prune -a --filter label={_LOCK_LABEL}",
+                507,
+            )
 
     # -- bookkeeping --
 
@@ -791,6 +872,13 @@ class Gateway:
     # -- requests --
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._connections >= self.config.max_connections:
+            with contextlib.suppress(ConnectionError, OSError):
+                writer.write(refusal(503, f"At most {self.config.max_connections} connections at once"))
+                await writer.drain()
+                writer.close()
+            return
+        self._connections += 1
         try:
             await self._handle(reader, writer)
         except Refused as refused:
@@ -805,17 +893,29 @@ class Gateway:
             with contextlib.suppress(ConnectionError, OSError):
                 writer.write(refusal(400, "unexpected error"))
         finally:
+            self._connections -= 1
             with contextlib.suppress(ConnectionError, OSError):
                 writer.close()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         # The route is decided on the head; the body limit depends on it (an image build sends its context).
-        request = await read_head(reader)
+        try:
+            request = await asyncio.wait_for(read_head(reader), timeout=self.config.head_timeout)
+        except asyncio.TimeoutError:
+            raise Refused("The request head took too long", 408) from None
         if request is None:
             return
         kind, ref = route(request.method, request.path)
         bare, prefix = _split(request.path)
-        await read_body(reader, request, limit=_BUILD_LIMIT if kind == "build" else _JSON_LIMIT)
+        if kind == "build" and self._builds.locked():
+            raise Refused("Another image build is running; try again when it is done", 429)
+        try:
+            await asyncio.wait_for(
+                read_body(reader, request, limit=_BUILD_LIMIT if kind == "build" else _JSON_LIMIT),
+                timeout=self.config.body_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise Refused("The request body took too long", 408) from None
         # Every target sent to the daemon is rebuilt from what was checked, never passed through as written.
         target, body = f"{prefix}{bare}", request.body
         if request.header("x-registry-auth") or (request.header("x-registry-config") not in ("", "e30=", "null")):
@@ -844,7 +944,10 @@ class Gateway:
             request.headers = [(key, value) for key, value in request.headers if key.lower() != "content-type"]
             request.headers.append(("Content-Type", "application/x-tar"))
             await self.require_limits()
+            if self._builds.locked():
+                raise Refused("Another image build is running; try again when it is done", 429)
             async with self._builds:
+                await self.require_image_space(tag=query["t"])
                 await self._forward(request, target, body, reader, writer)
             return
         if kind.startswith("container:"):

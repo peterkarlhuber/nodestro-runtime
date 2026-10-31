@@ -20,6 +20,35 @@ MCP OAuth 2.1 (ADR-0007, work package WP-6):
   `mcp.oauth_registration_unsupported`, `mcp.oauth_token_input`, `mcp.oauth_reauthorize`; new events
   `oauth_started`, `oauth_failed`.
 
+Sandbox gateway hardening (Nodestro Local Docker, internal cross-check K1, K2, K4, D2, D4):
+
+- **Image limits (K1).** A build is refused with 507 once the daemon holds `NODESTRO_SANDBOX_MAX_IMAGES` (32)
+  environment images or `NODESTRO_SANDBOX_MAX_IMAGES_GB` (20) of them. Rebuilding an existing tag is still allowed.
+- **Connections and queues (K2).**
+  - At most `NODESTRO_SANDBOX_MAX_CONNECTIONS` (32) client connections; more are refused with 503.
+  - A request head must arrive within 10 s and a body within 120 s (408).
+  - A second image build is refused with 429 on its head, before its body is read, instead of waiting in memory.
+- **Build contexts.** Only uncompressed tar archives are accepted, with at most 2000 entries, and they may not unpack
+  to more than their own size.
+- **Daemon security (D2).** Besides the resource limits (#37), the gateway requires the daemon's seccomp profile.
+  `SecurityOptions` without seccomp, or with `profile=unconfined`, means no sandbox container is created (503).
+- **Certificates (D4).** `ca.pem` in a build context must consist of X.509 certificates in PEM (comments allowed),
+  each of which `ssl` can load. Before, only its first line was checked.
+- **Base images (K4).** Environment images build on `python:<v>-slim` pinned by the digest of its multi-platform index
+  (`container_images.BASE_IMAGES`, Python 3.10 to 3.14). The gateway builds only on pinned bases. Existing
+  environment images get a new tag once and are rebuilt.
+
+Adaptive Orchestration M2 (time and parallel limits):
+
+- New `Workflow.limits` (`WorkflowLimits`): `max_parallel` (1 to 32 nodes of a run executing at the same time;
+  further ready nodes wait for a free slot) and `max_duration_s` (the longest active execution time of a run, at
+  most 7 days). Both default to `None` (no limit, as before) and are enforced by the `orkexa.flow` kernel.
+- The kernel's clock is the run's active time, stored as `Run.active_seconds`: waiting for an approval does not
+  count. When the time limit is reached, the kernel stops the flow, running nodes are cancelled and the run fails
+  with `run.time_limit` (`max_duration_s`). Known limitation: a model request or tool call that is already running
+  finishes first (agents and tools stop at their next cancellation check), so the run can end later than the limit
+  by the length of that call.
+
 Adaptive Orchestration M2 (budget reservations, AO-12):
 
 - **Behavior change: requests reserve their most expensive outcome before they are sent** (Orkexa

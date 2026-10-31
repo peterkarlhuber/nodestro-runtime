@@ -53,7 +53,8 @@ def flow_of(workflow: Workflow) -> flow.Flow:
             else None
         )
         edges.append(flow.Edge(id=ident, source=edge.source, target=edge.target, port=port, loop=loop))
-    return flow.Flow(nodes=tuple(nodes), edges=tuple(edges))
+    limits = flow.Limits(max_parallel=workflow.limits.max_parallel, max_duration_s=workflow.limits.max_duration_s)
+    return flow.Flow(nodes=tuple(nodes), edges=tuple(edges), limits=limits)
 
 
 def _invocation(node: Node, state: NodeRun) -> flow.Invocation | None:
@@ -82,7 +83,11 @@ def state_of(workflow: Workflow, states: dict[str, NodeRun], stored: dict[str, A
     continued run never reuses a node inside a loop (:mod:`nodestro_runtime.resume`).
     """
     if stored is not None:
-        return flow.FlowState.model_validate(stored)
+        found_state = flow.FlowState.model_validate(stored)
+        # The driver's clock is the run's active time (``Run.active_seconds``); it starts at 0.
+        if found_state.started_at is None:
+            found_state = found_state.model_copy(update={"started_at": 0.0})
+        return found_state
     looped = set().union(*loop_bodies(workflow).values()) if workflow.edges else set()
     found = []
     for node in workflow.nodes:
@@ -92,7 +97,7 @@ def state_of(workflow: Workflow, states: dict[str, NodeRun], stored: dict[str, A
         item = _invocation(node, state) if state is not None else None
         if item is not None:
             found.append(item)
-    return flow.FlowState(invocations=tuple(found), dispatched=len(found))
+    return flow.FlowState(invocations=tuple(found), dispatched=len(found), started_at=0.0)
 
 
 def result_of(node: Node, state: NodeRun) -> flow.Result:

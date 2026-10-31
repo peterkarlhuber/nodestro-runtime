@@ -12,10 +12,12 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
 import contextlib
 import copy
+import gzip
 import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,7 @@ import tarfile
 import tempfile
 import time
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 
@@ -35,6 +38,40 @@ CONFIG = GatewayConfig(instance="test")
 HASH = "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
 LOCK = f"six==1.17.0 \\\n    --hash=sha256:{HASH}\n    # via -r requirements.in\n"
 PYTHON = f"{sys.version_info[0]}.{sys.version_info[1]}"
+#: A real, public root certificate (Let's Encrypt), for build contexts with a CA bundle.
+ISRG_ROOT_X1 = """\
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+"""
 
 #: What ``docker run --rm -i --network none --read-only --cap-drop ALL ...`` (StreamedSandbox) sends, docker 29.
 CLI_CREATE: dict[str, Any] = {
@@ -291,7 +328,7 @@ def _context(lock: str = LOCK, *, ca: bool = False) -> tuple[str, bytes]:
         return subprocess.CompletedProcess(args, 1, "", "No such image")
 
     with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as handle:
-        handle.write("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+        handle.write(ISRG_ROOT_X1)
     environ = {"PATH": os.environ.get("PATH", ""), **({"NODESTRO_BUILD_CA_FILE": handle.name} if ca else {})}
     images = ContainerImages(environ=environ, run=run, docker=sys.executable)
     images.build(lock, PYTHON)
@@ -431,8 +468,11 @@ class FakeDaemon:
         self.requests: list[tuple[str, str, bytes]] = []
         self.containers: dict[str, dict[str, Any]] = {}
         self.created = 0
-        #: What ``/info`` reports about the daemon's resource limits.
+        #: What ``/info`` reports about the daemon's resource limits and security options.
         self.limits = True
+        self.security_options = ["name=seccomp,profile=builtin", "name=cgroupns"]
+        #: What ``/images/json`` lists (the environment images on the daemon).
+        self.images: list[dict[str, Any]] = []
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -454,7 +494,9 @@ class FakeDaemon:
             writer.write(f"Content-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.endswith("/info"):
             features = ("MemoryLimit", "PidsLimit", "CpuCfsQuota", "CpuCfsPeriod")
-            answer = json.dumps({name: self.limits for name in features}).encode()
+            info: dict[str, Any] = {name: self.limits for name in features}
+            info["SecurityOptions"] = self.security_options
+            answer = json.dumps(info).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.endswith("/attach"):
             writer.write(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
@@ -462,6 +504,9 @@ class FakeDaemon:
             writer.write(data.upper())
             await writer.drain()
             writer.write_eof()
+        elif path.endswith("/images/json"):
+            answer = json.dumps(self.images).encode()
+            writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.startswith("/containers/json") or path.endswith("/containers/json"):
             answer = json.dumps(list(self.containers.values())).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
@@ -829,3 +874,132 @@ def test_raw_requests_cannot_smuggle_past_the_gateway(real_gateway: dict[str, st
         answer = _raw(listen, attempt)
         assert answer.startswith((b"HTTP/1.1 400", b"HTTP/1.1 403")), (attempt, answer[:200])
         assert b"[{" not in answer and b"[]" not in answer, (attempt, answer[:400])
+
+
+# ---- resource limits of the gateway itself and daemon checks (K1, K2, D2, D4, K4) -----------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _gateway_with(tmp_path: Path, **limits: Any) -> AsyncIterator[tuple[FakeDaemon, str, Gateway]]:
+    daemon = FakeDaemon()
+    daemon_socket = str(tmp_path / "daemon.sock")
+    server = await asyncio.start_unix_server(daemon.handle, path=daemon_socket)
+    instance = Gateway(GatewayConfig(docker=daemon_socket, instance="test", **limits))
+    listen = str(tmp_path / "gateway.sock")
+    front = await asyncio.start_unix_server(instance.handle, path=listen)
+    async with server, front:
+        yield daemon, listen, instance
+
+
+async def test_a_slow_request_head_is_cut_off(tmp_path: Path) -> None:
+    async with _gateway_with(tmp_path, head_timeout=0.2) as (daemon, listen, _):
+        reader, writer = await asyncio.open_unix_connection(listen)
+        writer.write(b"GET /_ping HTTP/1.1\r\n")  # never finished
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+    assert answer.startswith(b"HTTP/1.1 408") and daemon.requests == []
+
+
+async def test_connections_beyond_the_limit_are_refused(tmp_path: Path) -> None:
+    async with _gateway_with(tmp_path, max_connections=1, head_timeout=5) as (_, listen, instance):
+        _, idle = await asyncio.open_unix_connection(listen)  # holds the only slot
+        for _ in range(50):
+            if instance._connections == 1:
+                break
+            await asyncio.sleep(0.01)
+        answer = await _send(listen, b"")  # refused on connect, before anything is read
+        idle.close()
+        assert answer.startswith(b"HTTP/1.1 503") and b"connections" in answer
+        for _ in range(100):
+            if instance._connections == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert (await _send(listen, b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n")).startswith(b"HTTP/1.1 200")
+
+
+async def test_a_second_build_is_refused_not_queued(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, instance = gateway
+    async with instance._builds:  # a build is running
+        head = b"POST /build?t=x HTTP/1.1\r\nHost: d\r\nContent-Length: 50000000\r\n\r\n"
+        answer = await _send(listen, head)  # refused on the head: the 50 MB body is never read
+    assert answer.startswith(b"HTTP/1.1 429") and daemon.requests == []
+
+
+async def test_builds_stop_at_the_image_limits(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, _, instance = gateway
+    instance.config = GatewayConfig(docker=instance.config.docker, max_images=2, max_images_gb=1.0)
+    small = [{"RepoTags": [f"nodestro-env:{n:032x}"], "Size": 100} for n in range(2)]
+    daemon.images = small
+    with pytest.raises(Refused) as refused:
+        await instance.require_image_space(tag="nodestro-env:" + "f" * 32)
+    assert refused.value.status == 507 and "image prune" in str(refused.value)
+    await instance.require_image_space(tag=f"nodestro-env:{0:032x}")  # rebuilding an existing image is fine
+    daemon.images = [{"RepoTags": ["nodestro-env:" + "a" * 32], "Size": 2 * 1024**3}]
+    with pytest.raises(Refused):
+        await instance.require_image_space(tag="nodestro-env:" + "f" * 32)
+    daemon.images = small[:1]
+    await instance.require_image_space(tag="nodestro-env:" + "f" * 32)
+    assert any('"reference"' in unquote(target) for _, target, _ in daemon.requests)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [["name=seccomp,profile=unconfined"], [], ["name=apparmor"]],
+)
+async def test_nothing_starts_without_the_daemon_s_seccomp_profile(
+    gateway: tuple[FakeDaemon, str, Gateway], options: list[str]
+) -> None:
+    daemon, listen, instance = gateway
+    daemon.security_options = options
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and b"seccomp" in answer
+    assert daemon.created == 0 and instance.containers == {}
+
+
+def test_compressed_or_oversized_build_contexts_are_refused() -> None:
+    tag, tar = _context()
+    with pytest.raises(Refused) as refused:
+        plan_build({"t": tag}, gzip.compress(tar), CONFIG)
+    assert "tar" in str(refused.value)
+    with pytest.raises(Refused) as refused:
+        plan_build({"t": tag}, tar, GatewayConfig(max_context_files=1))
+    assert refused.value.status == 413
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+        b"",
+        ISRG_ROOT_X1.encode() + b"RUN echo injected\n",
+        ISRG_ROOT_X1.encode().replace(b"CERTIFICATE-----\n", b"CERTIFICATE-----\n!!", 1),
+        "ä".encode() + ISRG_ROOT_X1.encode(),
+    ],
+)
+def test_only_real_certificates_pass_as_a_ca_bundle(bundle: bytes) -> None:
+    with pytest.raises(Refused):
+        gw.check_ca_bundle(bundle)
+
+
+def test_a_commented_certificate_bundle_is_accepted() -> None:
+    gw.check_ca_bundle(b"# Issuer: ISRG Root X1\n" + ISRG_ROOT_X1.encode() + b"\n# second\n" + ISRG_ROOT_X1.encode())
+
+
+def test_environment_images_build_on_digest_pinned_bases() -> None:
+    from nodestro_runtime.container_images import BASE_IMAGES, ContainerImages, default_base
+
+    assert BASE_IMAGES and all(
+        re.fullmatch(rf"python:{re.escape(version)}-slim@sha256:[0-9a-f]{{64}}", base)
+        for version, base in BASE_IMAGES.items()
+    )
+    assert ContainerImages().base(PYTHON) == BASE_IMAGES[PYTHON] == default_base(PYTHON)
+    _, tar = _context()
+    with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+        member = archive.extractfile("Dockerfile")
+        assert member is not None
+        dockerfile = member.read().decode()
+    assert dockerfile.count(f"FROM {BASE_IMAGES[PYTHON]}") == 2
+    with pytest.raises(Refused, match="pinned base"):
+        plan_build({"t": "nodestro-env:" + "0" * 32}, tar, GatewayConfig(python_versions=("3.9",)))

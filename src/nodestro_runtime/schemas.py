@@ -371,6 +371,22 @@ class Edge(_Model):
     loop: EdgeLoop | None = None
 
 
+#: Most branches of one run that may execute at the same time when a workflow sets a limit.
+MAX_PARALLEL_LIMIT = 32
+#: Longest wall time a workflow may allow for its own execution (7 days, in seconds).
+MAX_DURATION_LIMIT_S = 7 * 24 * 3600
+
+
+class WorkflowLimits(_Model):
+    """Execution limits of a workflow's runs (Adaptive Orchestration M2); ``None``: no limit of this kind."""
+
+    #: Most nodes of a run executing at the same time; further ready nodes wait for a free slot.
+    max_parallel: int | None = Field(default=None, ge=1, le=MAX_PARALLEL_LIMIT)
+    #: Longest active execution time of a run in seconds; waiting for approvals does not count. When it is
+    #: reached, running nodes are cancelled and the run fails with ``run.time_limit``.
+    max_duration_s: float | None = Field(default=None, gt=0, le=MAX_DURATION_LIMIT_S)
+
+
 class WorkflowIn(_Model):
     #: The default name is part of the published API schema (OpenAPI) and of stored workflows; it stays German.
     name: str = "Neuer Workflow"
@@ -378,6 +394,7 @@ class WorkflowIn(_Model):
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     budget_usd: float | None = Field(default=None, ge=0)
+    limits: WorkflowLimits = Field(default_factory=WorkflowLimits)
 
 
 class Workflow(WorkflowIn):
@@ -624,6 +641,9 @@ class Run(_Model):
     usage: Usage = Field(default_factory=Usage)
     #: The budget the run started with in USD (``None``: no limit, or a run of an earlier version).
     budget_usd: float | None = None
+    #: Active execution time so far in seconds (time spent waiting for approvals not included); the clock of
+    #: the workflow's ``limits.max_duration_s``.
+    active_seconds: float = 0.0
     #: Whether the budget was a hard maximum: every request reserved its most expensive outcome in advance and
     #: none was uncapped or unpriced. ``None`` without a budget.
     budget_hard_maximum: bool | None = None
