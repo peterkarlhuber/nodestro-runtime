@@ -310,6 +310,28 @@ async def test_another_process_cancels_a_run_a_worker_executes(
     assert [item.status for item in queue.jobs("alpha", RUN_JOB, started.id)] == ["cancelled"]
 
 
+async def test_other_processes_see_a_run_running_while_a_worker_executes_it(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
+) -> None:
+    release, started_call = threading.Event(), threading.Event()
+    api_db, worker_db = connect(), connect()
+    api = processes(api_db)
+    worker = processes(worker_db, {"WRITE": [blocking(release, started_call)]})
+    queue = JobQueue(api_db)
+    started = await api_start(api, queue, "alpha", simple_flow())
+    runner = RunWorker(JobQueue(worker_db), worker, name="w1", heartbeat=0.05, flush=0.02)
+    try:
+        executing = asyncio.ensure_future(runner.run_once())
+        await asyncio.to_thread(started_call.wait, 10)
+        seen = api("alpha").runs.get(started.id)  # read from the database, like an API process
+        assert seen is not None and seen.status == "running" and seen.started_at is not None
+    finally:
+        release.set()
+    await asyncio.wait_for(executing, 20)
+    done = api("alpha").runs.get(started.id)
+    assert done is not None and done.status == "succeeded"
+
+
 async def test_cancelling_a_queued_run_withdraws_its_job(
     connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
 ) -> None:

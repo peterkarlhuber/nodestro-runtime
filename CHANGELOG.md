@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Runs executed by a worker (M5/M6 PR-12, found by the server's end-to-end tests):
+
+- A run is stored as `running` when its execution starts, so other processes (the API of a server) no longer show
+  it as `queued` until it ends.
+
 Model endpoints on a server (M5/M6 PR-12):
 
 - `WorkspaceStorage.endpoints` / `tenant_storage(..., endpoints=...)`: a tenant's endpoint providers (`compatible`,
