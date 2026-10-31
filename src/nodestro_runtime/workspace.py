@@ -100,10 +100,11 @@ from .server_settings import SecretBox, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_approvals import ToolApprovals, ToolGate, approvals_enabled
 from .tool_drafts import ToolDrafts
+from .tool_legacy import LegacyReport, keep_only_inherited, stamp_workflow
 from .tool_library import ToolLibrary, make_sandbox
 from .tool_provenance import StoredProvenance
 from .usage_log import UsageLog
-from .versions import WorkflowVersions
+from .versions import WorkflowVersion, WorkflowVersions
 
 #: The database file inside the data directory (unchanged since Nodestro 0.1).
 DATABASE = "nodestro.db"
@@ -618,9 +619,45 @@ class Workspace:
         # saved workflow without its version.
         with self.store.transaction():
             previous = self.store.get("workflows", saved.id, Workflow)
+            # Legacy exemptions (S-2, D10b) come only from the activation step, never from a save, copy or import.
+            saved = keep_only_inherited(saved, previous)
             self.store.put("workflows", saved.id, saved)
             self.versions.record(saved, previous=previous)
         return saved
+
+    def stamp_legacy_tool_bindings(self) -> LegacyReport:
+        """The activation step of per-call tool approvals (S-2, D10b): every existing tool binding of every stored
+        workflow and workflow version becomes a visible legacy exemption, bound to the tool's current version.
+
+        Idempotent (bindings that have an entry are left alone). Stored as ``tool_approvals_activation/legacy``.
+        Runs only when an administrator activates approvals; nothing calls it on its own."""
+
+        def version_of(name: str) -> int | None:
+            try:
+                return self.tools.get(name).version
+            except KeyError:
+                return None
+
+        report = LegacyReport()
+        with self.store.transaction():
+            for key, stored in self.store.items("workflows", Workflow):
+                stamped, found = stamp_workflow(stored, version_of)
+                if found:
+                    self.store.put_raw("workflows", key, stamped.model_dump(mode="json"))
+                    report.workflows += 1
+                    report.bindings.extend(item.model_copy(update={"workflow_id": key}) for item in found)
+            for key, version in self.store.items("workflow_versions", WorkflowVersion):
+                snapshot, found = stamp_workflow(version.snapshot, version_of)
+                if found:
+                    updated = version.model_copy(update={"snapshot": snapshot})
+                    self.store.put_raw("workflow_versions", key, updated.model_dump(mode="json"))
+                    report.versions += 1
+                    report.bindings.extend(
+                        item.model_copy(update={"workflow_id": version.workflow_id, "workflow_version": version.number})
+                        for item in found
+                    )
+            self.store.put_raw("tool_approvals_activation", "legacy", report.model_dump(mode="json"))
+        return report
 
     def resolve_workflow(self, workflow_id: str, version: int | None) -> tuple[Workflow, int | None]:
         """A saved workflow in one of its versions (``None``: the latest), with the version's number.

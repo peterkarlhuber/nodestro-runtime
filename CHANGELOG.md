@@ -91,6 +91,12 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   waits for its held runs when stopped.
 - A question that an interruption expired (the reaper after a lost lease, a restart) stops the waiting execution
   instead of letting it go on (`ToolApprovalRequest.closed_because`, `run.interrupted`).
+- Legacy exemptions (D10b), `nodestro_runtime.tool_legacy`: `Workspace.stamp_legacy_tool_bindings()` is the
+  activation step (an administrator runs it; nothing calls it on its own). It writes every existing tool binding of
+  every stored workflow and workflow version as `ask: "never"`, `legacy: true`, bound to the tool's current version,
+  stores the report (`tool_approvals_activation/legacy`), and is idempotent. `save_workflow` drops legacy entries the
+  stored workflow did not already have for the same node, tool and version, so saving, copying, importing or an API
+  client never creates one; a new tool version ends an exemption at the next call.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
