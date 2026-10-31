@@ -11,9 +11,11 @@ versions continue without a migration.
 
 from __future__ import annotations
 
+from typing import Any
+
 from orkexa import flow
 
-from .graph import BRANCHING, opened_ports, ports
+from .graph import BRANCHING, loop_bodies, opened_ports, ports
 from .schemas import Node, NodeRun, Workflow
 
 __all__ = ["UNCONNECTED", "flow_of", "result_of", "state_of"]
@@ -45,7 +47,12 @@ def flow_of(workflow: Workflow) -> flow.Flow:
             port = edge.source_handle if edge.source_handle in ports(source) else UNCONNECTED
         ident = edge.id if edge.id and edge.id not in seen else f"{edge.id}#{index}"
         seen.add(ident)
-        edges.append(flow.Edge(id=ident, source=edge.source, target=edge.target, port=port))
+        loop = (
+            flow.Loop(max_iterations=edge.loop.max_iterations, on_exhausted=edge.loop.on_exhausted)
+            if edge.loop is not None
+            else None
+        )
+        edges.append(flow.Edge(id=ident, source=edge.source, target=edge.target, port=port, loop=loop))
     return flow.Flow(nodes=tuple(nodes), edges=tuple(edges))
 
 
@@ -67,10 +74,20 @@ def _invocation(node: Node, state: NodeRun) -> flow.Invocation | None:
     return None
 
 
-def state_of(workflow: Workflow, states: dict[str, NodeRun]) -> flow.FlowState:
-    """The flow state of a run, derived from its node states."""
+def state_of(workflow: Workflow, states: dict[str, NodeRun], stored: dict[str, Any] | None = None) -> flow.FlowState:
+    """The flow state of a run: the stored one, else derived from its node states.
+
+    Runs of earlier versions (and continued runs, whose reused nodes are preset) have no stored
+    state. Deriving is exact outside loops; inside loops the stored state is needed, and a
+    continued run never reuses a node inside a loop (:mod:`nodestro_runtime.resume`).
+    """
+    if stored is not None:
+        return flow.FlowState.model_validate(stored)
+    looped = set().union(*loop_bodies(workflow).values()) if workflow.edges else set()
     found = []
     for node in workflow.nodes:
+        if node.id in looped:
+            continue  # without a stored state, a node inside a loop runs again
         state = states.get(node.id)
         item = _invocation(node, state) if state is not None else None
         if item is not None:

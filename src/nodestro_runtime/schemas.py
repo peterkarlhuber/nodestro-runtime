@@ -339,6 +339,23 @@ class Node(_Model):
     output: OutputNodeConfig | None = None
 
 
+#: The most iterations a loop may allow (the first run included).
+MAX_LOOP_ITERATIONS = 20
+
+
+class EdgeLoop(_Model):
+    """Makes a connection a loop: following it runs the nodes from its target to its source again.
+
+    A loop leaves a decision or approval node through one of its branches and leads back to a node
+    before it. ``max_iterations`` is mandatory and counts the first run; ``on_exhausted`` says what
+    happens when the branch is taken once more: ``fail`` ends the run as failed
+    (``run.loop_exhausted``), ``continue`` ignores the loop, so the node's other open branches decide.
+    """
+
+    max_iterations: int = Field(ge=2, le=MAX_LOOP_ITERATIONS)
+    on_exhausted: Literal["fail", "continue"] = "fail"
+
+
 class Edge(_Model):
     id: str = Field(default_factory=lambda: new_id("edge"))
     source: str
@@ -346,6 +363,8 @@ class Edge(_Model):
     #: The output port of a branching source: a rule id or ``default`` of a decision node,
     #: ``approved`` or ``rejected`` of an approval node; ``None`` for the single output of other nodes.
     source_handle: str | None = None
+    #: Set for a loop connection (see :class:`EdgeLoop`); ``None`` for an ordinary one.
+    loop: EdgeLoop | None = None
 
 
 class WorkflowIn(_Model):
@@ -527,6 +546,11 @@ class NodeRun(_Model):
     files: list[ProvidedFile] = Field(default_factory=list)
     #: Agents: content proposed for knowledge (nothing is stored without a person's confirmation).
     proposals: list[KnowledgeProposal] = Field(default_factory=list)
+    #: Inside loops: the iteration of every loop around the node, outermost first, counted from 0
+    #: (empty outside loops). The state above is the node's latest execution.
+    iteration: list[int] = Field(default_factory=list)
+    #: Inside loops: the node's earlier executions, oldest first (each without its own ``earlier``).
+    earlier: list[NodeRun] = Field(default_factory=list)
 
 
 class SanitizeReport(_Model):
@@ -563,6 +587,9 @@ class Run(_Model):
     error_params: dict[str, Any] = Field(default_factory=dict)
     output: Any = None
     nodes: dict[str, NodeRun] = Field(default_factory=dict)
+    #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
+    #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
+    flow_state: dict[str, Any] | None = None
     usage: Usage = Field(default_factory=Usage)
     created_at: datetime = Field(default_factory=now)
     started_at: datetime | None = None

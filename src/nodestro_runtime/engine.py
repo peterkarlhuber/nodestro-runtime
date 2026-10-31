@@ -25,7 +25,7 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 import json
 import logging
@@ -223,6 +223,8 @@ def topological_order(workflow: Workflow) -> list[Node]:
             )
         if edge.source == edge.target:
             raise WorkflowError("workflow.self_loop", "A node cannot be connected to itself")
+        if edge.loop is not None:
+            continue  # loops run against the direction of the graph on purpose
         outgoing[edge.source].append(edge.target)
         incoming[edge.target] += 1
     ready = [node_id for node_id, count in incoming.items() if count == 0]
@@ -245,7 +247,7 @@ def _cycle_nodes(workflow: Workflow) -> list[str]:
     incoming: dict[str, int] = dict.fromkeys(ids, 0)
     outgoing: dict[str, list[str]] = {node_id: [] for node_id in ids}
     for edge in workflow.edges:
-        if edge.source in ids and edge.target in ids and edge.source != edge.target:
+        if edge.source in ids and edge.target in ids and edge.source != edge.target and edge.loop is None:
             outgoing[edge.source].append(edge.target)
             incoming[edge.target] += 1
     ready = [node_id for node_id, count in incoming.items() if count == 0]
@@ -396,7 +398,35 @@ def check_workflow(workflow: Workflow) -> list[CheckIssue]:
     if not cycle:
         for node in workflow.nodes:
             problems.extend(_node_problems(node, workflow))
+        if not problems and graph.loop_edges(workflow):
+            problems.extend(_loop_problems(workflow))
     return problems
+
+
+#: The kernel's loop checks, as the runtime's workflow problems.
+_LOOP_CODES = {
+    "flow.loop_unguarded": ("workflow.loop_unguarded", "A loop must start at a branch of a decision or approval"),
+    "flow.loop_target": ("workflow.loop_target", "A loop must lead back to a node before its decision or approval"),
+    "flow.loop_overlap": ("workflow.loop_overlap", "Two loops overlap without one lying inside the other"),
+    "flow.loop_head_shared": ("workflow.loop_shared", "A node starts more than one loop"),
+    "flow.loop_source_shared": ("workflow.loop_shared", "A decision or approval closes more than one loop"),
+}
+
+
+def _loop_problems(workflow: Workflow) -> list[CheckIssue]:
+    found: list[CheckIssue] = []
+    for issue in flow.validate(flow_driver.flow_of(workflow)):
+        code, message = _LOOP_CODES.get(issue.code, ("workflow.loop_invalid", issue.message))
+        edge = next((item for item in workflow.edges if item.id == issue.edge), None)
+        found.append(
+            CheckIssue(
+                code=code,
+                message=message,
+                node_id=edge.source if edge is not None else issue.node,
+                edge_id=edge.id if edge is not None else None,
+            )
+        )
+    return found
 
 
 def node_label(node: Node) -> str:
@@ -446,6 +476,15 @@ def _file_references(template: str, run: Run) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+@dataclass(frozen=True)
+class LoopContext:
+    """What a node inside a loop can refer to in its task (see :func:`render_task`)."""
+
+    iteration: int
+    previous: Any = None
+    feedback: list[tuple[str, Any]] = field(default_factory=list)
+
+
 def render_task(
     template: str,
     *,
@@ -455,6 +494,7 @@ def render_task(
     absent: set[str] | frozenset[str] = frozenset(),
     append: bool = True,
     run_names: set[str] | frozenset[str] = frozenset(),
+    loop: LoopContext | None = None,
 ) -> str:
     """Fill ``{{input}}``, ``{{run.input}}``, ``{{form.<field>}}`` and ``{{<node name>}}`` in a task template.
 
@@ -464,6 +504,9 @@ def render_task(
     predecessors whose branch was skipped in this run: their placeholder becomes ``-``.
     ``run_names`` are the names of start nodes: a template that uses the run input or a form
     value already has what the start node delivers, so it is not appended again.
+    Inside a loop (``loop``), ``{{iteration}}`` is the iteration (from 1), ``{{previous}}`` the
+    node's own result of the previous iteration and ``{{feedback}}`` what arrived over the loop
+    connection; both read ``-`` in the first iteration. A node named like them wins.
     """
     by_name = {name.lower(): value for name, value in inputs}
     form = {str(key).lower(): value for key, value in (values or {}).items()}
@@ -495,6 +538,18 @@ def render_task(
             return as_text(by_name[lowered])
         if lowered in absent:
             return "-"
+        if loop is not None:
+            if lowered == "iteration":
+                return str(loop.iteration)
+            if lowered == "previous":
+                return "-" if loop.previous is None else as_text(loop.previous)
+            if lowered == "feedback":
+                used.update(name.lower() for name, _ in loop.feedback)
+                if not loop.feedback:
+                    return "-"
+                if len(loop.feedback) == 1:
+                    return as_text(loop.feedback[0][1])
+                return "\n\n".join(f"## {name}\n\n{as_text(value)}" for name, value in loop.feedback)
         return match.group(0)
 
     text = _PLACEHOLDER.sub(replace, template or "")
@@ -618,6 +673,8 @@ class _RunContext:
         self.resume_requested = False
         #: Set when a rejection ended the run.
         self.stop: Problem | None = None
+        #: Set when the flow kernel stopped the run (a loop ran out of iterations).
+        self.flow_stop: flow.Stop | None = None
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
@@ -1136,6 +1193,10 @@ class RunManager:
 
     def _emit(self, context: _RunContext, kind: str, node_id: str | None = None, **data: Any) -> None:
         """Record and publish an event; safe to call from worker threads."""
+        if node_id is not None:
+            state = context.run.nodes.get(node_id)
+            if state is not None and state.iteration:
+                data.setdefault("iteration", list(state.iteration))
         loop = context.root.loop or self._loop
         if loop is None:
             # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens.
@@ -1276,6 +1337,21 @@ class RunManager:
         if context.stop is not None:
             run.status = "cancelled"
             _fail(run, context.stop)
+        elif context.flow_stop is not None and context.flow_stop.code == "flow.loop_exhausted":
+            run.status = "failed"
+            loop = next((edge for edge in run.workflow.edges if edge.id == context.flow_stop.params.get("loop")), None)
+            source = next((node for node in run.workflow.nodes if loop is not None and node.id == loop.source), None)
+            label = node_label(source) if source is not None else ""
+            limit = context.flow_stop.params.get("max_iterations")
+            _fail(
+                run,
+                problem(
+                    "run.loop_exhausted",
+                    f"The loop at {label} ran {limit} times without reaching its goal",
+                    node=label,
+                    max_iterations=limit,
+                ),
+            )
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -1309,21 +1385,27 @@ class RunManager:
             run.nodes.setdefault(node.id, NodeRun(status="waiting"))
         if not context.fingerprints:
             context.fingerprints = self.fingerprints(run, context.env)
-        state = flow_driver.state_of(workflow, run.nodes)
+        state = flow_driver.state_of(workflow, run.nodes, run.flow_state)
+        for item in state.invocations:
+            if item.status == "running":
+                # Stopped mid-node with its process (the node is already marked failed): never run it twice.
+                failed = flow.Result(status="failed", error="run.interrupted")
+                state = self._kernel_step(context, flow.complete(spec, state, item.id, failed), item.id).state
         if context.cancelled.is_set():
-            step = self._kernel_settled(context, flow.cancel(spec, state, code="run.node_cancelled"))
+            step = self._kernel_step(context, flow.cancel(spec, state, code="run.node_cancelled"))
         elif any(item.status == "suspended" for item in state.invocations):
             # Paused nodes are asked again: a decided approval succeeds, an open one stays paused.
-            step = self._kernel_settled(context, flow.resume(spec, state))
+            step = self._kernel_step(context, flow.resume(spec, state))
         else:
-            step = self._kernel_settled(context, flow.advance(spec, state))
+            step = self._kernel_step(context, flow.advance(spec, state))
         state = step.state
         tasks: dict[asyncio.Task[flow.Result], str] = {}
         actions = list(step.actions)
         while True:
             for action in actions:
                 node = nodes[action.invocation.node]
-                tasks[asyncio.ensure_future(self._invoke(context, node))] = action.invocation.id
+                task = asyncio.ensure_future(self._invoke(context, node, action.invocation.path))
+                tasks[task] = action.invocation.id
             actions = []
             if not tasks:
                 break
@@ -1331,21 +1413,32 @@ class RunManager:
             for task in finished:
                 invocation_id = tasks.pop(task)
                 if context.cancelled.is_set() and state.stop is None:
-                    state = self._kernel_settled(context, flow.cancel(spec, state, code="run.node_cancelled")).state
-                step = self._kernel_settled(context, flow.complete(spec, state, invocation_id, task.result()))
+                    state = self._kernel_step(context, flow.cancel(spec, state, code="run.node_cancelled")).state
+                result = task.result()
+                step = self._kernel_step(context, flow.complete(spec, state, invocation_id, result), invocation_id)
                 state = step.state
                 actions.extend(step.actions)
 
-    def _kernel_settled(self, context: _RunContext, step: flow.Step) -> flow.Step:
-        """Apply the nodes the kernel settled without executing them (skipped, blocked, cancelled)."""
+    def _kernel_step(self, context: _RunContext, step: flow.Step, reported: str | None = None) -> flow.Step:
+        """Store the kernel's new state and apply the nodes it settled without executing them.
+
+        ``reported`` is the invocation whose result this step recorded (settled by the node itself).
+        """
         run = context.run
+        run.flow_state = step.state.model_dump(mode="json")
+        if step.state.stop is not None and step.state.stop.code.startswith("flow."):
+            context.flow_stop = step.state.stop
         for event in step.events:
-            if event.kind != "invocation_settled" or event.node is None:
+            if event.kind == "loop_iteration" and event.node is not None:
+                self._emit(context, "loop_iteration", event.node, **event.data)
+            if event.kind != "invocation_settled" or event.node is None or event.invocation == reported:
                 continue
             status = event.data.get("status")
-            state = run.nodes[event.node]
-            if status == state.status or status not in ("skipped", "blocked", "cancelled"):
-                continue  # reported by the node itself
+            if status not in ("skipped", "blocked", "cancelled"):
+                continue
+            state = self._current(run, event.node, event.path)
+            if state.status == status:
+                continue
             state.fingerprint = context.fingerprints.get(event.node)
             state.status = status
             state.finished_at = now()
@@ -1360,9 +1453,23 @@ class RunManager:
             self._emit_settled(context, event.node)
         return step
 
-    async def _invoke(self, context: _RunContext, node: Node) -> flow.Result:
+    @staticmethod
+    def _current(run: Run, node_id: str, path: tuple[int, ...]) -> NodeRun:
+        """The node's state for the invocation at ``path``; a later loop iteration starts a fresh one."""
+        state = run.nodes[node_id]
+        if list(path) == state.iteration:
+            return state
+        if state.status == "waiting" and not state.earlier and state.started_at is None:
+            state.iteration = list(path)
+            return state
+        earlier = state.model_copy(update={"earlier": []})
+        fresh = NodeRun(status="waiting", iteration=list(path), earlier=[*state.earlier, earlier])
+        run.nodes[node_id] = fresh
+        return fresh
+
+    async def _invoke(self, context: _RunContext, node: Node, path: tuple[int, ...] = ()) -> flow.Result:
         """Execute one node the kernel dispatched and report how it ended."""
-        state = context.run.nodes[node.id]
+        state = self._current(context.run, node.id, path)
         state.fingerprint = context.fingerprints.get(node.id)
         if context.cancelled.is_set():
             # Stopped by a node dispatched together with this one (a rejection that ends the run).
@@ -1421,7 +1528,7 @@ class RunManager:
         )
 
     def _inputs(
-        self, run: Run, node_id: str, *, approval_comments: bool = True
+        self, run: Run, node_id: str, *, approval_comments: bool = True, loops: bool = True
     ) -> tuple[list[tuple[str, Any]], set[str]]:
         """The results arriving at a node over active connections, and the names of skipped ones.
 
@@ -1429,15 +1536,24 @@ class RunManager:
         arrives under the approval's name. Result and decision nodes get the results only: a
         reviewer's internal comment must not become part of the run's result, its result files or
         its published answer, and must not change what a decision evaluates.
+
+        In a later iteration of a loop, the loop's first node also receives what arrives over the
+        loop connection (the previous iteration's results behind the decision or approval).
         """
         nodes = {node.id: node for node in run.workflow.nodes}
         incoming = graph.predecessors(run.workflow)
+        iteration = run.nodes[node_id].iteration if node_id in run.nodes else []
+        looping = [
+            edge
+            for edge in graph.loop_edges(run.workflow)
+            if loops and edge.target == node_id and iteration and iteration[-1] > 0
+        ]
         found: list[tuple[str, Any]] = []
         seen: set[str] = set()
         silent: set[str] = set()
 
         def visit(target: str) -> None:
-            for edge in incoming.get(target, []):
+            for edge in [*incoming.get(target, []), *(looping if target == node_id else [])]:
                 if edge.source in seen or not edge_active(edge, nodes, run.nodes):
                     continue
                 seen.add(edge.source)
@@ -1468,6 +1584,23 @@ class RunManager:
             if node_label(nodes[source]).strip().lower() not in arrived
         } | silent
         return found, absent
+
+    def _loop_context(self, run: Run, node_id: str, inputs: list[tuple[str, Any]]) -> LoopContext | None:
+        """The loop placeholders of a node inside a loop (``None`` outside loops)."""
+        if not any(node_id in body for body in graph.loop_bodies(run.workflow).values()):
+            return None
+        state = run.nodes[node_id]
+        index = state.iteration[-1] if state.iteration else 0
+        previous = None
+        if state.earlier and state.earlier[-1].iteration[:-1] == state.iteration[:-1] and index > 0:
+            previous = state.earlier[-1].output if state.earlier[-1].status == "succeeded" else None
+        without, _ = self._inputs(run, node_id, loops=False)
+        plain = {name for name, _ in without}
+        return LoopContext(
+            iteration=index + 1,
+            previous=previous,
+            feedback=[(name, value) for name, value in inputs if name not in plain],
+        )
 
     def _feeds_from_start(self, run: Run, node_id: str) -> bool:
         sources = data_sources(run.workflow, node_id)
@@ -1601,6 +1734,7 @@ class RunManager:
             values=self._prompt_values(run),
             absent=absent,
             run_names=_start_names(run.workflow),
+            loop=self._loop_context(run, node.id, inputs),
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
