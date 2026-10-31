@@ -40,7 +40,7 @@ from .schemas import Edge, Node, NodeRun, Workflow, WorkflowIn
 TRANSPARENT = frozenset({"condition", "approval"})
 BRANCHING = frozenset({"condition", "approval"})
 #: Node types that do work without being an agent.
-WORKING = frozenset({"agent", "subworkflow"})
+WORKING = frozenset({"agent", "subworkflow", "orchestrator"})
 
 
 def ports(node: Node) -> list[str]:
@@ -229,6 +229,8 @@ def fingerprints(
             parts["files"] = sorted(file_ids)
         if node.subworkflow is not None:
             parts["child"] = child_tools(node.subworkflow.workflow_id, node.subworkflow.version)
+        if node.orchestrator is not None:
+            parts["teams"] = [child_tools(member.workflow_id, member.version) for member in node.orchestrator.members]
         result[node.id] = _hash(parts)
     return result
 

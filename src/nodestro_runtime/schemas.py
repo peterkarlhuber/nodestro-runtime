@@ -20,7 +20,7 @@ from .tool_policy import ToolBinding
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 ThinkingMode = Literal["adaptive", "between_tools", "disabled"]
 ThinkingDisplay = Literal["summarized", "omitted", "updates"]
-NodeType = Literal["start", "agent", "output", "condition", "approval", "subworkflow"]
+NodeType = Literal["start", "agent", "output", "condition", "approval", "subworkflow", "orchestrator"]
 #: ``paused``: the run waits for a human decision at an approval node.
 RunStatus = Literal["queued", "running", "paused", "succeeded", "failed", "cancelled"]
 #: ``skipped``: deliberately not run, because its branch was not chosen (no error);
@@ -313,6 +313,38 @@ class SubworkflowConfig(_Model):
     values: dict[str, str] = Field(default_factory=dict)
 
 
+#: Most teams in the pool of one orchestrator, and most decisions it may make.
+MAX_POOL = 20
+MAX_DECISIONS = 50
+
+
+class OrchestratorMember(_Model):
+    """A team in an orchestrator's pool: a saved workflow, run as a sub-workflow when chosen."""
+
+    workflow_id: str = ""
+    #: The pinned version; ``None`` takes the latest version when the run starts.
+    version: int | None = None
+
+
+class OrchestratorConfig(_Model):
+    """An AI model that delegates the task to teams of its pool until it can answer (AO M4).
+
+    It only selects: it creates no agents and no tools, and has no tools of its own. Each chosen team
+    runs as a linked child run with its own budget, limits and tool approvals; the orchestrator's
+    decisions, reasons and the teams' results are recorded (``NodeRun.orchestration``).
+    """
+
+    members: list[OrchestratorMember] = Field(default_factory=list, max_length=MAX_POOL)
+    #: What the orchestrator should do; placeholders as in an agent's task.
+    task_template: str = "{{input}}"
+    #: Extra instructions for the orchestrator (how to split work, what a good answer is).
+    instructions: str = ""
+    model: str = "anthropic:claude-opus-5-5"
+    max_decisions: int = Field(default=8, ge=1, le=MAX_DECISIONS)
+    #: How often one team may be chosen; ``None``: only ``max_decisions`` limits it.
+    max_per_member: int | None = Field(default=None, ge=1, le=MAX_DECISIONS)
+
+
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
 
 
@@ -343,6 +375,7 @@ class Node(_Model):
     approval: ApprovalConfig | None = None
     subworkflow: SubworkflowConfig | None = None
     output: OutputNodeConfig | None = None
+    orchestrator: OrchestratorConfig | None = None
 
 
 #: The most iterations a loop may allow (the first run included).
@@ -618,6 +651,10 @@ class NodeRun(_Model):
     #: Sub-workflow nodes: the child run and the version of the sub-workflow it ran.
     child_run_id: str | None = None
     child_version: int | None = None
+    #: Orchestrator nodes: the record of the orchestration (``orkexa.orchestration.OrchestrationState`` as JSON)
+    #: and the child run of every delegation, in order.
+    orchestration: dict[str, Any] | None = None
+    child_run_ids: list[str] = Field(default_factory=list)
     #: The result was taken over from this earlier run instead of executing the node again.
     reused_from: str | None = None
     #: Hash of everything the node's result depends on (configuration, inputs' sources, tools);

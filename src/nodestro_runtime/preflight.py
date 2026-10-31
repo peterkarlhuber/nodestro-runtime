@@ -404,6 +404,101 @@ def _flow_issues(workflow: Workflow) -> list[CheckIssue]:
     return found
 
 
+def _called(workflow: Workflow) -> list[tuple[str, int | None]]:
+    """The workflows (id, version) that ``workflow`` calls: sub-workflows and orchestrator teams."""
+    found: list[tuple[str, int | None]] = []
+    for item in workflow.nodes:
+        if item.type == "subworkflow" and item.subworkflow is not None and item.subworkflow.workflow_id:
+            found.append((item.subworkflow.workflow_id, item.subworkflow.version))
+        if item.type == "orchestrator" and item.orchestrator is not None:
+            found.extend(
+                (member.workflow_id, member.version) for member in item.orchestrator.members if member.workflow_id
+            )
+    return found
+
+
+def _calls_back(nodestro: Workspace, root: str, child: Workflow) -> bool:
+    """Whether ``child`` calls ``root`` again (directly or deeper) or nests too deep."""
+
+    def walk(current: Workflow, chain: tuple[str, ...]) -> bool:
+        if len(chain) > MAX_DEPTH:
+            return True
+        for workflow_id, version in _called(current):
+            if workflow_id in chain:
+                return True
+            try:
+                deeper, _ = nodestro.resolve_workflow(workflow_id, version)
+            except KeyError:
+                continue
+            if walk(deeper, (*chain, workflow_id)):
+                return True
+        return False
+
+    return walk(child, (root, child.id))
+
+
+def _orchestrator_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
+    """Orchestrator teams: do they exist, are they valid, and do they run without pausing?"""
+    found: list[CheckIssue] = []
+    for node in workflow.nodes:
+        if node.type != "orchestrator" or node.orchestrator is None:
+            continue
+        label = node_label(node)
+        for member in node.orchestrator.members:
+            if not member.workflow_id:
+                continue
+            try:
+                child, _ = nodestro.resolve_workflow(member.workflow_id, member.version)
+            except KeyError:
+                found.append(
+                    _issue(
+                        "check.orchestrator_member_missing",
+                        f"{label}: a team (or its version) no longer exists",
+                        level="error",
+                        node_id=node.id,
+                        name=label,
+                        version=member.version or "",
+                    )
+                )
+                continue
+            if member.workflow_id == workflow.id or _calls_back(nodestro, workflow.id, child):
+                found.append(
+                    _issue(
+                        "check.orchestrator_cycle",
+                        f"{label}: the team {child.name} would call this workflow again",
+                        level="error",
+                        node_id=node.id,
+                        name=label,
+                        workflow=child.name,
+                    )
+                )
+                continue
+            errors = [item for item in check_workflow(child) if item.level == "error"]
+            if errors:
+                found.append(
+                    _issue(
+                        "check.orchestrator_member_invalid",
+                        f"{label}: the team {child.name} has {len(errors)} errors",
+                        level="error",
+                        node_id=node.id,
+                        name=label,
+                        workflow=child.name,
+                        count=len(errors),
+                    )
+                )
+            if any(item.type == "approval" for item in child.nodes):
+                found.append(
+                    _issue(
+                        "check.orchestrator_member_approval",
+                        f"{label}: the team {child.name} pauses for approvals; an orchestrator stops it there",
+                        node_id=node.id,
+                        name=label,
+                        workflow=child.name,
+                    )
+                )
+    return found
+
+
 def _subworkflow_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
     """Sub-workflows: do they exist in their version, fit their inputs, and never call themselves?"""
     found: list[CheckIssue] = []
@@ -412,17 +507,14 @@ def _subworkflow_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
         """The name of a workflow that would be called again (a cycle) or nested too deep."""
         if len(chain) > MAX_DEPTH:
             return child.name
-        for item in child.nodes:
-            config = item.subworkflow
-            if item.type != "subworkflow" or config is None or not config.workflow_id:
-                continue
-            if config.workflow_id in chain:
+        for workflow_id, version in _called(child):
+            if workflow_id in chain:
                 return child.name
             try:
-                grandchild, _ = nodestro.resolve_workflow(config.workflow_id, config.version)
+                grandchild, _ = nodestro.resolve_workflow(workflow_id, version)
             except KeyError:
                 continue
-            found_cycle = calls(grandchild, (*chain, config.workflow_id))
+            found_cycle = calls(grandchild, (*chain, workflow_id))
             if found_cycle:
                 return found_cycle
         return None
@@ -631,6 +723,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
         *_node_issues(workflow, known_files, partial(_priced, snapshot=nodestro.pricing.effective_snapshot())),
         *_flow_issues(workflow),
         *_subworkflow_issues(nodestro, workflow),
+        *_orchestrator_issues(nodestro, workflow),
         *_contract_issues(workflow),
     ]
     budget = workflow.budget_usd if workflow.budget_usd is not None else nodestro.settings().default_budget_usd

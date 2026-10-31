@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+Adaptive Orchestration M4 (orchestrator node):
+
+- New node type `orchestrator` (`OrchestratorConfig`: `members` (up to 20 team workflows, optionally pinned to a
+  version), `task_template`, `instructions`, `model`, `max_decisions` (1..50, default 8), `max_per_member`). An AI
+  model chooses step by step which team of its pool gets which task and finishes with an answer, following the
+  `orkexa.orchestration` protocol (ADR 0010 in orkexa; orkexa pin b91d0b7). The model has no tools, cannot create
+  teams, agents or tools and has no permissions of its own: every team runs as a linked child run
+  (`NodeRun.child_run_ids`) with its own budget share, limits and tool approvals. Refused decisions (unknown team,
+  limits, repeated task, invalid answer) are recorded with their code and shown to the model.
+- Every decision, verdict, result and reason is stored in `NodeRun.orchestration` as it happens (events
+  `orchestration_delegated`, `orchestration_step`), so a run can be inspected and replayed.
+- A team that stops at an approval step is cancelled and reported to the orchestrator as a failure (pausing a
+  run inside an orchestrator is not supported yet). An orchestrator that uses all its decisions without
+  finishing fails with `run.orchestration_limit` (`node`, `max_decisions`); a missing team fails with
+  `run.orchestrator_member_missing`.
+- Workflow check: `workflow.orchestrator_no_members`, `workflow.orchestrator_member_duplicate`,
+  `workflow.orchestrator_self`, `workflow.orchestrator_limits`. Pre-check: `check.orchestrator_member_missing`,
+  `check.orchestrator_cycle`, `check.orchestrator_member_invalid` (errors) and `check.orchestrator_member_approval`
+  (warning). Runs pin the team versions like sub-workflows; resume fingerprints cover the teams.
+
 Adaptive Orchestration M3 (teams: output contracts and capabilities):
 
 - New `OutputNodeConfig.contract` (list of `OutputField`, like an agent's structured output): the fields a workflow
