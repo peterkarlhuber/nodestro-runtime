@@ -51,6 +51,7 @@ from .knowledge import KnowledgeBase
 from .launcher import launch
 from .memory_spaces import MemorySpaces
 from .problems import NodestroError
+from .profile import RuntimeProfile
 from .providers import (
     PROVIDERS,
     Connection,
@@ -133,16 +134,28 @@ class Workspace:
 
     def __init__(
         self,
-        data_dir: str | Path,
+        data_dir: str | Path | None = None,
         *,
         client_factory: Callable[[str], Any] | None = None,
         python_runner: Any | None = None,
         ocr_runner: Any | None = None,
         integrations: Iterable[Integration] | None = None,
+        profile: RuntimeProfile | None = None,
     ) -> None:
         """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
-        OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`)."""
-        data_dir = Path(data_dir).expanduser()
+        OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`).
+
+        ``profile`` chooses the operating profile (:mod:`nodestro_runtime.profile`); without one, the desktop
+        profile on ``data_dir`` is used, as before. Given both, ``data_dir`` must be the profile's data
+        directory. A profile that cannot be started is refused before any file or database is touched."""
+        if profile is None:
+            if data_dir is None:
+                raise TypeError("Workspace needs a data directory or a profile")
+            profile = RuntimeProfile.desktop(data_dir)
+        elif data_dir is not None:
+            profile.matches(data_dir)
+        self.profile = profile.validate()
+        data_dir = profile.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
         self._directory_lock = DataDirectoryLock(data_dir)

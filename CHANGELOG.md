@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Operating profiles (desktop and server plan, M1 PR-1). No behavior change for existing callers:
+
+- New `nodestro_runtime.profile`: an immutable `RuntimeProfile` with the profiles `desktop` (default) and
+  `server`, built with `RuntimeProfile.desktop(data_dir)` or `RuntimeProfile.from_env()` (`NODESTRO_PROFILE`,
+  `NODESTRO_DATA_DIR`; empty means default, anything unknown is refused). Stable codes: `profile.invalid` (every
+  problem listed in `params["problems"]`) and `profile.server_unavailable` (`params["missing"]`).
+- `Workspace` takes an optional `profile`. `Workspace(data_dir, ...)` works as before and always opens the desktop
+  profile, also when `NODESTRO_PROFILE` is set. A data directory that contradicts the profile, and the server
+  profile (which cannot start until authentication, PostgreSQL, tenant isolation, workers and the container sandbox
+  exist), are refused before the data directory is created, locked or opened. `workspace.profile` tells which
+  profile is open.
+
 Platform integration fixes (found while testing all six repositories together):
 
 - Approvals: an approval's comment reaches later agents and sub-workflows as before, but no longer result
