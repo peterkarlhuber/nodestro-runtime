@@ -109,6 +109,15 @@ wait in the database for their approval and continue after the next start. Runs 
 process stopped are marked as interrupted (`run.interrupted`) when the data directory is opened again and can
 be continued.
 
+**Operating profile.** A workspace serves one of two profiles (`nodestro_runtime.profile`): `desktop`, the
+default and the behavior described here, or `server` (many users, PostgreSQL, workers), which is planned and
+refused with `profile.server_unavailable` in this version. `Workspace(data_dir)` always opens the desktop profile,
+whatever the environment says. `Workspace(profile=RuntimeProfile.from_env())` takes the profile from
+`NODESTRO_PROFILE` (`desktop` or `server`, default `desktop`) and `NODESTRO_DATA_DIR` (default `~/.nodestro`);
+unknown values are refused with `profile.invalid` instead of falling back to a default. Given both a data
+directory and a profile, they must name the same directory. Every refusal happens before a file or the database is
+touched.
+
 **Running.** `await workspace.run(workflow, RunIn(...))` checks the workflow first (the same pre-check the
 editor shows, `nodestro_runtime.preflight`), refuses a run that would fail for a known reason and returns the
 queued run. `await workspace.wait(run_id)` returns it once it finished or paused. `workspace.cancel(run_id)`
