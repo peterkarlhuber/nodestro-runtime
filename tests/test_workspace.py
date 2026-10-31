@@ -373,6 +373,21 @@ async def test_a_time_limit_stops_a_run_and_cancels_its_running_nodes(make: Make
     assert 0.3 <= done.active_seconds < 5
 
 
+async def test_a_step_limit_stops_a_run_before_the_next_node(make: Make) -> None:
+    workspace = make({"A": [text("a")], "B": [text("b")], "C": [text("never")]})
+    flow = workflow(
+        [{"id": "start", "type": "start"}, agent("a", "A"), agent("b", "B"), agent("c", "C")],
+        [edge("start", "a"), edge("a", "b"), edge("b", "c")],
+        limits={"max_steps": 3},  # start, a and b
+    )
+    done = await run(workspace, flow)
+    assert done.status == "failed"
+    assert done.error_code == "run.step_limit"
+    assert done.error_params == {"max_steps": 3}
+    assert done.nodes["b"].status == "succeeded"
+    assert done.nodes["c"].status != "succeeded"
+
+
 async def test_waiting_for_an_approval_does_not_count_against_the_time_limit(make: Make) -> None:
     workspace = make({"DRAFT": [text("Entwurf")], "SEND": [text("Gesendet")]})
     flow = workflow(

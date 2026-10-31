@@ -375,6 +375,8 @@ class Edge(_Model):
 MAX_PARALLEL_LIMIT = 32
 #: Longest wall time a workflow may allow for its own execution (7 days, in seconds).
 MAX_DURATION_LIMIT_S = 7 * 24 * 3600
+#: Most node executions a workflow may allow for one run.
+MAX_STEPS_LIMIT = 10_000
 
 
 class WorkflowLimits(_Model):
@@ -385,6 +387,10 @@ class WorkflowLimits(_Model):
     #: Longest active execution time of a run in seconds; waiting for approvals does not count. When it is
     #: reached, running nodes are cancelled and the run fails with ``run.time_limit``.
     max_duration_s: float | None = Field(default=None, gt=0, le=MAX_DURATION_LIMIT_S)
+    #: Most node executions of a run. Every executed node counts once, start and result nodes included, and
+    #: every round of a loop counts again. When the next execution would exceed it, the run fails with
+    #: ``run.step_limit``.
+    max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS_LIMIT)
 
 
 class WorkflowIn(_Model):
