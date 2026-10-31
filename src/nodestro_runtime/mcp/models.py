@@ -13,20 +13,20 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
-import os
 import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..mcp_access import TOOL_PREFIX, is_mcp_tool, unattended_mcp_enabled
 from ..schemas import new_id, now
+
+__all__ = ["TOOL_PREFIX", "is_mcp_tool", "unattended_mcp_enabled"]
 
 SERVERS = "mcp_servers"
 TOOLS = "mcp_tools"
 EVENTS = "mcp_events"
 
-#: Prefix of every MCP tool name agents see: ``mcp__<server slug>__<tool>``.
-TOOL_PREFIX = "mcp__"
 _TOOL_NAME_MAX = 128
 _DESCRIPTION_MAX = 4000
 _SCHEMA_MAX_BYTES = 64_000
@@ -197,16 +197,6 @@ class McpEvent(_Model):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
-#: Set to ``1`` by the operator after the MCP security acceptance: MCP tools may then run without a person
-#: (schedules, batches, test series, published APIs; ADR-0007 D-7). Off by default.
-UNATTENDED_ENV = "NODESTRO_MCP_UNATTENDED"
-
-
-def unattended_mcp_enabled(environ: dict[str, str] | None = None) -> bool:
-    env = os.environ if environ is None else environ
-    return env.get(UNATTENDED_ENV, "").strip() == "1"
-
-
 def tool_key(server_id: str, name: str) -> str:
     return f"{server_id}/{name}"
 
@@ -231,10 +221,6 @@ def agent_tool_name(slug: str, tool: str) -> str:
         room = _TOOL_NAME_MAX - len(TOOL_PREFIX) - len(slug) - 2 - 9
         name = f"{TOOL_PREFIX}{slug}__{safe[:room]}_{digest}"
     return name
-
-
-def is_mcp_tool(name: str) -> bool:
-    return name.startswith(TOOL_PREFIX)
 
 
 def _canonical(value: Any) -> str:

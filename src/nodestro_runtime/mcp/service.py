@@ -15,6 +15,8 @@ import logging
 import threading
 from typing import Any
 
+from orkexa import Tool
+
 from ..problems import NodestroError
 from ..schemas import now
 from ..storage import DocumentStore
@@ -342,6 +344,29 @@ class McpService:
                 name=tool_name,
             )
         return server, tool
+
+    def agent_tool(self, tool_name: str, *, cancelled: Callable[[], bool] | None = None) -> Tool:
+        """The tool an agent gets for ``tool_name`` (policy checked now and again before every call)."""
+        from .tools import McpAgentTool
+
+        server, tool = self.check(tool_name)
+        return McpAgentTool(self, server, tool, cancelled=cancelled)
+
+    def provenance(self, tool_name: str) -> dict[str, Any]:
+        """Provenance of a call for the run record (threat model T14); empty for unknown names."""
+        found = self.find(tool_name)
+        if found is None:
+            return {}
+        server, tool = found
+        return {
+            "source": "mcp",
+            "server_id": server.id,
+            "server_name": server.name,
+            "qualified_name": tool.qualified,
+            "definition_hash": tool.approved_hash,
+            "access": tool.access,
+            "external_cost": "unknown",
+        }
 
     def usable(self) -> list[McpTool]:
         result = []

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
-import json
 from typing import Any
 
 from orkexa import Tool, ToolExecutionError, ToolInputError, ToolResultError
@@ -113,24 +112,3 @@ class McpAgentTool(Tool):
             "input_schema": deepcopy(self.input_schema),
             "strict": False,
         }
-
-
-def describe_call(service: McpService, tool_name: str) -> dict[str, Any]:
-    """Provenance of a call for the run record (threat model T14); empty for unknown names."""
-    found = service.find(tool_name)
-    if found is None:
-        return {}
-    server, tool = found
-    return {
-        "source": "mcp",
-        "server_id": server.id,
-        "server_name": server.name,
-        "qualified_name": tool.qualified,
-        "definition_hash": tool.approved_hash,
-        "access": tool.access,
-        "external_cost": "unknown",
-    }
-
-
-def dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)

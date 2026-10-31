@@ -16,8 +16,8 @@ from nodestro_runtime.workspace import Workspace
 
 pytest.importorskip("psycopg")
 
-from nodestro_runtime.postgres_tables import tenant_storage  # noqa: E402
-from nodestro_runtime.storage_postgres import PostgresDatabase  # noqa: E402
+from nodestro_runtime.postgres_tables import tenant_storage
+from nodestro_runtime.storage_postgres import PostgresDatabase
 
 ENDPOINT = "https://mcp.example.com"
 

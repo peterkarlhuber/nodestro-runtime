@@ -14,7 +14,7 @@ streaming, reasoning effort ...); such errors appear in the inspector.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import keyword
 import re
@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, create_model
 
 from .catalog import SERVER_TOOLS
 from .knowledge import KnowledgeBase
-from .mcp.models import is_mcp_tool, unattended_mcp_enabled
+from .mcp_access import check_unattended_mcp
 from .memory_spaces import MemorySpaces
 from .problems import NodestroError, library_problem
 from .providers import MAX_RETRIES, Connection, check_model, check_request_options, model_id, provider_of
@@ -166,18 +166,6 @@ def _messages(config: AgentConfig) -> list[dict[str, Any]]:
     if messages and messages[-1]["role"] != "assistant":
         raise NodestroError("config.examples_end", "Example messages must end with an answer of the assistant")
     return messages
-
-
-def check_unattended_mcp(names: Iterable[str]) -> None:
-    """Refuse MCP tools in a run without a person unless the operator enabled them (ADR-0007 D-7)."""
-    mcp = [name for name in names if is_mcp_tool(name)]
-    if mcp and not unattended_mcp_enabled():
-        raise NodestroError(
-            "mcp.unattended_not_enabled",
-            "MCP tools cannot be used in runs without a person yet (schedules, batches, test series, published "
-            "APIs); this needs the MCP security acceptance",
-            names=", ".join(mcp),
-        )
 
 
 class AgentBuilder:

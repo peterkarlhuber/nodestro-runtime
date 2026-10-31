@@ -22,7 +22,7 @@ import json
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa import Tool, ToolExecutionError, ToolInputError, ToolResultError, UsageTracker
 from orkexa.dynamic import (
@@ -49,14 +49,16 @@ from pydantic import BaseModel, Field
 
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
-from .mcp.models import McpTool, is_mcp_tool
-from .mcp.service import McpService
-from .mcp.tools import McpAgentTool
+from .mcp_access import is_mcp_tool
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
 from .sandbox_policy import SandboxPolicy, TrustClass
 from .schemas import new_id, now
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
+
+if TYPE_CHECKING:
+    from .mcp.models import McpTool
+    from .mcp.service import McpService
 
 logger = logging.getLogger(__name__)
 
@@ -519,8 +521,7 @@ class ToolLibrary:
         if is_mcp_tool(name):
             if self.mcp is None:
                 raise KeyError(name)
-            server, approved = self.mcp.check(name)
-            return McpAgentTool(self.mcp, server, approved, cancelled=cancelled)
+            return self.mcp.agent_tool(name, cancelled=cancelled)
         try:
             tool = self.registry.get_tool(name)
         except RegistryError:

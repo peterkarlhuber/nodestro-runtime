@@ -218,8 +218,6 @@ def test_tls_verifies_the_configured_name_not_the_address(tmp_path: Path) -> Non
 
 def test_only_the_desktop_can_consent_to_loopback() -> None:
     container = EgressPolicy.from_env(server=False, loopback=False, environ={})
-    assert code(lambda: container.check_url("http://127.0.0.1:8000/mcp", allow_loopback=True)) == (
-        "mcp.https_required"
-    )
+    assert code(lambda: container.check_url("http://127.0.0.1:8000/mcp", allow_loopback=True)) == ("mcp.https_required")
     desktop = EgressPolicy.from_env(server=False, loopback=True, environ={})
     assert desktop.check_url("http://127.0.0.1:8000/mcp", allow_loopback=True)
