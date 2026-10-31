@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Adaptive Orchestration M1 (loop placeholders in the check before a run):
+
+- `preflight` accepts `{{iteration}}`, `{{previous}}` and `{{feedback}}` in the tasks of nodes inside a loop; outside
+  loops they still get `check.placeholder_unknown`, because they stay as they are there.
+
 Sandbox gateway: no tool code without enforced resource limits (Nodestro Local Docker):
 
 - **Fixed: sandbox containers could run without memory, CPU and process limits.** Docker drops limits it cannot
