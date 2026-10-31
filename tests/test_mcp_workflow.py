@@ -129,3 +129,44 @@ async def test_a_definition_change_between_runs_fails_closed(tmp_path: Path, ser
         assert "changed the definition" in str(caught.value)
     finally:
         workspace.close()
+
+
+async def test_a_changing_mcp_tool_runs_only_after_a_person_approves_the_call(
+    tmp_path: Path, server: LoopbackServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from nodestro_runtime.tool_approvals import ENABLE_ENV, ToolApprovals
+
+    monkeypatch.setenv(ENABLE_ENV, "1")
+    delete = "mcp__catalog__delete_page"
+    script = {"LOOKUP": [tool_use(delete, {"page_id": "7"}), text("gone")]}
+    workspace = workspace_with(tmp_path, server, script)
+    try:
+        catalog = workspace.mcp.servers()[0]
+        workspace.mcp.decide(catalog.id, "delete_page", approve=True, access="write", actor="admin")
+        assert workspace.mcp.write_gate is True
+        # a "never" binding with a reason does not skip the question for an MCP tool
+        never = {delete: {"ask": "never", "reason": "Deletes only pages of the scratch space"}}
+        data = flow([delete]).model_dump()
+        data["nodes"][1]["agent"]["tool_policies"] = never
+        saved = workspace.save_workflow(WorkflowIn.model_validate(data))
+        started = await workspace.run(saved, RunIn(input="x"))
+        approvals = ToolApprovals(workspace.store)
+        for _ in range(500):
+            if found := approvals.pending(started.id):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("no approval request")
+        [request] = found
+        assert request.tool == delete and request.input == {"page_id": "7"}
+        assert request.definition_hash is not None and request.definition_hash.startswith("sha256:")
+        approvals.decide(started.id, request.id, approved=True, by="usr_1", arguments=request.arguments_hash)
+        done = await workspace.wait(started.id, timeout=30)
+        assert done.status == "succeeded", done.error
+        [call] = done.nodes["a"].tool_calls
+        assert not call.is_error and "deleted 7" in (call.output or "")
+        assert call.approval is not None and call.approval.status == "approved"
+    finally:
+        workspace.close()
