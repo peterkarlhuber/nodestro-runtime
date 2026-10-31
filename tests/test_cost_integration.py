@@ -241,3 +241,47 @@ def test_price_refusals_have_their_own_codes() -> None:
     assert library_problem(unreliable).code == "pricing.price_unreliable"
     assert library_problem(unreliable).params == {"model": "openai:gpt-5.1-mini"}
     assert node_problem(BudgetExceededError("Budget used up")).code == "run.budget_exceeded"
+
+
+# ---- budget reservations (Adaptive Orchestration AO-12) ------------------------------------------
+
+
+async def test_a_priced_run_within_its_budget_had_a_hard_maximum(make: Make) -> None:
+    workspace = make({"A": [text("ok")]})
+    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 50.0}))
+    assert done.status == "succeeded", done.error
+    assert done.budget_usd == 50.0
+    assert done.budget_hard_maximum is True and done.usage.uncapped_requests == 0
+
+
+async def test_an_unpriced_request_makes_the_budget_no_hard_maximum(make: Make) -> None:
+    workspace = make({"A": [text("ok", model="claude-unknown-9")]})
+    done = await _run(workspace, _flow("anthropic:claude-unknown-9").model_copy(update={"budget_usd": 50.0}))
+    assert done.status == "succeeded", done.error
+    assert done.usage.uncapped_requests == 1
+    assert done.budget_hard_maximum is False
+
+
+async def test_without_a_budget_there_is_no_maximum_to_report(make: Make) -> None:
+    workspace = make({"A": [text("ok")]})
+    workspace.update_settings(SettingsIn.model_validate({"default_budget_usd": None}))
+    done = await _run(workspace, _flow())
+    assert done.status == "succeeded", done.error
+    assert done.budget_usd is None and done.budget_hard_maximum is None
+
+
+async def test_strict_mode_refuses_a_request_that_could_exceed_the_budget(make: Make) -> None:
+    workspace = make({"A": [text("ok")]})
+    workspace.update_settings(SettingsIn(price_mode="strict"))
+    # 16,000 output tokens could cost far more than one cent, so the request is not sent.
+    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}))
+    assert done.status == "failed"
+    assert done.usage.requests == 0
+    assert done.nodes["a"].error_code == "run.budget_exceeded"
+
+
+async def test_standard_mode_runs_an_oversized_request_alone_and_reports_it(make: Make) -> None:
+    workspace = make({"A": [text("ok")]})
+    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}))
+    assert done.status == "succeeded", done.error
+    assert done.usage.uncapped_requests == 1 and done.budget_hard_maximum is False
