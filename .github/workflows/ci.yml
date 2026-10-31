@@ -85,6 +85,47 @@ jobs:
       - run: docker info
       - run: pytest tests/test_container_images.py
 
+  builtin-sandbox:
+    # Acceptance tests of the built-in sandbox prototype (ADR-0006 point 7, plan PR-13) on Linux x86-64. A sandbox
+    # that cannot start fails this job instead of skipping the tests. The prototype stays non-isolating either way.
+    runs-on: ubuntu-latest
+    env:
+      NODESTRO_REQUIRE_BWRAP: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
+      - name: Grant read access to the private repositories
+        env:
+          NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
+        run: |
+          if [ -z "$NODESTRO_READ" ]; then
+            echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+      # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor; the report records whether bwrap works
+      # as installed. Only if it does not, the restriction is lifted for this runner (never on a user's machine).
+      - name: Check that bwrap can create namespaces
+        run: |
+          bwrap --version
+          if bwrap --unshare-all --ro-bind / / true; then
+            echo "bwrap works as installed"
+          else
+            echo "::notice::bwrap cannot create user namespaces as installed; lifting the AppArmor restriction for this runner"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            bwrap --unshare-all --ro-bind / / true
+          fi
+      - run: pip install -e ".[dev]"
+      - run: pytest -s tests/test_builtin_sandbox.py
+      - run: python -m nodestro_runtime.builtin_sandbox
+
   package:
     # The wheel installs on its own and contains what the package needs at run time.
     runs-on: ubuntu-latest
