@@ -1,13 +1,18 @@
-"""Persistent memory spaces (``SQLiteMemory`` namespaces) that agents share or own."""
+"""Persistent memory spaces (Orkexa memory namespaces) that agents share or own.
+
+The desktop keeps them in ``SQLiteMemory``; the server passes :class:`MemoryTables` for PostgreSQL
+(:class:`nodestro_runtime.postgres_tables.PostgresMemoryTables`)."""
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from pathlib import Path
 import re
 import threading
+from typing import Protocol
 
 from orkexa import SQLiteMemory
-from orkexa.memory import MEMORY_ROOT
+from orkexa.memory import MEMORY_ROOT, MemoryBackend
 from pydantic import BaseModel
 
 from .problems import NodestroError
@@ -28,8 +33,8 @@ class MemorySpaceInfo(BaseModel):
     size: int
 
 
-class MemorySpace(SQLiteMemory):
-    """A ``SQLiteMemory`` with read access for the memory browser."""
+class BrowsableMemory(MemoryBackend):
+    """A memory with read access for the memory browser (any Orkexa storage)."""
 
     def entries(self) -> list[MemoryFile]:
         with self._lock:
@@ -51,8 +56,41 @@ class MemorySpace(SQLiteMemory):
     def remove(self, path: str) -> None:
         self.delete(path)
 
+    @abstractmethod
+    def clear(self) -> None:
+        """Delete every file of the space."""
+
+    def close(self) -> None:
+        """Release the storage (nothing for a shared connection)."""
+
+
+class MemorySpace(BrowsableMemory, SQLiteMemory):
+    """A ``SQLiteMemory`` with read access for the memory browser."""
+
     def clear(self) -> None:
         clear_memory(self)
+
+    def close(self) -> None:
+        SQLiteMemory.close(self)
+
+
+class MemoryTables(Protocol):
+    """Where memory spaces live: opens a namespace and sums up every namespace with a prefix."""
+
+    def open_space(self, namespace: str) -> BrowsableMemory: ...
+
+    def totals(self, prefix: str) -> list[tuple[str, int, int]]: ...
+
+
+class _SQLiteMemoryTables:
+    def __init__(self, database: str) -> None:
+        self.database = database
+
+    def open_space(self, namespace: str) -> BrowsableMemory:
+        return MemorySpace(self.database, namespace=namespace)
+
+    def totals(self, prefix: str) -> list[tuple[str, int, int]]:
+        return memory_totals(self.database, prefix)
 
 
 def check_space_name(name: str) -> str:
@@ -67,18 +105,18 @@ def check_space_name(name: str) -> str:
 class MemorySpaces:
     """Opens memory spaces in the Nodestro database by name."""
 
-    def __init__(self, database: str | Path) -> None:
-        self.database = str(database)
-        self._open: dict[str, MemorySpace] = {}
+    def __init__(self, database: str | Path | MemoryTables) -> None:
+        self.tables: MemoryTables = _SQLiteMemoryTables(str(database)) if isinstance(database, str | Path) else database
+        self._open: dict[str, BrowsableMemory] = {}
         self._lock = threading.Lock()
 
-    def open(self, name: str) -> MemorySpace:
+    def open(self, name: str) -> BrowsableMemory:
         """The space ``name``; one shared connection per space (memory commands are locked)."""
         name = check_space_name(name)
         with self._lock:
             space = self._open.get(name)
             if space is None:
-                space = self._open[name] = MemorySpace(self.database, namespace=_PREFIX + name)
+                space = self._open[name] = self.tables.open_space(_PREFIX + name)
             return space
 
     def close(self) -> None:
@@ -90,5 +128,5 @@ class MemorySpaces:
     def all(self) -> list[MemorySpaceInfo]:
         return [
             MemorySpaceInfo(name=namespace[len(_PREFIX) :], files=count, size=size)
-            for namespace, count, size in memory_totals(self.database, _PREFIX)
+            for namespace, count, size in self.tables.totals(_PREFIX)
         ]

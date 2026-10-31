@@ -1,7 +1,9 @@
 """Background knowledge: uploaded files, their search index and per-agent views.
 
 All files live in one ``SQLiteFileStore``; their text is indexed in one
-``SQLiteIndex`` (source = file id). An agent sees only the files assigned to
+``SQLiteIndex`` (source = file id). The server passes other backends of the same Orkexa
+interfaces as :class:`KnowledgeTables` (PostgreSQL:
+:func:`nodestro_runtime.postgres_tables.knowledge_tables`). An agent sees only the files assigned to
 it, through :class:`ScopedFileStore` and :class:`ScopedIndex`, because
 ``orkexa.Agent`` takes exactly one store and one index.
 
@@ -16,10 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tempfile
 import threading
+from typing import Protocol
 
 from orkexa import Chunk, FileStore, Hit, Index, SQLiteFileStore, SQLiteIndex, StoredFile
 from pydantic import BaseModel
@@ -128,21 +132,49 @@ class ScopedIndex(Index):
             limit = min(limit * 4, _MAX_CANDIDATES)
 
 
+class ChunkAccess(Protocol):
+    """What Nodestro reads from an index beside the Orkexa interface (``KnowledgeChunks`` on SQLite)."""
+
+    def counts(self) -> dict[str, int]: ...
+
+    def attach_file(self, source: str) -> None: ...
+
+    def text(self, source: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class KnowledgeTables:
+    """The storage of a knowledge base: the file store, the search index and its chunk access."""
+
+    store: FileStore
+    index: Index
+    chunks: ChunkAccess
+
+
 class KnowledgeBase:
     """Upload, index, list and delete knowledge files."""
 
     def __init__(
         self,
-        database: str | Path,
+        database: str | Path | KnowledgeTables,
         *,
         ocr: documents.OcrRunner | None = None,
         engine: Callable[[], OcrEngine | None] = lambda: None,
     ) -> None:
         """``engine`` returns the OCR engine of the installed integrations (``None``: no OCR);
         ``ocr`` replaces it with a fixed function (tests)."""
-        self.store = SQLiteFileStore(database, namespace="nodestro")
-        self.index = SQLiteIndex(database, namespace="nodestro")
-        self.chunks = KnowledgeChunks(self.index)
+        self.store: FileStore
+        self.index: Index
+        self.chunks: ChunkAccess
+        if isinstance(database, KnowledgeTables):
+            self.store, self.index, self.chunks = database.store, database.index, database.chunks
+        else:
+            index = SQLiteIndex(database, namespace="nodestro")
+            self.store, self.index, self.chunks = (
+                SQLiteFileStore(database, namespace="nodestro"),
+                index,
+                KnowledgeChunks(index),
+            )
         self._lock = threading.RLock()
         self.ocr_runner = ocr
         self.ocr_engine = engine
@@ -160,8 +192,10 @@ class KnowledgeBase:
         return engine.recognize if engine is not None else None
 
     def close(self) -> None:
-        self.store.close()
-        self.index.close()
+        for part in (self.store, self.index):
+            close = getattr(part, "close", None)
+            if close is not None:
+                close()
 
     def _chunk_counts(self) -> dict[str, int]:
         return self.chunks.counts()

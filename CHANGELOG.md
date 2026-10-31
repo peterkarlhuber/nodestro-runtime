@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Knowledge, search and memory on PostgreSQL, and the desktop-to-server import (M3 PR-8, ADR-0002). Nothing changes
+for the desktop:
+
+- Migration `0002`: tables `nodestro_files`, `nodestro_chunks` (full-text search with a `tsvector` over the words
+  of title and text, lower case and without diacritics) and `nodestro_memory_files`, each keyed by tenant.
+- `postgres_tables`: `PostgresFileStore`, `PostgresIndex` and `PostgresMemory` implement Orkexa's `FileStore`,
+  `Index` and `MemoryBackend` for one tenant; `knowledge_tables(database, tenant)` and
+  `PostgresMemoryTables(database, tenant)` plug them into `KnowledgeBase` and `MemorySpaces`, which now accept
+  `KnowledgeTables` and `MemoryTables` beside a SQLite path. `MemorySpaces.open` returns a `BrowsableMemory`.
+- Search on PostgreSQL matches any query word or word prefix like on SQLite, ranked with `ts_rank` instead of
+  BM25; vector search is not available there yet. PostgreSQL text cannot hold U+0000: indexed text keeps U+FFFD in
+  its place, and memory files with it are refused.
+- `postgres_import.import_desktop_database(path, database, tenant)` copies a desktop `nodestro.db` into an empty
+  tenant in one transaction (`storage.import_target_not_empty`, `storage.import_source`). Tool provenance is not
+  imported, so imported tools are untrusted; files beside the database (`tools`, `python`, `inputs`) stay behind
+  and are listed in the report.
+- Knowledge and memory tests run on both backends (`tests/test_knowledge_memory_backends.py`).
+
 PostgreSQL document store (desktop and server plan, M3 PR-7, ADR-0002). Nothing changes for the desktop:
 
 - New `storage_postgres`: `PostgresDatabase` (one connection, reentrant transactions, schema migrations) and

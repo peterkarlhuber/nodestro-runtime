@@ -182,7 +182,9 @@ files in `nodestro_runtime/migrations/postgres` under an advisory lock (several 
 records them in `nodestro_schema_migrations`; a database that already has a schema needs a backup first (operators:
 `pg_dump`), and the same error codes as on SQLite apply. Credentials come from the connection string, the `PG*`
 variables or `~/.pgpass`. The tests run the storage contract on PostgreSQL when `NODESTRO_TEST_POSTGRES` names a
-test database (each test uses its own schema).
+test database (each test uses its own schema). Knowledge files, their search index and memory spaces have
+PostgreSQL backends too (`nodestro_runtime.postgres_tables`), and `nodestro_runtime.postgres_import` moves a
+desktop database into an empty tenant (without tool provenance: imported tools are untrusted).
 
 ## Security and data protection
 
