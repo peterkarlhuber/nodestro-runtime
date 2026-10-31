@@ -39,7 +39,7 @@ from .catalog import SERVER_TOOLS
 from .knowledge import KnowledgeBase
 from .memory_spaces import MemorySpaces
 from .problems import NodestroError, library_problem
-from .providers import MAX_RETRIES, Connection, check_model, model_id, provider_of
+from .providers import MAX_RETRIES, Connection, check_model, check_request_options, model_id, provider_of
 from .schemas import AgentConfig, OutputConfig, OutputField
 from .tool_library import ToolLibrary
 
@@ -123,7 +123,11 @@ def _tool_choice(config: AgentConfig) -> str | dict[str, str]:
 
 
 def _options(config: AgentConfig, provider: str, connection: Connection) -> Any:
-    """Orkexa's options for the provider; Anthropic-only settings of another provider are an error."""
+    """Orkexa's options for the provider; Anthropic-only settings of another provider are an error.
+
+    Request options that would add tools or a provider-hosted MCP server are refused first
+    (:func:`~nodestro_runtime.providers.check_request_options`)."""
+    check_request_options(config.request_options)
     if provider == "anthropic":
         for fallback in config.fallbacks:
             if provider_of(check_model(fallback)) != "anthropic":
