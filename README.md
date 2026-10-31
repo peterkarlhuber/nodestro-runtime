@@ -245,7 +245,7 @@ servers cannot be reached (`mcp.unavailable`).
 from nodestro_runtime.mcp.models import McpServerIn
 
 server = workspace.mcp.add(McpServerIn(name="Docs", url="https://mcp.example.com/mcp", auth="bearer", token="..."))
-workspace.mcp.discover(server.id)              # lists the tools; each one starts as "new"
+workspace.mcp.discover(server.id)  # lists the tools; each one starts as "new"
 workspace.mcp.decide(server.id, "search", approve=True, access="read", actor="admin")
 # agents can now list "mcp__docs__search" in AgentConfig.tools
 ```
