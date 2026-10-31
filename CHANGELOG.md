@@ -14,6 +14,8 @@ Adaptive Orchestration M3 (teams: output contracts and capabilities):
   `check.contract_field_missing` (no structured agent before the result delivers a required field).
 - New `WorkflowIn.capabilities`: up to 20 tags (at most 40 characters each, trimmed, unique ignoring case) that
   say what a workflow can do as a team. They travel with the workflow and grant nothing.
+- `WorkflowSummary` gains `capabilities` and `contract` (the field names of the output contract), so lists can
+  offer teams without loading every workflow.
 
 Adaptive Orchestration M2 (step limit):
 

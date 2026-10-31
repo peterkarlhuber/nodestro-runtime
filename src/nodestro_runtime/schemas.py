@@ -440,6 +440,9 @@ class WorkflowSummary(_Model):
     agents: int
     updated_at: datetime
     last_run_status: RunStatus | None = None
+    #: The workflow's capability tags and the field names of its output contract (teams, AO M3).
+    capabilities: list[str] = Field(default_factory=list)
+    contract: list[str] = Field(default_factory=list)
 
 
 class AgentTemplateIn(_Model):
