@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Per-call tool approvals, security acceptance fixes (S-2, decision D10b):
+
+- **Fix:** running the activation step again (`Workspace.stamp_legacy_tool_bindings`) used to stamp every binding
+  without an entry, so a tool assigned after the first run, a new workflow or a new version became a legacy
+  exemption. The step now runs once per workspace: `LegacyReport` records `stamped_at`, `stamped_by` and
+  `publications_stamped_at`; a repeated call stamps nothing and is audited (`legacy_stamped`, `repeated: true`).
+  `record_legacy_tool_bindings(..., publications_stamped_at=)` records the API's part.
+- **Fix:** `keep_only_inherited` also drops legacy entries of tools the agent no longer has, so removing a tool and
+  assigning it again (or sending the old entry back) never revives an exemption.
+- Regression tests for both, and a test that a new tool version and the expiry end a pre-grant.
+
 MCP tools in releases (ADR-0007, work package WP-9):
 
 - `ReleaseBundle.mcp_tools` freezes each MCP tool a release uses as a `release.McpToolRef` (server id and slug, approved

@@ -96,6 +96,7 @@ from .schemas import (
     SettingsIn,
     Workflow,
     WorkflowIn,
+    now,
 )
 from .server_settings import SecretBox, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
@@ -650,13 +651,19 @@ class Workspace:
         raw = self.store.get_raw("tool_approvals_activation", "legacy")
         return None if raw is None else LegacyReport.model_validate(raw)
 
-    def record_legacy_tool_bindings(self, added: LegacyReport) -> LegacyReport:
-        """Add newly stamped exemptions to the stored activation report (earlier ones stay listed) and return it."""
+    def record_legacy_tool_bindings(
+        self, added: LegacyReport, *, publications_stamped_at: datetime | None = None
+    ) -> LegacyReport:
+        """Add newly stamped exemptions to the stored activation report (earlier ones stay listed) and return it;
+        ``publications_stamped_at`` records that the published releases were stamped."""
         stored = self.legacy_tool_bindings() or LegacyReport()
         combined = LegacyReport(
             bindings=[*stored.bindings, *added.bindings],
             workflows=stored.workflows + added.workflows,
             versions=stored.versions + added.versions,
+            stamped_at=stored.stamped_at or added.stamped_at,
+            stamped_by=stored.stamped_by or added.stamped_by,
+            publications_stamped_at=stored.publications_stamped_at or publications_stamped_at,
         )
         self.store.put_raw("tool_approvals_activation", "legacy", combined.model_dump(mode="json"))
         return combined
@@ -665,9 +672,10 @@ class Workspace:
         """The activation step of per-call tool approvals (S-2, D10b): every existing tool binding of every stored
         workflow and workflow version becomes a visible legacy exemption, bound to the tool's current version.
 
-        Idempotent (bindings that have an entry are left alone). Returns what this call stamped; the stored report
-        ``tool_approvals_activation/legacy`` (:meth:`legacy_tool_bindings`) keeps every exemption stamped so far.
-        Runs only when an administrator activates approvals; nothing calls it on its own."""
+        Runs **once**: when the stored report ``tool_approvals_activation/legacy`` (:meth:`legacy_tool_bindings`)
+        exists, a repeated call stamps nothing (it is audited as repeated), so an assignment made after the first
+        call can never become an exemption by running the step again. Returns what this call stamped. Runs only
+        when an administrator activates approvals; nothing calls it on its own."""
 
         def version_of(name: str) -> int | None:
             try:
@@ -675,8 +683,19 @@ class Workspace:
             except KeyError:
                 return None
 
-        report = LegacyReport()
         with self.store.transaction():
+            earlier = self.legacy_tool_bindings()
+            if earlier is not None:
+                record_audit(
+                    self.store,
+                    ToolApprovalEvent(
+                        kind="legacy_stamped",
+                        actor=by,
+                        details={"bindings": 0, "repeated": True, "first_stamped_at": str(earlier.stamped_at)},
+                    ),
+                )
+                return LegacyReport(stamped_at=earlier.stamped_at, stamped_by=earlier.stamped_by)
+            report = LegacyReport(stamped_at=now(), stamped_by=by)
             for key, stored in self.store.items("workflows", Workflow):
                 stamped, found = stamp_workflow(stored, version_of)
                 if found:

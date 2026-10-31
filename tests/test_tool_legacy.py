@@ -11,7 +11,7 @@ import pytest
 
 from nodestro_runtime.schemas import RunIn, Workflow, WorkflowIn
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
-from nodestro_runtime.tool_approvals import ToolApprovals, ToolGate
+from nodestro_runtime.tool_approvals import ToolApprovals, ToolGate, audit_events
 from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
 from nodestro_runtime.tool_policy import ToolBinding
 from nodestro_runtime.workspace import Workspace
@@ -75,6 +75,66 @@ def test_activation_stamps_every_existing_binding_visibly_and_once(workspace: Wo
     again = workspace.stamp_legacy_tool_bindings()
     assert again.bindings == [] and again.workflows == 0
     assert workspace.legacy_tool_bindings() == report  # a second activation keeps the exemptions listed
+    assert report.stamped_at is not None and again.stamped_at == report.stamped_at
+
+
+def test_repeating_the_activation_never_exempts_a_later_assignment(workspace: Workspace) -> None:
+    """Regression (security acceptance 2026-10-31): the activation step used to stamp every binding without an
+    entry, so running it again after a tool had been assigned in between turned that new assignment into a legacy
+    exemption. It now runs once; later assignments, workflows and versions stay new bindings that are asked about."""
+    second = "other_tool"
+    code, tests = CUSTOM_TOOL_TEMPLATE.replace(TOOL, second), CUSTOM_TESTS_TEMPLATE.replace(TOOL, second)
+    result, _ = workspace.tools.save_custom(code, tests, second, trust=workspace.tools.editor_trust(second, code))
+    assert result.ok, result
+    saved = workspace.save_workflow(flow())
+    first = workspace.stamp_legacy_tool_bindings(by="usr_admin")
+    assert {item.tool for item in first.bindings} == {TOOL}
+    # In between: a new tool on the existing agent, a new workflow and a new version.
+    stamped = workspace.workflow(saved.id)
+    node = stamped.nodes[1]
+    assert node.agent is not None
+    agent = node.agent.model_copy(update={"tools": [TOOL, second]})
+    changed = workspace.save_workflow(
+        stamped.model_copy(update={"nodes": [stamped.nodes[0], node.model_copy(update={"agent": agent})]})
+    )
+    fresh = workspace.save_workflow(flow())
+    again = workspace.stamp_legacy_tool_bindings(by="usr_admin")
+    assert again.bindings == [] and again.workflows == 0 and again.versions == 0
+    assert set(policies(workspace.workflow(changed.id))) == {TOOL}  # the new tool has no exemption
+    assert policies(workspace.workflow(fresh.id)) == {}
+    assert all(set(policies(version.snapshot)) <= {TOOL} for version in workspace.versions.all(saved.id))
+    report = workspace.legacy_tool_bindings()
+    assert report is not None and report.bindings == first.bindings
+    events = [event for event in audit_events(workspace.store) if event.kind == "legacy_stamped"]
+    assert [event.details.get("repeated", False) for event in reversed(events)] == [False, True]
+
+
+def test_removing_and_assigning_a_tool_again_ends_its_exemption(workspace: Workspace) -> None:
+    saved = workspace.save_workflow(flow())
+    workspace.stamp_legacy_tool_bindings()
+    stamped = workspace.workflow(saved.id)
+
+    def with_tools(workflow: Workflow, tools: list[str]) -> Workflow:
+        node = workflow.nodes[1]
+        assert node.agent is not None
+        agent = node.agent.model_copy(update={"tools": tools})
+        return workflow.model_copy(update={"nodes": [workflow.nodes[0], node.model_copy(update={"agent": agent})]})
+
+    removed = workspace.save_workflow(with_tools(stamped, []))
+    assert policies(removed) == {}
+    # Even a client that sends the old entry back with the tool cannot revive it.
+    revived = with_tools(removed, [TOOL])
+    node = revived.nodes[1]
+    assert node.agent is not None
+    revived = revived.model_copy(
+        update={
+            "nodes": [
+                revived.nodes[0],
+                node.model_copy(update={"agent": node.agent.model_copy(update={"tool_policies": policies(stamped)})}),
+            ]
+        }
+    )
+    assert policies(workspace.save_workflow(revived)) == {}
 
 
 async def test_a_legacy_binding_runs_unasked_until_the_tool_changes(workspace: Workspace) -> None:

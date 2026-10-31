@@ -6,14 +6,18 @@ activation step (:func:`stamp_workflow`, called for every stored workflow and it
 ``ask: "never"`` with ``legacy: true`` and the tool version it was bound to. Nothing else creates a legacy exemption:
 
 - :func:`keep_only_inherited` runs on every save of a workflow and drops legacy entries that the stored workflow did
-  not already have for the same node, tool and version. A copied agent, an imported or new workflow, an agent from a
-  template, or an entry an API client invents therefore becomes a new binding (``auto``).
+  not already have for the same node, tool and version, and entries of tools the agent no longer has. A copied
+  agent, an imported or new workflow, an agent from a template, a tool that was removed and assigned again, or an
+  entry an API client invents therefore becomes a new binding (``auto``).
 - A new tool version ends the exemption at the next call (``tool_policy.wants_question`` compares the version).
+- The activation step runs **once** per workspace: its report records when it ran, and a repeated call stamps
+  nothing. Assignments made after it (also while approvals are still off) are new bindings and are asked about.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -77,7 +81,7 @@ def _legacy_entries(workflow: WorkflowIn | Workflow | None) -> set[tuple[str, st
         for node in workflow.nodes
         if node.agent is not None
         for name, binding in node.agent.tool_policies.items()
-        if binding.legacy
+        if binding.legacy and name in node.agent.tools
     }
 
 
@@ -95,7 +99,7 @@ def keep_only_inherited(workflow: Workflow, previous: Workflow | None) -> Workfl
         policies = {
             name: binding
             for name, binding in agent.tool_policies.items()
-            if not binding.legacy or (node.id, name, binding.bound_version) in inherited
+            if not binding.legacy or (name in agent.tools and (node.id, name, binding.bound_version) in inherited)
         }
         if len(policies) != len(agent.tool_policies):
             changed = True
@@ -110,6 +114,11 @@ class LegacyReport(BaseModel):
     bindings: list[LegacyBinding] = Field(default_factory=list)
     workflows: int = 0
     versions: int = 0
+    #: When and by whom the workspace's workflows and versions were stamped (the step runs once).
+    stamped_at: datetime | None = None
+    stamped_by: str | None = None
+    #: When the published releases were stamped (the API's part of the step; also once).
+    publications_stamped_at: datetime | None = None
 
 
 __all__ = [
