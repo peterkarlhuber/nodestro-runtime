@@ -4,7 +4,9 @@ A draft is code plus tests that were only checked statically. Nothing of it has 
 even in the sandbox, and it is not registered: agents cannot use it yet. The user reviews
 the code and decides explicitly:
 
-* ``test`` runs the tests in the sandbox (the same check as for hand-written tools);
+* ``test`` runs the tests in the sandbox (the same check as for hand-written tools); drafts are
+  AI-generated and therefore ``untrusted``: without an isolating sandbox they are not run
+  (``sandbox.isolation_required``, ADR-0006), also not after approval;
 * ``approve`` runs the same check and registers the tool only if everything passes;
 * ``reject`` deletes the draft.
 
@@ -86,9 +88,11 @@ class ToolDrafts:
         """Run the draft's tests in the sandbox; the user asked for it explicitly. Nothing is registered."""
         draft = self._pending(draft_id)
         if self.python is not None:
-            draft.check = check_with_dependencies(self.tools, self.python, draft.code, draft.tests, draft.name)
+            draft.check = check_with_dependencies(
+                self.tools, self.python, draft.code, draft.tests, draft.name, trust="untrusted"
+            )
         else:
-            draft.check = self.tools.check(draft.code, draft.tests, draft.name)
+            draft.check = self.tools.check(draft.code, draft.tests, draft.name, trust="untrusted")
         self.store.put(_COLLECTION, draft.id, draft)
         return draft
 
@@ -99,10 +103,18 @@ class ToolDrafts:
             raise NodestroError("tool_draft.name_taken", f"A tool named {draft.name!r} exists already", name=draft.name)
         if self.python is not None:
             result, info = save_with_dependencies(
-                self.tools, self.python, draft.code, draft.tests, draft.name, requirement=draft.requirement
+                self.tools,
+                self.python,
+                draft.code,
+                draft.tests,
+                draft.name,
+                requirement=draft.requirement,
+                trust="untrusted",
             )
         else:
-            result, info = self.tools.save_custom(draft.code, draft.tests, draft.name, requirement=draft.requirement)
+            result, info = self.tools.save_custom(
+                draft.code, draft.tests, draft.name, requirement=draft.requirement, trust="untrusted"
+            )
         draft.check = result
         if info is not None:
             draft.status = "approved"

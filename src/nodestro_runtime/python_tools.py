@@ -12,6 +12,7 @@ from orkexa.dynamic import Sandbox, check_tool_source, check_tool_tests
 
 from .problems import NodestroError, Problem, problem
 from .python_envs import DependencyStatus, Needed, PythonEnvironments, scope_of
+from .sandbox_policy import TrustClass
 from .tool_library import CheckResult, DependencyGate, DependencyOutcome, ToolInfo, ToolLibrary
 
 
@@ -65,15 +66,55 @@ class ToolEnvironment:
         return self.needed.all_modules()
 
 
+def libraries_problem(name: str) -> Problem:
+    """Why code that needs isolation cannot use third-party libraries yet (ADR-0006)."""
+    return problem(
+        "sandbox.libraries_need_isolation",
+        f"The tool {name!r} is AI-generated or of unknown origin and needs third-party libraries; such tools "
+        "cannot run yet, because libraries are only available without isolation",
+        name=name,
+    )
+
+
+def needs_isolated_libraries(tools: ToolLibrary, python: PythonEnvironments, trust: TrustClass, needed: Needed) -> bool:
+    """Code of class ``trust`` needs libraries that would run without the isolation the policy requires."""
+    return bool(needed.requirements) and tools.policy.needs_isolation(trust) and python.isolation() == "none"
+
+
 def check_with_dependencies(
-    tools: ToolLibrary, python: PythonEnvironments, code: str, tests: str, function_name: str
+    tools: ToolLibrary,
+    python: PythonEnvironments,
+    code: str,
+    tests: str,
+    function_name: str,
+    *,
+    trust: TrustClass | None = None,
 ) -> CheckResult:
-    """The tool editor's check: approved libraries run in the tool's test environment."""
+    """The tool editor's check: approved libraries run in the tool's test environment.
+
+    ``trust`` is the class of the code; ``None`` means a person submitted it in the tool editor
+    (:meth:`ToolLibrary.editor_trust`)."""
+    if trust is None:
+        trust = tools.editor_trust(function_name, code)
     environment = ToolEnvironment(python, function_name, code, tests)
+    if needs_isolated_libraries(tools, python, trust, environment.needed):
+        # Nothing is approved, installed or run for code that could not use the libraries anyway.
+        extra = environment.extra_imports
+        errors = [
+            problem("tool.code_check", text)
+            for text in check_tool_source(code, function_name, extra_imports=extra).errors
+        ]
+        errors += [problem("tool.test_check", text) for text in check_tool_tests(tests, extra_imports=extra).errors]
+        return CheckResult(ok=False, errors=[*errors, libraries_problem(function_name)])
     environment.ensure()
     if environment.ready:
         return tools.check(
-            code, tests, function_name, sandbox=environment.sandbox, extra_imports=environment.extra_imports
+            code,
+            tests,
+            function_name,
+            sandbox=environment.sandbox,
+            extra_imports=environment.extra_imports,
+            trust=trust,
         )
     # Report problems in the code first; the tests can only run once the libraries are there.
     extra = environment.extra_imports
@@ -93,11 +134,18 @@ def save_with_dependencies(
     function_name: str,
     *,
     requirement: str | None = None,
+    trust: TrustClass | None = None,
 ) -> tuple[CheckResult, ToolInfo | None]:
+    """Check and store a tool; ``trust`` as in :func:`check_with_dependencies` (a ``requirement`` makes it
+    ``untrusted``)."""
+    if trust is None:
+        trust = "untrusted" if requirement else tools.editor_trust(function_name, code)
     environment = ToolEnvironment(python, function_name, code, tests)
+    if needs_isolated_libraries(tools, python, trust, environment.needed):
+        return check_with_dependencies(tools, python, code, tests, function_name, trust=trust), None
     environment.ensure()
     if not environment.ready:
-        return check_with_dependencies(tools, python, code, tests, function_name), None
+        return check_with_dependencies(tools, python, code, tests, function_name, trust=trust), None
     return tools.save_custom(
         code,
         tests,
@@ -105,6 +153,7 @@ def save_with_dependencies(
         requirement=requirement,
         sandbox=environment.sandbox,
         extra_imports=environment.extra_imports,
+        trust=trust,
     )
 
 
@@ -116,6 +165,9 @@ def tool_run_sandbox(tools: ToolLibrary, python: PythonEnvironments, name: str) 
     environment = ToolEnvironment(python, name, info.code, info.tests or "")
     if not environment.needed.requirements:
         return None
+    if needs_isolated_libraries(tools, python, info.trust, environment.needed):
+        found = libraries_problem(name)
+        raise NodestroError(found.code, found.message, **found.params)
     environment.ensure()
     if not environment.ready:
         found = state_problem(environment.status)
@@ -143,6 +195,12 @@ class EnvironmentGate(DependencyGate):
             return DependencyOutcome(feedback=f"{issues}\n{_FEEDBACK}")
         if not environment.needed.requirements:
             return DependencyOutcome(ready=True)
+        if self.python.isolation() == "none":
+            # Generated code is untrusted: its libraries would run without isolation (ADR-0006).
+            return DependencyOutcome(
+                feedback="Third-party libraries cannot be used for generated tools here (they would run without "
+                "isolation). Use only the standard library."
+            )
         if environment.status.state == "unsupported":
             reason = environment.status.problem.message if environment.status.problem else "not available"
             return DependencyOutcome(

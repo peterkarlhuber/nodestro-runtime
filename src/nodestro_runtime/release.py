@@ -29,7 +29,9 @@ from typing import Any
 from orkexa.dynamic import ToolRecord
 from pydantic import BaseModel, Field
 
+from .sandbox_policy import TrustClass
 from .schemas import Workflow, now
+from .tool_provenance import MemoryProvenance
 
 FORMAT = "nodestro-release"
 FORMAT_VERSION = 1
@@ -90,6 +92,11 @@ class ReleaseBundle(BaseModel):
     subworkflows: list[SubworkflowSnapshot] = Field(default_factory=list)
     #: Own and generated tools: the approved registry records (name, version, code, hash, schema).
     tools: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: The trust class of each own tool when it was published (ADR-0006). Only ``user-authored`` tools may run
+    #: without an isolating sandbox; a tool missing here (e.g. in a bundle published before this field existed)
+    #: is ``untrusted``. Nodestro's own API ignores this claim and asks the studio's provenance instead
+    #: (a restored database can carry any claim); an exported project uses it.
+    tool_trust: dict[str, TrustClass] = Field(default_factory=dict)
     builtin_tools: list[str] = Field(default_factory=list)
     server_tools: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
@@ -102,8 +109,11 @@ class ReleaseBundle(BaseModel):
     created_at: str = Field(default_factory=lambda: now().isoformat())
 
     def digest(self) -> str:
-        """SHA-256 of the content (without the creation time): equal bundles, equal digest."""
-        data = self.model_dump(mode="json", exclude={"created_at"})
+        """SHA-256 of the content (without the creation time): equal bundles, equal digest.
+
+        An empty ``tool_trust`` is left out, so bundles published before it existed keep their digest."""
+        exclude = {"created_at"} if self.tool_trust else {"created_at", "tool_trust"}
+        data = self.model_dump(mode="json", exclude=exclude)
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
     def all_workflows(self) -> list[Workflow]:
@@ -132,6 +142,15 @@ class ReleaseBundle(BaseModel):
             return found.workflow.model_copy(deep=True), found.version
 
         return resolve
+
+    def provenance(self) -> MemoryProvenance:
+        """The recorded ``user-authored`` tool versions of the bundle, for a :class:`ToolLibrary` of its tools."""
+        provenance = MemoryProvenance()
+        for name, trust in self.tool_trust.items():
+            record = self.tools.get(name)
+            if trust == "user-authored" and record is not None:
+                provenance.record_authored(name, int(record.get("version") or 1))
+        return provenance
 
     def tool_marker(self, name: str) -> str:
         record = self.tools.get(name)

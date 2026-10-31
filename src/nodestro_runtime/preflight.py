@@ -537,7 +537,7 @@ def _mark_unapproved(issues: list[ConfigIssue], pending: set[str]) -> list[Confi
 
 def _dependency_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
     """Third-party libraries of the workflow's tools: resolvable, approved, installed?"""
-    from .python_tools import state_problem
+    from .python_tools import libraries_problem, needs_isolated_libraries, state_problem
 
     tool_nodes: dict[str, str] = {}
     for node in workflow.nodes:
@@ -570,6 +570,18 @@ def _dependency_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIss
             reason = state_problem(status)
             level: Literal["error", "warning", "info"] = "warning" if status.state == "install_needed" else "error"
             found.append(_issue(reason.code, reason.message, level=level, **reason.params))
+    for name, node_id in tool_nodes.items():
+        if name not in nodestro.tools or name in nodestro.tools.builtin:
+            continue
+        info = nodestro.tools.get(name)
+        own = nodestro.python.needed_for_sources([(name, info.code or "", info.tests or "")])
+        if needs_isolated_libraries(nodestro.tools, nodestro.python, info.trust, own):
+            found_problem = libraries_problem(name)
+            found.append(
+                _issue(
+                    found_problem.code, found_problem.message, level="error", node_id=node_id, **found_problem.params
+                )
+            )
     drafts = {draft.name: draft for draft in nodestro.tool_drafts.pending() if draft.dependencies}
     for name, node_id in tool_nodes.items():
         draft = drafts.get(name)

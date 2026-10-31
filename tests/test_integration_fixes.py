@@ -248,11 +248,17 @@ def test_generated_tools_never_build_a_package_while_resolving(make: Make) -> No
     workspace = make(python_runner=uv)
     code = '# /// script\n# dependencies = ["onlysource"]\n# ///\nimport onlysource\n'
     outcome = workspace.tools.dependencies.prepare("measure", code, "")
-    assert uv.builds == [False]
-    assert outcome.plan is not None and outcome.plan["error"]["code"] == "deps.build_required"
-    assert outcome.plan["error"]["params"] == {"name": "onlysource"}
-    # A person who asks for the plan may still resolve it (and then approve the installation).
+    # Generated code is untrusted (ADR-0006): its libraries would run without isolation, so the tool job
+    # does not even resolve them and asks for a standard-library version instead.
+    assert uv.builds == [] and outcome.plan is None
+    assert outcome.feedback is not None and "standard library" in outcome.feedback
+    # The plan a tool job would ask for never builds a package.
     needed = workspace.python.needed_for_sources([("measure", code, "")])
+    unbuilt = workspace.python.plan("tool", "measure", needed, builds=False)
+    assert uv.builds == [False]
+    assert unbuilt.error is not None and unbuilt.error.code == "deps.build_required"
+    assert unbuilt.error.params == {"name": "onlysource"}
+    # A person who asks for the plan may still resolve it (and then approve the installation).
     plan = workspace.python.plan("tool", "measure", needed)
     assert uv.builds[-1] is True and plan.error is None and plan.lock
 
