@@ -48,7 +48,23 @@ IMAGE_REPOSITORY = "nodestro-env"
 LOCK_LABEL = "org.nodestro.lock-sha256"
 _PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
+#: Base images of environment images, pinned by the digest of their multi-platform index (amd64 and arm64), so a
+#: build is reproducible and a changed upstream tag cannot slip into it. Update them together, on purpose, with
+#: ``docker buildx imagetools inspect python:<v>-slim``; every update gives every environment a new image tag.
+BASE_IMAGES: dict[str, str] = {
+    "3.10": "python:3.10-slim@sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d",
+    "3.11": "python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60",
+    "3.12": "python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159",
+    "3.13": "python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb",
+    "3.14": "python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8",
+}
 _BUILD_TIMEOUT = 1800.0
+
+
+def default_base(python_version: str) -> str:
+    """The pinned base image of a Python version (:data:`BASE_IMAGES`); other versions fall back to the plain tag."""
+    return BASE_IMAGES.get(python_version, f"python:{python_version}-slim")
+
 
 _DOCKERFILE = """\
 # Built by Nodestro from an approved lock file (nodestro_runtime.container_images).
@@ -104,7 +120,7 @@ class ContainerImages:
         self,
         *,
         docker: str = "docker",
-        base: Callable[[str], str] = lambda python_version: f"python:{python_version}-slim",
+        base: Callable[[str], str] = default_base,
         environ: Mapping[str, str] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
