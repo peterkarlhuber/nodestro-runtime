@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import re
 import threading
+import time
 from typing import Any, Literal
 
 from orkexa.pricing import BUILTIN_SNAPSHOT, ModelPrice, PriceResolver, PriceSnapshot, PricingError
@@ -165,6 +166,8 @@ class PricingEvent(BaseModel):
 
     id: str = Field(default_factory=lambda: new_id("prc"))
     at: datetime = Field(default_factory=now)
+    #: Wall-clock nanoseconds when the event was written: orders events with the same ``at``.
+    recorded_ns: int = Field(default_factory=time.time_ns)
     kind: EventKind
     #: ``reference`` for reference prices, ``workspace`` for overrides and reviews of this workspace.
     scope: Literal["reference", "workspace"] = "reference"
@@ -428,7 +431,7 @@ class PricingService:
         if self.store is not self.reference_store:
             events = [event for event in events if event.scope == "reference"]
             events += [event for event in self.store.list(EVENTS, PricingEvent) if event.scope == "workspace"]
-        return sorted(events, key=lambda event: event.at, reverse=True)[:limit]
+        return sorted(events, key=lambda event: (event.at, event.recorded_ns), reverse=True)[:limit]
 
     def effective_snapshot(self) -> PriceSnapshot:
         """The reference snapshot with the workspace's overrides applied: the prices Orkexa uses."""
@@ -648,6 +651,7 @@ class PricingService:
         - Invalid prices are dropped; a candidate whose prices are mostly invalid, or that has fewer than
           ``min_share`` of the prices the active snapshot holds from the same sources, is rejected as a whole
           (a broken or truncated download), and the active prices stay unchanged.
+        - An unconfirmed price never replaces an officially confirmed price of another source.
         - Changes that need review are held back in a ``pending_review`` snapshot; the active prices keep the
           old values for those models until the review is approved.
         - Everything else is activated atomically as a new version.
@@ -679,6 +683,19 @@ class PricingService:
                 )
                 return SubmitResult(outcome="rejected", active_version=active.version, issues=issues, reason=reason)
 
+            # An unconfirmed price never replaces an officially confirmed one of another source (LiteLLM's
+            # Anthropic prices next to Orkexa's verified ones): the confirmed price stays, without a review case.
+            confirmed = {
+                (price.provider, price.model): price.source
+                for price in active.prices
+                if price.quality in CONFIRMED_QUALITIES
+            }
+            valid = [
+                price
+                for price in valid
+                if price.quality in CONFIRMED_QUALITIES
+                or confirmed.get((price.provider, price.model), price.source) == price.source
+            ]
             changes = diff_snapshots(
                 active, valid, review_change_ratio=self.settings.review_change_ratio, sources=sources
             )

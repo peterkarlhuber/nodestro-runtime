@@ -16,7 +16,8 @@ Managed model prices (PRICING-1, phases N1, N2 and N4):
   and drops invalid ones. It rejects a candidate that is empty, mostly invalid or truncated, and the active
   prices stay as they are. Rate changes above 20 % without official confirmation (quality `verified` or
   `contract`) and models that vanish from their source are held back as `pending_review`; everything else is
-  activated. `approve()`/`reject()` decide a review.
+  activated. An unconfirmed price never replaces an officially confirmed price of another source.
+  `approve()`/`reject()` decide a review.
 - Every price has a status (`current`, `stale`, `unknown`, `pending_review`, `custom`) and, separately,
   Orkexa's quality and its source. Freshness defaults: a warning after 48 hours without a successful check and
   `critical` after seven days (`PricingSettings`).

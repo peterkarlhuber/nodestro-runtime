@@ -399,3 +399,19 @@ def test_stored_snapshots_use_orkexas_format(service: PricingService) -> None:
     assert isinstance(record, StoredSnapshot)
     assert record.data["format"] == "orkexa.price-snapshot/1"
     assert record.content_hash == record.snapshot().content_hash()
+
+
+def test_an_unconfirmed_price_never_replaces_a_confirmed_one(service: PricingService) -> None:
+    verified = service.entry("anthropic", "claude-sonnet-5-5")
+    assert verified is not None and verified.quality == "verified"
+    result = service.submit(
+        _candidate(
+            "litellm-1",
+            _price("claude-sonnet-5-5", "9", "15", provider="anthropic"),
+            _price("gpt-5.5", "1.25", "10"),
+        )
+    )
+    assert result.outcome == "activated"
+    assert all(change.model != "claude-sonnet-5-5" for change in result.changes)
+    after = service.entry("anthropic", "claude-sonnet-5-5")
+    assert after is not None and after.input_usd_per_mtok == verified.input_usd_per_mtok
