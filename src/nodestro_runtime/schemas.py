@@ -650,7 +650,8 @@ class BuiltinSandboxStatus(_Model):
 
     available: bool = False
     #: Why not: ``platform``, ``untested-system``, ``landlock``, ``seccomp``, ``root``, ``paths``, ``verify``,
-    #: ``failed``, or ``server`` (a server runs tool code in containers only); empty when available.
+    #: ``failed``, or ``server`` (a server or Nodestro Local Docker: tool code runs in containers only); empty when
+    #: available.
     reason: str = ""
     #: The technical detail in English (for support), e.g. "Landlock not enabled in this kernel".
     detail: str = ""

@@ -77,7 +77,7 @@ def test_the_server_profile_starts_only_with_its_settings(tmp_path: Path) -> Non
         secret_key=b"k" * 32,
     )
     assert server.validate(settings) is server
-    assert PROFILE_KINDS == ("desktop", "server")
+    assert PROFILE_KINDS == ("desktop", "server", "local-container")
 
 
 # ---- the environment ----------------------------------------------------------------------
@@ -106,7 +106,7 @@ def test_invalid_environment_values_are_refused_all_at_once() -> None:
         {
             "field": ENV_PROFILE,
             "value": "production",
-            "reason": "NODESTRO_PROFILE='production' is not a profile (choose desktop or server)",
+            "reason": "NODESTRO_PROFILE='production' is not a profile (choose desktop, server or local-container)",
         }
     ]
     with pytest.raises(NodestroError) as error:
@@ -216,3 +216,36 @@ def test_a_server_workspace_without_tenant_storage_is_refused_without_side_effec
     with Workspace(existing, integrations=[]) as workspace:
         assert workspace.profile.kind == "desktop"
     assert {LOCK_FILE, DATABASE} <= set(os.listdir(existing))
+
+
+# ---- the local container (Nodestro Local Docker) ------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["local-container", "LOCAL-CONTAINER", " local_container "])
+def test_the_environment_chooses_the_local_container(value: str, tmp_path: Path) -> None:
+    profile = RuntimeProfile.from_env({ENV_PROFILE: value, ENV_DATA_DIR: str(tmp_path)})
+    assert profile.kind == "local-container"
+    assert profile.validate() is profile
+
+
+def test_a_local_container_workspace_is_one_person_on_sqlite_with_containers_only(tmp_path: Path) -> None:
+    from nodestro_runtime.container_images import RuntimeImageSandbox
+    from nodestro_runtime.workspace import LOCAL_TENANT
+
+    profile = RuntimeProfile(kind="local-container", data_dir=tmp_path / "data")
+    with Workspace(profile=profile, integrations=[]) as workspace:
+        assert workspace.tenant_id == LOCAL_TENANT
+        assert (tmp_path / "data" / DATABASE).is_file() and (tmp_path / "data" / LOCK_FILE).exists()
+        assert workspace.sandbox_policy.profile == "local-container"
+        # Tool code runs in containers of the runtime image (no bind mounts: the daemon is the host's).
+        assert isinstance(workspace.tools.registry.sandbox, RuntimeImageSandbox)
+        assert workspace.python.containers()
+        settings = workspace.settings()
+        assert settings.sandbox == "docker"
+        assert settings.builtin_sandbox.available is False and settings.builtin_sandbox.reason == "server"
+        assert "Local Docker" in settings.builtin_sandbox.detail
+        with pytest.raises(NodestroError) as error:
+            from nodestro_runtime.schemas import SettingsIn
+
+            workspace.update_settings(SettingsIn(sandbox="subprocess"))
+        assert error.value.code == "sandbox.unavailable" and "Local Docker" in str(error.value)

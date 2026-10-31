@@ -13,12 +13,16 @@ The policy, not the call site, decides whether a sandbox may run a class. Two sa
 * a container (:class:`orkexa.dynamic.DockerSandbox`), in every profile;
 * the built-in Linux sandbox (:class:`nodestro_runtime.builtin_sandbox.LinuxSandbox`, Landlock and seccomp), in the
   desktop profile only, and only on a computer where its self-test passed and whose distribution is one of the
-  tested systems (:data:`nodestro_runtime.builtin_sandbox.TESTED_SYSTEMS`).
+  tested systems (:data:`nodestro_runtime.builtin_sandbox.TESTED_SYSTEMS`). In the ``local-container`` profile it
+  does not count: inside a container the self-test can pass (a Debian 13 image on a host kernel with Landlock), but
+  the sandbox was validated for a person's own computer, not for the Nodestro container, which holds the data and
+  the keys; there tool code runs in sandbox containers (:mod:`nodestro_runtime.sandbox_gateway`).
 
 Untrusted code never runs in a host subprocess: without an isolating sandbox it is refused with
 ``sandbox.isolation_required``, and the message says why the built-in sandbox is not available. No setting,
-environment variable or confirmation changes that, and there is no fallback to a host subprocess. In the server
-profile every class except ``trusted`` needs a container, and a host subprocess sandbox cannot be created at all.
+environment variable or confirmation changes that, and there is no fallback to a host subprocess. In the server and
+``local-container`` profiles every class except ``trusted`` needs a container, and a host subprocess sandbox cannot
+be created at all.
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ class SandboxPolicy:
 
     def accepts(self, isolation: Isolation) -> bool:
         """Whether this profile counts ``isolation`` as isolating: a container everywhere, the built-in Linux sandbox
-        only on the desktop (a server keeps its tenants' code in containers)."""
+        only on the desktop (a server keeps its tenants' code in containers, and so does the local container)."""
         if isolation == "container":
             return True
         return isolation == "kernel" and self.profile == "desktop"
@@ -102,9 +106,10 @@ class SandboxPolicy:
     def check_construction(self, isolation: Isolation) -> None:
         """Raise ``sandbox.unavailable`` for a sandbox kind the profile does not allow at all."""
         if self.profile != "desktop" and isolation != "container":
+            product = "Nodestro Local Docker" if self.profile == "local-container" else "The server profile"
             raise NodestroError(
                 "sandbox.unavailable",
-                "The server profile runs tool code only in containers; a host subprocess sandbox is not available",
+                f"{product} runs tool code only in containers; a host subprocess sandbox is not available",
             )
 
 

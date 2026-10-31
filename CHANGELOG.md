@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+Nodestro Local Docker (the `local-container` profile and the sandbox gateway):
+
+- New operating profile `local-container` (`NODESTRO_PROFILE=local-container`, also `local_container`): one person
+  and SQLite like the desktop, for a runtime that runs in a container and is used from the host's browser. Tool code
+  that needs isolation runs only in containers there, as on a server: every trust class except `trusted` needs a
+  container, a host subprocess sandbox cannot be created (`sandbox.unavailable`), and the built-in Linux sandbox does
+  not count as isolating inside the container (its self-test could pass in a Debian 13 image, but it was validated for
+  a person's own computer, not for a container that holds the data and keys). Tool code without libraries runs in the
+  runtime image, environments become images (`RuntimeImageSandbox`, no bind mounts). `builtin_sandbox.reason` is
+  `server` (containers only) with its own detail text. `SINGLE_USER_PROFILES` names the profiles of one person.
+- New `nodestro_runtime.sandbox_gateway` (`python -m nodestro_runtime.sandbox_gateway --listen SOCKET`): a Docker
+  Engine API endpoint on a UNIX socket that holds the real daemon's socket and forwards only what Nodestro's
+  sandboxes need, in their safe form. Containers are created from image, command and working directory only; the
+  gateway sets no network, a read-only root file system, no capabilities, `no-new-privileges`, user 65534, memory,
+  CPU and process limits up to its maxima, two `noexec` tmpfs and its label, and refuses requests for anything else
+  (privileged, mounts, devices, host namespaces, ports, other images, unmasked paths). Only containers it created
+  can be attached to, started, waited for, killed, inspected or removed; it removes them after a maximum lifetime and
+  at start and stop, and limits how many run at once. Images can only be built from exactly the runtime's Dockerfile,
+  with a lock of exact versions with hashes, the gateway's own Orkexa and the tag the runtime computes; only
+  `nodestro-env:<key>` images can be inspected or removed. Everything else (exec, archives, pulls, volumes,
+  networks, events, BuildKit sessions) is refused. Limits: `NODESTRO_SANDBOX_MAX_CONTAINERS`, `_MAX_MEMORY_MB`,
+  `_MAX_CPUS`, `_MAX_PIDS`, `_MAX_LIFETIME`, `_BUILD_NETWORK`, `_INSTANCE`. Tests: the policy on the requests docker
+  29 really sends and on hostile ones, the protocol (including attach with half-close) against a stand-in daemon,
+  and with `NODESTRO_DOCKER_TESTS=1` a real image build, a tool call without network or writable files, and refused
+  escape attempts through the docker CLI.
+
 Price refusals with their own codes (PRICING-1, strict price mode):
 
 - A request refused because its model has no known price (Orkexa's `UnpricedModelError`) now fails with
