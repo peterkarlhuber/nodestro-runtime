@@ -57,6 +57,47 @@ def request_key(run_id: str, request_id: str) -> str:
     return f"{run_id}:{request_id}"
 
 
+# ---- the audit trail ------------------------------------------------------------------------------------------
+
+AUDIT = "tool_approval_audit"
+#: The newest audit events kept per tenant (older ones are dropped when the trail is read).
+MAX_AUDIT = 5000
+
+AuditKind = Literal["decided", "decision_refused", "pre_granted", "pre_grant_revoked", "legacy_stamped"]
+
+
+class ToolApprovalEvent(BaseModel):
+    """One entry of a tenant's approval audit trail: who decided, granted or revoked what, when; and every refused
+    decision with its problem code. Never holds the call's arguments (only their hash)."""
+
+    id: str = Field(default_factory=lambda: new_id("tae"))
+    at: datetime = Field(default_factory=now)
+    kind: AuditKind
+    actor: str
+    tool: str | None = None
+    run_id: str | None = None
+    request_id: str | None = None
+    pre_grant_id: str | None = None
+    #: ``approved`` / ``rejected`` for decisions; the problem code for refused ones.
+    outcome: str | None = None
+    arguments_hash: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+def record_audit(store: DocumentStore, event: ToolApprovalEvent) -> ToolApprovalEvent:
+    store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
+    return event
+
+
+def audit_events(store: DocumentStore, *, limit: int = 200) -> list[ToolApprovalEvent]:
+    """The newest audit events first."""
+    items = store.items(AUDIT, ToolApprovalEvent)
+    items.sort(key=lambda pair: pair[0], reverse=True)
+    for key, _ in items[MAX_AUDIT:]:
+        store.delete(AUDIT, key)
+    return [event for _, event in items[:limit]]
+
+
 class ToolApprovalRequest(BaseModel):
     id: str = Field(default_factory=lambda: new_id("tap"))
     run_id: str
@@ -171,6 +212,11 @@ class ToolApprovals:
     def pending(self, run_id: str) -> list[ToolApprovalRequest]:
         return [item for item in self.of_run(run_id) if item.status == "pending"]
 
+    def open(self) -> list[ToolApprovalRequest]:
+        """Every pending request of the tenant, oldest first (the approval inbox; also after a restart)."""
+        found = [item for _, item in self.store.items(COLLECTION, ToolApprovalRequest) if item.status == "pending"]
+        return sorted(found, key=lambda item: (item.requested_at, item.id))
+
     def of_run(self, run_id: str) -> list[ToolApprovalRequest]:
         """The requests of a run, oldest first."""
         found = self.store.list_prefix(COLLECTION, f"{run_id}:", ToolApprovalRequest)
@@ -189,7 +235,51 @@ class ToolApprovals:
         """Approve or reject a pending request. ``arguments`` is the :func:`arguments_hash` the person was shown: a
         decision about other arguments or another tool definition is refused (``tool.approval_stale``), and so is a
         decision after the deadline (``tool.approval_expired``) or about a request that was decided already
-        (``tool.approval_decided``)."""
+        (``tool.approval_decided``). Every decision and every refused one is written to the audit trail."""
+        try:
+            decided = self._decide(run_id, request_id, approved=approved, by=by, arguments=arguments, comment=comment)
+        except NodestroError as problem:
+            self._audit("decision_refused", by, run_id, request_id, arguments, outcome=problem.code)
+            raise
+        self._audit("decided", by, run_id, request_id, arguments, outcome=decided.status, tool=decided.tool)
+        return decided
+
+    def _audit(
+        self,
+        kind: AuditKind,
+        actor: str,
+        run_id: str,
+        request_id: str,
+        arguments: str,
+        *,
+        outcome: str,
+        tool: str | None = None,
+    ) -> None:
+        if tool is None:
+            found = self.get(run_id, request_id)
+            tool = found.tool if found is not None else None
+        event = ToolApprovalEvent(
+            at=self.clock(),
+            kind=kind,
+            actor=actor,
+            tool=tool,
+            run_id=run_id,
+            request_id=request_id,
+            outcome=outcome,
+            arguments_hash=arguments,
+        )
+        record_audit(self.store, event)
+
+    def _decide(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        approved: bool,
+        by: str,
+        arguments: str,
+        comment: str | None,
+    ) -> ToolApprovalRequest:
         found = self.get(run_id, request_id)
         if found is None:
             raise NodestroError("tool.approval_not_found", "There is no such approval request", request_id=request_id)
@@ -367,25 +457,53 @@ class ToolPreGrants:
             expires_at=expires_at,
         )
         self.store.put(PRE_GRANTS, f"{scope}:{scope_id}:{found.id}", found)
+        record_audit(
+            self.store,
+            ToolApprovalEvent(
+                at=at,
+                kind="pre_granted",
+                actor=by,
+                tool=tool,
+                pre_grant_id=found.id,
+                details={"scope": scope, "scope_id": scope_id, "version": version, "expires_at": expires_at},
+            ),
+        )
         return found
+
+    def all(self) -> list[ToolPreGrant]:
+        """Every pre-grant of the tenant (revoked and expired ones included), newest first."""
+        found = [item for _, item in self.store.items(PRE_GRANTS, ToolPreGrant)]
+        return sorted(found, key=lambda item: (item.granted_at, item.id), reverse=True)
 
     def of_scope(self, scope: PreGrantScope, scope_id: str) -> list[ToolPreGrant]:
         """Every pre-grant stored for the scope, revoked and expired ones included (``decide`` filters them)."""
         return self.store.list_prefix(PRE_GRANTS, f"{scope}:{scope_id}:", ToolPreGrant)
 
-    def revoke(self, scope: PreGrantScope, scope_id: str, grant_id: str) -> ToolPreGrant:
+    def revoke(self, scope: PreGrantScope, scope_id: str, grant_id: str, *, by: str) -> ToolPreGrant:
         key = f"{scope}:{scope_id}:{grant_id}"
         found = self.store.get(PRE_GRANTS, key, ToolPreGrant)
         if found is None:
             raise NodestroError("tool.pre_grant_not_found", "There is no such pre-grant", id=grant_id)
         if found.revoked_at is not None:
             return found
-        revoked = found.model_copy(update={"revoked_at": self.clock()})
+        revoked = found.model_copy(update={"revoked_at": self.clock(), "revoked_by": by})
         self.store.put(PRE_GRANTS, key, revoked)
+        record_audit(
+            self.store,
+            ToolApprovalEvent(
+                at=revoked.revoked_at or self.clock(),
+                kind="pre_grant_revoked",
+                actor=by,
+                tool=found.tool,
+                pre_grant_id=found.id,
+                details={"scope": scope, "scope_id": scope_id},
+            ),
+        )
         return revoked
 
 
 __all__ = [
+    "AUDIT",
     "COLLECTION",
     "DEFAULT_WAIT",
     "DESKTOP_MAX_WAITING",
@@ -395,6 +513,8 @@ __all__ = [
     "MAX_WAIT",
     "PRE_GRANTS",
     "ApprovalStatus",
+    "AuditKind",
+    "ToolApprovalEvent",
     "ToolApprovalRequest",
     "ToolApprovals",
     "ToolGate",
@@ -402,5 +522,7 @@ __all__ = [
     "WaitingSlots",
     "approvals_enabled",
     "arguments_hash",
+    "audit_events",
+    "record_audit",
     "request_key",
 ]

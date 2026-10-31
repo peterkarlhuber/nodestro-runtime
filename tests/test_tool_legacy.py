@@ -74,6 +74,7 @@ def test_activation_stamps_every_existing_binding_visibly_and_once(workspace: Wo
     assert workspace.store.get_raw("tool_approvals_activation", "legacy") is not None
     again = workspace.stamp_legacy_tool_bindings()
     assert again.bindings == [] and again.workflows == 0
+    assert workspace.legacy_tool_bindings() == report  # a second activation keeps the exemptions listed
 
 
 async def test_a_legacy_binding_runs_unasked_until_the_tool_changes(workspace: Workspace) -> None:

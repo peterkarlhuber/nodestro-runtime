@@ -183,6 +183,15 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   one schedule, batch or test series, with who and when, an optional expiry and revocation; refused for MCP and
   `destructive` tools and for tools without a version (`tool.pre_grant_*`). The workspace's gate reads them per
   call, so a revocation applies at the next call.
+- Approval audit trail (S-2b, D10): collection `tool_approval_audit` (`tool_approvals.ToolApprovalEvent`,
+  `record_audit`, `audit_events`, newest 5000 kept) records every decision, every refused decision with its problem
+  code, every pre-grant and revocation and the activation step, with actor and time, never the call's arguments
+  (only their hash). `ToolApprovals.open()` lists the tenant's open requests of all runs (the approval inbox),
+  `ToolPreGrants.all()` the pre-grants; `ToolPreGrant.revoked_by` and `ToolPreGrants.revoke(..., by=)` name who
+  revoked; `Workspace.legacy_tool_bindings()` reads the activation report and `stamp_legacy_tool_bindings(by=)`
+  names who activated. `LegacyBinding.release` names a published release stamped by the API's activation step.
+  Fix: running the activation step again no longer replaces the stored report with an empty one;
+  `record_legacy_tool_bindings` adds to it, so earlier exemptions stay listed.
 - Changing MCP tools behind the gate (WP-5, D10c): with `NODESTRO_TOOL_APPROVALS=1` the workspace sets
   `McpService.write_gate`, so approved `write`/`destructive` MCP tools become usable, and every such call is asked,
   whatever the binding says (no `never`, no legacy exemption, no pre-grant). The approval binds the arguments and the
