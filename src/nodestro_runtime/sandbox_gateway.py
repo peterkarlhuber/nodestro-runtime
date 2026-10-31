@@ -688,6 +688,10 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 # ---- the gateway ------------------------------------------------------------------------------------------------
 
 
+#: What ``/info`` must report as ``true`` before a sandbox container or image build is started.
+_LIMIT_FEATURES = ("MemoryLimit", "PidsLimit", "CpuCfsQuota", "CpuCfsPeriod")
+
+
 class Gateway:
     """Serves the policy above on a UNIX socket and forwards what it allows to the Docker daemon."""
 
@@ -697,6 +701,7 @@ class Gateway:
         self.containers: dict[str, str] = {}
         self._builds = asyncio.Semaphore(config.max_builds)
         self._creating = asyncio.Lock()
+        self._limits_enforced = False
 
     # -- daemon access --
 
@@ -719,6 +724,25 @@ class Gateway:
             return status, json.loads(payload) if payload.strip() else None
         except ValueError:
             return status, None
+
+    async def require_limits(self) -> None:
+        """Refuse to create or build anything when the daemon cannot enforce the sandbox's resource limits.
+
+        Docker discards memory, CPU and process limits it cannot apply and only warns about it, for example rootless
+        Docker without cgroup v2 delegation. Tool code would then run without limits, so nothing is started (503).
+        Once the daemon has confirmed its limits, they are not asked for again."""
+        if self._limits_enforced:
+            return
+        status, info = await self.call("GET", "/info")
+        missing = [name for name in _LIMIT_FEATURES if not (isinstance(info, dict) and info.get(name) is True)]
+        if status != 200 or missing:
+            raise Refused(
+                "The Docker daemon cannot enforce the sandbox's resource limits "
+                f"({', '.join(missing) or f'HTTP {status}'}), so no tool code is run. "
+                "Rootless Docker needs cgroup v2 with delegated controllers (see Docker's rootless documentation)",
+                503,
+            )
+        self._limits_enforced = True
 
     # -- bookkeeping --
 
@@ -806,6 +830,7 @@ class Gateway:
             logger.debug("create %s", json.dumps(parsed)[:4000])
             query, body = plan_create(request.query, parsed, self.config)
             target = f"{prefix}/containers/create?{urlencode(query)}"
+            await self.require_limits()
             async with self._creating:
                 if len(self.containers) >= self.config.max_containers:
                     await self.reconcile()
@@ -818,6 +843,7 @@ class Gateway:
             target = f"{prefix}/build?{urlencode(query)}"
             request.headers = [(key, value) for key, value in request.headers if key.lower() != "content-type"]
             request.headers.append(("Content-Type", "application/x-tar"))
+            await self.require_limits()
             async with self._builds:
                 await self._forward(request, target, body, reader, writer)
             return

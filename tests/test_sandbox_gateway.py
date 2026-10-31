@@ -431,6 +431,8 @@ class FakeDaemon:
         self.requests: list[tuple[str, str, bytes]] = []
         self.containers: dict[str, dict[str, Any]] = {}
         self.created = 0
+        #: What ``/info`` reports about the daemon's resource limits.
+        self.limits = True
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -450,6 +452,10 @@ class FakeDaemon:
             answer = json.dumps({"Id": container_id, "Warnings": []}).encode()
             writer.write(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n")
             writer.write(f"Content-Length: {len(answer)}\r\n\r\n".encode() + answer)
+        elif path.endswith("/info"):
+            features = ("MemoryLimit", "PidsLimit", "CpuCfsQuota", "CpuCfsPeriod")
+            answer = json.dumps({name: self.limits for name in features}).encode()
+            writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.endswith("/attach"):
             writer.write(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
             data = await reader.read()  # until the client half-closes
@@ -654,6 +660,25 @@ async def test_at_most_max_containers_exist_at_once(gateway: tuple[FakeDaemon, s
     assert len(instance.containers) == 2
 
 
+async def test_nothing_starts_when_the_daemon_cannot_enforce_limits(
+    gateway: tuple[FakeDaemon, str, Gateway],
+) -> None:
+    # Rootless Docker without cgroup v2 delegation drops memory, CPU and process limits with only a warning.
+    daemon, listen, instance = gateway
+    daemon.limits = False
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and b"resource limits" in answer
+    assert daemon.created == 0 and instance.containers == {}
+    answer = await _send(listen, b"POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
+    assert not any(target.startswith("/build") for _, target, _ in daemon.requests)
+    daemon.limits = True  # asked again until the daemon confirms them, then remembered
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
+    daemon.limits = False
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 2
+
+
 async def test_expired_and_leftover_containers_are_removed(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
     daemon, listen, instance = gateway
     await _send(listen, _post("/v1.51/containers/create", body()))
@@ -662,8 +687,8 @@ async def test_expired_and_leftover_containers_are_removed(gateway: tuple[FakeDa
     daemon.containers[first]["Created"] -= 3600
     await instance.reconcile()
     assert list(daemon.containers) == [second] and list(instance.containers) == [second]
-    filters = [target for method, target, _ in daemon.requests if method == "GET"]
-    assert all("dev.nodestro.sandbox%3Dtest" in target for target in filters)
+    filters = [target for method, target, _ in daemon.requests if method == "GET" and "/containers/json" in target]
+    assert filters and all("dev.nodestro.sandbox%3Dtest" in target for target in filters)
     await instance.reconcile(remove_all=True)  # at start and stop
     assert daemon.containers == {} and instance.containers == {}
 

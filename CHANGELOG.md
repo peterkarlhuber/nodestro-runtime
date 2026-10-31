@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Sandbox gateway: no tool code without enforced resource limits (Nodestro Local Docker):
+
+- **Fixed: sandbox containers could run without memory, CPU and process limits.** Docker drops limits it cannot
+  apply and only warns, for example rootless Docker without cgroup v2 delegation (found in the rootless Docker end-to-end
+  run). The gateway now asks the daemon's `/info` before the first container create or image build and refuses both
+  with 503 until `MemoryLimit`, `PidsLimit`, `CpuCfsQuota` and `CpuCfsPeriod` are confirmed.
+
 Sandbox gateway security fixes (Nodestro Local Docker):
 
 - **Fixed: request smuggling to the Docker daemon.** A header value with a bare line feed (`User-Agent: x\n\nGET
