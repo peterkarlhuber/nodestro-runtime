@@ -209,7 +209,9 @@ class Workspace:
         data_dir = profile.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
-        self._directory_lock = DataDirectoryLock(data_dir)
+        # A tenant's workspace on a server is opened by several API and worker processes at once (ADR-0004): the
+        # database coordinates them (job leases), so the directory lock of the desktop does not apply.
+        self._directory_lock: DataDirectoryLock | None = DataDirectoryLock(data_dir) if storage is None else None
         # Installed integrations are optional: one that does not fit is left out (and logged) instead
         # of stopping the runtime; integrations passed explicitly must fit.
         self.extensions = Extensions(
@@ -228,7 +230,8 @@ class Workspace:
                 self._sqlite.migrate(before_migration=before_migration or self._backup_before_migration)
             except BaseException:
                 self._sqlite.close()
-                self._directory_lock.release()
+                if self._directory_lock is not None:
+                    self._directory_lock.release()
                 raise
             self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(database)
@@ -290,13 +293,16 @@ class Workspace:
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None
         self.compose()
-        # Runs that were executing when Nodestro stopped can never finish; they become continuable.
-        self.runs.recover()
-        # The same for installations of Python environments (the last working environment is kept).
-        try:
-            self.python.recover()
-        except Exception:  # housekeeping; it never stops Nodestro from starting
-            logging.getLogger(__name__).exception("Recovering interrupted Python installations failed")
+        # On a server, other processes execute this tenant's runs right now; runs whose worker died are found by
+        # the job reaper (nodestro_runtime.jobs.reap), never by a process that merely opens the workspace.
+        if storage is None:
+            # Runs that were executing when Nodestro stopped can never finish; they become continuable.
+            self.runs.recover()
+            # The same for installations of Python environments (the last working environment is kept).
+            try:
+                self.python.recover()
+            except Exception:  # housekeeping; it never stops Nodestro from starting
+                logging.getLogger(__name__).exception("Recovering interrupted Python installations failed")
         # Uploads nobody used (e.g. a run dialog that was closed) are removed after a day.
         try:
             self.inputs.cleanup()
@@ -350,7 +356,8 @@ class Workspace:
         self.knowledge.close()
         self.memory.close()
         self.store.close()
-        self._directory_lock.release()
+        if self._directory_lock is not None:
+            self._directory_lock.release()
 
     async def aclose(self) -> None:
         """Cancel the runs of this process, wait until they stored their final state, then :meth:`close`."""

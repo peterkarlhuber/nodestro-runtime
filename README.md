@@ -109,6 +109,15 @@ wait in the database for their approval and continue after the next start. Runs 
 process stopped are marked as interrupted (`run.interrupted`) when the data directory is opened again and can
 be continued.
 
+**Workers (server, ADR-0004).** A workspace on handed-in tenant storage takes no directory lock and recovers
+nothing when it opens, because API and worker processes open the same tenant at once. `nodestro_runtime.jobs`
+coordinates them through PostgreSQL: `QueuedRuns(queue, tenant, workspace.runs).attach()` makes an API process
+store and queue runs instead of executing them; `RunWorker(queue, workspaces).serve(stop)` claims run jobs
+(`FOR UPDATE SKIP LOCKED`), executes them, renews their leases and writes their events to `nodestro_run_events`
+(`PostgresEventLog`); `reap(queue, workspaces)` marks the runs of jobs whose lease expired as interrupted. Such a
+run is never executed again by itself. `LeaderLock` and `ScheduleFirings` let exactly one process fire each
+schedule slot once. Only runs go through the queue so far.
+
 **Operating profile.** A workspace serves one of two profiles (`nodestro_runtime.profile`): `desktop`, the
 default and the behavior described here, or `server` (many users, PostgreSQL, workers), which is planned and
 refused with `profile.server_unavailable` in this version. `Workspace(data_dir)` always opens the desktop profile,
