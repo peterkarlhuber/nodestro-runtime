@@ -1,26 +1,96 @@
-"""A small document store on SQLite: one JSON document per (collection, id).
+"""Document storage: the :class:`DocumentStore` contract and its SQLite implementation.
 
-Workflows, agent templates, runs and settings are stored as Pydantic models.
-The library's ``SQLiteMemory``, ``SQLiteFileStore`` and ``SQLiteIndex`` use
-their own tables in the same database file.
+Workflows, agent templates, runs and settings are stored as Pydantic models, one JSON document per
+(collection, id). Every component depends on :class:`DocumentStore` only; :class:`SQLiteStore` (``Store``
+for existing imports) keeps them in the table ``nodestro_documents`` of the data directory's database. The
+library's ``SQLiteMemory``, ``SQLiteFileStore`` and ``SQLiteIndex`` use their own tables in the same database
+file; the SQL that Nodestro runs on those tables is in :mod:`nodestro_runtime.sqlite_tables`.
+
+Schema versions (SQLite): the database records its version in ``PRAGMA user_version``. Every release so far
+uses version 0 and :data:`SCHEMA_VERSION` is 0, so opening a data directory changes nothing. A later release
+that needs a migration adds it to :data:`MIGRATIONS`; :meth:`SQLiteStore.migrate` then writes a backup first
+(the ``before_migration`` hook), runs every step in one transaction, and refuses a database written by a newer
+release (``storage.schema_too_new``) instead of misreading it.
 """
 
 from __future__ import annotations
 
 import builtins
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 import json
 from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
+from .problems import NodestroError
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+#: The schema version this release reads and writes (``PRAGMA user_version``; 0 since Nodestro 0.1).
+SCHEMA_VERSION = 0
+#: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
+#: transaction :meth:`SQLiteStore.migrate` opened (it must not commit).
+Migration = Callable[[sqlite3.Connection], None]
+#: The steps of this release, by the version they lead to. Empty: no release has needed one yet.
+MIGRATIONS: Mapping[int, Migration] = {}
+#: Called with (current version, target version) before a migration changes anything; writes a backup.
+BeforeMigration = Callable[[int, int], None]
+
+
+@runtime_checkable
+class DocumentStore(Protocol):
+    """JSON documents grouped into collections: the storage every Nodestro component uses.
+
+    Contract (tested for every implementation in ``tests/test_storage_contract.py``):
+
+    - ``put``/``put_raw`` insert or replace; ``put`` also marks the document as updated now, ``put_raw`` keeps the
+      update time of an existing document.
+    - ``list`` returns the most recently updated first (ties in id order); ``find``, in update order, the
+      documents whose top-level field has one of the values; ``items``, ``list_prefix`` in id order.
+      ``list_prefix``/``delete_prefix`` treat the prefix literally (``%`` and ``_`` are ordinary characters).
+    - ``search_raw`` returns ``(collection, JSON text)`` of the documents whose JSON text contains ``text``
+      (ASCII letters compared without case), for scans that look into documents of several collections.
+    - Every write is atomic. ``transaction`` groups writes: all of them are stored or none; it is reentrant,
+      and other threads wait until it ends.
+    - ``close`` is idempotent; ``closed`` says whether it was called.
+    """
+
+    @property
+    def closed(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+    def transaction(self) -> AbstractContextManager[None]: ...
+
+    def put(self, collection: str, key: str, model: BaseModel) -> None: ...
+
+    def put_raw(self, collection: str, key: str, value: Any) -> None: ...
+
+    def get_raw(self, collection: str, key: str) -> Any | None: ...
+
+    def get(self, collection: str, key: str, model: type[ModelT]) -> ModelT | None: ...
+
+    def list(self, collection: str, model: type[ModelT], *, limit: int | None = None) -> list[ModelT]: ...
+
+    def find(
+        self, collection: str, field: str, values: Iterable[str], model: type[ModelT]
+    ) -> builtins.list[ModelT]: ...
+
+    def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]: ...
+
+    def list_prefix(self, collection: str, prefix: str, model: type[ModelT]) -> builtins.list[ModelT]: ...
+
+    def delete_prefix(self, collection: str, prefix: str) -> int: ...
+
+    def delete(self, collection: str, key: str) -> bool: ...
+
+    def search_raw(self, collections: Iterable[str], text: str) -> builtins.list[tuple[str, str]]: ...
 
 
 def _like(prefix: str) -> str:
@@ -28,12 +98,13 @@ def _like(prefix: str) -> str:
     return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-class Store:
-    """Thread-safe JSON documents in SQLite, grouped into collections.
+class SQLiteStore:
+    """Thread-safe JSON documents in SQLite, grouped into collections (a :class:`DocumentStore`).
 
     One connection serves every thread; an ``RLock`` serializes its use. Each write is its own
     ``BEGIN IMMEDIATE`` transaction, and :meth:`transaction` groups several writes into one, so
-    related documents (a workflow and its version) are stored together or not at all.
+    related documents (a workflow and its version) are stored together or not at all. The database is in
+    WAL mode (except ``:memory:``), so other connections (Orkexa's tables, backups) can read while it writes.
     """
 
     def __init__(self, database: str | Path) -> None:
@@ -183,3 +254,136 @@ class Store:
         with self._transaction() as db:
             cursor = db.execute("DELETE FROM nodestro_documents WHERE collection = ? AND id = ?", (collection, key))
         return cursor.rowcount > 0
+
+    def search_raw(self, collections: Iterable[str], text: str) -> builtins.list[tuple[str, str]]:
+        """``(collection, JSON text)`` of the documents in ``collections`` whose JSON contains ``text``."""
+        wanted = builtins.list(dict.fromkeys(collections))
+        if not wanted:
+            return []
+        marks = ", ".join("?" for _ in wanted)
+        pattern = "%" + _like(text)
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT collection, data FROM nodestro_documents WHERE collection IN ({marks})"
+                " AND data LIKE ? ESCAPE '\\'",
+                (*wanted, pattern),
+            ).fetchall()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
+    # ---- SQLite only: schema version, migrations, maintenance ---------------------------
+
+    @property
+    def schema_version(self) -> int:
+        """The schema version recorded in the database (``PRAGMA user_version``)."""
+        with self._lock:
+            return int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def migrate(
+        self,
+        *,
+        before_migration: BeforeMigration | None,
+        migrations: Mapping[int, Migration] | None = None,
+        target: int | None = None,
+    ) -> int:
+        """Bring the database to schema version ``target`` (default :data:`SCHEMA_VERSION`, with :data:`MIGRATIONS`);
+        returns the version it had.
+
+        Nothing is written when the database already has ``target`` (every database so far). A database of a
+        newer release is refused (``storage.schema_too_new``) before anything is written. Otherwise
+        ``before_migration(current, target)`` writes a backup first (a migration without one is refused with
+        ``storage.backup_required``; a failing backup stops it with ``storage.backup_failed``), and every step
+        runs in one transaction together with the new version number: a failing step
+        (``storage.migration_failed``) leaves the database exactly as it was.
+        """
+        migrations = MIGRATIONS if migrations is None else migrations
+        target = SCHEMA_VERSION if target is None else target
+        with self._lock:
+            if self._depth:
+                raise RuntimeError("migrate() cannot run inside a transaction")
+            current = self.schema_version
+            if current == target:
+                return current
+            if current > target:
+                raise NodestroError(
+                    "storage.schema_too_new",
+                    f"The database {self.database} has schema version {current}; this Nodestro release reads "
+                    f"version {target}. Use the newer release, or restore a backup made with this one",
+                    found=current,
+                    supported=target,
+                )
+            missing = [version for version in range(current + 1, target + 1) if version not in migrations]
+            if missing:
+                raise NodestroError(
+                    "storage.migration_missing",
+                    f"No migration to schema version {missing[0]}",
+                    found=current,
+                    supported=target,
+                )
+            if before_migration is None:
+                raise NodestroError(
+                    "storage.backup_required",
+                    "A schema migration needs a backup first; none was configured",
+                    found=current,
+                    supported=target,
+                )
+            try:
+                before_migration(current, target)
+            except Exception as exc:
+                raise NodestroError(
+                    "storage.backup_failed",
+                    f"The backup before the schema migration failed, so nothing was changed: {exc}",
+                    found=current,
+                    supported=target,
+                ) from exc
+            step = current
+            try:
+                with self._transaction() as db:
+                    for step in range(current + 1, target + 1):
+                        migrations[step](db)
+                    db.execute(f"PRAGMA user_version = {int(target)}")
+            except Exception as exc:
+                raise NodestroError(
+                    "storage.migration_failed",
+                    f"The schema migration to version {step} failed; the database is unchanged: {exc}",
+                    found=current,
+                    supported=target,
+                    step=step,
+                ) from exc
+            return current
+
+    def snapshot(self, target: str | Path) -> None:
+        """Copy the whole database, consistently, to the SQLite file ``target`` (an online backup).
+
+        Writes of this store wait until the copy is complete; other connections may keep reading."""
+        destination = sqlite3.connect(str(target))
+        try:
+            with self._lock:
+                self._connection.backup(destination)
+        finally:
+            destination.close()
+
+    @contextmanager
+    def maintenance(self) -> Iterator[sqlite3.Connection]:
+        """The connection itself, with every other use of this store waiting until the block ends.
+
+        For SQLite maintenance that has no document operation (restoring a backup into the open database);
+        the caller manages transactions. Not available inside :meth:`transaction`."""
+        with self._lock:
+            if self._depth:
+                raise RuntimeError("maintenance() cannot run inside a transaction")
+            yield self._connection
+
+
+#: The name of :class:`SQLiteStore` in Nodestro 0.1 and 0.2 (imports and type hints keep working).
+Store = SQLiteStore
+
+__all__ = [
+    "MIGRATIONS",
+    "SCHEMA_VERSION",
+    "BeforeMigration",
+    "DocumentStore",
+    "Migration",
+    "ModelT",
+    "SQLiteStore",
+    "Store",
+]

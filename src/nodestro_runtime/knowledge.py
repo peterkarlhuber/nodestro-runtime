@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from . import documents
 from .extensions import OcrEngine
 from .schemas import KnowledgeConfig
+from .sqlite_tables import KnowledgeChunks
 
 #: The most chunks a scoped search looks at in the shared index.
 _MAX_CANDIDATES = 20_000
@@ -141,6 +142,7 @@ class KnowledgeBase:
         ``ocr`` replaces it with a fixed function (tests)."""
         self.store = SQLiteFileStore(database, namespace="nodestro")
         self.index = SQLiteIndex(database, namespace="nodestro")
+        self.chunks = KnowledgeChunks(self.index)
         self._lock = threading.RLock()
         self.ocr_runner = ocr
         self.ocr_engine = engine
@@ -162,13 +164,7 @@ class KnowledgeBase:
         self.index.close()
 
     def _chunk_counts(self) -> dict[str, int]:
-        connection = self.index._connection
-        with self.index._lock:
-            rows = connection.execute(
-                "SELECT source, count(*) FROM index_chunks WHERE namespace = ? GROUP BY source",
-                (self.index.namespace,),
-            ).fetchall()
-        return {str(source): int(count) for source, count in rows}
+        return self.chunks.counts()
 
     def _describe(self, entry: StoredFile, counts: dict[str, int]) -> KnowledgeFile:
         meta = entry.metadata
@@ -272,11 +268,7 @@ class KnowledgeBase:
 
     def _attach_file_id(self, file_id: str) -> None:
         """Let every chunk of a file point to it (an agent can then load the whole file after a hit)."""
-        with self.index._lock:
-            self.index._connection.execute(
-                "UPDATE index_chunks SET file_id = ? WHERE namespace = ? AND source = ?",
-                (file_id, self.index.namespace, file_id),
-            )
+        self.chunks.attach_file(file_id)
 
     def restore_file(self, entry: StoredFile, data: bytes, text: str) -> None:
         """Store a file under its original id with its readable text (an exported project's knowledge)."""
@@ -323,13 +315,7 @@ class KnowledgeBase:
         entry = self.store.info(file_id)
         if entry.media_type.startswith("text/"):
             return self.store.get_bytes(file_id).decode("utf-8", errors="replace")
-        connection = self.index._connection
-        with self.index._lock:
-            rows = connection.execute(
-                "SELECT text FROM index_chunks WHERE namespace = ? AND source = ? ORDER BY id",
-                (self.index.namespace, file_id),
-            ).fetchall()
-        return "\n".join(str(row[0]) for row in rows)
+        return self.chunks.text(file_id)
 
     def update(self, file_id: str, *, description: str, collection: str | None = None) -> KnowledgeFile:
         entry = self.store.info(file_id)

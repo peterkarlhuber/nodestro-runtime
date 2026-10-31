@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+Storage seams (desktop and server plan, M1 PR-3). No change of data, schema, SQL statements or behavior:
+
+- `nodestro_runtime.storage.DocumentStore`: a typed protocol with the existing operations (`put`, `put_raw`, `get`,
+  `get_raw`, `list`, `find`, `items`, `list_prefix`, `delete_prefix`, `delete`, `transaction`, `close`, `closed`)
+  and the new `search_raw(collections, text)`. The SQLite class is now `SQLiteStore`; `Store` stays as an alias, so
+  imports and type hints keep working. Runtime components declare `DocumentStore`.
+- No module outside `storage` and the new `sqlite_tables` uses a database connection any more (a test checks it):
+  input-file references use `search_raw` (same `LIKE` query), knowledge chunk counts, the file id of chunks and the
+  indexed text use `sqlite_tables.KnowledgeChunks`, memory totals and clearing a space use
+  `sqlite_tables.memory_totals`/`clear_memory`, each with the statement used before.
+- Schema versions: `PRAGMA user_version` (0, as every existing database) is checked when a workspace opens.
+  `SQLiteStore.migrate()` runs the steps of `storage.MIGRATIONS` (none in this release) after a mandatory backup
+  (`Workspace(before_migration=...)`, default: a copy of the database in `<data_dir>/backups/`), all in one
+  transaction. New codes: `storage.schema_too_new`, `storage.migration_missing`, `storage.backup_required`,
+  `storage.backup_failed`, `storage.migration_failed`. A refused workspace releases the data directory again.
+- `SQLiteStore.snapshot(path)` (online backup) and `SQLiteStore.maintenance()` (the connection with the store held)
+  give the API's backup and restore a public way to do what they did with private attributes (follow-up PR in
+  nodestro-api).
+- Contract tests (`tests/test_storage_contract.py`) for every store operation, transactions, concurrent writers,
+  WAL readers, migrations with failing steps and backups, FTS5 search after attaching file ids, memory totals, and
+  a data directory written like Nodestro 0.1/0.2 that opens without any change.
+
 Operating profiles (desktop and server plan, M1 PR-1). No behavior change for existing callers:
 
 - New `nodestro_runtime.profile`: an immutable `RuntimeProfile` with the profiles `desktop` (default) and

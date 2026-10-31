@@ -24,7 +24,7 @@ from orkexa.usage import summarize_usage
 from pydantic import BaseModel, Field
 
 from .schemas import Usage, new_id, now
-from .storage import Store
+from .storage import DocumentStore
 
 UsageSource = Literal[
     "agent_test",
@@ -70,7 +70,7 @@ class UsageEntry(BaseModel):
 class UsageLog:
     """Stores :class:`UsageEntry` documents in the Nodestro database."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: DocumentStore) -> None:
         self.store = store
 
     def record(

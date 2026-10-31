@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
 from .schemas import Workflow, WorkflowIn, new_id, now
-from .storage import Store
+from .storage import DocumentStore
 
 if TYPE_CHECKING:
     from .tool_library import ToolLibrary
@@ -500,7 +500,7 @@ class PythonEnvironments:
 
     def __init__(
         self,
-        store: Store,
+        store: DocumentStore,
         root: Path,
         tools: ToolLibrary,
         *,

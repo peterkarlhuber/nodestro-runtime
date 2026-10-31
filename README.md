@@ -19,7 +19,7 @@ package; the runtime itself depends on neither.
 | Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities) |
 | Tools | `tool_library`, `builtin_tools`, `tool_drafts`, `python_deps`, `python_envs`, `python_tools` |
 | Knowledge, memory, files | `knowledge`, `memory_spaces`, `documents`, `input_files`, `file_formats`, `file_delivery`, `office`, `reports`, `adoption`, `sanitize`, `preview` |
-| Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` |
+| Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` (`DocumentStore`, `SQLiteStore`), `sqlite_tables` |
 | Extensions | `extensions` (contract for integrations, entry point group `nodestro.integrations`) |
 | Testing | `testing` (simulated provider clients and uv; never a real request) |
 
@@ -149,6 +149,16 @@ a sandbox (a separate Python process with an empty environment, time and memory 
 process sandbox limits what a tool can do by accident; it is not a proven security boundary against hostile
 code, and the Docker sandbox isolates more strongly. Third-party Python packages are installed only after a person approved
 the exact versions of every package (`python_envs`), into a separate environment per workflow or tool.
+
+**Storage.** Every component stores its documents through the `DocumentStore` protocol
+(`nodestro_runtime.storage`); `SQLiteStore` (still importable as `Store`) implements it on the table
+`nodestro_documents`. The SQL Nodestro runs on Orkexa's own tables (knowledge chunks, memory) is in
+`sqlite_tables`; no other module opens or uses a database connection. The database records its schema version in
+`PRAGMA user_version` (0, unchanged since Nodestro 0.1). When a later release needs a migration, the workspace
+copies the database to `<data_dir>/backups/pre-migration-<from>-to-<to>-<time>.db` first (or calls
+`Workspace(before_migration=...)`), then runs every step in one transaction; a failing backup or step leaves the
+database unchanged (`storage.backup_failed`, `storage.migration_failed`), and a database of a newer release is
+refused (`storage.schema_too_new`).
 
 ## Security and data protection
 

@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from .problems import NodestroError
 from .schemas import Run, new_id, now
-from .storage import Store
+from .storage import DocumentStore
 
 MAX_TRACE_BYTES = 50 * 1024 * 1024
 _FINGERPRINTS = "trace_imports"
@@ -65,7 +65,7 @@ def parse_trace(data: bytes) -> Run:
         ) from None
 
 
-def find_duplicate(store: Store, trace: Run) -> Run | None:
+def find_duplicate(store: DocumentStore, trace: Run) -> Run | None:
     """The stored run this trace duplicates: the original run itself or an earlier import."""
     key = fingerprint(trace)
     original = store.get("runs", trace.id, Run)
@@ -77,7 +77,7 @@ def find_duplicate(store: Store, trace: Run) -> Run | None:
     return None
 
 
-def import_trace(store: Store, data: bytes) -> tuple[Run, bool]:
+def import_trace(store: DocumentStore, data: bytes) -> tuple[Run, bool]:
     """Store a trace as a new, read-only run; returns ``(run, duplicate)``."""
     trace = parse_trace(data)
     duplicate = find_duplicate(store, trace)

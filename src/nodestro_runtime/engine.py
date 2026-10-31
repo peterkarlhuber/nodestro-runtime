@@ -82,7 +82,7 @@ from .schemas import (
     Workflow,
     now,
 )
-from .storage import Store
+from .storage import DocumentStore
 
 logger = logging.getLogger(__name__)
 
@@ -574,7 +574,7 @@ class RunManager:
 
     def __init__(
         self,
-        store: Store,
+        store: DocumentStore,
         builder: AgentBuilder,
         *,
         connect: Callable[[str], Connection],

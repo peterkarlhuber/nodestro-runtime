@@ -15,7 +15,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from .schemas import Workflow, WorkflowIn, now
-from .storage import Store
+from .storage import DocumentStore
 
 _COLLECTION = "workflow_versions"
 
@@ -58,7 +58,7 @@ def _content(workflow: WorkflowIn) -> str:
 
 
 class WorkflowVersions:
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: DocumentStore) -> None:
         self.store = store
 
     def all(self, workflow_id: str) -> list[WorkflowVersion]:
