@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Adaptive Orchestration M1-4 (loop connections):
+
+- A connection can carry `loop` (`max_iterations` 2..20, required; `on_exhausted` `fail` or `continue`): it leads from
+  a decision or approval back to an earlier node, and the nodes in between run again (quality loops, revise after a
+  rejected approval). Loop connections are not dependencies: they are ignored for the order and for cycle detection,
+  and `check_workflow` reports `workflow.loop_unguarded`, `workflow.loop_target`, `workflow.loop_overlap`,
+  `workflow.loop_shared` and `workflow.loop_invalid`. A connection that closes a cycle without `loop` is still
+  `workflow.cycle`.
+- The kernel counts the iterations: `Run.flow_state` stores the kernel's flow state (needed to continue a paused run
+  inside a loop, also in another process). A node that runs again keeps its earlier results in `NodeRun.earlier`;
+  `NodeRun.iteration` names the iteration (one entry per loop around the node). Node events carry `iteration`, a new
+  `loop_iteration` event marks each new round. A loop that reaches its limit fails the run with `run.loop_exhausted`
+  (`node`, `max_iterations`) or, with `continue`, follows the other branches of the decision.
+- Task templates of nodes in a loop know `{{iteration}}` (1-based), `{{previous}}` (the node's own result of the
+  previous round) and `{{feedback}}` (what arrived over the loop connection); `-` in the first round, unchanged
+  outside loops. Continuing a failed run runs a whole loop again (`resume.in_loop`).
+
 Adaptive Orchestration M1-2 (the engine on the `orkexa.flow` kernel):
 
 - The engine no longer has a scheduler of its own: `RunManager` executes the nodes that the `orkexa.flow` kernel

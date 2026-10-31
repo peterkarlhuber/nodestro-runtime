@@ -15,6 +15,12 @@ Rules of the data flow
   incoming connection is active, it is *skipped* (deliberately, not an error) when none
   is, and it is *blocked* when a predecessor failed. Merging branches therefore needs no
   setting: a node behind both branches of a decision runs with what arrives.
+- A *loop* connection (``Edge.loop``) leaves a decision or approval node through a branch and
+  leads back to an earlier node. Taking that branch runs the nodes from the loop's target to its
+  source again, at most ``max_iterations`` times; nodes after the loop wait until it is over and
+  see its last iteration. In later iterations the loop's target also receives what arrives over
+  the loop connection (for example the reviewer's verdict behind a decision). All other functions
+  here ignore loop connections: the rest of the graph stays acyclic.
 - Decision and approval nodes pass data through: a node behind them receives the
   results that arrived at them, named after the agents that produced them. An
   approval's comment is passed on as well.
@@ -58,22 +64,51 @@ def port_label(node: Node, handle: str | None) -> str:
 
 
 def predecessors(workflow: Workflow | WorkflowIn) -> dict[str, list[Edge]]:
-    """Incoming connections per node (only connections between existing nodes)."""
+    """Incoming connections per node (only connections between existing nodes, without loops)."""
     ids = {node.id for node in workflow.nodes}
     found: dict[str, list[Edge]] = {node.id: [] for node in workflow.nodes}
     for edge in workflow.edges:
-        if edge.source in ids and edge.target in ids and edge.source != edge.target:
+        if edge.source in ids and edge.target in ids and edge.source != edge.target and edge.loop is None:
             found[edge.target].append(edge)
     return found
 
 
 def successors(workflow: Workflow | WorkflowIn) -> dict[str, list[Edge]]:
+    """Outgoing connections per node (only connections between existing nodes, without loops)."""
     ids = {node.id for node in workflow.nodes}
     found: dict[str, list[Edge]] = {node.id: [] for node in workflow.nodes}
     for edge in workflow.edges:
-        if edge.source in ids and edge.target in ids and edge.source != edge.target:
+        if edge.source in ids and edge.target in ids and edge.source != edge.target and edge.loop is None:
             found[edge.source].append(edge)
     return found
+
+
+def loop_edges(workflow: Workflow | WorkflowIn) -> list[Edge]:
+    """The loop connections between existing nodes."""
+    ids = {node.id for node in workflow.nodes}
+    return [edge for edge in workflow.edges if edge.loop is not None and edge.source in ids and edge.target in ids]
+
+
+def loop_bodies(workflow: Workflow | WorkflowIn) -> dict[str, set[str]]:
+    """Per loop connection, the nodes it repeats: every node on a path from its target to its source."""
+    incoming = predecessors(workflow)
+    outgoing = successors(workflow)
+
+    def reach(start: str, step: dict[str, list[Edge]], end: Callable[[Edge], str]) -> set[str]:
+        seen = {start}
+        todo = [start]
+        while todo:
+            for edge in step.get(todo.pop(), []):
+                if end(edge) not in seen:
+                    seen.add(end(edge))
+                    todo.append(end(edge))
+        return seen
+
+    return {
+        edge.id: reach(edge.target, outgoing, lambda item: item.target)
+        & reach(edge.source, incoming, lambda item: item.source)
+        for edge in loop_edges(workflow)
+    }
 
 
 def data_sources(workflow: Workflow | WorkflowIn, node_id: str) -> list[str]:
@@ -204,13 +239,14 @@ def continuation(
     """How continuing a failed run treats each node, in execution order: ``(node, action, reason)``.
 
     ``reuse`` takes the earlier result over: the node succeeded (or was deliberately skipped),
-    its fingerprint is unchanged and all its predecessors are reused too. ``rerun`` runs a node
-    again that ran before; ``run`` one that did not run (or did not finish). ``reason`` is a code
+    its fingerprint is unchanged, it is not part of a loop and all its predecessors are reused too.
+    ``rerun`` runs a node again that ran before; ``run`` one that did not run (or did not finish). ``reason`` is a code
     for the UI. Used by :mod:`nodestro_runtime.resume` and by continued API runs (:mod:`nodestro_api.serving`).
     """
     from .engine import topological_order
 
     incoming = predecessors(workflow)
+    looped = set().union(*loop_bodies(workflow).values()) if workflow.edges else set()
     reused: set[str] = set()
     result: list[tuple[Node, Literal["reuse", "rerun", "run"], str | None]] = []
     for node in topological_order(workflow):
@@ -220,6 +256,9 @@ def continuation(
         reason: str | None = None
         if old is None:
             reason = "resume.new_node"
+        elif node.id in looped:
+            # A loop's iterations depend on each other: the whole loop runs again.
+            action, reason = "rerun", "resume.in_loop"
         elif old.status not in ("succeeded", "skipped"):
             action = "rerun" if old.status in ("failed", "cancelled") else "run"
             reason = f"resume.was_{old.status}"
