@@ -64,8 +64,13 @@ class McpServer(_Model):
     timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
     max_output_chars: int = Field(default=20_000, ge=1_000, le=200_000)
     max_parallel_calls: int = Field(default=4, ge=1, le=16)
-    #: OAuth state (WP-6): issuer, client id, scopes; tokens live in ``token_sealed`` like every other token.
+    #: OAuth summary (WP-6) the API may show: issuer, scope, expiry, a running sign-in's deadline. The credentials
+    #: (tokens, client registration) live sealed in ``token_sealed`` like every other token.
     oauth: dict[str, Any] = Field(default_factory=dict)
+    #: A started sign-in (PKCE verifier, discovered metadata), sealed; and the digest of its ``state`` for the
+    #: callback's lookup. Never returned by the API.
+    oauth_pending_sealed: str | None = Field(default=None, repr=False)
+    oauth_state_digest: str | None = Field(default=None, repr=False)
     protocol_version: str | None = None
     server_name: str | None = None
     server_version: str | None = None
@@ -184,7 +189,9 @@ EventKind = Literal[
     "tool_changed",
     "tool_removed",
     "call_refused",
+    "oauth_started",
     "oauth_connected",
+    "oauth_failed",
     "oauth_disconnected",
 ]
 
