@@ -129,6 +129,10 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   one schedule, batch or test series, with who and when, an optional expiry and revocation; refused for MCP and
   `destructive` tools and for tools without a version (`tool.pre_grant_*`). The workspace's gate reads them per
   call, so a revocation applies at the next call.
+- Changing MCP tools behind the gate (WP-5, D10c): with `NODESTRO_TOOL_APPROVALS=1` the workspace sets
+  `McpService.write_gate`, so approved `write`/`destructive` MCP tools become usable, and every such call is asked,
+  whatever the binding says (no `never`, no legacy exemption, no pre-grant). The approval binds the arguments and the
+  approved definition hash; unattended runs still deny them. Without the switch they stay refused as before.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 

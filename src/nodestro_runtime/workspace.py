@@ -329,6 +329,8 @@ class Workspace:
                 pre_grants=ToolPreGrants(self.store).of_scope,
                 mcp_unattended=unattended_mcp_enabled,
             )
+            # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
+            self.mcp.write_gate = True
         self.tester = AgentTester(
             self.builder, connect=self.connection, default_budget=lambda: self.settings().default_budget_usd
         )
