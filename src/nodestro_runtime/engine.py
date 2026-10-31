@@ -46,6 +46,7 @@ from orkexa import (
     UsageRecord,
     UsageSummary,
     UsageTracker,
+    flow,
     refine,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
@@ -53,7 +54,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import graph
+from . import flow_driver, graph
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -113,10 +114,6 @@ class WorkflowError(NodestroError):
     """The workflow cannot run (cycle, no agents, broken edges)."""
 
 
-#: How a node ended for its successors.
-DONE, SKIPPED, BLOCKED, PAUSED = "done", "skipped", "blocked", "paused"
-#: Node states that are final: such a node is never executed again in the same run.
-_SETTLED = {"succeeded", "skipped", "blocked", "failed", "cancelled"}
 #: How deep sub-workflows may be nested.
 MAX_DEPTH = 5
 
@@ -1303,33 +1300,94 @@ class RunManager:
         run.output = self._run_output(run)
 
     async def _run_graph(self, context: _RunContext) -> None:
+        """Execute the nodes the ``orkexa.flow`` kernel dispatches until none is left to run.
+
+        The kernel decides; this method executes nodes and applies what the kernel settled on
+        its own (skipped, blocked, cancelled) to the node states (:mod:`nodestro_runtime.flow_driver`).
+        """
         run = context.run
         workflow = run.workflow
-        order = topological_order(workflow)
+        topological_order(workflow)  # the runtime's own errors for broken connections and cycles
+        spec = flow_driver.flow_of(workflow)
         nodes = {node.id: node for node in workflow.nodes}
-        incoming = graph.predecessors(workflow)
+        for node in workflow.nodes:
+            run.nodes.setdefault(node.id, NodeRun(status="waiting"))
         if not context.fingerprints:
             context.fingerprints = self.fingerprints(run, context.env)
-        loop = asyncio.get_running_loop()
-        done: dict[str, asyncio.Future[str]] = {node.id: loop.create_future() for node in order}
+        state = flow_driver.state_of(workflow, run.nodes)
+        if context.cancelled.is_set():
+            step = self._kernel_settled(context, flow.cancel(spec, state, code="run.node_cancelled"))
+        elif any(item.status == "suspended" for item in state.invocations):
+            # Paused nodes are asked again: a decided approval succeeds, an open one stays paused.
+            step = self._kernel_settled(context, flow.resume(spec, state))
+        else:
+            step = self._kernel_settled(context, flow.advance(spec, state))
+        state = step.state
+        tasks: dict[asyncio.Task[flow.Result], str] = {}
+        actions = list(step.actions)
+        while True:
+            for action in actions:
+                node = nodes[action.invocation.node]
+                tasks[asyncio.ensure_future(self._invoke(context, node))] = action.invocation.id
+            actions = []
+            if not tasks:
+                break
+            finished, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in finished:
+                invocation_id = tasks.pop(task)
+                if context.cancelled.is_set() and state.stop is None:
+                    state = self._kernel_settled(context, flow.cancel(spec, state, code="run.node_cancelled")).state
+                step = self._kernel_settled(context, flow.complete(spec, state, invocation_id, task.result()))
+                state = step.state
+                actions.extend(step.actions)
 
-        async def run_node(node: Node) -> None:
-            outcomes = [await done[edge.source] for edge in incoming[node.id]]
-            run.nodes.setdefault(node.id, NodeRun(status="waiting"))
-            outcome = BLOCKED
-            try:
-                outcome = await self._settle(context, node, incoming[node.id], outcomes, nodes)
-            except Exception as exc:  # recorded on the node; the run continues with other branches
-                logger.exception("Node %s failed", node.id)
-                state = run.nodes[node.id]
-                state.status = "failed"
-                state.finished_at = state.finished_at or now()
-                _fail(state, node_problem(exc))
-                self._emit_settled(context, node.id)
-            finally:
-                done[node.id].set_result(outcome)
+    def _kernel_settled(self, context: _RunContext, step: flow.Step) -> flow.Step:
+        """Apply the nodes the kernel settled without executing them (skipped, blocked, cancelled)."""
+        run = context.run
+        for event in step.events:
+            if event.kind != "invocation_settled" or event.node is None:
+                continue
+            status = event.data.get("status")
+            state = run.nodes[event.node]
+            if status == state.status or status not in ("skipped", "blocked", "cancelled"):
+                continue  # reported by the node itself
+            state.fingerprint = context.fingerprints.get(event.node)
+            state.status = status
+            state.finished_at = now()
+            if status == "skipped":
+                # A regular outcome of a decision or approval: not an error.
+                state.error = state.error_code = None
+                state.error_params = {}
+            elif status == "blocked":
+                _fail(state, problem("run.blocked", "Not run because a predecessor did not succeed"))
+            else:
+                _fail(state, problem("run.node_cancelled", "Cancelled"))
+            self._emit_settled(context, event.node)
+        return step
 
-        await asyncio.gather(*(run_node(node) for node in order))
+    async def _invoke(self, context: _RunContext, node: Node) -> flow.Result:
+        """Execute one node the kernel dispatched and report how it ended."""
+        state = context.run.nodes[node.id]
+        state.fingerprint = context.fingerprints.get(node.id)
+        if context.cancelled.is_set():
+            # Stopped by a node dispatched together with this one (a rejection that ends the run).
+            state.status = "cancelled"
+            state.finished_at = now()
+            _fail(state, problem("run.node_cancelled", "Cancelled"))
+            self._emit_settled(context, node.id)
+            return flow_driver.result_of(node, state)
+        try:
+            if node.type == "approval":
+                self._approval(context, node)
+            else:
+                await self._run_node(context, node)
+        except Exception as exc:  # recorded on the node; the run continues with other branches
+            logger.exception("Node %s failed", node.id)
+            state.status = "failed"
+            state.finished_at = state.finished_at or now()
+            _fail(state, node_problem(exc))
+            self._emit_settled(context, node.id)
+        return flow_driver.result_of(node, state)
 
     def fingerprints(self, run: Run, env: RunEnvironment | None = None) -> dict[str, str]:
         env = env or self.environment(run)
@@ -1366,47 +1424,6 @@ class RunManager:
             error_code=state.error_code,
             error_params=state.error_params,
         )
-
-    async def _settle(
-        self, context: _RunContext, node: Node, edges: list[Edge], outcomes: list[str], nodes: dict[str, Node]
-    ) -> str:
-        """Decide what happens to one node once its predecessors are settled, and do it."""
-        run = context.run
-        state = run.nodes[node.id]
-        if state.status in _SETTLED:
-            return {"succeeded": DONE, "skipped": SKIPPED}.get(state.status, BLOCKED)
-        state.fingerprint = context.fingerprints.get(node.id)
-        if context.cancelled.is_set():
-            state.status = "cancelled"
-            state.finished_at = now()
-            _fail(state, problem("run.node_cancelled", "Cancelled"))
-            self._emit_settled(context, node.id)
-            return BLOCKED
-        if BLOCKED in outcomes:
-            state.status = "blocked"
-            state.finished_at = now()
-            _fail(state, problem("run.blocked", "Not run because a predecessor did not succeed"))
-            self._emit_settled(context, node.id)
-            return BLOCKED
-        if PAUSED in outcomes:
-            state.status = "waiting"
-            return PAUSED
-        if edges and not any(edge_active(edge, nodes, run.nodes) for edge in edges):
-            # A regular outcome of a decision or approval: not an error.
-            state.status = "skipped"
-            state.error = state.error_code = None
-            state.error_params = {}
-            state.finished_at = now()
-            self._emit_settled(context, node.id)
-            return SKIPPED
-        if node.type == "approval":
-            return self._approval(context, node)
-        await self._run_node(context, node)
-        if state.status == "succeeded":
-            return DONE
-        if state.status == "awaiting_approval":
-            return PAUSED
-        return BLOCKED
 
     def _inputs(
         self, run: Run, node_id: str, *, approval_comments: bool = True
@@ -1478,7 +1495,7 @@ class RunManager:
                 output[key] = value
         return output
 
-    def _approval(self, context: _RunContext, node: Node) -> str:
+    def _approval(self, context: _RunContext, node: Node) -> None:
         state = context.run.nodes[node.id]
         config = node.approval or ApprovalConfig()
         if state.approval is None:
@@ -1486,7 +1503,7 @@ class RunManager:
             state.started_at = state.started_at or now()
             self._emit(context, "approval_requested", node.id, status=state.status)
             self._save(context)
-            return PAUSED
+            return
         state.status = "succeeded"
         state.started_at = state.started_at or now()
         state.finished_at = now()
@@ -1501,7 +1518,6 @@ class RunManager:
             status=state.status,
             approval=state.approval.model_dump(mode="json"),
         )
-        return DONE
 
     def _decide(self, context: _RunContext, node: Node, inputs: list[tuple[str, Any]]) -> None:
         run = context.run
