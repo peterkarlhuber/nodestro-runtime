@@ -11,6 +11,56 @@ MCP tools in releases (ADR-0007, work package WP-9):
   stands in for the service in a release's tool library: only frozen tools, and each lookup and call checks the live
   policy plus the frozen hash and classification (`mcp.release_tool_changed`, `mcp.tool_not_in_release`).
 
+Adaptive Orchestration M5 (pool selection):
+
+- New `OrchestratorConfig.select` (`capabilities`, up to 10 tags; `max_teams` 1..20, default 5; `done`, set once a snapshot selected): saved workflows
+  whose capabilities match join the pool. The selection happens when a run or a published release pins its
+  workflows, so it is fixed and visible in the run's snapshot: each selected `OrchestratorMember` has `matched`
+  (the tags it shares). Order: number of matching tags, then name and id; no score is invented. Workflows with
+  errors or approval steps, explicit members and the workflow itself are left out; a selected team that is already
+  running is not offered. `RunManager.team_candidates()` lists the saved teams; `graph.workflow_refs(node)` names
+  every workflow a node calls (sub-workflow or orchestrator teams).
+- Pre-check: `check.orchestrator_selected` (info: the teams the selection takes now) and
+  `check.orchestrator_no_match` (error without explicit members, else warning). At run time an empty pool after
+  selection fails with `run.orchestrator_no_match` (`node`, `capabilities`).
+- `NodeRun.decision_usage`: the orchestrator's own requests; usage per model counts them for its model and the
+  teams' requests for their agents' models.
+
+Adaptive Orchestration M4 (orchestrator node):
+
+- New node type `orchestrator` (`OrchestratorConfig`: `members` (up to 20 team workflows, optionally pinned to a
+  version), `task_template`, `instructions`, `model`, `max_decisions` (1..50, default 8), `max_per_member`). An AI
+  model chooses step by step which team of its pool gets which task and finishes with an answer, following the
+  `orkexa.orchestration` protocol (ADR 0010 in orkexa; orkexa pin b91d0b7). The model has no tools, cannot create
+  teams, agents or tools and has no permissions of its own: every team runs as a linked child run
+  (`NodeRun.child_run_ids`) with its own budget share, limits and tool approvals. Refused decisions (unknown team,
+  limits, repeated task, invalid answer) are recorded with their code and shown to the model.
+- Every decision, verdict, result and reason is stored in `NodeRun.orchestration` as it happens (events
+  `orchestration_delegated`, `orchestration_step`), so a run can be inspected and replayed.
+- A team that stops at an approval step is cancelled and reported to the orchestrator as a failure (pausing a
+  run inside an orchestrator is not supported yet). An orchestrator that uses all its decisions without
+  finishing fails with `run.orchestration_limit` (`node`, `max_decisions`); a missing team fails with
+  `run.orchestrator_member_missing`.
+- Workflow check: `workflow.orchestrator_no_members`, `workflow.orchestrator_member_duplicate`,
+  `workflow.orchestrator_self`, `workflow.orchestrator_limits`. Pre-check: `check.orchestrator_member_missing`,
+  `check.orchestrator_cycle`, `check.orchestrator_member_invalid` (errors) and `check.orchestrator_member_approval`
+  (warning). Runs pin the team versions like sub-workflows; resume fingerprints cover the teams.
+
+Adaptive Orchestration M3 (teams: output contracts and capabilities):
+
+- New `OutputNodeConfig.contract` (list of `OutputField`, like an agent's structured output): the fields a workflow
+  promises to deliver. The result node checks its input against it (an object, or JSON text of one), keeps only
+  the contract's fields and fails with `run.output_contract` (`fields`) when a required field is missing or has
+  the wrong type. A parent that runs such a workflow as a sub-workflow therefore receives a checked object, and
+  decisions after it can rely on its fields. New module `nodestro_runtime.contracts` (`contract_of(workflow)`).
+- Workflow check: `workflow.contract_field_name` and `workflow.contract_field_duplicate` block a run. Pre-check
+  warnings: `check.contract_text_source` (an agent before the result answers in plain text) and
+  `check.contract_field_missing` (no structured agent before the result delivers a required field).
+- New `WorkflowIn.capabilities`: up to 20 tags (at most 40 characters each, trimmed, unique ignoring case) that
+  say what a workflow can do as a team. They travel with the workflow and grant nothing.
+- `WorkflowSummary` gains `capabilities` and `contract` (the field names of the output contract), so lists can
+  offer teams without loading every workflow.
+
 Local MCP servers over stdio in an isolated container (ADR-0007, work package WP-8):
 
 - `McpServer.transport` (`http` or `stdio`) and `McpServer.stdio` (`StdioCommand`: plain package requirements, a

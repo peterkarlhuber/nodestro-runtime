@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .providers import ProviderSettingsIn, ProviderStatus
 from .tool_policy import ToolBinding
@@ -20,7 +20,7 @@ from .tool_policy import ToolBinding
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 ThinkingMode = Literal["adaptive", "between_tools", "disabled"]
 ThinkingDisplay = Literal["summarized", "omitted", "updates"]
-NodeType = Literal["start", "agent", "output", "condition", "approval", "subworkflow"]
+NodeType = Literal["start", "agent", "output", "condition", "approval", "subworkflow", "orchestrator"]
 #: ``paused``: the run waits for a human decision at an approval node.
 RunStatus = Literal["queued", "running", "paused", "succeeded", "failed", "cancelled"]
 #: ``skipped``: deliberately not run, because its branch was not chosen (no error);
@@ -313,6 +313,80 @@ class SubworkflowConfig(_Model):
     values: dict[str, str] = Field(default_factory=dict)
 
 
+#: Most teams in the pool of one orchestrator, and most decisions it may make.
+MAX_POOL = 20
+MAX_DECISIONS = 50
+
+
+class OrchestratorMember(_Model):
+    """A team in an orchestrator's pool: a saved workflow, run as a sub-workflow when chosen."""
+
+    workflow_id: str = ""
+    #: The pinned version; ``None`` takes the latest version when the run starts.
+    version: int | None = None
+    #: Filled in when the team was selected by capability (``OrchestratorConfig.select``): the matching tags.
+    matched: list[str] = Field(default_factory=list)
+
+
+def _clean_tags(value: list[str]) -> list[str]:
+    """Capability tags trimmed, without empty ones and unique ignoring case."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        tag = " ".join(item.split())
+        if not tag:
+            continue
+        if len(tag) > MAX_CAPABILITY_LENGTH:
+            raise ValueError(f"a capability has at most {MAX_CAPABILITY_LENGTH} characters")
+        if tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            cleaned.append(tag)
+    return cleaned
+
+
+class OrchestratorSelect(_Model):
+    """Pool selection by capability (AO M5): saved workflows whose capabilities match join the pool.
+
+    The selection is made when a run (or a published release) pins its workflows, so it is fixed and
+    visible in the run's snapshot: every selected member names the tags it matched. Teams are ordered
+    by the number of matching tags, then by name; no score is invented. Workflows with errors, with
+    approval steps (not supported inside an orchestrator) and the workflow itself are left out.
+    """
+
+    capabilities: list[str] = Field(default_factory=list, max_length=10)
+    #: At most this many selected teams (the explicit members come first and count towards ``MAX_POOL``).
+    max_teams: int = Field(default=5, ge=1, le=MAX_POOL)
+    #: Set in a pinned snapshot once the selection was made: pinning it again (a team started by a run, a
+    #: published release) keeps the selected members and never adds teams saved later.
+    done: bool = False
+
+    @field_validator("capabilities")
+    @classmethod
+    def _clean(cls, value: list[str]) -> list[str]:
+        return _clean_tags(value)
+
+
+class OrchestratorConfig(_Model):
+    """An AI model that delegates the task to teams of its pool until it can answer (AO M4).
+
+    It only selects: it creates no agents and no tools, and has no tools of its own. Each chosen team
+    runs as a linked child run with its own budget, limits and tool approvals; the orchestrator's
+    decisions, reasons and the teams' results are recorded (``NodeRun.orchestration``).
+    """
+
+    members: list[OrchestratorMember] = Field(default_factory=list, max_length=MAX_POOL)
+    #: What the orchestrator should do; placeholders as in an agent's task.
+    task_template: str = "{{input}}"
+    #: Extra instructions for the orchestrator (how to split work, what a good answer is).
+    instructions: str = ""
+    model: str = "anthropic:claude-opus-5-5"
+    max_decisions: int = Field(default=8, ge=1, le=MAX_DECISIONS)
+    #: How often one team may be chosen; ``None``: only ``max_decisions`` limits it.
+    max_per_member: int | None = Field(default=None, ge=1, le=MAX_DECISIONS)
+    #: Add teams by capability when the run starts (AO M5); ``None``: only ``members``.
+    select: OrchestratorSelect | None = None
+
+
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
 
 
@@ -328,6 +402,8 @@ class ResultFileSpec(_Model):
 
 class OutputNodeConfig(_Model):
     files: list[ResultFileSpec] = Field(default_factory=list)
+    #: The fields the workflow promises to deliver (see :mod:`nodestro_runtime.contracts`); empty: no contract.
+    contract: list[OutputField] = Field(default_factory=list, max_length=50)
 
 
 class Node(_Model):
@@ -341,6 +417,7 @@ class Node(_Model):
     approval: ApprovalConfig | None = None
     subworkflow: SubworkflowConfig | None = None
     output: OutputNodeConfig | None = None
+    orchestrator: OrchestratorConfig | None = None
 
 
 #: The most iterations a loop may allow (the first run included).
@@ -377,6 +454,9 @@ MAX_PARALLEL_LIMIT = 32
 MAX_DURATION_LIMIT_S = 7 * 24 * 3600
 #: Most node executions a workflow may allow for one run.
 MAX_STEPS_LIMIT = 10_000
+#: Most capability tags of a workflow, and the longest tag.
+MAX_CAPABILITIES = 20
+MAX_CAPABILITY_LENGTH = 40
 
 
 class WorkflowLimits(_Model):
@@ -401,6 +481,14 @@ class WorkflowIn(_Model):
     edges: list[Edge] = Field(default_factory=list)
     budget_usd: float | None = Field(default=None, ge=0)
     limits: WorkflowLimits = Field(default_factory=WorkflowLimits)
+    #: What the workflow can do as a team, e.g. ``research`` or ``translate`` (up to 20 short tags). They travel
+    #: with the workflow (versions, export) and help to find a fitting team; they grant nothing.
+    capabilities: list[str] = Field(default_factory=list, max_length=MAX_CAPABILITIES)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _clean_capabilities(cls, value: list[str]) -> list[str]:
+        return _clean_tags(value)
 
 
 class Workflow(WorkflowIn):
@@ -416,6 +504,9 @@ class WorkflowSummary(_Model):
     agents: int
     updated_at: datetime
     last_run_status: RunStatus | None = None
+    #: The workflow's capability tags and the field names of its output contract (teams, AO M3).
+    capabilities: list[str] = Field(default_factory=list)
+    contract: list[str] = Field(default_factory=list)
 
 
 class AgentTemplateIn(_Model):
@@ -591,6 +682,12 @@ class NodeRun(_Model):
     #: Sub-workflow nodes: the child run and the version of the sub-workflow it ran.
     child_run_id: str | None = None
     child_version: int | None = None
+    #: Orchestrator nodes: the record of the orchestration (``orkexa.orchestration.OrchestrationState`` as JSON)
+    #: and the child run of every delegation, in order.
+    orchestration: dict[str, Any] | None = None
+    child_run_ids: list[str] = Field(default_factory=list)
+    #: Orchestrator: the usage of its own decisions, without its teams (they are in ``usage`` as well).
+    decision_usage: Usage | None = None
     #: The result was taken over from this earlier run instead of executing the node again.
     reused_from: str | None = None
     #: Hash of everything the node's result depends on (configuration, inputs' sources, tools);

@@ -47,6 +47,7 @@ from orkexa import (
     UsageRecord,
     UsageSummary,
     flow,
+    orchestration,
     refine,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
@@ -55,7 +56,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import flow_driver, graph, tool_policy
+from . import contracts, flow_driver, graph, tool_policy
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -64,6 +65,7 @@ from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
+from .orchestrator import DECISION_FIELDS, ORCHESTRATOR_PROMPT, decision_of, orchestrator_problems, select_teams
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
@@ -78,6 +80,7 @@ from .schemas import (
     KnowledgeProposal,
     Node,
     NodeRun,
+    OutputConfig,
     Run,
     RunEvent,
     RunIn,
@@ -345,6 +348,11 @@ def _node_problems(node: Node, workflow: Workflow) -> list[CheckIssue]:
             add("condition.source_ambiguous", f"{label} receives several results; choose the one to evaluate")
     if node.type == "subworkflow" and (node.subworkflow is None or not node.subworkflow.workflow_id):
         add("workflow.subworkflow_missing", f"{label} has no workflow selected")
+    if node.type == "output" and node.output is not None:
+        for code, message, params in contracts.contract_problems(node.output.contract):
+            add(code, f"{label}: {message}", **params)
+    for code, message, params in orchestrator_problems(node, workflow):
+        add(code, f"{label} {message}", **params)
     return found
 
 
@@ -466,6 +474,7 @@ def node_label(node: Node) -> str:
         "condition": "Entscheidung",
         "approval": "Freigabe",
         "subworkflow": "Sub-Workflow",
+        "orchestrator": "Orchestrator",
     }.get(node.type, node.id)
 
 
@@ -717,6 +726,13 @@ def _no_workflow(workflow_id: str, _version: int | None) -> tuple[Workflow, int 
     raise KeyError(workflow_id)
 
 
+def _usable_team(workflow: Workflow) -> bool:
+    """Whether a selected workflow can run as a team: no errors and no approval steps."""
+    if any(node.type == "approval" for node in workflow.nodes):
+        return False
+    return not any(issue.level == "error" for issue in check_workflow(workflow))
+
+
 class RunManager:
     """Starts runs, keeps their live event streams and persists their results.
 
@@ -907,15 +923,41 @@ class RunManager:
 
     def pin_subworkflows(self, workflow: Workflow) -> Workflow:
         """A copy whose sub-workflow nodes name the exact version they will run."""
-        if not any(node.type == "subworkflow" for node in workflow.nodes):
+        selecting = [
+            node
+            for node in workflow.nodes
+            if node.orchestrator is not None
+            and node.orchestrator.select is not None
+            and not node.orchestrator.select.done
+        ]
+        if not selecting and not any(graph.workflow_refs(node) for node in workflow.nodes):
             return workflow
         pinned = workflow.model_copy(deep=True)
         for node in pinned.nodes:
-            config = node.subworkflow
-            if config is not None and config.workflow_id and config.version is None:
-                with suppress(KeyError, NodestroError):
-                    config.version = self.resolve_workflow(config.workflow_id, None)[1]
+            for ref in graph.workflow_refs(node):
+                if ref.version is None:
+                    with suppress(KeyError, NodestroError):
+                        ref.version = self.resolve_workflow(ref.workflow_id, None)[1]
+        if selecting:
+            candidates = self.team_candidates()
+            for node in pinned.nodes:
+                config = node.orchestrator
+                if config is not None and config.select is not None and not config.select.done:
+                    config.members += select_teams(config, workflow.id, candidates, _usable_team)
+                    config.select.done = True
         return pinned
+
+    def team_candidates(self) -> list[tuple[Workflow, int]]:
+        """Saved workflows with capabilities, in their latest saved version (for pool selection)."""
+        found: list[tuple[Workflow, int]] = []
+        for current in self.store.list("workflows", Workflow):
+            if not current.capabilities:
+                continue
+            with suppress(KeyError, NodestroError):
+                snapshot, version = self.resolve_workflow(current.id, None)
+                if version is not None and snapshot.capabilities:
+                    found.append((snapshot, version))
+        return found
 
     def _launch(self, run: Run, *, local: bool = False) -> Run:
         if self.dispatch is not None and not local:
@@ -1791,16 +1833,45 @@ class RunManager:
             self._emit(context, "node_finished", node.id, status="succeeded", output=state.output)
             return
         if node.type == "output":
-            state.status = "succeeded"
-            state.output = inputs[0][1] if len(inputs) == 1 else {name: value for name, value in inputs}
+            contract = node.output.contract if node.output is not None else []
+            if contract:
+                try:
+                    state.output = contracts.apply_contract(contract, contracts.merged_input(inputs))
+                    state.status = "succeeded"
+                except contracts.ContractError as error:
+                    state.status = "failed"
+                    names = ", ".join(error.fields)
+                    _fail(
+                        state,
+                        problem(
+                            "run.output_contract",
+                            f"The result does not fulfil the workflow's contract: {names}",
+                            fields=names,
+                        ),
+                    )
+            else:
+                state.status = "succeeded"
+                state.output = inputs[0][1] if len(inputs) == 1 else {name: value for name, value in inputs}
             state.finished_at = now()
-            self._emit(context, "node_finished", node.id, status="succeeded", output=state.output)
+            self._emit(
+                context,
+                "node_finished",
+                node.id,
+                status=state.status,
+                output=state.output,
+                error=state.error,
+                error_code=state.error_code,
+                error_params=state.error_params,
+            )
             return
         if node.type == "condition":
             self._decide(context, node, inputs)
             return
         if node.type == "subworkflow":
             await self._subworkflow(context, node, inputs, absent)
+            return
+        if node.type == "orchestrator":
+            await self._orchestrate(context, node, inputs, absent)
             return
         assert node.agent is not None
         state.status = "running"
@@ -1825,6 +1896,25 @@ class RunManager:
             return run.values
         names = self.file_names() if self.file_names is not None else {}
         return prompt_values(start_fields(run.workflow), run.values, names, mark_empty=mark_empty)
+
+    async def _execute_child(self, context: _RunContext, node: Node, child: Run) -> _RunContext:
+        """Run a child run to its end (or pause): its own budget inside the parent's, cost counted at ``node``."""
+        child.budget_usd = child.workflow.budget_usd
+        child_context = _RunContext(
+            child,
+            _ChildTracker(context.tracker, node.id, _remaining(child.workflow.budget_usd, child)),
+            context.env,
+            cancelled=CancelFlag(context.cancelled),
+            stack=(*context.stack, context.run.workflow_id),
+            root=context.root,
+        )
+        self._contexts[child.id] = child_context
+        self._events.setdefault(child.id, [])
+        try:
+            await self._execute_body(child_context)
+        finally:
+            self._contexts.pop(child.id, None)
+        return child_context
 
     async def _subworkflow(
         self, context: _RunContext, node: Node, inputs: list[tuple[str, Any]], absent: set[str]
@@ -1905,21 +1995,7 @@ class RunManager:
         state.status = "running"
         self._emit(context, "node_started", node.id, child_run_id=child.id, version=state.child_version)
         self._save(context)
-        child.budget_usd = child.workflow.budget_usd
-        child_context = _RunContext(
-            child,
-            _ChildTracker(context.tracker, node.id, _remaining(child.workflow.budget_usd, child)),
-            context.env,
-            cancelled=CancelFlag(context.cancelled),
-            stack=(*context.stack, run.workflow_id),
-            root=context.root,
-        )
-        self._contexts[child.id] = child_context
-        self._events.setdefault(child.id, [])
-        try:
-            await self._execute_body(child_context)
-        finally:
-            self._contexts.pop(child.id, None)
+        child_context = await self._execute_child(context, node, child)
         state.usage = add_usage(prior, self._node_usage(context, node.id))
         state.finished_at = now()
         if child.status == "succeeded":
@@ -2102,6 +2178,210 @@ class RunManager:
     def _expire_approvals(self, run_id: str) -> None:
         """A run stopped without its process (interrupted, crashed, lost lease): its open questions expire."""
         ToolApprovals(self.store).expire_run(run_id)
+
+    def _orchestration_pool(
+        self, context: _RunContext, node: Node
+    ) -> tuple[orchestration.Pool, dict[str, tuple[Workflow, int | None]]]:
+        """The teams of an orchestrator, resolved in their version (pinned at the start of the run)."""
+        config = node.orchestrator
+        assert config is not None
+        label = node_label(node)
+        if len(context.stack) >= MAX_DEPTH:
+            raise NodestroError("run.subworkflow_too_deep", f"Sub-workflows nested too deeply at {label}", node=label)
+        teams: dict[str, tuple[Workflow, int | None]] = {}
+        members: list[orchestration.Member] = []
+        for item in config.members:
+            if item.workflow_id == context.run.workflow_id or item.workflow_id in context.stack:
+                if item.matched:
+                    continue  # selected by capability: a team that is already running is simply not offered
+                raise NodestroError(
+                    "run.subworkflow_recursive", f"{label} would call a workflow that is already running", node=label
+                )
+            try:
+                snapshot, version = context.env.resolve_workflow(item.workflow_id, item.version)
+            except KeyError:
+                raise NodestroError(
+                    "run.orchestrator_member_missing", f"A team of {label} no longer exists", node=label
+                ) from None
+            if snapshot.id in teams:
+                continue
+            teams[snapshot.id] = (snapshot, version)
+            members.append(
+                orchestration.Member(
+                    id=snapshot.id,
+                    name=(snapshot.name or snapshot.id)[:200],
+                    description=snapshot.description[:2000],
+                    capabilities=tuple(snapshot.capabilities),
+                    contract=tuple(field.name for field in contracts.contract_of(snapshot)),
+                )
+            )
+        if not members:
+            if config.select is not None and config.select.capabilities:
+                raise NodestroError(
+                    "run.orchestrator_no_match",
+                    f"No saved team of {label} has one of the capabilities it selects",
+                    node=label,
+                    capabilities=", ".join(config.select.capabilities),
+                )
+            raise NodestroError("workflow.orchestrator_no_members", f"{label} has no teams to choose from", node=label)
+        return orchestration.Pool(members=tuple(members)), teams
+
+    async def _orchestrate(
+        self, context: _RunContext, node: Node, inputs: list[tuple[str, Any]], absent: set[str]
+    ) -> None:
+        """Let an AI model delegate the task to teams of its pool (``orkexa.orchestration``, ADR 0010).
+
+        The model only selects: it has no tools, creates nothing and has no permissions of its own. Every
+        chosen team runs as a linked child run with its own budget, limits and tool approvals; a team that
+        stops at an approval step is not supported inside an orchestrator and is cancelled (the model sees
+        the failure). Every step is stored in ``NodeRun.orchestration`` as it happens.
+        """
+        run = context.run
+        state = run.nodes[node.id]
+        config = node.orchestrator
+        assert config is not None
+        label = node_label(node)
+        pool, teams = self._orchestration_pool(context, node)
+        limits = orchestration.OrchestrationLimits(
+            max_decisions=config.max_decisions, max_per_member=config.max_per_member
+        )
+        task = render_task(
+            config.task_template,
+            run_input=run.input,
+            inputs=inputs,
+            values=self._prompt_values(run),
+            absent=absent,
+            run_names=_start_names(run.workflow),
+        )
+        state.prompt = task
+        state.status = "running"
+        self._emit(context, "node_started", node.id)
+        self._save(context)
+
+        async def decide(prompt: str) -> Any:
+            return await asyncio.to_thread(self._decide_sync, context, node, prompt)
+
+        async def delegate(member: orchestration.Member, team_task: str) -> str:
+            snapshot, version = teams[member.id]
+            prepared = prepare(start_fields(snapshot), {}, team_task, [], file_names=None)
+            child = Run(
+                workflow_id=snapshot.id,
+                workflow_name=snapshot.name,
+                workflow=self.pin_subworkflows(snapshot),
+                input=prepared.input,
+                values=prepared.values,
+                file_ids=prepared.file_ids,
+                nodes={item.id: NodeRun(status="waiting") for item in snapshot.nodes},
+                trigger="subworkflow",
+                trigger_ref=run.id,
+                parent_run_id=run.id,
+                parent_node_id=node.id,
+                workflow_version=version,
+            )
+            self.store.put("runs", child.id, child)
+            state.child_run_ids.append(child.id)
+            self._emit(context, "orchestration_delegated", node.id, member=member.id, child_run_id=child.id)
+            self._save(context)
+            await self._execute_child(context, node, child)
+            state.usage = self._node_usage(context, node.id)
+            if child.status == "succeeded":
+                return as_text(child.output)
+            if context.cancelled.is_set():
+                raise RunCancelled
+            if child.status == "paused":
+                child.status = "cancelled"
+                _fail(child, problem("run.cancelled", "The run was cancelled"))
+                self.store.put("runs", child.id, child)
+                raise RuntimeError(
+                    f"{member.name} stopped at an approval step, which is not possible inside an orchestrator"
+                )
+            raise RuntimeError(f"{member.name} failed: {child.error or child.status}")
+
+        def on_step(current: orchestration.OrchestrationState) -> None:
+            state.orchestration = current.model_dump(mode="json")
+            self._emit(context, "orchestration_step", node.id, step=current.steps[-1].model_dump(mode="json"))
+            self._save(context)
+
+        try:
+            result = await orchestration.arun_orchestration(
+                task,
+                pool,
+                decide=decide,
+                delegate=delegate,
+                limits=limits,
+                on_step=on_step,
+                stop_on=(RunCancelled,),
+            )
+            if result.outcome == "finished":
+                state.status = "succeeded"
+                state.output = result.answer
+            else:
+                state.status = "failed"
+                _fail(
+                    state,
+                    problem(
+                        "run.orchestration_limit",
+                        f"{label} made {config.max_decisions} decisions without finishing",
+                        node=label,
+                        max_decisions=config.max_decisions,
+                    ),
+                )
+        except RunCancelled:
+            state.status = "cancelled"
+            _fail(state, problem("run.node_cancelled", "Cancelled"))
+        except Exception as exc:  # API errors, budget, invalid configuration
+            state.status = "failed"
+            _fail(state, node_problem(exc))
+        finally:
+            state.usage = self._node_usage(context, node.id)
+            own = [record for record in context.tracker.records if record.agent == node.id]
+            state.decision_usage = usage_of(
+                summarize_usage(own), own, stale_requests=stale_requests(context.tracker, own)
+            )
+            state.finished_at = now()
+        self._emit(
+            context,
+            "node_finished",
+            node.id,
+            status=state.status,
+            output=state.output,
+            error=state.error,
+            error_code=state.error_code,
+            error_params=state.error_params,
+            usage=state.usage.model_dump(mode="json"),
+        )
+        self._save(context)
+
+    def _decide_sync(self, context: _RunContext, node: Node, prompt: str) -> Any:
+        """One decision of an orchestrator, in a worker thread: a tool-less agent with a structured answer."""
+        config = node.orchestrator
+        assert config is not None
+
+        def on_request(_args: dict[str, Any]) -> None:
+            context.check()
+            context.tracker.check()
+
+        agent = AgentConfig(
+            name=node_label(node),
+            model=config.model,
+            system_prompt=ORCHESTRATOR_PROMPT
+            + (f"\n\nInstructions:\n{config.instructions}" if config.instructions else ""),
+            output=OutputConfig(mode="structured", name="Decision", fields=DECISION_FIELDS),
+            effort="medium",
+            max_tool_rounds=0,
+        )
+        outcome = execute_agent(
+            context.env.builder,
+            agent,
+            prompt,
+            connect=self.connect,
+            tracker=context.tracker,
+            name=node.id,
+            hooks={"on_request": on_request},
+            cancelled=context.cancelled.is_set,
+            attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
+        )
+        return decision_of(outcome.output)
 
     def _run_agent_sync(self, context: _RunContext, node: Node, prompt: str, with_run_files: bool) -> None:
         """Runs in a worker thread: build the agent, ask (or refine), record the result."""
