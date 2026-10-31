@@ -89,6 +89,21 @@ def test_documents_round_trip(store: DocumentStore) -> None:
     assert store.get("docs", "a", Doc) == Doc(id="a", n=2)
 
 
+def test_documents_may_hold_any_character(store: DocumentStore) -> None:
+    text = 'nul \x00 tab \t emoji \U0001f600 rtl \u05d0 \\u0000 quote "'
+    store.put("docs", "a", Doc(id="a", kind=text))
+    store.put_raw("raw", "r", {"k\x00": [text], "plain": "x"})
+    assert store.get("docs", "a", Doc) == Doc(id="a", kind=text)
+    assert store.get_raw("raw", "r") == {"k\x00": [text], "plain": "x"}
+    assert store.find("docs", "id", ["a"], Doc) == [Doc(id="a", kind=text)]
+    assert [collection for collection, _raw in store.search_raw(["docs", "raw"], "emoji")] in (
+        ["docs", "raw"],
+        ["raw", "docs"],
+    )
+    store.put("docs", "a", Doc(id="a", kind="plain again"))
+    assert store.get("docs", "a", Doc) == Doc(id="a", kind="plain again")
+
+
 def test_list_is_newest_first_and_honors_the_limit(store: DocumentStore) -> None:
     for key in ("a", "b", "c"):
         store.put("docs", key, Doc(id=key))

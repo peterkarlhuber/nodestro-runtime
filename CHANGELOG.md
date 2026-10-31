@@ -6,7 +6,8 @@ PostgreSQL document store (desktop and server plan, M3 PR-7, ADR-0002). Nothing 
 
 - New `storage_postgres`: `PostgresDatabase` (one connection, reentrant transactions, schema migrations) and
   `PostgresStore`, a `DocumentStore` for one tenant. Table `nodestro_documents` with `tenant_id` in the primary key;
-  every query filters on the tenant. Tenant ids are checked (`[a-z0-9][a-z0-9_-]{0,62}`).
+  every query filters on the tenant. Tenant ids are checked (`[a-z0-9][a-z0-9_-]{0,62}`). Documents may hold any
+  character: `jsonb` cannot store U+0000, so such a document also keeps its exact JSON text.
 - Migrations are numbered SQL files in `nodestro_runtime/migrations/postgres` (package data), applied under an
   advisory lock and recorded in `nodestro_schema_migrations`; backup required for a database with a schema, newer
   databases refused, failing steps leave the database unchanged (`storage.*` codes as on SQLite).

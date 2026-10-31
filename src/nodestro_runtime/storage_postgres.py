@@ -52,6 +52,30 @@ MIGRATION_LOCK = 0x6E6F646573747230
 PostgresStep = str | Callable[[Any], None]
 
 
+_NUL_ESCAPE = "\\u0000"
+
+
+def _without_nul(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "\ufffd")
+    if isinstance(value, dict):
+        return {_without_nul(key): _without_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_without_nul(item) for item in value]
+    return value
+
+
+def _encode(text: str) -> tuple[str, str | None]:
+    """``(data, raw)`` for the table: jsonb cannot hold U+0000, so such a document keeps its exact JSON in ``raw``."""
+    if _NUL_ESCAPE not in text:
+        return text, None
+    return json.dumps(_without_nul(json.loads(text))), text
+
+
+#: The exact JSON text of a row.
+_JSON = "coalesce(raw, data::text)"
+
+
 def _require_driver() -> None:
     if psycopg is None:
         raise NodestroError(
@@ -299,25 +323,25 @@ class PostgresStore:
 
     def put(self, collection: str, key: str, model: BaseModel) -> None:
         self._check()
-        self.database._write(
-            "INSERT INTO nodestro_documents (tenant_id, collection, id, data) VALUES (%s, %s, %s, %s::jsonb)"
-            " ON CONFLICT (tenant_id, collection, id) DO UPDATE SET data = excluded.data,"
-            " updated_at = clock_timestamp()",
-            (self.tenant_id, collection, key, model.model_dump_json()),
-        )
+        self._put(collection, key, model.model_dump_json(), touch=True)
 
     def put_raw(self, collection: str, key: str, value: Any) -> None:
         self._check()
+        self._put(collection, key, json.dumps(value), touch=False)
+
+    def _put(self, collection: str, key: str, text: str, *, touch: bool) -> None:
+        data, raw = _encode(text)
         self.database._write(
-            "INSERT INTO nodestro_documents (tenant_id, collection, id, data) VALUES (%s, %s, %s, %s::jsonb)"
-            " ON CONFLICT (tenant_id, collection, id) DO UPDATE SET data = excluded.data",
-            (self.tenant_id, collection, key, json.dumps(value)),
+            "INSERT INTO nodestro_documents (tenant_id, collection, id, data, raw) VALUES (%s, %s, %s, %s::jsonb, %s)"
+            " ON CONFLICT (tenant_id, collection, id) DO UPDATE SET data = excluded.data, raw = excluded.raw"
+            + (", updated_at = clock_timestamp()" if touch else ""),
+            (self.tenant_id, collection, key, data, raw),
         )
 
     def _one(self, collection: str, key: str) -> str | None:
         self._check()
         rows = self.database._query(
-            "SELECT data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = %s AND id = %s",
+            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s AND id = %s",
             (self.tenant_id, collection, key),
         )
         return str(rows[0][0]) if rows else None
@@ -334,7 +358,7 @@ class PostgresStore:
         """Documents of a collection, most recently updated first."""
         self._check()
         query = (
-            "SELECT data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " ORDER BY updated_at DESC, id"
         )
         params: tuple[Any, ...] = (self.tenant_id, collection)
@@ -352,7 +376,7 @@ class PostgresStore:
         if not wanted:
             return []
         rows = self.database._query(
-            "SELECT data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " AND jsonb_typeof(data -> %s) = 'string' AND data ->> %s = ANY(%s) ORDER BY updated_at, id",
             (self.tenant_id, collection, field, field, wanted),
         )
@@ -362,7 +386,7 @@ class PostgresStore:
         """``(id, document)`` pairs of a collection, in id order."""
         self._check()
         rows = self.database._query(
-            "SELECT id, data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = %s ORDER BY id",
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s ORDER BY id",
             (self.tenant_id, collection),
         )
         return [(str(row[0]), model.model_validate_json(row[1])) for row in rows]
@@ -371,7 +395,7 @@ class PostgresStore:
         """Documents whose id starts with ``prefix`` (literally), in id order."""
         self._check()
         rows = self.database._query(
-            "SELECT data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " AND starts_with(id, %s) ORDER BY id",
             (self.tenant_id, collection, prefix),
         )
@@ -401,8 +425,8 @@ class PostgresStore:
         if not wanted:
             return []
         rows = self.database._query(
-            "SELECT collection, data::text FROM nodestro_documents WHERE tenant_id = %s AND collection = ANY(%s)"
-            ' AND strpos(lower(data::text COLLATE "C"), lower(%s COLLATE "C")) > 0',
+            f"SELECT collection, {_JSON} FROM nodestro_documents WHERE tenant_id = %s AND collection = ANY(%s)"
+            f' AND strpos(lower({_JSON} COLLATE "C"), lower(%s COLLATE "C")) > 0',
             (self.tenant_id, wanted, text),
         )
         return [(str(row[0]), str(row[1])) for row in rows]
