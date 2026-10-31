@@ -1,42 +1,42 @@
-"""Prototype of a built-in sandbox for Linux (plan PR-13, ADR-0006 point 7): bubblewrap plus a seccomp filter.
+"""The built-in Linux sandbox: runs tool code isolated without Docker, Bubblewrap or any other installed tool.
 
-**A prototype, not an isolating sandbox.** :func:`nodestro_runtime.sandbox_policy.isolation_of` keeps classifying
-it as ``"none"``, so untrusted code is still refused with it. It exists so the acceptance tests of ADR-0006 can be run
-against a candidate and its gaps can be measured (``python -m nodestro_runtime.builtin_sandbox`` prints the report).
-A candidate becomes isolating only for an operating system on which every security and compatibility test passed,
-including on a clean machine with the desktop bundle; that decision is a separate, reviewed change.
+Each call starts the interpreter that runs the tool (Nodestro's own or a Python environment's) as a new process
+that confines itself before it reads any tool code (:mod:`nodestro_runtime.sandbox_confine`):
 
-What one call gets:
+- **Landlock** (Linux 6.7+, ABI 4): read-only access to the interpreter, the system's shared libraries and the
+  call's working directory; write access only to the call's private ``tmp`` directory; nothing else of the file
+  system, so no home directory, no Nodestro data directory, no other call's files and no ``/proc`` of other
+  processes; no TCP. With ABI 6 (Linux 6.12) also no abstract UNIX sockets and no signals out of the sandbox.
+- **seccomp**: no new processes and no ``execve``, no sockets of any kind (no network, loopback, DNS, D-Bus or
+  display server), no ``ptrace``, no System V IPC, no signals, priority, affinity or limit changes aimed at another
+  process, no namespaces, mounts, keyrings, BPF, ``io_uring`` and other kernel interfaces.
+- **Resource limits**: address space, CPU time, file size, open files, processes (also threads); the host adds a
+  wall-clock timeout and a limit for the total size of ``tmp``, and kills the process on cancel or timeout.
+- **An empty environment**: no API keys, tokens or other variables of the Nodestro process.
 
-- new user, PID, network, IPC, UTS and cgroup namespaces (``bwrap --unshare-all``): no network interface except an
-  unconfigured loopback, no view of the host's processes, no capabilities, user ``nobody``;
-- a root file system built from scratch: only the interpreter, its standard library and site-packages, the shared
-  libraries they link against (found with ``ldd``), Orkexa's runner, the call's files (read-only) and a small
-  ``/tmp`` (tmpfs with a size limit). No home directory, data directory, ``/etc`` or other programs;
-- an empty environment (``--clearenv``);
-- a seccomp filter (x86-64 only) that refuses new processes (``fork``, ``vfork``, ``clone`` without
-  ``CLONE_THREAD``), sockets other than ``AF_UNIX``, ``ptrace``, mounts, namespaces, keyrings, ``bpf``,
-  ``perf_event_open``, ``userfaultfd``, ``io_uring`` and other kernel interfaces tools never need;
-- Orkexa's runner limits (CPU time, address space, file size, no core dumps) and the host's wall-clock timeout;
-  the process tree dies with the call (``--die-with-parent`` and the PID namespace).
+It needs no user namespaces, so Ubuntu's AppArmor restriction of unprivileged user namespaces does not affect it,
+and no setuid helper. :meth:`LinuxSandbox.status` checks the computer once and says why the sandbox is not
+available; the policy (:mod:`nodestro_runtime.sandbox_policy`) counts it as isolating only on the Linux systems on
+which the security and compatibility tests passed (:data:`TESTED_SYSTEMS`). Every run checks the confinement again
+from the inside; a run whose confinement fails never executes tool code.
 
-Known gaps (see the report): no Landlock rules, no cgroup limits for memory or processes beyond the rlimits, timing
-and cache side channels of the shared CPU, and distributions that restrict unprivileged user namespaces (Ubuntu 24.04
-with AppArmor) need a profile for ``bwrap``.
+Limits (see ADR-0006): it shares the kernel with the computer (a kernel bug can break any Linux sandbox), file
+metadata outside the allowed paths (``stat``, existence of a guessed path) is not hidden, the CPU's timing and cache
+side channels remain, and the ``tmp`` size limit is checked by polling, so a run can exceed it briefly before it is
+killed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-import errno
+from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import platform
-import shutil
-import struct
 import subprocess
 import sys
-import sysconfig
+import tempfile
+import threading
 import time
 from typing import ClassVar
 
@@ -44,134 +44,19 @@ import orkexa
 from orkexa.dynamic import Sandbox
 from orkexa.dynamic.errors import SandboxError
 
-#: Where Orkexa's package (with the sandbox runner) appears inside the sandbox.
-PACKAGE_TARGET = "/opt/orkexa/orkexa"
-_PACKAGE_DIR = Path(orkexa.__file__).resolve().parent
+from . import sandbox_confine
 
-# --- seccomp -----------------------------------------------------------------------------------------------------
+#: Linux distributions (``ID`` and ``VERSION_ID`` of ``/etc/os-release``) on which every security and
+#: compatibility test of the built-in sandbox passed on x86-64, with the distribution's own kernel and AppArmor.
+TESTED_SYSTEMS: frozenset[tuple[str, str]] = frozenset({("ubuntu", "24.04"), ("debian", "13")})
 
-_AUDIT_ARCH_X86_64 = 0xC000003E
-_X32_SYSCALL_BIT = 0x40000000
-_CLONE_THREAD = 0x00010000
-_AF_UNIX = 1
-
-_RET_ALLOW = 0x7FFF0000
-_RET_KILL_PROCESS = 0x80000000
-_RET_ERRNO = 0x00050000
-
-_LD_W_ABS = 0x20  # BPF_LD | BPF_W | BPF_ABS
-_JEQ_K = 0x15  # BPF_JMP | BPF_JEQ | BPF_K
-_JGE_K = 0x35  # BPF_JMP | BPF_JGE | BPF_K
-_JSET_K = 0x45  # BPF_JMP | BPF_JSET | BPF_K
-_RET_K = 0x06  # BPF_RET | BPF_K
-
-# struct seccomp_data: int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6];
-_OFFSET_NR = 0
-_OFFSET_ARCH = 4
-_OFFSET_ARG0 = 16  # low 32 bits on little-endian
-
-#: x86-64 system calls refused with EPERM (numbers from asm/unistd_64.h).
-_DENIED_X86_64: dict[str, int] = {
-    "fork": 57,
-    "vfork": 58,
-    "ptrace": 101,
-    "syslog": 103,
-    "uselib": 134,
-    "personality": 135,
-    "vhangup": 153,
-    "pivot_root": 155,
-    "adjtimex": 159,
-    "chroot": 161,
-    "acct": 163,
-    "settimeofday": 164,
-    "mount": 165,
-    "umount2": 166,
-    "swapon": 167,
-    "swapoff": 168,
-    "reboot": 169,
-    "iopl": 172,
-    "ioperm": 173,
-    "init_module": 175,
-    "delete_module": 176,
-    "quotactl": 179,
-    "lookup_dcookie": 212,
-    "clock_settime": 227,
-    "kexec_load": 246,
-    "add_key": 248,
-    "request_key": 249,
-    "keyctl": 250,
-    "unshare": 272,
-    "perf_event_open": 298,
-    "name_to_handle_at": 303,
-    "open_by_handle_at": 304,
-    "setns": 308,
-    "process_vm_readv": 310,
-    "process_vm_writev": 311,
-    "finit_module": 313,
-    "kexec_file_load": 320,
-    "bpf": 321,
-    "userfaultfd": 323,
-    "io_uring_setup": 425,
-    "io_uring_enter": 426,
-    "io_uring_register": 427,
-    "open_tree": 428,
-    "move_mount": 429,
-    "fsopen": 430,
-    "fsconfig": 431,
-    "fsmount": 432,
-    "fspick": 433,
-    "pidfd_getfd": 438,
-    "mount_setattr": 442,
-}
-_CLONE_X86_64 = 56
-_CLONE3_X86_64 = 435
-_SOCKET_X86_64 = 41
-
-
-def _instruction(code: int, jt: int, jf: int, k: int) -> bytes:
-    return struct.pack("<HBBI", code, jt, jf, k)
-
-
-def seccomp_filter(machine: str | None = None) -> bytes:
-    """The compiled classic-BPF seccomp program (``struct sock_filter[]``) for ``bwrap --seccomp``.
-
-    Raises :class:`SandboxError` on an architecture the prototype has no tested syscall table for."""
-    machine = machine or platform.machine()
-    if machine not in ("x86_64", "AMD64"):
-        raise SandboxError(f"The built-in sandbox prototype has no seccomp filter for {machine}")
-    eperm = _RET_ERRNO | errno.EPERM
-    program = [
-        _instruction(_LD_W_ABS, 0, 0, _OFFSET_ARCH),
-        _instruction(_JEQ_K, 1, 0, _AUDIT_ARCH_X86_64),
-        _instruction(_RET_K, 0, 0, _RET_KILL_PROCESS),
-        _instruction(_LD_W_ABS, 0, 0, _OFFSET_NR),
-        # x32 system calls (a second syscall table) are not allowed at all.
-        _instruction(_JGE_K, 0, 1, _X32_SYSCALL_BIT),
-        _instruction(_RET_K, 0, 0, _RET_KILL_PROCESS),
-    ]
-    for number in _DENIED_X86_64.values():
-        program += [_instruction(_JEQ_K, 0, 1, number), _instruction(_RET_K, 0, 0, eperm)]
-    # glibc falls back from clone3 (whose flags live in memory a filter cannot read) to clone.
-    program += [_instruction(_JEQ_K, 0, 1, _CLONE3_X86_64), _instruction(_RET_K, 0, 0, _RET_ERRNO | errno.ENOSYS)]
-    # clone: threads only (CLONE_THREAD set); a new process is refused.
-    program += [
-        _instruction(_JEQ_K, 0, 4, _CLONE_X86_64),
-        _instruction(_LD_W_ABS, 0, 0, _OFFSET_ARG0),
-        _instruction(_JSET_K, 0, 1, _CLONE_THREAD),
-        _instruction(_RET_K, 0, 0, _RET_ALLOW),
-        _instruction(_RET_K, 0, 0, eperm),
-    ]
-    # socket: AF_UNIX only (there is no network in the namespace anyway).
-    program += [
-        _instruction(_JEQ_K, 0, 4, _SOCKET_X86_64),
-        _instruction(_LD_W_ABS, 0, 0, _OFFSET_ARG0),
-        _instruction(_JEQ_K, 0, 1, _AF_UNIX),
-        _instruction(_RET_K, 0, 0, _RET_ALLOW),
-        _instruction(_RET_K, 0, 0, _RET_ERRNO | errno.EAFNOSUPPORT),
-    ]
-    program.append(_instruction(_RET_K, 0, 0, _RET_ALLOW))
-    return b"".join(program)
-
+#: Most files and folders a call may create in its ``tmp`` (an empty file uses no blocks, but an inode).
+MAX_TMP_ENTRIES = 10_000
+_RUNNER = Path(orkexa.__file__).resolve().parent / "dynamic" / "_sandbox_runner.py"
+_CONFINE = Path(sandbox_confine.__file__).resolve()
+#: Variables every sandbox process gets; nothing is inherited from Nodestro's environment.
+BASE_ENV = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONIOENCODING": "utf-8", "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}  # fmt: skip
 
 _PING = (
     "def ping(text: str) -> str:\n"
@@ -180,178 +65,248 @@ _PING = (
 )
 
 
-# --- file system -------------------------------------------------------------------------------------------------
+def os_release(path: str = "/etc/os-release") -> tuple[str, str]:
+    """``ID`` and ``VERSION_ID`` of the running distribution ("", "" if unknown)."""
+    values: dict[str, str] = {}
+    try:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"')
+    except OSError:
+        return "", ""
+    return values.get("ID", ""), values.get("VERSION_ID", "")
 
 
-def _ldd(paths: Iterable[Path], ldd: str) -> set[Path]:
-    """Shared libraries (and the dynamic loader) the ELF files in ``paths`` need, as absolute paths."""
-    found: set[Path] = set()
-    batch = [str(p) for p in paths]
-    for start in range(0, len(batch), 200):
-        completed = subprocess.run(
-            [ldd, *batch[start : start + 200]], capture_output=True, text=True, check=False, env={"LC_ALL": "C"}
-        )
-        for line in completed.stdout.splitlines():
-            line = line.strip()
-            if line.endswith(":") or "not found" in line:  # a file header of a multi-file listing
-                continue
-            target = line.split("=>", 1)[1].strip() if "=>" in line else line
-            target = target.split(" (", 1)[0]
-            if target.startswith("/"):
-                found.add(Path(target))
-    return found
+@dataclass(frozen=True)
+class SandboxStatus:
+    """Whether the built-in sandbox can isolate tool code on this computer.
+
+    ``reason`` is "" when ``available``; otherwise one of ``platform`` (not Linux x86-64), ``untested-system`` (a
+    distribution the tests have not covered), ``landlock`` / ``seccomp`` (kernel feature missing or disabled),
+    ``root`` (Nodestro runs as root), ``paths`` (the interpreter lives in a protected directory), ``verify``
+    (the confinement did not hold) or
+    ``failed`` (the self-test did not run)."""
+
+    available: bool
+    reason: str
+    detail: str
+    system: str
+    landlock_abi: int
 
 
-def _python_dirs() -> list[Path]:
-    """The standard library and site-packages of this interpreter (each existing directory once)."""
-    paths = sysconfig.get_paths()
-    dirs: list[Path] = []
-    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-        value = paths.get(key)
-        if value and Path(value).is_dir() and Path(value) not in dirs:
-            dirs.append(Path(value))
-    return dirs
+_STATUS: SandboxStatus | None = None
+_STATUS_LOCK = threading.Lock()
 
 
-class BubblewrapSandbox(Sandbox):
-    """Runs Orkexa's sandbox runner under ``bwrap`` with the root file system, namespaces and filter described in
-    the module docstring. Not classified as isolating (prototype)."""
+class LinuxSandbox(Sandbox):
+    """Runs Orkexa's sandbox runner confined by Landlock, seccomp and resource limits (module docstring).
 
-    #: Not a security boundary until the prototype has passed every acceptance test (ADR-0006 point 7).
-    isolated: ClassVar[bool] = False
+    Args:
+        timeout: Wall-clock limit per call in seconds.
+        memory_mb: Address-space limit.
+        tmp_mb: Limit for the total size of the call's ``tmp`` directory (and for one file).
+        python: Interpreter, e.g. a Python environment's; defaults to Nodestro's own.
+        env: Extra variables (never secrets).
+        read: Extra directories the code may read (e.g. a Python environment).
+        protected: Paths that must never become readable (Nodestro's data directory); the home directory and the
+            temp root are always protected.
+    """
+
+    isolated: ClassVar[bool] = True
 
     def __init__(
         self,
         *,
-        timeout: float = 10.0,
-        memory_mb: int = 512,
+        timeout: float = 15.0,
+        memory_mb: int = 1024,
         max_output_chars: int = 65_536,
-        tmp_mb: int = 16,
-        bwrap: str | None = None,
-        ldd: str | None = None,
+        tmp_mb: int = 64,
+        python: str | None = None,
+        env: dict[str, str] | None = None,
+        read: tuple[str, ...] = (),
+        protected: tuple[str, ...] = (),
     ) -> None:
         super().__init__(timeout=timeout, memory_mb=memory_mb, max_output_chars=max_output_chars)
         self.tmp_mb = tmp_mb
-        self.bwrap = bwrap or shutil.which("bwrap") or "bwrap"
-        self.ldd = ldd or shutil.which("ldd") or "ldd"
-        self._filter = seccomp_filter()
-        self._binds: list[str] | None = None
+        self.python = python or sys.executable
+        self.env = {**(env or {}), **BASE_ENV}
+        self.read = tuple(read)
+        self.protected = tuple(protected)
+        #: The calls running now; :meth:`cancel` kills them.
+        self._processes: set[subprocess.Popen[bytes]] = set()
+        self._lock = threading.Lock()
+        #: Tests only: require a newer Landlock ABI than the kernel has, to check that the run is refused.
+        self._min_landlock_abi = 0
+
+    # --- availability --------------------------------------------------------------------------------------------
 
     @staticmethod
-    def available(bwrap: str | None = None) -> bool:
-        """Whether this computer can run the prototype (Linux x86-64, ``bwrap`` and ``ldd`` present, user
-        namespaces allowed)."""
-        if not sys.platform.startswith("linux") or platform.machine() != "x86_64":
-            return False
-        if shutil.which(bwrap or "bwrap") is None or shutil.which("ldd") is None:
-            return False
-        try:
-            return BubblewrapSandbox(bwrap=bwrap, timeout=20.0).call(_PING, "ping", {"text": "ok"}) == "ok"
-        except Exception:  # any failure means the prototype cannot run here
-            return False
+    def status(*, refresh: bool = False) -> SandboxStatus:
+        """Check this computer once (cached): platform, tested distribution, kernel features and a confined
+        self-test call."""
+        global _STATUS
+        with _STATUS_LOCK:
+            if _STATUS is None or refresh:
+                _STATUS = _check()
+            return _STATUS
 
-    def _bind_arguments(self) -> list[str]:
-        if self._binds is not None:
-            return self._binds
-        executable = Path(sys.executable)
-        real_executable = executable.resolve()
-        python_dirs = _python_dirs()
-        elf_files = [real_executable]
-        for directory in python_dirs:
-            elf_files += [p for p in directory.rglob("*.so*") if p.is_file()]
-        libraries = _ldd(elf_files, self.ldd)
-        if not libraries:
-            raise SandboxError(f"Cannot list the shared libraries of {real_executable} with {self.ldd}")
-        args: list[str] = []
-        for library in sorted(libraries):
-            args += ["--ro-bind", str(library.resolve()), str(library)]
-        for directory in python_dirs:
-            args += ["--ro-bind", str(directory.resolve()), str(directory)]
-        args += ["--ro-bind", str(real_executable), str(executable)]
-        venv_config = Path(sys.prefix) / "pyvenv.cfg"
-        if sys.prefix != sys.base_prefix and venv_config.is_file():
-            args += ["--ro-bind", str(venv_config.resolve()), str(venv_config)]
-        args += ["--ro-bind", str(_PACKAGE_DIR), PACKAGE_TARGET]
-        self._binds = args
-        return args
+    @staticmethod
+    def system_supported() -> bool:
+        """Whether this is one of the tested distributions (does not check the kernel)."""
+        return platform.machine() == "x86_64" and sys.platform.startswith("linux") and os_release() in TESTED_SYSTEMS
 
-    def command(self, workdir: Path, seccomp_fd: int) -> list[str]:
-        """The ``bwrap`` command line for one run; the caller passes the filter on ``seccomp_fd``."""
-        return [
-            self.bwrap,
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--cap-drop",
-            "ALL",
-            "--uid",
-            "65534",
-            "--gid",
-            "65534",
-            "--hostname",
-            "sandbox",
-            *self._bind_arguments(),
-            "--ro-bind",
-            str(workdir),
-            "/work",
-            "--size",
-            str(self.tmp_mb * 1024 * 1024),
-            "--tmpfs",
-            "/tmp",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--setenv",
-            "HOME",
-            "/tmp",
-            "--chdir",
-            "/work",
-            "--seccomp",
-            str(seccomp_fd),
-            sys.executable,
-            "-I",
-            "-B",
-        ]
+    # --- runs ----------------------------------------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Kill every call this sandbox is running."""
+        with self._lock:
+            for process in self._processes:
+                _kill(process)
 
     def _execute(self, workdir: Path, request: str) -> str:
-        read_fd, write_fd = os.pipe()
+        tmp = workdir / "tmp"
+        tmp.mkdir(mode=0o700)
+        probe = workdir.parent / f"{workdir.name}.probe"
+        probe.write_bytes(b"outside")
+        config = {
+            "parent": os.getpid(),
+            "runner": str(_RUNNER),
+            # Orkexa's runner and ``orkexa.tools`` (also for a Python environment's interpreter, which lacks them).
+            "read": [str(_RUNNER.parents[1]), *self.read],
+            "write": [str(tmp)],
+            "forbidden": [str(Path.home()), tempfile.gettempdir(), *self.protected],
+            "probe_file": str(probe),
+            "min_landlock_abi": self._min_landlock_abi,
+            "limits": {
+                "memory_bytes": self.memory_mb * 1024 * 1024,
+                "cpu_seconds": int(self.timeout) + 1,
+                "file_bytes": self.tmp_mb * 1024 * 1024,
+            },
+        }
+        env = {**self.env, "TMPDIR": str(tmp), "HOME": str(tmp)}
         try:
-            # The filter is small (well below the pipe buffer), so writing it before bwrap starts cannot block.
-            os.write(write_fd, self._filter)
-            os.close(write_fd)
-            write_fd = -1
-            command = [*self.command(workdir, read_fd), f"{PACKAGE_TARGET}/dynamic/_sandbox_runner.py"]
-            completed = subprocess.run(
-                command,
-                input=request,
-                capture_output=True,
-                text=True,
-                env={},
-                timeout=self.timeout,
-                check=False,
-                pass_fds=(read_fd,),
+            process = subprocess.Popen(
+                [self.python, "-I", "-B", str(_CONFINE), json.dumps(config)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=workdir,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise SandboxError(f"Timed out after {self.timeout:g} seconds") from exc
         except OSError as exc:
-            raise SandboxError(f"Cannot start bwrap: {exc}") from exc
+            probe.unlink(missing_ok=True)
+            raise SandboxError(f"Cannot start the sandbox interpreter {self.python}: {exc}") from exc
+        with self._lock:
+            self._processes.add(process)
+        result: dict[str, bytes] = {}
+
+        def communicate() -> None:
+            out, err = process.communicate(request.encode("utf-8"))
+            result["out"], result["err"] = out, err
+
+        reader = threading.Thread(target=communicate, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + self.timeout
+        limit = self.tmp_mb * 1024 * 1024
+        problem = ""
+        try:
+            while reader.is_alive():
+                reader.join(0.05)
+                if not reader.is_alive():
+                    break
+                if time.monotonic() > deadline:
+                    problem = f"Timed out after {self.timeout:g} seconds"
+                else:
+                    size, entries = _usage(tmp)
+                    if size > limit:
+                        problem = f"The temporary files exceeded the limit of {self.tmp_mb} MB"
+                    elif entries > MAX_TMP_ENTRIES:
+                        problem = f"The temporary files exceeded the limit of {MAX_TMP_ENTRIES} files"
+                if problem:
+                    _kill(process)
+                    reader.join(5)
+                    break
         finally:
-            os.close(read_fd)
-            if write_fd >= 0:
-                os.close(write_fd)
-        if not completed.stdout.strip():
-            raise SandboxError(f"Sandbox exited with code {completed.returncode}: {completed.stderr[-1000:]}")
-        return completed.stdout
+            _kill(process)  # no-op if it has exited; the process cannot have children
+            with self._lock:
+                self._processes.discard(process)
+            probe.unlink(missing_ok=True)
+        if problem:
+            raise SandboxError(problem)
+        out, err = result.get("out", b""), result.get("err", b"")
+        stderr = err.decode("utf-8", "replace")
+        if process.returncode == sandbox_confine.EXIT_UNAVAILABLE and sandbox_confine.MARKER in stderr:
+            detail = stderr.split(sandbox_confine.MARKER, 1)[1].strip().splitlines()[0]
+            raise SandboxError(f"The built-in sandbox could not confine the run, nothing was executed ({detail})")
+        if process.returncode is not None and process.returncode < 0 and not out.strip():
+            raise SandboxError(f"Sandbox process was killed by signal {-process.returncode}")
+        if not out.strip():
+            raise SandboxError(f"Sandbox exited with code {process.returncode}: {stderr[-1000:]}")
+        return out.decode("utf-8", "replace")
 
 
-# --- report ------------------------------------------------------------------------------------------------------
+def _kill(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, 9)
+        except OSError:
+            process.kill()
+        process.wait()
+
+
+def _usage(directory: Path) -> tuple[int, int]:
+    """Total size (allocated blocks) and number of entries below ``directory``, without following links."""
+    total = count = 0
+    stack = [str(directory)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    count += 1
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_blocks * 512
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, count
+
+
+def _check() -> SandboxStatus:
+    system = " ".join(os_release())
+    if not sys.platform.startswith("linux") or platform.machine() != "x86_64":
+        return SandboxStatus(False, "platform", f"needs Linux x86-64, this is {sys.platform}", system, 0)
+    abi = sandbox_confine.landlock_abi()
+    if not LinuxSandbox.system_supported():
+        return SandboxStatus(
+            False,
+            "untested-system",
+            f"the built-in sandbox is tested on Ubuntu 24.04 and Debian 13, this is {system or 'unknown'}",
+            system,
+            abi,
+        )
+    try:
+        result = LinuxSandbox(timeout=30.0).call(_PING, "ping", {"text": "ok"})
+    except Exception as exc:
+        text = str(exc)
+        reason = "failed"
+        for code in ("landlock", "seccomp", "paths", "verify", "platform", "limits", "root"):
+            if f"({code}:" in text:
+                reason = code
+        return SandboxStatus(False, reason, text, system, abi)
+    if result != "ok":
+        return SandboxStatus(False, "failed", f"unexpected self-test result {result!r}", system, abi)
+    return SandboxStatus(True, "", "", system, abi)
 
 
 def measure(sandbox: Sandbox, calls: int = 10) -> dict[str, float]:
-    """Wall-clock times of trivial tool calls in milliseconds: the first call (with one-time setup such as listing
-    the shared libraries) and the mean and worst of ``calls`` further calls."""
+    """Wall-clock times of trivial tool calls in milliseconds: the first call and the mean and worst of ``calls``
+    further calls."""
     started = time.perf_counter()
     sandbox.call(_PING, "ping", {"text": "x"})
     first = (time.perf_counter() - started) * 1000
@@ -363,25 +318,17 @@ def measure(sandbox: Sandbox, calls: int = 10) -> dict[str, float]:
     return {"first_ms": first, "mean_ms": sum(times) / len(times), "max_ms": max(times)}
 
 
-def _report() -> str:  # pragma: no cover - manual tool, exercised by the tests through ``measure``
-    """Timings of this computer (the host subprocess comparison is printed by the tests, which may create one)."""
-    lines = ["| Check | Result |", "| --- | --- |"]
-    available = BubblewrapSandbox.available()
-    lines.append(f"| available on this computer | {'yes' if available else 'no'} |")
-    if available:
-        bwrap = measure(BubblewrapSandbox())
-        lines.append(f"| first call, bubblewrap (one-time setup) | {bwrap['first_ms']:.0f} ms |")
-        lines.append(f"| per call, bubblewrap (mean / max) | {bwrap['mean_ms']:.0f} ms / {bwrap['max_ms']:.0f} ms |")
-    return "\n".join(lines)
-
-
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - manual tool
+    """``python -m nodestro_runtime.builtin_sandbox``: print this computer's status and timings."""
     del argv
-    print(_report())
-    return 0
+    status = LinuxSandbox.status()
+    print(json.dumps(status.__dict__, indent=2))
+    if status.available:
+        print(json.dumps(measure(LinuxSandbox()), indent=2))
+    return 0 if status.available else 1
 
 
-__all__ = ["BubblewrapSandbox", "measure", "seccomp_filter"]
+__all__ = ["TESTED_SYSTEMS", "LinuxSandbox", "SandboxStatus", "measure", "os_release"]
 
 
 if __name__ == "__main__":  # pragma: no cover

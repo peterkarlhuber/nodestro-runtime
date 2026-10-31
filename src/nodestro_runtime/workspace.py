@@ -45,6 +45,7 @@ from orkexa.providers.base import redact
 
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
+from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
 from .container_images import ContainerImages, RuntimeImageSandbox
@@ -81,6 +82,7 @@ from .schemas import (
     DEFAULT_AGENT_MODEL,
     DEFAULT_ASSISTANT_MODEL,
     LANGUAGES,
+    BuiltinSandboxStatus,
     Run,
     RunIn,
     RunTrigger,
@@ -489,6 +491,7 @@ class Workspace:
             default_budget_usd=budget,
             sandbox=self._sandbox_kind(),
             docker_available=self._docker_available(),
+            builtin_sandbox=self._builtin_sandbox(),
             language=values.get("language") if values.get("language") in LANGUAGES else None,
             architect_budget_usd=values.get("architect_budget_usd", 2.0),
             architect_max_repairs=int(values.get("architect_max_repairs") or 0)
@@ -507,6 +510,14 @@ class Workspace:
         """A usage tracker for one AI operation of this workspace, priced with its catalog and price mode."""
         return PricedTracker(
             Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode()
+        )
+
+    def _builtin_sandbox(self) -> BuiltinSandboxStatus:
+        if self.sandbox_policy.profile != "desktop":
+            return BuiltinSandboxStatus(reason="server", detail="A server runs tool code in containers only")
+        status = LinuxSandbox.status()
+        return BuiltinSandboxStatus(
+            available=status.available, reason=status.reason, detail=status.detail, system=status.system
         )
 
     def _docker_available(self) -> bool:

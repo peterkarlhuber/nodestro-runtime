@@ -47,6 +47,7 @@ from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
 from pydantic import BaseModel, Field
 
+from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
@@ -304,12 +305,19 @@ class ToolLibrary:
         extra_tools: Sequence[Tool] = (),
         policy: SandboxPolicy | None = None,
         provenance: ToolProvenance | None = None,
+        protected: tuple[str, ...] | None = None,
     ) -> None:
         """``extra_tools``: trusted tools of installed integrations (:mod:`nodestro_runtime.extensions`).
+
+        ``protected`` are paths the built-in sandbox never makes readable; by default the directory that holds
+        ``path`` (Nodestro's data directory).
 
         ``provenance`` records which tools a person wrote in the editor; without it, records live in memory only
         and every stored tool counts as ``untrusted``."""
         self.policy = policy or SandboxPolicy()
+        if protected is None:
+            protected = (str(Path(path).resolve().parent),) if path is not None else ()
+        self.protected = protected
         self.provenance: ToolProvenance = provenance or MemoryProvenance()
         self.registry = ToolRegistry(path, sandbox=sandbox or make_sandbox("subprocess", self.policy))
         self.builtin: dict[str, Tool] = {}
@@ -418,8 +426,32 @@ class ToolLibrary:
         stored with the copy."""
         return _LinkedProvenance(self)
 
-    def _require(self, trust: TrustClass, sandbox: Sandbox, name: str) -> None:
+    def _require(self, trust: TrustClass, sandbox: Sandbox, name: str) -> Sandbox:
+        """The sandbox code of class ``trust`` runs in, instead of ``sandbox`` (ADR-0006).
+
+        ``sandbox`` itself if the policy allows it; on the desktop, code that needs isolation but was given a host
+        subprocess (the default sandbox or a Python environment's interpreter) runs in the built-in Linux sandbox
+        with the same interpreter, if this computer passed its checks. Otherwise ``sandbox.isolation_required`` is
+        raised: there is no fallback to the host subprocess."""
+        if self.policy.allows(trust, sandbox):
+            return sandbox
+        isolated = self._isolated(sandbox)
+        if isolated is not None and self.policy.allows(trust, isolated):
+            return isolated
         self.policy.require(trust, sandbox, name=name)
+        return sandbox  # pragma: no cover - require() raised
+
+    def _isolated(self, sandbox: Sandbox) -> Sandbox | None:
+        if not isinstance(sandbox, SubprocessSandbox) or not self.policy.builtin_available():
+            return None
+        return LinuxSandbox(
+            timeout=max(sandbox.timeout, 15.0),
+            memory_mb=sandbox.memory_mb,
+            max_output_chars=sandbox.max_output_chars,
+            python=sandbox.python,
+            env=dict(sandbox.env),
+            protected=self.protected,
+        )
 
     def all(self) -> list[ToolInfo]:
         return [self._info(name) for name in self.registry.names()]
@@ -444,7 +476,8 @@ class ToolLibrary:
         except RegistryError:
             raise KeyError(name) from None
         if isinstance(tool, SandboxedTool):
-            self._require(self.trust(name), sandbox or self.registry.sandbox, name)
+            routed = self._require(self.trust(name), sandbox or self.registry.sandbox, name)
+            sandbox = routed if routed is not self.registry.sandbox else sandbox
         if sandbox is not None and isinstance(tool, SandboxedTool):
             assert tool.input_schema is not None and tool.name is not None and tool.description is not None
             return SandboxedTool(
@@ -494,9 +527,8 @@ class ToolLibrary:
             )
         if errors:
             return CheckResult(ok=False, errors=errors)
-        chosen = sandbox or self.registry.sandbox
         try:
-            self._require(trust, chosen, function_name)
+            chosen = self._require(trust, sandbox or self.registry.sandbox, function_name)
         except NodestroError as exc:
             return CheckResult(ok=False, errors=[exc.problem])
         try:
@@ -648,7 +680,8 @@ class ToolLibrary:
             """Prepare the libraries, then make sure the tests may run where they will run."""
             assert builder is not None
             proposal = prepare_dependencies(proposal)
-            self._require("untrusted", builder.sandbox, proposal.function_name)
+            # The tests of generated code run where the policy allows (the built-in sandbox on the desktop).
+            builder.test_sandbox = self._require("untrusted", builder.sandbox, proposal.function_name)
             return proposal
 
         def prepare_dependencies(proposal: ToolProposal) -> ToolProposal:

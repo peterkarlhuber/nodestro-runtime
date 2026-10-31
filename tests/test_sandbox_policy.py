@@ -11,6 +11,7 @@ from typing import Any
 from orkexa.dynamic import DockerSandbox, Sandbox, SubprocessSandbox, ValidationResult
 import pytest
 
+from nodestro_runtime.builtin_sandbox import LinuxSandbox, SandboxStatus
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.profile import PROFILE_KINDS
 from nodestro_runtime.release import ReleaseBundle
@@ -69,12 +70,23 @@ def save_generated(tools: ToolLibrary, sandbox: Sandbox) -> None:
 
 
 @pytest.mark.parametrize(
-    ("profile", "trust", "isolation"), list(itertools.product(PROFILE_KINDS, TRUST_CLASSES, ["none", "container"]))
+    ("profile", "trust", "isolation"),
+    list(itertools.product(PROFILE_KINDS, TRUST_CLASSES, ["none", "container", "kernel"])),
 )
-def test_policy_matrix(profile: Any, trust: Any, isolation: str) -> None:
+def test_policy_matrix(profile: Any, trust: Any, isolation: str, monkeypatch: pytest.MonkeyPatch) -> None:
     policy = SandboxPolicy(profile)
-    sandbox: Sandbox = ContainerDouble() if isolation == "container" else SubprocessSandbox(acknowledge_unsafe=True)
-    expected = trust == "trusted" or isolation == "container" or (profile == "desktop" and trust == "user-authored")
+    sandbox: Sandbox
+    if isolation == "kernel":  # the built-in Linux sandbox on a computer that passed its checks
+        up = SandboxStatus(True, "", "", "ubuntu 24.04", 4)
+        monkeypatch.setattr(LinuxSandbox, "status", staticmethod(lambda refresh=False: up))
+        sandbox = LinuxSandbox()
+    else:
+        sandbox = ContainerDouble() if isolation == "container" else SubprocessSandbox(acknowledge_unsafe=True)
+    expected = (
+        trust == "trusted"
+        or isolation == "container"
+        or (profile == "desktop" and (trust == "user-authored" or isolation == "kernel"))
+    )
     assert policy.allows(trust, sandbox) is expected
     if expected:
         policy.require(trust, sandbox)
@@ -82,20 +94,22 @@ def test_policy_matrix(profile: Any, trust: Any, isolation: str) -> None:
         with pytest.raises(NodestroError) as error:
             policy.require(trust, sandbox, name="tool_x")
         assert error.value.code == "sandbox.isolation_required"
-        assert error.value.params == {"name": "tool_x", "trust": trust}
+        reason = "untested-system" if profile == "desktop" else ""
+        assert error.value.params == {"name": "tool_x", "trust": trust, "reason": reason}
 
 
 def test_an_unknown_trust_class_is_treated_as_untrusted() -> None:
     assert SandboxPolicy().needs_isolation("unknown")  # type: ignore[arg-type]
 
 
-def test_only_a_docker_sandbox_counts_as_isolating() -> None:
+def test_only_a_docker_or_a_checked_builtin_sandbox_counts_as_isolating() -> None:
     class Claims(SubprocessSandbox):
         isolated = True  # a claim, not a container
 
     assert isolation_of(DockerSandbox()) == "container"
     assert isolation_of(Claims(acknowledge_unsafe=True)) == "none"
     assert isolation_of(SubprocessSandbox(acknowledge_unsafe=True)) == "none"
+    assert isolation_of(LinuxSandbox()) == "none"  # its checks did not pass on this (test) computer
 
 
 def test_the_server_profile_cannot_create_a_host_subprocess_sandbox() -> None:

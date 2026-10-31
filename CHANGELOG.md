@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+Built-in Linux sandbox (replaces the bubblewrap prototype of PR-13; ADR-0006 point 7):
+
+- New `nodestro_runtime.builtin_sandbox.LinuxSandbox`: runs tool code isolated without Docker, Bubblewrap or any
+  installed tool. The sandbox process confines itself before it reads any tool code
+  (`nodestro_runtime.sandbox_confine`): Landlock (ABI 4 or newer) allows reading only the interpreter, the system
+  libraries and the call's files, and writing only the call's private `tmp`; seccomp refuses new processes,
+  `execve`, every socket, `ptrace`, System V IPC, signals and limit changes aimed at other processes, namespaces,
+  mounts and other kernel interfaces; resource limits cover memory, CPU, file size, open files and processes; the
+  environment is empty. The host adds the wall-clock timeout, a size limit for `tmp`, cancel and cleanup. Each run
+  verifies the confinement from the inside; if any step fails, no tool code runs.
+- It needs no user namespaces, so Ubuntu 24.04's AppArmor restriction of unprivileged user namespaces does not
+  affect it (bubblewrap does not work there without an administrator's AppArmor profile, measured on a clean
+  Ubuntu 24.04 machine). A root user is refused.
+- `LinuxSandbox.status()` checks the computer once: Linux x86-64, a tested distribution (`TESTED_SYSTEMS`: Ubuntu
+  24.04 and Debian 13), the kernel features and a confined self-test call. The reason is reported when it is not
+  available (`platform`, `untested-system`, `landlock`, `seccomp`, `root`, `paths`, `verify`, `failed`).
+- The sandbox policy counts it as isolating (`isolation_of` → `"kernel"`) only in the desktop profile and only where
+  its status is available. A server keeps tenants' code in containers.
+- On the desktop, code that needs isolation and was given a host subprocess (the default sandbox or a Python
+  environment's interpreter) runs in the built-in sandbox automatically (`ToolLibrary._require`). Without it, such
+  code is refused with `sandbox.isolation_required`, whose message and new `reason` parameter say why; there is no
+  fallback to a host subprocess. User-authored code keeps the configured sandbox. Untrusted code may now use
+  approved third-party libraries where the built-in sandbox is available (`PythonEnvironments.isolation()` →
+  `"kernel"`).
+- New `python -m nodestro_runtime.sandbox_probes`: the security probes (files, data directory, keys and
+  environment, network, processes, foreign processes, kernel interfaces, limits, timeout, cancel, cleanup,
+  manipulated paths, fail-closed) and compatibility checks (standard library, the examples' built-in tools,
+  generated tool tests, repeated, parallel and long calls, timeouts, a compiled library, overhead). A probe passes
+  only if its code ran in the sandbox and every attempt was refused. CI runs them as a normal user.
+- Tests see a computer without the built-in sandbox unless a module is marked `real_sandbox_status`
+  (`tests/conftest.py`), so the rules for computers without isolation stay tested everywhere.
+
 Comparing estimates with the providers' bills (PRICING-1, phase N7, optional; runtime part):
 
 - New `nodestro_runtime.reconciliation.CostReconciliationService`. It fetches the providers' cost reports and
