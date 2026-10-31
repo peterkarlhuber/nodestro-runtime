@@ -15,7 +15,9 @@ from typing import TYPE_CHECKING, Any
 
 from orkexa import MODEL_PRICING
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+from .tool_policy import UNKNOWN, ToolCapability, server_tool_capability
 
 if TYPE_CHECKING:
     from .pricing import PricingService
@@ -158,6 +160,15 @@ class ServerToolInfo(BaseModel):
     label: str
     description: str
     definition: dict[str, Any]
+    #: What the tool may do (S-1). Server tools run at the provider and never pass Nodestro's per-call rules.
+    capability: ToolCapability = UNKNOWN
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_capability(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("capability") is None:
+            data = {**data, "capability": server_tool_capability(str(data.get("key", "")))}
+        return data
 
 
 SERVER_TOOLS: dict[str, ServerToolInfo] = {

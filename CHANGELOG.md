@@ -15,6 +15,11 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   future (PostgreSQL: one conditional `UPDATE` against the database clock; SQLite: inside `BEGIN IMMEDIATE`). Exactly
   one of several concurrent writers wins, also across processes and connections. Tool approval decisions will use it,
   so that they never live in (and are never overwritten by saves of) the run document.
+- `ToolInfo.capability` is now a `ToolCapability` and set for every tool (it was a plain dict, for MCP tools only; the
+  JSON shape is unchanged): built-in tools carry Nodestro's statement, own and generated tools `write` + `external`
+  until their author states otherwise, `internal` (`derived`) when the library's sandbox has no network, MCP tools the
+  administrator's class. `ServerToolInfo.capability` shows what the provider's server tools do. `McpTool.capability()`
+  returns a `ToolCapability`; `ToolLibrary.isolation(trust)` tells how the library's sandbox isolates a trust class.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 

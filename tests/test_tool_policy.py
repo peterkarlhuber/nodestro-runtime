@@ -67,3 +67,9 @@ def test_reach_is_derived_from_a_sandbox_without_network(isolation: str | None, 
 def test_statements_are_immutable() -> None:
     with pytest.raises(ValueError):
         UNKNOWN.access = "read"  # type: ignore[misc]
+
+
+def test_a_statement_without_a_source_takes_the_given_one() -> None:
+    found = parse_capability({"access": "read", "reach": "internal"}, source="author")
+    assert found == ToolCapability(access="read", reach="internal", source="author")
+    assert parse_capability({"access": "read", "reach": "internal"}) is None

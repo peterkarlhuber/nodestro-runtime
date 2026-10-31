@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..mcp_access import TOOL_PREFIX, is_mcp_tool, unattended_mcp_enabled
 from ..schemas import new_id, now
+from ..tool_policy import ToolCapability, capability_of
 
 __all__ = ["TOOL_PREFIX", "is_mcp_tool", "unattended_mcp_enabled"]
 
@@ -157,9 +158,10 @@ class McpTool(_Model):
     def qualified(self) -> str:
         return f"mcp:{self.server_id}/{self.name}"
 
-    def capability(self) -> dict[str, str]:
-        """The tool's capability statement in the shared model (S-1): MCP tools always reach outside Nodestro."""
-        return {"access": self.access, "reach": "external", "source": "admin"}
+    def capability(self) -> ToolCapability:
+        """The tool's capability statement in the shared model (S-1): the administrator's classification; MCP tools
+        always reach outside Nodestro."""
+        return capability_of(name=self.tool_name, kind="mcp", stated={"access": self.access, "reach": "external"})
 
     def suggested_access(self) -> ToolAccess:
         """What the annotations suggest; shown as a hint only (the administrator decides)."""

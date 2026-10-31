@@ -81,6 +81,8 @@ def parse_capability(value: Any, *, source: CapabilitySource | None = None) -> T
     """
     if value is None:
         return None
+    if isinstance(value, dict) and source is not None:
+        value = {**value, "source": source}
     try:
         found = value if isinstance(value, ToolCapability) else ToolCapability.model_validate(value)
     except (TypeError, ValueError):
