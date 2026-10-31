@@ -397,6 +397,9 @@ def host_probes(canaries: _Canaries) -> list[Result]:
         "import time\nfor i in range(200):\n"
         "    open(os.environ['TMPDIR'] + '/f%d' % i, 'wb').write(b'x' * 1024 * 1024)\n"
         "    time.sleep(0.01)\nreturn 'written'"), "probe", {"x": ""}), ("exceeded",), 20))  # fmt: skip
+    results.append(_expect_error("tmp-limit-file-count", "limits", lambda: tmp.call(_tool(
+        "for i in range(200000):\n    open(os.environ['TMPDIR'] + '/e%d' % i, 'wb').close()\nreturn 'written'"),
+        "probe", {"x": ""}), ("files",), 20))  # fmt: skip
     threads = _sandbox(canaries, timeout=20.0)
     results.append(_expect_error("process-limit", "limits", lambda: threads.call(_tool(
         "ts = [threading.Thread(target=lambda: None) for _ in range(5)]\n[t.start() for t in ts]\nreturn 'started'"),

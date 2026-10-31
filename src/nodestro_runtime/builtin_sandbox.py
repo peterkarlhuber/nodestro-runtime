@@ -50,6 +50,8 @@ from . import sandbox_confine
 #: compatibility test of the built-in sandbox passed on x86-64, with the distribution's own kernel and AppArmor.
 TESTED_SYSTEMS: frozenset[tuple[str, str]] = frozenset({("ubuntu", "24.04"), ("debian", "13")})
 
+#: Most files and folders a call may create in its ``tmp`` (an empty file uses no blocks, but an inode).
+MAX_TMP_ENTRIES = 10_000
 _RUNNER = Path(orkexa.__file__).resolve().parent / "dynamic" / "_sandbox_runner.py"
 _CONFINE = Path(sandbox_confine.__file__).resolve()
 #: Variables every sandbox process gets; nothing is inherited from Nodestro's environment.
@@ -216,8 +218,12 @@ class LinuxSandbox(Sandbox):
                     break
                 if time.monotonic() > deadline:
                     problem = f"Timed out after {self.timeout:g} seconds"
-                elif _size(tmp) > limit:
-                    problem = f"The temporary files exceeded the limit of {self.tmp_mb} MB"
+                else:
+                    size, entries = _usage(tmp)
+                    if size > limit:
+                        problem = f"The temporary files exceeded the limit of {self.tmp_mb} MB"
+                    elif entries > MAX_TMP_ENTRIES:
+                        problem = f"The temporary files exceeded the limit of {MAX_TMP_ENTRIES} files"
                 if problem:
                     _kill(process)
                     reader.join(5)
@@ -250,14 +256,15 @@ def _kill(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _size(directory: Path) -> int:
-    """Total size of the files below ``directory``, without following symbolic links."""
-    total = 0
+def _usage(directory: Path) -> tuple[int, int]:
+    """Total size (allocated blocks) and number of entries below ``directory``, without following links."""
+    total = count = 0
     stack = [str(directory)]
     while stack:
         try:
             with os.scandir(stack.pop()) as entries:
                 for entry in entries:
+                    count += 1
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
@@ -267,7 +274,7 @@ def _size(directory: Path) -> int:
                         continue
         except OSError:
             continue
-    return total
+    return total, count
 
 
 def _check() -> SandboxStatus:
