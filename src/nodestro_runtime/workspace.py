@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import logging
@@ -48,9 +49,9 @@ from .catalog import models
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
-from .memory_spaces import MemorySpaces
+from .memory_spaces import MemorySpaces, MemoryTables
 from .problems import NodestroError
 from .profile import RuntimeProfile
 from .providers import (
@@ -83,7 +84,7 @@ from .schemas import (
     Workflow,
     WorkflowIn,
 )
-from .storage import BeforeMigration, SQLiteStore, Store
+from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_drafts import ToolDrafts
 from .tool_library import ToolLibrary, make_sandbox
 from .tool_provenance import StoredProvenance
@@ -149,6 +150,25 @@ def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, 
     return target_path
 
 
+#: The tenant of a workspace on its own SQLite database (the desktop).
+LOCAL_TENANT = "local"
+
+
+@dataclass(frozen=True)
+class WorkspaceStorage:
+    """Storage handed to a workspace instead of its own SQLite database: one tenant of a server database.
+
+    The workspace uses these stores as they are: it neither migrates nor closes the database behind them (its
+    owner does, see :mod:`nodestro_runtime.storage_postgres`); its ``data_dir`` holds only the tenant's files
+    (tools, Python environments, uploaded inputs). :func:`nodestro_runtime.postgres_tables.tenant_storage` builds
+    one for PostgreSQL."""
+
+    tenant_id: str
+    store: DocumentStore
+    knowledge: KnowledgeTables
+    memory: MemoryTables
+
+
 class Workspace:
     """Every runtime service of one data directory; one instance per process and directory."""
 
@@ -162,6 +182,7 @@ class Workspace:
         integrations: Iterable[Integration] | None = None,
         profile: RuntimeProfile | None = None,
         before_migration: BeforeMigration | None = None,
+        storage: WorkspaceStorage | None = None,
     ) -> None:
         """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
         OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`).
@@ -174,7 +195,10 @@ class Workspace:
         (:meth:`~nodestro_runtime.storage.SQLiteStore.migrate`; nothing happens while the version is current).
         ``before_migration`` writes the backup a migration needs first; without one, the database file is copied
         to ``<data_dir>/backups/pre-migration-<from>-to-<to>-<time>.db``. A database of a newer release is refused
-        (``storage.schema_too_new``) and the workspace does not open."""
+        (``storage.schema_too_new``) and the workspace does not open.
+
+        ``storage`` replaces the SQLite database with the stores of one tenant (:class:`WorkspaceStorage`); the
+        data directory then holds only that tenant's files. Without it the tenant is ``local``."""
         if profile is None:
             if data_dir is None:
                 raise TypeError("Workspace needs a data directory or a profile")
@@ -193,17 +217,27 @@ class Workspace:
             strict=integrations is not None,
             reserved={tool.name for tool in BUILTIN_TOOLS if tool.name},
         )
-        database = data_dir / DATABASE
-        self.store = Store(database)
-        try:
-            self.store.migrate(before_migration=before_migration or self._backup_before_migration)
-        except BaseException:
-            self.store.close()
-            self._directory_lock.release()
-            raise
-        self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
+        self.store: DocumentStore
+        self._sqlite: SQLiteStore | None = None
+        if storage is None:
+            database = data_dir / DATABASE
+            self._sqlite = Store(database)
+            self.store = self._sqlite
+            self.tenant_id = LOCAL_TENANT
+            try:
+                self._sqlite.migrate(before_migration=before_migration or self._backup_before_migration)
+            except BaseException:
+                self._sqlite.close()
+                self._directory_lock.release()
+                raise
+            self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
+            self.memory = MemorySpaces(database)
+        else:
+            self.store = storage.store
+            self.tenant_id = storage.tenant_id
+            self.knowledge = KnowledgeBase(storage.knowledge, ocr=ocr_runner, engine=self.extensions.ocr)
+            self.memory = MemorySpaces(storage.memory)
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
-        self.memory = MemorySpaces(database)
         self.sandbox_policy = SandboxPolicy(self.profile.kind)
         sandbox = make_sandbox(self._stored("sandbox") or "subprocess", self.sandbox_policy)
         self.tools = ToolLibrary(
@@ -269,7 +303,18 @@ class Workspace:
 
     def _backup_before_migration(self, current: int, target: int) -> None:
         """Copy the database before a schema migration (the default ``before_migration``)."""
-        backup_migrated_database(self.store, self.data_dir / "backups", current, target)
+        backup_migrated_database(self.sqlite_store, self.data_dir / "backups", current, target)
+
+    @property
+    def sqlite_store(self) -> SQLiteStore:
+        """The workspace's own SQLite database (backups, maintenance, diagnostics of the desktop).
+
+        A workspace on handed-in storage has none (``storage.not_sqlite``): its database belongs to the server."""
+        if self._sqlite is None:
+            raise NodestroError(
+                "storage.not_sqlite", "This workspace keeps its data in the server database, not in a SQLite file"
+            )
+        return self._sqlite
 
     def compose(self) -> None:
         """Add services before interrupted runs are recovered; applications built on the runtime override it."""
@@ -559,4 +604,4 @@ class Workspace:
             self.connection(provider)
 
 
-__all__ = ["DATABASE", "MissingApiKeyError", "Workspace"]
+__all__ = ["DATABASE", "LOCAL_TENANT", "MissingApiKeyError", "Workspace", "WorkspaceStorage"]

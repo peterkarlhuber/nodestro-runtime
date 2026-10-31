@@ -19,7 +19,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import unicodedata
 
 from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
@@ -28,6 +28,9 @@ from orkexa.memory import MemoryBackend
 from .knowledge import KnowledgeTables
 from .memory_spaces import BrowsableMemory
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
+
+if TYPE_CHECKING:
+    from .workspace import WorkspaceStorage
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
 _WORD = re.compile(r"[^\W_]+")
@@ -347,6 +350,18 @@ def knowledge_tables(database: PostgresDatabase, tenant_id: str, *, namespace: s
     return KnowledgeTables(PostgresFileStore(database, tenant_id, namespace=namespace), index, index)
 
 
+def tenant_storage(database: PostgresDatabase, tenant_id: str) -> WorkspaceStorage:
+    """Everything a :class:`~nodestro_runtime.workspace.Workspace` stores, for one tenant of ``database``."""
+    from .workspace import WorkspaceStorage
+
+    return WorkspaceStorage(
+        tenant_id=tenant_id,
+        store=database.store(tenant_id),
+        knowledge=knowledge_tables(database, tenant_id),
+        memory=PostgresMemoryTables(database, tenant_id),
+    )
+
+
 def memory_totals(database: PostgresDatabase, tenant_id: str, prefix: str) -> builtins.list[tuple[str, int, int]]:
     """``(namespace, files, bytes)`` of every memory namespace of the tenant starting with ``prefix``."""
     _check(tenant_id, "-")
@@ -367,4 +382,5 @@ __all__ = [
     "knowledge_tables",
     "memory_totals",
     "search_words",
+    "tenant_storage",
 ]
