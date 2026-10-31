@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+Costs priced with the workspace's catalog (PRICING-1, phases N5 and N6, runtime part):
+
+- New `nodestro_runtime.cost_tracking.PricedTracker`: the `BudgetTracker` of workflow runs, sub-workflows and
+  agent tests, and `Workspace.tracker(budget)` for the API's other AI operations. It hands Orkexa the
+  workspace's resolver, so overrides and synced prices apply everywhere. It remembers which requests were
+  priced with a stale price. Costs are calculated once, when a request ends; later price changes never alter
+  stored costs.
+- `Usage` gained price references: `known_cost_usd` (a lower bound when incomplete), `cost_complete`,
+  `unpriced_requests`, `stale_price_requests`, `missing_cost_components`, `pricing_versions`, `pricing_sources`
+  and `pricing_quality` (the lowest involved). `usage_of(summary, records)` fills them; `add_usage` merges them.
+  Usage stored by earlier releases reads unchanged (`known_cost_usd` and `cost_complete` are `None`); in sums
+  an older unknown cost counts as unpriced and an older known cost as known.
+- `UsageLog.record(..., tracker=...)` stores the same references for operations outside runs.
+- New setting `price_mode`: `standard` (default; unknown and stale prices warn, as before) or `strict` (a
+  request without a known price, or with a price not checked for seven days (`pricing.stale_price`), is not
+  sent; a request whose cost turned out unknown stops the operation after it was recorded). Existing budget
+  settings are unchanged.
+- The pre-check (`check.model_unpriced`) uses the workspace's prices instead of Orkexa's built-in table.
+
 Automatic price updates (PRICING-1, phase N3):
 
 - New `nodestro_runtime.pricing_sync.PricingSyncService`. It asks each price source for a candidate and hands it

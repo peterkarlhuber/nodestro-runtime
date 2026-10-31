@@ -22,7 +22,7 @@ lets a continued run (:mod:`nodestro_runtime.resume`) take over results of an ea
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -56,10 +56,12 @@ from pydantic import BaseModel
 from . import graph
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
+from .cost_tracking import PricedTracker, PriceMode, stale_requests
 from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
+from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
 from .schemas import (
@@ -117,8 +119,26 @@ _SETTLED = {"succeeded", "skipped", "blocked", "failed", "cancelled"}
 MAX_DEPTH = 5
 
 
-def usage_of(summary: UsageSummary) -> Usage:
+#: Orkexa's price qualities, most trustworthy first.
+_QUALITY_ORDER = ("verified", "contract", "unverified", "estimated")
+_MAX_LISTED = 50
+
+
+def _lowest_quality(*qualities: str | None) -> str | None:
+    known = [quality for quality in qualities if quality]
+    if not known:
+        return None
+    return max(known, key=lambda q: _QUALITY_ORDER.index(q) if q in _QUALITY_ORDER else len(_QUALITY_ORDER))
+
+
+def _merged(*lists: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(item for items in lists for item in items))[:_MAX_LISTED]
+
+
+def usage_of(summary: UsageSummary, records: Iterable[UsageRecord] = (), *, stale_requests: int = 0) -> Usage:
+    """Nodestro's usage of an Orkexa summary; ``records`` (the summarized requests) add the price references."""
     cost = summary.estimated_cost_usd
+    used = list(records)
     return Usage(
         requests=summary.requests,
         input_tokens=summary.input_tokens,
@@ -129,22 +149,68 @@ def usage_of(summary: UsageSummary) -> Usage:
         web_search_requests=summary.web_search_requests,
         total_tokens=summary.total_tokens,
         estimated_cost_usd=float(cost) if cost is not None else None,
+        known_cost_usd=float(summary.known_cost_usd),
+        cost_complete=cost is not None,
+        unpriced_requests=summary.unpriced_requests,
+        stale_price_requests=stale_requests,
+        missing_cost_components=list(summary.missing_cost_components)[:_MAX_LISTED],
+        pricing_versions=_merged([record.pricing_version for record in used if record.pricing_version]),
+        pricing_sources=_merged([record.pricing_source for record in used if record.pricing_source]),
+        pricing_quality=_lowest_quality(*(record.pricing_quality for record in used)),
     )
 
 
+def _cost_parts(usage: Usage) -> tuple[float, int, bool | None]:
+    """(known cost, unpriced requests, complete) of a usage, also of one stored before price references."""
+    if usage.requests == 0:
+        return 0.0, 0, True
+    if usage.known_cost_usd is None:  # recorded before PRICING-1
+        known = usage.estimated_cost_usd
+        if known is None:
+            return 0.0, usage.requests, False
+        return known, 0, None  # priced, but whether every part of it was known was not recorded
+    return usage.known_cost_usd, usage.unpriced_requests, usage.cost_complete
+
+
 def add_usage(first: Usage, second: Usage) -> Usage:
-    """The sum of two usages (``None`` cost stays unknown)."""
+    """The sum of two usages: an unknown cost stays unknown, known parts add up, references are merged."""
     cost = (
         None
         if first.estimated_cost_usd is None or second.estimated_cost_usd is None
         else first.estimated_cost_usd + second.estimated_cost_usd
     )
-    data = {
-        name: getattr(first, name) + getattr(second, name)
-        for name in Usage.model_fields
-        if name != "estimated_cost_usd"
-    }
-    return Usage(**data, estimated_cost_usd=cost)
+    known_a, unpriced_a, complete_a = _cost_parts(first)
+    known_b, unpriced_b, complete_b = _cost_parts(second)
+    complete: bool | None
+    if complete_a is False or complete_b is False:
+        complete = False
+    elif complete_a is None or complete_b is None:
+        complete = None
+    else:
+        complete = True
+    counted = (
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "thinking_tokens",
+        "web_search_requests",
+        "total_tokens",
+        "stale_price_requests",
+    )
+    data = {name: getattr(first, name) + getattr(second, name) for name in counted}
+    return Usage(
+        **data,
+        estimated_cost_usd=cost,
+        known_cost_usd=known_a + known_b,
+        cost_complete=complete,
+        unpriced_requests=unpriced_a + unpriced_b,
+        missing_cost_components=_merged(first.missing_cost_components, second.missing_cost_components),
+        pricing_versions=_merged(first.pricing_versions, second.pricing_versions),
+        pricing_sources=_merged(first.pricing_sources, second.pricing_sources),
+        pricing_quality=_lowest_quality(first.pricing_quality, second.pricing_quality),
+    )
 
 
 def topological_order(workflow: Workflow) -> list[Node]:
@@ -485,15 +551,23 @@ class CancelFlag:
         return self._event.is_set() or (self.parent is not None and self.parent.is_set())
 
 
-class _ChildTracker(BudgetTracker):
-    """A sub-workflow's usage: kept for the child run and, renamed, counted in the parent's budget."""
+class _ChildTracker(PricedTracker):
+    """A sub-workflow's usage: kept for the child run and, renamed, counted in the parent's budget.
+
+    It prices with the parent's catalog and price mode, so a sub-workflow is priced exactly like its parent.
+    """
 
     def __init__(self, parent: BudgetTracker, prefix: str) -> None:
-        super().__init__(None)
+        if isinstance(parent, PricedTracker):
+            super().__init__(None, pricing=parent.pricing, mode=parent.mode)
+        else:
+            super().__init__(None)
+            self.price_resolver = parent.price_resolver
         self.parent = parent
         self.prefix = prefix
 
     def add(self, record: UsageRecord) -> None:
+        self.note(record)
         UsageTracker.add(self, record)
         self.parent.add(replace(record, agent=f"{self.prefix}/{record.agent}"))
 
@@ -590,6 +664,9 @@ class RunManager:
         self.connect = connect
         self.default_budget = default_budget
         self.assistant_model = assistant_model
+        #: The workspace's price catalog and price mode (PRICING-1); without a catalog Orkexa's built-in prices apply.
+        self.pricing: PricingService | None = None
+        self.price_mode: Callable[[], PriceMode] = lambda: "standard"
         #: A saved workflow in a version (``None``: the latest), with the version's number.
         self.resolve_workflow: Callable[[str, int | None], tuple[Workflow, int | None]] = _no_workflow
         #: What identifies a tool's current code (for fingerprints of continued runs).
@@ -724,6 +801,12 @@ class RunManager:
             run.nodes.update({node_id: state for node_id, state in preset.items() if node_id in run.nodes})
         return self._launch(run)
 
+    def tracker(self, budget: float | None) -> PricedTracker:
+        """The tracker of one run: the budget in USD (``None``: none), priced with the workspace's catalog."""
+        return PricedTracker(
+            Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode()
+        )
+
     def environment(self, run: Run) -> RunEnvironment:
         """What ``run`` executes with (a sub-workflow's run: ask with its top-level run)."""
         found = self.environments(run)
@@ -761,9 +844,7 @@ class RunManager:
         budget = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
         if budget is not None:
             budget = max(budget - _known_cost(run), 0.0)
-        context = _RunContext(
-            run, BudgetTracker(Decimal(str(budget)) if budget is not None else None), self.environment(run)
-        )
+        context = _RunContext(run, self.tracker(budget), self.environment(run))
         context.loop = loop
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
@@ -1149,7 +1230,12 @@ class RunManager:
             run.status = "failed"
             _fail(run, node_problem(exc))
         finally:
-            run.usage = add_usage(context.base_usage, usage_of(context.tracker.usage))
+            run.usage = add_usage(
+                context.base_usage,
+                usage_of(
+                    context.tracker.usage, context.tracker.records, stale_requests=stale_requests(context.tracker)
+                ),
+            )
             paused = _is_paused(run)
             if not paused:
                 run.finished_at = now()
@@ -1773,7 +1859,7 @@ class RunManager:
         records: list[UsageRecord] = [
             record for record in context.tracker.records if record.agent in names or record.agent.startswith(prefix)
         ]
-        return usage_of(summarize_usage(records))
+        return usage_of(summarize_usage(records), records, stale_requests=stale_requests(context.tracker, records))
 
 
 def _proposal_text(value: Any) -> str:

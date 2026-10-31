@@ -23,6 +23,8 @@ from orkexa import UsageRecord
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel, Field
 
+from .cost_tracking import stale_requests
+from .engine import usage_of
 from .schemas import Usage, new_id, now
 from .storage import DocumentStore
 
@@ -83,8 +85,14 @@ class UsageLog:
         detail: str | None = None,
         request: str | None = None,
         estimated: bool = False,
+        tracker: object | None = None,
     ) -> list[UsageEntry]:
-        """Store the requests of one operation, one entry per model (``provider:model``); nothing for no requests."""
+        """Store the requests of one operation, one entry per model (``provider:model``); nothing for no requests.
+
+        Each entry keeps the cost Orkexa calculated when the request ended and its price references (snapshot
+        versions, sources, quality); ``tracker`` (the operation's :class:`~.cost_tracking.PricedTracker`) adds
+        which requests were priced with a stale price.
+        """
         by_model: dict[str, list[UsageRecord]] = {}
         for record in records:
             model = f"{record.provider}:{record.model}" if record.provider else record.model
@@ -92,8 +100,6 @@ class UsageLog:
         entries = []
         with self.store.transaction():  # one operation: all of its entries or none
             for model, group in by_model.items():
-                summary = summarize_usage(group)
-                cost = summary.estimated_cost_usd
                 entry = UsageEntry(
                     source=source,
                     label=label[:120],
@@ -102,17 +108,7 @@ class UsageLog:
                     detail=detail,
                     request=request,
                     estimated=estimated,
-                    usage=Usage(
-                        requests=summary.requests,
-                        input_tokens=summary.input_tokens,
-                        output_tokens=summary.output_tokens,
-                        cache_read_input_tokens=summary.cache_read_input_tokens,
-                        cache_creation_input_tokens=summary.cache_creation_input_tokens,
-                        thinking_tokens=summary.thinking_tokens,
-                        web_search_requests=summary.web_search_requests,
-                        total_tokens=summary.total_tokens,
-                        estimated_cost_usd=float(cost) if cost is not None else None,
-                    ),
+                    usage=usage_of(summarize_usage(group), group, stale_requests=stale_requests(tracker, group)),
                 )
                 self.store.put(_COLLECTION, entry.id, entry)
                 entries.append(entry)

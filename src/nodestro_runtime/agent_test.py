@@ -24,7 +24,9 @@ from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
 from .agent_builder import AgentBuilder
+from .cost_tracking import PricedTracker, PriceMode
 from .engine import execute_agent, node_problem, render_task, usage_of
+from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
 from .schemas import AgentConfig, EvaluationRecord, ToolCallRecord, Usage, new_id, now
@@ -90,6 +92,9 @@ class AgentTester:
         self.tool_sandbox = tool_sandbox
         self.connect = connect
         self.default_budget = default_budget
+        #: The workspace's price catalog and price mode (PRICING-1).
+        self.pricing: PricingService | None = None
+        self.price_mode: Callable[[], PriceMode] = lambda: "standard"
 
     def _memory(self, config: AgentConfig) -> tuple[AgentConfig, Callable[[], MemoryBackend], bool]:
         """Persistent memory becomes a writable copy, so a test never changes the space."""
@@ -105,7 +110,9 @@ class AgentTester:
         config = request.agent
         prompt = task_prompt(config, request.input, raw=request.raw)
         budget = self.default_budget()
-        tracker = BudgetTracker(Decimal(str(budget)) if budget is not None else None)
+        tracker = PricedTracker(
+            Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode()
+        )
         result = AgentTestResult(agent_name=config.name, model=config.model, prompt=prompt)
         calls: dict[str, ToolCallRecord] = {}
         lock = threading.Lock()
@@ -157,6 +164,6 @@ class AgentTester:
             result.status = "failed"
             result.error, result.error_code, result.error_params = found.message, found.code, found.params
         finally:
-            result.usage = usage_of(tracker.usage)
+            result.usage = usage_of(tracker.usage, tracker.records, stale_requests=tracker.stale_requests())
             result.finished_at = now()
         return result, tracker
