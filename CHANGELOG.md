@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+Comparing estimates with the providers' bills (PRICING-1, phase N7, optional; runtime part):
+
+- New `nodestro_runtime.reconciliation.CostReconciliationService`. It fetches the providers' cost reports and
+  compares them with Nodestro's estimates per UTC day, provider and model. Adapters: `OpenAICostsAdapter`
+  (`/v1/organization/costs`, admin key, optionally limited to projects) and `AnthropicCostAdapter`
+  (`/v1/organizations/analytics/cost`, admin or `read:analytics` key, amounts in cents, 31-day windows,
+  `data_refreshed_at` as the watermark, optionally limited to workspaces). Admin keys are passed in by the caller
+  and are never logged or stored by the runtime.
+- `nodestro_estimates(workspace, start, end)` sums the estimates of workflow runs (without imported traces and
+  sub-workflow runs, which count in their parent) and of the usage ledger.
+- A deviation (`warning`) needs both thresholds: more than 5 % and more than 1 USD (`ReconciliationSettings`).
+  A day the provider has not finalized yet is `pending`, a day with unknown costs is `incomplete` (never a
+  deviation), billed lines without a model are `unattributed`, and a model the report does not name is
+  `not_comparable`. Dated snapshot names in reports (`gpt-5-2026-08-07`) match the alias Nodestro used. A failing
+  provider is reported and does not hide the others.
+
 Costs priced with the workspace's catalog (PRICING-1, phases N5 and N6, runtime part):
 
 - New `nodestro_runtime.cost_tracking.PricedTracker`: the `BudgetTracker` of workflow runs, sub-workflows and
