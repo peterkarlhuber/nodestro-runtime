@@ -20,6 +20,18 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   until their author states otherwise, `internal` (`derived`) when the library's sandbox has no network, MCP tools the
   administrator's class. `ServerToolInfo.capability` shows what the provider's server tools do. `McpTool.capability()`
   returns a `ToolCapability`; `ToolLibrary.isolation(trust)` tells how the library's sandbox isolates a trust class.
+- Per-call approval rules, not wired into runs yet: `tool_policy.ToolBinding` (`ask` `auto`/`always`/`never`; `never`
+  needs a reason for `write` tools, never applies to `destructive` tools; legacy exemptions hold only for the bound
+  tool version), `ToolPreGrant` (one tool version, one schedule, batch or test series, expiry, revocation; not for
+  destructive or MCP tools), `CallContext` and `decide(...)` -> allow / deny (`tool.not_granted`,
+  `tool.approval_unattended`) / ask. Orchestrator grants only narrow; unattended runs deny what would ask unless a
+  pre-grant matches; MCP tools unattended only as read-only with D-7.
+- `nodestro_runtime.tool_approvals.ToolApprovals`: stored approval requests (collection `tool_approvals`, key
+  `<run id>:<call id>`) bound to the call, its exact arguments and the tool version or definition hash
+  (`arguments_hash`); decisions, expiry and cancellation are compare-and-set from `pending` with the deadline
+  checked in the same step (at most 15 minutes); the waiter reads the store, so a decision from another process
+  reaches it; `expire_run` for stopped runs. New codes `tool.approval_stale`, `tool.approval_expired`,
+  `tool.approval_decided`, `tool.approval_not_found`, `tool.approval_exists`.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
