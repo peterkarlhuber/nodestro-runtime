@@ -272,6 +272,50 @@ class ContainerImages:
         )
 
 
+def sandbox_run_args(
+    docker: str, container_name: str, image: str, *, memory_mb: int, cpus: float, pids_limit: int
+) -> list[str]:
+    """``docker run`` up to the image for a container of Nodestro's sandbox shape (the command follows).
+
+    No network, read-only root file system, no capabilities, no new privileges, user ``nobody``, memory/CPU/process
+    limits, small ``noexec`` temporary file systems, stdin attached, removed on exit and never pulled. The sandbox
+    gateway accepts exactly this shape (:func:`~nodestro_runtime.sandbox_gateway.plan_create`)."""
+    return [
+        docker,
+        "run",
+        "--rm",
+        "-i",
+        "--pull",
+        "never",
+        "--name",
+        container_name,
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        "65534:65534",
+        "--pids-limit",
+        str(pids_limit),
+        "--memory",
+        f"{memory_mb}m",
+        "--memory-swap",
+        f"{memory_mb}m",
+        "--cpus",
+        str(cpus),
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=16m",
+        "--tmpfs",
+        "/work:rw,noexec,nosuid,size=16m,uid=65534,gid=65534,mode=0700",
+        "-w",
+        "/work",
+        image,
+    ]
+
+
 #: Runs first in the container: writes the tool files into the tmpfs ``/work`` and starts Orkexa's runner there.
 _BOOTSTRAP = (
     "import io, json, os, runpy, sys\n"
@@ -309,38 +353,14 @@ class StreamedSandbox(DockerSandbox):
 
     def command(self, workdir: Path, container_name: str) -> list[str]:
         return [
-            self.docker,
-            "run",
-            "--rm",
-            "-i",
-            "--pull",
-            "never",
-            "--name",
-            container_name,
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--user",
-            "65534:65534",
-            "--pids-limit",
-            str(self.pids_limit),
-            "--memory",
-            f"{self.memory_mb}m",
-            "--memory-swap",
-            f"{self.memory_mb}m",
-            "--cpus",
-            str(self.cpus),
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=16m",
-            "--tmpfs",
-            "/work:rw,noexec,nosuid,size=16m,uid=65534,gid=65534,mode=0700",
-            "-w",
-            "/work",
-            self.image,
+            *sandbox_run_args(
+                self.docker,
+                container_name,
+                self.image,
+                memory_mb=self.memory_mb,
+                cpus=self.cpus,
+                pids_limit=self.pids_limit,
+            ),
             "python",
             "-I",
             "-B",

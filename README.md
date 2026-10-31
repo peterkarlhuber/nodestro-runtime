@@ -289,6 +289,34 @@ Operational limits (WP-7) come from the environment: `NODESTRO_MCP_MAX_SERVERS` 
 `NODESTRO_MCP_BREAKER_SECONDS` (60): after that many transport failures in a row a server rests
 (`mcp.cooling_down`). `workspace.mcp.hub.stats()` reports active calls, the limits and each server's health.
 
+Local MCP servers over stdio (WP-8) run only in an isolated container, never on the host (decision D-5, ADR-0006).
+An administrator names the server's Python packages and its module; the packages go through the same review as a
+tool's libraries (hash-pinned lock, approval, image build), and each connection starts `python -m <module> <args>` in
+a container of that image:
+
+```python
+from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
+
+server = workspace.mcp.add(
+    McpServerIn(
+        name="Time",
+        transport="stdio",
+        stdio=StdioCommand(requirements=["mcp-server-time==2025.9.25", "mcp>=1.10,<2"], module="mcp_server_time"),
+    )
+)
+plan = workspace.mcp.plan_environment(server.id)  # the versions and hashes to review
+workspace.python.approve(plan.id, wait=True)  # an administrator approves; the image is built
+workspace.mcp.discover(server.id)  # then tools are reviewed and approved as for HTTP servers
+```
+
+The container has no network, a read-only root file system, no capabilities, runs as `nobody` with memory, CPU and
+process limits, is never pulled from a registry and is removed when the connection ends; on a server it goes through
+the sandbox gateway like every sandbox container. Without the Docker sandbox a stdio server is refused
+(`sandbox.isolation_required`); without approved and installed packages it does not start
+(`mcp.environment_not_ready`). A local server takes no token and no sign-in. Servers that need network access, and
+servers that are not Python packages (for example npm packages), are not supported. A relay between the SDK and the
+container ends a connection whose server writes a line over 8 MB, and the server's stderr is discarded.
+
 ## Security and data protection
 
 - Everything is stored locally in `<data_dir>/nodestro.db` (SQLite, WAL mode) and below the data directory.

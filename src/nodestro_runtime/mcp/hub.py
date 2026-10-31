@@ -34,6 +34,7 @@ from ..problems import NodestroError
 from .models import McpServer, ToolDefinition, clean_definition
 from .netguard import EgressPolicy, Resolver, guarded_client
 from .oauth import OAuthCredentials
+from .stdio import StdioLaunch, remove_container
 
 #: How a call authenticates: nothing, a static bearer token, or OAuth credentials (refreshed by the hub).
 Credential = str | OAuthCredentials | None
@@ -282,6 +283,9 @@ class McpHub:
         #: One refreshing OAuth provider per server, so that concurrent calls share one refresh (rotating refresh
         #: tokens are valid once); keyed by server id, with the fingerprint of the credentials it was built from.
         self._oauth: dict[str, tuple[str, Any]] = {}
+        #: Starts a stdio server's connection in its sandbox container (WP-8); set by the workspace. ``None``: stdio
+        #: servers are refused (``sandbox.isolation_required``).
+        self.stdio_launcher: Callable[[McpServer], StdioLaunch] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -489,6 +493,8 @@ class McpHub:
 
     async def _session(self, server: McpServer, token: Credential, operation: Callable[[Any], Awaitable[T]]) -> T:
         require_sdk()
+        if server.transport == "stdio":
+            return await self._stdio_session(server, operation)
         from mcp import Client
         from mcp.client.streamable_http import streamable_http_client
         from mcp_types import Implementation
@@ -527,6 +533,52 @@ class McpHub:
                     ) from None
             statuses = getattr(getattr(http, "nodestro_backend", None), "statuses", None)
             raise translate(exc, server, statuses) from None
+
+    def _launch(self, server: McpServer) -> StdioLaunch:
+        if self.stdio_launcher is None:
+            raise NodestroError(
+                "sandbox.isolation_required",
+                "A local MCP server runs only in an isolated container; this installation has no Docker sandbox",
+                server=server.name,
+            )
+        return self.stdio_launcher(server)
+
+    async def _stdio_session(self, server: McpServer, operation: Callable[[Any], Awaitable[T]]) -> T:
+        """One connection to a local server: its sandbox container lives exactly as long as the operation."""
+        from mcp import Client
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+        from mcp_types import Implementation
+
+        from .. import __version__
+
+        launch = self._launch(server)
+        try:
+            async with self._semaphore(server):
+                parameters = StdioServerParameters(command=launch.command, args=launch.args, env=launch.env)
+                with open(os.devnull, "w") as errlog:
+                    transport = stdio_client(parameters, errlog=errlog)
+                    with _deadline(server.timeout_seconds * 2):
+                        async with Client(
+                            transport,
+                            mode="auto",
+                            read_timeout_seconds=server.timeout_seconds,
+                            cache=None,
+                            client_info=Implementation(name="nodestro", version=__version__),
+                        ) as client:
+                            return await operation(client)
+        except NodestroError:
+            raise
+        except Exception as exc:
+            error = translate(exc, server)
+            if error.code == "mcp.unreachable":
+                error = NodestroError(
+                    "mcp.stdio_failed",
+                    f"{server.name} could not be started or ended the connection",
+                    server=server.name,
+                )
+            raise error from None
+        finally:
+            await asyncio.to_thread(remove_container, launch.docker, launch.container, launch.env)
 
     @staticmethod
     async def _list(client: Any) -> tuple[list[ToolDefinition], list[dict[str, str]]]:

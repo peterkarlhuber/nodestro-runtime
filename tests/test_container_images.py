@@ -449,3 +449,52 @@ def test_a_server_runs_plain_tools_in_its_runtime_image(tmp_path: Path) -> None:
     finally:
         ContainerImages().remove(python_envs._RUNTIME_IMAGES.pop(next(iter(python_envs._RUNTIME_IMAGES)), ""))
         opened.close()
+
+
+def test_a_local_mcp_server_gets_its_packages_through_the_same_approval(
+    workspace: Workspace, docker: FakeDocker
+) -> None:
+    """WP-8: a stdio server's packages are planned, approved and built into a sandbox image like a tool's; the
+    server starts only in that image, and removing the server removes its environment."""
+    pytest.importorskip("mcp")
+    from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
+
+    mcp = workspace.mcp
+    assert mcp.python is workspace.python
+    server = mcp.add(
+        McpServerIn(name="Tables", transport="stdio", stdio=StdioCommand(requirements=["tablib"], module="tablib"))
+    )
+    assert mcp.environment(server.id).state == "approval_needed"
+    with pytest.raises(NodestroError) as caught:
+        mcp.stdio_launch(server)
+    assert caught.value.code == "mcp.environment_not_ready"
+    plan = mcp.plan_environment(server.id)
+    assert plan.scope == f"mcp:{server.id}" and plan.needs_approval
+    workspace.python.approve(plan.id, wait=True)
+    assert mcp.environment(server.id).state == "ready"
+    assert mcp.view(mcp.server(server.id)).environment_state == "ready"
+    env = workspace.python.get(plan.scope)
+    assert env is not None
+    tag = workspace.python.images.tag(env.lock, env.python_version)
+    started = mcp.stdio_launch(server)
+    run = started.args[started.args.index("--") + 1 :]
+    assert tag in run and run[run.index("--network") + 1] == "none"
+    assert [item.scope for item in workspace.python.python_status().environments if item.orphaned] == []
+    mcp.remove(server.id)
+    assert workspace.python.get(plan.scope) is None
+
+
+def test_without_docker_a_local_mcp_server_is_refused(tmp_path: Path) -> None:
+    pytest.importorskip("mcp")
+    from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
+
+    opened = Workspace(tmp_path / "data", python_runner=FakeUv(INDEX), integrations=[])
+    try:
+        assert not opened.python.containers()
+        with pytest.raises(NodestroError) as caught:
+            opened.mcp.add(
+                McpServerIn(name="T", transport="stdio", stdio=StdioCommand(requirements=["tablib"], module="tablib"))
+            )
+        assert caught.value.code == "sandbox.isolation_required"
+    finally:
+        opened.close()

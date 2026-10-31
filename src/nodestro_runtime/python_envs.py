@@ -109,7 +109,8 @@ SANDBOX_ENV = {
     "VECLIB_MAXIMUM_THREADS": "1",
 }
 
-ScopeKind = Literal["workflow", "tool"]
+#: Who owns an environment: a workflow, a tool, or a local MCP server started over stdio (WP-8).
+ScopeKind = Literal["workflow", "tool", "mcp"]
 EnvState = Literal[
     "none", "ready", "approval_needed", "install_needed", "installing", "failed", "unresolved", "unsupported"
 ]
@@ -172,6 +173,42 @@ class Needed(BaseModel):
 
     def all_modules(self) -> set[str]:
         return {module for modules in self.modules.values() for module in modules}
+
+
+def needed_for_requirements(lines: Iterable[str], owner: str) -> Needed:
+    """What a list of requirement lines needs (a local MCP server's packages, WP-8): no import analysis, the
+    administrator names the packages directly. A line that is not a plain requirement is a blocking issue."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    needed = Needed()
+    for line in lines:
+        try:
+            parsed = Requirement(line)
+        except InvalidRequirement as exc:
+            needed.issues.append(
+                ToolIssue(tool=owner, code="deps.requirement_invalid", message=str(exc)[:300], params={"line": line})
+            )
+            continue
+        if parsed.url or parsed.marker is not None:
+            needed.issues.append(
+                ToolIssue(
+                    tool=owner,
+                    code="deps.requirement_invalid",
+                    message="Only package names, extras and versions are allowed",
+                    params={"line": line},
+                )
+            )
+            continue
+        needed.requirements.append(
+            NeededRequirement(
+                name=parsed.name,
+                key=normalize(parsed.name),
+                spec=str(parsed.specifier),
+                extras=sorted(parsed.extras),
+                required_by=[owner],
+            )
+        )
+    return needed
 
 
 class LockedPackage(BaseModel):
@@ -533,6 +570,7 @@ class PythonEnvironments:
         sandbox_kind: Callable[[], str] = lambda: "subprocess",
         workflow_exists: Callable[[str], bool] = lambda _id: True,
         images: ContainerImages | None = None,
+        mcp_exists: Callable[[str], bool] = lambda _id: True,
     ) -> None:
         """``images`` builds the container images of the Docker sandbox (tests pass a stand-in)."""
         self.store = store
@@ -544,6 +582,7 @@ class PythonEnvironments:
         self.runner = runner if runner is not None else UvRunner(root / "cache")
         self.sandbox_kind = sandbox_kind
         self.workflow_exists = workflow_exists
+        self.mcp_exists = mcp_exists
         self._plans: dict[str, tuple[Plan, Needed]] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
@@ -1180,6 +1219,16 @@ class PythonEnvironments:
             acknowledge_unsafe=True,
         )
 
+    def image(self, scope: str) -> str | None:
+        """The container image of the scope's approved and installed lock; ``None`` without the Docker sandbox or
+        while it is not installed. Local MCP servers (WP-8) run only in such an image, never on the host."""
+        if not self.containers():
+            return None
+        env = self.get(scope)
+        if env is None or not self._ready(env):
+            return None
+        return self.images.tag(env.lock, env.python_version)
+
     def runtime_sandbox(self, *, timeout: float = 15.0) -> RuntimeImageSandbox:
         """The container sandbox for tool code without third-party libraries on a server (image built on first use).
 
@@ -1310,13 +1359,15 @@ class PythonEnvironments:
 
     def _describe(self, info: EnvironmentInfo, env: PythonEnvironment | None) -> None:
         kind, _, ref = info.scope.partition(":")
-        if kind in ("workflow", "tool"):
+        if kind in ("workflow", "tool", "mcp"):
             info.kind, info.ref = kind, ref  # type: ignore[assignment]
         info.label = env.label if env else ""
         if kind == "workflow":
             info.orphaned = not self.workflow_exists(ref)
         elif kind == "tool":
             info.orphaned = ref not in self.tools
+        elif kind == "mcp":
+            info.orphaned = not self.mcp_exists(ref)
         else:
             info.orphaned = True
 
