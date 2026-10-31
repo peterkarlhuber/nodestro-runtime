@@ -139,3 +139,14 @@ def test_mcp_tools_are_strict_without_a_person() -> None:
     # pre-grants never cover MCP tools
     context = unattended(mcp_unattended=True, scope=("schedule", "sch_1"), pre_grants=(grant(tool="mcp__x__y"),))
     assert gate(write, None, context, kind="mcp", tool="mcp__x__y") == "deny:tool.approval_unattended"
+
+
+def test_a_changing_mcp_call_is_asked_whatever_the_binding_says() -> None:
+    write = ToolCapability(access="write", reach="external", source="admin")
+    legacy = ToolBinding(ask="never", legacy=True, bound_version=1)
+    reasoned = ToolBinding(ask="never", reason=REASON)
+    for binding in (None, legacy, reasoned, ToolBinding(ask="auto")):
+        assert gate(write, binding, attended(), kind="mcp", version=1) == "ask"
+    assert gate(DESTRUCTIVE, reasoned, attended(), kind="mcp", version=1) == "ask"
+    # the same bindings still apply to non-MCP tools
+    assert gate(write, reasoned, attended(), version=1) == "allow"

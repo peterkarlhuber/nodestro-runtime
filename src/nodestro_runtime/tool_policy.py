@@ -275,6 +275,10 @@ def decide(
         return _deny("tool.not_granted", f"The tool {tool} was not granted to this agent (by {scope})")
     if kind == "mcp" and not context.attended and not (context.mcp_unattended and capability.reads_only):
         return _deny("tool.approval_unattended", f"The MCP tool {tool} cannot run without a person watching")
+    if kind == "mcp" and not capability.reads_only:
+        # MCP is strict (D10c): a changing MCP call is asked every time, whatever the binding says. No ``never`` and
+        # no legacy exemption applies, because such calls were refused outright before per-call approvals existed.
+        return ASK
     if not wants_question(capability, binding, version=version):
         return ALLOW
     if context.attended:
