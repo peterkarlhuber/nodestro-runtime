@@ -5,6 +5,10 @@ editor and tools the Coding Agent generates are stored in a
 ``orkexa.dynamic.ToolRegistry``: their code is checked statically, their
 tests run in the sandbox, and every call runs in the sandbox as well.
 
+Before any stored or proposed code runs, the :class:`~nodestro_runtime.sandbox_policy.SandboxPolicy`
+checks its trust class against the sandbox (ADR-0006): AI-generated code and code of unknown
+provenance runs only in an isolating sandbox, never in a host subprocess.
+
 Generating a tool takes a while and ends with a human decision, so it runs as a
 :class:`ToolJob` in a background thread: ``ToolBuilder`` does the work, and its
 ``CallbackApprover`` waits until the user approves or rejects in the UI.
@@ -46,7 +50,9 @@ from pydantic import BaseModel, Field
 from .builtin_tools import BUILTIN_TOOLS
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
+from .sandbox_policy import SandboxPolicy, TrustClass
 from .schemas import new_id, now
+from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +110,9 @@ def test_boiling_point():
 class ToolInfo(BaseModel):
     name: str
     kind: ToolKind
+    #: Who wrote the code (ADR-0006): ``trusted`` (built in), ``user-authored`` (the tool editor) or
+    #: ``untrusted`` (AI-generated or unknown provenance; runs only in an isolating sandbox).
+    trust: TrustClass = "untrusted"
     description: str
     input_schema: dict[str, Any] | None = None
     version: int = 1
@@ -254,20 +263,52 @@ class DependencyGate:
         raise NotImplementedError
 
 
-def make_sandbox(kind: str) -> Sandbox:
+def make_sandbox(kind: str, policy: SandboxPolicy | None = None) -> Sandbox:
+    """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess.
+
+    The subprocess sandbox runs only trusted and user-authored code; the policy refuses everything else in it
+    (and, in the server profile, refuses to create it at all)."""
     if kind == "docker":
         return DockerSandbox()
+    (policy or SandboxPolicy()).check_construction("none")
     return SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
+
+
+class _LinkedProvenance:
+    """Read-only provenance that follows another library (see :meth:`ToolLibrary.linked_provenance`)."""
+
+    def __init__(self, source: ToolLibrary) -> None:
+        self.source = source
+
+    def authored(self, name: str) -> set[int]:
+        return self.source.provenance.authored(name) if self.source.trust(name) == "user-authored" else set()
+
+    def record_authored(self, name: str, version: int) -> None:
+        raise NodestroError("tool.frozen", "Tools of a published release cannot be changed")
+
+    def clear(self) -> None:
+        """Nothing to forget: the records belong to the source library."""
 
 
 class ToolLibrary:
     """All tools agents can use, plus the jobs that generate new ones."""
 
     def __init__(
-        self, path: str | Path | None, *, sandbox: Sandbox | None = None, extra_tools: Sequence[Tool] = ()
+        self,
+        path: str | Path | None,
+        *,
+        sandbox: Sandbox | None = None,
+        extra_tools: Sequence[Tool] = (),
+        policy: SandboxPolicy | None = None,
+        provenance: ToolProvenance | None = None,
     ) -> None:
-        """``extra_tools``: trusted tools of installed integrations (:mod:`nodestro_runtime.extensions`)."""
-        self.registry = ToolRegistry(path, sandbox=sandbox or SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True))
+        """``extra_tools``: trusted tools of installed integrations (:mod:`nodestro_runtime.extensions`).
+
+        ``provenance`` records which tools a person wrote in the editor; without it, records live in memory only
+        and every stored tool counts as ``untrusted``."""
+        self.policy = policy or SandboxPolicy()
+        self.provenance: ToolProvenance = provenance or MemoryProvenance()
+        self.registry = ToolRegistry(path, sandbox=sandbox or make_sandbox("subprocess", self.policy))
         self.builtin: dict[str, Tool] = {}
         for tool in (*BUILTIN_TOOLS, *extra_tools):
             assert tool.name is not None
@@ -278,6 +319,8 @@ class ToolLibrary:
         self.dependencies: DependencyGate | None = None
         self._decisions: dict[str, _Decision] = {}
         self._lock = threading.RLock()
+        #: Code that is untrusted but not stored as a tool, e.g. pending tool drafts (set by the workspace).
+        self.untrusted_sources: Callable[[], Iterable[str]] = lambda: ()
 
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
@@ -298,6 +341,7 @@ class ToolLibrary:
             return ToolInfo(
                 name=record.name,
                 kind="builtin",
+                trust="trusted",
                 description=record.description,
                 input_schema=record.input_schema,
                 created_at=record.created_at,
@@ -305,6 +349,7 @@ class ToolLibrary:
         return ToolInfo(
             name=record.name,
             kind="generated" if record.requirement else "custom",
+            trust=self.trust(name),
             description=record.description,
             input_schema=record.input_schema,
             version=record.version,
@@ -314,6 +359,64 @@ class ToolLibrary:
             tests=record.tests,
             requirement=record.requirement,
         )
+
+    # ---- provenance ---------------------------------------------------------------------
+
+    def trust(self, name: str) -> TrustClass:
+        """The trust class of a stored tool (ADR-0006); ``untrusted`` for unknown names.
+
+        ``user-authored`` only while every version under the name was written in the tool editor."""
+        try:
+            versions = self.registry.versions(name)
+        except RegistryError:
+            return "untrusted"
+        if not versions:
+            return "untrusted"
+        if any(record.kind == "trusted" for record in versions):
+            return "trusted"
+        authored = self.provenance.authored(name)
+        if all(record.version in authored and not record.requirement for record in versions):
+            return "user-authored"
+        return "untrusted"
+
+    def editor_trust(self, function_name: str, code: str) -> TrustClass:
+        """The class of code a person submits in the tool editor.
+
+        New code is ``user-authored``. A new version of a tool that is not ``user-authored`` stays ``untrusted``,
+        and so does code identical to a stored untrusted tool or a pending tool draft (copying AI-generated code
+        into a new tool does not change where it came from)."""
+        try:
+            existing = self.registry.versions(function_name)
+        except RegistryError:
+            existing = ()
+        if existing and self.trust(function_name) != "user-authored":
+            return "untrusted"
+        digest = code_digest(code)
+        if digest in self._untrusted_digests():
+            return "untrusted"
+        return "user-authored"
+
+    def _untrusted_digests(self) -> set[str]:
+        digests = {code_digest(source) for source in self.untrusted_sources()}
+        for name in self.registry.names():
+            if self.trust(name) == "untrusted":
+                for record in self.registry.versions(name):
+                    if record.code:
+                        digests.add(code_digest(record.code))
+        with self._lock:
+            for job in self.jobs.values():
+                digests.update(code_digest(attempt.code) for attempt in job.attempts)
+        return digests
+
+    def linked_provenance(self) -> ToolProvenance:
+        """Provenance for a library of frozen copies of these tools (a published release).
+
+        A copy is ``user-authored`` only while the tool here is: the studio's records decide, never a claim
+        stored with the copy."""
+        return _LinkedProvenance(self)
+
+    def _require(self, trust: TrustClass, sandbox: Sandbox, name: str) -> None:
+        self.policy.require(trust, sandbox, name=name)
 
     def all(self) -> list[ToolInfo]:
         return [self._info(name) for name in self.registry.names()]
@@ -337,6 +440,8 @@ class ToolLibrary:
             tool = self.registry.get_tool(name)
         except RegistryError:
             raise KeyError(name) from None
+        if isinstance(tool, SandboxedTool):
+            self._require(self.trust(name), sandbox or self.registry.sandbox, name)
         if sandbox is not None and isinstance(tool, SandboxedTool):
             assert tool.input_schema is not None and tool.name is not None and tool.description is not None
             return SandboxedTool(
@@ -363,11 +468,13 @@ class ToolLibrary:
         *,
         sandbox: Sandbox | None = None,
         extra_imports: Iterable[str] = (),
+        trust: TrustClass = "untrusted",
     ) -> CheckResult:
         """Static checks plus a test run in the sandbox, without saving anything.
 
         ``extra_imports`` are approved third-party modules, ``sandbox`` the environment they
-        are installed in.
+        are installed in. ``trust`` is the class of the code (ADR-0006); the tests run only in a
+        sandbox the policy allows for it, otherwise the result reports ``sandbox.isolation_required``.
         """
         source = check_tool_source(code, function_name, extra_imports=extra_imports)
         test_report = check_tool_tests(tests, extra_imports=extra_imports)
@@ -384,8 +491,13 @@ class ToolLibrary:
             )
         if errors:
             return CheckResult(ok=False, errors=errors)
+        chosen = sandbox or self.registry.sandbox
         try:
-            result = (sandbox or self.registry.sandbox).validate(code, tests, function_name)
+            self._require(trust, chosen, function_name)
+        except NodestroError as exc:
+            return CheckResult(ok=False, errors=[exc.problem])
+        try:
+            result = chosen.validate(code, tests, function_name)
         except DynamicAgentError as exc:
             return CheckResult(ok=False, errors=[problem("tool.sandbox", f"Sandbox: {exc}")])
         if result.error:
@@ -413,12 +525,16 @@ class ToolLibrary:
         requirement: str | None = None,
         sandbox: Sandbox | None = None,
         extra_imports: Iterable[str] = (),
+        trust: TrustClass = "untrusted",
     ) -> tuple[CheckResult, ToolInfo | None]:
         """Check a tool and store it as a new version if everything passes.
 
-        ``requirement`` marks an AI-written tool (a draft of the Workflow Architect the user approved).
+        ``requirement`` marks an AI-written tool (a draft of the Workflow Architect the user approved); such a
+        tool is always ``untrusted``. Only ``trust="user-authored"`` records the version as written in the editor.
         """
-        result = self.check(code, tests, function_name, sandbox=sandbox, extra_imports=extra_imports)
+        if requirement:
+            trust = "untrusted"
+        result = self.check(code, tests, function_name, sandbox=sandbox, extra_imports=extra_imports, trust=trust)
         if not result.ok:
             return result, None
         assert result.name is not None and result.description is not None and result.input_schema is not None
@@ -440,6 +556,8 @@ class ToolLibrary:
                 output_schema=None,
                 requirement=requirement,
             )
+            if trust == "user-authored":
+                self.provenance.record_authored(record.name, record.version)
             for older in existing:
                 if older.status == "approved":
                     self.registry.set_status(older.name, older.version, "revoked")
@@ -481,6 +599,8 @@ class ToolLibrary:
         """
         if not requirement.strip():
             raise NodestroError("tool.requirement_missing", "Please describe what the tool should do")
+        # The Coding Agent's tests run automatically: without isolation nothing is generated at all.
+        self._require("untrusted", self.registry.sandbox, "")
         job = ToolJob(requirement=requirement.strip())
         decision = _Decision()
         with self._lock:
@@ -522,6 +642,13 @@ class ToolLibrary:
         coding_agent: _RecordingCodingAgent | None = None
 
         def prepare(proposal: ToolProposal) -> ToolProposal:
+            """Prepare the libraries, then make sure the tests may run where they will run."""
+            assert builder is not None
+            proposal = prepare_dependencies(proposal)
+            self._require("untrusted", builder.sandbox, proposal.function_name)
+            return proposal
+
+        def prepare_dependencies(proposal: ToolProposal) -> ToolProposal:
             """Third-party packages: resolve, ask the user, install, before the tests run."""
             gate = self.dependencies
             assert builder is not None and coding_agent is not None
@@ -605,7 +732,11 @@ class ToolLibrary:
             logger.exception("Tool job %s failed", job.id)
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}"
-            _step(job, problem("job.failed", "The tool could not be created."))
+            if isinstance(exc, NodestroError) and exc.code.startswith("sandbox."):
+                # E.g. ``sandbox.isolation_required``: reported with its code; the code was not run.
+                _step(job, exc.problem)
+            else:
+                _step(job, problem("job.failed", "The tool could not be created."))
         finally:
             cost = tracker.usage.estimated_cost_usd
             job.cost_usd = float(cost) if cost is not None else None

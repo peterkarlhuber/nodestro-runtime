@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Sandbox policy and trust classes (desktop and server plan, M1 PR-4, ADR-0006). **Changed behavior on purpose:**
+
+- New `sandbox_policy` (`TrustClass`, `SandboxPolicy`, `isolation_of`) and `tool_provenance` (records of the tool
+  versions a person wrote in the editor; collection `tool_provenance`). `ToolInfo.trust` reports the class.
+- Untrusted code (AI-generated tools, also after approval; tool drafts; tool job tests; tools of unknown
+  provenance) runs only in an isolating sandbox. Only `DockerSandbox` counts as isolating. Otherwise
+  `ToolLibrary.tool`, `run`, `check` and `save_custom` refuse with `sandbox.isolation_required` and execute nothing.
+  `ToolLibrary.start_job` refuses before a job starts. The agent check reports the code on the `tools` field, so
+  the workflow check blocks a run before it starts.
+- Without Docker on the desktop, these features are unavailable: generating tools, testing and approving tool
+  drafts, and running AI-generated tools or tools stored before this release (their provenance is unknown, also
+  for hand-written ones; copying their code into a new tool keeps it untrusted). With Docker they keep running.
+  Tools written in the editor from now on run in the process sandbox as before.
+- Untrusted code with third-party libraries is refused (`sandbox.libraries_need_isolation`); tool jobs ask the
+  Coding Agent for a standard-library version and never resolve or install the libraries.
+- `make_sandbox(kind, policy)` refuses the process sandbox in the server profile (`sandbox.unavailable`).
+- `Workspace.reload_after_restore` forgets all provenance records: restored tools are untrusted.
+- `ReleaseBundle.tool_trust` records the class of each tool at publish time (left out of the digest when empty);
+  `ReleaseBundle.provenance()` and `ToolLibrary.linked_provenance()` give release libraries their provenance.
+- `testing.ContainerDouble`: a test-only stand-in for Docker (not isolated).
+
 Storage seams (desktop and server plan, M1 PR-3). No change of data, schema, SQL statements or behavior:
 
 - `nodestro_runtime.storage.DocumentStore`: a typed protocol with the existing operations (`put`, `put_raw`, `get`,

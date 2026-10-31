@@ -70,6 +70,7 @@ from .python_tools import EnvironmentGate
 from .reports import ResultFiles
 from .resume import PublishedRuns
 from .resume import resume as resume_run
+from .sandbox_policy import SandboxPolicy
 from .schemas import (
     DEFAULT_AGENT_MODEL,
     DEFAULT_ASSISTANT_MODEL,
@@ -85,6 +86,7 @@ from .schemas import (
 from .storage import BeforeMigration, SQLiteStore, Store
 from .tool_drafts import ToolDrafts
 from .tool_library import ToolLibrary, make_sandbox
+from .tool_provenance import StoredProvenance
 from .usage_log import UsageLog
 from .versions import WorkflowVersions
 
@@ -202,8 +204,15 @@ class Workspace:
         self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         self.memory = MemorySpaces(database)
-        sandbox = make_sandbox(self._stored("sandbox") or "subprocess")
-        self.tools = ToolLibrary(data_dir / "tools", sandbox=sandbox, extra_tools=self.extensions.tools())
+        self.sandbox_policy = SandboxPolicy(self.profile.kind)
+        sandbox = make_sandbox(self._stored("sandbox") or "subprocess", self.sandbox_policy)
+        self.tools = ToolLibrary(
+            data_dir / "tools",
+            sandbox=sandbox,
+            extra_tools=self.extensions.tools(),
+            policy=self.sandbox_policy,
+            provenance=StoredProvenance(self.store),
+        )
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
         self._client_factory = client_factory
@@ -221,6 +230,7 @@ class Workspace:
         self.usage_log = UsageLog(self.store)
         self.versions = WorkflowVersions(self.store)
         self.tool_drafts = ToolDrafts(self.store, self.tools)
+        self.tools.untrusted_sources = lambda: [draft.code for draft in self.tool_drafts.pending()]
         self.python = PythonEnvironments(
             self.store,
             data_dir / "python",
@@ -390,12 +400,16 @@ class Workspace:
         values.update(changes)
         self.store.put_raw("settings", "app", values)
         if changes.get("sandbox"):
-            self.tools.set_sandbox(make_sandbox(changes["sandbox"]))
+            self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy))
         return self.settings()
 
     def reload_after_restore(self) -> None:
-        """Pick up restored data that is cached in memory: the tool registry and its sandbox."""
-        self.tools.reload(make_sandbox(self._stored("sandbox") or "subprocess"))
+        """Pick up restored data that is cached in memory: the tool registry and its sandbox.
+
+        A backup can come from anywhere, so the provenance of its tools is unknown: every restored custom tool
+        becomes ``untrusted`` (ADR-0006)."""
+        self.tools.provenance.clear()
+        self.tools.reload(make_sandbox(self._stored("sandbox") or "subprocess", self.sandbox_policy))
         self.inputs.forget()
 
     # ---- workflows ------------------------------------------------------------------

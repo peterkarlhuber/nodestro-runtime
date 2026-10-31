@@ -8,6 +8,7 @@ SDK tests) simulates models the same way. Nothing here is used outside tests.
 - :func:`text`, :func:`tool_use`, :func:`parsed` build the answers.
 - :class:`AnswerAllClient` answers every request without a script (every example workflow runs with it).
 - :class:`FakeUv` replaces uv for tools with Python libraries (``Workspace(python_runner=...)``).
+- :class:`ContainerDouble` stands in for Docker in tests of flows that need an isolating sandbox.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Literal, Union, get_args, get_origin
 
 from anthropic.types import Message
+from orkexa.dynamic import DockerSandbox, SubprocessSandbox, ValidationResult
 from pydantic import BaseModel
 
 
@@ -323,3 +325,24 @@ class FakeUv:
 
     def prune_cache(self, *, log: Callable[[str], None]) -> None:
         log("pruned")
+
+
+class ContainerDouble(DockerSandbox):
+    """**Tests only, not isolated.** Counts as a container for the sandbox policy but runs the code in a host
+    subprocess, so tests can exercise flows that need Docker (tool generation, drafts, AI-generated tools)
+    on machines without Docker. Never offered by a setting; the settings create a real ``DockerSandbox``.
+
+    ``calls`` records what ran (``("validate", name)`` or ``("call", name)``)."""
+
+    def __init__(self, *, timeout: float = 15.0) -> None:
+        super().__init__(timeout=timeout)
+        self.host = SubprocessSandbox(timeout=timeout, acknowledge_unsafe=True)
+        self.calls: list[tuple[str, str]] = []
+
+    def validate(self, code: str, tests: str, function_name: str) -> ValidationResult:
+        self.calls.append(("validate", function_name))
+        return self.host.validate(code, tests, function_name)
+
+    def call(self, code: str, function_name: str, payload: dict[str, Any]) -> str:
+        self.calls.append(("call", function_name))
+        return self.host.call(code, function_name, payload)

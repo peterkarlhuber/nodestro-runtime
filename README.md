@@ -145,10 +145,23 @@ Text and thinking deltas beyond 5,000 events are published but not kept for late
 subscriber that falls 10,000 events behind is ended (it reads the run again).
 
 **Tools.** Built-in tools run in the process. Custom and AI-generated tools are checked statically and run in
-a sandbox (a separate Python process with an empty environment, time and memory limits, or Docker). The
-process sandbox limits what a tool can do by accident; it is not a proven security boundary against hostile
-code, and the Docker sandbox isolates more strongly. Third-party Python packages are installed only after a person approved
+a sandbox: a separate Python process with an empty environment, time and memory limits (`subprocess`), or a Docker
+container without network (`docker`). The process sandbox limits what a tool can do by accident; it is not a
+security boundary against hostile code. Third-party Python packages are installed only after a person approved
 the exact versions of every package (`python_envs`), into a separate environment per workflow or tool.
+
+**Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
+installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
+`untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).
+`nodestro_runtime.sandbox_policy.SandboxPolicy` decides before any code runs: untrusted code runs only in an
+isolating sandbox (Docker); in the process sandbox it is refused with `sandbox.isolation_required`, and nothing is
+executed. There is no setting, environment variable or confirmation that lifts this. Consequences without Docker:
+tool generation does not start, tool drafts cannot be tested or approved, and agents that use untrusted tools fail
+the workflow check before a run starts. Provenance is stored per tool (`tool_provenance`); editing an untrusted tool,
+re-creating it under the same name or copying its code into a new tool keeps it untrusted, tools stored before this
+release are untrusted, and a restored backup makes every restored tool untrusted. Untrusted tools cannot use
+third-party libraries yet (`sandbox.libraries_need_isolation`), because the library environments run as host
+processes; containers with libraries are planned. In the server profile, only containers run tool code.
 
 **Storage.** Every component stores its documents through the `DocumentStore` protocol
 (`nodestro_runtime.storage`); `SQLiteStore` (still importable as `Store`) implements it on the table

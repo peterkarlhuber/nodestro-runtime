@@ -300,7 +300,11 @@ class AgentBuilder:
         try:
             self.build(config, connection=_validation_connection(self.declared, config))
         except NodestroError as exc:
-            field = "tools" if exc.code in ("config.unknown_tools", "config.unknown_server_tool") else None
+            field = (
+                "tools"
+                if exc.code in ("config.unknown_tools", "config.unknown_server_tool", "sandbox.isolation_required")
+                else None
+            )
             issue(exc.code, str(exc), field=field, **exc.params)
         except KeyError as exc:
             found = library_problem(exc)

@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
+from .sandbox_policy import Isolation
 from .schemas import Workflow, WorkflowIn, new_id, now
 from .storage import DocumentStore
 
@@ -1053,6 +1054,12 @@ class PythonEnvironments:
         return status
 
     # ---- sandbox ----------------------------------------------------------------------
+
+    def isolation(self) -> Isolation:
+        """How the environments' sandboxes isolate tool code: today a host subprocess with the environment's
+        interpreter (``none``), so only ``user-authored`` code may use third-party libraries (ADR-0006).
+        Container images per lock file come with plan step PR-11."""
+        return "none"
 
     def sandbox(self, scope: str) -> Sandbox | None:
         """A sandbox whose interpreter is the scope's environment, if it is installed."""
