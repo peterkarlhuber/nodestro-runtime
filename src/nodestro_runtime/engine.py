@@ -1129,6 +1129,8 @@ class RunManager:
         run.error = run.error_code = None
         run.error_params = {}
         self._emit(context, "run_started", status=run.status)
+        # Stored at once: other processes (the API of a server) read the run from the database, not this context.
+        self._save(context)
         try:
             while True:
                 await self._run_graph(context)
