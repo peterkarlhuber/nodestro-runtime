@@ -312,6 +312,11 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges"],
             "Privileged": False,
+            # Stated rather than left to the daemon's defaults, which an administrator can change.
+            "IpcMode": "private",
+            "Binds": [],
+            "Mounts": [],
+            "Devices": [],
             "PidsLimit": pids,
             "Memory": memory,
             "MemorySwap": memory,
@@ -463,6 +468,9 @@ def plan_build(query: dict[str, str], context: bytes, config: GatewayConfig) -> 
         if tag != images.tag(lock_text, version):
             raise Refused(f"The image tag {tag!r} does not belong to this lock file")
         forwarded = {"t": tag, "rm": "1", "forcerm": "1", "version": "1", "dockerfile": "Dockerfile"}
+        # The build's own containers get the same memory and CPU limits as sandbox containers.
+        memory = str(config.max_memory_mb * 1024 * 1024)
+        forwarded.update(memory=memory, memswap=memory, cpuperiod="100000", cpuquota=str(int(config.max_cpus * 1e5)))
         forwarded["networkmode"] = config.build_network
         if build_args:
             forwarded["buildargs"] = json.dumps(build_args)
@@ -535,8 +543,43 @@ class Request:
         return "upgrade" in self.header("connection").lower() and bool(self.header("upgrade"))
 
 
-async def read_request(reader: asyncio.StreamReader, *, limit: int) -> Request | None:
-    """One HTTP/1.1 request head and its body (``Content-Length`` or chunked, at most ``limit`` bytes)."""
+_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE"})
+#: Visible ASCII without the fragment mark: what an origin-form request target may contain.
+_TARGET = re.compile(r"^/[\x21-\x22\x24-\x7e]*$")
+_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+#: Control characters (tab is allowed in header values). A bare line feed would let a client end a header early
+#: and smuggle a second request to the daemon, so the head is refused instead of passed on.
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def parse_head(head: bytes) -> Request:
+    """The request line and headers of one request head (ending in an empty line), checked strictly.
+
+    Raises :class:`Refused` (400) for anything a lenient parser could read differently: bare CR or LF, control
+    characters, folded headers, an unknown method, a target that is not a plain path and query."""
+    text = head.decode("latin-1")
+    if not text.endswith("\r\n\r\n"):
+        raise Refused("Malformed request head", 400)
+    lines = text[:-4].split("\r\n")
+    if any(_CONTROL.search(line.replace("\t", " ")) for line in lines):
+        raise Refused("Control characters are not allowed in a request head", 400)
+    parts = lines[0].split(" ")
+    if len(parts) != 3 or parts[0] not in _METHODS or parts[2] not in ("HTTP/1.1", "HTTP/1.0"):
+        raise Refused("Malformed request line", 400)
+    method, target, _version = parts
+    if not _TARGET.fullmatch(target):
+        raise Refused("The request target must be a plain path and query", 400)
+    headers: list[tuple[str, str]] = []
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if not sep or not _TOKEN.fullmatch(key):
+            raise Refused("Malformed header", 400)
+        headers.append((key, value.strip(" \t")))
+    return Request(method, target, headers, b"")
+
+
+async def read_head(reader: asyncio.StreamReader) -> Request | None:
+    """One request head (``None`` when the client closed without sending one)."""
     try:
         head = await reader.readuntil(b"\r\n\r\n")
     except asyncio.IncompleteReadError as exc:
@@ -545,21 +588,26 @@ async def read_request(reader: asyncio.StreamReader, *, limit: int) -> Request |
         raise Refused("Incomplete request", 400) from None
     except asyncio.LimitOverrunError:
         raise Refused("Request head too large", 431) from None
-    lines = head.decode("latin-1").split("\r\n")
-    try:
-        method, target, _version = lines[0].split(" ", 2)
-    except ValueError:
-        raise Refused("Malformed request line", 400) from None
-    headers: list[tuple[str, str]] = []
-    for line in lines[1:]:
-        if not line:
-            continue
-        key, sep, value = line.partition(":")
-        if not sep:
-            raise Refused("Malformed header", 400)
-        headers.append((key.strip(), value.strip()))
-    request = Request(method.upper(), target, headers, b"")
-    if request.header("transfer-encoding").lower() == "chunked":
+    return parse_head(head)
+
+
+async def read_request(reader: asyncio.StreamReader, *, limit: int) -> Request | None:
+    """One HTTP/1.1 request head and its body (``Content-Length`` or chunked, at most ``limit`` bytes)."""
+    request = await read_head(reader)
+    if request is None:
+        return None
+    await read_body(reader, request, limit=limit)
+    return request
+
+
+async def read_body(reader: asyncio.StreamReader, request: Request, *, limit: int) -> None:
+    """The body of ``request`` (``Content-Length`` or chunked, at most ``limit`` bytes)."""
+    if request.header("transfer-encoding") and request.header("content-length"):
+        raise Refused("Content-Length and Transfer-Encoding together are not allowed", 400)
+    encoding = request.header("transfer-encoding").lower()
+    if encoding not in ("", "chunked"):
+        raise Refused("Only chunked transfer encoding is supported", 400)
+    if encoding == "chunked":
         body = bytearray()
         while True:
             size_line = await reader.readuntil(b"\r\n")
@@ -577,14 +625,12 @@ async def read_request(reader: asyncio.StreamReader, *, limit: int) -> Request |
             await reader.readexactly(2)
         request.body = bytes(body)
     elif request.header("content-length"):
-        try:
-            length = int(request.header("content-length"))
-        except ValueError:
-            raise Refused("Malformed Content-Length", 400) from None
+        if not request.header("content-length").isdigit():
+            raise Refused("Malformed Content-Length", 400)
+        length = int(request.header("content-length"))
         if length < 0 or length > limit:
-            raise Refused(f"The request body exceeds {limit // (1024 * 1024)} MB", 413)
+            raise Refused(f"The request body exceeds {max(limit // (1024 * 1024), 1)} MB", 413)
         request.body = await reader.readexactly(length)
-    return request
 
 
 def encode_request(request: Request, target: str, body: bytes, *, upgrade: bool) -> bytes:
@@ -740,12 +786,14 @@ class Gateway:
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         # The route is decided on the head; the body limit depends on it (an image build sends its context).
-        request = await read_request(reader, limit=_BUILD_LIMIT)
+        request = await read_head(reader)
         if request is None:
             return
         kind, ref = route(request.method, request.path)
-        _, prefix = _split(request.path)
-        target, body = request.target, request.body
+        bare, prefix = _split(request.path)
+        await read_body(reader, request, limit=_BUILD_LIMIT if kind == "build" else _JSON_LIMIT)
+        # Every target sent to the daemon is rebuilt from what was checked, never passed through as written.
+        target, body = f"{prefix}{bare}", request.body
         if request.header("x-registry-auth") or (request.header("x-registry-config") not in ("", "e30=", "null")):
             logger.debug("Registry credentials of the client are dropped")
         if kind != "build" and len(body) > _JSON_LIMIT:
@@ -799,11 +847,14 @@ class Gateway:
                 self.containers.pop(container_id, None)
             return
         if kind.startswith("image:"):
-            if request.query and not set(request.query) <= {"force", "noprune"}:
+            query = request.query
+            if query and not set(query) <= {"force", "noprune"}:
                 raise Refused("These parameters are not allowed")
+            path = f"{prefix}/images/{quote(ref, safe=':')}" + ("/json" if kind == "image:inspect" else "")
+            target = path + (f"?{urlencode(query)}" if query else "")
             await self._forward(request, target, b"", reader, writer)
             return
-        await self._forward(request, target, b"", reader, writer)
+        await self._forward(request, target, b"", reader, writer)  # ping, version, info: the bare path, no query
 
     async def _create(
         self, request: Request, target: str, body: bytes, name: str, writer: asyncio.StreamWriter
@@ -840,6 +891,18 @@ class Gateway:
             daemon_writer.write(encode_request(request, target, body, upgrade=upgrade))
             await daemon_writer.drain()
             if upgrade:
+                # Only a switched connection carries the client's raw bytes on. On any other answer the daemon may
+                # keep the connection open for further requests, which must never reach it unchecked.
+                try:
+                    head = await daemon_reader.readuntil(b"\r\n\r\n")
+                except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                    return
+                writer.write(head)
+                await writer.drain()
+                if head.split(b" ", 2)[1:2] != [b"101"]:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(_pipe(daemon_reader, writer), timeout=10)
+                    return
                 await asyncio.gather(_pipe(daemon_reader, writer), _pipe(reader, daemon_writer))
             else:
                 await _pipe(daemon_reader, writer)

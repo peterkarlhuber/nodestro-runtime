@@ -132,6 +132,7 @@ def test_the_sandbox_request_of_the_docker_cli_is_accepted_and_locked_down() -> 
     assert host["CapDrop"] == ["ALL"] and host["SecurityOpt"] == ["no-new-privileges"]
     assert host["Memory"] == host["MemorySwap"] == 536870912 and host["PidsLimit"] == 64
     assert host["Tmpfs"] == TMPFS and host["AutoRemove"] is True
+    assert host["IpcMode"] == "private" and host["Binds"] == host["Mounts"] == host["Devices"] == []
     # Nothing else of the request reaches the daemon.
     assert set(host) == {
         "NetworkMode",
@@ -139,6 +140,10 @@ def test_the_sandbox_request_of_the_docker_cli_is_accepted_and_locked_down() -> 
         "CapDrop",
         "SecurityOpt",
         "Privileged",
+        "IpcMode",
+        "Binds",
+        "Mounts",
+        "Devices",
         "PidsLimit",
         "Memory",
         "MemorySwap",
@@ -317,6 +322,9 @@ def test_the_runtime_s_image_build_is_accepted(ca: bool) -> None:
     tag, tar = _context(ca=ca)
     query = plan_build({"t": tag, "networkmode": "default", "buildargs": "{}", "version": "1", "rm": "1"}, tar, CONFIG)
     assert query["t"] == tag and query["networkmode"] == "default" and query["version"] == "1"
+    # The build's containers are limited like sandbox containers.
+    assert query["memory"] == query["memswap"] == str(CONFIG.max_memory_mb * 1024 * 1024)
+    assert query["cpuperiod"] == "100000" and query["cpuquota"] == str(int(CONFIG.max_cpus * 1e5))
 
 
 def test_a_build_is_refused_when_anything_differs() -> None:
@@ -482,6 +490,103 @@ async def _send(socket_path: str, raw: bytes, *, half_close: bool = False) -> by
     data = await reader.read()
     writer.close()
     return data
+
+
+# ---- adversarial requests (request smuggling, rewritten targets, non-upgraded attach) -----------------------------
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        # A bare line feed ends the header for the daemon's parser and starts a second, unchecked request.
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nUser-Agent: x\n\nGET /containers/json HTTP/1.1\nHost: d\n\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nAccept: x\nX-Registry-Auth: e30=\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nAccept: a\rb\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nAccept: a\x00b\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\n folded: header\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nBad Header: x\r\n\r\n",
+        # Targets the daemon could read as another path: a fragment, absolute form, spaces, no leading slash.
+        b"GET /_ping#/../containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET http://docker/containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET /_ping /containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET * HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"CONNECT /_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET /_ping HTTP/2\r\nHost: d\r\n\r\n",
+    ],
+)
+def test_ambiguous_request_heads_are_refused(head: bytes) -> None:
+    with pytest.raises(Refused) as refused:
+        gw.parse_head(head)
+    assert refused.value.status == 400
+
+
+async def test_a_smuggled_request_never_reaches_the_daemon(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, _ = gateway
+    smuggled = (
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nUser-Agent: x\n\nGET /containers/json?all=1 HTTP/1.1\nHost: d\n\r\n\r\n"
+    )
+    answer = await _send(listen, smuggled)
+    assert answer.startswith(b"HTTP/1.1 400") and b"Nodestro sandbox gateway" in answer
+    assert daemon.requests == []
+
+
+async def test_forwarded_targets_are_rebuilt_from_what_was_checked(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, _ = gateway
+    await _send(listen, b"GET /v1.51/_ping?anything=1&x=%2F..%2Fcontainers HTTP/1.1\r\nHost: d\r\n\r\n")
+    assert daemon.requests[-1][1] == "/v1.51/_ping"
+    image = "nodestro-env:" + "a" * 32
+    await _send(listen, f"GET /v1.51/images/{image.replace(':', '%3A')}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode())
+    assert daemon.requests[-1][1] == f"/v1.51/images/{image}/json"
+    await _send(listen, f"DELETE /images/{image}?force=1 HTTP/1.1\r\nHost: d\r\n\r\n".encode())
+    assert daemon.requests[-1][:2] == ("DELETE", f"/images/{image}?force=1")
+
+
+async def test_a_large_body_is_refused_before_it_is_read(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, _ = gateway
+    head = b"POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 10000000\r\n\r\n"
+    answer = await _send(listen, head)  # no body sent: the gateway must answer on the head alone
+    assert answer.startswith(b"HTTP/1.1 413") and daemon.requests == []
+    both = b"POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}"
+    assert (await _send(listen, both)).startswith(b"HTTP/1.1 400")
+
+
+class _KeepAliveDaemon(FakeDaemon):
+    """A daemon that answers attach without switching protocols and then reads further requests (keep-alive)."""
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not self.containers:
+            await super().handle(reader, writer)
+            return
+        while True:
+            request = await gw.read_request(reader, limit=1 << 20)
+            if request is None:
+                break
+            self.requests.append((request.method, request.target, request.body))
+            writer.write(b"HTTP/1.1 409 Conflict\r\nContent-Length: 7\r\n\r\nstopped")
+            await writer.drain()
+        writer.close()
+
+
+async def test_client_bytes_pass_only_through_a_switched_attach(tmp_path: Path) -> None:
+    daemon = _KeepAliveDaemon()
+    daemon_socket = str(tmp_path / "daemon.sock")
+    server = await asyncio.start_unix_server(daemon.handle, path=daemon_socket)
+    instance = Gateway(GatewayConfig(docker=daemon_socket, instance="test", max_containers=2))
+    listen = str(tmp_path / "gateway.sock")
+    front = await asyncio.start_unix_server(instance.handle, path=listen)
+    async with server, front:
+        await _send(listen, _post("/containers/create?name=nodestro-sandbox-ka", body()))
+        container_id = next(iter(daemon.containers))
+        before = len(daemon.requests)
+        attach = (
+            f"POST /containers/{container_id}/attach?stream=1&stdin=1 HTTP/1.1\r\nHost: d\r\n"
+            "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+        ).encode()
+        smuggled = b"POST /containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\n{}"
+        answer = await asyncio.wait_for(_send(listen, attach + smuggled, half_close=True), timeout=20)
+    assert answer.startswith(b"HTTP/1.1 409")
+    forwarded = [target for _, target, _ in daemon.requests[before:]]
+    assert forwarded == [f"/containers/{container_id}/attach?stream=1&stdin=1"]
 
 
 def _post(path: str, payload: Any) -> bytes:
@@ -668,3 +773,34 @@ def test_tools_run_through_the_gateway_and_escapes_are_refused(real_gateway: dic
             assert "Nodestro sandbox gateway" in result.stderr, (args, result.stderr)
     finally:
         images.remove(tag)
+
+
+def _raw(socket_path: str, data: bytes, timeout: float = 5.0) -> bytes:
+    import socket
+
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(socket_path)
+        client.settimeout(timeout)
+        client.sendall(data)
+        client.shutdown(socket.SHUT_WR)
+        found = b""
+        with contextlib.suppress(TimeoutError):
+            while chunk := client.recv(65536):
+                found += chunk
+        return found
+
+
+def test_raw_requests_cannot_smuggle_past_the_gateway(real_gateway: dict[str, str]) -> None:
+    """Hand-made requests against the real daemon: none of them reaches an endpoint the gateway refuses."""
+    listen = real_gateway["DOCKER_HOST"].removeprefix("unix://")
+    attempts = [
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nUser-Agent: x\n\nGET /containers/json?all=1 HTTP/1.1\nHost: d\n\r\n\r\n",
+        b"GET /_ping#/../containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET /v1.47/version/../containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET /containers/json HTTP/1.1\r\nHost: d\r\n\r\n",
+        b"GET /_ping HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+    ]
+    for attempt in attempts:
+        answer = _raw(listen, attempt)
+        assert answer.startswith((b"HTTP/1.1 400", b"HTTP/1.1 403")), (attempt, answer[:200])
+        assert b"[{" not in answer and b"[]" not in answer, (attempt, answer[:400])

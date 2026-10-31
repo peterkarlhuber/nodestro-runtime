@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Sandbox gateway security fixes (Nodestro Local Docker):
+
+- **Fixed: request smuggling to the Docker daemon.** A header value with a bare line feed (`User-Agent: x\n\nGET
+  /containers/json ...`) was passed on; the daemon's parser ended the header there and ran the rest as a second,
+  unchecked request, so a compromised studio container could reach the whole Docker API (host root on rootful
+  Docker). Request heads are now parsed strictly (`parse_head`): no control characters, bare CR or LF, folded
+  headers, unknown methods, fragments or non-path targets, and not `Content-Length` with `Transfer-Encoding`.
+- Every target sent to the daemon is rebuilt from the checked parts (ping, version and info without a query, image
+  inspect and remove from the checked name); before, those were passed through as written.
+- An attach passes the client's raw bytes on only after the daemon switched protocols (101); on any other answer
+  the connection ends, so a kept-alive daemon connection can never carry further unchecked requests.
+- The body limit is chosen by route before the body is read (1 MB, 64 MB for builds), and image builds get the
+  sandbox's memory and CPU limits. Sandbox containers state `IpcMode: private` and empty binds, mounts and devices
+  instead of relying on daemon defaults.
+- Adversarial tests: 12 ambiguous request heads, smuggling and target rewriting through the gateway, a
+  non-switched attach with a smuggled request, and the same raw attempts against a real daemon.
+
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
 - New package `nodestro_runtime.mcp`: remote MCP servers over Streamable HTTP through the official SDK (`mcp` 2.x,
