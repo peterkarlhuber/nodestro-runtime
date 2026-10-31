@@ -20,6 +20,7 @@ from typing import Any
 from orkexa import Tool
 
 from ..problems import NodestroError
+from ..release import McpToolRef
 from ..schemas import now
 from ..storage import DocumentStore
 from . import oauth as oauth_flow
@@ -511,6 +512,21 @@ class McpService:
 
         server, tool = self.check(tool_name)
         return McpAgentTool(self, server, tool, cancelled=cancelled)
+
+    def pin(self, tool_name: str) -> McpToolRef:
+        """Freeze a usable tool for a release bundle (WP-9): server id and slug, approved hash, classification and
+        definition; never an address or a token. Refuses tools an agent could not use now."""
+        server, tool = self.check(tool_name)
+        assert tool.approved_hash is not None
+        return McpToolRef(
+            tool_name=tool.tool_name,
+            server_id=server.id,
+            server_slug=server.slug,
+            name=tool.name,
+            hash=tool.approved_hash,
+            access=tool.access,
+            definition=(tool.approved_definition or tool.definition).model_dump(mode="json"),
+        )
 
     def provenance(self, tool_name: str) -> dict[str, Any]:
         """Provenance of a call for the run record (threat model T14); empty for unknown names."""

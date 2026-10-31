@@ -289,6 +289,13 @@ Operational limits (WP-7) come from the environment: `NODESTRO_MCP_MAX_SERVERS` 
 `NODESTRO_MCP_BREAKER_SECONDS` (60): after that many transport failures in a row a server rests
 (`mcp.cooling_down`). `workspace.mcp.hub.stats()` reports active calls, the limits and each server's health.
 
+Published releases (WP-9) freeze the MCP tools their agents use: `McpService.pin(name)` gives a `McpToolRef`
+(server id and slug, approved hash, classification, definition; no address, no token) for `ReleaseBundle.mcp_tools`.
+A release's tool library uses `PinnedMcp(workspace.mcp, bundle.mcp_tools)` instead of the service: only the frozen
+tools exist, and every lookup and call checks the live policy and that the approval still has the frozen hash and
+classification (`mcp.release_tool_changed`, `mcp.tool_not_in_release`). Tokens stay in the tenant's configuration.
+Runs of published APIs are unattended, so they also need `NODESTRO_MCP_UNATTENDED=1` (D-7).
+
 Local MCP servers over stdio (WP-8) run only in an isolated container, never on the host (decision D-5, ADR-0006).
 An administrator names the server's Python packages and its module; the packages go through the same review as a
 tool's libraries (hash-pinned lock, approval, image build), and each connection starts `python -m <module> <args>` in

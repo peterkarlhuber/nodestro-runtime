@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+MCP tools in releases (ADR-0007, work package WP-9):
+
+- `ReleaseBundle.mcp_tools` freezes each MCP tool a release uses as a `release.McpToolRef` (server id and slug, approved
+  hash, classification, definition); never an address or a token. Left out of the digest while empty, so existing
+  bundles keep their digest. `tool_marker` names the frozen hash.
+- `McpService.pin(name)` builds the reference (only for tools usable now). `nodestro_runtime.mcp.pinned.PinnedMcp`
+  stands in for the service in a release's tool library: only frozen tools, and each lookup and call checks the live
+  policy plus the frozen hash and classification (`mcp.release_tool_changed`, `mcp.tool_not_in_release`).
+
 Adaptive Orchestration M5 (pool selection):
 
 - New `OrchestratorConfig.select` (`capabilities`, up to 10 tags; `max_teams` 1..20, default 5; `done`, set once a snapshot selected): saved workflows
