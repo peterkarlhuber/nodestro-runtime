@@ -1,7 +1,8 @@
 """Waiting for a person's decision about one tool call (S-2, decision D10; worker concept in nodestro-studio
 ``docs/evolution/s2-worker-concept.md``).
 
-A request is a document of its own in the tenant's store (collection ``tool_approvals``, key ``<run id>:<call id>``),
+A request is a document of its own in the tenant's store (collection ``tool_approvals``, key ``<run id>:<request
+id>``),
 never part of the run document: runs are saved whole from memory, and such a save must not lose or overwrite a
 decision. Every change of a request's status is a compare-and-set (:meth:`DocumentStore.replace_if`) from
 ``pending`` to ``approved``, ``rejected``, ``expired`` or ``cancelled``; a decision is also checked against the
@@ -9,9 +10,10 @@ deadline in that same atomic step, so a decision and an expiry that race have ex
 processes and database connections.
 
 The run that asks waits in the agent's thread (:meth:`ToolApprovals.wait`), reading the stored request at a short
-interval: the decision reaches it through the database, whichever process made it. A request is bound to the call
-id, the exact arguments, and the tool version or MCP definition hash (:func:`arguments_hash`); it is never matched to
-another call, and a request that is not ``pending`` any more never becomes ``pending`` again.
+interval: the decision reaches it through the database, whichever process made it. Every question gets a new
+request id (call ids of some providers repeat), and the request records the node, its loop iteration and the call
+id. It is bound to the exact arguments and the tool version or MCP definition hash (:func:`arguments_hash`); it is
+never matched to another call, and a request that is not ``pending`` any more never becomes ``pending`` again.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from .problems import NodestroError
-from .schemas import now
+from .schemas import new_id, now
 from .storage import DocumentStore
 from .tool_policy import ToolCapability
 
@@ -47,13 +49,16 @@ def arguments_hash(tool: str, arguments: dict[str, Any], *, version: int | None,
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def request_key(run_id: str, call_id: str) -> str:
-    return f"{run_id}:{call_id}"
+def request_key(run_id: str, request_id: str) -> str:
+    return f"{run_id}:{request_id}"
 
 
 class ToolApprovalRequest(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("tap"))
     run_id: str
     node_id: str
+    #: The node's loop iteration (Adaptive Orchestration loops run a node again).
+    iteration: int = 0
     call_id: str
     tool: str
     #: The arguments exactly as they will be sent (shown to the person; never written to logs).
@@ -72,7 +77,7 @@ class ToolApprovalRequest(BaseModel):
 
     @property
     def key(self) -> str:
-        return request_key(self.run_id, self.call_id)
+        return request_key(self.run_id, self.id)
 
 
 class ToolApprovals:
@@ -104,19 +109,18 @@ class ToolApprovals:
         node_id: str,
         call_id: str,
         tool: str,
+        iteration: int = 0,
         arguments: dict[str, Any],
         capability: ToolCapability,
         version: int | None = None,
         definition_hash: str | None = None,
     ) -> ToolApprovalRequest:
-        """Store a new pending request. A call id is asked about once: an existing request is never replaced."""
-        key = request_key(run_id, call_id)
-        if self.store.get(COLLECTION, key, ToolApprovalRequest) is not None:
-            raise NodestroError("tool.approval_exists", "This tool call was already asked about", call_id=call_id)
+        """Store a new pending request with a new id (never replacing another one)."""
         asked = self.clock()
         found = ToolApprovalRequest(
             run_id=run_id,
             node_id=node_id,
+            iteration=iteration,
             call_id=call_id,
             tool=tool,
             input=arguments,
@@ -127,46 +131,48 @@ class ToolApprovals:
             requested_at=asked,
             deadline=asked + self.wait_for,
         )
-        self.store.put(COLLECTION, key, found)
+        self.store.put(COLLECTION, found.key, found)
         return found
 
-    def wait(self, run_id: str, call_id: str, *, check: Callable[[], None] | None = None) -> ToolApprovalRequest:
+    def wait(self, run_id: str, request_id: str, *, check: Callable[[], None] | None = None) -> ToolApprovalRequest:
         """Wait until the request is decided or its deadline passes; return the final stored request.
 
         ``check`` is called between reads and may raise (a cancelled run): the request then becomes ``cancelled``
         (unless a decision won the race) and the exception propagates."""
         while True:
-            found = self.get(run_id, call_id)
+            found = self.get(run_id, request_id)
             if found is None:
-                raise NodestroError("tool.approval_not_found", "The approval request is gone", call_id=call_id)
+                raise NodestroError("tool.approval_not_found", "The approval request is gone", request_id=request_id)
             if found.status != "pending":
                 return found
             if self.clock() >= found.deadline:
-                self.close(run_id, call_id, "expired")
+                self.close(run_id, request_id, "expired")
                 continue
             if check is not None:
                 try:
                     check()
                 except BaseException:
-                    self.close(run_id, call_id, "cancelled")
+                    self.close(run_id, request_id, "cancelled")
                     raise
             self.sleep(self.poll_seconds)
 
     # ---- the deciding side ----------------------------------------------------------------------------------------
 
-    def get(self, run_id: str, call_id: str) -> ToolApprovalRequest | None:
-        return self.store.get(COLLECTION, request_key(run_id, call_id), ToolApprovalRequest)
+    def get(self, run_id: str, request_id: str) -> ToolApprovalRequest | None:
+        return self.store.get(COLLECTION, request_key(run_id, request_id), ToolApprovalRequest)
 
     def pending(self, run_id: str) -> list[ToolApprovalRequest]:
         return [item for item in self.of_run(run_id) if item.status == "pending"]
 
     def of_run(self, run_id: str) -> list[ToolApprovalRequest]:
-        return self.store.list_prefix(COLLECTION, f"{run_id}:", ToolApprovalRequest)
+        """The requests of a run, oldest first."""
+        found = self.store.list_prefix(COLLECTION, f"{run_id}:", ToolApprovalRequest)
+        return sorted(found, key=lambda item: (item.requested_at, item.id))
 
     def decide(
         self,
         run_id: str,
-        call_id: str,
+        request_id: str,
         *,
         approved: bool,
         by: str,
@@ -177,12 +183,12 @@ class ToolApprovals:
         decision about other arguments or another tool definition is refused (``tool.approval_stale``), and so is a
         decision after the deadline (``tool.approval_expired``) or about a request that was decided already
         (``tool.approval_decided``)."""
-        found = self.get(run_id, call_id)
+        found = self.get(run_id, request_id)
         if found is None:
-            raise NodestroError("tool.approval_not_found", "There is no such approval request", call_id=call_id)
+            raise NodestroError("tool.approval_not_found", "There is no such approval request", request_id=request_id)
         if found.arguments_hash != arguments:
             raise NodestroError(
-                "tool.approval_stale", "The call changed since it was shown; decide again", call_id=call_id
+                "tool.approval_stale", "The call changed since it was shown; decide again", request_id=request_id
             )
         self._refuse_final(found)
         decided = found.model_copy(
@@ -198,17 +204,17 @@ class ToolApprovals:
         ):
             return decided
         # Lost the race: either somebody decided first, or the deadline passed (by the store's clock).
-        current = self.get(run_id, call_id)
+        current = self.get(run_id, request_id)
         if current is not None and current.status == "pending":
-            self.close(run_id, call_id, "expired")
-            current = self.get(run_id, call_id)
+            self.close(run_id, request_id, "expired")
+            current = self.get(run_id, request_id)
         assert current is not None
         self._refuse_final(current)
         raise AssertionError("unreachable: the request is final")  # pragma: no cover
 
-    def close(self, run_id: str, call_id: str, status: Literal["expired", "cancelled"]) -> bool:
+    def close(self, run_id: str, request_id: str, status: Literal["expired", "cancelled"]) -> bool:
         """Mark a pending request ``expired`` or ``cancelled``; ``False`` when it was not pending any more."""
-        found = self.get(run_id, call_id)
+        found = self.get(run_id, request_id)
         if found is None or found.status != "pending":
             return False
         closed = found.model_copy(update={"status": status, "decided_at": self.clock()})
@@ -216,17 +222,17 @@ class ToolApprovals:
 
     def expire_run(self, run_id: str) -> int:
         """Expire every pending request of a run (the run stopped: interrupted, lost lease, crash, restart)."""
-        return sum(self.close(run_id, item.call_id, "expired") for item in self.pending(run_id))
+        return sum(self.close(run_id, item.id, "expired") for item in self.pending(run_id))
 
     @staticmethod
     def _refuse_final(found: ToolApprovalRequest) -> None:
         if found.status == "expired":
-            raise NodestroError("tool.approval_expired", "The approval request expired", call_id=found.call_id)
+            raise NodestroError("tool.approval_expired", "The approval request expired", request_id=found.id)
         if found.status != "pending":
             raise NodestroError(
                 "tool.approval_decided",
                 f"The approval request is {found.status} already",
-                call_id=found.call_id,
+                request_id=found.id,
                 status=found.status,
             )
 

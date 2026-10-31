@@ -111,26 +111,26 @@ def test_a_request_binds_to_tool_version_and_arguments(opened: Opened) -> None:
         "mailer", {**ARGS, "to": "x@example.com"}, version=3, definition_hash=None
     )
     assert found.arguments_hash != arguments_hash("mailer", ARGS, version=4, definition_hash=None)
-    with pytest.raises(NodestroError) as error:
-        ask(approvals)
-    assert error.value.code == "tool.approval_exists"
+    # The same call id again (some providers repeat ids) is a new question, never the old answer.
+    again = ask(approvals)
+    assert again.id != found.id and again.key == f"run_1:{again.id}"
 
 
 def test_a_decision_is_final_and_never_reused(opened: Opened) -> None:
     approvals = ToolApprovals(opened.store)
     found = ask(approvals)
     with pytest.raises(NodestroError) as error:
-        approvals.decide("run_1", "call_1", approved=True, by="usr_1", arguments="other")
+        approvals.decide("run_1", found.id, approved=True, by="usr_1", arguments="other")
     assert error.value.code == "tool.approval_stale"
     rejected = approvals.decide(
-        "run_1", "call_1", approved=False, by="usr_1", arguments=found.arguments_hash, comment="Not now"
+        "run_1", found.id, approved=False, by="usr_1", arguments=found.arguments_hash, comment="Not now"
     )
     assert rejected.status == "rejected" and rejected.decided_by == "usr_1"
     with pytest.raises(NodestroError) as error:
-        approvals.decide("run_1", "call_1", approved=True, by="usr_2", arguments=found.arguments_hash)
+        approvals.decide("run_1", found.id, approved=True, by="usr_2", arguments=found.arguments_hash)
     assert error.value.code == "tool.approval_decided"
-    assert approvals.close("run_1", "call_1", "expired") is False
-    assert approvals.get("run_1", "call_1") == rejected
+    assert approvals.close("run_1", found.id, "expired") is False
+    assert approvals.get("run_1", found.id) == rejected
     # another call of the same tool with the same arguments gets its own request
     assert ask(approvals, "call_2").status == "pending"
 
@@ -143,9 +143,9 @@ def test_a_decision_after_the_deadline_is_refused_by_the_store(opened: Opened) -
     opened.store.put(COLLECTION, found.key, found.model_copy(update={"deadline": datetime.now(timezone.utc)}))
     clock.at -= timedelta(minutes=30)
     with pytest.raises(NodestroError) as error:
-        approvals.decide("run_1", "call_1", approved=True, by="usr_1", arguments=found.arguments_hash)
+        approvals.decide("run_1", found.id, approved=True, by="usr_1", arguments=found.arguments_hash)
     assert error.value.code == "tool.approval_expired"
-    assert approvals.get("run_1", "call_1").status == "expired"  # type: ignore[union-attr]
+    assert approvals.get("run_1", found.id).status == "expired"  # type: ignore[union-attr]
 
 
 def test_the_waiter_sees_a_decision_made_on_another_connection(opened: Opened) -> None:
@@ -156,11 +156,11 @@ def test_the_waiter_sees_a_decision_made_on_another_connection(opened: Opened) -
         timer = threading.Timer(
             0.1,
             lambda: ToolApprovals(other).decide(
-                "run_1", "call_1", approved=True, by="usr_1", arguments=found.arguments_hash
+                "run_1", found.id, approved=True, by="usr_1", arguments=found.arguments_hash
             ),
         )
         timer.start()
-        assert approvals.wait("run_1", "call_1").status == "approved"
+        assert approvals.wait("run_1", found.id).status == "approved"
         timer.join()
     finally:
         other.close()
@@ -176,16 +176,16 @@ def test_the_waiter_expires_at_the_deadline(opened: Opened) -> None:
 
     approvals = ToolApprovals(opened.store, clock=clock, sleep=sleep)
     found = ask(approvals)
-    assert approvals.wait("run_1", "call_1").status == "expired"
+    assert approvals.wait("run_1", found.id).status == "expired"
     assert len(ticks) == 3
     with pytest.raises(NodestroError) as error:
-        approvals.decide("run_1", "call_1", approved=True, by="usr_1", arguments=found.arguments_hash)
+        approvals.decide("run_1", found.id, approved=True, by="usr_1", arguments=found.arguments_hash)
     assert error.value.code == "tool.approval_expired"
 
 
 def test_cancelling_the_wait_cancels_the_request(opened: Opened) -> None:
     approvals = ToolApprovals(opened.store, poll_seconds=0.01)
-    ask(approvals)
+    found = ask(approvals)
 
     class Cancelled(Exception):
         pass
@@ -194,15 +194,15 @@ def test_cancelling_the_wait_cancels_the_request(opened: Opened) -> None:
         raise Cancelled
 
     with pytest.raises(Cancelled):
-        approvals.wait("run_1", "call_1", check=check)
-    assert approvals.get("run_1", "call_1").status == "cancelled"  # type: ignore[union-attr]
+        approvals.wait("run_1", found.id, check=check)
+    assert approvals.get("run_1", found.id).status == "cancelled"  # type: ignore[union-attr]
 
 
 def test_a_stopped_run_expires_its_pending_requests_only(opened: Opened) -> None:
     approvals = ToolApprovals(opened.store)
     first = ask(approvals, "call_1")
     ask(approvals, "call_2")
-    approvals.decide("run_1", "call_1", approved=True, by="usr_1", arguments=first.arguments_hash)
+    approvals.decide("run_1", first.id, approved=True, by="usr_1", arguments=first.arguments_hash)
     assert approvals.expire_run("run_1") == 1
     assert [item.status for item in approvals.of_run("run_1")] == ["approved", "expired"]
     assert approvals.pending("run_1") == []
@@ -229,10 +229,10 @@ def test_decide_and_expire_race_in_threads(opened: Opened) -> None:
         start.wait()
         try:
             if index % 3 == 0:
-                result = "expired" if mine.close("run_1", "call_1", "expired") else "lost"
+                result = "expired" if mine.close("run_1", found.id, "expired") else "lost"
             else:
                 mine.decide(
-                    "run_1", "call_1", approved=index % 3 == 1, by=f"usr_{index}", arguments=found.arguments_hash
+                    "run_1", found.id, approved=index % 3 == 1, by=f"usr_{index}", arguments=found.arguments_hash
                 )
                 result = "decided"
         except NodestroError as error:
@@ -252,14 +252,16 @@ def test_decide_and_expire_race_in_threads(opened: Opened) -> None:
     assert all(
         item in ("lost", "tool.approval_decided", "tool.approval_expired") for item in outcomes if item not in winners
     )
-    final = approvals.get("run_1", "call_1")
+    final = approvals.get("run_1", found.id)
     assert final is not None and final.status != "pending"
 
 
 # ---- PostgreSQL: separate processes --------------------------------------------------------------------------
 
 
-def _decide_in_process(dsn: str, schema: str, index: int, digest: str, start: Any, results: Any) -> None:
+def _decide_in_process(
+    dsn: str, schema: str, index: int, request_id: str, digest: str, start: Any, results: Any
+) -> None:
     from nodestro_runtime.storage_postgres import PostgresStore
 
     store = PostgresStore.connect(dsn, "tenant-a", schema=schema)
@@ -268,9 +270,9 @@ def _decide_in_process(dsn: str, schema: str, index: int, digest: str, start: An
         start.wait()
         try:
             if index == 0:
-                results.put((index, "expired" if approvals.close("run_1", "call_1", "expired") else "lost"))
+                results.put((index, "expired" if approvals.close("run_1", request_id, "expired") else "lost"))
                 return
-            approvals.decide("run_1", "call_1", approved=index % 2 == 1, by=f"usr_{index}", arguments=digest)
+            approvals.decide("run_1", request_id, approved=index % 2 == 1, by=f"usr_{index}", arguments=digest)
             results.put((index, "decided"))
         except NodestroError as error:
             results.put((index, error.code))
@@ -288,7 +290,8 @@ def test_one_decision_wins_across_processes_and_a_run_save_does_not_touch_it(pos
     results = context.Queue()
     processes = [
         context.Process(
-            target=_decide_in_process, args=(opened.dsn, opened.schema, index, found.arguments_hash, start, results)
+            target=_decide_in_process,
+            args=(opened.dsn, opened.schema, index, found.id, found.arguments_hash, start, results),
         )
         for index in range(4)
     ]
@@ -303,7 +306,7 @@ def test_one_decision_wins_across_processes_and_a_run_save_does_not_touch_it(pos
     outcomes = [results.get(timeout=5) for _ in processes]
     winners = [item for item in outcomes if item[1] in ("decided", "expired")]
     assert len(winners) == 1, outcomes
-    final = approvals.get("run_1", "call_1")
+    final = approvals.get("run_1", found.id)
     assert final is not None and final.status in ("approved", "rejected", "expired")
     if winners[0][1] == "decided":
         assert final.decided_by == f"usr_{winners[0][0]}"
@@ -318,11 +321,11 @@ def test_tenants_never_see_each_others_requests(postgres: Opened) -> None:
     other = PostgresStore.connect(opened.dsn, "tenant-b", schema=opened.schema)
     try:
         theirs = ToolApprovals(other)
-        assert theirs.get("run_1", "call_1") is None
+        assert theirs.get("run_1", found.id) is None
         with pytest.raises(NodestroError) as error:
-            theirs.decide("run_1", "call_1", approved=True, by="usr_b", arguments=found.arguments_hash)
+            theirs.decide("run_1", found.id, approved=True, by="usr_b", arguments=found.arguments_hash)
         assert error.value.code == "tool.approval_not_found"
         assert theirs.expire_run("run_1") == 0
     finally:
         other.close()
-    assert ToolApprovals(opened.store).get("run_1", "call_1").status == "pending"  # type: ignore[union-attr]
+    assert ToolApprovals(opened.store).get("run_1", found.id).status == "pending"  # type: ignore[union-attr]

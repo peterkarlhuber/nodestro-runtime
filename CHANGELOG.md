@@ -27,11 +27,12 @@ Tool capabilities and per-call approvals, groundwork (evolution S-1/S-2, decisio
   `tool.approval_unattended`) / ask. Orchestrator grants only narrow; unattended runs deny what would ask unless a
   pre-grant matches; MCP tools unattended only as read-only with D-7.
 - `nodestro_runtime.tool_approvals.ToolApprovals`: stored approval requests (collection `tool_approvals`, key
-  `<run id>:<call id>`) bound to the call, its exact arguments and the tool version or definition hash
+  `<run id>:<request id>`, a new id per question; node, loop iteration and call id recorded) bound to the exact
+  arguments and the tool version or definition hash
   (`arguments_hash`); decisions, expiry and cancellation are compare-and-set from `pending` with the deadline
   checked in the same step (at most 15 minutes); the waiter reads the store, so a decision from another process
   reaches it; `expire_run` for stopped runs. New codes `tool.approval_stale`, `tool.approval_expired`,
-  `tool.approval_decided`, `tool.approval_not_found`, `tool.approval_exists`.
+  `tool.approval_decided`, `tool.approval_not_found`.
 
 MCP client (ADR-0007, work packages WP-1 and WP-2):
 
