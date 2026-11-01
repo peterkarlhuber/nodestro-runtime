@@ -676,3 +676,13 @@ def test_replace_if_has_one_winner_across_threads(store: DocumentStore) -> None:
     assert len(wins) == 1
     stored = store.get("requests", "r", Request)
     assert stored is not None and stored.by == wins[0]
+
+
+def test_the_api_imports_only_public_names() -> None:
+    """D-14: the HTTP API uses these patterns; the private names stay as aliases for older callers."""
+    from nodestro_runtime import engine, memory_spaces
+
+    assert engine.PLACEHOLDER is engine._PLACEHOLDER
+    assert [match.group(1) for match in engine.PLACEHOLDER.finditer("{{ topic }} and {{input}}")] == ["topic", "input"]
+    assert memory_spaces.SPACE_PATTERN is memory_spaces._SPACE
+    assert memory_spaces.SPACE_PATTERN.fullmatch("Team notes") and not memory_spaces.SPACE_PATTERN.fullmatch("../x")

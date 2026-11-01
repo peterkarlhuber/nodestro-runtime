@@ -120,7 +120,9 @@ from .tool_approvals import (
 
 logger = logging.getLogger(__name__)
 
-_PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+#: A ``{{ name }}`` placeholder in a prompt template (group 1: the name); the HTTP API finds them with it too.
+PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_PLACEHOLDER = PLACEHOLDER  # the name before it was public
 #: Events of a live run kept for late subscribers; beyond it ``text`` and ``thinking`` deltas are
 #: no longer kept (they are still published, and the node state holds the whole text).
 _MAX_EVENT_HISTORY = 5000
