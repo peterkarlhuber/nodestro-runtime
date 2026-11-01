@@ -156,8 +156,8 @@ step's earlier result is reused only when its fingerprint (configuration, connec
 files, sub-workflow version) is unchanged; reused steps cost nothing again. Steps that run again after they
 had called tools need `confirm=True`: this includes the tools called in the child runs of sub-workflow and
 orchestrator steps and calls that had started when the process stopped (each call is noted in the store before it
-runs, `nodestro_runtime.tool_journal`). Only Nodestro's read-only built-in tools and calls that ended with an error
-are not counted.
+runs, `nodestro_runtime.tool_journal`). Not counted are Nodestro's read-only built-in tools, calls that ended with an
+error and calls that never ran because they waited for a person's approval or were refused.
 
 **Errors.** Expected failures raise `nodestro_runtime.problems.NodestroError` (a `ValueError`) with a stable
 `code`, `params` and an English message, for example `api_key_missing`, `workflow.blocked` or

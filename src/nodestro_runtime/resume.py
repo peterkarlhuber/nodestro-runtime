@@ -17,8 +17,8 @@ node whether its earlier result can be taken over:
   of sub-workflow and orchestrator nodes (and of their children), and calls that started
   but whose node never stored its result because the process stopped
   (:mod:`nodestro_runtime.tool_journal`). Only Nodestro's own read-only built-in tools
-  (:data:`~nodestro_runtime.tool_policy.BUILTIN_CAPABILITIES`) and calls that ended with an
-  error are left out.
+  (:data:`~nodestro_runtime.tool_policy.BUILTIN_CAPABILITIES`), calls that ended with an
+  error and calls that were still waiting for (or were refused) a person's approval are left out.
 
 Reused nodes count no cost in the new run: their cost stays with the earlier run, so the
 usage dashboard never counts it twice. When nothing can be reused safely, the plan says
@@ -37,7 +37,7 @@ from .graph import continuation, data_sources
 from .launcher import launch
 from .preflight import PROVIDER_CHECKS, preflight
 from .problems import CheckIssue, NodestroError
-from .schemas import NodeRun, Run, RunIn, Usage, Workflow, total_cost
+from .schemas import NodeRun, Run, RunIn, ToolCallRecord, Usage, Workflow, total_cost
 from .tool_policy import BUILTIN_CAPABILITIES
 
 if TYPE_CHECKING:
@@ -242,13 +242,23 @@ def _node_effects(ctx: Workspace, state: NodeRun | None, started: set[str], seen
     if state is None:
         return names
     for execution in (state, *state.earlier):
-        names.update(
-            call.name for call in execution.tool_calls if call.name not in BUILTIN_CAPABILITIES and not call.is_error
-        )
+        names.update(call.name for call in execution.tool_calls if _may_have_run(call))
         children = [execution.child_run_id] if execution.child_run_id else []
         for child_id in [*children, *execution.child_run_ids]:
             names.update(_run_effects(ctx, child_id, seen))
     return names
+
+
+#: Approval states of a call that never ran: asked and not (yet) approved, or refused.
+_NOT_RUN = frozenset({"pending", "rejected", "expired", "cancelled", "denied"})
+
+
+def _may_have_run(call: ToolCallRecord) -> bool:
+    """Whether a recorded call ran (or may have) and can have had effects; a call that waited for a person when the
+    run stopped is stored with its question, but it never ran."""
+    if call.name in BUILTIN_CAPABILITIES or call.is_error:
+        return False
+    return call.approval is None or call.approval.status not in _NOT_RUN
 
 
 def _run_effects(ctx: Workspace, run_id: str, seen: set[str]) -> set[str]:

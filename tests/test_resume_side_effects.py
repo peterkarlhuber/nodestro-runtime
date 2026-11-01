@@ -185,3 +185,20 @@ async def test_the_notes_of_started_calls_go_once_the_node_is_stored(make: Make)
     workspace.store.delete("runs", done.id)
     workspace.runs.discard_tool_waits(done.id, because="run.deleted")
     assert tool_journal.started(workspace.store, done.id) == []
+
+
+def test_only_calls_that_may_have_run_count() -> None:
+    from nodestro_runtime.schemas import ToolCallApproval, ToolCallRecord
+
+    def call(name: str = TOOL, *, error: bool = False, status: str | None = None) -> ToolCallRecord:
+        approval = ToolCallApproval(status=status) if status is not None else None  # type: ignore[arg-type]
+        return ToolCallRecord(id="toolu_1", name=name, is_error=error, approval=approval)
+
+    assert resume._may_have_run(call()) and resume._may_have_run(call(status="approved"))
+    assert resume._may_have_run(call(status="allowed"))
+    # Asked and never answered (the run stopped), refused, or a read-only built-in tool: nothing ran outside.
+    assert not resume._may_have_run(call(status="pending"))
+    assert not resume._may_have_run(call(error=True))
+    assert not resume._may_have_run(call("calculator"))
+    # A tool an extension adds counts like any other tool (it may change things).
+    assert resume._may_have_run(call("send_note"))
