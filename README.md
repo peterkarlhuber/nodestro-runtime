@@ -401,6 +401,8 @@ Docker and network); `NODESTRO_REQUIRE_DOCKER=1` makes a missing Docker fail ins
 
 CI needs the repository secret `NODESTRO_READ` (read access to Orkexa and the Nodestro repositories).
 
+Open work (release blockers, known bugs, security follow-ups, debt) is listed in [docs/TODO.md](docs/TODO.md).
+
 ## Provenance and license
 
 Extracted from `nodestro` 0.1 (15e2076); see [PROVENANCE.md](PROVENANCE.md) and [CHANGELOG.md](CHANGELOG.md).
