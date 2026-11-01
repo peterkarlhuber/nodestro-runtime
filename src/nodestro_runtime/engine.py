@@ -54,13 +54,12 @@ from orkexa import (
     refine,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
-from orkexa.memory import MEMORY_TOOL_NAME
 from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
 from . import contracts, flow_driver, graph, tool_checkpoints, tool_policy
-from .agent_builder import AgentBuilder
+from .agent_builder import AgentBuilder, run_own_tool
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
 from .file_delivery import collect, deliver
@@ -106,12 +105,16 @@ from .storage import DocumentStore
 from .tool_approvals import (
     EXECUTION_WINDOW,
     INTERRUPTED,
+    RECLASSIFIED,
     SWITCH_OFF,
+    CallBinding,
     ToolApprovalRequest,
     ToolApprovals,
     ToolGate,
     arguments_hash,
+    bind_call,
     checkpoints_enabled,
+    reclassified,
     tool_facts,
 )
 
@@ -1208,12 +1211,22 @@ class RunManager:
         by: str,
         arguments: str,
         comment: str | None = None,
+        current: tool_policy.ToolCapability | None = None,
     ) -> ToolApprovalRequest:
-        """Approve or reject one tool call (:meth:`ToolApprovals.decide`, unchanged). A run paused at the call
-        (M6b) continues once none of its calls waits any more; a run waiting in a thread reads the decision itself."""
-        decided = ToolApprovals(self.store).decide(
-            run_id, request_id, approved=approved, by=by, arguments=arguments, comment=comment
-        )
+        """Approve or reject one tool call (:meth:`ToolApprovals.decide`). ``current`` is the tool's classification
+        now: an approval of a call asked with another one is refused and closes the request (re-review R-1). A run
+        paused at the call (M6b) continues once none of its calls waits any more; a run waiting in a thread reads the
+        decision itself."""
+        approvals = ToolApprovals(self.store)
+        try:
+            decided = approvals.decide(
+                run_id, request_id, approved=approved, by=by, arguments=arguments, comment=comment, current=current
+            )
+        except NodestroError:
+            found = approvals.get(run_id, request_id)
+            if found is not None and found.checkpointed and found.closed_because == RECLASSIFIED:
+                self._continue_paused(run_id)  # the paused run goes on and refuses the call
+            raise
         if decided.checkpointed:
             self._continue_paused(run_id)
         return decided
@@ -2225,6 +2238,7 @@ class RunManager:
         shown = capability.model_dump()
         if verdict.action == "allow":
             record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            bind_call(CallBinding(tool=call.name, capability=capability, definition_hash=definition))
             return None
         if verdict.action == "deny":
             return self._deny_call(
@@ -2280,7 +2294,7 @@ class RunManager:
             # Stopped elsewhere (the reaper after a lost lease, a restart): this execution must not go on.
             record.approval = record.approval.model_copy(update={"status": "expired", "code": "run.interrupted"})
             raise RunCancelled("The run was interrupted while it waited for an approval")
-        code = {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+        code = _decision_code(final)
         record.approval = ToolCallApproval(
             status=final.status,
             request_id=final.id,
@@ -2303,11 +2317,19 @@ class RunManager:
         self._save(context)
         if final.status == "approved":
             # The approval binds the call to the tool as it was asked about (arguments, version, MCP definition
-            # hash). An administrator may have approved another MCP definition while the person decided (independent
-            # review L-4): then this approval does not cover the call that would run now. Own tools are bound to their
-            # version by the tool object itself (it refuses to run after a change).
-            if is_mcp_tool(call.name) and _current_hash(context.env.builder.tools, call) != final.arguments_hash:
-                gate.approvals.audit("stale", final, outcome="changed")
+            # hash, classification). An administrator may have approved another MCP definition (independent review
+            # L-4) or classified the tool differently (re-review R-1) while the person decided: then this approval
+            # does not cover the call that would run now. Own tools are also bound to their version by the tool object
+            # itself (it refuses to run after a change).
+            capability, _version, _kind, definition = tool_facts(context.env.builder.tools, call.name)
+            same = _current_hash(context.env.builder.tools, call) == final.arguments_hash
+            stale = None
+            if not same and is_mcp_tool(call.name):
+                stale = "changed"
+            elif same and reclassified(final.capability, capability):
+                stale = "reclassified"
+            if stale is not None:
+                gate.approvals.audit("stale", final, outcome=stale)
                 return self._deny_call(
                     context,
                     node_id,
@@ -2317,7 +2339,19 @@ class RunManager:
                     "The tool changed while this call waited for its approval, so it was not made",
                     shown,
                 )
+            # The call runs as approved, and only so: an MCP tool checks this again right before it sends the call.
+            bind_call(CallBinding(tool=call.name, capability=final.capability, definition_hash=definition))
             return None
+        if final.status == "expired" and final.closed_because == RECLASSIFIED:
+            return self._deny_call(
+                context,
+                node_id,
+                call,
+                record,
+                "tool.approval_stale",
+                "The tool was classified differently while this call waited for its approval, so it was not made",
+                shown,
+            )
         if final.status == "rejected":
             return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
         if final.status == "expired":
@@ -2409,7 +2443,7 @@ class RunManager:
         if found.status == "pending":
             # Still undecided (another call of the same turn was decided): keep waiting, without a new question.
             raise ToolCallSuspended("waits for a person's approval", ref=found.id)
-        capability, version, kind, _definition = tool_facts(context.env.builder.tools, call.name)
+        capability, version, kind, definition = tool_facts(context.env.builder.tools, call.name)
         shown = capability.model_dump()
         current = _current_hash(context.env.builder.tools, call)
         if found.status != "approved":
@@ -2432,6 +2466,8 @@ class RunManager:
         stale: str | None = None
         if current != found.arguments_hash:
             stale = "changed"
+        elif reclassified(found.capability, capability):
+            stale = "reclassified"
         elif found.decided_at is None or found.decided_at > found.deadline:
             stale = "late_decision"
         elif now() > found.decided_at + EXECUTION_WINDOW:
@@ -2476,6 +2512,7 @@ class RunManager:
             )
         released[call.id] = marked
         self._record_decision(context, node_id, record, marked, shown)
+        bind_call(CallBinding(tool=call.name, capability=marked.capability, definition_hash=definition))
         return None
 
     def _audit_released(
@@ -2484,8 +2521,11 @@ class RunManager:
         """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
         after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
         (``tool.changed``), not ``executed``. The request stays ``executed``, so the call never runs later."""
-        if is_error and _current_hash(context.env.builder.tools, call) != request.arguments_hash:
+        tools = context.env.builder.tools
+        if is_error and _current_hash(tools, call) != request.arguments_hash:
             gate.approvals.audit("stale", request, outcome="tool.changed")
+        elif is_error and reclassified(request.capability, tool_facts(tools, call.name)[0]):
+            gate.approvals.audit("stale", request, outcome="tool.reclassified")
         else:
             gate.approvals.audit("executed", request)
 
@@ -2498,7 +2538,7 @@ class RunManager:
         shown: dict[str, str],
     ) -> str | None:
         """Record a decided request on the call; ``None`` when approved, the denial text otherwise."""
-        code = {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+        code = _decision_code(final)
         if final.status == "cancelled":
             code = final.closed_because or "run.cancelled"
         record.approval = ToolCallApproval(
@@ -2951,8 +2991,8 @@ class RunManager:
                     state.tool_calls.append(record)
             calls[call.id] = record
             denial = None
-            own = {tool.name for tool in extra_tools} | {MEMORY_TOOL_NAME}
-            if gate is not None and call.name not in own:
+            bind_call(None)  # every call gets its own binding (or none) from the gate below
+            if gate is not None and not run_own_tool(config, call.name, extra_tools):
                 if checkpointing and call.resumed:
                     denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
                 else:
@@ -3236,6 +3276,13 @@ class AgentSuspended(Exception):
         super().__init__("the agent waits for a tool approval")
         self.checkpoint = checkpoint
         self.memory = memory
+
+
+def _decision_code(final: ToolApprovalRequest) -> str | None:
+    """The problem code of a decided or closed request on its call (``None`` when approved or cancelled)."""
+    if final.status == "expired" and final.closed_because == RECLASSIFIED:
+        return "tool.approval_stale"
+    return {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
 
 
 def _current_hash(tools: Any, call: ToolCall) -> str:

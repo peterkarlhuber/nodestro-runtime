@@ -156,6 +156,9 @@ class CallResult:
     #: False when the call was not sent: the tool was missing or its listed definition did not match the expected
     #: hash (the comparison happens on the same connection, before the request).
     sent: bool = True
+    #: True when the caller's last check right before the send refused the call (``confirm``; re-review R-1): the
+    #: request was not sent.
+    refused: bool = False
 
 
 def _find(exc: BaseException, kind: type[BaseException]) -> BaseException | None:
@@ -674,9 +677,14 @@ class McpHub:
         arguments: dict[str, Any],
         *,
         expected_hash: str | None = None,
+        confirm: Callable[[], bool] | None = None,
     ) -> CallResult:
         """List, compare and call on one connection. With ``expected_hash`` the request is sent only when the tool's
-        listed definition has exactly that hash (an approval never covers a definition changed since)."""
+        listed definition has exactly that hash (an approval never covers a definition changed since). ``confirm`` is
+        the caller's last check, right before the request is sent (after the listing, which takes a round trip): when
+        it returns false, nothing is sent (``refused``)."""
+        import anyio
+
         from .models import definition_hash
 
         async def operation(client: Any) -> CallResult:
@@ -687,6 +695,8 @@ class McpHub:
                 return CallResult("", True, client.protocol_version, None, 0, sent=False)
             if expected_hash is not None and definition_hash(definition) != expected_hash:
                 return CallResult("", True, client.protocol_version, definition, 0, sent=False)
+            if confirm is not None and not await anyio.to_thread.run_sync(confirm):
+                return CallResult("", True, client.protocol_version, definition, 0, sent=False, refused=True)
             if name == RESOURCE_TOOL:
                 text, is_error = await self._read_resource(client, server, definition, arguments.get("uri"))
             else:
@@ -731,9 +741,10 @@ class McpHub:
         *,
         expected_hash: str | None = None,
         cancelled: Callable[[], bool] | None = None,
+        confirm: Callable[[], bool] | None = None,
     ) -> CallResult:
         return self.run(
-            self.acall_tool(server, token, name, arguments, expected_hash=expected_hash),
+            self.acall_tool(server, token, name, arguments, expected_hash=expected_hash, confirm=confirm),
             timeout=server.timeout_seconds * 2 + self.limits.queue_seconds + 5,
             cancelled=cancelled,
         )

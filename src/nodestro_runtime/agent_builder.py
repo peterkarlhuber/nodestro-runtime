@@ -14,7 +14,7 @@ streaming, reasoning effort ...); such errors appear in the inspector.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import keyword
 import re
@@ -166,6 +166,23 @@ def _messages(config: AgentConfig) -> list[dict[str, Any]]:
     if messages and messages[-1]["role"] != "assistant":
         raise NodestroError("config.examples_end", "Example messages must end with an answer of the assistant")
     return messages
+
+
+def run_own_tool(config: AgentConfig, name: str, extra_tools: Iterable[Tool] = ()) -> bool:
+    """Whether the call ``name`` of an agent built from ``config`` reaches one of the run's own tools, which the
+    per-call gate does not ask about (re-review R-2): the agent's system memory tool, or a tool of the run itself
+    (``extra_tools``: input files, knowledge proposals).
+
+    Decided by what the built agent really calls, not by the name alone: a call named ``memory`` is the memory tool
+    only when the agent has memory (Orkexa then answers it from the memory backend) and no tool of the library was
+    assigned under that name; a run tool only when no library tool of the same name took its place (library tools
+    win in :meth:`AgentBuilder.build`). The name ``memory`` is reserved in the tool library, so no own or generated
+    tool can be saved or used under it."""
+    if name in config.tools:
+        return False
+    if name == MEMORY_TOOL_NAME:
+        return config.memory.mode != "none"
+    return any(tool.name == name for tool in extra_tools)
 
 
 class AgentBuilder:
@@ -345,7 +362,7 @@ class AgentBuilder:
                 "Citations cannot be combined with a structured output format",
                 field="knowledge",
             )
-        if config.memory.mode != "none" and MEMORY_TOOL_NAME in config.tools:
+        if MEMORY_TOOL_NAME in config.tools:
             issue("config.memory_name_reserved", "The name 'memory' is reserved for the memory tool", field="tools")
         if config.quality.enabled and not config.quality.criteria:
             issue("config.quality_no_criteria", "The quality check needs at least one criterion", field="quality")

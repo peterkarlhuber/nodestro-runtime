@@ -25,6 +25,8 @@ compare-and-set), and only within :data:`EXECUTION_WINDOW` after the decision.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -54,6 +56,9 @@ ApprovalStatus = Literal["pending", "approved", "rejected", "expired", "cancelle
 INTERRUPTED = "run.interrupted"
 #: ``closed_because`` of the requests of paused runs found while the checkpoint switch is off (M6b).
 SWITCH_OFF = "switch_off"
+#: ``closed_because`` of a pending request whose tool was classified differently while it waited (re-review R-1): the
+#: approval would no longer cover the call, so the request is closed and the call is refused (``tool.approval_stale``).
+RECLASSIFIED = "tool.reclassified"
 #: What became of an approved checkpointed call: ``open`` (not run yet), ``executed`` (marked right before it ran),
 #: ``stale`` (too late, or the call or the rules changed), ``closed`` (switch off, cancel, the run is gone).
 CallUse = Literal["open", "executed", "stale", "closed"]
@@ -69,6 +74,44 @@ def arguments_hash(tool: str, arguments: dict[str, Any], *, version: int | None,
 
 def request_key(run_id: str, request_id: str) -> str:
     return f"{run_id}:{request_id}"
+
+
+def reclassified(asked: ToolCapability, current: ToolCapability) -> bool:
+    """Whether a tool's classification changed in a way that matters for an approval (re-review R-1): what it may do
+    (``access``) or how far it reaches (``reach``), in either direction. Who stated it (``source``) does not matter."""
+    return asked.access != current.access or asked.reach != current.reach
+
+
+# ---- the call an approval or an allow verdict covers ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CallBinding:
+    """What the gate let a call run as (re-review R-1): the tool, its classification and, for MCP tools, the approved
+    definition hash, at the moment of the gate's last check.
+
+    The run engine binds it in the tool call's own context right before the call runs; an MCP tool checks it again
+    against the stored tool right before the request is sent (:meth:`~nodestro_runtime.mcp.service.McpService.call`),
+    so a reclassification between the gate and the call refuses the call instead of running it under the old
+    decision."""
+
+    tool: str
+    capability: ToolCapability
+    definition_hash: str | None = None
+
+
+_BINDING: ContextVar[CallBinding | None] = ContextVar("nodestro_tool_call_binding", default=None)
+
+
+def bind_call(binding: CallBinding | None) -> None:
+    """Bind (or clear) what the current tool call may run as; set for every call before it runs."""
+    _BINDING.set(binding)
+
+
+def bound_call(tool: str) -> CallBinding | None:
+    """The binding of the current call if it is about ``tool``; ``None`` otherwise."""
+    found = _BINDING.get()
+    return found if found is not None and found.tool == tool else None
 
 
 # ---- the audit trail ------------------------------------------------------------------------------------------
@@ -266,18 +309,61 @@ class ToolApprovals:
         by: str,
         arguments: str,
         comment: str | None = None,
+        current: ToolCapability | None = None,
     ) -> ToolApprovalRequest:
         """Approve or reject a pending request. ``arguments`` is the :func:`arguments_hash` the person was shown: a
         decision about other arguments or another tool definition is refused (``tool.approval_stale``), and so is a
         decision after the deadline (``tool.approval_expired``) or about a request that was decided already
-        (``tool.approval_decided``). Every decision and every refused one is written to the audit trail."""
+        (``tool.approval_decided``). Every decision and every refused one is written to the audit trail.
+
+        ``current`` is the tool's classification now. If it differs from the one the request was asked with
+        (:func:`reclassified`), an approval is refused (``tool.approval_stale``) and the request is closed
+        (:data:`RECLASSIFIED`): the person was shown another classification (re-review R-1). Rejecting stays
+        possible."""
         try:
+            if approved and current is not None:
+                self._refuse_reclassified(run_id, request_id, current)
             decided = self._decide(run_id, request_id, approved=approved, by=by, arguments=arguments, comment=comment)
         except NodestroError as problem:
             self._audit("decision_refused", by, run_id, request_id, arguments, outcome=problem.code)
             raise
         self._audit("decided", by, run_id, request_id, arguments, outcome=decided.status, tool=decided.tool)
         return decided
+
+    def _refuse_reclassified(self, run_id: str, request_id: str, current: ToolCapability) -> None:
+        found = self.get(run_id, request_id)
+        if found is None or found.status != "pending" or not reclassified(found.capability, current):
+            return
+        if self.close(run_id, request_id, "expired", because=RECLASSIFIED):
+            self.audit("stale", found, outcome="reclassified", access=current.access)
+        raise NodestroError(
+            "tool.approval_stale",
+            "The tool was classified differently since this call was shown; it is not made",
+            request_id=request_id,
+        )
+
+    def invalidate_tool(self, tool: str, current: ToolCapability) -> int:
+        """Invalidate what a reclassification of ``tool`` makes stale (re-review R-1): pending requests asked with
+        another classification are closed (:data:`RECLASSIFIED`), and approved checkpointed calls that did not run yet
+        are marked ``stale``. A call waiting in a thread refuses itself (the engine compares the classification before
+        the call runs). Returns how many requests changed; every change is audited."""
+        changed = 0
+        for _key, item in self.store.items(COLLECTION, ToolApprovalRequest):
+            if item.tool != tool or not reclassified(item.capability, current):
+                continue
+            if item.status == "pending":
+                if self.close(item.run_id, item.id, "expired", because=RECLASSIFIED):
+                    self.audit("stale", item, outcome="reclassified", access=current.access)
+                    changed += 1
+            elif (
+                item.status == "approved"
+                and item.checkpointed
+                and item.use == "open"
+                and self.use(item, "stale") is not None
+            ):
+                self.audit("stale", item, outcome="reclassified", access=current.access)
+                changed += 1
+        return changed
 
     def _audit(
         self,
@@ -427,6 +513,12 @@ class ToolApprovals:
 
     @staticmethod
     def _refuse_final(found: ToolApprovalRequest) -> None:
+        if found.status == "expired" and found.closed_because == RECLASSIFIED:
+            raise NodestroError(
+                "tool.approval_stale",
+                "The tool was classified differently since this call was shown; it is not made",
+                request_id=found.id,
+            )
         if found.status == "expired":
             raise NodestroError("tool.approval_expired", "The approval request expired", request_id=found.id)
         if found.status != "pending":

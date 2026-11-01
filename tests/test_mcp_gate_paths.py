@@ -24,6 +24,7 @@ from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.schemas import AgentConfig
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
 from nodestro_runtime.tool_approvals import ENABLE_ENV
+from nodestro_runtime.tool_policy import ToolBinding
 from nodestro_runtime.workspace import Workspace
 
 DELETE = "mcp__catalog__delete_page"
@@ -75,18 +76,42 @@ def test_agent_test_respects_per_call_approval(
 def test_agent_test_follows_the_same_rules_for_read_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: LoopbackServer
 ) -> None:
-    """A read tool is decided by the same rules as in a run: allowed here, so it runs and is marked ``allowed``."""
+    """A read tool with the default binding (``auto``) is allowed without a question, exactly as in a run: it runs
+    once, reaches the server once and is marked ``allowed`` (re-review test gap 1: exactly this, nothing else)."""
     monkeypatch.setenv(ENABLE_ENV, "1")
     workspace = _workspace(tmp_path, {"FIND": [tool_use(SEARCH, {"query": "q"}), text("done")]}, server)
     try:
         agent = AgentConfig(name="A", system_prompt="FIND", tools=[SEARCH])
         result, _tracker = workspace.tester.run(AgentTestIn(agent=agent, input="x"))
-        call = next(c for c in result.tool_calls if c.name == SEARCH)
+        assert result.status == "succeeded", result.error
+        [call] = result.tool_calls
+        assert call.name == SEARCH
         assert call.approval is not None
-        if call.approval.status == "allowed":
-            assert not call.is_error and "results for q" in (call.output or "")
-        else:  # a binding that asks: never run in a test
-            assert call.approval.status == "denied" and _calls_reaching(server, "search") == 0
+        assert call.approval.status == "allowed" and call.approval.code is None
+        assert call.approval.capability["access"] == "read"
+        assert not call.is_error and "results for q" in (call.output or "")
+        assert _calls_reaching(server, "search") == 1
+    finally:
+        workspace.close()
+
+
+def test_agent_test_refuses_a_read_tool_whose_binding_always_asks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: LoopbackServer
+) -> None:
+    """The same read tool bound with ``ask: always`` needs a question, which a test cannot ask: refused with
+    ``tool.approval_not_in_test``, and the server is never called."""
+    monkeypatch.setenv(ENABLE_ENV, "1")
+    workspace = _workspace(tmp_path, {"FIND": [tool_use(SEARCH, {"query": "q"}), text("done")]}, server)
+    try:
+        agent = AgentConfig(
+            name="A", system_prompt="FIND", tools=[SEARCH], tool_policies={SEARCH: ToolBinding(ask="always")}
+        )
+        result, _tracker = workspace.tester.run(AgentTestIn(agent=agent, input="x"))
+        [call] = result.tool_calls
+        assert call.approval is not None
+        assert call.approval.status == "denied" and call.approval.code == "tool.approval_not_in_test"
+        assert call.is_error and "results for q" not in (call.output or "")
+        assert _calls_reaching(server, "search") == 0
     finally:
         workspace.close()
 

@@ -34,6 +34,7 @@ from nodestro_runtime.mcp.netguard import EgressPolicy  # noqa: E402
 from nodestro_runtime.mcp.service import McpService  # noqa: E402
 from nodestro_runtime.mcp.vault import TokenVault  # noqa: E402
 from nodestro_runtime.storage import SQLiteStore  # noqa: E402
+from nodestro_runtime.tool_approvals import CallBinding, bind_call  # noqa: E402
 
 
 class Clock:
@@ -193,4 +194,13 @@ def test_tools_that_change_data_are_usable_while_the_shared_gate_is_on(make: Any
     service.write_gate = True
     # The switch alone is not enough: only a caller that asks before every call (gated) may run it (review H-1).
     assert code(lambda: service.call("mcp__catalog__delete_page", {"page_id": "7"})) == "mcp.write_not_supported"
-    assert service.call("mcp__catalog__delete_page", {"page_id": "7"}, gated=True)[2].text == "deleted 7"
+    # A gated call runs only as the gate let it (re-review R-1): without the gate's binding it is refused.
+    assert code(lambda: service.call("mcp__catalog__delete_page", {"page_id": "7"}, gated=True)) == (
+        "tool.approval_stale"
+    )
+    tool = service.tool(server_id, "delete_page")
+    bind_call(CallBinding(tool=tool.tool_name, capability=tool.capability(), definition_hash=tool.approved_hash))
+    try:
+        assert service.call("mcp__catalog__delete_page", {"page_id": "7"}, gated=True)[2].text == "deleted 7"
+    finally:
+        bind_call(None)

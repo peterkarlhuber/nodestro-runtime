@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Security fixes from the independent MCP re-review (R-1, R-2, two test gaps):
+
+- R-1: a per-call approval now also covers the tool's classification (`access`, `reach`). Reclassifying a tool in
+  either direction while a call waits closes the pending request (`closed_because = tool.reclassified`) and marks an
+  approved, unused M6b request `stale` (`ToolApprovals.invalidate_tool`, called by `McpService.decide`). Approving a
+  request whose tool is classified differently now (`ToolApprovals.decide(current=...)`, `RunManager.decide_tool_call`)
+  is refused with `tool.approval_stale`. The engine compares the stored and the current classification right before
+  the call in the thread path and the M6b resume path and refuses stale approvals with `tool.approval_stale`. Against
+  races between that check and the request, the engine binds what the gate let the call run as
+  (`tool_approvals.CallBinding`, a context variable of the call); `McpService.call` checks it against the stored tool
+  before connecting and again right before sending (`McpHub.call_tool(confirm=...)`, `CallResult.refused`). A gated
+  call of a changing MCP tool without a binding is refused.
+- R-2: the name `memory` is reserved for the agent's system memory tool (`tool_library.RESERVED_NAMES`): saving or
+  generating a tool under it is refused (`tool.name_reserved`), a tool stored under it before is never handed out
+  (`ToolLibrary.tool` raises `tool.name_reserved`; it stays listed so it can be deleted), and `config.memory_name_reserved`
+  is reported whenever an agent lists `memory` as a tool. The per-call gate exempts a call only when it reaches the
+  real memory tool or a run's own tool (`agent_builder.run_own_tool`), in runs and agent tests.
+- Tests: the agent test of a read tool asserts exactly the expected result; the PostgreSQL token search runs a real
+  MCP discovery, approval and execution through an API and a worker process and searches tables, run events, MCP
+  events, the approval audit, logs and the run trace.
+
 Security fixes from the independent MCP review (H-1, M-1, M-2, L-2..L-8):
 
 - H-1: the process-wide per-call approval switch (`NODESTRO_TOOL_APPROVALS=1`, `McpService.write_gate`) no longer opens
