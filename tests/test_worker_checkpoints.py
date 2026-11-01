@@ -149,7 +149,7 @@ async def test_racing_decisions_and_resumes_run_the_call_once(
         if stored.status == "approved":
             assert record.output == "sent hi" and stored.use == "executed"
         else:
-            assert record.output != "sent hi" and stored.use == "open"
+            assert record.output != "sent hi" and stored.use == "closed"
         assert sum(1 for item in done.nodes["a"].tool_calls if item.name == TOOL) == 1
     finally:
         await serving.close()
