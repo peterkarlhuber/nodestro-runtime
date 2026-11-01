@@ -654,6 +654,7 @@ class Workspace:
         # The workflow and its version are stored together: a crash in between never leaves a
         # saved workflow without its version.
         with self.store.transaction():
+            self.store.lock("workflows", saved.id)  # ``previous`` stays the state this save replaces
             previous = self.store.get("workflows", saved.id, Workflow)
             # Legacy exemptions (S-2, D10b) come only from the activation step, never from a save, copy or import.
             saved = keep_only_inherited(saved, previous)
@@ -699,6 +700,7 @@ class Workspace:
                 return None
 
         with self.store.transaction():
+            self.store.lock("tool_approvals_activation", "legacy")  # once, also when two processes start it
             earlier = self.legacy_tool_bindings()
             if earlier is not None:
                 record_audit(

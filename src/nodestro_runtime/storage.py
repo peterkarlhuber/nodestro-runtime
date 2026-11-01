@@ -6,11 +6,11 @@ for existing imports) keeps them in the table ``nodestro_documents`` of the data
 library's ``SQLiteMemory``, ``SQLiteFileStore`` and ``SQLiteIndex`` use their own tables in the same database
 file; the SQL that Nodestro runs on those tables is in :mod:`nodestro_runtime.sqlite_tables`.
 
-Schema versions (SQLite): the database records its version in ``PRAGMA user_version``. Every release so far
-uses version 0 and :data:`SCHEMA_VERSION` is 0, so opening a data directory changes nothing. A later release
-that needs a migration adds it to :data:`MIGRATIONS`; :meth:`SQLiteStore.migrate` then writes a backup first
-(the ``before_migration`` hook), runs every step in one transaction, and refuses a database written by a newer
-release (``storage.schema_too_new``) instead of misreading it.
+Schema versions (SQLite): the database records its version in ``PRAGMA user_version``. Earlier releases used
+version 0; version 1 adds the indexes of the list and find queries (:data:`MIGRATIONS`). :meth:`SQLiteStore.migrate`
+writes a backup first (the ``before_migration`` hook; a new, empty database needs none), runs every step in one
+transaction, and refuses a database written by a newer release (``storage.schema_too_new``) instead of misreading
+it.
 """
 
 from __future__ import annotations
@@ -33,13 +33,31 @@ from .problems import NodestroError
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-#: The schema version this release reads and writes (``PRAGMA user_version``; 0 since Nodestro 0.1).
-SCHEMA_VERSION = 0
+#: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
+SCHEMA_VERSION = 1
 #: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
 #: transaction :meth:`SQLiteStore.migrate` opened (it must not commit).
 Migration = Callable[[sqlite3.Connection], None]
-#: The steps of this release, by the version they lead to. Empty: no release has needed one yet.
-MIGRATIONS: Mapping[int, Migration] = {}
+#: The fields :meth:`SQLiteStore.find` looks up on hot paths (runs by status at start-up, runs of a publication).
+INDEXED_FIELDS = ("status", "trigger_ref")
+
+
+def _list_and_find_indexes(db: sqlite3.Connection) -> None:
+    """Version 1: ``list`` reads the newest documents from an index instead of sorting the whole collection, and
+    ``find`` on :data:`INDEXED_FIELDS` looks values up. Only documents with valid JSON are in the find indexes, so a
+    damaged document never stops a write."""
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS nodestro_documents_updated ON nodestro_documents (collection, updated_at DESC, id)"
+    )
+    for field in INDEXED_FIELDS:
+        db.execute(
+            f"CREATE INDEX IF NOT EXISTS nodestro_documents_{field} ON nodestro_documents"
+            f" (collection, json_extract(data, '$.{field}')) WHERE json_valid(data)"
+        )
+
+
+#: The steps of this release, by the version they lead to.
+MIGRATIONS: Mapping[int, Migration] = {1: _list_and_find_indexes}
 #: Called with (current version, target version) before a migration changes anything; writes a backup.
 BeforeMigration = Callable[[int, int], None]
 
@@ -75,6 +93,9 @@ class DocumentStore(Protocol):
     - ``replace_if`` replaces a document only while its top-level ``field`` still has the value ``expected`` (and,
       with ``live_until``, while the time in that top-level field lies in the future by the store's clock), as one
       atomic step that is safe across threads, processes and database connections. It returns whether it did.
+    - ``lock(collection, key)``, inside ``transaction``, makes every other transaction (of any thread, connection or
+      process) that locks the same pair wait until this one ends: for read-modify-write steps such as numbering
+      versions. Outside a transaction it raises ``RuntimeError``.
     - ``close`` is idempotent; ``closed`` says whether it was called.
     """
 
@@ -84,6 +105,8 @@ class DocumentStore(Protocol):
     def close(self) -> None: ...
 
     def transaction(self) -> AbstractContextManager[None]: ...
+
+    def lock(self, collection: str, key: str) -> None: ...
 
     def put(self, collection: str, key: str, model: BaseModel) -> None: ...
 
@@ -186,6 +209,13 @@ class SQLiteStore:
             self._depth = 0
             self._connection.execute("COMMIT")
 
+    def lock(self, collection: str, key: str) -> None:
+        """Nothing more to do inside :meth:`transaction`: ``BEGIN IMMEDIATE`` already holds the database's write lock
+        for every connection and process, so no other transaction can run until this one ends."""
+        with self._lock:
+            if not self._depth:
+                raise RuntimeError("lock() needs a transaction")
+
     def put(self, collection: str, key: str, model: BaseModel) -> None:
         data = model.model_dump_json()
         with self._transaction() as db:
@@ -261,10 +291,14 @@ class SQLiteStore:
         if not wanted:
             return []
         marks = ", ".join("?" for _ in wanted)
+        # ``json_valid(data)`` lets the partial indexes of :data:`INDEXED_FIELDS` apply (a damaged document has no
+        # field to match anyway); ``+updated_at`` keeps SQLite from preferring the list index for the order and
+        # scanning the whole collection instead of looking the values up.
+        order = "+updated_at, id" if field in INDEXED_FIELDS else "updated_at, id"
         with self._lock:
             rows = self._connection.execute(
-                f"SELECT data FROM nodestro_documents WHERE collection = ?"
-                f" AND json_extract(data, '$.{field}') IN ({marks}) ORDER BY updated_at, id",
+                f"SELECT data FROM nodestro_documents WHERE collection = ? AND json_valid(data)"
+                f" AND json_extract(data, '$.{field}') IN ({marks}) ORDER BY {order}",
                 (collection, *wanted),
             ).fetchall()
         return [model.model_validate_json(row[0]) for row in rows]
@@ -333,9 +367,9 @@ class SQLiteStore:
         """Bring the database to schema version ``target`` (default :data:`SCHEMA_VERSION`, with :data:`MIGRATIONS`);
         returns the version it had.
 
-        Nothing is written when the database already has ``target`` (every database so far). A database of a
-        newer release is refused (``storage.schema_too_new``) before anything is written. Otherwise
-        ``before_migration(current, target)`` writes a backup first (a migration without one is refused with
+        Nothing is written when the database already has ``target``. A database of a newer release is refused
+        (``storage.schema_too_new``) before anything is written. Otherwise ``before_migration(current, target)``
+        writes a backup first (not for a new, empty database; a migration without one is refused with
         ``storage.backup_required``; a failing backup stops it with ``storage.backup_failed``), and every step
         runs in one transaction together with the new version number: a failing step
         (``storage.migration_failed``) leaves the database exactly as it was.
@@ -364,7 +398,8 @@ class SQLiteStore:
                     found=current,
                     supported=target,
                 )
-            if before_migration is None:
+            fresh = self._is_empty()
+            if before_migration is None and not fresh:
                 raise NodestroError(
                     "storage.backup_required",
                     "A schema migration needs a backup first; none was configured",
@@ -372,7 +407,8 @@ class SQLiteStore:
                     supported=target,
                 )
             try:
-                before_migration(current, target)
+                if not fresh and before_migration is not None:
+                    before_migration(current, target)
             except Exception as exc:
                 raise NodestroError(
                     "storage.backup_failed",
@@ -395,6 +431,16 @@ class SQLiteStore:
                     step=step,
                 ) from exc
             return current
+
+    def _is_empty(self) -> bool:
+        """Whether the database holds nothing yet (only this store's empty table): migrating it needs no backup."""
+        tables = self._connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name <> 'nodestro_documents'"
+            " AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        if tables:
+            return False
+        return self._connection.execute("SELECT 1 FROM nodestro_documents LIMIT 1").fetchone() is None
 
     def snapshot(self, target: str | Path) -> None:
         """Copy the whole database, consistently, to the SQLite file ``target`` (an online backup).
@@ -423,6 +469,7 @@ class SQLiteStore:
 Store = SQLiteStore
 
 __all__ = [
+    "INDEXED_FIELDS",
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "BeforeMigration",

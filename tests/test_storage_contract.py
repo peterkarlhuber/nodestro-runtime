@@ -241,7 +241,7 @@ def test_the_database_format_is_unchanged(tmp_path: Path) -> None:
     try:
         assert connection.execute("PRAGMA table_info(nodestro_documents)").fetchall() == DOCUMENT_COLUMNS
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0  # versions are set by migrate()
         assert connection.execute("SELECT data FROM nodestro_documents").fetchone()[0] == Doc(id="a").model_dump_json()
     finally:
         connection.close()
@@ -343,9 +343,11 @@ def _unchanged(store: SQLiteStore) -> None:
 def test_the_current_version_needs_no_migration_and_no_backup(database: SQLiteStore) -> None:
     calls: list[tuple[int, int]] = []
     assert database.migrate(before_migration=lambda *versions: calls.append(versions)) == 0
-    assert database.migrate(before_migration=None) == 0  # nothing to do, so no backup needed
-    assert calls == []
-    assert storage.MIGRATIONS == {}  # this release has no migration
+    assert calls == [(0, SCHEMA_VERSION)]  # this release's migration (the list and find indexes), after a backup
+    assert database.migrate(before_migration=lambda *versions: calls.append(versions)) == SCHEMA_VERSION
+    assert database.migrate(before_migration=None) == SCHEMA_VERSION  # nothing to do, so no backup needed
+    assert calls == [(0, SCHEMA_VERSION)]
+    assert sorted(storage.MIGRATIONS) == [1] == [SCHEMA_VERSION]
 
 
 def test_a_migration_backs_up_first_and_runs_every_step(database: SQLiteStore) -> None:
@@ -410,7 +412,7 @@ def test_a_database_of_a_newer_release_is_refused(database: SQLiteStore) -> None
     with pytest.raises(NodestroError) as error:
         database.migrate(before_migration=lambda *v: calls.append(v))
     assert error.value.code == "storage.schema_too_new"
-    assert error.value.params == {"found": 5, "supported": 0}
+    assert error.value.params == {"found": 5, "supported": SCHEMA_VERSION}
     assert calls == []
     assert database.get("docs", "keep", Doc) == Doc(id="keep", n=7)
 
@@ -476,14 +478,17 @@ def test_an_existing_data_directory_opens_unchanged(tmp_path: Path) -> None:
     assert [row for row in after["nodestro_documents"] if row[0] == "settings"] == before["nodestro_documents"]
     assert after["index_chunks"] == before["index_chunks"]
     assert after["memory_files"] == before["memory_files"]
-    assert _version(directory / DATABASE) == 0
-    assert not (directory / "backups").exists()  # no migration, so no backup
+    # Schema version 1 only added indexes, after a backup of the database as it was.
+    assert _version(directory / DATABASE) == SCHEMA_VERSION == 1
+    backups = list((directory / "backups").glob("pre-migration-0-to-1-*.db"))
+    assert len(backups) == 1 and _version(backups[0]) == 0
+    assert _rows(backups[0]) == before
 
 
 def test_a_workspace_refuses_a_newer_database_and_releases_the_directory(tmp_path: Path) -> None:
     directory = _old_data_directory(tmp_path / "newer")
     connection = sqlite3.connect(directory / DATABASE)
-    connection.execute("PRAGMA user_version = 1")
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     connection.close()
     with pytest.raises(NodestroError) as error:
         Workspace(directory, integrations=[])

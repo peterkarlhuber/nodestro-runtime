@@ -509,15 +509,16 @@ class LeaderLock:
         self.held = False
 
     def acquire(self) -> bool:
-        if self.held:
+        # The lock lives on the database's own session connection: when the server dropped it, the lock is gone
+        # (another process may hold it now), so it is checked and taken again instead of trusted.
+        if self.held and self.database.holds_session_lock(self.key):
             return True
-        rows = self.database._query("SELECT pg_try_advisory_lock(%s)", (self.key,))
-        self.held = bool(rows[0][0])
+        self.held = self.database.try_session_lock(self.key)
         return self.held
 
     def release(self) -> None:
         if self.held and not self.database.closed:
-            self.database._query("SELECT pg_advisory_unlock(%s)", (self.key,))
+            self.database.release_session_lock(self.key)
         self.held = False
 
 
