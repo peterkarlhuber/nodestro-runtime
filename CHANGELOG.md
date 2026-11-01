@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+Runs paused at a tool call that waits for a person (M6b, behind a second switch, default off):
+
+- New switch `NODESTRO_TOOL_APPROVAL_CHECKPOINTS=1`, effective only together with `NODESTRO_TOOL_APPROVALS=1`. While it
+  is off nothing changes: a call that asks waits in the agent's thread as before. Activating it is a separate decision.
+- With it on, a call the rules ask about stores the same approval request (now `checkpointed`) and stops the agent's
+  turn with an orkexa turn checkpoint; the node waits (`awaiting_approval`), the run is `paused` and frees its worker
+  (no waiting slot). The checkpoint (conversation of the turn, results of calls that ran, the waiting calls, run
+  memory; no tool definitions or keys) is stored per tenant in `agent_checkpoints` (module `tool_checkpoints`), never
+  in the run document or its exports, carries a format version and expires with its requests.
+- `RunManager.decide_tool_call` decides through the unchanged `ToolApprovals.decide` and continues the run once none
+  of its calls waits; the turn resumes without asking the model again. On resume only the stored request of exactly
+  that call (run, node, iteration, call id, arguments hash with tool version or MCP definition hash) answers it; the
+  rules are applied again and a new deny wins. An approved call runs only within 15 minutes after its decision
+  (`tool.approval_stale` otherwise) and at most once: `use` is set to `executed` by compare-and-set right before it
+  runs, so a crash after the mark gives `tool.result_lost` instead of a second call. A changed agent definition ends
+  the turn (`tool.checkpoint_stale`).
+- `RunManager.sweep_tool_waits` (at start before anything continues, then periodically by the app): overdue questions
+  expire, checkpoints of runs that are gone are dropped with their questions, decided runs continue (also after a
+  restart between decision and resume). With the switch off at restart, open questions of paused runs are closed
+  (`closed_because="switch_off"`) and the node ends with `tool.checkpoint_expired`; the call never runs.
+- Cancelling or deleting a paused run closes its questions and deletes its checkpoints (`discard_tool_waits`).
+- At most `NODESTRO_TOOL_APPROVAL_MAX_PAUSED` (default 20) runs of a tenant pause at a tool call; above it a call is
+  denied at once (`tool.approval_capacity`).
+- New request fields `checkpointed`, `use`, `executed_at`; new audit kinds `suspended`, `resumed`, `executed`,
+  `stale`, `result_lost` and `switch_off` (never with arguments). Agents with a quality check keep waiting in the
+  thread (a judge's refinement cannot be checkpointed).
+- Fix: the docstring of `OrchestratorSelect`.
+
 Orchestrators: dynamic teams and approvals inside teams (Adaptive Orchestration M6b, orkexa ADR 0011):
 
 - **Behavior change:** a team that waits for an approval step no longer gets cancelled. The orchestrator node waits

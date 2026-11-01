@@ -106,6 +106,8 @@ from .tool_approvals import (
     ToolGate,
     ToolPreGrants,
     approvals_enabled,
+    checkpoints_enabled,
+    max_paused,
     record_audit,
 )
 from .tool_drafts import ToolDrafts
@@ -337,6 +339,9 @@ class Workspace:
                 ToolApprovals(self.store),
                 pre_grants=ToolPreGrants(self.store).of_scope,
                 mcp_unattended=unattended_mcp_enabled,
+                # M6b: pause runs at a waiting call instead of waiting in a thread (a second switch, default off).
+                checkpoints=checkpoints_enabled(),
+                max_paused=max_paused(),
             )
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True
@@ -389,6 +394,12 @@ class Workspace:
         if storage is None:
             # Runs that were executing when Nodestro stopped can never finish; they become continuable.
             self.runs.recover()
+            # Runs paused at a tool call (M6b): overdue questions expire before anything continues; with the
+            # switch off their questions are closed. Continuing them needs the event loop (the app's sweep).
+            try:
+                self.runs.sweep_tool_waits(resume=False)
+            except Exception:  # housekeeping; the app's periodic sweep tries again
+                logging.getLogger(__name__).exception("Sweeping runs paused at tool calls failed")
             # The same for installations of Python environments (the last working environment is kept).
             try:
                 self.python.recover()
