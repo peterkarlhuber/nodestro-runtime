@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+Orchestrators: dynamic teams and approvals inside teams (Adaptive Orchestration M6b, orkexa ADR 0011):
+
+- **Behavior change:** a team that waits for an approval step no longer gets cancelled. The orchestrator node waits
+  (`awaiting_approval`, the run is `paused`), also when the approval is in a sub-workflow of a team or below a nested
+  orchestrator. After the decision the same team run continues and the orchestrator goes on from its stored record;
+  the model is not asked again for that delegation, and this also works after a restart. Pending approvals of team
+  runs are listed with the run (`approvals_of_tree`). A rejection that stops a team's run (`on_reject="stop"`) is
+  recorded as `rejected` and stops the orchestrated run like a sub-workflow, so no other team can get around it.
+  Cancelling a waiting run cancels its waiting teams and closes the record (`stop_code: run.cancelled`).
+- Teams with approval steps are selected by capability again; the preflight note
+  `check.orchestrator_member_approval` is now an `info`.
+- New `OrchestratorConfig` options, all off by default: `staffing` + `max_team` (the orchestrator assembles its team
+  from the pool while it runs and may change it), `max_parallel` (up to 5 teams per decision at the same time) and
+  `allow_values` (the orchestrator fills a team's start form fields except files; checked like a manual start).
+  The pool stays pinned at the run's start; creating teams or agents is still impossible.
+- The record (`NodeRun.orchestration`) is protocol version 2: an `outcomes` entry per delegated team
+  (`succeeded`, `failed`, `rejected`, `cancelled`, `expired`) and `pending` while a team waits. New events
+  `orchestration_waiting` and `orchestration_resumed`; `orchestration_delegated` carries `step` and `slot`.
+- Requires orkexa with orchestration protocol version 2.
+
 MCP resources (WP-10):
 
 - A server's listed resources become one tool, `resources/read`, approved and classified like any other tool and

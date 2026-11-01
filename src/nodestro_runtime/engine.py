@@ -65,7 +65,15 @@ from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .orchestrator import DECISION_FIELDS, ORCHESTRATOR_PROMPT, decision_of, orchestrator_problems, select_teams
+from .orchestrator import (
+    child_outcome,
+    decision_fields,
+    decision_of,
+    member_parameters,
+    orchestrator_problems,
+    orchestrator_prompt,
+    select_teams,
+)
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
@@ -113,6 +121,32 @@ T = TypeVar("T")
 
 class RunCancelled(Exception):
     """Raised inside agent hooks when the user cancels the run."""
+
+
+class _TeamStopped(Exception):
+    """A team of an orchestrator stopped its run (a rejection with ``on_reject="stop"``)."""
+
+    def __init__(self, stop: Problem) -> None:
+        super().__init__("stopped by a team")
+        self.problem = stop
+
+
+def _cancelled_orchestration(record: dict[str, Any]) -> dict[str, Any]:
+    """An orchestration record whose waiting teams were cancelled with their run (no decision is pending)."""
+    try:
+        current = orchestration.OrchestrationState.model_validate(record)
+    except ValueError:
+        return record
+    if current.pending is None:
+        return record
+    outcomes = tuple(
+        item.model_copy(update={"status": "cancelled", "error": "run.cancelled"}) if item.status == "waiting" else item
+        for item in current.pending.outcomes
+    )
+    ended = orchestration.complete_pending(
+        current, outcomes, limits=orchestration.OrchestrationLimits(max_decisions=50)
+    )
+    return ended.model_copy(update={"outcome": "stopped", "stop_code": "run.cancelled"}).model_dump(mode="json")
 
 
 class WorkflowError(NodestroError):
@@ -727,9 +761,7 @@ def _no_workflow(workflow_id: str, _version: int | None) -> tuple[Workflow, int 
 
 
 def _usable_team(workflow: Workflow) -> bool:
-    """Whether a selected workflow can run as a team: no errors and no approval steps."""
-    if any(node.type == "approval" for node in workflow.nodes):
-        return False
+    """Whether a selected workflow can run as a team: no errors (approval steps pause the orchestrator)."""
     return not any(issue.level == "error" for issue in check_workflow(workflow))
 
 
@@ -1124,10 +1156,12 @@ class RunManager:
                 state.status = "cancelled"
                 state.finished_at = now()
                 _fail(state, problem("run.node_cancelled", "Cancelled"))
-                if state.child_run_id:
-                    child = self.store.get("runs", state.child_run_id, Run)
+                for child_id in [state.child_run_id, *state.child_run_ids]:
+                    child = self.store.get("runs", child_id, Run) if child_id else None
                     if child is not None and child.status == "paused":
                         self._cancel_stored(child)
+                if state.orchestration is not None:
+                    state.orchestration = _cancelled_orchestration(state.orchestration)
         run.status = "cancelled"
         run.finished_at = now()
         _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -2200,6 +2234,7 @@ class RunManager:
                     description=snapshot.description[:2000],
                     capabilities=tuple(snapshot.capabilities),
                     contract=tuple(field.name for field in contracts.contract_of(snapshot)),
+                    parameters=member_parameters(start_fields(snapshot)) if config.allow_values else (),
                 )
             )
         if not members:
@@ -2216,41 +2251,69 @@ class RunManager:
     async def _orchestrate(
         self, context: _RunContext, node: Node, inputs: list[tuple[str, Any]], absent: set[str]
     ) -> None:
-        """Let an AI model delegate the task to teams of its pool (``orkexa.orchestration``, ADR 0010).
+        """Let an AI model delegate the task to teams of its pool (``orkexa.orchestration``, ADR 0010/0011).
 
         The model only selects: it has no tools, creates nothing and has no permissions of its own. Every
-        chosen team runs as a linked child run with its own budget, limits and tool approvals; a team that
-        stops at an approval step is not supported inside an orchestrator and is cancelled (the model sees
-        the failure). Every step is stored in ``NodeRun.orchestration`` as it happens.
+        chosen team runs as a linked child run with its own budget, limits and tool approvals. With
+        ``staffing`` it assembles its team from the pool while it runs, with ``max_parallel`` several teams
+        work at once, with ``allow_values`` it fills the teams' start forms (checked like a manual start).
+
+        A team that waits for a person (an approval step, also deeper in nested teams or orchestrators) pauses
+        this node (``awaiting_approval``): the record keeps the pending decision with the team's run, and
+        after the decision the same team run continues; the model is not asked again. A rejection that stops
+        a team's run (``on_reject="stop"``) is recorded as ``rejected`` and stops this run, like a
+        sub-workflow: no other team can get around it. Every step is stored in ``NodeRun.orchestration``.
         """
         run = context.run
         state = run.nodes[node.id]
         config = node.orchestrator
         assert config is not None
         label = node_label(node)
+        prior = state.usage.model_copy() if state.status == "awaiting_approval" else None
         pool, teams = self._orchestration_pool(context, node)
         limits = orchestration.OrchestrationLimits(
-            max_decisions=config.max_decisions, max_per_member=config.max_per_member
+            max_decisions=config.max_decisions,
+            max_per_member=config.max_per_member,
+            max_parallel=config.max_parallel,
+            staffing=config.staffing,
+            max_team=min(config.max_team, len(pool.members)),
         )
-        task = render_task(
-            config.task_template,
-            run_input=run.input,
-            inputs=inputs,
-            values=self._prompt_values(run),
-            absent=absent,
-            run_names=_start_names(run.workflow),
-        )
-        state.prompt = task
+        recorded: orchestration.OrchestrationState | None = None
+        if state.status == "awaiting_approval" and state.orchestration is not None:
+            recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
+            task = recorded.task
+        else:
+            task = render_task(
+                config.task_template,
+                run_input=run.input,
+                inputs=inputs,
+                values=self._prompt_values(run),
+                absent=absent,
+                run_names=_start_names(run.workflow),
+            )
+            state.prompt = task
         state.status = "running"
-        self._emit(context, "node_started", node.id)
+        state.finished_at = None
+        self._emit(context, "node_started", node.id, resumed=recorded is not None)
         self._save(context)
+        stopped: list[Problem] = []
+
+        def node_usage() -> Usage:
+            current = self._node_usage(context, node.id)
+            return add_usage(prior, current) if prior is not None else current
 
         async def decide(prompt: str) -> Any:
             return await asyncio.to_thread(self._decide_sync, context, node, prompt)
 
-        async def delegate(member: orchestration.Member, team_task: str) -> str:
-            snapshot, version = teams[member.id]
-            prepared = prepare(start_fields(snapshot), {}, team_task, [], file_names=None)
+        def start_child(item: orchestration.Delegation) -> Run:
+            snapshot, version = teams[item.member.id]
+            prepared = prepare(
+                start_fields(snapshot),
+                dict(item.values) if config.allow_values else {},
+                item.task,
+                [],
+                file_names=None,
+            )
             child = Run(
                 workflow_id=snapshot.id,
                 workflow_name=snapshot.name,
@@ -2258,7 +2321,7 @@ class RunManager:
                 input=prepared.input,
                 values=prepared.values,
                 file_ids=prepared.file_ids,
-                nodes={item.id: NodeRun(status="waiting") for item in snapshot.nodes},
+                nodes={entry.id: NodeRun(status="waiting") for entry in snapshot.nodes},
                 trigger="subworkflow",
                 trigger_ref=run.id,
                 parent_run_id=run.id,
@@ -2267,39 +2330,61 @@ class RunManager:
             )
             self.store.put("runs", child.id, child)
             state.child_run_ids.append(child.id)
-            self._emit(context, "orchestration_delegated", node.id, member=member.id, child_run_id=child.id)
+            self._emit(
+                context,
+                "orchestration_delegated",
+                node.id,
+                member=item.member.id,
+                child_run_id=child.id,
+                step=item.step,
+                slot=item.slot,
+            )
             self._save(context)
-            await self._execute_child(context, node, child)
-            state.usage = self._node_usage(context, node.id)
-            if child.status == "succeeded":
-                return as_text(child.output)
-            if context.cancelled.is_set():
-                raise RunCancelled
-            if child.status == "paused":
-                child.status = "cancelled"
-                _fail(child, problem("run.cancelled", "The run was cancelled"))
-                self.store.put("runs", child.id, child)
-                raise RuntimeError(
-                    f"{member.name} stopped at an approval step, which is not possible inside an orchestrator"
-                )
-            raise RuntimeError(f"{member.name} failed: {child.error or child.status}")
+            return child
+
+        async def execute(item: orchestration.Delegation) -> str:
+            if item.ref is None:
+                child = start_child(item)
+            else:
+                # Continue the team run that waited; never start it again.
+                found = self.get(item.ref)
+                if found is None or found.parent_run_id != run.id or item.ref not in state.child_run_ids:
+                    raise orchestration.DelegationEnded("failed", "run.orchestration_team_missing")
+                child = found
+                self._emit(context, "orchestration_resumed", node.id, member=item.member.id, child_run_id=child.id)
+                if child.status != "paused":
+                    return self._team_result(child, item.member, context)
+            child_context = await self._execute_child(context, node, child)
+            state.usage = node_usage()
+            if child.status == "cancelled" and child_context.stop is not None and not context.cancelled.is_set():
+                stopped.append(child_context.stop)
+            return self._team_result(child, item.member, context)
 
         def on_step(current: orchestration.OrchestrationState) -> None:
             state.orchestration = current.model_dump(mode="json")
-            self._emit(context, "orchestration_step", node.id, step=current.steps[-1].model_dump(mode="json"))
+            if current.paused:
+                assert current.pending is not None
+                self._emit(context, "orchestration_waiting", node.id, pending=current.pending.model_dump(mode="json"))
+            else:
+                self._emit(context, "orchestration_step", node.id, step=current.steps[-1].model_dump(mode="json"))
             self._save(context)
+            if stopped:
+                raise _TeamStopped(stopped[0])
 
         try:
             result = await orchestration.arun_orchestration(
                 task,
                 pool,
                 decide=decide,
-                delegate=delegate,
+                execute=execute,
                 limits=limits,
+                state=recorded,
                 on_step=on_step,
                 stop_on=(RunCancelled,),
             )
-            if result.outcome == "finished":
+            if result.paused:
+                state.status = "awaiting_approval"
+            elif result.outcome == "finished":
                 state.status = "succeeded"
                 state.output = result.answer
             else:
@@ -2313,6 +2398,13 @@ class RunManager:
                         max_decisions=config.max_decisions,
                     ),
                 )
+        except _TeamStopped as stop:
+            # A team's rejection ended its run: this run ends too (like a sub-workflow), nobody gets around it.
+            state.status = "cancelled"
+            _fail(state, problem("run.node_cancelled", "Cancelled"))
+            if not context.cancelled.is_set():
+                context.stop = stop.problem
+                context.cancelled.set()
         except RunCancelled:
             state.status = "cancelled"
             _fail(state, problem("run.node_cancelled", "Cancelled"))
@@ -2320,24 +2412,43 @@ class RunManager:
             state.status = "failed"
             _fail(state, node_problem(exc))
         finally:
-            state.usage = self._node_usage(context, node.id)
+            state.usage = node_usage()
             own = [record for record in context.tracker.records if record.agent == node.id]
-            state.decision_usage = usage_of(
-                summarize_usage(own), own, stale_requests=stale_requests(context.tracker, own)
+            decisions = usage_of(summarize_usage(own), own, stale_requests=stale_requests(context.tracker, own))
+            state.decision_usage = (
+                add_usage(state.decision_usage, decisions)
+                if prior is not None and state.decision_usage is not None
+                else decisions
             )
-            state.finished_at = now()
-        self._emit(
-            context,
-            "node_finished",
-            node.id,
-            status=state.status,
-            output=state.output,
-            error=state.error,
-            error_code=state.error_code,
-            error_params=state.error_params,
-            usage=state.usage.model_dump(mode="json"),
-        )
+            state.finished_at = None if state.status == "awaiting_approval" else now()
+        if state.status == "awaiting_approval":
+            self._emit(context, "approval_requested", node.id, status=state.status)
+        else:
+            self._emit(
+                context,
+                "node_finished",
+                node.id,
+                status=state.status,
+                output=state.output,
+                error=state.error,
+                error_code=state.error_code,
+                error_params=state.error_params,
+                usage=state.usage.model_dump(mode="json"),
+            )
         self._save(context)
+
+    def _team_result(self, child: Run, member: orchestration.Member, context: _RunContext) -> str:
+        """A team run's result for the orchestrator, or the exception that says how it ended without one."""
+        status = child_outcome(child.status, child.error_code)
+        if status == "succeeded":
+            return as_text(child.output)
+        if context.cancelled.is_set():
+            raise RunCancelled
+        if status == "waiting":
+            raise orchestration.DelegationSuspended(child.id, f"{member.name} waits for an approval")
+        if status == "failed":
+            raise RuntimeError(f"{member.name} failed: {child.error or child.status}")
+        raise orchestration.DelegationEnded(status, f"{member.name}: {child.error or status}", ref=child.id)
 
     def _decide_sync(self, context: _RunContext, node: Node, prompt: str) -> Any:
         """One decision of an orchestrator, in a worker thread: a tool-less agent with a structured answer."""
@@ -2351,9 +2462,9 @@ class RunManager:
         agent = AgentConfig(
             name=node_label(node),
             model=config.model,
-            system_prompt=ORCHESTRATOR_PROMPT
+            system_prompt=orchestrator_prompt(config)
             + (f"\n\nInstructions:\n{config.instructions}" if config.instructions else ""),
-            output=OutputConfig(mode="structured", name="Decision", fields=DECISION_FIELDS),
+            output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
             effort="medium",
             max_tool_rounds=0,
         )

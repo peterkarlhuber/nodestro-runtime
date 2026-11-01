@@ -316,6 +316,8 @@ class SubworkflowConfig(_Model):
 #: Most teams in the pool of one orchestrator, and most decisions it may make.
 MAX_POOL = 20
 MAX_DECISIONS = 50
+#: Most teams an orchestrator decision may start at the same time.
+MAX_PARALLEL_TEAMS = 5
 
 
 class OrchestratorMember(_Model):
@@ -350,7 +352,8 @@ class OrchestratorSelect(_Model):
     The selection is made when a run (or a published release) pins its workflows, so it is fixed and
     visible in the run's snapshot: every selected member names the tags it matched. Teams are ordered
     by the number of matching tags, then by name; no score is invented. Workflows with errors, with
-    approval steps (not supported inside an orchestrator) and the workflow itself are left out.
+    and the workflow itself are left out. Teams with approval steps are offered: the orchestrator waits while
+    one of them waits for a person (AO M6b).
     """
 
     capabilities: list[str] = Field(default_factory=list, max_length=10)
@@ -385,6 +388,16 @@ class OrchestratorConfig(_Model):
     max_per_member: int | None = Field(default=None, ge=1, le=MAX_DECISIONS)
     #: Add teams by capability when the run starts (AO M5); ``None``: only ``members``.
     select: OrchestratorSelect | None = None
+    #: How many teams one decision may start at the same time (AO M6b); 1: one team at a time.
+    max_parallel: int = Field(default=1, ge=1, le=MAX_PARALLEL_TEAMS)
+    #: The orchestrator assembles its own team from the pool while it runs and may change it (AO M6b);
+    #: ``False``: every pool team can get work at any time.
+    staffing: bool = False
+    #: The largest team at any time (with ``staffing``).
+    max_team: int = Field(default=5, ge=1, le=MAX_POOL)
+    #: The orchestrator may fill a team's start form fields (except files) besides its task (AO-5 level 2);
+    #: the values are checked like a manual start of that team.
+    allow_values: bool = False
 
 
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
