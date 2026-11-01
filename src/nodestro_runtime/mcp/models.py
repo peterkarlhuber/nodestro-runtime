@@ -306,6 +306,62 @@ def definition_hash(definition: ToolDefinition) -> str:
     return "sha256:" + hashlib.sha256(_canonical(payload).encode()).hexdigest()
 
 
+#: The name of the tool that reads a server's resources (WP-10). ``/`` is not allowed in MCP tool names, so no tool a
+#: server lists can take it (one that tries is skipped at discovery).
+RESOURCE_TOOL = "resources/read"
+_RESOURCES_MAX = 100
+_RESOURCE_URI_MAX = 500
+
+
+def resource_definition(resources: list[dict[str, Any]]) -> ToolDefinition | None:
+    """The tool definition that offers a server's listed resources for reading (WP-10), or ``None`` without any.
+
+    Only the resources the server listed are readable (the ``uri`` is an enum, templates are not offered), so an agent
+    cannot make Nodestro fetch an arbitrary address through the server. The definition, and with it its hash, contains
+    the whole list: when the server changes its resources, an approval no longer covers the new list and an
+    administrator reviews it again, exactly like a changed tool. Names and descriptions are foreign text (T3) and are
+    shortened."""
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in resources:
+        uri = str(item.get("uri") or "")
+        if not uri or len(uri) > _RESOURCE_URI_MAX or uri in seen or any(ord(char) < 32 for char in uri):
+            continue
+        name = str(item.get("title") or item.get("name") or "")[:120]
+        about = " ".join(str(item.get("description") or "").split())[:200]
+        mime = str(item.get("mimeType") or item.get("mime_type") or "")[:80]
+        label = " - ".join(part for part in (name, about) if part)
+        if mime:
+            label = f"{label} ({mime})" if label else mime
+        seen.add(uri)
+        entries.append((uri, label))
+        if len(entries) >= _RESOURCES_MAX:
+            break
+    if not entries:
+        return None
+    lines = [f"- {uri}" + (f": {label}" if label else "") for uri, label in entries]
+    description = "Read one of the documents (resources) this MCP service offers. Available:\n" + "\n".join(lines)
+    schema = {
+        "type": "object",
+        "properties": {
+            "uri": {
+                "type": "string",
+                "enum": [uri for uri, _label in entries],
+                "description": "The address of the resource to read.",
+            }
+        },
+        "required": ["uri"],
+        "additionalProperties": False,
+    }
+    return ToolDefinition(
+        name=RESOURCE_TOOL,
+        title="Read resources",
+        description=description[:_DESCRIPTION_MAX],
+        input_schema=schema,
+        annotations={"readOnlyHint": True},
+    )
+
+
 def clean_definition(raw: dict[str, Any]) -> ToolDefinition:
     """A server's tool entry, limited in size (descriptions and schemas are foreign text, threat model T3)."""
     schema = raw.get("inputSchema") or raw.get("input_schema") or {"type": "object", "properties": {}}
@@ -324,6 +380,8 @@ def clean_definition(raw: dict[str, Any]) -> ToolDefinition:
     annotations = {key: value for key, value in annotations.items() if isinstance(value, (bool, str, int, float))}
     description = str(raw.get("description") or "")[:_DESCRIPTION_MAX]
     title = raw.get("title")
+    if str(raw["name"]) == RESOURCE_TOOL:
+        raise ValueError("reserved name")
     return ToolDefinition(
         name=str(raw["name"]),
         title=str(title)[:200] if title else None,

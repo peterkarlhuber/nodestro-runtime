@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+MCP resources (WP-10):
+
+- A server's listed resources become one tool, `resources/read`, approved and classified like any other tool and
+  called through the same policy, per-call approval and audit. Its `uri` is an enum of the listed addresses (no
+  templates), its hash covers the list (a changed list needs a new review), text results are marked as external data
+  and binary content is not passed on. Server tools named `resources/read` are skipped at discovery.
+- Tests prove that Nodestro's client declares no elicitation, sampling or roots capability (threat model T16).
+
 Per-call tool approvals, warning before an unattended start (S-2, risk R1 of the security acceptance):
 
 - New `tool_preflight.unattended_tool_issues(ctx, workflow, trigger=..., trigger_ref=...)`: the tool calls a

@@ -289,6 +289,15 @@ Operational limits (WP-7) come from the environment: `NODESTRO_MCP_MAX_SERVERS` 
 `NODESTRO_MCP_BREAKER_SECONDS` (60): after that many transport failures in a row a server rests
 (`mcp.cooling_down`). `workspace.mcp.hub.stats()` reports active calls, the limits and each server's health.
 
+Resources (WP-10): when a server lists resources, discovery adds one more tool, `resources/read` (agent name
+`mcp__<slug>__resources_read_<hash>`), whose definition holds the listed addresses as an enum. It is approved and
+classified like every other tool and goes through the same per-call policy; its hash covers the whole list, so a
+changed list blocks it (`mcp.tool_changed`) until an administrator reviews it again. Only listed addresses can be read
+(resource templates are not offered), text comes back marked as external data, binary content is not passed on. A
+server tool cannot take the name `resources/read`. Nodestro's client declares no elicitation, sampling or roots
+capability, so servers cannot ask for input, model calls or file roots. Prompts, change subscriptions and the tasks
+extension are not used: each connection is short-lived and every call compares the listed definition anyway.
+
 Published releases (WP-9) freeze the MCP tools their agents use: `McpService.pin(name)` gives a `McpToolRef`
 (server id and slug, approved hash, classification, definition; no address, no token) for `ReleaseBundle.mcp_tools`.
 A release's tool library uses `PinnedMcp(workspace.mcp, bundle.mcp_tools)` instead of the service: only the frozen

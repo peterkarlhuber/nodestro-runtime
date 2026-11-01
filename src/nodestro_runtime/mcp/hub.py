@@ -31,7 +31,7 @@ import time
 from typing import Any, ClassVar, TypeVar
 
 from ..problems import NodestroError
-from .models import McpServer, ToolDefinition, clean_definition
+from .models import RESOURCE_TOOL, McpServer, ToolDefinition, clean_definition, resource_definition
 from .netguard import EgressPolicy, Resolver, guarded_client
 from .oauth import OAuthCredentials
 from .stdio import StdioLaunch, remove_container
@@ -598,7 +598,49 @@ class McpHub:
             cursor = listing.next_cursor
             if not cursor:
                 break
+        resources = await McpHub._resources(client, skipped)
+        if resources is not None:
+            tools.append(resources)
         return tools, skipped
+
+    @staticmethod
+    async def _resources(client: Any, skipped: list[dict[str, str]]) -> ToolDefinition | None:
+        """The resource-reading tool for the server's listed resources (WP-10), if it offers any."""
+        if getattr(client.server_capabilities, "resources", None) is None:
+            return None
+        found: list[dict[str, Any]] = []
+        cursor: str | None = None
+        try:
+            for _page in range(MAX_PAGES):
+                listing = await client.list_resources(cursor=cursor, cache_mode="bypass")
+                found.extend(
+                    entry.model_dump(mode="json", by_alias=True, exclude_none=True) for entry in listing.resources
+                )
+                cursor = listing.next_cursor
+                if not cursor or len(found) >= MAX_TOOLS:
+                    break
+        except Exception as exc:  # a broken resource list must not hide the server's tools
+            skipped.append({"name": RESOURCE_TOOL, "reason": f"resources/list failed: {type(exc).__name__}"})
+            return None
+        return resource_definition(found)
+
+    @staticmethod
+    async def _read_resource(client: Any, server: McpServer, definition: ToolDefinition, uri: Any) -> tuple[str, bool]:
+        """The text of one listed resource; ``(message, True)`` for an address the server did not list."""
+        listed = definition.input_schema.get("properties", {}).get("uri", {}).get("enum", [])
+        if not isinstance(uri, str) or uri not in listed:
+            return "The resource is not in the list this service offers.", True
+        result = await client.read_resource(uri, cache_mode="bypass")
+        parts: list[str] = []
+        for content in result.contents:
+            text = getattr(content, "text", None)
+            address = getattr(content, "uri", uri)
+            if text is not None:
+                parts.append(str(text) if len(result.contents) == 1 else f"[{address}]\n{text}")
+            else:
+                mime = getattr(content, "mime_type", None) or "binary"
+                parts.append(f"[binary content ({mime}) of {address} not shown]")
+        return "\n".join(parts), False
 
     async def adiscover(self, server: McpServer, token: Credential) -> Discovery:
         async def operation(client: Any) -> Discovery:
@@ -645,16 +687,20 @@ class McpHub:
                 return CallResult("", True, client.protocol_version, None, 0, sent=False)
             if expected_hash is not None and definition_hash(definition) != expected_hash:
                 return CallResult("", True, client.protocol_version, definition, 0, sent=False)
-            result = await client.call_tool(name, arguments, read_timeout_seconds=server.timeout_seconds)
-            text = _content_text(list(result.content))
-            if not text and result.structured_content is not None:
-                text = json.dumps(result.structured_content, ensure_ascii=False)
+            if name == RESOURCE_TOOL:
+                text, is_error = await self._read_resource(client, server, definition, arguments.get("uri"))
+            else:
+                result = await client.call_tool(name, arguments, read_timeout_seconds=server.timeout_seconds)
+                text = _content_text(list(result.content))
+                if not text and result.structured_content is not None:
+                    text = json.dumps(result.structured_content, ensure_ascii=False)
+                is_error = bool(result.is_error)
             truncated = len(text) > server.max_output_chars
             if truncated:
                 text = text[: server.max_output_chars]
             return CallResult(
                 text=text,
-                is_error=bool(result.is_error),
+                is_error=is_error,
                 protocol_version=client.protocol_version,
                 definition=definition,
                 duration_ms=int((time.monotonic() - started) * 1000),
