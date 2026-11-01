@@ -2383,7 +2383,6 @@ class RunManager:
             # Still undecided (another call of the same turn was decided): keep waiting, without a new question.
             raise ToolCallSuspended("waits for a person's approval", ref=found.id)
         capability, version, kind, _definition = tool_facts(context.env.builder.tools, call.name)
-        version = _stored_version(context.env.builder.tools, call.name, kind, version)
         shown = capability.model_dump()
         current = _current_hash(context.env.builder.tools, call)
         if found.status != "approved":
@@ -3209,27 +3208,8 @@ class AgentSuspended(Exception):
 
 def _current_hash(tools: Any, call: ToolCall) -> str:
     """The arguments hash of a call against the tool as it is now (version or MCP definition)."""
-    _capability, version, kind, definition = tool_facts(tools, call.name)
-    version = _stored_version(tools, call.name, kind, version)
+    _capability, version, _kind, definition = tool_facts(tools, call.name)
     return arguments_hash(call.name, call.input, version=version, definition_hash=definition)
-
-
-def _stored_version(tools: Any, name: str, kind: str, version: int | None) -> int | None:
-    """The latest approved version of a custom or generated tool as stored now, read from its files (not from a
-    registry a long-running process loaded earlier); the given version for other tools."""
-    registry = getattr(tools, "registry", None)
-    path = getattr(registry, "path", None)
-    if kind not in ("custom", "generated") or path is None:
-        return version
-    latest: int | None = None
-    for file in sorted(path.glob(f"{name}/v*.json")):
-        try:
-            data = json.loads(file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("status") == "approved" and isinstance(data.get("version"), int):
-            latest = max(latest or 0, data["version"])
-    return latest
 
 
 def node_problem(exc: BaseException) -> Problem:

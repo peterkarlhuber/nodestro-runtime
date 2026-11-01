@@ -250,6 +250,35 @@ async def test_a_changed_tool_definition_ends_the_waiting_turn(make: Make) -> No
     assert tool_checkpoints.runs_with_checkpoints(workspace.store) == set()
 
 
+async def test_a_tool_changed_after_the_release_is_not_run_and_not_audited_as_executed(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = make()
+    paused = await paused_run(workspace)
+    gate = workspace.runs.tool_gate
+    assert gate is not None
+    release = gate.approvals.use
+    changed = CUSTOM_TOOL_TEMPLATE.replace("return celsius * 9 / 5 + 32", "return 32 + celsius * 1.8")
+
+    def use_then_change(found: ToolApprovalRequest, use: Any) -> ToolApprovalRequest | None:
+        marked = release(found, use)
+        if use == "executed":  # another process stores a new version right after the release
+            result, _ = workspace.tools.save_custom(
+                changed, CUSTOM_TESTS_TEMPLATE, TOOL, trust=workspace.tools.editor_trust(TOOL, changed)
+            )
+            assert result.ok, result
+        return marked
+
+    monkeypatch.setattr(gate.approvals, "use", use_then_change)
+    done = await decide(workspace, paused)
+    record = call(done)
+    assert record.is_error and "changed or deleted" in (record.output or "")  # the pinned tool refused it
+    (request,) = requests(workspace, done.id)
+    assert request.use == "executed"  # never released again
+    assert kinds(workspace)[-1] == "stale" and "executed" not in kinds(workspace)
+    assert audit_events(workspace.store)[0].outcome == "tool.changed"
+
+
 async def test_a_call_marked_executed_is_never_made_again(make: Make) -> None:
     workspace = make()
     paused = await paused_run(workspace)
