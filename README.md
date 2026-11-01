@@ -151,7 +151,10 @@ carried out on that loop.
 **Continuing.** `await workspace.resume(run_id)` continues a failed or cancelled run as a new linked run. A
 step's earlier result is reused only when its fingerprint (configuration, connections, tool code, inputs and
 files, sub-workflow version) is unchanged; reused steps cost nothing again. Steps that run again after they
-had called own tools need `confirm=True`.
+had called tools need `confirm=True`: this includes the tools called in the child runs of sub-workflow and
+orchestrator steps and calls that had started when the process stopped (each call is noted in the store before it
+runs, `nodestro_runtime.tool_journal`). Only Nodestro's read-only built-in tools and calls that ended with an error
+are not counted.
 
 **Errors.** Expected failures raise `nodestro_runtime.problems.NodestroError` (a `ValueError`) with a stable
 `code`, `params` and an English message, for example `api_key_missing`, `workflow.blocked` or

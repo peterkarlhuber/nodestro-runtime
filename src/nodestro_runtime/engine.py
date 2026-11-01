@@ -62,7 +62,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, tool_checkpoints, tool_policy
+from . import contracts, flow_driver, graph, tool_checkpoints, tool_journal, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -1347,6 +1347,10 @@ class RunManager:
         deleted, so nothing it waited for can run later."""
         ToolApprovals(self.store).close_checkpointed(run_id, because=because)
         tool_checkpoints.delete_run(self.store, run_id)
+        if self.store.get_raw("runs", run_id) is None:
+            # Only for a deleted run: the notes of started calls are what lets continuing a failed or cancelled
+            # run ask before it calls tools again (:mod:`nodestro_runtime.tool_journal`).
+            tool_journal.delete_run(self.store, run_id)
 
     def decide_tool_call(
         self,
@@ -2259,6 +2263,9 @@ class RunManager:
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
         self._save(context)
+        if state.tool_calls:
+            # The call records are stored with the node now; the notes written before each call are not needed.
+            tool_journal.clear_node(self.store, run.id, node.id)
 
     def _prompt_values(self, run: Run, *, mark_empty: bool = True) -> dict[str, Any]:
         """The run's form values as task placeholders show them (file names, empty fields marked)."""
@@ -3195,13 +3202,18 @@ class RunManager:
             calls[call.id] = record
             denial = None
             bind_call(None)  # every call gets its own binding (or none) from the gate below
-            if gate is not None and not run_own_tool(config, call.name, extra_tools):
+            own = run_own_tool(config, call.name, extra_tools)
+            if gate is not None and not own:
                 if checkpointing and call.resumed:
                     denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
                 else:
                     denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
             elif call.resumed:
                 pass  # an own tool never waits, so it is never resumed
+            if denial is None and not own:
+                # Stored before the call runs: if the process dies now, the run still shows that this node may
+                # have had effects outside Nodestro, and continuing it asks first (audit B-02).
+                tool_journal.record(self.store, context.run.id, node_id, iteration, call.id, call.name, call.input)
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
             return denial
 
