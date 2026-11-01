@@ -30,7 +30,9 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Any
+import weakref
 
 from pydantic import BaseModel
 
@@ -58,6 +60,10 @@ DOCUMENT_LOCK_CLASS = 0x6E6F6400
 DEFAULT_POOL_SIZE = 8
 DEFAULT_STATEMENT_TIMEOUT = 30.0
 DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT = 300.0
+#: A pooled connection idle for longer than this (seconds) is checked before it is handed out again; a connection
+#: in steady use is not, which saves a round trip on every query. A read that still meets a lost connection is
+#: retried on another one (reads are safe to repeat; writes are not, and fail).
+CHECK_AFTER_IDLE = 2.0
 #: A migration step: SQL text (several statements allowed) or a function that runs on the connection.
 PostgresStep = str | Callable[[Any], None]
 
@@ -137,12 +143,14 @@ class PostgresDatabase:
     from the usual ``PG*`` variables and ``~/.pgpass``, never from Nodestro's settings. ``schema`` puts every table
     into that schema (created by :meth:`migrate` when missing); without it the server's ``search_path`` applies.
 
-    The pool holds at most ``pool_size`` connections (default ``NODESTRO_DATABASE_POOL_SIZE``, else 8). Every
-    connection is checked before it is handed out, so a connection the server dropped (a restart, a failover, an
-    idle timeout of a proxy) is replaced instead of failing every later call. ``statement_timeout`` (seconds,
-    default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every statement and
-    ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every transaction
-    left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
+    The pool holds at most ``pool_size`` connections (default ``NODESTRO_DATABASE_POOL_SIZE``, else 8). A
+    connection that sat idle in the pool for more than :data:`CHECK_AFTER_IDLE` seconds is checked before it is
+    handed out, so a connection the server dropped (a restart, a failover, an idle timeout of a proxy) is replaced
+    instead of failing the next call. A read outside a transaction that meets a lost connection anyway is retried on
+    another one; a write is not repeated (it may have been applied) and fails. The pool discards lost connections.
+    ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
+    statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
+    transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
     """
 
     def __init__(
@@ -177,6 +185,8 @@ class PostgresDatabase:
         #: The calling thread's transaction: its connection and nesting depth.
         self._local = threading.local()
         self._closed = False
+        #: When each pooled connection went back into the pool (``time.monotonic()``).
+        self._returned: weakref.WeakKeyDictionary[Any, float] = weakref.WeakKeyDictionary()
         # A first connection outside the pool reports a wrong address or password at once (the pool would retry).
         probe = psycopg.connect(conninfo, **self._connect_kwargs)
         try:
@@ -190,7 +200,7 @@ class PostgresDatabase:
             max_size=self.pool_size,
             open=False,
             configure=self._configure,
-            check=ConnectionPool.check_connection,
+            check=self._check_if_idle,
             name="nodestro",
         )
         try:
@@ -215,6 +225,21 @@ class PostgresDatabase:
                 *((f'"{self.schema}"',) if self.schema is not None else ()),
             ),
         )
+
+    @contextmanager
+    def _connection(self, timeout: float | None = None) -> Iterator[Any]:
+        """A pooled connection; notes when it goes back (no ``reset`` callback: that returns through a worker)."""
+        with self._pool.connection(timeout=timeout) as connection:
+            try:
+                yield connection
+            finally:
+                self._returned[connection] = time.monotonic()
+
+    def _check_if_idle(self, connection: Any) -> None:
+        """Check a connection that sat idle (raises when it is broken; the pool then opens another one)."""
+        returned = self._returned.get(connection)
+        if returned is not None and time.monotonic() - returned > CHECK_AFTER_IDLE:
+            ConnectionPool.check_connection(connection)
 
     # ---- connections and transactions ------------------------------------------------------
 
@@ -241,7 +266,7 @@ class PostgresDatabase:
         if self._closed:
             return False
         try:
-            with self._pool.connection(timeout=timeout) as connection:
+            with self._connection(timeout=timeout) as connection:
                 connection.execute("SELECT 1").fetchone()
         except Exception:
             return False
@@ -271,7 +296,7 @@ class PostgresDatabase:
         with self._lock:
             if self._closed:
                 raise RuntimeError("The database is closed")
-            with self._pool.connection() as connection:
+            with self._connection() as connection:
                 connection.execute("BEGIN")
                 state.connection, state.depth = connection, 1
                 try:
@@ -289,15 +314,31 @@ class PostgresDatabase:
         if current is not None:  # inside this thread's transaction: read its own writes
             rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
             return rows
-        if self._closed:
-            raise RuntimeError("The database is closed")
-        with self._pool.connection() as connection:
-            rows = connection.execute(query, params).fetchall()
-        return rows
+        attempts = self.pool_size + 1  # every pooled connection may have been dropped at once
+        for attempt in range(1, attempts + 1):
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            connection: Any = None
+            try:
+                with self._connection() as connection:
+                    rows = connection.execute(query, params).fetchall()
+                return rows
+            except psycopg.OperationalError:
+                # A lost connection (not a statement timeout, which leaves the connection usable): try another one.
+                if connection is None or not connection.broken or attempt == attempts:
+                    raise
+        raise AssertionError("unreachable")
 
     def _write(self, query: str, params: tuple[Any, ...]) -> int:
-        with self._transaction() as db:
-            return int(db.execute(query, params).rowcount)
+        if getattr(self._local, "depth", 0):
+            return int(self._local.connection.execute(query, params).rowcount)
+        # One statement is atomic on its own: run it in autocommit (no BEGIN/COMMIT round trips), still serialized
+        # with the transactions of this process.
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            with self._connection() as connection:
+                return int(connection.execute(query, params).rowcount)
 
     # ---- session-level advisory locks ------------------------------------------------------------
 
@@ -462,6 +503,10 @@ class PostgresDatabase:
                             db.execute(
                                 "INSERT INTO nodestro_schema_migrations (version, name) VALUES (%s, %s)", (step, name)
                             )
+                        if current > 0:
+                            # Fresh statistics for the changed indexes: without them the planner may pick a wrong
+                            # index until autovacuum gets to the table.
+                            db.execute("ANALYZE nodestro_documents")
                 except Exception as exc:
                     raise NodestroError(
                         "storage.migration_failed",
@@ -608,7 +653,7 @@ class PostgresStore:
         wanted = builtins.list(dict.fromkeys(values))
         if not wanted:
             return []
-        # The field is a literal (checked above), so the expression indexes of migrations 0001 and 0005 apply.
+        # The field is a literal (checked above), so the expression indexes of migrations 0001 and 0006 apply.
         rows = self.database._query(
             "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             f" AND jsonb_typeof(data -> '{field}') = 'string' AND data ->> '{field}' = ANY(%s) ORDER BY updated_at, id",

@@ -4,6 +4,14 @@
 
 Backend audit (2026-11-01):
 
+- C-14 follow-up (re-verification found PostgreSQL reads slower than before the pool): a pooled connection is
+  checked only after it sat idle for more than 2 s (`CHECK_AFTER_IDLE`), not on every checkout; a read that meets
+  a lost connection anyway is retried on another one (writes are not repeated). A single write outside a
+  transaction runs in autocommit, without `BEGIN`/`COMMIT` round trips. Migration 0006 makes the `status` and
+  `trigger_ref` expression indexes partial (`IS NOT NULL`), so a lookup by id on a table without fresh statistics
+  can no longer tie with them and scan the collection, and `migrate()` runs `ANALYZE` after migrating a database
+  with data. Same-machine benchmark (5,000 runs, get + list): 1 thread ~690 ops/s (before the audit ~600, at
+  `6eacec1` ~350); with fresh statistics ~1,300 vs ~1,480 before the audit (the pool's checkout costs ~0.1 ms).
 - B-01: the built-in Linux sandbox and the container sandboxes (`StreamedSandbox`, `RuntimeImageSandbox`) read a
   tool call's output with Orkexa's `communicate_bounded()` / `run_bounded()`: at most `response_limit()` bytes of
   stdout and the end of stderr stay in the API or worker process. Code that wrote straight to the inherited stdout

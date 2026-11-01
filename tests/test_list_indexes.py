@@ -2,7 +2,7 @@
 
 SQLite: schema version 1 adds an index for ``list`` (newest first) and partial expression indexes for the ``find``
 fields on hot paths, through the migration framework (backup first, forward only). PostgreSQL: ``find`` names the
-field as a literal so that the expression indexes (``status`` from 0001, ``trigger_ref`` from 0005) apply.
+field as a literal so that the expression indexes (``status`` and ``trigger_ref``, partial since 0006) apply.
 """
 
 from __future__ import annotations
