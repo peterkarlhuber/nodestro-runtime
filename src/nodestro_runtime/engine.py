@@ -817,6 +817,9 @@ class _RunContext:
         self.flow_stop: flow.Stop | None = None
         #: Set when the run's time limit was reached and its running nodes were cancelled.
         self.timed_out = False
+        #: Set (root context) when the process stops gracefully (SIGTERM, quitting the app): the run ends as
+        #: interrupted, not as cancelled by a person (AD-10).
+        self.shutting_down = False
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
@@ -1574,6 +1577,7 @@ class RunManager:
         Paused runs are not affected: they wait in the database for their approval.
         """
         for context in list(self._contexts.values()):
+            context.root.shutting_down = context.shutting_down = True
             context.cancelled.set()
         tasks = [task for task in self._tasks.values() if not task.done()]
         if tasks:
@@ -1704,7 +1708,10 @@ class RunManager:
         except asyncio.CancelledError:
             # The task itself was cancelled (shutdown): the run must not stay "running" in the database.
             context.cancelled.set()
-            _abandon(run)
+            if context.root.shutting_down:
+                _interrupt(run, shutdown=True)
+            else:
+                _abandon(run)
             raise
         except Exception as exc:
             logger.exception("Run %s failed", run.id)
@@ -1817,6 +1824,8 @@ class RunManager:
             run.status = "failed"
             steps = run.workflow.limits.max_steps
             _fail(run, problem("run.step_limit", f"The run reached its limit of {steps} steps", max_steps=steps))
+        elif context.cancelled.is_set() and context.root.shutting_down:
+            _interrupt(run, shutdown=True)
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -2260,6 +2269,9 @@ class RunManager:
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
+        # Stored as running before the agent works (AD-10): after a crash the recovery finds the step that was
+        # running, instead of a step that looks as if it was never reached.
+        self._save(context)
         await self._in_run_thread(
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
@@ -3574,16 +3586,29 @@ def _child_ids(run: Run) -> list[str]:
     return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
 
 
-def _interrupt(run: Run) -> None:
-    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable."""
+def _interrupt(run: Run, *, shutdown: bool = False) -> None:
+    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable (AD-10).
+
+    - A step that was running fails with ``run.interrupted`` (continuing the run runs it again).
+    - ``shutdown``: the process stopped gracefully and the steps were stopped as cancelled first; a started step
+      that was cancelled that way is interrupted too, one that never started is "not reached" (``waiting``) again,
+      as after a crash. ``params.cause`` is ``shutdown`` (a crash or lost worker has no cause).
+    """
+    params = {"cause": "shutdown"} if shutdown else {}
     for state in run.nodes.values():
-        if state.status == "running":
+        stopped = shutdown and state.status == "cancelled" and state.error_code in (None, "run.node_cancelled")
+        if stopped and state.started_at is None:
+            state.status = "waiting"
+            state.finished_at = None
+            state.error = state.error_code = None
+            state.error_params = {}
+        elif state.status == "running" or stopped:
             state.status = "failed"
-            state.finished_at = now()
-            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran"))
+            state.finished_at = state.finished_at or now()
+            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran", **params))
     run.status = "failed"
     run.finished_at = now()
-    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran"))
+    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran", **params))
 
 
 def _abandon(run: Run) -> None:

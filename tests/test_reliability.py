@@ -23,6 +23,7 @@ from nodestro_runtime.extensions import ExtensionError, Extensions, Integration
 from nodestro_runtime.knowledge import ScopedIndex
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import EnvChange, InstallState, PythonEnvironment, UvError, UvRunner, uv_environment
+from nodestro_runtime.resume import plan as plan_resume
 from nodestro_runtime.schemas import Run, RunIn, Usage, Workflow, WorkflowIn
 from nodestro_runtime.testing import FakeUv, ScriptedClient, message, text
 from nodestro_runtime.tool_library import ToolJob, _Decision
@@ -197,7 +198,9 @@ def test_a_decision_without_an_event_loop_is_refused_before_it_is_recorded(tmp_p
 # ---- lifecycle -----------------------------------------------------------------------
 
 
-async def test_shutdown_stores_a_run_that_does_not_stop_in_time_as_cancelled(make: Make, tmp_path: Path) -> None:
+async def test_shutdown_stores_a_run_that_does_not_stop_in_time_as_interrupted(make: Make, tmp_path: Path) -> None:
+    """AD-10: a graceful stop (SIGTERM, quitting the app) is not a cancellation by a person: the run is interrupted
+    and can be continued, like after a crash."""
     release = threading.Event()
     workspace = make({"SLOW": [blocking(release)]}, data=tmp_path / "data")
     saved = workspace.save_workflow(workflow([agent("slow", "SLOW")], []))
@@ -211,8 +214,34 @@ async def test_shutdown_stores_a_run_that_does_not_stop_in_time_as_cancelled(mak
     workspace.close()
     reopened = make(data=tmp_path / "data")
     stored = reopened.runs.get(started.id)
-    assert stored is not None and stored.status == "cancelled" and stored.error_code == "run.cancelled"
-    assert stored.nodes["slow"].status == "cancelled"
+    assert stored is not None and stored.status == "failed" and stored.error_code == "run.interrupted"
+    assert stored.error_params == {"cause": "shutdown"}
+    assert stored.nodes["slow"].status == "failed" and stored.nodes["slow"].error_code == "run.interrupted"
+
+
+async def test_shutdown_interrupts_a_run_that_stops_in_time(make: Make, tmp_path: Path) -> None:
+    release = threading.Event()
+    workspace = make(
+        {"SLOW": [blocking(release)], "NEXT": [text("next")]},
+        data=tmp_path / "data",
+    )
+    saved = workspace.save_workflow(
+        workflow(
+            [{"id": "start", "type": "start"}, agent("slow", "SLOW"), agent("next", "NEXT")],
+            [edge("start", "slow"), edge("slow", "next")],
+        )
+    )
+    started = await workspace.run(saved, RunIn(input="x"))
+    await until(lambda: started.nodes["slow"].status == "running")
+    stopping = asyncio.create_task(workspace.runs.shutdown(timeout=5))
+    await asyncio.sleep(0.05)
+    release.set()  # the agent stops at its next model response
+    await stopping
+    stored = workspace.runs.get(started.id)
+    assert stored is not None and (stored.status, stored.error_code) == ("failed", "run.interrupted")
+    # A step that never started stays "not reached"; nothing is reported as cancelled by a person.
+    assert stored.nodes["next"].status == "waiting" and stored.nodes["next"].error_code is None
+    assert all(state.error_code != "run.node_cancelled" for state in stored.nodes.values())
 
 
 async def test_the_workspace_closes_cleanly_as_a_context_manager(tmp_path: Path) -> None:
@@ -258,6 +287,10 @@ async def test_an_interrupted_run_is_recovered_and_continued_without_paying_twic
     interrupted = second.runs.get(started.id)
     assert interrupted is not None and interrupted.status == "failed"
     assert interrupted.error_code == "run.interrupted" and interrupted.nodes["one"].status == "succeeded"
+    # AD-10: the step that was running is stored as running, so the recovery marks it interrupted (not "waiting").
+    assert interrupted.nodes["two"].status == "failed" and interrupted.nodes["two"].error_code == "run.interrupted"
+    reasons = {entry.node_id: entry.reason for entry in plan_resume(second, started.id).nodes}
+    assert reasons["two"] == "resume.was_interrupted"
     continued = await second.wait((await second.resume(started.id)).id, timeout=10)
     assert continued.status == "succeeded" and continued.output == "two"
     assert continued.nodes["one"].reused_from == started.id
