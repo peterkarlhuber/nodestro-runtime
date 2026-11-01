@@ -169,6 +169,8 @@ def test_container_sandboxes_pass_nothing_into_the_container(tmp_path: Path) -> 
 
 
 def test_mcp_stdio_servers_get_no_aws_credentials() -> None:
+    # The MCP SDK needs Python 3.11+ (an optional dependency): without it there is no MCP stdio path to check.
+    pytest.importorskip("mcp")
     from mcp.client.stdio import get_default_environment
 
     cli = ContainerImages(docker="docker")._cli_environment()
