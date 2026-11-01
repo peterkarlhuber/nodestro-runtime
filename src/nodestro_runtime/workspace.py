@@ -73,6 +73,7 @@ from .providers import (
     check_capabilities,
     check_endpoint_allowed,
     check_model,
+    endpoint_client,
     env_key,
     provider_of,
     provider_status,
@@ -375,6 +376,8 @@ class Workspace:
             sandbox_kind=self._sandbox_kind,
             workflow_exists=lambda workflow_id: self.store.get_raw("workflows", workflow_id) is not None,
             mcp_exists=lambda server_id: self.store.get_raw(MCP_SERVERS, server_id) is not None,
+            # One Docker daemon serves every tenant of a server: a tenant's action never removes a shared image.
+            remove_images=storage is None,
         )
         # Local MCP servers (WP-8) run in a container of their approved packages' image, never on the host.
         self.mcp.python = self.python
@@ -654,6 +657,7 @@ class Workspace:
         # The workflow and its version are stored together: a crash in between never leaves a
         # saved workflow without its version.
         with self.store.transaction():
+            self.store.lock("workflows", saved.id)  # ``previous`` stays the state this save replaces
             previous = self.store.get("workflows", saved.id, Workflow)
             # Legacy exemptions (S-2, D10b) come only from the activation step, never from a save, copy or import.
             saved = keep_only_inherited(saved, previous)
@@ -699,6 +703,7 @@ class Workspace:
                 return None
 
         with self.store.transaction():
+            self.store.lock("tool_approvals_activation", "legacy")  # once, also when two processes start it
             earlier = self.legacy_tool_bindings()
             if earlier is not None:
                 record_audit(
@@ -824,6 +829,9 @@ class Workspace:
         if base_url and info.base_url:
             check_endpoint_allowed(base_url, self._endpoints)  # also a URL stored before the operator changed the list
         client = self._client_factory(provider) if self._client_factory is not None else None
+        if client is None and base_url and info.base_url and self._endpoints is not None:
+            # A server: the endpoint was checked against the allowlist, and a redirect must not lead elsewhere.
+            client = endpoint_client(base_url, key)
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
             raise MissingApiKeyError(provider)
         return Connection(

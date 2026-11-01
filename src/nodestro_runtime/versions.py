@@ -82,10 +82,12 @@ class WorkflowVersions:
 
         ``previous`` is the state before this save: it becomes ``v1`` when the workflow has no
         versions yet, so a workflow from before the history keeps its old state. Reading the latest
-        version and storing the next one is one transaction: two saves at the same time never get
-        the same number, and a crash never leaves half of it.
+        version and storing the next one is one transaction that holds the lock of the workflow's
+        versions: two saves at the same time never get the same number, also from two processes on
+        PostgreSQL, and a crash never leaves half of it.
         """
         with self.store.transaction():
+            self.store.lock(_COLLECTION, workflow.id)
             return self._record(workflow, description=description, restored_from=restored_from, previous=previous)
 
     def _record(

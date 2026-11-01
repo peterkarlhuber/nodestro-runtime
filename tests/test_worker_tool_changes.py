@@ -3,7 +3,9 @@
 The API process and two workers are separate workspaces on separate PostgreSQL connections that share one data
 directory, as on a server. Before the fix, a worker kept the tools it read when it opened the tenant: after a change
 or deletion in the API it ran the old code, and an advance approval or a decision for the old version still let it
-run. Real PostgreSQL only (``NODESTRO_REQUIRE_POSTGRES=1`` turns a missing database into a failure).
+run. Real PostgreSQL only (``NODESTRO_REQUIRE_POSTGRES=1`` turns a missing database into a failure). A server checks
+and runs tool code only in containers, so the tests need a reachable Docker daemon: without one they are skipped,
+except in CI (``GITHUB_ACTIONS``) or with ``NODESTRO_REQUIRE_DOCKER=1``, where a missing daemon is a failure.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+import os
 from pathlib import Path
 import threading
 import time
@@ -30,6 +33,19 @@ pytest.importorskip("psycopg")
 from nodestro_runtime.jobs import RUN_JOB, JobQueue, QueuedRuns, RunWorker
 from nodestro_runtime.postgres_tables import tenant_storage
 from nodestro_runtime.storage_postgres import PostgresDatabase
+
+
+def _docker_daemon() -> bool:
+    from orkexa.dynamic import DockerSandbox
+
+    return bool(DockerSandbox.available())
+
+
+_DOCKER_REQUIRED = os.environ.get("NODESTRO_REQUIRE_DOCKER") == "1" or os.environ.get("GITHUB_ACTIONS") == "true"
+pytestmark = pytest.mark.skipif(
+    not _DOCKER_REQUIRED and not _docker_daemon(),
+    reason="needs a Docker daemon (a server runs tool code in containers)",
+)
 
 TOOL = "celsius_to_fahrenheit"
 SCHEDULE = "sch_pilot"

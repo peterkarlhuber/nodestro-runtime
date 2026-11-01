@@ -575,9 +575,15 @@ class PythonEnvironments:
         workflow_exists: Callable[[str], bool] = lambda _id: True,
         images: ContainerImages | None = None,
         mcp_exists: Callable[[str], bool] = lambda _id: True,
+        remove_images: bool = True,
     ) -> None:
-        """``images`` builds the container images of the Docker sandbox (tests pass a stand-in)."""
+        """``images`` builds the container images of the Docker sandbox (tests pass a stand-in).
+
+        ``remove_images=False`` (a server): deleting an environment never removes its container image. Images are
+        content-addressed and the Docker daemon is shared by every tenant, so another tenant's environment with the
+        same lock may use the image; unused images are the operator's to remove (``docker image prune``)."""
         self.store = store
+        self.remove_images = remove_images
         self.images = images if images is not None else ContainerImages()
         #: Image tag -> the lock hash it was found with (images are immutable, so a hit stays valid).
         self._images_ready: dict[str, str] = {}
@@ -1286,11 +1292,17 @@ class PythonEnvironments:
         self.store.delete(_COLLECTION, scope)
 
     def _remove_image(self, scope: str) -> None:
-        """Drop the scope's container image (a cache; another scope with the same lock simply rebuilds it)."""
+        """Drop the scope's container image unless another installed (or installing) environment of this store has
+        the same lock (the image is content-addressed, so they share it). Never on a server (``remove_images=False``):
+        there, environments of other tenants may share it too."""
         env = self.get(scope)
-        if env is None or not env.lock or not self.containers():
+        if env is None or not env.lock or not self.remove_images or not self.containers():
             return
         tag = self.images.tag(env.lock, env.python_version)
+        for other in self.all():
+            in_use = other.install.status in ("installed", "installing")
+            if other.scope != scope and in_use and self.images.tag(other.lock, other.python_version) == tag:
+                return
         self._images_ready.pop(tag, None)
         self.images.remove(tag)
 

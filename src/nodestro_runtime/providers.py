@@ -424,6 +424,26 @@ def check_endpoint_allowed(url: str, allowed: Iterable[str] | None) -> None:
         )
 
 
+#: The key an OpenAI-compatible endpoint without a key gets (the SDK would otherwise read ``OPENAI_API_KEY``).
+_NO_KEY = "nodestro-no-api-key"
+
+
+def endpoint_client(base_url: str, api_key: str | None) -> Any:
+    """An OpenAI SDK client for an allow-listed endpoint (``compatible``, ``ollama``, ``vllm``) that never follows
+    redirects.
+
+    :func:`check_endpoint_allowed` checks only the configured base URL; an endpoint that answers with a redirect would
+    otherwise send the request (the prompt) on to any address, also one the operator did not allow. A redirect is
+    reported as the endpoint's error instead."""
+    import openai
+
+    return openai.OpenAI(
+        api_key=api_key or _NO_KEY,
+        base_url=base_url,
+        http_client=openai.DefaultHttpxClient(follow_redirects=False),
+    )
+
+
 def check_capabilities(values: Mapping[str, str]) -> dict[str, str]:
     unknown = sorted(set(values) - set(CAPABILITY_NAMES))
     if unknown:

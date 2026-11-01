@@ -1,16 +1,17 @@
 """The :class:`~nodestro_runtime.storage.DocumentStore` on PostgreSQL, for the server profile (ADR-0002, ADR-0003).
 
-:class:`PostgresDatabase` owns one connection to a PostgreSQL database (optionally a schema in it) and its schema
+:class:`PostgresDatabase` owns a pool of connections to a PostgreSQL database (optionally a schema in it) and its schema
 migrations; :meth:`PostgresDatabase.store` gives the documents of one tenant as a :class:`PostgresStore`. Every row
 carries ``tenant_id`` and every query filters on it, so one tenant's store never reads or changes another tenant's
 documents.
 
 Needs the optional dependency ``nodestro-runtime[postgres]`` (psycopg 3). The desktop never imports this module.
 
-Semantics follow the SQLite store exactly (``tests/test_storage_contract.py`` runs the same cases on both): one
-connection serves every thread of a process, an ``RLock`` serializes its use, every write is atomic, and
-:meth:`PostgresDatabase.transaction` groups writes (reentrant, all-or-nothing, other threads wait). Several
-processes may use the same database; PostgreSQL's row locks keep their writes consistent.
+Semantics follow the SQLite store (``tests/test_storage_contract.py`` runs the same cases on both): every write is
+atomic, and :meth:`PostgresDatabase.transaction` groups writes (reentrant, all-or-nothing; the transactions of one
+process run one after the other, each on the calling thread's own pooled connection). Reads run in parallel on pooled
+connections and see committed data. Several processes may use the same database; PostgreSQL's row locks keep their
+writes consistent, and :meth:`PostgresStore.lock` serializes read-modify-write steps across processes.
 
 Migrations (forward only) are the numbered SQL files in ``nodestro_runtime/migrations/postgres``. They run under a
 PostgreSQL advisory lock, so several processes starting at once apply each step exactly once, and are recorded in
@@ -23,9 +24,10 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from importlib import resources
 import json
+import os
 import re
 import threading
 from typing import Any
@@ -33,14 +35,16 @@ from typing import Any
 from pydantic import BaseModel
 
 from .problems import NodestroError
-from .storage import BeforeMigration, ModelT
+from .storage import BeforeMigration, DamagedDocuments, ModelT
 
 try:  # optional: nodestro-runtime[postgres]
     import psycopg
     from psycopg import sql
+    from psycopg_pool import ConnectionPool
 except ImportError:  # pragma: no cover - exercised only without the extra
     psycopg = None  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
+    ConnectionPool = None  # type: ignore[assignment,misc]
 
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 #: Tenant ids: lower-case letters, digits, ``-`` and ``_``; at most 63 characters. The desktop's tenant is ``local``.
@@ -48,6 +52,12 @@ TENANT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _SCHEMA = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 #: The advisory lock key of the migration runner (any constant; ``nodestro`` in ASCII).
 MIGRATION_LOCK = 0x6E6F646573747230
+#: The advisory lock class of :meth:`PostgresStore.lock` (two-key form, so it never meets the one-key locks above).
+DOCUMENT_LOCK_CLASS = 0x6E6F6400
+#: Defaults of the connection pool and its time limits (seconds); the environment and the constructor override them.
+DEFAULT_POOL_SIZE = 8
+DEFAULT_STATEMENT_TIMEOUT = 30.0
+DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT = 300.0
 #: A migration step: SQL text (several statements allowed) or a function that runs on the connection.
 PostgresStep = str | Callable[[Any], None]
 
@@ -76,6 +86,28 @@ def _encode(text: str) -> tuple[str, str | None]:
 _JSON = "coalesce(raw, data::text)"
 
 
+def _setting(given: float | None, variable: str, default: float, *, minimum: float) -> Any:
+    """``given``, else the environment variable ``variable``, else ``default``; a whole number when ``default`` is."""
+    kind = int if isinstance(default, int) else float
+    if given is None:
+        text = os.environ.get(variable, "").strip()
+        if not text:
+            return default
+        try:
+            given = kind(text)
+        except ValueError:
+            given = None
+        if given is None or given < minimum:
+            raise NodestroError(
+                "storage.settings_invalid",
+                f"{variable} must be a {'whole ' if kind is int else ''}number of at least {minimum:g}, not {text!r}",
+                variable=variable,
+            )
+    if given < minimum:
+        raise ValueError(f"{variable}: at least {minimum:g}")
+    return kind(given)
+
+
 def _require_driver() -> None:
     if psycopg is None:
         raise NodestroError(
@@ -99,37 +131,126 @@ POSTGRES_SCHEMA_VERSION = max(postgres_migrations())
 
 
 class PostgresDatabase:
-    """One PostgreSQL connection shared by the stores of every tenant, with its schema migrations.
+    """A pool of PostgreSQL connections shared by the stores of every tenant, with its schema migrations.
 
     ``conninfo`` is a libpq connection string or URL (``postgresql://user@host/db``); credentials come from it or
     from the usual ``PG*`` variables and ``~/.pgpass``, never from Nodestro's settings. ``schema`` puts every table
     into that schema (created by :meth:`migrate` when missing); without it the server's ``search_path`` applies.
+
+    The pool holds at most ``pool_size`` connections (default ``NODESTRO_DATABASE_POOL_SIZE``, else 8). Every
+    connection is checked before it is handed out, so a connection the server dropped (a restart, a failover, an
+    idle timeout of a proxy) is replaced instead of failing every later call. ``statement_timeout`` (seconds,
+    default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every statement and
+    ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every transaction
+    left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
     """
 
-    def __init__(self, conninfo: str, *, schema: str | None = None, connect_timeout: int = 10) -> None:
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        schema: str | None = None,
+        connect_timeout: int = 10,
+        pool_size: int | None = None,
+        statement_timeout: float | None = None,
+        idle_in_transaction_timeout: float | None = None,
+    ) -> None:
         _require_driver()
         if schema is not None and not _SCHEMA.fullmatch(schema):
             raise ValueError(f"Invalid schema name {schema!r}")
         self.schema = schema
+        self.pool_size = _setting(pool_size, "NODESTRO_DATABASE_POOL_SIZE", DEFAULT_POOL_SIZE, minimum=1)
+        self.statement_timeout = _setting(
+            statement_timeout, "NODESTRO_DATABASE_STATEMENT_TIMEOUT", DEFAULT_STATEMENT_TIMEOUT, minimum=0
+        )
+        self.idle_in_transaction_timeout = _setting(
+            idle_in_transaction_timeout,
+            "NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT",
+            DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT,
+            minimum=0,
+        )
+        self._conninfo = conninfo
+        self._connect_kwargs: dict[str, Any] = {"autocommit": True, "connect_timeout": connect_timeout}
+        #: Serializes the transactions (and so the writes) of this process, as with one connection: a thread that
+        #: writes waits until another thread's transaction ends. Reads do not wait; each takes a pooled connection.
         self._lock = threading.RLock()
-        self._depth = 0
+        #: The calling thread's transaction: its connection and nesting depth.
+        self._local = threading.local()
         self._closed = False
-        self._connection = psycopg.connect(conninfo, autocommit=True, connect_timeout=connect_timeout)
-        if schema is not None:
-            self._connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+        # A first connection outside the pool reports a wrong address or password at once (the pool would retry).
+        probe = psycopg.connect(conninfo, **self._connect_kwargs)
+        try:
+            self._configure(probe)
+        finally:
+            probe.close()
+        self._pool = ConnectionPool(
+            conninfo,
+            kwargs=self._connect_kwargs,
+            min_size=1,
+            max_size=self.pool_size,
+            open=False,
+            configure=self._configure,
+            check=ConnectionPool.check_connection,
+            name="nodestro",
+        )
+        try:
+            self._pool.open(wait=True, timeout=max(float(connect_timeout), 1.0))
+        except BaseException:
+            self._pool.close()
+            raise
+        #: The connection that holds session-level advisory locks (key -> how often this process took it).
+        self._session_guard = threading.Lock()
+        self._session: Any = None
+        self._session_held: dict[int, int] = {}
 
-    # ---- connection and transactions -------------------------------------------------------
+    def _configure(self, connection: Any) -> None:
+        """Settings of every new connection: the schema and the time limits (one round trip)."""
+        connection.execute(
+            "SELECT set_config('statement_timeout', %s, false),"
+            " set_config('idle_in_transaction_session_timeout', %s, false)"
+            + (", set_config('search_path', %s, false)" if self.schema is not None else ""),
+            (
+                f"{int(self.statement_timeout * 1000)}",
+                f"{int(self.idle_in_transaction_timeout * 1000)}",
+                *((f'"{self.schema}"',) if self.schema is not None else ()),
+            ),
+        )
+
+    # ---- connections and transactions ------------------------------------------------------
 
     def close(self) -> None:
-        """Close the connection; closing twice is harmless."""
+        """Close every connection; closing twice is harmless."""
         with self._lock:
-            if not self._closed:
-                self._closed = True
-                self._connection.close()
+            if self._closed:
+                return
+            self._closed = True
+        with self._session_guard:
+            if self._session is not None:
+                with suppress(Exception):
+                    self._session.close()
+                self._session = None
+                self._session_held.clear()
+        self._pool.close()
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def ping(self, *, timeout: float = 5.0) -> bool:
+        """Whether the database answers a trivial query within ``timeout`` seconds (a health check; never raises)."""
+        if self._closed:
+            return False
+        try:
+            with self._pool.connection(timeout=timeout) as connection:
+                connection.execute("SELECT 1").fetchone()
+        except Exception:
+            return False
+        return True
+
+    @property
+    def in_transaction(self) -> bool:
+        """Whether the calling thread is inside :meth:`transaction`."""
+        return bool(getattr(self._local, "depth", 0))
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -139,32 +260,111 @@ class PostgresDatabase:
 
     @contextmanager
     def _transaction(self) -> Iterator[Any]:
-        with self._lock:
-            if self._depth:
-                self._depth += 1
-                try:
-                    yield self._connection
-                finally:
-                    self._depth -= 1
-                return
-            self._connection.execute("BEGIN")
-            self._depth = 1
+        state = self._local
+        if getattr(state, "depth", 0):
+            state.depth += 1
             try:
-                yield self._connection
-            except BaseException:
-                self._depth = 0
-                self._connection.execute("ROLLBACK")
-                raise
-            self._depth = 0
-            self._connection.execute("COMMIT")
+                yield state.connection
+            finally:
+                state.depth -= 1
+            return
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            with self._pool.connection() as connection:
+                connection.execute("BEGIN")
+                state.connection, state.depth = connection, 1
+                try:
+                    yield connection
+                except BaseException:
+                    state.connection, state.depth = None, 0
+                    with suppress(psycopg.Error):  # a lost connection: the pool discards it
+                        connection.execute("ROLLBACK")
+                    raise
+                state.connection, state.depth = None, 0
+                connection.execute("COMMIT")
 
     def _query(self, query: str, params: tuple[Any, ...] = ()) -> builtins.list[tuple[Any, ...]]:
-        with self._lock:
-            return self._connection.execute(query, params).fetchall()
+        current: Any = getattr(self._local, "connection", None)
+        if current is not None:  # inside this thread's transaction: read its own writes
+            rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
+            return rows
+        if self._closed:
+            raise RuntimeError("The database is closed")
+        with self._pool.connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return rows
 
     def _write(self, query: str, params: tuple[Any, ...]) -> int:
         with self._transaction() as db:
             return int(db.execute(query, params).rowcount)
+
+    # ---- session-level advisory locks ------------------------------------------------------------
+
+    def _session_connection(self) -> Any:
+        """The live connection of the session locks (called under ``_session_guard``); a lost one is replaced, and
+        the locks it held are gone with it."""
+        if self._session is not None:
+            try:
+                self._session.execute("SELECT 1")
+            except psycopg.Error:
+                with suppress(Exception):
+                    self._session.close()
+                self._session = None
+                self._session_held.clear()
+        if self._session is None:
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            connection = psycopg.connect(self._conninfo, **self._connect_kwargs)
+            try:
+                self._configure(connection)
+            except BaseException:
+                connection.close()
+                raise
+            self._session = connection
+        return self._session
+
+    def try_session_lock(self, key: int) -> bool:
+        """Take the session-level advisory lock ``key`` unless another process holds it (``False``).
+
+        Held until :meth:`release_session_lock` or until the connection of the locks ends (with the process, or
+        when the server drops it: then :meth:`holds_session_lock` says ``False`` and a later call takes it again,
+        if it is still free). Taking it again in this process counts, as in PostgreSQL."""
+        with self._session_guard:
+            connection = self._session_connection()
+            if self._session_held.get(key):
+                self._session_held[key] += 1
+                return True
+            row = connection.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()
+            if not row or not row[0]:
+                return False
+            self._session_held[key] = 1
+            return True
+
+    def holds_session_lock(self, key: int) -> bool:
+        """Whether this process still holds the session lock ``key`` (checks that its connection is alive)."""
+        with self._session_guard:
+            if not self._session_held.get(key) or self._closed:
+                return False
+            try:
+                self._session_connection()
+            except Exception:
+                return False
+            return bool(self._session_held.get(key))
+
+    def release_session_lock(self, key: int) -> None:
+        """Give up one hold of the session lock ``key`` (the lock is free when the last one is released)."""
+        with self._session_guard:
+            count = self._session_held.get(key, 0)
+            if count > 1:
+                self._session_held[key] = count - 1
+                return
+            if not count:
+                return
+            del self._session_held[key]
+            if self._session is not None:
+                with suppress(psycopg.Error):
+                    self._session.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
     # ---- tenants -----------------------------------------------------------------------------
 
@@ -177,14 +377,11 @@ class PostgresDatabase:
     @property
     def schema_version(self) -> int:
         """The newest applied migration (0: no Nodestro tables yet)."""
-        with self._lock:
-            exists = self._connection.execute("SELECT to_regclass('nodestro_schema_migrations') IS NOT NULL").fetchone()
-            if not exists or not exists[0]:
-                return 0
-            row = self._connection.execute(
-                "SELECT coalesce(max(version), 0) FROM nodestro_schema_migrations"
-            ).fetchone()
-        return int(row[0]) if row else 0
+        exists = self._query("SELECT to_regclass('nodestro_schema_migrations') IS NOT NULL")
+        if not exists or not exists[0][0]:
+            return 0
+        row = self._query("SELECT coalesce(max(version), 0) FROM nodestro_schema_migrations")
+        return int(row[0][0]) if row else 0
 
     def migrate(
         self,
@@ -203,9 +400,11 @@ class PostgresDatabase:
         steps: Mapping[int, tuple[str, PostgresStep]] = postgres_migrations() if migrations is None else migrations
         target = max(steps) if steps else 0
         with self._lock:
-            if self._depth:
+            if self.in_transaction:
                 raise RuntimeError("migrate() cannot run inside a transaction")
             with self._transaction() as db:
+                # Building an index of a large table may take longer than the statement timeout of normal work.
+                db.execute("SET LOCAL statement_timeout = 0")
                 # The lock first: CREATE ... IF NOT EXISTS is not safe against a concurrent creator.
                 db.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK,))
                 if self.schema is not None:
@@ -299,6 +498,8 @@ class PostgresStore:
         self.tenant_id = tenant_id
         self._owns_database = owns_database
         self._closed = False
+        #: Documents listings left out because they do not fit the model (C-10; jsonb always holds valid JSON).
+        self.damaged = DamagedDocuments()
 
     @classmethod
     def connect(cls, conninfo: str, tenant_id: str, *, schema: str | None = None) -> PostgresStore:
@@ -320,6 +521,18 @@ class PostgresStore:
     def _check(self) -> None:
         if self._closed:
             raise RuntimeError("The store is closed")
+
+    def lock(self, collection: str, key: str) -> None:
+        """Inside :meth:`transaction`: wait until no other transaction (of any connection or process) holds the lock
+        of ``(collection, key)``, then hold it until this transaction ends. For read-modify-write steps, such as
+        numbering the next version of a workflow; the document need not exist."""
+        self._check()
+        if not self.database.in_transaction:
+            raise RuntimeError("lock() needs a transaction")
+        self.database._query(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (DOCUMENT_LOCK_CLASS, json.dumps([self.tenant_id, collection, key])),
+        )
 
     def put(self, collection: str, key: str, model: BaseModel) -> None:
         self._check()
@@ -377,14 +590,15 @@ class PostgresStore:
         """Documents of a collection, most recently updated first."""
         self._check()
         query = (
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " ORDER BY updated_at DESC, id"
         )
         params: tuple[Any, ...] = (self.tenant_id, collection)
         if limit is not None:
             query += " LIMIT %s"
             params = (*params, limit)
-        return [model.model_validate_json(row[0]) for row in self.database._query(query, params)]
+        rows = self.database._query(query, params)
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, in update order."""
@@ -394,12 +608,13 @@ class PostgresStore:
         wanted = builtins.list(dict.fromkeys(values))
         if not wanted:
             return []
+        # The field is a literal (checked above), so the expression indexes of migrations 0001 and 0005 apply.
         rows = self.database._query(
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
-            " AND jsonb_typeof(data -> %s) = 'string' AND data ->> %s = ANY(%s) ORDER BY updated_at, id",
-            (self.tenant_id, collection, field, field, wanted),
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            f" AND jsonb_typeof(data -> '{field}') = 'string' AND data ->> '{field}' = ANY(%s) ORDER BY updated_at, id",
+            (self.tenant_id, collection, wanted),
         )
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]:
         """``(id, document)`` pairs of a collection, in id order."""
@@ -408,17 +623,17 @@ class PostgresStore:
             "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s ORDER BY id",
             (self.tenant_id, collection),
         )
-        return [(str(row[0]), model.model_validate_json(row[1])) for row in rows]
+        return self.damaged.parse(collection, rows, model)
 
     def list_prefix(self, collection: str, prefix: str, model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose id starts with ``prefix`` (literally), in id order."""
         self._check()
         rows = self.database._query(
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " AND starts_with(id, %s) ORDER BY id",
             (self.tenant_id, collection, prefix),
         )
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def delete_prefix(self, collection: str, prefix: str) -> int:
         self._check()
@@ -452,6 +667,10 @@ class PostgresStore:
 
 
 __all__ = [
+    "DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT",
+    "DEFAULT_POOL_SIZE",
+    "DEFAULT_STATEMENT_TIMEOUT",
+    "DOCUMENT_LOCK_CLASS",
     "MIGRATION_LOCK",
     "POSTGRES_SCHEMA_VERSION",
     "TENANT_ID",
