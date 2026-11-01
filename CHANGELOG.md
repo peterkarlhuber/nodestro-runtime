@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Per-call tool approvals, warning before an unattended start (S-2, risk R1 of the security acceptance):
+
+- New `tool_preflight.unattended_tool_issues(ctx, workflow, trigger=..., trigger_ref=...)`: the tool calls a
+  schedule, a batch, a test series or a published API would have refused, found before the start or the publication.
+  It asks the existing `tool_policy.decide` with the same call context as the engine, so classification, tool version,
+  legacy exemptions and pre-grants count exactly as at call time. Warnings only (codes `tool.unattended_*`: no
+  pre-grant, outdated pre-grant, batch not started yet, published API, destructive, MCP); it never grants anything
+  and the engine still refuses at every call. Empty while `NODESTRO_TOOL_APPROVALS` is off.
+- `ToolGate.call_context(...)` and `tool_approvals.tool_facts(...)`: the call context and the tool facts of the
+  engine's gate, now shared with the warning (no behavior change in the engine).
+
 Per-call tool approvals, security acceptance fixes (S-2, decision D10b):
 
 - **Fix:** running the activation step again (`Workspace.stamp_legacy_tool_bindings`) used to stamp every binding

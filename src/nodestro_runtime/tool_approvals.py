@@ -25,14 +25,15 @@ import json
 import os
 import threading
 import time
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
+from .mcp_access import UNATTENDED_TRIGGERS
 from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
-from .tool_policy import PreGrantScope, ToolCapability, ToolPreGrant
+from .tool_policy import UNKNOWN, CallContext, PreGrantScope, ToolCapability, ToolPreGrant
 
 COLLECTION = "tool_approvals"
 #: The longest a call waits for a decision on a server (D10d; longer waits need an agent checkpoint).
@@ -406,6 +407,33 @@ class ToolGate:
         #: ADR-0007 D-7 (read-only MCP tools unattended), only after the MCP security acceptance.
         self.mcp_unattended = mcp_unattended
 
+    def call_context(self, *, run_id: str, node_id: str, trigger: str, trigger_ref: str | None) -> CallContext:
+        """The situation of a call in a run started by ``trigger`` (the root run's): the one place that says
+        whether a person can answer and which pre-grants count. The engine's gate and the warning before an
+        unattended start (:mod:`nodestro_runtime.tool_preflight`) both use it, so they cannot disagree."""
+        scope: tuple[PreGrantScope, str] | None = None
+        if trigger in ("schedule", "batch", "benchmark") and trigger_ref:
+            scope = (cast(PreGrantScope, trigger), trigger_ref)
+        return CallContext(
+            run_id=run_id,
+            node_id=node_id,
+            trigger=trigger,
+            attended=trigger not in UNATTENDED_TRIGGERS,
+            scope=scope,
+            pre_grants=tuple(self.pre_grants(*scope)) if scope is not None else (),
+            mcp_unattended=self.mcp_unattended(),
+        )
+
+
+def tool_facts(tools: Any, name: str) -> tuple[ToolCapability, int | None, str, str | None]:
+    """Capability, version, kind and MCP definition hash of the tool ``name`` in a tool registry; a tool that is
+    not there counts as an unknown own tool (:data:`~nodestro_runtime.tool_policy.UNKNOWN`)."""
+    try:
+        info = tools.get(name)
+    except KeyError:
+        return UNKNOWN, None, "custom", None
+    return info.capability, info.version, info.kind, info.definition_hash
+
 
 # ---- pre-grants (D10c) ------------------------------------------------------------------------------------------
 
@@ -525,4 +553,5 @@ __all__ = [
     "audit_events",
     "record_audit",
     "request_key",
+    "tool_facts",
 ]

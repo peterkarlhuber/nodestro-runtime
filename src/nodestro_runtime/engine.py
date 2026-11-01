@@ -92,7 +92,7 @@ from .schemas import (
     now,
 )
 from .storage import DocumentStore
-from .tool_approvals import INTERRUPTED, ToolApprovals, ToolGate
+from .tool_approvals import INTERRUPTED, ToolApprovals, ToolGate, tool_facts
 
 logger = logging.getLogger(__name__)
 
@@ -2048,23 +2048,10 @@ class RunManager:
 
         Asking waits here for a stored decision (at most the deadline); the run stays ``running``. An approval only
         lets the call run as it would have without the question, in its sandbox (ADR-0006)."""
-        try:
-            info = context.env.builder.tools.get(call.name)
-            capability, version, kind, definition = info.capability, info.version, info.kind, info.definition_hash
-        except KeyError:
-            capability, version, kind, definition = tool_policy.UNKNOWN, None, "custom", None
+        capability, version, kind, definition = tool_facts(context.env.builder.tools, call.name)
         root = context.root.run
-        scope: tuple[tool_policy.PreGrantScope, str] | None = None
-        if root.trigger in ("schedule", "batch", "benchmark") and root.trigger_ref:
-            scope = (root.trigger, root.trigger_ref)
-        situation = tool_policy.CallContext(
-            run_id=context.run.id,
-            node_id=node_id,
-            trigger=root.trigger,
-            attended=root.trigger not in UNATTENDED_TRIGGERS,
-            scope=scope,
-            pre_grants=tuple(gate.pre_grants(*scope)) if scope is not None else (),
-            mcp_unattended=gate.mcp_unattended(),
+        situation = gate.call_context(
+            run_id=context.run.id, node_id=node_id, trigger=root.trigger, trigger_ref=root.trigger_ref
         )
         verdict = tool_policy.decide(
             tool=call.name,
