@@ -54,6 +54,15 @@ class PricedTracker(BudgetTracker):
         self._stale: set[int] = set()
         self._stale_lock = threading.Lock()
         self._entry_status: dict[tuple[str, str], tuple[str, str]] = {}
+        #: Request conditions fixed when an agent was built (Bedrock: the region its client was made for), by agent
+        #: name; they win over the workspace's current settings, which may change while the agent runs.
+        self._agent_conditions: dict[str, dict[str, str]] = {}
+
+    def pin_conditions(self, agent: str, options: Any) -> None:
+        """Remember the conditions of an agent's requests from its options (Bedrock: ``region_name``)."""
+        region = getattr(options, "region_name", None) if getattr(options, "provider", None) == "bedrock" else None
+        if isinstance(region, str) and region:
+            self._agent_conditions[agent] = {"aws_region": region}
 
     def _status(self, provider: str, model: str) -> tuple[str, str]:
         """(status, staleness) of a model's price, looked up once per tracker (one operation)."""
@@ -65,12 +74,15 @@ class PricedTracker(BudgetTracker):
             self._entry_status[key] = found
         return found
 
-    def _uncovered(self, provider: str, price: ModelPrice) -> list[str]:
-        """The known request conditions (Bedrock: the connection's region) that ``price`` does not cover."""
+    def _uncovered(self, provider: str, price: ModelPrice, agent: str = "") -> list[str]:
+        """The known request conditions (Bedrock: the region the agent was built for, else the connection's
+        current region) that ``price`` does not cover."""
         dimension = REGIONAL_PROVIDERS.get(provider)
         if dimension is None:
             return []
-        known = self.pricing.request_conditions(provider) if self.pricing is not None else {}
+        known = self._agent_conditions.get(agent) or (
+            self.pricing.request_conditions(provider) if self.pricing is not None else {}
+        )
         value = known.get(dimension)
         if not value:
             return [f"tariff:{dimension}=unknown"]  # the region is not known: the price cannot be shown to fit
@@ -79,7 +91,7 @@ class PricedTracker(BudgetTracker):
     def check_request(self, *, agent: str, provider: str, model: str, lookup: PriceLookup) -> None:
         super().check_request(agent=agent, provider=provider, model=model, lookup=lookup)
         if self.mode == "strict" and lookup.price is not None:
-            uncovered = self._uncovered(provider, lookup.price)
+            uncovered = self._uncovered(provider, lookup.price, agent)
             if uncovered:
                 # Orkexa's pre-check only asks whether a price exists; its cost would still be unknown here.
                 raise UnpricedModelError(

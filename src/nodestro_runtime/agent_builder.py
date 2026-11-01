@@ -312,6 +312,9 @@ class AgentBuilder:
             **connection.agent_kwargs(),
             **(hooks or {}),
         )
+        pin = getattr(usage_tracker, "pin_conditions", None)
+        if pin is not None:
+            pin(agent.name, options)  # strict prices: the region this agent's client is built for
         _check_context(agent, context_blocks)
         names = {*agent.tools, *(str(item.get("name")) for item in server_tools)}
         if memory is not None:

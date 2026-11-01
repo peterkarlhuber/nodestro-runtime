@@ -90,8 +90,8 @@ def test_uv_gets_no_aws_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr(python_envs.subprocess, "run", run)
     UvRunner(tmp_path, binary="/usr/bin/uv")._run(["--version"], log=lambda _line: None)
     _assert_clean(seen["env"])
-    # An AWS SDK in a build script finds neither the user's credential files nor an instance metadata service.
-    assert {key: seen["env"][key] for key in HOST_AWS_ENV} == HOST_AWS_ENV
+    # uv keeps the user's shared AWS files (private indexes through CodeArtifact); it gets no AWS_* variable at all.
+    assert not [key for key in seen["env"] if key.startswith("AWS_")]
 
 
 # ---- the subprocess sandbox (host, tools with and without a Python environment) -----------------------------

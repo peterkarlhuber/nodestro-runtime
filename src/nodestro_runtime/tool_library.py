@@ -47,8 +47,10 @@ from orkexa.dynamic import (
 from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
 from orkexa.memory import MEMORY_TOOL_NAME
+from orkexa.providers.base import redact
 from pydantic import BaseModel, Field, model_validator
 
+from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .mcp_access import is_mcp_tool
@@ -974,7 +976,8 @@ class ToolLibrary:
         except Exception as exc:  # the job reports every failure to the UI
             logger.exception("Tool job %s failed", job.id)
             job.status = "failed"
-            job.error = f"{type(exc).__name__}: {exc}"
+            # Shown to the user (GET /api/jobs): no credentials and, on a server, no AWS identity of the operator.
+            job.error = redact_identity(redact(f"{type(exc).__name__}: {exc}"))
             if isinstance(exc, NodestroError) and exc.code.startswith("sandbox."):
                 # E.g. ``sandbox.isolation_required``: reported with its code; the code was not run.
                 _step(job, exc.problem)

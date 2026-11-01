@@ -224,7 +224,9 @@ class BedrockOperatorConfig:
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> BedrockOperatorConfig:
         """Read ``NODESTRO_BEDROCK_TENANT_ROLES`` (JSON, or ``..._FILE`` with a path to it),
-        ``NODESTRO_BEDROCK_DATA_RESIDENCY`` (``eu_only``) and ``NODESTRO_BEDROCK_ALLOWED_REGIONS`` (comma-separated).
+        ``NODESTRO_BEDROCK_DATA_RESIDENCY`` (``eu_only``) and ``NODESTRO_BEDROCK_ALLOWED_REGIONS`` (comma-separated:
+        the regions where inference may run, i.e. also every destination region of the cross-Region profiles tenants
+        use, not only source regions; a single region excludes every ``eu.`` profile).
 
         ``NODESTRO_BEDROCK_TENANT_ROLES`` maps tenant ids to ``{"role_arn": ..., "external_id": ...}``. Nothing is
         set: no tenant can use Bedrock.
@@ -330,6 +332,29 @@ def desktop_session(settings: BedrockSettings) -> Any:
         ) from None
 
 
+#: Timeouts of a tenant's ``bedrock-runtime`` client (the values Orkexa uses for the clients it builds itself).
+RUNTIME_READ_TIMEOUT = 900.0
+RUNTIME_CONNECT_TIMEOUT = 10.0
+
+
+def tenant_client(session: Any, service: str, region: str, *, max_retries: int) -> Any:
+    """A ``bedrock-runtime`` or ``bedrock`` client of a tenant's session, configured like Orkexa's own clients
+    (long read timeout, standard retries, endpoints from the environment or config ignored)."""
+    from botocore.config import Config
+
+    return session.client(
+        service,
+        region_name=region,
+        config=Config(
+            read_timeout=RUNTIME_READ_TIMEOUT,
+            connect_timeout=RUNTIME_CONNECT_TIMEOUT,
+            retries={"mode": "standard", "total_max_attempts": max_retries + 1},
+            ignore_configured_endpoint_urls=True,
+            user_agent_extra="orkexa nodestro",
+        ),
+    )
+
+
 def operator_sts_client(region: str) -> Any:
     """An STS client with the operator's base credentials (the server's own chain), regional endpoint."""
     boto3 = _boto3()
@@ -390,16 +415,40 @@ class TenantCredentials:
             raise BedrockRoleError(code) from None
 
     def session(self) -> Any:
-        """A fresh boto3 session that holds only these credentials (never the server's own chain)."""
+        """A fresh boto3 session that holds only these credentials (never the server's own chain or config)."""
         boto3 = _boto3()
-        import botocore.session
-
-        core = botocore.session.Session()
+        core = isolated_core_session(self._region)
         # botocore has no public setter for refreshable credentials; this is the documented pattern of
         # boto3/botocore users (the session never falls back to its own credential chain once it is set).
         core._credentials = self.credentials
-        core.set_config_variable("region", self._region)
         return boto3.Session(botocore_session=core, region_name=self._region)
+
+
+def isolated_core_session(region: str) -> Any:
+    """A botocore session that reads nothing of the server operator's AWS configuration.
+
+    A tenant's session must not inherit the operator's profile: no ``AWS_PROFILE``/``AWS_DEFAULT_PROFILE``, no
+    ``AWS_CONFIG_FILE``/``AWS_SHARED_CREDENTIALS_FILE`` (or ``~/.aws``) with their region, ``ca_bundle``,
+    ``credential_process``, retry or endpoint settings, no ``AWS_*`` configuration variables, and no credential
+    chain at all (environment, instance metadata, container credentials): every session variable resolves to its
+    built-in default only, the parsed config is empty, and the caller sets the credentials explicitly.
+
+    One deliberate exception: ``AWS_CA_BUNDLE`` from the server's *environment* is honoured, so a corporate TLS
+    proxy the operator configured for the whole process keeps working for tenant clients (a ``ca_bundle`` in the
+    operator's config file is not). It only decides which certificates are trusted, never where requests go.
+    """
+    from botocore.configprovider import BOTOCORE_DEFAUT_SESSION_VARIABLES
+    import botocore.session
+
+    variables: dict[str, tuple[Any, Any, Any, Any]] = {
+        name: (None, None, default, conversion)
+        for name, (_config, _env, default, conversion) in BOTOCORE_DEFAUT_SESSION_VARIABLES.items()
+    }
+    variables["ca_bundle"] = (None, "AWS_CA_BUNDLE", None, None)
+    core = botocore.session.Session(session_vars=variables)
+    core._config = {"profiles": {}}  # never parse the operator's config or credentials files
+    core.set_config_variable("region", region)
+    return core
 
 
 class RoleCache:
@@ -438,13 +487,22 @@ class BedrockRoleError(NodestroError):
 
 
 _IDENTITY_ARN = re.compile(r"arn:aws[a-z-]*:(?:iam|sts)::\d{12}:[^\s\"',;)]+")
-_ACCOUNT = re.compile(r"(?<!\d)\d{12}(?!\d)")
+#: The account field of any other ARN (``arn:aws:bedrock:eu-central-1:<account>:inference-profile/...``).
+_ARN_ACCOUNT = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:)\d{12}(?=:)")
+_ACCOUNT = re.compile(r"(?<![\d.])\d{12}(?!\d|\.\d)")
+_AWS_TEXT = re.compile(r"(?i)\b(?:aws|bedrock|arn:|sts|iam)\b")
 
 
 def redact_identity(text: str) -> str:
-    """Remove IAM/STS identities (role and user ARNs with their account id) from an AWS error text."""
+    """Remove AWS identities from an error text: IAM/STS ARNs (users, roles, assumed roles) entirely, the account
+    of every other ARN (Bedrock profiles, provisioned models; service, region and resource stay), and, in a text
+    about AWS, any bare 12-digit account id. Meant for error messages only: a model id the user configured keeps
+    its account where it is the user's own setting."""
     text = _IDENTITY_ARN.sub("[AWS-IDENTITY]", text)
-    return re.sub(r"(?i)(account(?: id)?[ :=]+)\d{12}", r"\1[ACCOUNT]", text)
+    text = _ARN_ACCOUNT.sub(r"\1[ACCOUNT]", text)
+    if _AWS_TEXT.search(text):
+        text = _ACCOUNT.sub("[ACCOUNT]", text)
+    return text
 
 
 _CREDENTIALS_MISSING = ("NoCredentialsError", "PartialCredentialsError", "ProfileNotFound", "SSOTokenLoadError")
@@ -526,7 +584,12 @@ def verify(session: Any, settings: BedrockSettings, model: str | None = None) ->
     Every client has short timeouts and at most one retry; no model is invoked. Errors become stable codes
     (:func:`error_code`); nothing about the AWS identity is returned.
     """
-    from orkexa.providers.bedrock_residency import check_destinations, parse_model_id, profile_destinations
+    from orkexa.providers.bedrock_residency import (
+        check_destinations,
+        parse_model_id,
+        profile_destinations,
+        static_destinations,
+    )
 
     region = settings.region or ""
     config = check_config()
@@ -536,10 +599,16 @@ def verify(session: Any, settings: BedrockSettings, model: str | None = None) ->
             raise NodestroError(
                 "provider.data_residency_region", f"The region {region} is outside the allowed regions", region=region
             )
+        ref = parse_model_id(model) if model else None
+        if ref is not None and allowed is not None:
+            # The same static checks a run makes (another region's ARN, a global profile, an unverifiable id):
+            # a configuration a run would refuse is never reported as verified.
+            known = static_destinations(ref, region)
+            if known is not None:
+                check_destinations(known, allowed, ref.model_id)
         sts = session.client("sts", region_name=region, endpoint_url=sts_endpoint(region), config=config)
         sts.get_caller_identity()
         control = session.client("bedrock", region_name=region, config=config)
-        ref = parse_model_id(model) if model else None
         if ref is None:
             control.list_foundation_models(byProvider="anthropic")
         elif ref.kind in ("inference-profile", "application-inference-profile"):

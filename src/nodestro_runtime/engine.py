@@ -3493,6 +3493,9 @@ def execute_agent(
             name=f"{name}:judge",
             **judge_connection.agent_kwargs(),
         )
+        pin = getattr(tracker, "pin_conditions", None)
+        if pin is not None:
+            pin(evaluator.agent.name, evaluator.agent.options)
         if "on_request" in hooks:
             evaluator.agent.on_request = hooks["on_request"]
         if on_evaluation_start is not None:

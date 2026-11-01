@@ -11,7 +11,7 @@ its cost is shown as unknown, never as zero.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa import MODEL_PRICING
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
@@ -49,6 +49,9 @@ class ModelInfo(BaseModel):
     #: tariff); a region outside ``price_regions`` has an unknown cost.
     price_region: str | None = None
     price_regions: list[str] | None = None
+    #: Amazon Bedrock: what the model supports according to Orkexa (``CAPABILITY_NAMES``); ``None`` for the other
+    #: providers. Any typed model id gets the same values from :func:`model_capabilities`.
+    capabilities: dict[str, Literal["supported", "unsupported", "unknown"]] | None = None
 
 
 _MODEL_TEXT: dict[str, tuple[str, str, str]] = {
@@ -179,18 +182,41 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
         result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
     for provider, model_id, label, tier, description in _BEDROCK_MODELS:
         result.append(
-            _priced(
-                provider,
-                model_id,
-                label,
-                tier,
-                description + _BEDROCK_SUGGESTION,
-                model_id.startswith("eu.anthropic.claude-sonnet"),
-                snapshot=snapshot,
-                pricing=pricing,
+            _with_capabilities(
+                _priced(
+                    provider,
+                    model_id,
+                    label,
+                    tier,
+                    description + _BEDROCK_SUGGESTION,
+                    model_id.startswith("eu.anthropic.claude-sonnet"),
+                    snapshot=snapshot,
+                    pricing=pricing,
+                )
             )
         )
     return result
+
+
+def model_capabilities(model: str) -> dict[str, Literal["supported", "unsupported", "unknown"]] | None:
+    """Orkexa's capability values of a Bedrock model (``bedrock:<id>``, catalog or typed); ``None`` for the other
+    providers and for invalid names (their capabilities depend on the connection's declared values)."""
+    from .problems import NodestroError
+    from .providers import CAPABILITY_NAMES, Connection, check_model, provider_of
+
+    try:
+        qualified = check_model(model)
+    except NodestroError:
+        return None
+    if provider_of(qualified) != "bedrock":
+        return None
+    caps = Connection(provider="bedrock").model_capabilities(qualified)
+    return {name: getattr(caps, name) for name in CAPABILITY_NAMES}
+
+
+def _with_capabilities(info: ModelInfo) -> ModelInfo:
+    info.capabilities = model_capabilities(info.id)
+    return info
 
 
 class ServerToolInfo(BaseModel):

@@ -277,6 +277,10 @@ class Connection:
             # No key, no endpoint, no declared capabilities: AWS credentials come from the options' session.
             if self.client is not None:
                 kwargs["client"] = self.client
+            elif self.require_session:
+                # A server tenant (fail closed): the runtime client is built here from the tenant's own session, so
+                # an agent built without ``options=`` still never signs with the server's ambient AWS chain.
+                kwargs["client"] = self._tenant_client("bedrock-runtime")
             return kwargs
         if self.client is not None:
             kwargs["client"] = self.client
@@ -306,16 +310,30 @@ class Connection:
             return self._bedrock_options(extra)
         return None
 
+    def _tenant_client(self, service: str) -> Any:
+        from .bedrock import tenant_client
+
+        settings = self.bedrock or BedrockSettings()
+        if self.session_factory is None or settings.region is None:
+            raise bedrock_not_available()
+        return tenant_client(self.session_factory(), service, settings.region, max_retries=MAX_RETRIES)
+
     def _bedrock_options(self, extra: dict[str, Any]) -> BedrockOptions:
         """Region, credentials and residency from this connection only; request options become model fields."""
         check_bedrock_request_options(extra)
         settings = self.bedrock or BedrockSettings()
         session = None
+        control = None
         if self.client is None:
             if self.session_factory is not None:
                 session = self.session_factory()
             elif self.require_session:
                 raise bedrock_not_available()
+            if self.require_session and settings.region is not None:
+                # The runtime client is injected (see agent_kwargs), so residency checks need this control client.
+                from .bedrock import tenant_client
+
+                control = tenant_client(session, "bedrock", settings.region, max_retries=MAX_RETRIES)
         allowed = settings.allowed_regions
         if allowed is not None and settings.data_residency == "eu_only":
             allowed = tuple(region for region in allowed if region in eu_regions()) or None
@@ -328,6 +346,7 @@ class Connection:
                 region_name=settings.region,
                 profile_name=settings.profile_name if session is None and settings.auth == "profile" else None,
                 session=session,
+                control_client=control,
                 data_residency=settings.data_residency,
                 allowed_regions=allowed,
                 additional_model_request_fields=extra,
@@ -549,7 +568,13 @@ def bedrock_settings(
     stored_auth = str(stored.get("auth") or "")
     auth = stored_auth if stored_auth in methods else methods[0]
     region = str(stored.get("region") or "") or None
+    from .bedrock import PROFILE_PATTERN, REGION_PATTERN
+
+    if region is not None and not REGION_PATTERN.fullmatch(region):
+        region = None  # a stored (e.g. imported) value that is no region name counts as not configured
     profile_name = str(stored.get("profile_name") or "") or None if auth == "profile" else None
+    if profile_name is not None and not PROFILE_PATTERN.fullmatch(profile_name):
+        profile_name = None
     residency = "eu_only" if stored.get("data_residency") == "eu_only" else None
     allowed: tuple[str, ...] | None = None
     if server and policy is not None:
@@ -577,6 +602,25 @@ def bedrock_settings(
     return settings, problem
 
 
+def verification_key(settings: BedrockSettings, policy: BedrockServerPolicy | None) -> str:
+    """What a stored check result was made for: the settings in effect and, on a server, the operator's role (a
+    hash of it). A result counts only while both are unchanged, so an imported or edited result never shows."""
+    import hashlib
+
+    role = policy.role.fingerprint if policy is not None and policy.role is not None else ""
+    text = "\0".join(
+        [
+            settings.region or "",
+            settings.auth,
+            settings.profile_name or "",
+            settings.data_residency or "",
+            ",".join(settings.allowed_regions or ()),
+            role,
+        ]
+    )
+    return hashlib.sha256(text.encode()).hexdigest()[:24]
+
+
 def _bedrock_status(
     info: ProviderInfo,
     stored: Mapping[str, Any],
@@ -590,7 +634,11 @@ def _bedrock_status(
     verification = ProviderVerification(state="not_configured", code=problem)
     if configured:
         found = stored.get("verification")
-        if isinstance(found, Mapping) and found.get("state") in ("verified", "failed"):
+        if (
+            isinstance(found, Mapping)
+            and found.get("state") in ("verified", "failed")
+            and found.get("for") == verification_key(settings, policy if server else None)
+        ):
             verification = ProviderVerification.model_validate(
                 {key: found.get(key) for key in ("state", "checked_at", "code")}
             )

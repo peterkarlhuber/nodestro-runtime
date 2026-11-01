@@ -30,6 +30,19 @@ Amazon Bedrock (2026-11-01):
 - The workspace feeds the strict price mode the Bedrock region in effect (`PricingService.conditions_source`); the
   pre-check reports `check.model_unpriced` when a Bedrock price does not cover that region; catalog entries show
   `price_region`/`price_regions`.
+- Review fixes (PR #66): a tenant's AWS session reads nothing of the operator's AWS configuration (no
+  `AWS_PROFILE`, config or credentials file, `ca_bundle`, `credential_process`, credential chain or `AWS_*` settings;
+  only `AWS_CA_BUNDLE` from the server's environment is honoured, for corporate TLS proxies). On a server the
+  `bedrock-runtime` client is built from the tenant session in `Connection.agent_kwargs()` too, so an agent built
+  without options can never sign with the server's chain. Error texts (runs, agent tests, tool jobs) drop the account
+  of every ARN and bare account ids. Imports into a tenant drop Bedrock `auth`, `profile_name` and `verification`; a
+  stored check result counts only for the settings and role it was made for, and an invalid stored region counts as
+  not configured. Verification under a residency makes the run's static checks first. The strict price check uses
+  the region an agent was built for. `NODESTRO_BEDROCK_ALLOWED_REGIONS` lists the regions where inference may run
+  (destinations of cross-Region profiles included), not only the source regions.
+- Studio data: Bedrock catalog entries carry Orkexa's `capabilities` (`catalog.model_capabilities(model)` gives the
+  same for any typed `bedrock:` id; `None` for the other providers); `PriceEntry.regions` lists a price's
+  `aws_region` tariff values (base-rate region first).
 
 Amazon Bedrock, pricing and credential isolation:
 
@@ -43,10 +56,12 @@ Amazon Bedrock, pricing and credential isolation:
   throughput and ambiguous duplicates are left out (`LiteLLMSource.bedrock_unmapped`).
 - Reconciliation lists providers without a billing adapter under `not_reconciled`
   (`pricing.reconciliation_not_supported` for Bedrock, whose bill also has charges usage does not report).
-- The subprocess sandbox and uv get `HOST_AWS_ENV` (no shared AWS credential/config files, no instance metadata), so
-  an AWS SDK in tool code never picks up the desktop user's AWS credentials; regression tests prove that no `AWS_*`
-  variable reaches uv, the subprocess, built-in and container sandboxes or MCP stdio servers. Trace exports also hide
-  temporary AWS keys, session tokens and Bedrock API keys.
+- The subprocess sandbox gets `HOST_AWS_ENV` (no shared AWS credential/config files, no instance metadata), so an
+  AWS SDK in tool code never picks up the desktop user's AWS credentials; regression tests prove that no `AWS_*`
+  variable reaches uv, the subprocess, built-in and container sandboxes or MCP stdio servers. uv keeps the user's
+  shared AWS files (private package indexes through AWS CodeArtifact keep working); residual risk, unchanged from
+  before: a source build runs third-party code on the host with `HOME` and could read `~/.aws`. Trace exports also
+  hide temporary AWS keys, session tokens and Bedrock API keys.
 
 Backend audit (2026-11-01):
 

@@ -210,6 +210,9 @@ class PriceEntry(BaseModel):
     cache_write_1h_usd_per_mtok: str | None = None
     has_long_context: bool = False
     tariffs: list[str] = Field(default_factory=list)
+    #: Amazon Bedrock: the regions the price covers (values of its ``aws_region`` tariff; the first is the region
+    #: of the base rates). ``None`` for prices without a region tariff.
+    regions: list[str] | None = None
     status: PriceStatus
     staleness: Staleness
     #: Orkexa's quality of the price (``verified``, ``contract``, ``unverified``, ``estimated``).
@@ -222,6 +225,14 @@ class PriceEntry(BaseModel):
     overridden: bool = False
     #: The reference price an override replaces (``None`` when the model has none).
     reference: PriceEntry | None = None
+
+
+def _regions(price: ModelPrice) -> list[str] | None:
+    tariff = price.tariff("aws_region")
+    if tariff is None:
+        return None
+    values = [option.value for option in tariff.options]
+    return [tariff.default, *(value for value in values if value != tariff.default)]
 
 
 class SubmitResult(BaseModel):
@@ -570,6 +581,7 @@ class PricingService:
             cache_write_1h_usd_per_mtok=None if rates.cache_write_1h is None else str(rates.cache_write_1h),
             has_long_context=bool(price.long_context),
             tariffs=[tariff.dimension for tariff in price.tariffs],
+            regions=_regions(price),
             status=status,
             staleness=staleness,
             quality=price.quality,

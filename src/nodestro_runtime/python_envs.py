@@ -410,8 +410,9 @@ class UvRunner:
         """
         environment = uv_environment()
         environment.update({"UV_CACHE_DIR": str(self.cache_dir), "NO_COLOR": "1", "UV_NO_PROGRESS": "1"})
-        # Package builds run on the host with HOME: an AWS SDK in a build script finds no AWS credentials.
-        environment.update(HOST_AWS_ENV)
+        # No AWS_* variable reaches uv (allowlist). Its shared AWS files are deliberately not hidden: private package
+        # indexes that authenticate through AWS (CodeArtifact keyring backends) keep working. Residual risk: a source
+        # build runs third-party code on the host with HOME and can read ~/.aws, as before (approval-gated builds).
         return environment
 
     def _run(self, args: list[str], log: Callable[[str], None], *, timeout: float = 900, cwd: str | None = None) -> str:

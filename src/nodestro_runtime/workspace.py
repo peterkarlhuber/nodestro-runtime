@@ -38,6 +38,7 @@ import hashlib
 import logging
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Literal
 
 from orkexa.dynamic import DockerSandbox, Sandbox
@@ -81,6 +82,7 @@ from .providers import (
     provider_of,
     provider_status,
     qualify,
+    verification_key,
 )
 from .python_envs import PythonEnvironments
 from .python_tools import EnvironmentGate
@@ -317,6 +319,7 @@ class Workspace:
         self._bedrock_policy = storage.bedrock if storage is not None else None
         self._bedrock_roles = bedrock_auth.RoleCache()
         self._bedrock_checked = 0.0
+        self._bedrock_check_lock = threading.Lock()
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
@@ -852,16 +855,23 @@ class Workspace:
                 f"{PROVIDERS[provider].label} has no verification check",
                 provider=provider,
             )
-        elapsed = time.monotonic() - self._bedrock_checked
-        if self._bedrock_checked and elapsed < VERIFY_INTERVAL_SECONDS:
-            raise NodestroError(
-                "provider.verify_rate_limited",
-                "The AWS settings were checked a moment ago; try again shortly",
-                retry_after=int(VERIFY_INTERVAL_SECONDS - elapsed) + 1,
-            )
-        self._bedrock_checked = time.monotonic()
+        with self._bedrock_check_lock:  # two concurrent requests: only one of them checks
+            elapsed = time.monotonic() - self._bedrock_checked
+            if self._bedrock_checked and elapsed < VERIFY_INTERVAL_SECONDS:
+                raise NodestroError(
+                    "provider.verify_rate_limited",
+                    "The AWS settings were checked a moment ago; try again shortly",
+                    retry_after=int(VERIFY_INTERVAL_SECONDS - elapsed) + 1,
+                )
+            self._bedrock_checked = time.monotonic()
         values = self.store.get_raw("settings", "app") or {}
         stored = self._providers(values).get(provider, {})
+        connection_settings, _problem = bedrock_settings(
+            stored,
+            server=self._server_tenant,
+            policy=self._bedrock_policy_for_tenant(),
+            local_container=self._local_container(),
+        )
         try:
             connection = self._bedrock_connection(stored)
             assert connection.bedrock is not None and connection.session_factory is not None
@@ -871,6 +881,7 @@ class Workspace:
         values = self.store.get_raw("settings", "app") or {}
         providers = dict(values.get("providers") or {})
         entry = dict(providers.get(provider) or {})
+        result["for"] = verification_key(connection_settings, self._bedrock_policy_for_tenant())
         entry["verification"] = result
         providers[provider] = entry
         values["providers"] = providers
