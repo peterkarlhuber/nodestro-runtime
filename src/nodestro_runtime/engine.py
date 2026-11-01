@@ -39,6 +39,7 @@ from typing import Any, Literal, TypeVar
 import uuid
 
 from orkexa import (
+    AuthenticationError,
     CheckpointError,
     ContentBlock,
     Criterion,
@@ -46,7 +47,9 @@ from orkexa import (
     Evaluator,
     MemoryBackend,
     OrkexaError,
+    ProviderConnectionError,
     ProviderError,
+    RateLimitError,
     Tool,
     ToolCall,
     ToolCallSuspended,
@@ -3510,11 +3513,47 @@ def node_problem(exc: BaseException) -> Problem:
     if isinstance(exc, BudgetExceededError):
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
-        return problem("run.api_error", text, status=exc.status_code or "", provider=exc.provider or "")
+        return provider_problem(exc, text)
     if isinstance(exc, OrkexaError):
         return problem(f"run.agent.{kind}", text, type=kind)
     found = library_problem(exc, code="run.failed")
     return found.model_copy(update={"message": text})
+
+
+# HTTP statuses that mean "the provider is temporarily out of capacity" (Anthropic 529, 503).
+_OVERLOADED_STATUSES = frozenset({503, 529})
+
+
+def provider_problem(exc: ProviderError, text: str) -> Problem:
+    """A provider failure as a code the UI can act on (AD-01).
+
+    Orkexa already sorts SDK exceptions into subclasses by HTTP status (``provider_error``):
+    ``AuthenticationError`` (401/403), ``ProviderConnectionError`` (connection, DNS, timeout),
+    ``RateLimitError`` (429) and ``ProviderServerError`` (5xx/529). The codes are:
+
+    - ``run.provider_auth``: the key is missing, wrong, expired or lacks permission.
+    - ``run.provider_unreachable``: no answer (offline, DNS, proxy, timeout).
+    - ``run.provider_rate_limited``: too many requests or tokens for the account.
+    - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
+      ``overloaded`` error inside a stream, which arrives without that status).
+    - ``run.api_error``: anything else (other 4xx/5xx), as before.
+
+    ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
+    provider answered (``run.api_error`` keeps ``""`` for an unknown status, as before).
+    """
+    provider = exc.provider or ""
+    status = exc.status_code
+    known: dict[str, Any] = {"provider": provider} if status is None else {"provider": provider, "status": status}
+    if isinstance(exc, AuthenticationError) or status in (401, 403):
+        return problem("run.provider_auth", text, **known)
+    if isinstance(exc, ProviderConnectionError):
+        return problem("run.provider_unreachable", text, **known)
+    if isinstance(exc, RateLimitError) or status == 429:
+        return problem("run.provider_rate_limited", text, **known)
+    client_error = status is not None and 400 <= status < 500
+    if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
+        return problem("run.provider_overloaded", text, **known)
+    return problem("run.api_error", text, status=status or "", provider=provider)
 
 
 def _fail(target: NodeRun | Run, found: Problem) -> None:

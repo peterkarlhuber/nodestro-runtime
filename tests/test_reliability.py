@@ -12,6 +12,7 @@ import threading
 from typing import Any
 import zipfile
 
+import orkexa
 from orkexa import Tool
 import pytest
 
@@ -555,3 +556,63 @@ def test_the_same_requirements_give_the_same_lock_in_every_process(tmp_path: Pat
     assert "# via -r requirements.in (in " in first
     assert first.split(" (in ")[0] == second.split(" (in ")[0]
     assert "nodestro-resolve-" not in first.split(" (in ")[0]
+
+
+# ---- provider failures (AD-01) --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "params"),
+    [
+        (
+            orkexa.AuthenticationError("anthropic: AuthenticationError: no", provider="anthropic", status_code=401),
+            "run.provider_auth",
+            {"provider": "anthropic", "status": 401},
+        ),
+        (
+            orkexa.AuthenticationError("openai: PermissionDeniedError: no", provider="openai", status_code=403),
+            "run.provider_auth",
+            {"provider": "openai", "status": 403},
+        ),
+        (
+            orkexa.ProviderConnectionError("anthropic: APIConnectionError: Connection error.", provider="anthropic"),
+            "run.provider_unreachable",
+            {"provider": "anthropic"},
+        ),
+        (
+            orkexa.RateLimitError("openai: RateLimitError: slow down", provider="openai", status_code=429),
+            "run.provider_rate_limited",
+            {"provider": "openai", "status": 429},
+        ),
+        (
+            orkexa.ProviderServerError("anthropic: OverloadedError: Overloaded", provider="anthropic", status_code=529),
+            "run.provider_overloaded",
+            {"provider": "anthropic", "status": 529},
+        ),
+        (
+            orkexa.ProviderServerError("gemini: ServerError: unavailable", provider="gemini", status_code=503),
+            "run.provider_overloaded",
+            {"provider": "gemini", "status": 503},
+        ),
+        (
+            orkexa.ProviderError(
+                "anthropic: APIStatusError: {'type': 'overloaded_error'}", provider="anthropic", status_code=200
+            ),
+            "run.provider_overloaded",
+            {"provider": "anthropic", "status": 200},
+        ),
+        (
+            orkexa.ProviderServerError("openai: InternalServerError: boom", provider="openai", status_code=500),
+            "run.api_error",
+            {"provider": "openai", "status": 500},
+        ),
+        (
+            orkexa.InvalidRequestError("openai: BadRequestError: bad", provider="openai", status_code=400),
+            "run.api_error",
+            {"provider": "openai", "status": 400},
+        ),
+    ],
+)
+def test_provider_failures_get_distinct_codes(error: Exception, code: str, params: dict[str, object]) -> None:
+    found = node_problem(error)
+    assert (found.code, found.params) == (code, params)
