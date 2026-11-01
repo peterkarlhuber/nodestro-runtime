@@ -28,6 +28,7 @@ be created at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Literal, get_args
 
 from orkexa.dynamic import DockerSandbox, Sandbox
@@ -37,6 +38,18 @@ from .problems import NodestroError
 from .profile import DEFAULT_PROFILE, ProfileKind
 
 TrustClass = Literal["trusted", "user-authored", "untrusted"]
+
+#: Variables for code that runs on the host as the user (the subprocess sandbox, uv and the package builds it runs).
+#: Their environment never contains Nodestro's ``AWS_*`` variables (it is empty or an allowlist), but an AWS SDK
+#: would still find the user's ``~/.aws`` files (it falls back to the account's home directory without ``HOME``) or
+#: an instance metadata service. These settings stop that, so a tool never uses the desktop user's AWS credentials
+#: (Amazon Bedrock's default chain or profile) by accident. Defence in depth only: code that opens ``~/.aws`` itself
+#: can still read it there; only the built-in sandbox (the home directory is not readable) and containers hide it.
+HOST_AWS_ENV: dict[str, str] = {
+    "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+    "AWS_CONFIG_FILE": os.devnull,
+    "AWS_EC2_METADATA_DISABLED": "true",
+}
 TRUST_CLASSES: tuple[TrustClass, ...] = get_args(TrustClass)
 
 Isolation = Literal["none", "container", "kernel"]
@@ -113,4 +126,4 @@ class SandboxPolicy:
             )
 
 
-__all__ = ["TRUST_CLASSES", "Isolation", "SandboxPolicy", "TrustClass", "isolation_of"]
+__all__ = ["HOST_AWS_ENV", "TRUST_CLASSES", "Isolation", "SandboxPolicy", "TrustClass", "isolation_of"]

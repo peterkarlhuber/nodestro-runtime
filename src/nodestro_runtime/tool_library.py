@@ -54,7 +54,7 @@ from .builtin_tools import BUILTIN_TOOLS
 from .mcp_access import is_mcp_tool
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
-from .sandbox_policy import Isolation, SandboxPolicy, TrustClass, isolation_of
+from .sandbox_policy import HOST_AWS_ENV, Isolation, SandboxPolicy, TrustClass, isolation_of
 from .schemas import new_id, now
 from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
@@ -312,7 +312,7 @@ def make_sandbox(
     if kind == "docker":
         return container() if container is not None else DockerSandbox()
     (policy or SandboxPolicy()).check_construction("none")
-    return SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
+    return SubprocessSandbox(timeout=15.0, env=dict(HOST_AWS_ENV), acknowledge_unsafe=True)
 
 
 class _LinkedProvenance:

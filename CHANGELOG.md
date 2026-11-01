@@ -27,6 +27,22 @@ Amazon Bedrock (2026-11-01):
   `check.bedrock_not_available`, `check.bedrock_settings_invalid`. Exports: `environment_connection(..., settings=)`
   and `exported_settings()` (region + data residency only; `provider.region_missing`). Catalog: EU inference profile
   suggestions. Orkexa pin: `3467940` (master with the Bedrock provider).
+Amazon Bedrock, pricing and credential isolation:
+
+- Bedrock is its own price source (never Anthropic's list prices). A `bedrock` price must list its AWS regions as an
+  `aws_region` tariff (`pricing.region_required`, `pricing.invalid_region`); a region it does not list has an unknown
+  cost, never 0. `PricingService.conditions_source` tells the strict price mode the connection's region, so a Bedrock
+  request whose price does not cover it (or whose region is not known) is refused before it is sent
+  (`pricing.price_unknown`). Refusals keep model ids with colons (`...-v1:0`, ARNs) whole in `params.model`.
+- LiteLLM sync maps only regional Bedrock entries (`bedrock/<region>/<model id>`) into one price per model id with an
+  option per region; entries without a region (`anthropic.claude-...`, `eu.`/`global.` profiles), provisioned
+  throughput and ambiguous duplicates are left out (`LiteLLMSource.bedrock_unmapped`).
+- Reconciliation lists providers without a billing adapter under `not_reconciled`
+  (`pricing.reconciliation_not_supported` for Bedrock, whose bill also has charges usage does not report).
+- The subprocess sandbox and uv get `HOST_AWS_ENV` (no shared AWS credential/config files, no instance metadata), so
+  an AWS SDK in tool code never picks up the desktop user's AWS credentials; regression tests prove that no `AWS_*`
+  variable reaches uv, the subprocess, built-in and container sandboxes or MCP stdio servers. Trace exports also hide
+  temporary AWS keys, session tokens and Bedrock API keys.
 
 Backend audit (2026-11-01):
 

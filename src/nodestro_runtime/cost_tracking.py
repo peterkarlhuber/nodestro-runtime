@@ -18,15 +18,17 @@ import threading
 from typing import Any, Literal
 
 from orkexa import UsageRecord
-from orkexa.dynamic import BudgetTracker
-from orkexa.pricing import PriceLookup
+from orkexa.dynamic import BudgetTracker, UnpricedModelError
+from orkexa.pricing import ModelPrice, PriceLookup
 
-from .pricing import PricingService
+from .pricing import REGIONAL_PROVIDERS, PricingService, missing_conditions
 from .problems import NodestroError
 
 #: ``standard``: unknown prices and stale prices only warn (the default). ``strict``: a request without a known
 #: price, or with a price not checked for longer than ``critical_after``, is not sent; a request whose cost
-#: turned out unknown or incomplete stops the operation after it was recorded.
+#: turned out unknown or incomplete stops the operation after it was recorded. For a provider priced per region
+#: (Amazon Bedrock, :data:`~nodestro_runtime.pricing.REGIONAL_PROVIDERS`) "a known price" means a price that covers
+#: the region of the workspace's connection; a price for other regions only is refused before the request too.
 PriceMode = Literal["standard", "strict"]
 PRICE_MODES: tuple[str, ...] = ("standard", "strict")
 
@@ -63,8 +65,27 @@ class PricedTracker(BudgetTracker):
             self._entry_status[key] = found
         return found
 
+    def _uncovered(self, provider: str, price: ModelPrice) -> list[str]:
+        """The known request conditions (Bedrock: the connection's region) that ``price`` does not cover."""
+        dimension = REGIONAL_PROVIDERS.get(provider)
+        if dimension is None:
+            return []
+        known = self.pricing.request_conditions(provider) if self.pricing is not None else {}
+        value = known.get(dimension)
+        if not value:
+            return [f"tariff:{dimension}=unknown"]  # the region is not known: the price cannot be shown to fit
+        return missing_conditions(price, {dimension: value})
+
     def check_request(self, *, agent: str, provider: str, model: str, lookup: PriceLookup) -> None:
         super().check_request(agent=agent, provider=provider, model=model, lookup=lookup)
+        if self.mode == "strict" and lookup.price is not None:
+            uncovered = self._uncovered(provider, lookup.price)
+            if uncovered:
+                # Orkexa's pre-check only asks whether a price exists; its cost would still be unknown here.
+                raise UnpricedModelError(
+                    f"No price known for {provider}:{model} under {', '.join(uncovered)} (agent {agent!r}); "
+                    "the request was not sent (strict price mode)"
+                )
         if self.mode == "strict" and lookup.price is not None and self.pricing is not None:
             _, staleness = self._status(lookup.price.provider, lookup.price.model)
             if staleness == "critical":

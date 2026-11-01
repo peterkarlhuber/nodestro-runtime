@@ -8,7 +8,9 @@
 - :class:`LiteLLMSource`: LiteLLM's community-maintained model cost map, a JSON file on GitHub. It covers
   OpenAI, Anthropic and Gemini models, so it is the only automatic source for OpenAI and Gemini prices. Its
   prices are ``unverified``: large changes wait for review, and they never replace an officially confirmed
-  price (see :meth:`PricingService.submit`).
+  price (see :meth:`PricingService.submit`). Amazon Bedrock is taken only from its regional entries
+  (``bedrock/<region>/<model id>``), as prices with one ``aws_region`` option per listed region; entries without a
+  region are left out (see :func:`litellm_bedrock_rate`).
 - :class:`SnapshotFileSource`: a reviewed snapshot an operator supplies (a file in Orkexa's snapshot format),
   for example prices checked by hand against the OpenAI and Google price lists, or contract prices.
 
@@ -183,6 +185,14 @@ class SnapshotFileSource:
 
 #: LiteLLM provider names and the Nodestro provider each one maps to.
 LITELLM_PROVIDERS: Mapping[str, str] = {"openai": "openai", "anthropic": "anthropic", "gemini": "gemini"}
+#: LiteLLM provider names of Amazon Bedrock entries; they become prices of provider ``bedrock`` only through
+#: :func:`litellm_bedrock_rate` and :func:`bedrock_prices`, never through :func:`litellm_price`.
+LITELLM_BEDROCK_PROVIDERS = frozenset({"bedrock", "bedrock_converse"})
+BEDROCK_PROVIDER = "bedrock"
+BEDROCK_REGION_DIMENSION = "aws_region"
+#: ``bedrock/<region>/<model id>``: a token price of one model id in one source region. Keys with more parts
+#: (``bedrock/us-east-1/1-month-commitment/<model>``: provisioned throughput) are not token prices.
+_BEDROCK_KEY = re.compile(r"^bedrock/(?P<region>[a-z]{2}(?:-[a-z]+)+-\d)/(?P<model>[A-Za-z0-9][A-Za-z0-9._:-]*)$")
 #: The modes of LiteLLM entries that are text-generation models (others are images, audio, embeddings, ...).
 _LITELLM_MODES = frozenset({"chat", "responses", "completion"})
 #: LiteLLM suffixes that are a service tier, and the value providers report for it.
@@ -264,9 +274,89 @@ def litellm_price(
     )
 
 
+@dataclass(frozen=True)
+class BedrockRegionalRate:
+    """The token rates LiteLLM lists for one Bedrock model id in one AWS region."""
+
+    model: str
+    region: str
+    rates: TokenRates
+    long_context: tuple[LongContextTier, ...]
+
+
+def litellm_bedrock_rate(key: str, entry: Mapping[str, Any]) -> BedrockRegionalRate | None:
+    """A regional Bedrock entry (``bedrock/<region>/<model id>``) of LiteLLM, or ``None``.
+
+    Only these entries say both what is priced and where. LiteLLM's other Bedrock entries (``anthropic.claude-...``,
+    ``eu.anthropic.claude-...``, ``global...``) name no region, but AWS prices by the client's source region and
+    Orkexa records that region on every request (tariff condition ``aws_region``). Applying such an entry to every
+    region would present a guess as a price, so they are left out: the cost stays unknown until a regional entry or
+    an override (with an ``aws_region`` tariff) covers it. Service-tier variants are not taken either (a Bedrock
+    ``priority`` or ``flex`` request stays unpriced unless an override lists the tier)."""
+    if entry.get("litellm_provider") not in LITELLM_BEDROCK_PROVIDERS or entry.get("mode") not in _LITELLM_MODES:
+        return None
+    match = _BEDROCK_KEY.match(key)
+    if match is None:
+        return None
+    rates = _litellm_rates(entry, "")
+    tiers = _litellm_tiers(entry)
+    if rates is None or tiers is None:
+        return None
+    return BedrockRegionalRate(
+        model=match.group("model"), region=match.group("region"), rates=rates, long_context=tiers
+    )
+
+
+def bedrock_prices(
+    found: list[BedrockRegionalRate], *, checked_at: datetime, url: str = LITELLM_URL
+) -> tuple[list[ModelPrice], list[str]]:
+    """One price per Bedrock model id with an ``aws_region`` option per region LiteLLM lists for it.
+
+    The alphabetically first region is the tariff's default and carries the price's base rates; every other region
+    with different rates gets its own replacement rates. Regions that are not listed have an unknown cost. A model
+    and region listed twice with different rates is ambiguous and left out. Returns the prices and the ambiguous
+    ``model@region`` pairs."""
+    by_model: dict[str, dict[str, BedrockRegionalRate]] = {}
+    conflicts: set[tuple[str, str]] = set()
+    for item in found:
+        regions = by_model.setdefault(item.model, {})
+        known = regions.get(item.region)
+        if known is not None and (known.rates, known.long_context) != (item.rates, item.long_context):
+            conflicts.add((item.model, item.region))
+        regions.setdefault(item.region, item)
+    prices: list[ModelPrice] = []
+    for model in sorted(by_model):
+        regions = {region: item for region, item in by_model[model].items() if (model, region) not in conflicts}
+        if not regions:
+            continue
+        ordered = sorted(regions)
+        base = regions[ordered[0]]
+        options = [TariffOption(ordered[0])]
+        for region in ordered[1:]:
+            item = regions[region]
+            if (item.rates, item.long_context) == (base.rates, base.long_context):
+                options.append(TariffOption(region))
+            else:
+                options.append(TariffOption(region, rates=item.rates, long_context=item.long_context))
+        prices.append(
+            ModelPrice(
+                provider=BEDROCK_PROVIDER,
+                model=model,
+                rates=base.rates,
+                long_context=base.long_context,
+                tariffs=(Tariff(dimension=BEDROCK_REGION_DIMENSION, default=ordered[0], options=tuple(options)),),
+                source=LITELLM_SOURCE,
+                source_url=url,
+                checked_at=checked_at,
+                quality="unverified",
+            )
+        )
+    return prices, sorted(f"{model}@{region}" for model, region in conflicts)
+
+
 @dataclass
 class LiteLLMSource:
-    """LiteLLM's model cost map: OpenAI, Anthropic and Gemini text models."""
+    """LiteLLM's model cost map: OpenAI, Anthropic and Gemini text models, and regional Amazon Bedrock prices."""
 
     url: str = LITELLM_URL
     http: HttpSettings = field(default_factory=HttpSettings)
@@ -276,6 +366,9 @@ class LiteLLMSource:
     name: str = LITELLM_SOURCE
     #: Entries skipped because Orkexa refused them (logged; the rest is still used).
     skipped: list[str] = field(default_factory=list)
+    #: Bedrock entries left out because they name no region (or are no token price), or because a model and region
+    #: was listed twice with different rates; their costs stay unknown until an override covers them.
+    bedrock_unmapped: list[str] = field(default_factory=list)
 
     def fetch(self, at: datetime) -> PriceSnapshot:
         data = fetch_with_retries(
@@ -289,8 +382,21 @@ class LiteLLMSource:
             raise SourceError("The LiteLLM cost map is not a JSON object")
         prices: dict[tuple[str, str], ModelPrice] = {}
         self.skipped = []
+        self.bedrock_unmapped = []
+        regional: list[BedrockRegionalRate] = []
         for key, entry in document.items():
             if not isinstance(entry, dict) or key == "sample_spec":
+                continue
+            if entry.get("litellm_provider") in LITELLM_BEDROCK_PROVIDERS:
+                try:
+                    rate = litellm_bedrock_rate(str(key), entry)
+                except (PricingError, ValueError, TypeError) as exc:
+                    self.skipped.append(f"{key}: {exc}")
+                    continue
+                if rate is None:
+                    self.bedrock_unmapped.append(str(key))
+                else:
+                    regional.append(rate)
                 continue
             try:
                 price = litellm_price(str(key), entry, checked_at=at, url=self.url)
@@ -300,10 +406,23 @@ class LiteLLMSource:
             if price is not None:
                 # The same model listed twice (``gemini/x`` and ``x``): the first entry wins, deterministically.
                 prices.setdefault((price.provider, price.model), price)
+        try:
+            bedrock, ambiguous = bedrock_prices(regional, checked_at=at, url=self.url)
+        except (PricingError, ValueError, TypeError) as exc:
+            self.skipped.append(f"bedrock: {exc}")
+            bedrock, ambiguous = [], []
+        self.bedrock_unmapped += ambiguous
+        for price in bedrock:
+            prices.setdefault((price.provider, price.model), price)
         if not prices:
             raise SourceError("The LiteLLM cost map contains no usable prices")
         if self.skipped:
             logger.info("Skipped %d LiteLLM entries Orkexa refused", len(self.skipped))
+        if self.bedrock_unmapped:
+            logger.info(
+                "Left out %d LiteLLM Bedrock entries without an unambiguous region (their costs stay unknown)",
+                len(self.bedrock_unmapped),
+            )
         return PriceSnapshot(
             f"litellm-{at.strftime('%Y%m%dT%H%M%SZ')}",
             tuple(prices[key] for key in sorted(prices)),
@@ -456,9 +575,11 @@ class PricingSyncService:
 
 
 __all__ = [
+    "LITELLM_BEDROCK_PROVIDERS",
     "LITELLM_PROVIDERS",
     "LITELLM_SOURCE",
     "LITELLM_URL",
+    "BedrockRegionalRate",
     "HttpSettings",
     "LiteLLMSource",
     "OrkexaBuiltinSource",
@@ -468,8 +589,10 @@ __all__ = [
     "SourceError",
     "SourceReport",
     "SyncReport",
+    "bedrock_prices",
     "default_sources",
     "fetch_with_retries",
     "https_get",
+    "litellm_bedrock_rate",
     "litellm_price",
 ]

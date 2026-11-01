@@ -50,7 +50,7 @@ from .builtin_sandbox import LinuxSandbox
 from .container_images import ContainerImages, RuntimeImageSandbox, lock_has_hashes, orkexa_fingerprint
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
-from .sandbox_policy import Isolation
+from .sandbox_policy import HOST_AWS_ENV, Isolation
 from .schemas import Workflow, WorkflowIn, new_id, now
 from .storage import DocumentStore
 
@@ -100,13 +100,15 @@ def uv_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
-#: Numerical libraries start one thread per core; the sandbox allows no extra processes.
+#: Numerical libraries start one thread per core; the sandbox allows no extra processes. No AWS SDK in tool code
+#: finds the user's AWS credentials (:data:`~nodestro_runtime.sandbox_policy.HOST_AWS_ENV`).
 SANDBOX_ENV = {
     "OPENBLAS_NUM_THREADS": "1",
     "OMP_NUM_THREADS": "1",
     "MKL_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "VECLIB_MAXIMUM_THREADS": "1",
+    **HOST_AWS_ENV,
 }
 
 #: Who owns an environment: a workflow, a tool, or a local MCP server started over stdio (WP-8).
@@ -408,6 +410,8 @@ class UvRunner:
         """
         environment = uv_environment()
         environment.update({"UV_CACHE_DIR": str(self.cache_dir), "NO_COLOR": "1", "UV_NO_PROGRESS": "1"})
+        # Package builds run on the host with HOME: an AWS SDK in a build script finds no AWS credentials.
+        environment.update(HOST_AWS_ENV)
         return environment
 
     def _run(self, args: list[str], log: Callable[[str], None], *, timeout: float = 900, cwd: str | None = None) -> str:
