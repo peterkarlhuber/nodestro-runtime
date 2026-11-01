@@ -164,7 +164,9 @@ async def test_a_rejected_call_is_not_made(make: Make) -> None:
     assert done.status == "succeeded", done.error
     assert call(done).is_error and "No" in (call(done).output or "")
     assert call(done).approval.status == "rejected"
-    assert requests(workspace, done.id)[0].use == "open"
+    # Closed when the run continued, so a later continue of the run never audits it again.
+    assert requests(workspace, done.id)[0].use == "closed"
+    assert kinds(workspace).count("resumed") == 1
 
 
 async def test_two_calls_of_one_round_wait_together(make: Make) -> None:

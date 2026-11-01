@@ -1227,7 +1227,13 @@ class RunManager:
         except NodestroError:  # no event loop here (``run.no_event_loop``): the next sweep continues it
             return False
         for item in approvals.of_run(run_id):
-            if item.checkpointed and item.use == "open" and item.status in ("approved", "rejected", "expired"):
+            if not item.checkpointed or item.use != "open":
+                continue
+            if item.status == "approved":
+                # Marked when the resumed turn reaches the call (executed or stale), so audited once.
+                approvals.audit("resumed", item, outcome=item.status)
+            elif item.status in ("rejected", "expired") and approvals.use(item, "closed") is not None:
+                # Never usable again: closing it (compare-and-set) audits it once, not at every later continue.
                 approvals.audit("resumed", item, outcome=item.status)
         return True
 
@@ -2354,6 +2360,7 @@ class RunManager:
         record: ToolCallRecord,
         gate: ToolGate,
         iteration: list[int],
+        released: dict[str, ToolApprovalRequest],
     ) -> str | None:
         """Decide a call of a resumed turn (M6b; Evolution conditions 1, 2 and 5).
 
@@ -2361,7 +2368,9 @@ class RunManager:
         tool version or definition hash); nobody is asked again and no new request is made. The rules are applied
         again and a new deny wins. An approved call runs only within :data:`EXECUTION_WINDOW` after its decision and
         at most once: ``use`` is set to ``executed`` by compare-and-set right before it runs, so a second resume (or
-        a crash after the mark) never runs it again (``tool.result_lost``)."""
+        a crash after the mark) never runs it again (``tool.result_lost``). The released request is put in
+        ``released``; what really happened (``executed``, or ``stale`` when the tool changed in between and refused
+        the call) is audited when the call ends (:meth:`_audit_released`)."""
         approvals = gate.approvals
         run_id = context.run.id
         shown = record.approval.capability if record.approval is not None else {}
@@ -2373,10 +2382,10 @@ class RunManager:
         if found.status == "pending":
             # Still undecided (another call of the same turn was decided): keep waiting, without a new question.
             raise ToolCallSuspended("waits for a person's approval", ref=found.id)
-        capability, version, kind, definition = tool_facts(context.env.builder.tools, call.name)
+        capability, version, kind, _definition = tool_facts(context.env.builder.tools, call.name)
         version = _stored_version(context.env.builder.tools, call.name, kind, version)
         shown = capability.model_dump()
-        current = arguments_hash(call.name, call.input, version=version, definition_hash=definition)
+        current = _current_hash(context.env.builder.tools, call)
         if found.status != "approved":
             return self._record_decision(context, node_id, record, found, shown)
         if found.use == "executed":
@@ -2439,9 +2448,20 @@ class RunManager:
             return self._deny_call(
                 context, node_id, call, record, "tool.result_lost", "This call was already handled elsewhere", shown
             )
-        approvals.audit("executed", marked)
+        released[call.id] = marked
         self._record_decision(context, node_id, record, marked, shown)
         return None
+
+    def _audit_released(
+        self, context: _RunContext, gate: ToolGate, call: ToolCall, request: ToolApprovalRequest, is_error: bool
+    ) -> None:
+        """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
+        after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
+        (``tool.changed``), not ``executed``. The request stays ``executed``, so the call never runs later."""
+        if is_error and _current_hash(context.env.builder.tools, call) != request.arguments_hash:
+            gate.approvals.audit("stale", request, outcome="tool.changed")
+        else:
+            gate.approvals.audit("executed", request)
 
     def _record_decision(
         self,
@@ -2863,6 +2883,7 @@ class RunManager:
         state = context.run.nodes[node.id]
         node_id = node.id
         calls: dict[str, ToolCallRecord] = {}
+        released: dict[str, ToolApprovalRequest] = {}
         gate = self.tool_gate
         # A judge refines whole answers, which a checkpoint cannot hold: such agents keep waiting in the thread.
         checkpointing = (
@@ -2907,7 +2928,7 @@ class RunManager:
             own = {tool.name for tool in extra_tools} | {MEMORY_TOOL_NAME}
             if gate is not None and call.name not in own:
                 if checkpointing and call.resumed:
-                    denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration)
+                    denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
                 else:
                     denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
             elif call.resumed:
@@ -2916,6 +2937,9 @@ class RunManager:
             return denial
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
+            request = released.pop(call.id, None)
+            if request is not None and gate is not None:
+                self._audit_released(context, gate, call, request, is_error)
             record = calls.get(call.id)
             if record is not None:
                 record.output = content[:20_000]
@@ -3181,6 +3205,13 @@ class AgentSuspended(Exception):
         super().__init__("the agent waits for a tool approval")
         self.checkpoint = checkpoint
         self.memory = memory
+
+
+def _current_hash(tools: Any, call: ToolCall) -> str:
+    """The arguments hash of a call against the tool as it is now (version or MCP definition)."""
+    _capability, version, kind, definition = tool_facts(tools, call.name)
+    version = _stored_version(tools, call.name, kind, version)
+    return arguments_hash(call.name, call.input, version=version, definition_hash=definition)
 
 
 def _stored_version(tools: Any, name: str, kind: str, version: int | None) -> int | None:

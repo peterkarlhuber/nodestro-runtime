@@ -26,8 +26,12 @@ Runs paused at a tool call that waits for a person (M6b, behind a second switch,
 - At most `NODESTRO_TOOL_APPROVAL_MAX_PAUSED` (default 20) runs of a tenant pause at a tool call; above it a call is
   denied at once (`tool.approval_capacity`).
 - New request fields `checkpointed`, `use`, `executed_at`; new audit kinds `suspended`, `resumed`, `executed`,
-  `stale`, `result_lost` and `switch_off` (never with arguments). Agents with a quality check keep waiting in the
-  thread (a judge's refinement cannot be checkpointed).
+  `stale`, `result_lost` and `switch_off` (never with arguments). `executed` is audited when the released call
+  ends; a call a pinned tool refused because the tool changed after its release is audited `stale`
+  (`tool.changed`) and is never made later. A rejected or expired request is set to `use="closed"` when its run
+  continues, so `resumed` is audited once.
+- Known limit: agents with a quality check keep waiting in the thread and hold a worker while they wait (a judge's
+  refinement cannot be checkpointed); they still count against the waiting slots and `max_waiting`.
 - Fix: the docstring of `OrchestratorSelect`.
 
 Orchestrators: dynamic teams and approvals inside teams (Adaptive Orchestration M6b, orkexa ADR 0011):
