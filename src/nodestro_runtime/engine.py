@@ -88,6 +88,7 @@ from .orchestrator import (
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, model_id, provider_of
+from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
     AgentConfig,
@@ -95,6 +96,7 @@ from .schemas import (
     ApprovalRecord,
     Edge,
     EvaluationRecord,
+    GuidanceRef,
     InputField,
     KnowledgeProposal,
     Node,
@@ -914,6 +916,8 @@ class RunManager:
         self.remote_poll = 0.25
         #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
         self.tool_gate: ToolGate | None = None
+        #: The live chat of runs (LRC-1): instructions of people reach orchestrators at their next decision.
+        self.chat = RunChat(store)
         #: How many agents (and orchestrator decisions) of this manager's runs execute at the same time, each in a
         #: thread of the manager's own pool (C-08; :data:`RUN_THREADS_ENV`). Read when the pool is first used.
         self.run_threads = run_threads()
@@ -2968,11 +2972,14 @@ class RunManager:
             max_team=min(config.max_team, len(pool.members)),
         )
         recorded: orchestration.OrchestrationState | None = None
+        #: The index of the next decision (the number of recorded steps): instructions are handed to it (LRC-1).
+        next_step = [0]
         #: The team run of each assignment started here, by (step, slot): the record's outcomes name it (X-02).
         team_runs: dict[tuple[int, int], str] = {}
         if state.status == "awaiting_approval" and state.orchestration is not None:
             recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
             task = recorded.task
+            next_step[0] = len(recorded.steps)
         else:
             task = render_task(
                 config.task_template,
@@ -2994,7 +3001,12 @@ class RunManager:
             return add_usage(prior, current) if prior is not None else current
 
         async def decide(prompt: str) -> Any:
-            return await self._in_run_thread(self._decide_sync, context, node, prompt)
+            # A safe decision boundary (LRC-1): the instructions that arrived until now join this decision's prompt;
+            # a model call that already started, a running team and the record are never changed by them.
+            guidance = await self._in_run_thread(self._guidance, context, node, next_step[0])
+            answer = await self._in_run_thread(self._decide_sync, context, node, prompt + guidance)
+            state.current_decision = _shown_decision(answer)
+            return answer
 
         def start_child(item: orchestration.Delegation) -> Run:
             snapshot, version = teams[item.member.id]
@@ -3054,12 +3066,16 @@ class RunManager:
 
         def on_step(current: orchestration.OrchestrationState) -> None:
             state.orchestration = _with_team_runs(current.model_dump(mode="json"), team_runs)
+            state.current_decision = None
+            made = current.pending.index if current.pending is not None else len(current.steps) - 1
+            next_step[0] = len(current.steps)
             if current.paused:
                 assert current.pending is not None
                 self._emit(context, "orchestration_waiting", node.id, pending=current.pending.model_dump(mode="json"))
             else:
                 self._emit(context, "orchestration_step", node.id, step=current.steps[-1].model_dump(mode="json"))
             self._save(context)
+            self._guidance_considered(context, node, current, made)
             if stopped:
                 raise _TeamStopped(stopped[0])
 
@@ -3113,6 +3129,9 @@ class RunManager:
                 else decisions
             )
             state.finished_at = None if state.status == "awaiting_approval" else now()
+            state.current_decision = None
+        if state.status != "awaiting_approval":
+            self._guidance_expired(context, node)
         if state.status == "awaiting_approval":
             self._emit(context, "approval_requested", node.id, status=state.status)
         else:
@@ -3128,6 +3147,98 @@ class RunManager:
                 usage=state.usage.model_dump(mode="json"),
             )
         self._save(context)
+
+    def _guidance(self, context: _RunContext, node: Node, step: int) -> str:
+        """The instructions of people for decision ``step`` of orchestrator ``node``, as a prompt part (LRC-1).
+
+        Open instructions are recorded in the run first (``NodeRun.guidance``, a fenced write), then marked
+        ``delivered``: an execution that lost its run (C-06) delivers nothing. Empty without instructions, so a run
+        without live chat sends exactly the prompt it sent before. A failing chat store never stops the run.
+        """
+        root = context.root
+        run = context.run
+        if root.fenced_out:
+            return ""
+        try:
+            items = self.chat.instructions_for(run.id, node.id, root.run.id)
+            relevant = [item for item in items if item.status in ("queued", "delivered", "considered")]
+            if not relevant:
+                return ""
+            fresh = [
+                item
+                for item in relevant
+                if item.status == "queued" or (item.status == "delivered" and item.step != step)
+            ]
+            if fresh:
+                state = run.nodes[node.id]
+                with context.lock:
+                    known = {(ref.message_id, ref.step) for ref in state.guidance}
+                    for item in fresh:
+                        if (item.id, step) not in known:
+                            state.guidance.append(GuidanceRef(message_id=item.id, step=step, seq=item.seq))
+                self._save(context)
+                if root.fenced_out:
+                    return ""
+            delivered = self.chat.deliver(run.id, node.id, root.run.id, step)
+        except Exception:
+            logger.exception("Reading the live chat of run %s failed; the decision goes on without it", run.id)
+            return ""
+        if fresh:
+            self._emit(
+                context,
+                "orchestration_guidance",
+                node.id,
+                step=step,
+                status="delivered",
+                message_ids=[item.id for item in fresh],
+            )
+        return "\n" + guidance_block(delivered)
+
+    def _guidance_considered(
+        self, context: _RunContext, node: Node, current: orchestration.OrchestrationState, made: int
+    ) -> None:
+        """Decision ``made`` is recorded: the instructions in its prompt were taken into account (not: obeyed)."""
+        if context.root.fenced_out or made < 0:
+            return
+        decision: Any
+        if current.pending is not None and current.pending.index == made:
+            decision, accepted = current.pending.decision, True
+        elif made < len(current.steps):
+            step = current.steps[made]
+            decision, accepted = step.decision, step.verdict.ok
+        else:
+            return
+        shown = decision.model_dump(mode="json") if decision is not None else None
+        try:
+            done = self.chat.consider(
+                context.run.id, node.id, context.root.run.id, made, decision_note(shown, accepted)
+            )
+        except Exception:
+            logger.exception("Updating the live chat of run %s failed", context.run.id)
+            return
+        if done:
+            self._emit(
+                context,
+                "orchestration_guidance",
+                node.id,
+                step=made,
+                status="considered",
+                message_ids=[item.id for item in done],
+            )
+
+    def _guidance_expired(self, context: _RunContext, node: Node) -> None:
+        """The orchestrator ended: instructions it did not take into account expire."""
+        if context.root.fenced_out:
+            return
+        try:
+            done = self.chat.expire(context.run.id, node.id, context.root.run.id, code="run_chat.orchestrator_finished")
+        except Exception:
+            logger.exception("Updating the live chat of run %s failed", context.run.id)
+            return
+        if done:
+            self._emit(
+                context, "orchestration_guidance", node.id, status="expired", message_ids=[item.id for item in done]
+            )
 
     def _team_result(self, child: Run, member: orchestration.Member, context: _RunContext) -> str:
         """A team run's result for the orchestrator, or the exception that says how it ended without one."""
@@ -3647,6 +3758,25 @@ def run_warnings(run: Run) -> list[RunWarning]:
             else:
                 found[key] = RunWarning(code=code, node_id=node.id, tool=call.name)
     return list(found.values())
+
+
+def _shown_decision(answer: Any) -> dict[str, Any] | None:
+    """A decision just made, as the run shows it while its teams work (shortened; ``None`` for anything else)."""
+    if not isinstance(answer, dict):
+        return None
+    shown: dict[str, Any] = {}
+    for key in ("action", "member", "reason", "add", "remove"):
+        if answer.get(key) is not None:
+            shown[key] = answer[key] if not isinstance(answer[key], str) else answer[key][:2000]
+    if isinstance(answer.get("task"), str):
+        shown["task"] = answer["task"][:2000]
+    if isinstance(answer.get("assignments"), list):
+        shown["assignments"] = [
+            {"member": item.get("member"), "task": str(item.get("task") or "")[:2000]}
+            for item in answer["assignments"][:10]
+            if isinstance(item, dict)
+        ]
+    return shown
 
 
 def _with_team_runs(record: dict[str, Any], team_runs: dict[tuple[int, int], str]) -> dict[str, Any]:

@@ -229,7 +229,8 @@ def fingerprints(
     incoming = predecessors(workflow)
     result: dict[str, str] = {}
     for node in topological_order(workflow):
-        config = node.model_dump(mode="json", exclude={"position"})
+        # Who may steer an orchestrator live does not change what its result depends on.
+        config = node.model_dump(mode="json", exclude={"position": True, "orchestrator": {"live_steering"}})
         parts: dict[str, Any] = {"node": config}
         parts["inputs"] = sorted(
             (result.get(edge.source, ""), edge.source, edge.source_handle or "") for edge in incoming[node.id]

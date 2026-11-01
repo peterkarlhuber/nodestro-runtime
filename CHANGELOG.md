@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+Live run chat and steering (LRC-1, 2026-11-01):
+
+- New `nodestro_runtime.run_chat`: a person can ask an orchestrator node of a running run read-only questions and
+  give it instructions. Messages are documents of their own (collection `run_messages`, key `<root run>:<seq>`, in
+  the tenant's store); `seq` is numbered under a transaction lock (one order, also across processes), status
+  changes are compare-and-set. Idempotent sending (`client_id`), an open instruction with the same text is not
+  stored twice; limits for length (2000), messages, instructions, questions, pending questions, questions per
+  minute and a chat budget per run (0.50 USD; `NODESTRO_RUN_CHAT_BUDGET_USD`, `..._MAX_QUESTIONS`,
+  `..._MAX_INSTRUCTIONS`).
+- Instructions reach the orchestrator at its next decision: inside Nodestro's `decide` callback of `_orchestrate`
+  they are recorded in the run (`NodeRun.guidance`, fenced save), marked `delivered` and appended to that
+  decision's prompt as quoted, untrusted guidance; the recorded decision marks them `considered` (with what was
+  decided); an orchestrator that ends expires the open ones. A model call that already started, running teams,
+  recorded steps, approvals, budgets and the system prompt are never changed; an execution that lost its run
+  delivers nothing. Without instructions the prompt is unchanged. No orkexa change.
+- Questions are answered by `answer_question` from `snapshot_text` of the stored run (decisions, the decision in
+  progress `NodeRun.current_decision`, team runs and working specialists): a separate tool-less model call whose
+  usage goes to the usage log (new source `run_chat`), never into the run's usage or budget.
+- `OrchestratorConfig.live_steering` (`attended` default, `always`, `off`): runs started by an API, schedule, batch
+  or test series take instructions only with `always`. Not part of node fingerprints.
+- Sanitized trace exports mask or remove the chat (`chat` next to the run); importing a trace brings its chat along.
+
 Amazon Bedrock (2026-11-01):
 
 - New provider `bedrock` ("Amazon Bedrock (AWS)", `ProviderInfo.auth == "aws"`; the other providers get `auth`

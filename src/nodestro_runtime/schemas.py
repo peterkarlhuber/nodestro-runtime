@@ -398,6 +398,10 @@ class OrchestratorConfig(_Model):
     #: The orchestrator may fill a team's start form fields (except files) besides its task (AO-5 level 2);
     #: the values are checked like a manual start of that team.
     allow_values: bool = False
+    #: Who may give the orchestrator instructions while it runs (live steering, LRC-1): ``attended`` (default) only in
+    #: runs a person started (not by a published API, schedule, batch or test series), ``always`` also in those,
+    #: ``off`` never. Questions about the run (read-only) are always possible. Not part of the node's fingerprint.
+    live_steering: Literal["attended", "always", "off"] = "attended"
 
 
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
@@ -685,6 +689,14 @@ class KnowledgeProposal(_Model):
     adopted_file_id: str | None = None
 
 
+class GuidanceRef(_Model):
+    """One instruction of a person that was part of an orchestrator decision's prompt."""
+
+    message_id: str
+    step: int
+    seq: int = 0
+
+
 class NodeRun(_Model):
     status: NodeStatus = "waiting"
     prompt: str | None = None
@@ -712,6 +724,11 @@ class NodeRun(_Model):
     #: and the child run of every delegation, in order.
     orchestration: dict[str, Any] | None = None
     child_run_ids: list[str] = Field(default_factory=list)
+    #: Orchestrator: the instructions of people (live steering, :mod:`nodestro_runtime.run_chat`) that were in the
+    #: prompt of a decision: message id and decision index (the messages themselves are stored beside the run).
+    guidance: list[GuidanceRef] = Field(default_factory=list)
+    #: Orchestrator: the decision the model just made while its teams work (not recorded yet; cleared when it is).
+    current_decision: dict[str, Any] | None = None
     #: Orchestrator: the usage of its own decisions, without its teams (they are in ``usage`` as well).
     decision_usage: Usage | None = None
     #: The result was taken over from this earlier run instead of executing the node again.
