@@ -25,6 +25,7 @@ import unicodedata
 from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
 from orkexa.memory import MemoryBackend
 
+from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
 from .memory_spaces import BrowsableMemory
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
@@ -356,11 +357,14 @@ def tenant_storage(
     tenant_id: str,
     secrets: SecretBox | None = None,
     endpoints: tuple[str, ...] = (),
+    bedrock: BedrockOperatorConfig | None = None,
 ) -> WorkspaceStorage:
     """Everything a :class:`~nodestro_runtime.workspace.Workspace` stores, for one tenant of ``database``.
 
     ``secrets`` encrypts the tenant's provider keys at rest (a server always passes its box); ``endpoints`` are the
-    model endpoints the operator allows (none by default)."""
+    model endpoints the operator allows (none by default). ``bedrock`` is the operator's Amazon Bedrock configuration
+    (:meth:`~nodestro_runtime.bedrock.BedrockOperatorConfig.from_env`); the workspace gets only this tenant's own
+    entry (``for_tenant``), never the roles of other tenants. ``None``: Bedrock is not available."""
     from .workspace import WorkspaceStorage
 
     return WorkspaceStorage(
@@ -370,6 +374,7 @@ def tenant_storage(
         memory=PostgresMemoryTables(database, tenant_id),
         secrets=secrets,
         endpoints=tuple(endpoints),
+        bedrock=bedrock.for_tenant(tenant_id) if bedrock is not None else None,
     )
 
 

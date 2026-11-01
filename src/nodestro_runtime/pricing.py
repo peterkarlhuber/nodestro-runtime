@@ -28,20 +28,30 @@ network access happens here (fetching candidates is :mod:`nodestro_runtime.prici
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
+import logging
 import re
 import threading
 import time
 from typing import Any, Literal
 
-from orkexa.pricing import BUILTIN_SNAPSHOT, ModelPrice, PriceResolver, PriceSnapshot, PricingError
+from orkexa.pricing import (
+    BUILTIN_SNAPSHOT,
+    NEUTRAL_CONDITIONS,
+    ModelPrice,
+    PriceResolver,
+    PriceSnapshot,
+    PricingError,
+)
 from pydantic import BaseModel, Field, ValidationError
 
 from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
+
+logger = logging.getLogger(__name__)
 
 PriceStatus = Literal["current", "stale", "unknown", "pending_review", "custom"]
 #: How old the last successful check of a price is: ``ok``, ``warning`` (after ``warn_after``) or ``critical``
@@ -75,6 +85,15 @@ MAX_PLAUSIBLE_RATE = Decimal("10000")
 _PROVIDER = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 _RATE_FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+#: Providers whose usage always carries a tariff condition that is known before the request, and its dimension.
+#: Amazon Bedrock is priced per AWS region: Orkexa records the client's source region as ``aws_region`` on every
+#: Bedrock request, so a Bedrock price must list the regions it covers (one option per region, with its own rates
+#: where they differ). A request from a region the price does not list has an unknown cost (``None``, never 0).
+#: Bedrock is its own price source: Anthropic's first-party prices are never used for Claude on Bedrock.
+REGIONAL_PROVIDERS: Mapping[str, str] = {"bedrock": "aws_region"}
+#: An AWS region name (``eu-central-1``, ``us-gov-west-1``).
+AWS_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-\d")
 
 
 class PricingSettings(BaseModel):
@@ -191,6 +210,9 @@ class PriceEntry(BaseModel):
     cache_write_1h_usd_per_mtok: str | None = None
     has_long_context: bool = False
     tariffs: list[str] = Field(default_factory=list)
+    #: Amazon Bedrock: the regions the price covers (values of its ``aws_region`` tariff; the first is the region
+    #: of the base rates). ``None`` for prices without a region tariff.
+    regions: list[str] | None = None
     status: PriceStatus
     staleness: Staleness
     #: Orkexa's quality of the price (``verified``, ``contract``, ``unverified``, ``estimated``).
@@ -203,6 +225,14 @@ class PriceEntry(BaseModel):
     overridden: bool = False
     #: The reference price an override replaces (``None`` when the model has none).
     reference: PriceEntry | None = None
+
+
+def _regions(price: ModelPrice) -> list[str] | None:
+    tariff = price.tariff("aws_region")
+    if tariff is None:
+        return None
+    values = [option.value for option in tariff.options]
+    return [tariff.default, *(value for value in values if value != tariff.default)]
 
 
 class SubmitResult(BaseModel):
@@ -269,7 +299,39 @@ def validate_price(price: ModelPrice, *, known_providers: Iterable[str] | None =
         add("warning", "pricing.cache_read_above_input", "Cache reads cost more than uncached input")
     if not price.source:
         add("error", "pricing.no_source", "The price names no source")
+    dimension = REGIONAL_PROVIDERS.get(price.provider)
+    if dimension is not None:
+        tariff = price.tariff(dimension)
+        if tariff is None:
+            # Orkexa would leave every request unpriced; say so when the price is entered, not after the bill.
+            add(
+                "error",
+                "pricing.region_required",
+                f"A {price.provider} price must list the AWS regions it applies to (tariff {dimension!r})",
+            )
+        else:
+            invalid = [option.value for option in tariff.options if not AWS_REGION.fullmatch(option.value)]
+            if invalid:
+                add("error", "pricing.invalid_region", f"Not an AWS region: {', '.join(sorted(invalid))}")
     return issues
+
+
+def missing_conditions(price: ModelPrice, conditions: Mapping[str, str]) -> list[str]:
+    """The request conditions ``price`` does not cover, named as Orkexa names them (``tariff:aws_region=eu-west-3``).
+
+    Mirrors Orkexa's cost calculation: a condition without a tariff, or a value the tariff does not list, makes the
+    cost unknown (a neutral value such as ``service_tier=default`` is the standard price)."""
+    missing: list[str] = []
+    for dimension, value in conditions.items():
+        neutral = NEUTRAL_CONDITIONS.get(dimension, frozenset())
+        tariff = price.tariff(dimension)
+        if tariff is None:
+            covered = value in neutral
+        else:
+            covered = tariff.option(value) is not None or (value in neutral and tariff.default in neutral)
+        if not covered:
+            missing.append(f"tariff:{dimension}={value}")
+    return missing
 
 
 def validate_snapshot(
@@ -383,6 +445,9 @@ class PricingService:
         self.settings = settings or PricingSettings()
         self.reference_writable = reference_writable
         self.known_providers = None if known_providers is None else frozenset(known_providers)
+        #: The tariff conditions this workspace's requests to a provider will report, known before the request
+        #: (see :meth:`request_conditions`); set by the workspace from its provider connections.
+        self.conditions_source: Callable[[str], Mapping[str, str] | None] | None = None
         self._clock = clock
         self._builtin = builtin
         self._lock = threading.RLock()
@@ -516,6 +581,7 @@ class PricingService:
             cache_write_1h_usd_per_mtok=None if rates.cache_write_1h is None else str(rates.cache_write_1h),
             has_long_context=bool(price.long_context),
             tariffs=[tariff.dimension for tariff in price.tariffs],
+            regions=_regions(price),
             status=status,
             staleness=staleness,
             quality=price.quality,
@@ -551,6 +617,22 @@ class PricingService:
             if entry.provider == lookup.price.provider and entry.model == lookup.price.model:
                 return entry
         return None
+
+    def request_conditions(self, provider: str) -> dict[str, str]:
+        """The tariff conditions of the workspace's requests to ``provider`` that are known before a request is sent.
+
+        For Amazon Bedrock this is the connection's region (``{"aws_region": "eu-central-1"}``): the strict price mode
+        refuses a Bedrock request before it is sent when the price does not cover that region. Empty when the
+        workspace does not know them (then a strict Bedrock request is refused as well)."""
+        source = self.conditions_source
+        if source is None:
+            return {}
+        try:
+            found = source(provider)
+        except Exception:  # a broken connection setting must not break pricing; strict mode then refuses
+            logger.warning("The request conditions of provider %s could not be determined", provider, exc_info=True)
+            return {}
+        return {str(key): str(value) for key, value in (found or {}).items() if value}
 
     def price_status(self, provider: str, model: str) -> PriceStatus:
         entry = self.entry(provider, model)
@@ -865,6 +947,7 @@ class PricingService:
 __all__ = [
     "CONFIRMED_QUALITIES",
     "CURRENCY",
+    "REGIONAL_PROVIDERS",
     "PriceChange",
     "PriceEntry",
     "PriceIssue",
@@ -879,6 +962,7 @@ __all__ = [
     "StoredSnapshot",
     "SubmitResult",
     "diff_snapshots",
+    "missing_conditions",
     "validate_price",
     "validate_snapshot",
 ]

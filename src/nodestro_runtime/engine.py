@@ -43,6 +43,7 @@ from orkexa import (
     CheckpointError,
     ContentBlock,
     Criterion,
+    DataResidencyError,
     EphemeralMemory,
     Evaluator,
     MemoryBackend,
@@ -67,6 +68,7 @@ from pydantic import BaseModel
 
 from . import contracts, flow_driver, graph, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
+from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
 from .file_delivery import collect, deliver
@@ -3491,6 +3493,9 @@ def execute_agent(
             name=f"{name}:judge",
             **judge_connection.agent_kwargs(),
         )
+        pin = getattr(tracker, "pin_conditions", None)
+        if pin is not None:
+            pin(evaluator.agent.name, evaluator.agent.options)
         if "on_request" in hooks:
             evaluator.agent.on_request = hooks["on_request"]
         if on_evaluation_start is not None:
@@ -3543,7 +3548,9 @@ def node_problem(exc: BaseException) -> Problem:
     if isinstance(exc, NodestroError):
         return exc.problem
     kind = type(exc).__name__
-    text = redact(f"{kind}: {exc}" if str(exc) else kind)
+    # AWS errors name the caller's identity (``arn:aws:sts::<account>:assumed-role/...``); a server tenant must never
+    # see the operator's role or account, so IAM/STS identities are removed for every provider.
+    text = redact_identity(redact(f"{kind}: {exc}" if str(exc) else kind))
     priced = price_problem(exc, text)
     if priced is not None:
         return priced
@@ -3551,6 +3558,8 @@ def node_problem(exc: BaseException) -> Problem:
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
         return provider_problem(exc, text)
+    if isinstance(exc, DataResidencyError):
+        return problem("provider.data_residency_violation", text, provider="bedrock")
     if isinstance(exc, OrkexaError):
         return problem(f"run.agent.{kind}", text, type=kind)
     found = library_problem(exc, code="run.failed")

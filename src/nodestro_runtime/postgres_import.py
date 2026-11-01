@@ -157,6 +157,13 @@ def _without_provider_keys(data: str, report: ImportReport) -> str:
     for name, entry in (values.get("providers") or {}).items():
         if isinstance(entry, dict) and entry.pop("api_key", None):
             removed.append(name)
+        if name == "bedrock" and isinstance(entry, dict):
+            # A tenant signs in only with its operator's role, and a check that ran on a desktop proves nothing here.
+            dropped = [key for key in ("auth", "profile_name", "verification") if entry.pop(key, None) is not None]
+            if dropped:
+                report.not_imported.append(
+                    f"Amazon Bedrock sign-in settings ({', '.join(dropped)}): the server uses its operator's role"
+                )
     if removed:
         names = ", ".join(sorted(set(removed)))
         report.not_imported.append(f"provider keys ({names}): enter them again in the server's settings")

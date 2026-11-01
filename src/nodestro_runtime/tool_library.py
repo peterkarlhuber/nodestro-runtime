@@ -47,14 +47,16 @@ from orkexa.dynamic import (
 from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
 from orkexa.memory import MEMORY_TOOL_NAME
+from orkexa.providers.base import redact
 from pydantic import BaseModel, Field, model_validator
 
+from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .mcp_access import is_mcp_tool
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
-from .sandbox_policy import Isolation, SandboxPolicy, TrustClass, isolation_of
+from .sandbox_policy import HOST_AWS_ENV, Isolation, SandboxPolicy, TrustClass, isolation_of
 from .schemas import new_id, now
 from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
@@ -312,7 +314,7 @@ def make_sandbox(
     if kind == "docker":
         return container() if container is not None else DockerSandbox()
     (policy or SandboxPolicy()).check_construction("none")
-    return SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
+    return SubprocessSandbox(timeout=15.0, env=dict(HOST_AWS_ENV), acknowledge_unsafe=True)
 
 
 class _LinkedProvenance:
@@ -974,7 +976,8 @@ class ToolLibrary:
         except Exception as exc:  # the job reports every failure to the UI
             logger.exception("Tool job %s failed", job.id)
             job.status = "failed"
-            job.error = f"{type(exc).__name__}: {exc}"
+            # Shown to the user (GET /api/jobs): no credentials and, on a server, no AWS identity of the operator.
+            job.error = redact_identity(redact(f"{type(exc).__name__}: {exc}"))
             if isinstance(exc, NodestroError) and exc.code.startswith("sandbox."):
                 # E.g. ``sandbox.isolation_required``: reported with its code; the code was not run.
                 _step(job, exc.problem)
