@@ -276,7 +276,8 @@ def continuation(
             action, reason = "rerun", "resume.in_loop"
         elif old.status not in ("succeeded", "skipped"):
             action = "rerun" if old.status in ("failed", "cancelled") else "run"
-            reason = f"resume.was_{old.status}"
+            # A step that stopped with its process says so, not "failed" (AD-10).
+            reason = "resume.was_interrupted" if old.error_code == "run.interrupted" else f"resume.was_{old.status}"
         elif not old.fingerprint:
             action, reason = "rerun", "resume.no_fingerprint"
         elif old.fingerprint != current_prints.get(node.id):

@@ -105,6 +105,8 @@ async def test_the_orchestrator_delegates_to_a_team_and_finishes(make: Make) -> 
     assert [step["decision"]["action"] for step in steps] == ["delegate", "finish"]
     assert steps[0]["result"] == "Otters hold hands." and steps[0]["decision"]["reason"] == "facts first"
     assert len(lead.child_run_ids) == 1
+    # X-02: the team's result names the run that produced it.
+    assert steps[0]["outcomes"][0]["ref"] == lead.child_run_ids[0]
     child = workspace.runs.get(lead.child_run_ids[0])
     assert (
         child.parent_run_id == done.id and child.parent_node_id == "lead" and child.input.startswith("Find otter facts")

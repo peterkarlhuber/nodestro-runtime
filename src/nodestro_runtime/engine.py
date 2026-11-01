@@ -39,6 +39,7 @@ from typing import Any, Literal, TypeVar
 import uuid
 
 from orkexa import (
+    AuthenticationError,
     CheckpointError,
     ContentBlock,
     Criterion,
@@ -46,7 +47,9 @@ from orkexa import (
     Evaluator,
     MemoryBackend,
     OrkexaError,
+    ProviderConnectionError,
     ProviderError,
+    RateLimitError,
     Tool,
     ToolCall,
     ToolCallSuspended,
@@ -99,6 +102,7 @@ from .schemas import (
     RunEvent,
     RunIn,
     RunTrigger,
+    RunWarning,
     ToolCallApproval,
     ToolCallRecord,
     Usage,
@@ -814,6 +818,9 @@ class _RunContext:
         self.flow_stop: flow.Stop | None = None
         #: Set when the run's time limit was reached and its running nodes were cancelled.
         self.timed_out = False
+        #: Set (root context) when the process stops gracefully (SIGTERM, quitting the app): the run ends as
+        #: interrupted, not as cancelled by a person (AD-10).
+        self.shutting_down = False
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
@@ -1575,6 +1582,7 @@ class RunManager:
         Paused runs are not affected: they wait in the database for their approval.
         """
         for context in list(self._contexts.values()):
+            context.root.shutting_down = context.shutting_down = True
             context.cancelled.set()
         tasks = [task for task in self._tasks.values() if not task.done()]
         if tasks:
@@ -1705,7 +1713,10 @@ class RunManager:
         except asyncio.CancelledError:
             # The task itself was cancelled (shutdown): the run must not stay "running" in the database.
             context.cancelled.set()
-            _abandon(run)
+            if context.root.shutting_down:
+                _interrupt(run, shutdown=True)
+            else:
+                _abandon(run)
             raise
         except Exception as exc:
             logger.exception("Run %s failed", run.id)
@@ -1818,6 +1829,8 @@ class RunManager:
             run.status = "failed"
             steps = run.workflow.limits.max_steps
             _fail(run, problem("run.step_limit", f"The run reached its limit of {steps} steps", max_steps=steps))
+        elif context.cancelled.is_set() and context.root.shutting_down:
+            _interrupt(run, shutdown=True)
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -1835,6 +1848,7 @@ class RunManager:
         else:
             run.status = "succeeded"
         run.output = self._run_output(run)
+        run.warnings = run_warnings(run)
 
     async def _run_graph(self, context: _RunContext) -> None:
         """Execute the nodes the ``orkexa.flow`` kernel dispatches until none is left to run.
@@ -2197,7 +2211,9 @@ class RunManager:
         run = context.run
         state = run.nodes[node.id]
         inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
-        state.started_at = now()
+        # A step that continues after a decision (paused at an approval) keeps when it began (X-02).
+        if state.status != "awaiting_approval" or state.started_at is None:
+            state.started_at = now()
         if node.type == "start":
             state.status = "succeeded"
             state.output = self._start_output(run)
@@ -2261,6 +2277,9 @@ class RunManager:
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
+        # Stored as running before the agent works (AD-10): after a crash the recovery finds the step that was
+        # running, instead of a step that looks as if it was never reached.
+        self._save(context)
         await self._in_run_thread(
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
@@ -2947,6 +2966,8 @@ class RunManager:
             max_team=min(config.max_team, len(pool.members)),
         )
         recorded: orchestration.OrchestrationState | None = None
+        #: The team run of each assignment started here, by (step, slot): the record's outcomes name it (X-02).
+        team_runs: dict[tuple[int, int], str] = {}
         if state.status == "awaiting_approval" and state.orchestration is not None:
             recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
             task = recorded.task
@@ -2998,6 +3019,7 @@ class RunManager:
             )
             self.store.put("runs", child.id, child)
             state.child_run_ids.append(child.id)
+            team_runs[(item.step, item.slot)] = child.id
             self._emit(
                 context,
                 "orchestration_delegated",
@@ -3029,7 +3051,7 @@ class RunManager:
             return self._team_result(child, item.member, context)
 
         def on_step(current: orchestration.OrchestrationState) -> None:
-            state.orchestration = current.model_dump(mode="json")
+            state.orchestration = _with_team_runs(current.model_dump(mode="json"), team_runs)
             if current.paused:
                 assert current.pending is not None
                 self._emit(context, "orchestration_waiting", node.id, pending=current.pending.model_dump(mode="json"))
@@ -3528,11 +3550,47 @@ def node_problem(exc: BaseException) -> Problem:
     if isinstance(exc, BudgetExceededError):
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
-        return problem("run.api_error", text, status=exc.status_code or "", provider=exc.provider or "")
+        return provider_problem(exc, text)
     if isinstance(exc, OrkexaError):
         return problem(f"run.agent.{kind}", text, type=kind)
     found = library_problem(exc, code="run.failed")
     return found.model_copy(update={"message": text})
+
+
+# HTTP statuses that mean "the provider is temporarily out of capacity" (Anthropic 529, 503).
+_OVERLOADED_STATUSES = frozenset({503, 529})
+
+
+def provider_problem(exc: ProviderError, text: str) -> Problem:
+    """A provider failure as a code the UI can act on (AD-01).
+
+    Orkexa already sorts SDK exceptions into subclasses by HTTP status (``provider_error``):
+    ``AuthenticationError`` (401/403), ``ProviderConnectionError`` (connection, DNS, timeout),
+    ``RateLimitError`` (429) and ``ProviderServerError`` (5xx/529). The codes are:
+
+    - ``run.provider_auth``: the key is missing, wrong, expired or lacks permission.
+    - ``run.provider_unreachable``: no answer (offline, DNS, proxy, timeout).
+    - ``run.provider_rate_limited``: too many requests or tokens for the account.
+    - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
+      ``overloaded`` error inside a stream, which arrives without that status).
+    - ``run.api_error``: anything else (other 4xx/5xx), as before.
+
+    ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
+    provider answered (``run.api_error`` keeps ``""`` for an unknown status, as before).
+    """
+    provider = exc.provider or ""
+    status = exc.status_code
+    known: dict[str, Any] = {"provider": provider} if status is None else {"provider": provider, "status": status}
+    if isinstance(exc, AuthenticationError) or status in (401, 403):
+        return problem("run.provider_auth", text, **known)
+    if isinstance(exc, ProviderConnectionError):
+        return problem("run.provider_unreachable", text, **known)
+    if isinstance(exc, RateLimitError) or status == 429:
+        return problem("run.provider_rate_limited", text, **known)
+    client_error = status is not None and 400 <= status < 500
+    if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
+        return problem("run.provider_overloaded", text, **known)
+    return problem("run.api_error", text, status=status or "", provider=provider)
 
 
 def _fail(target: NodeRun | Run, found: Problem) -> None:
@@ -3551,16 +3609,77 @@ def _child_ids(run: Run) -> list[str]:
     return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
 
 
-def _interrupt(run: Run) -> None:
-    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable."""
+#: A tool's error text that starts with a problem code (``mcp.unreachable: Docs cannot be reached``).
+_CODED_TOOL_ERROR = re.compile(r"^(?P<code>[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+):")
+#: Approval verdicts that mean the call was not made.
+_REFUSED_CALLS = ("rejected", "expired", "denied")
+
+
+def run_warnings(run: Run) -> list[RunWarning]:
+    """The tool calls of a run's nodes that were refused, expired or failed, one warning per node, tool and code
+    (AD-03): a run can succeed although an agent had to answer without one of its tools."""
+    found: dict[tuple[str, str, str], RunWarning] = {}
+    for node in run.workflow.nodes:
+        state = run.nodes.get(node.id)
+        if state is None:
+            continue
+        for call in [item for earlier in state.earlier for item in earlier.tool_calls] + state.tool_calls:
+            approval = call.approval
+            if approval is not None and approval.status in _REFUSED_CALLS:
+                code = approval.code or f"tool.approval_{approval.status}"
+            elif call.is_error:
+                matched = _CODED_TOOL_ERROR.match(call.output or "")
+                code = matched.group("code") if matched else "tool.failed"
+            else:
+                continue
+            key = (node.id, call.name, code)
+            if key in found:
+                found[key].count += 1
+            else:
+                found[key] = RunWarning(code=code, node_id=node.id, tool=call.name)
+    return list(found.values())
+
+
+def _with_team_runs(record: dict[str, Any], team_runs: dict[tuple[int, int], str]) -> dict[str, Any]:
+    """An orchestration record whose outcomes name the team run that produced them (X-02).
+
+    Orkexa sets an outcome's ``ref`` only for an assignment that waited and continued; a team run that ended at once
+    is added here from the runs started for each (step, slot). Orkexa uses ``ref`` only to continue a waiting
+    outcome, so naming finished ones changes nothing in the orchestration."""
+    groups = [(step.get("index"), step.get("outcomes") or []) for step in record.get("steps") or []]
+    pending = record.get("pending")
+    if pending:
+        groups.append((pending.get("index"), pending.get("outcomes") or []))
+    for index, outcomes in groups:
+        for slot, outcome in enumerate(outcomes):
+            if outcome.get("ref") is None and (index, slot) in team_runs:
+                outcome["ref"] = team_runs[(index, slot)]
+    return record
+
+
+def _interrupt(run: Run, *, shutdown: bool = False) -> None:
+    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable (AD-10).
+
+    - A step that was running fails with ``run.interrupted`` (continuing the run runs it again).
+    - ``shutdown``: the process stopped gracefully and the steps were stopped as cancelled first; a started step
+      that was cancelled that way is interrupted too, one that never started is "not reached" (``waiting``) again,
+      as after a crash. ``params.cause`` is ``shutdown`` (a crash or lost worker has no cause).
+    """
+    params = {"cause": "shutdown"} if shutdown else {}
     for state in run.nodes.values():
-        if state.status == "running":
+        stopped = shutdown and state.status == "cancelled" and state.error_code in (None, "run.node_cancelled")
+        if stopped and state.started_at is None:
+            state.status = "waiting"
+            state.finished_at = None
+            state.error = state.error_code = None
+            state.error_params = {}
+        elif state.status == "running" or stopped:
             state.status = "failed"
-            state.finished_at = now()
-            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran"))
+            state.finished_at = state.finished_at or now()
+            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran", **params))
     run.status = "failed"
     run.finished_at = now()
-    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran"))
+    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran", **params))
 
 
 def _abandon(run: Run) -> None:
