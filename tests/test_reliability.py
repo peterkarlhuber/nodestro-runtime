@@ -539,3 +539,19 @@ def test_a_worksheet_with_odd_row_references_is_still_read() -> None:
         archive.writestr("xl/worksheets/sheet1.xml", sheet)
     [found] = xlsx_sheets(buffer.getvalue())
     assert [row[0] for row in found.grid()] == ["first", "second"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as uv")
+def test_the_same_requirements_give_the_same_lock_in_every_process(tmp_path: Path) -> None:
+    """S-2 pilot F5: the lock named its temporary directory (``# via -r /tmp/nodestro-resolve-…/requirements.in``),
+    so every worker start computed another image tag for the runtime image and rebuilt it, which needs the network.
+    """
+    fake = tmp_path / "uv"
+    # Like ``uv pip compile <source> -o <output>``: the output names the source as it was given.
+    fake.write_text('#!/bin/sh\nprintf "six==1.17.0\\n    # via -r %s (in %s)\\n" "$3" "$(pwd)" > "$5"\n')
+    fake.chmod(0o755)
+    runner = UvRunner(tmp_path / "cache", binary=str(fake))
+    first, second = (runner.compile(["six"], python="3.13", previous="", log=lambda _: None) for _ in range(2))
+    assert "# via -r requirements.in (in " in first
+    assert first.split(" (in ")[0] == second.split(" (in ")[0]
+    assert "nodestro-resolve-" not in first.split(" (in ")[0]

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Fix: tools on a server worker after a restart without network (S-2 pilot finding F5):
+
+- A resolved lock named the temporary directory it was resolved in (`# via -r /tmp/nodestro-resolve-…/requirements.in`).
+  The image of the runtime requirements (tool code without third-party libraries) is resolved once per process, so
+  every worker start computed a new image tag and built that image again, which downloads its packages. Without
+  network the build failed and tool calls failed closed with "The sandbox image is not available". uv now runs in the
+  temporary directory with relative names, so the same requirements give the same lock and the existing image is
+  found. Resolving still needs the package index, or `UV_OFFLINE=1` with a prepared cache.
+
 Fix: continuing a paused run from several processes at once (Evolution review of api #40):
 
 - A paused run is queued again by a compare-and-set from `paused` (`replace_if` on `status`). When a decision and
