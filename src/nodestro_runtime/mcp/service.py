@@ -484,14 +484,14 @@ class McpService:
         """Approve or reject the tool's current definition. ``expected_hash`` guards against approving a definition
         that changed after the administrator looked at it; an approval needs it (independent review L-3), so an
         approval always names the exact definition the administrator reviewed."""
-        if approve and not expected_hash:
-            raise NodestroError(
-                "mcp.hash_required",
-                "An approval must name the definition hash that was reviewed",
-                name=name,
-            )
         with self._lock:
-            tool = self.tool(server_id, name)
+            tool = self.tool(server_id, name)  # an unknown tool stays "not found"
+            if approve and not expected_hash:
+                raise NodestroError(
+                    "mcp.hash_required",
+                    "An approval must name the definition hash that was reviewed",
+                    name=name,
+                )
             if expected_hash is not None and expected_hash != tool.hash:
                 raise NodestroError(
                     "mcp.definition_moved",
