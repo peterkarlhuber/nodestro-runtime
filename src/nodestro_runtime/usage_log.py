@@ -7,7 +7,8 @@ Agent that generates tools, the Workflow Architect (``workflow_design``, with
 the kind of request in ``detail``) and the Nodestro Assistant (``assistant``: the
 conversation in ``ref``, the answer in ``request``) and the AI judge of workflow test series
 (``benchmark_judge``: the test series run in ``ref``, the test case in ``request``) and the
-optional AI guide of a published API (``api_docs``: the guide in ``ref``). One entry per
+optional AI guide of a published API (``api_docs``: the guide in ``ref``) and the answers of the live run chat
+(``run_chat``: the run in ``ref``, the question in ``request``). One entry per
 operation and model, so the usage
 dashboard can show tokens, cost, model and time of every request without
 counting a run twice.
@@ -37,6 +38,7 @@ UsageSource = Literal[
     "assistant",
     "benchmark_judge",
     "api_docs",
+    "run_chat",
 ]
 USAGE_SOURCES: tuple[str, ...] = (
     "agent_test",
@@ -47,6 +49,7 @@ USAGE_SOURCES: tuple[str, ...] = (
     "assistant",
     "benchmark_judge",
     "api_docs",
+    "run_chat",
 )
 _COLLECTION = "usage_log"
 

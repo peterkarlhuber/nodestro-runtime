@@ -97,4 +97,28 @@ def import_trace(store: DocumentStore, data: bytes) -> tuple[Run, bool]:
                 state.status = "cancelled"
     store.put("runs", run.id, run)
     store.put_raw(_FINGERPRINTS, fingerprint(trace), run.id)
+    _import_chat(store, data, trace.id, run.id)
     return run, False
+
+
+def _import_chat(store: DocumentStore, data: bytes, old_id: str, new_id_: str) -> None:
+    """The live run chat an exported trace carries (``chat``, LRC-1), stored with the imported run (read-only)."""
+    from .run_chat import COLLECTION, MAX_MESSAGES_IMPORTED, RunMessage, message_key
+
+    raw = json.loads(data)
+    items = raw.get("chat") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return
+    for item in items[:MAX_MESSAGES_IMPORTED]:
+        try:
+            message = RunMessage.model_validate(item)
+        except ValidationError:
+            continue  # a damaged message is left out; the trace itself is valid
+        message = message.model_copy(
+            update={
+                "run_id": new_id_,
+                "target_run_id": new_id_ if message.target_run_id == old_id else message.target_run_id,
+                "client_id": None,
+            }
+        )
+        store.put(COLLECTION, message_key(new_id_, message.seq), message)

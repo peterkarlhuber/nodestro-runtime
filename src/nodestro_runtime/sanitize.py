@@ -57,7 +57,7 @@ _PERSONAL: list[tuple[str, re.Pattern[str]]] = [
 
 #: Run fields that hold free text, removed in the "contents" mode (paths in the run JSON).
 _RUN_TEXT = ("input", "output", "error")
-_NODE_TEXT = ("prompt", "output", "text", "thinking", "error")
+_NODE_TEXT = ("prompt", "output", "text", "thinking", "error", "current_decision")
 _AGENT_TEXT = ("system_prompt", "task_template", "description")
 
 
@@ -175,6 +175,11 @@ def sanitize_run(run: dict[str, Any], *, personal_data: bool = True, contents: b
                 state["memory"] = {path: sanitizer.removed(text) for path, text in state["memory"].items()}
             if state.get("evaluation"):
                 state["evaluation"]["feedback"] = sanitizer.removed(state["evaluation"].get("feedback"))
+        for message in copy.get("chat") or []:
+            # The live run chat (LRC-1) that a full trace export carries next to the run.
+            message["content"] = sanitizer.removed(message.get("content"))
+            if message.get("decision"):
+                message["decision"]["reason"] = sanitizer.removed(message["decision"].get("reason"))
         for node in (copy.get("workflow") or {}).get("nodes") or []:
             agent = node.get("agent")
             if agent:
