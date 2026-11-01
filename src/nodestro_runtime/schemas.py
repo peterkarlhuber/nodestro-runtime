@@ -351,8 +351,8 @@ class OrchestratorSelect(_Model):
 
     The selection is made when a run (or a published release) pins its workflows, so it is fixed and
     visible in the run's snapshot: every selected member names the tags it matched. Teams are ordered
-    by the number of matching tags, then by name; no score is invented. Workflows with errors, with
-    and the workflow itself are left out. Teams with approval steps are offered: the orchestrator waits while
+    by the number of matching tags, then by name; no score is invented. Workflows with errors and the
+    workflow itself are left out. Teams with approval steps are offered: the orchestrator waits while
     one of them waits for a person (AO M6b).
     """
 
