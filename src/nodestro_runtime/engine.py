@@ -35,6 +35,7 @@ import time
 from typing import Any, Literal, TypeVar
 
 from orkexa import (
+    CheckpointError,
     ContentBlock,
     Criterion,
     EphemeralMemory,
@@ -44,6 +45,8 @@ from orkexa import (
     ProviderError,
     Tool,
     ToolCall,
+    ToolCallSuspended,
+    TurnSuspended,
     UsageRecord,
     UsageSummary,
     flow,
@@ -56,7 +59,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, tool_policy
+from . import contracts, flow_driver, graph, tool_checkpoints, tool_policy
 from .agent_builder import AgentBuilder
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -100,7 +103,17 @@ from .schemas import (
     now,
 )
 from .storage import DocumentStore
-from .tool_approvals import INTERRUPTED, ToolApprovals, ToolGate, tool_facts
+from .tool_approvals import (
+    EXECUTION_WINDOW,
+    INTERRUPTED,
+    SWITCH_OFF,
+    ToolApprovalRequest,
+    ToolApprovals,
+    ToolGate,
+    arguments_hash,
+    checkpoints_enabled,
+    tool_facts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1166,8 +1179,99 @@ class RunManager:
         run.finished_at = now()
         _fail(run, problem("run.cancelled", "The run was cancelled"))
         self.store.put("runs", run.id, run)
+        self.discard_tool_waits(run.id, because="cancelled")
         self._forget_events(run.id)
         self._notify(run)
+
+    # ---- runs paused at a tool call (M6b) ------------------------------------------------------------------------
+
+    def discard_tool_waits(self, run_id: str, *, because: str) -> None:
+        """A run paused at tool calls ends (cancelled, deleted, gone): its questions are closed and its checkpoints
+        deleted, so nothing it waited for can run later."""
+        ToolApprovals(self.store).close_checkpointed(run_id, because=because)
+        tool_checkpoints.delete_run(self.store, run_id)
+
+    def decide_tool_call(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        approved: bool,
+        by: str,
+        arguments: str,
+        comment: str | None = None,
+    ) -> ToolApprovalRequest:
+        """Approve or reject one tool call (:meth:`ToolApprovals.decide`, unchanged). A run paused at the call
+        (M6b) continues once none of its calls waits any more; a run waiting in a thread reads the decision itself."""
+        decided = ToolApprovals(self.store).decide(
+            run_id, request_id, approved=approved, by=by, arguments=arguments, comment=comment
+        )
+        if decided.checkpointed:
+            self._continue_paused(run_id)
+        return decided
+
+    def _continue_paused(self, run_id: str) -> bool:
+        """Continue the top-level run of a run paused at tool calls once none of them is pending; ``False`` when
+        it cannot continue here (still waiting, not paused, executing, or no event loop: the sweep does it)."""
+        approvals = ToolApprovals(self.store)
+        if any(item.checkpointed for item in approvals.pending(run_id)):
+            return False
+        run = self.get(run_id)
+        if run is None:
+            return False
+        root = self.root_of(run)
+        if root.status != "paused" or root.id in self._contexts:
+            return False
+        try:
+            self.resume(root.id)
+        except NodestroError:  # no event loop here (``run.no_event_loop``): the next sweep continues it
+            return False
+        for item in approvals.of_run(run_id):
+            if not item.checkpointed or item.use != "open":
+                continue
+            if item.status == "approved":
+                # Marked when the resumed turn reaches the call (executed or stale), so audited once.
+                approvals.audit("resumed", item, outcome=item.status)
+            elif item.status in ("rejected", "expired") and approvals.use(item, "closed") is not None:
+                # Never usable again: closing it (compare-and-set) audits it once, not at every later continue.
+                approvals.audit("resumed", item, outcome=item.status)
+        return True
+
+    def sweep_tool_waits(self, *, resume: bool = True) -> list[str]:
+        """The deadline sweep of runs paused at tool calls (M6b; at start before anything continues, then
+        periodically). Returns the runs it continued.
+
+        - With the checkpoint switch off, every paused run's questions are closed (``switch_off``); when the run
+          continues, its node ends without running them (and its checkpoint is deleted). No call runs without the
+          gate.
+        - Pending questions past their deadline expire (the call counts as not approved in time).
+        - Checkpoints of runs that are gone or not paused any more are deleted, with their questions.
+        - A paused run with no pending question left continues (also when the process stopped after a decision).
+        """
+        approvals = ToolApprovals(self.store)
+        gate = self.tool_gate
+        enabled = gate is not None and gate.checkpoints and checkpoints_enabled()
+        holding = tool_checkpoints.runs_with_checkpoints(self.store)
+        if not enabled:
+            for run_id in holding:
+                for item in approvals.of_run(run_id):
+                    if item.checkpointed and (
+                        item.status == "pending" or (item.status == "approved" and item.use == "open")
+                    ):
+                        approvals.audit("switch_off", item)
+                # The checkpoint stays until the run continues: then the node ends without running the call.
+                approvals.close_checkpointed(run_id, because=SWITCH_OFF)
+        for item in approvals.overdue():
+            approvals.close(item.run_id, item.id, "expired", because="deadline")
+        continued: list[str] = []
+        for run_id in holding:
+            run = self.store.get("runs", run_id, Run)
+            if run is None or run.status in ("succeeded", "failed", "cancelled"):
+                self.discard_tool_waits(run_id, because="run.gone")
+                continue
+            if run.status == "paused" and resume and self._continue_paused(run_id):
+                continued.append(run_id)
+        return continued
 
     def _notify(self, run: Run) -> None:
         for listener in list(self.listeners):
@@ -1908,6 +2012,8 @@ class RunManager:
             await self._orchestrate(context, node, inputs, absent)
             return
         assert node.agent is not None
+        # Paused at a tool call (M6b): the turn continues from its checkpoint, the model is not asked again.
+        resuming = state.status == "awaiting_approval"
         state.status = "running"
         config = node.agent
         prompt = render_task(
@@ -1921,7 +2027,9 @@ class RunManager:
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
-        await asyncio.to_thread(self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id))
+        await asyncio.to_thread(
+            self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
+        )
         self._save(context)
 
     def _prompt_values(self, run: Run, *, mark_empty: bool = True) -> dict[str, Any]:
@@ -2077,11 +2185,17 @@ class RunManager:
         call: ToolCall,
         record: ToolCallRecord,
         gate: ToolGate,
+        *,
+        suspend: bool = False,
     ) -> str | None:
         """Apply the per-call rules (S-2) to one call in the agent's thread: ``None`` runs it, a string denies it.
 
         Asking waits here for a stored decision (at most the deadline); the run stays ``running``. An approval only
-        lets the call run as it would have without the question, in its sandbox (ADR-0006)."""
+        lets the call run as it would have without the question, in its sandbox (ADR-0006).
+
+        With ``suspend`` (agent checkpoints, M6b) asking stores the same request and stops the turn instead
+        (:class:`~orkexa.ToolCallSuspended`): the run pauses and frees its worker; the decision continues it
+        (:meth:`_gate_resumed_call`)."""
         capability, version, kind, definition = tool_facts(context.env.builder.tools, call.name)
         root = context.root.run
         situation = gate.call_context(
@@ -2105,6 +2219,8 @@ class RunManager:
                 context, node_id, call, record, verdict.code or "tool.denied_by_policy", verdict.reason or "", shown
             )
         run_id = context.run.id
+        if suspend:
+            return self._suspend_call(context, node_id, call, record, gate, capability, version, definition, shown)
         if not gate.slots.enter(run_id):
             return self._deny_call(
                 context,
@@ -2181,6 +2297,278 @@ class RunManager:
             return "Nobody approved this call in time, so it was not made"
         context.check()
         raise RunCancelled("The run was cancelled")
+
+    def _suspend_call(
+        self,
+        context: _RunContext,
+        node_id: str,
+        call: ToolCall,
+        record: ToolCallRecord,
+        gate: ToolGate,
+        capability: tool_policy.ToolCapability,
+        version: int | None,
+        definition: str | None,
+        shown: dict[str, str],
+    ) -> str | None:
+        """Ask about a call by pausing the run at it (M6b): store the request, then stop the turn."""
+        run_id = context.run.id
+        paused = tool_checkpoints.runs_with_checkpoints(self.store) - {run_id}
+        if len(paused) >= gate.max_paused:
+            return self._deny_call(
+                context,
+                node_id,
+                call,
+                record,
+                "tool.approval_capacity",
+                "Too many runs are waiting for an approval right now, so this call was not made",
+                shown,
+            )
+        request = gate.approvals.request(
+            run_id=run_id,
+            node_id=node_id,
+            iteration=context.run.nodes[node_id].iteration,
+            call_id=call.id,
+            tool=call.name,
+            arguments=call.input,
+            capability=capability,
+            version=version,
+            definition_hash=definition,
+            checkpointed=True,
+        )
+        record.approval = ToolCallApproval(
+            status="pending", request_id=request.id, deadline=request.deadline, capability=shown
+        )
+        gate.approvals.audit("suspended", request)
+        self._emit(
+            context,
+            "tool_approval_requested",
+            node_id,
+            id=call.id,
+            name=call.name,
+            request_id=request.id,
+            deadline=request.deadline.isoformat(),
+            arguments_hash=request.arguments_hash,
+        )
+        raise ToolCallSuspended("waits for a person's approval", ref=request.id)
+
+    def _gate_resumed_call(
+        self,
+        context: _RunContext,
+        node_id: str,
+        config: AgentConfig,
+        call: ToolCall,
+        record: ToolCallRecord,
+        gate: ToolGate,
+        iteration: list[int],
+        released: dict[str, ToolApprovalRequest],
+    ) -> str | None:
+        """Decide a call of a resumed turn (M6b; Evolution conditions 1, 2 and 5).
+
+        Only the stored request of exactly this call answers it (run, node, iteration, call id, arguments hash and
+        tool version or definition hash); nobody is asked again and no new request is made. The rules are applied
+        again and a new deny wins. An approved call runs only within :data:`EXECUTION_WINDOW` after its decision and
+        at most once: ``use`` is set to ``executed`` by compare-and-set right before it runs, so a second resume (or
+        a crash after the mark) never runs it again (``tool.result_lost``). The released request is put in
+        ``released``; what really happened (``executed``, or ``stale`` when the tool changed in between and refused
+        the call) is audited when the call ends (:meth:`_audit_released`)."""
+        approvals = gate.approvals
+        run_id = context.run.id
+        shown = record.approval.capability if record.approval is not None else {}
+        found = approvals.matching(run_id, node_id=node_id, iteration=iteration, call_id=call.id)
+        if found is None:
+            return self._deny_call(
+                context, node_id, call, record, "tool.approval_missing", "The approval of this call is gone", shown
+            )
+        if found.status == "pending":
+            # Still undecided (another call of the same turn was decided): keep waiting, without a new question.
+            raise ToolCallSuspended("waits for a person's approval", ref=found.id)
+        capability, version, kind, _definition = tool_facts(context.env.builder.tools, call.name)
+        shown = capability.model_dump()
+        current = _current_hash(context.env.builder.tools, call)
+        if found.status != "approved":
+            return self._record_decision(context, node_id, record, found, shown)
+        if found.use == "executed":
+            approvals.audit("result_lost", found)
+            return self._deny_call(
+                context,
+                node_id,
+                call,
+                record,
+                "tool.result_lost",
+                "This call may have been made, but its result was lost; it is not made again",
+                shown,
+            )
+        if found.use != "open":
+            return self._deny_call(
+                context, node_id, call, record, "tool.approval_stale", "This approval can no longer be used", shown
+            )
+        stale: str | None = None
+        if current != found.arguments_hash:
+            stale = "changed"
+        elif found.decided_at is None or found.decided_at > found.deadline:
+            stale = "late_decision"
+        elif now() > found.decided_at + EXECUTION_WINDOW:
+            stale = "execution_window"
+        if stale is not None:
+            if approvals.use(found, "stale") is not None:
+                approvals.audit("stale", found, outcome=stale)
+            return self._deny_call(
+                context,
+                node_id,
+                call,
+                record,
+                "tool.approval_stale",
+                "The approved call changed or waited too long, so it was not made",
+                shown,
+            )
+        root = context.root.run
+        situation = gate.call_context(
+            run_id=run_id, node_id=node_id, trigger=root.trigger, trigger_ref=root.trigger_ref
+        )
+        verdict = tool_policy.decide(
+            tool=call.name,
+            kind=kind,
+            capability=capability,
+            binding=config.tool_policies.get(call.name),
+            context=situation,
+            at=now(),
+            version=version,
+        )
+        if verdict.action == "deny":
+            if approvals.use(found, "stale") is not None:
+                approvals.audit("stale", found, outcome=verdict.code or "tool.denied_by_policy")
+            return self._deny_call(
+                context, node_id, call, record, verdict.code or "tool.denied_by_policy", verdict.reason or "", shown
+            )
+        marked = approvals.use(found, "executed")
+        if marked is None:
+            # Another process used it first: never run the call twice.
+            approvals.audit("result_lost", found, outcome="raced")
+            return self._deny_call(
+                context, node_id, call, record, "tool.result_lost", "This call was already handled elsewhere", shown
+            )
+        released[call.id] = marked
+        self._record_decision(context, node_id, record, marked, shown)
+        return None
+
+    def _audit_released(
+        self, context: _RunContext, gate: ToolGate, call: ToolCall, request: ToolApprovalRequest, is_error: bool
+    ) -> None:
+        """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
+        after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
+        (``tool.changed``), not ``executed``. The request stays ``executed``, so the call never runs later."""
+        if is_error and _current_hash(context.env.builder.tools, call) != request.arguments_hash:
+            gate.approvals.audit("stale", request, outcome="tool.changed")
+        else:
+            gate.approvals.audit("executed", request)
+
+    def _record_decision(
+        self,
+        context: _RunContext,
+        node_id: str,
+        record: ToolCallRecord,
+        final: ToolApprovalRequest,
+        shown: dict[str, str],
+    ) -> str | None:
+        """Record a decided request on the call; ``None`` when approved, the denial text otherwise."""
+        code = {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+        if final.status == "cancelled":
+            code = final.closed_because or "run.cancelled"
+        record.approval = ToolCallApproval(
+            status=final.status,
+            request_id=final.id,
+            code=code,
+            deadline=final.deadline,
+            decided_by=final.decided_by,
+            decided_at=final.decided_at,
+            comment=final.comment,
+            capability=shown,
+        )
+        self._emit(
+            context,
+            "tool_approval_decided",
+            node_id,
+            id=record.id,
+            request_id=final.id,
+            status=final.status,
+            decided_by=final.decided_by,
+        )
+        if final.status == "approved":
+            return None
+        if final.status == "rejected":
+            return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
+        if final.status == "expired":
+            return "Nobody approved this call in time, so it was not made"
+        return "The question about this call was closed, so it was not made"
+
+    def _suspend_agent(
+        self,
+        context: _RunContext,
+        node_id: str,
+        state: NodeRun,
+        iteration: list[int],
+        stop: AgentSuspended,
+        gate: ToolGate,
+    ) -> None:
+        """Store where the turn stopped and let the node wait (the run pauses)."""
+        turn = stop.checkpoint
+        refs = [item.ref for item in turn.waiting if item.ref]
+        requests = [found for ref in refs if (found := gate.approvals.get(context.run.id, ref)) is not None]
+        latest = max((item.deadline for item in requests), default=now())
+        tool_checkpoints.save(
+            self.store,
+            tool_checkpoints.AgentCheckpoint(
+                run_id=context.run.id,
+                node_id=node_id,
+                iteration=iteration,
+                turn=turn.model_dump(mode="json"),
+                memory=stop.memory,
+                request_ids=refs,
+                expires_at=latest + EXECUTION_WINDOW,
+            ),
+        )
+        state.status = "awaiting_approval"
+
+    def _checkpoint_lost(self, context: _RunContext, node: Node, state: NodeRun, prior: Usage | None) -> None:
+        """A paused agent whose checkpoint is gone, expired or switched off: the waiting calls never run."""
+        gate = self.tool_gate
+        if gate is not None:
+            self._close_node_waits(context.run.id, node.id, list(state.iteration), gate.approvals, because=SWITCH_OFF)
+        tool_checkpoints.delete(self.store, context.run.id, node.id, list(state.iteration))
+        state.status = "failed"
+        if prior is not None:
+            state.usage = prior
+        state.finished_at = now()
+        _fail(
+            state,
+            problem(
+                "tool.checkpoint_expired",
+                "The waiting tool call can no longer continue (it expired or the setting was switched off)",
+            ),
+        )
+        self._emit(
+            context,
+            "node_finished",
+            node.id,
+            status=state.status,
+            error=state.error,
+            error_code=state.error_code,
+            error_params=state.error_params,
+            usage=state.usage.model_dump(mode="json"),
+        )
+
+    @staticmethod
+    def _close_node_waits(
+        run_id: str, node_id: str, iteration: list[int], approvals: ToolApprovals, *, because: str
+    ) -> None:
+        """Close the open requests of one node's turn: pending ones are cancelled, approved unused ones closed."""
+        for item in approvals.of_run(run_id):
+            if not item.checkpointed or item.node_id != node_id or item.iteration != iteration:
+                continue
+            if item.status == "pending":
+                approvals.close(run_id, item.id, "cancelled", because=because)
+            elif item.status == "approved" and item.use == "open":
+                approvals.use(item, "closed")
 
     def _deny_call(
         self,
@@ -2481,13 +2869,33 @@ class RunManager:
         )
         return decision_of(outcome.output)
 
-    def _run_agent_sync(self, context: _RunContext, node: Node, prompt: str, with_run_files: bool) -> None:
-        """Runs in a worker thread: build the agent, ask (or refine), record the result."""
+    def _run_agent_sync(
+        self, context: _RunContext, node: Node, prompt: str, with_run_files: bool, resuming: bool = False
+    ) -> None:
+        """Runs in a worker thread: build the agent, ask (or refine), record the result.
+
+        With agent checkpoints (M6b) a call that waits for a person stops the turn: the checkpoint is stored, the
+        node waits (``awaiting_approval``) and the run pauses. ``resuming`` continues that turn from its checkpoint
+        without asking the model again."""
         assert node.agent is not None
         config = node.agent
         state = context.run.nodes[node.id]
         node_id = node.id
         calls: dict[str, ToolCallRecord] = {}
+        released: dict[str, ToolApprovalRequest] = {}
+        gate = self.tool_gate
+        # A judge refines whole answers, which a checkpoint cannot hold: such agents keep waiting in the thread.
+        checkpointing = (
+            gate is not None and gate.checkpoints and not (config.quality.enabled and config.quality.criteria)
+        )
+        iteration = list(state.iteration)
+        prior = state.usage.model_copy() if resuming else None
+        checkpoint: tool_checkpoints.AgentCheckpoint | None = None
+        if resuming:
+            checkpoint = tool_checkpoints.load(self.store, context.run.id, node_id, iteration)
+            if checkpoint is None or gate is None or not checkpointing:
+                self._checkpoint_lost(context, node, state, prior)
+                return
 
         def on_text(delta: str) -> None:
             context.check()
@@ -2505,21 +2913,32 @@ class RunManager:
 
         def before_tool(call: ToolCall) -> str | None:
             context.check()
-            record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
-            mcp = context.env.builder.tools.mcp
-            if mcp is not None and is_mcp_tool(call.name):
-                record.provenance = mcp.provenance(call.name)
+            # A resumed call keeps the record it got when it was asked about.
+            record = next((item for item in state.tool_calls if item.id == call.id), None) if call.resumed else None
+            if record is None:
+                record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
+                mcp = context.env.builder.tools.mcp
+                if mcp is not None and is_mcp_tool(call.name):
+                    record.provenance = mcp.provenance(call.name)
+                with context.lock:
+                    state.tool_calls.append(record)
             calls[call.id] = record
-            with context.lock:
-                state.tool_calls.append(record)
             denial = None
             own = {tool.name for tool in extra_tools} | {MEMORY_TOOL_NAME}
-            if self.tool_gate is not None and call.name not in own:
-                denial = self._gate_call(context, node_id, config, call, record, self.tool_gate)
+            if gate is not None and call.name not in own:
+                if checkpointing and call.resumed:
+                    denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
+                else:
+                    denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
+            elif call.resumed:
+                pass  # an own tool never waits, so it is never resumed
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
             return denial
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
+            request = released.pop(call.id, None)
+            if request is not None and gate is not None:
+                self._audit_released(context, gate, call, request, is_error)
             record = calls.get(call.id)
             if record is not None:
                 record.output = content[:20_000]
@@ -2561,6 +2980,7 @@ class RunManager:
             extra_tools.append(
                 _proposal_tool(state, config, lambda: self._emit(context, "knowledge_proposed", node_id))
             )
+        suspended = False
         try:
             outcome = execute_agent(
                 context.env.builder,
@@ -2576,6 +2996,10 @@ class RunManager:
                 extra_tools=extra_tools,
                 cancelled=context.cancelled.is_set,
                 attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
+                run_memory=(
+                    (lambda: EphemeralMemory(checkpoint.memory or {})) if checkpoint is not None else EphemeralMemory
+                ),
+                resume=checkpoint.turn if checkpoint is not None else None,
             )
             state.output = outcome.output
             state.memory = outcome.memory
@@ -2592,15 +3016,34 @@ class RunManager:
                 state.evaluation = outcome.evaluation
                 self._emit(context, "evaluation", node_id, **outcome.evaluation.model_dump())
             state.status = "succeeded"
+        except AgentSuspended as stop:
+            suspended = True
+            assert gate is not None
+            self._suspend_agent(context, node_id, state, iteration, stop, gate)
         except RunCancelled:
             state.status = "cancelled"
             _fail(state, problem("run.node_cancelled", "Cancelled"))
+        except CheckpointError as exc:
+            # The agent changed since the turn stopped (prompt, tools, model): the waiting calls never run.
+            state.status = "failed"
+            _fail(state, problem("tool.checkpoint_stale", f"The agent changed while it waited: {exc}"))
         except Exception as exc:  # API errors, budget, invalid configuration
             state.status = "failed"
             _fail(state, node_problem(exc))
         finally:
+            if checkpointing and not suspended:
+                # The turn ended (or failed): what it waited for is over, nothing of it may run later.
+                if gate is not None and (resuming or checkpoint is not None):
+                    self._close_node_waits(context.run.id, node_id, iteration, gate.approvals, because="turn_ended")
+                tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)
+                for item in state.tool_calls:
+                    if item.approval is not None and item.approval.status == "pending":
+                        code = state.error_code or "run.node_cancelled"
+                        item.approval = item.approval.model_copy(update={"status": "cancelled", "code": code})
             state.usage = self._node_usage(context, node_id)
-            state.finished_at = now()
+            if prior is not None:
+                state.usage = add_usage(prior, state.usage)
+            state.finished_at = None if suspended else now()
             self._emit(
                 context,
                 "node_finished",
@@ -2694,8 +3137,12 @@ def execute_agent(
     extra_tools: list[Tool] | None = None,
     cancelled: Callable[[], bool] | None = None,
     attended: bool = True,
+    resume: Mapping[str, Any] | None = None,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
+
+    ``resume`` continues a turn from its orkexa checkpoint instead of asking (M6b); a turn that stops at a waiting
+    call raises :class:`AgentSuspended` with the checkpoint and the run memory.
 
     Used by workflow runs and by the agent test in the inspector, so both behave the same.
     Agent and judge each use the connection of their own provider.
@@ -2741,9 +3188,28 @@ def execute_agent(
             feedback=refinement.evaluation.feedback(),
         )
     else:
-        result = agent.ask(prompt)
+        try:
+            result = agent.resume(resume) if resume is not None else agent.ask(prompt)
+        except TurnSuspended as stop:
+            files = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
+            raise AgentSuspended(stop.checkpoint, files) from None
     memory = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
     return AgentOutcome(output=_jsonable(result), evaluation=evaluation, memory=memory)
+
+
+class AgentSuspended(Exception):
+    """An agent's turn stopped at a tool call that waits (M6b): its checkpoint and its run memory."""
+
+    def __init__(self, checkpoint: Any, memory: dict[str, str] | None) -> None:
+        super().__init__("the agent waits for a tool approval")
+        self.checkpoint = checkpoint
+        self.memory = memory
+
+
+def _current_hash(tools: Any, call: ToolCall) -> str:
+    """The arguments hash of a call against the tool as it is now (version or MCP definition)."""
+    _capability, version, _kind, definition = tool_facts(tools, call.name)
+    return arguments_hash(call.name, call.input, version=version, definition_hash=definition)
 
 
 def node_problem(exc: BaseException) -> Problem:

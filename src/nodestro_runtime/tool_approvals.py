@@ -14,6 +14,12 @@ interval: the decision reaches it through the database, whichever process made i
 request id (call ids of some providers repeat), and the request records the node, its loop iteration and the call
 id. It is bound to the exact arguments and the tool version or MCP definition hash (:func:`arguments_hash`); it is
 never matched to another call, and a request that is not ``pending`` any more never becomes ``pending`` again.
+
+With :data:`CHECKPOINTS_ENV` switched on as well (M6b, default off), the run does not wait in a thread: the agent's
+turn stops at the call (an orkexa turn checkpoint, :mod:`nodestro_runtime.tool_checkpoints`), the run pauses and
+frees its worker, and the decision continues it. Such a request is ``checkpointed``. On resume only this request
+can answer the call; an approved call runs at most once (``use`` goes from ``open`` to ``executed`` in one
+compare-and-set), and only within :data:`EXECUTION_WINDOW` after the decision.
 """
 
 from __future__ import annotations
@@ -40,10 +46,17 @@ COLLECTION = "tool_approvals"
 DEFAULT_WAIT = timedelta(minutes=15)
 MAX_WAIT = timedelta(minutes=15)
 POLL_SECONDS = 1.0
+#: How long after its approval a checkpointed call may still run; later it is stale and never runs (M6b).
+EXECUTION_WINDOW = timedelta(minutes=15)
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired", "cancelled"]
 #: ``closed_because`` of the requests of a run that was stopped elsewhere.
 INTERRUPTED = "run.interrupted"
+#: ``closed_because`` of the requests of paused runs found while the checkpoint switch is off (M6b).
+SWITCH_OFF = "switch_off"
+#: What became of an approved checkpointed call: ``open`` (not run yet), ``executed`` (marked right before it ran),
+#: ``stale`` (too late, or the call or the rules changed), ``closed`` (switch off, cancel, the run is gone).
+CallUse = Literal["open", "executed", "stale", "closed"]
 FINAL: frozenset[str] = frozenset({"approved", "rejected", "expired", "cancelled"})
 
 
@@ -64,7 +77,21 @@ AUDIT = "tool_approval_audit"
 #: The newest audit events kept per tenant (older ones are dropped when the trail is read).
 MAX_AUDIT = 5000
 
-AuditKind = Literal["decided", "decision_refused", "pre_granted", "pre_grant_revoked", "legacy_stamped"]
+AuditKind = Literal[
+    "decided",
+    "decision_refused",
+    "pre_granted",
+    "pre_grant_revoked",
+    "legacy_stamped",
+    # M6b: a turn stopped at the call (checkpoint), the paused run went on, the approved call ran, an approval
+    # could not be used any more, a call whose result was lost in a crash, requests closed because the switch is off.
+    "suspended",
+    "resumed",
+    "executed",
+    "stale",
+    "result_lost",
+    "switch_off",
+]
 
 
 class ToolApprovalEvent(BaseModel):
@@ -123,6 +150,11 @@ class ToolApprovalRequest(BaseModel):
     #: Why a request was closed without a decision: ``deadline``, ``cancelled`` or ``run.interrupted`` (the run was
     #: stopped elsewhere, e.g. by the reaper: the waiting run must not go on either).
     closed_because: str | None = None
+    #: The run paused at this call (an agent checkpoint) instead of waiting in a thread (M6b).
+    checkpointed: bool = False
+    #: Whether an approved checkpointed call ran (:data:`CallUse`); changed only by compare-and-set from ``open``.
+    use: CallUse = "open"
+    executed_at: datetime | None = None
 
     @property
     def key(self) -> str:
@@ -163,6 +195,7 @@ class ToolApprovals:
         capability: ToolCapability,
         version: int | None = None,
         definition_hash: str | None = None,
+        checkpointed: bool = False,
     ) -> ToolApprovalRequest:
         """Store a new pending request with a new id (never replacing another one)."""
         asked = self.clock()
@@ -179,6 +212,7 @@ class ToolApprovals:
             arguments_hash=arguments_hash(tool, arguments, version=version, definition_hash=definition_hash),
             requested_at=asked,
             deadline=asked + self.wait_for,
+            checkpointed=checkpointed,
         )
         self.store.put(COLLECTION, found.key, found)
         return found
@@ -320,6 +354,73 @@ class ToolApprovals:
         closed = found.model_copy(update={"status": status, "decided_at": self.clock(), "closed_because": because})
         return self.store.replace_if(COLLECTION, found.key, closed, field="status", expected="pending")
 
+    def use(self, found: ToolApprovalRequest, use: CallUse) -> ToolApprovalRequest | None:
+        """Mark what became of an approved checkpointed call, once: a compare-and-set from ``open``. ``None`` when
+        another process marked it first (the call must then not run here)."""
+        marked = found.model_copy(update={"use": use, "executed_at": self.clock() if use == "executed" else None})
+        if self.store.replace_if(COLLECTION, found.key, marked, field="use", expected="open"):
+            return marked
+        return None
+
+    def matching(
+        self, run_id: str, *, node_id: str, iteration: Sequence[int], call_id: str
+    ) -> ToolApprovalRequest | None:
+        """The newest checkpointed request of exactly this call (run, node, loop iteration, call id); ``None``
+        when there is none. A request of another iteration or turn never matches."""
+        found = [
+            item
+            for item in self.of_run(run_id)
+            if item.checkpointed
+            and item.node_id == node_id
+            and item.iteration == list(iteration)
+            and item.call_id == call_id
+        ]
+        return found[-1] if found else None
+
+    def close_checkpointed(self, run_id: str, *, because: str) -> int:
+        """Close what a paused run's checkpoint still holds: pending requests become ``cancelled`` and approved
+        calls that did not run are marked ``closed`` (they never run). Returns how many changed."""
+        changed = 0
+        for item in self.of_run(run_id):
+            if not item.checkpointed:
+                continue
+            if item.status == "pending":
+                changed += self.close(run_id, item.id, "cancelled", because=because)
+            elif item.status == "approved" and item.use == "open":
+                closed = item.model_copy(update={"use": "closed", "closed_because": because})
+                changed += self.store.replace_if(COLLECTION, item.key, closed, field="use", expected="open")
+        return changed
+
+    def overdue(self) -> list[ToolApprovalRequest]:
+        """Pending checkpointed requests whose deadline passed (the deadline sweep closes them)."""
+        at = self.clock()
+        return [item for item in self.open() if item.checkpointed and item.deadline <= at]
+
+    def audit(
+        self,
+        kind: AuditKind,
+        found: ToolApprovalRequest,
+        *,
+        actor: str = "nodestro",
+        outcome: str | None = None,
+        **details: Any,
+    ) -> None:
+        """An audit event about one request: never its arguments, only their hash."""
+        record_audit(
+            self.store,
+            ToolApprovalEvent(
+                at=self.clock(),
+                kind=kind,
+                actor=actor,
+                tool=found.tool,
+                run_id=found.run_id,
+                request_id=found.id,
+                outcome=outcome,
+                arguments_hash=found.arguments_hash,
+                details=details,
+            ),
+        )
+
     def expire_run(self, run_id: str) -> int:
         """Expire every pending request of a run (the run stopped: interrupted, lost lease, crash, restart)."""
         return sum(self.close(run_id, item.id, "expired", because=INTERRUPTED) for item in self.pending(run_id))
@@ -342,12 +443,31 @@ class ToolApprovals:
 #: Switches per-call approvals on (``1``). Off by default: activating them is a separate, explicit step after the
 #: security acceptance (D10); while off, runs behave exactly as before S-2.
 ENABLE_ENV = "NODESTRO_TOOL_APPROVALS"
+#: Pauses runs at a call that waits for a decision instead of waiting in a thread (``1``; M6b, default off). Only
+#: effective together with :data:`ENABLE_ENV`; activation is a separate decision like the approvals themselves.
+CHECKPOINTS_ENV = "NODESTRO_TOOL_APPROVAL_CHECKPOINTS"
+#: How many runs of one tenant may be paused at a tool call at the same time (``NODESTRO_TOOL_APPROVAL_MAX_PAUSED``).
+DEFAULT_MAX_PAUSED = 20
+MAX_PAUSED_ENV = "NODESTRO_TOOL_APPROVAL_MAX_PAUSED"
 #: How many runs of one process may wait for an approval at the same time (desktop default 3, D10 concept §2.4).
 DESKTOP_MAX_WAITING = 3
 
 
 def approvals_enabled() -> bool:
     return os.environ.get(ENABLE_ENV, "").strip() == "1"
+
+
+def checkpoints_enabled() -> bool:
+    """Whether calls that wait for a decision pause their run (both switches on)."""
+    return approvals_enabled() and os.environ.get(CHECKPOINTS_ENV, "").strip() == "1"
+
+
+def max_paused() -> int:
+    """The per-tenant cap on runs paused at a tool call (:data:`DEFAULT_MAX_PAUSED` unless configured)."""
+    try:
+        return max(0, int(os.environ.get(MAX_PAUSED_ENV, "") or DEFAULT_MAX_PAUSED))
+    except ValueError:
+        return DEFAULT_MAX_PAUSED
 
 
 class WaitingSlots:
@@ -399,8 +519,14 @@ class ToolGate:
         slots: WaitingSlots | None = None,
         pre_grants: Callable[[PreGrantScope, str], Sequence[ToolPreGrant]] = lambda _scope, _ref: (),
         mcp_unattended: Callable[[], bool] = lambda: False,
+        checkpoints: bool = False,
+        max_paused: int = DEFAULT_MAX_PAUSED,
     ) -> None:
         self.approvals = approvals
+        #: Pause the run at a call that waits (M6b) instead of waiting in the agent's thread.
+        self.checkpoints = checkpoints
+        #: At most this many runs of the tenant paused at a tool call; above it a call is denied at once.
+        self.max_paused = max_paused
         self.slots = slots or WaitingSlots()
         #: The pre-grants stored for one unattended scope (schedule, batch, test series); none until they are stored.
         self.pre_grants = pre_grants
@@ -532,16 +658,22 @@ class ToolPreGrants:
 
 __all__ = [
     "AUDIT",
+    "CHECKPOINTS_ENV",
     "COLLECTION",
+    "DEFAULT_MAX_PAUSED",
     "DEFAULT_WAIT",
     "DESKTOP_MAX_WAITING",
     "ENABLE_ENV",
+    "EXECUTION_WINDOW",
     "FINAL",
     "INTERRUPTED",
+    "MAX_PAUSED_ENV",
     "MAX_WAIT",
     "PRE_GRANTS",
+    "SWITCH_OFF",
     "ApprovalStatus",
     "AuditKind",
+    "CallUse",
     "ToolApprovalEvent",
     "ToolApprovalRequest",
     "ToolApprovals",
@@ -551,6 +683,8 @@ __all__ = [
     "approvals_enabled",
     "arguments_hash",
     "audit_events",
+    "checkpoints_enabled",
+    "max_paused",
     "record_audit",
     "request_key",
     "tool_facts",
