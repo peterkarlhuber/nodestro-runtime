@@ -137,9 +137,12 @@ touched.
 editor shows, `nodestro_runtime.preflight`), refuses a run that would fail for a known reason and returns the
 queued run. `await workspace.wait(run_id)` returns it once it finished or paused. `workspace.cancel(run_id)`
 stops a running or paused run, and also ends a run stored as queued or running that nothing executes (for example
-one restored from a backup taken while it ran). Agents and orchestrator decisions execute in a thread pool of the
-run manager, separate from asyncio's default executor: `NODESTRO_RUN_THREADS` (default 32) sets how many run at the
-same time (agents waiting for a tool approval included); further agents wait for a free thread.
+one restored from a backup taken while it ran). A tool call of a cancelled run that is running in the built-in Linux
+sandbox or in a container sandbox Nodestro built (`StreamedSandbox`) is stopped as well
+(`nodestro_runtime.sandbox_cancel`); calls in Orkexa's process or Docker sandbox end at their timeout. Agents and
+orchestrator decisions execute in a thread pool of the run manager, separate from asyncio's default executor:
+`NODESTRO_RUN_THREADS` (default 32) sets how many run at the same time (agents waiting for a tool approval
+included); further agents wait for a free thread.
 
 **Approvals.** An approval node pauses the run (`status == "paused"`, the node is `awaiting_approval`) until
 a person decides with `workspace.decide(run_id, node_id, "approved" | "rejected", comment)`. Nothing is ever

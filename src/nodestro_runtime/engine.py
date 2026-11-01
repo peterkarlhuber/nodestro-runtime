@@ -62,7 +62,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, tool_checkpoints, tool_journal, tool_policy
+from . import contracts, flow_driver, graph, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -3263,6 +3263,8 @@ class RunManager:
                 _proposal_tool(state, config, lambda: self._emit(context, "knowledge_proposed", node_id))
             )
         suspended = False
+        # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
+        cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
             outcome = execute_agent(
                 context.env.builder,
@@ -3315,6 +3317,7 @@ class RunManager:
             state.status = "failed"
             _fail(state, node_problem(exc))
         finally:
+            sandbox_cancel.reset(cancel_token)
             if checkpointing and not suspended:
                 # The turn ended (or failed): what it waited for is over, nothing of it may run later.
                 if gate is not None and (resuming or checkpoint is not None):
