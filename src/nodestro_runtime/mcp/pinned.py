@@ -38,11 +38,11 @@ class PinnedMcp:
             return None
         return self.service.find(tool_name)
 
-    def check(self, tool_name: str) -> tuple[McpServer, McpTool]:
+    def check(self, tool_name: str, *, gated: bool = False) -> tuple[McpServer, McpTool]:
         ref = self.refs.get(tool_name)
         if ref is None:
             raise NodestroError("mcp.tool_not_in_release", f"{tool_name} is not part of this release", name=tool_name)
-        server, tool = self.service.check(tool_name)
+        server, tool = self.service.check(tool_name, gated=gated)
         if server.id != ref.server_id or tool.approved_hash != ref.hash or tool.access != ref.access:
             raise NodestroError(
                 "mcp.release_tool_changed",
@@ -61,17 +61,22 @@ class PinnedMcp:
                 continue
         return result
 
-    def agent_tool(self, tool_name: str, *, cancelled: Callable[[], bool] | None = None) -> Tool:
+    def agent_tool(self, tool_name: str, *, cancelled: Callable[[], bool] | None = None, gated: bool = False) -> Tool:
         from .tools import McpAgentTool
 
-        server, tool = self.check(tool_name)
-        return McpAgentTool(self, server, tool, cancelled=cancelled)  # type: ignore[arg-type]
+        server, tool = self.check(tool_name, gated=gated)
+        return McpAgentTool(self, server, tool, cancelled=cancelled, gated=gated)  # type: ignore[arg-type]
 
     def call(
-        self, tool_name: str, arguments: dict[str, Any], *, cancelled: Callable[[], bool] | None = None
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        gated: bool = False,
     ) -> tuple[McpServer, McpTool, CallResult]:
-        self.check(tool_name)
-        return self.service.call(tool_name, arguments, cancelled=cancelled)
+        self.check(tool_name, gated=gated)
+        return self.service.call(tool_name, arguments, cancelled=cancelled, gated=gated)
 
     def provenance(self, tool_name: str) -> dict[str, Any]:
         found = self.service.provenance(tool_name)

@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Security fixes from the independent MCP review (H-1, M-1, M-2, L-2..L-8):
+
+- H-1: the process-wide per-call approval switch (`NODESTRO_TOOL_APPROVALS=1`, `McpService.write_gate`) no longer opens
+  MCP tools that change data on its own. `McpService.check/agent_tool/call`, `PinnedMcp`, `McpAgentTool`,
+  `ToolLibrary.tool`, `AgentBuilder.build` and `execute_agent` take an explicit `gated` flag; a non-read MCP tool needs
+  `write_gate and gated`. Only the run engine passes `gated=True` (it asks a person before every such call);
+  assignability checks (`validate`, `usable`, `pin`) ask "could a gated run use it". The agent test applies the same
+  tool rules as a run (`tool_policy.decide`): allowed calls run, a call the rules would ask about is refused with
+  `tool.approval_not_in_test`, a refusal stays a refusal. The tool test panel (`ToolLibrary.run`) never runs a changing
+  MCP tool (`mcp.write_not_supported`).
+- M-1: server addresses that carry credentials (credential-like query names, token-like query values or path segments,
+  any fragment) are refused with `mcp.url_secret` (param `where`). Stored addresses from before are cleaned at start:
+  the secret part is removed, the server is switched off with `last_error_code = mcp.url_secret_removed`, and old audit
+  events are redacted. Events and error texts only ever hold redacted addresses (`netguard.redact_url`).
+- M-2: every MCP HTTP answer (tool calls, discovery, OAuth metadata and token answers) is limited to
+  `netguard.MAX_RESPONSE_BYTES` (8 MiB) while it is read: a larger declared `Content-Length` is refused before the body,
+  a longer stream stops at the limit (`mcp.response_too_large`), and compressed answers are neither asked for
+  (`Accept-Encoding: identity`) nor accepted (`mcp.protocol_error`).
+- L-2: loopback consent only for loopback addresses (`mcp.loopback_not_local`). L-3: approving a tool needs the reviewed
+  definition hash (`mcp.hash_required`). L-4: a per-call approval no longer covers a definition that was approved while
+  the call waited (`tool.approval_stale`). L-5: the external-data marker around MCP results carries a per-call nonce,
+  so a result cannot fake its end. L-6: slugs of removed servers are retired and never given to a new server. L-7: a
+  tool status change is dropped when the definition was approved again meanwhile. L-8: new test searching a bearer
+  token in logs, the run trace, all data files (SQLite with WAL) and every PostgreSQL table.
+
 Fix: continuing a paused run from several processes at once (Evolution review of api #40):
 
 - A paused run is queued again by a compare-and-set from `paused` (`replace_if` on `status`). When a decision and

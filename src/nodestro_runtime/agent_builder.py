@@ -200,6 +200,7 @@ class AgentBuilder:
         extra_tools: list[Tool] | None = None,
         cancelled: Callable[[], bool] | None = None,
         attended: bool = True,
+        gated: bool = False,
     ) -> BuiltAgent:
         """Build the agent; raises ``ValueError``/``TypeError``/``KeyError`` for invalid settings.
 
@@ -208,7 +209,8 @@ class AgentBuilder:
         environment. ``extra_tools`` are tools of the run (the input files tool, knowledge proposals).
         ``cancelled`` stops running MCP calls with the run; ``attended`` is false for runs without a person
         (schedules, batches, test series, published APIs), which may use MCP tools only once the operator
-        enabled it after the MCP security acceptance (ADR-0007 D-7).
+        enabled it after the MCP security acceptance (ADR-0007 D-7). ``gated`` is true only when the ``before_tool``
+        hook asks the shared per-call approval gate before every call; MCP tools that change data need it.
         """
         model = check_model(config.model)
         provider = provider_of(model)
@@ -227,7 +229,7 @@ class AgentBuilder:
         if not attended:
             check_unattended_mcp(config.tools)
         tools = [
-            self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled)
+            self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled, gated=gated)
             for tool_name in dict.fromkeys(config.tools)
         ]
         taken = {tool.name for tool in tools}
@@ -313,7 +315,9 @@ class AgentBuilder:
             issues.append(ConfigIssue(level=level, field=field, code=code, params=params, message=message))
 
         try:
-            self.build(config, connection=_validation_connection(self.declared, config))
+            # Checked as for a run that asks before every call (gated): validation never runs a tool. Paths that
+            # do not ask (agent test without a gate, tool test panel) refuse such tools when they build them.
+            self.build(config, connection=_validation_connection(self.declared, config), gated=True)
         except NodestroError as exc:
             field = (
                 "tools"

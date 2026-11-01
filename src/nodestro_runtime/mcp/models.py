@@ -27,6 +27,8 @@ __all__ = ["TOOL_PREFIX", "is_mcp_tool", "unattended_mcp_enabled"]
 SERVERS = "mcp_servers"
 TOOLS = "mcp_tools"
 EVENTS = "mcp_events"
+#: Slugs of removed servers, never given to a new server (independent review L-6).
+RETIRED_SLUGS = "mcp_retired_slugs"
 
 _TOOL_NAME_MAX = 128
 _DESCRIPTION_MAX = 4000
@@ -136,6 +138,13 @@ class McpServer(_Model):
     last_error_params: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=now)
     updated_at: datetime = Field(default_factory=now)
+
+
+class RetiredSlug(_Model):
+    """The slug of a removed server (independent review L-6): kept so no new server gets it."""
+
+    server_id: str
+    retired_at: datetime = Field(default_factory=now)
 
 
 class McpServerIn(_Model):

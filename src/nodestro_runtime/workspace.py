@@ -346,7 +346,11 @@ class Workspace:
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True
         self.tester = AgentTester(
-            self.builder, connect=self.connection, default_budget=lambda: self.settings().default_budget_usd
+            self.builder,
+            connect=self.connection,
+            default_budget=lambda: self.settings().default_budget_usd,
+            # The same per-call rules as runs (independent review H-1).
+            tool_gate=lambda: self.runs.tool_gate,
         )
         self.usage_log = UsageLog(self.store)
         # The price catalog: on a desktop reference prices and overrides live in this database; a server tenant

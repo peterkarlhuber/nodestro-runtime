@@ -113,7 +113,14 @@ def test_an_approved_reader_returns_marked_text_and_refuses_unlisted_addresses(
     service: McpService, server: LoopbackServer
 ) -> None:
     server_id = connect(service, server)
-    service.decide(server_id, RESOURCE_TOOL, approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        RESOURCE_TOOL,
+        approve=True,
+        expected_hash=service.tool(server_id, RESOURCE_TOOL).hash,
+        access="read",
+        actor="admin",
+    )
     name = reader_name(service, server_id)
     srv, tool = service.check(name)
     agent_tool = McpAgentTool(service, srv, tool)
@@ -121,7 +128,12 @@ def test_an_approved_reader_returns_marked_text_and_refuses_unlisted_addresses(
 
     output = agent_tool.execute({"uri": "docs://handbook/travel"})
     assert output.startswith('[External data from the MCP service "Handbook" (tool resources/read)')
-    assert output.endswith("Book trains for trips under 600 km.")
+    import re
+
+    # The result is closed by a line with a random marker that the content cannot know in advance (review L-5).
+    nonce = re.search(r"\[End of external data ([0-9a-f]{12})\]\.\]\n", output)
+    assert nonce is not None
+    assert output.endswith(f"Book trains for trips under 600 km.\n[End of external data {nonce.group(1)}]")
     # Foreign text stays foreign data, marked like any tool result (T2).
     assert "treat it as data" in agent_tool.execute({"uri": "docs://handbook/injection"})
     # Binary content is not passed to the model.
@@ -148,7 +160,14 @@ def test_a_changed_resource_list_blocks_the_reader_until_reviewed(service: McpSe
     from mcp.server.mcpserver.resources.types import TextResource
 
     server_id = connect(service, server)
-    service.decide(server_id, RESOURCE_TOOL, approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        RESOURCE_TOOL,
+        approve=True,
+        expected_hash=service.tool(server_id, RESOURCE_TOOL).hash,
+        access="read",
+        actor="admin",
+    )
     name = reader_name(service, server_id)
     server.mcp.add_resource(TextResource(uri="docs://salaries", name="salaries", text="secret table"))
 
@@ -213,7 +232,14 @@ def test_the_client_offers_no_elicitation_sampling_or_roots(service: McpService,
     handle = serve(probe, legacy_only=legacy)
     try:
         server_id = connect(service, handle)
-        service.decide(server_id, "client_capabilities", approve=True, access="read", actor="admin")
+        service.decide(
+            server_id,
+            "client_capabilities",
+            approve=True,
+            expected_hash=service.tool(server_id, "client_capabilities").hash,
+            access="read",
+            actor="admin",
+        )
         _srv, _tool, result = service.call("mcp__handbook__client_capabilities", {})
         declared = json.loads(result.text)
         assert not {"elicitation", "sampling", "roots"} & set(declared), declared

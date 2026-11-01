@@ -9,6 +9,9 @@ run. It is still kept apart from runs:
 - Persistent memory is used read-only: the agent sees a copy of its memory space, and
   whatever it writes stays in the copy (shown in the result, never saved).
 - Its tokens and cost go to the usage ledger as an "agent test".
+- The per-call approval rules (S-2) apply as in a run: a call they allow runs, a call they deny is denied, and a call
+  that would need a person's approval is denied too, because a test cannot wait for one (independent review H-1).
+  Without the approval gate, MCP tools that change data are refused when the agent is built, exactly as in a run.
 """
 
 from __future__ import annotations
@@ -23,13 +26,15 @@ from orkexa import EphemeralMemory, MemoryBackend, ToolCall
 from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
+from . import tool_policy
 from .agent_builder import AgentBuilder
 from .cost_tracking import PricedTracker, PriceMode
 from .engine import execute_agent, node_problem, render_task, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
-from .schemas import AgentConfig, EvaluationRecord, ToolCallRecord, Usage, new_id, now
+from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
+from .tool_approvals import ToolGate, tool_facts
 
 #: Test results show at most this much of a tool result (the run view keeps 20,000 too).
 _MAX_TOOL_OUTPUT = 20_000
@@ -87,8 +92,11 @@ class AgentTester:
         connect: Callable[[str], Connection],
         default_budget: Callable[[], float | None] = lambda: None,
         tool_sandbox: Callable[[str], Sandbox | None] = lambda _workflow_id: None,
+        tool_gate: Callable[[], ToolGate | None] = lambda: None,
     ) -> None:
         self.builder = builder
+        #: The tenant's per-call approval gate (S-2), read at every test; ``None`` while approvals are off.
+        self.tool_gate = tool_gate
         self.tool_sandbox = tool_sandbox
         self.connect = connect
         self.default_budget = default_budget
@@ -105,6 +113,38 @@ class AgentTester:
         isolated = config.model_copy(deep=True)
         isolated.memory.mode = "run"
         return isolated, lambda: EphemeralMemory(files), True
+
+    def _gate(
+        self, gate: ToolGate | None, config: AgentConfig, call: ToolCall, record: ToolCallRecord, test_id: str
+    ) -> str | None:
+        """The per-call rules for one call of a test: ``None`` runs it, a string denies it (never waits)."""
+        if gate is None:
+            return None
+        capability, version, kind, _definition = tool_facts(self.builder.tools, call.name)
+        situation = gate.call_context(run_id=test_id, node_id="agent-test", trigger="manual", trigger_ref=None)
+        verdict = tool_policy.decide(
+            tool=call.name,
+            kind=kind,
+            capability=capability,
+            binding=config.tool_policies.get(call.name),
+            context=situation,
+            at=now(),
+            version=version,
+        )
+        shown = capability.model_dump()
+        if verdict.action == "allow":
+            record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            return None
+        if verdict.action == "deny":
+            record.approval = ToolCallApproval(
+                status="denied", code=verdict.code or "tool.denied_by_policy", capability=shown
+            )
+            return verdict.reason or "The tool rules do not allow this call"
+        record.approval = ToolCallApproval(status="denied", code="tool.approval_not_in_test", capability=shown)
+        return (
+            "This call needs a person's approval before it runs; an agent test cannot ask for one, so it was not "
+            "made. Run the workflow to approve the call."
+        )
 
     def run(self, request: AgentTestIn) -> tuple[AgentTestResult, BudgetTracker]:
         config = request.agent
@@ -123,11 +163,14 @@ class AgentTester:
         def on_request(_args: dict[str, Any]) -> None:
             tracker.check()
 
-        def before_tool(call: ToolCall) -> None:
+        gate = self.tool_gate()
+
+        def before_tool(call: ToolCall) -> str | None:
             record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
             with lock:
                 calls[call.id] = record
                 result.tool_calls.append(record)
+            return self._gate(gate, config, call, record, result.id)
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             record = calls.get(call.id)
@@ -155,6 +198,8 @@ class AgentTester:
                 hooks=hooks,
                 run_memory=run_memory,
                 sandbox=self.tool_sandbox(request.workflow_id) if request.workflow_id else None,
+                # before_tool applies the per-call rules to every call while the gate exists.
+                gated=gate is not None,
             )
             result.output = outcome.output
             result.evaluation = outcome.evaluation

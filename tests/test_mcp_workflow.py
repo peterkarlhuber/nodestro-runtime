@@ -50,7 +50,14 @@ def workspace_with(tmp_path: Path, server: LoopbackServer, script: dict[str, lis
     workspace = Workspace(tmp_path / "data", client_factory=lambda _p: ScriptedClient(script), integrations=[])
     added = workspace.mcp.add(McpServerIn(name="Catalog", url=server.url, allow_loopback=True), actor="admin")
     workspace.mcp.discover(added.id)
-    workspace.mcp.decide(added.id, "search", approve=True, access="read", actor="admin")
+    workspace.mcp.decide(
+        added.id,
+        "search",
+        approve=True,
+        expected_hash=workspace.mcp.tool(added.id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     return workspace
 
 
@@ -144,7 +151,14 @@ async def test_a_changing_mcp_tool_runs_only_after_a_person_approves_the_call(
     workspace = workspace_with(tmp_path, server, script)
     try:
         catalog = workspace.mcp.servers()[0]
-        workspace.mcp.decide(catalog.id, "delete_page", approve=True, access="write", actor="admin")
+        workspace.mcp.decide(
+            catalog.id,
+            "delete_page",
+            approve=True,
+            expected_hash=workspace.mcp.tool(catalog.id, "delete_page").hash,
+            access="write",
+            actor="admin",
+        )
         assert workspace.mcp.write_gate is True
         # a "never" binding with a reason does not skip the question for an MCP tool
         never = {delete: {"ask": "never", "reason": "Deletes only pages of the scratch space"}}
@@ -168,5 +182,57 @@ async def test_a_changing_mcp_tool_runs_only_after_a_person_approves_the_call(
         [call] = done.nodes["a"].tool_calls
         assert not call.is_error and "deleted 7" in (call.output or "")
         assert call.approval is not None and call.approval.status == "approved"
+    finally:
+        workspace.close()
+
+
+async def test_an_approval_does_not_cover_a_definition_approved_while_it_waited(
+    tmp_path: Path, server: LoopbackServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Independent review L-4: a person approves the call as it was asked about. If an administrator approves a
+    changed definition in the meantime, the old approval does not let the call run against the new one."""
+    import asyncio
+
+    from nodestro_runtime.tool_approvals import ENABLE_ENV, ToolApprovals
+
+    monkeypatch.setenv(ENABLE_ENV, "1")
+    delete = "mcp__catalog__delete_page"
+    script = {"LOOKUP": [tool_use(delete, {"page_id": "7"}), text("after")]}
+    workspace = workspace_with(tmp_path, server, script)
+    try:
+        catalog = workspace.mcp.servers()[0]
+        first = workspace.mcp.tool(catalog.id, "delete_page")
+        workspace.mcp.decide(
+            catalog.id, "delete_page", approve=True, access="write", expected_hash=first.hash, actor="admin"
+        )
+        saved = workspace.save_workflow(flow([delete]))
+        started = await workspace.run(saved, RunIn(input="x"))
+        approvals = ToolApprovals(workspace.store)
+        for _ in range(500):
+            if found := approvals.pending(started.id):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("no approval request")
+        [request] = found
+
+        def delete_page(page_id: str) -> str:
+            """Deletes a page and everything below it."""
+            return f"deleted {page_id} and below"
+
+        server.mcp.remove_tool("delete_page")
+        server.mcp.add_tool(delete_page, name="delete_page")
+        workspace.mcp.discover(catalog.id)
+        changed = workspace.mcp.tool(catalog.id, "delete_page")
+        assert changed.status == "changed" and changed.hash != first.hash
+        workspace.mcp.decide(
+            catalog.id, "delete_page", approve=True, access="write", expected_hash=changed.hash, actor="admin"
+        )
+        before = len(server.requests)
+        approvals.decide(started.id, request.id, approved=True, by="usr_1", arguments=request.arguments_hash)
+        done = await workspace.wait(started.id, timeout=30)
+        [call] = done.nodes["a"].tool_calls
+        assert call.approval is not None and call.approval.code == "tool.approval_stale"
+        assert not any("tools/call" in str(r) and "delete_page" in str(r) for r in server.requests[before:])
     finally:
         workspace.close()

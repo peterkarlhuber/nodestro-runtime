@@ -268,7 +268,14 @@ def test_discovery_approval_and_calls_run_in_the_container(service: McpService, 
     assert discovery.protocol_version
     assert {tool.name for tool in service.tools(server.id)} >= {"search", "delete_page"}
     assert service.usable() == []
-    service.decide(server.id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server.id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server.id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     _server, _tool, result = service.call("mcp__local-catalog__search", {"query": "q"})
     assert result.text == "results for q"
     calls = docker_calls(docker[1])
@@ -280,7 +287,14 @@ def test_discovery_approval_and_calls_run_in_the_container(service: McpService, 
         name = call[call.index("--name") + 1]
         assert ["rm", "-f", name] in calls  # removed after the connection
     # Changing a write tool stays blocked without the per-call approval gate (as for HTTP servers).
-    service.decide(server.id, "delete_page", approve=True, access="write", actor="admin")
+    service.decide(
+        server.id,
+        "delete_page",
+        approve=True,
+        expected_hash=service.tool(server.id, "delete_page").hash,
+        access="write",
+        actor="admin",
+    )
     assert code(lambda: service.check("mcp__local-catalog__delete_page")) == "mcp.write_not_supported"
 
 
@@ -293,7 +307,14 @@ def test_a_server_flooding_stdout_fails_with_a_stable_code(service: McpService, 
 def test_a_changed_command_needs_new_approvals(service: McpService) -> None:
     server = service.add(stdio_input())
     service.discover(server.id)
-    service.decide(server.id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server.id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server.id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     service.update(server.id, stdio_input(cmd={"args": ["--other"]}))
     assert service.tool(server.id, "search").status == "changed"
     service.remove(server.id)
@@ -369,7 +390,14 @@ def test_a_real_third_party_server_runs_in_the_sandbox_container(tmp_path: Path,
         assert stored.server_name and "time" in stored.server_name.lower()
         names = {tool.name for tool in discovery.tools}
         assert "get_current_time" in names
-        svc.decide(server.id, "get_current_time", approve=True, access="read", actor="admin")
+        svc.decide(
+            server.id,
+            "get_current_time",
+            approve=True,
+            expected_hash=svc.tool(server.id, "get_current_time").hash,
+            access="read",
+            actor="admin",
+        )
         _server, _tool, result = svc.call("mcp__time__get_current_time", {"timezone": "UTC"})
         assert "UTC" in result.text and not result.is_error
         # Nothing is left running.

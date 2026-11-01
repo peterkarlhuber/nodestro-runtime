@@ -52,7 +52,14 @@ def connect(service: McpService, server: LoopbackServer) -> str:
     data = McpServerIn(name="Docs", url=server.url, allow_loopback=True, auth="bearer", token=TOKEN)
     server_id = service.add(data, actor="admin").id
     service.discover(server_id, actor="admin")
-    service.decide(server_id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server_id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     return server_id
 
 
@@ -97,7 +104,9 @@ def test_a_release_uses_only_its_frozen_tools_at_their_definition(
     library.mcp = pinned  # type: ignore[assignment]
     assert NAME in library
     # A tool approved after publishing is not part of the release.
-    service.decide(server_id, "big", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id, "big", approve=True, expected_hash=service.tool(server_id, "big").hash, access="read", actor="admin"
+    )
     assert "mcp__docs__big" not in library
     assert code(lambda: pinned.check("mcp__docs__big")) == "mcp.tool_not_in_release"
     tool = library.tool(NAME)
@@ -105,9 +114,23 @@ def test_a_release_uses_only_its_frozen_tools_at_their_definition(
     assert pinned.provenance(NAME)["release_hash"] == pinned.refs[NAME].hash
     assert [item.name for item in pinned.usable()] == ["search"]
     # A changed classification (or re-approval at another hash) stops the release until it is published again.
-    service.decide(server_id, "search", approve=True, access="destructive", actor="admin")
+    service.decide(
+        server_id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server_id, "search").hash,
+        access="destructive",
+        actor="admin",
+    )
     assert code(lambda: pinned.check(NAME)) in ("mcp.release_tool_changed", "mcp.write_not_supported")
-    service.decide(server_id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server_id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     pinned.check(NAME)
     tool_record = service.tool(server_id, "search")
     tool_record.approved_hash = "0" * 64
@@ -121,13 +144,16 @@ def test_a_release_uses_only_its_frozen_tools_at_their_definition(
 def test_a_removed_server_stops_the_release(service: McpService, server: LoopbackServer) -> None:
     server_id = connect(service, server)
     pinned = PinnedMcp(service, {NAME: service.pin(NAME)})
+    old_slug = service.server(server_id).slug
     service.remove(server_id)
     assert code(lambda: pinned.check(NAME)) == "mcp.tool_not_found"
-    # Another server under the same slug is not the frozen one.
+    # A new server with the same name never gets the removed server's slug (review L-6), so the frozen name finds
+    # nothing; even under the same slug the server id would not match (mcp.release_tool_changed).
     other = serve(build_server("other"), token=TOKEN)
     try:
-        connect(service, other)
-        assert code(lambda: pinned.check(NAME)) == "mcp.release_tool_changed"
+        other_id = connect(service, other)
+        assert service.server(other_id).slug != old_slug
+        assert code(lambda: pinned.check(NAME)) == "mcp.tool_not_found"
     finally:
         other.stop()
 

@@ -6,7 +6,10 @@ when an agent is built and again right before every call, against the definition
 (threat model T4): a changed definition is blocked (``changed``) until an administrator accepts it.
 
 Tools classified as ``write`` or ``destructive`` are usable only while the shared per-call approval gate is active
-(``write_gate``, set by the workspace together with the run engine's tool gate; evolution plan S-2, WP-5).
+(``write_gate``, set by the workspace together with the run engine's tool gate; evolution plan S-2, WP-5) **and** the
+caller asks that gate before every call (``gated``). The process-wide switch alone never opens them: every path that
+builds an agent or runs a tool outside the gated engine path (agent test, tool test panel, releases) gets the default
+``gated=False`` and is refused (independent review H-1).
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from . import oauth as oauth_flow
 from .hub import CallResult, Credential, Discovery, McpHub
 from .models import (
     EVENTS,
+    RETIRED_SLUGS,
     SERVERS,
     TOOLS,
     EventKind,
@@ -35,6 +39,7 @@ from .models import (
     McpServerIn,
     McpServerView,
     McpTool,
+    RetiredSlug,
     ToolAccess,
     ToolDefinition,
     agent_tool_name,
@@ -43,6 +48,7 @@ from .models import (
     make_slug,
     tool_key,
 )
+from .netguard import is_loopback_url, redact_url, url_secret_problem
 from .oauth import OAuthCredentials, PendingAuthorization
 from .stdio import StdioLaunch, launch
 from .vault import TokenVault
@@ -66,6 +72,7 @@ class McpService:
         self.python: Any = None
         self._lock = threading.RLock()
         hub.stdio_launcher = self.stdio_launch
+        self._scrub_url_secrets()
 
     # ---- servers ---------------------------------------------------------------------------
 
@@ -140,6 +147,31 @@ class McpService:
                 current.oauth,
             )
 
+    def _scrub_url_secrets(self) -> None:
+        """Stored configurations from before addresses were checked for keys (independent review M-1): an address
+        that carries one loses its query, fragment or secret-looking path, the server is switched off until an
+        administrator enters the key as a token, and the address is removed from older audit events."""
+        try:
+            servers = self.store.items(SERVERS, McpServer)
+        except Exception:  # an unreadable store fails later, where it is reported
+            return
+        for key, server in servers:
+            if server.transport != "http" or url_secret_problem(server.url) is None:
+                continue
+            with self._lock:
+                server.url = redact_url(server.url).replace("?…", "").replace("…", "")
+                server.enabled = False
+                server.last_error_code = "mcp.url_secret_removed"
+                server.last_error_params = {}
+                server.updated_at = now()
+                self.store.put(SERVERS, key, server)
+            self.event("server_changed", server_id=server.id, url=server.url, enabled=False, reason="url_secret")
+        for key, event in self.store.items(EVENTS, McpEvent):
+            address = event.details.get("url")
+            if isinstance(address, str) and url_secret_problem(address) is not None:
+                event.details["url"] = redact_url(address)
+                self.store.put(EVENTS, key, event)
+
     def _check_input(self, data: McpServerIn) -> None:
         if data.transport == "stdio":
             self._check_stdio(data)
@@ -149,6 +181,21 @@ class McpService:
         if not data.url:
             raise NodestroError("mcp.url_invalid", "The server needs an address", url="")
         self.hub.policy.check_url(data.url, allow_loopback=data.allow_loopback)
+        where = url_secret_problem(data.url)
+        if where is not None:
+            # The address is stored and shown in the clear (independent review M-1, D-3): keys go in the token.
+            raise NodestroError(
+                "mcp.url_secret",
+                "The address seems to contain a key or token. Remove it from the address and enter it as the "
+                "server's token instead; tokens are stored sealed.",
+                where=where,
+            )
+        if data.allow_loopback and not is_loopback_url(data.url):
+            # The consent is for a development server on this computer only (independent review L-2).
+            raise NodestroError(
+                "mcp.loopback_not_local",
+                "Loopback access can only be allowed for an address on this computer (localhost or 127.0.0.1)",
+            )
         if data.auth == "oauth" and data.token:
             raise NodestroError(
                 "mcp.oauth_token_input", "An OAuth server gets its tokens from the sign-in, not from a pasted token"
@@ -189,11 +236,13 @@ class McpService:
                     f"At most {self.hub.limits.max_servers} MCP servers can be connected",
                     limit=self.hub.limits.max_servers,
                 )
-            taken = {item.slug for item in existing}
+            # Slugs of removed servers are never given again (independent review L-6): an agent that still lists
+            # ``mcp__<old slug>__<tool>`` must not silently reach a new server that happens to get the same name.
+            taken = {item.slug for item in existing} | {key for key, _ in self.store.items(RETIRED_SLUGS, RetiredSlug)}
             server = McpServer(slug=make_slug(data.name, taken), **self._fields(data))
             self._set_token(server, data.token)
             self.store.put(SERVERS, server.id, server)
-        self.event("server_added", actor=actor, server_id=server.id, url=server.url, name=server.name)
+        self.event("server_added", actor=actor, server_id=server.id, url=redact_url(server.url), name=server.name)
         if data.token:
             self.event("token_changed", actor=actor, server_id=server.id, storage=server.token_storage)
         return server
@@ -227,7 +276,9 @@ class McpService:
             self._set_token(server, data.token)
             server.updated_at = now()
             self.store.put(SERVERS, server.id, server)
-        self.event("server_changed", actor=actor, server_id=server.id, url=server.url, enabled=server.enabled)
+        self.event(
+            "server_changed", actor=actor, server_id=server.id, url=redact_url(server.url), enabled=server.enabled
+        )
         if data.token is not None:
             self.event("token_changed", actor=actor, server_id=server.id, storage=server.token_storage)
         return server
@@ -237,6 +288,7 @@ class McpService:
             server = self.server(server_id)
             self.store.delete_prefix(TOOLS, f"{server.id}/")
             self.store.delete(SERVERS, server.id)
+            self.store.put(RETIRED_SLUGS, server.slug, RetiredSlug(server_id=server.id))
             self.hub.session_tokens.pop(server.id, None)
             self.hub.session_tokens.pop(self._pending_key(server.id), None)
             self.hub.forget_oauth(server.id)
@@ -430,7 +482,14 @@ class McpService:
         actor: str | None = None,
     ) -> McpTool:
         """Approve or reject the tool's current definition. ``expected_hash`` guards against approving a definition
-        that changed after the administrator looked at it."""
+        that changed after the administrator looked at it; an approval needs it (independent review L-3), so an
+        approval always names the exact definition the administrator reviewed."""
+        if approve and not expected_hash:
+            raise NodestroError(
+                "mcp.hash_required",
+                "An approval must name the definition hash that was reviewed",
+                name=name,
+            )
         with self._lock:
             tool = self.tool(server_id, name)
             if expected_hash is not None and expected_hash != tool.hash:
@@ -474,8 +533,11 @@ class McpService:
         server = self.store.get(SERVERS, tool.server_id, McpServer)
         return (server, tool) if server is not None else None
 
-    def check(self, tool_name: str) -> tuple[McpServer, McpTool]:
-        """The server and tool behind ``tool_name`` if an agent may use it now; a stable refusal otherwise."""
+    def check(self, tool_name: str, *, gated: bool = False) -> tuple[McpServer, McpTool]:
+        """The server and tool behind ``tool_name`` if an agent may use it now; a stable refusal otherwise.
+
+        ``gated`` says that the caller asks the shared per-call approval gate before every call of this tool (the run
+        engine with a tool gate). Only then are tools that change data usable, and only while ``write_gate`` is on."""
         found = self.find(tool_name)
         if found is None:
             raise NodestroError("mcp.tool_not_found", f"MCP tool not found: {tool_name}", name=tool_name)
@@ -498,25 +560,29 @@ class McpService:
             raise NodestroError(
                 "mcp.tool_not_approved", f"{tool_name} is not approved by an administrator", name=tool_name
             )
-        if tool.access != "read" and not self.write_gate:
+        if tool.access != "read" and not (self.write_gate and gated):
             raise NodestroError(
                 "mcp.write_not_supported",
-                f"{tool_name} changes data; such tools need per-call approval, which is not available yet",
+                f"{tool_name} changes data; it runs only in workflow runs that ask for approval before every call",
                 name=tool_name,
             )
         return server, tool
 
-    def agent_tool(self, tool_name: str, *, cancelled: Callable[[], bool] | None = None) -> Tool:
-        """The tool an agent gets for ``tool_name`` (policy checked now and again before every call)."""
+    def agent_tool(self, tool_name: str, *, cancelled: Callable[[], bool] | None = None, gated: bool = False) -> Tool:
+        """The tool an agent gets for ``tool_name`` (policy checked now and again before every call).
+
+        ``gated``: the caller asks the per-call approval gate before every call (see :meth:`check`)."""
         from .tools import McpAgentTool
 
-        server, tool = self.check(tool_name)
-        return McpAgentTool(self, server, tool, cancelled=cancelled)
+        server, tool = self.check(tool_name, gated=gated)
+        return McpAgentTool(self, server, tool, cancelled=cancelled, gated=gated)
 
     def pin(self, tool_name: str) -> McpToolRef:
         """Freeze a usable tool for a release bundle (WP-9): server id and slug, approved hash, classification and
-        definition; never an address or a token. Refuses tools an agent could not use now."""
-        server, tool = self.check(tool_name)
+        definition; never an address or a token. Refuses tools an agent could not use now (in a gated run; the
+        release itself never asks, so :class:`~nodestro_runtime.mcp.pinned.PinnedMcp` refuses changing tools when
+        it runs)."""
+        server, tool = self.check(tool_name, gated=True)
         assert tool.approved_hash is not None
         return McpToolRef(
             tool_name=tool.tool_name,
@@ -548,7 +614,7 @@ class McpService:
         result = []
         for tool in self.all_tools():
             try:
-                self.check(tool.tool_name)
+                self.check(tool.tool_name, gated=True)  # assignable: usable in a run that asks before every call
             except NodestroError:
                 continue
             result.append(tool)
@@ -560,9 +626,10 @@ class McpService:
         arguments: dict[str, Any],
         *,
         cancelled: Callable[[], bool] | None = None,
+        gated: bool = False,
     ) -> tuple[McpServer, McpTool, CallResult]:
         """Check the policy, call the tool and check the definition the server listed right before the call."""
-        server, tool = self.check(tool_name)
+        server, tool = self.check(tool_name, gated=gated)
         credential = self.credential(server)
         try:
             result = self.hub.call_tool(
@@ -576,14 +643,13 @@ class McpService:
         finally:
             self._keep_refreshed(server, credential)
         if result.definition is None:
-            self._mark(tool, "removed")
+            self._mark(tool, "removed", seen_hash=tool.approved_hash)
             raise NodestroError("mcp.tool_removed", f"{server.name} no longer offers {tool.name}", name=tool_name)
         live = definition_hash(result.definition)
         if live != tool.approved_hash:
             # The hub compared the listed definition with the approved hash on the same connection and did not send
             # the request (result.sent is False). Record the change and block all further calls.
-            tool.definition, tool.hash = result.definition, live
-            self._mark(tool, "changed")
+            self._mark(tool, "changed", seen_hash=tool.approved_hash, definition=result.definition, live=live)
             self.event(
                 "tool_changed", server_id=server.id, tool=tool.name, approved_hash=tool.approved_hash, new_hash=live
             )
@@ -595,10 +661,26 @@ class McpService:
             )
         return server, tool, result
 
-    def _mark(self, tool: McpTool, status: Any) -> None:
+    def _mark(
+        self,
+        tool: McpTool,
+        status: Any,
+        *,
+        seen_hash: str | None,
+        definition: ToolDefinition | None = None,
+        live: str | None = None,
+    ) -> None:
+        """Record what a call found out about ``tool``, on the stored record as it is now (independent review L-7):
+        the copy read before the call may be stale, e.g. an administrator decided in the meantime. If the approval
+        the call used is no longer the stored one, the administrator's newer decision stands and nothing changes."""
         with self._lock:
-            tool.status = status
-            self.store.put(TOOLS, tool.key, tool)
+            current = self.store.get(TOOLS, tool.key, McpTool)
+            if current is None or current.approved_hash != seen_hash:
+                return
+            if definition is not None and live is not None:
+                current.definition, current.hash = definition, live
+            current.status = status
+            self.store.put(TOOLS, current.key, current)
 
     # ---- OAuth (WP-6) ----------------------------------------------------------------------
 
