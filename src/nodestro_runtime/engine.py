@@ -2263,8 +2263,9 @@ class RunManager:
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
         self._save(context)
-        if state.tool_calls:
+        if state.tool_calls and not context.root.fenced_out:
             # The call records are stored with the node now; the notes written before each call are not needed.
+            # A run another process took over (C-06) was not stored here: its notes stay for that process.
             tool_journal.clear_node(self.store, run.id, node.id)
 
     def _prompt_values(self, run: Run, *, mark_empty: bool = True) -> dict[str, Any]:
