@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import re
 import sqlite3
@@ -32,6 +33,8 @@ from .problems import NodestroError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+logger = logging.getLogger(__name__)
 
 #: The schema version this release reads and writes (``PRAGMA user_version``; 0 since Nodestro 0.1).
 SCHEMA_VERSION = 0
@@ -114,6 +117,39 @@ class DocumentStore(Protocol):
     def search_raw(self, collections: Iterable[str], text: str) -> builtins.list[tuple[str, str]]: ...
 
 
+class DamagedDocuments:
+    """Documents a listing left out because they cannot be read (C-10): JSON that does not parse (a disk fault, a
+    manual edit) or that does not fit the model (a newer release's data after a downgrade). One such document
+    never stops a whole listing, the start-up recovery or a search; each one is logged once as a warning with its
+    collection and id, and :attr:`found` keeps them for diagnostics. Reading it alone (``get``) still raises."""
+
+    def __init__(self) -> None:
+        #: ``(collection, id)`` -> why it cannot be read (the first line of the error).
+        self.found: dict[tuple[str, str], str] = {}
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self.found)
+
+    def parse(self, collection: str, rows: Iterable[tuple[Any, Any]], model: type[ModelT]) -> list[tuple[str, ModelT]]:
+        """``(id, document)`` of ``rows`` (``(id, JSON text)``) in their order, without the damaged ones."""
+        parsed: list[tuple[str, ModelT]] = []
+        for key, text in rows:
+            try:
+                parsed.append((str(key), model.model_validate_json(text)))
+            except ValueError as exc:  # json and pydantic errors: the document is left out, never the listing
+                self.report(collection, str(key), exc)
+        return parsed
+
+    def report(self, collection: str, key: str, error: BaseException) -> None:
+        reason = (str(error).strip().splitlines() or [type(error).__name__])[0][:300]
+        with self._lock:
+            new = (collection, key) not in self.found
+            self.found[(collection, key)] = reason
+        if new:
+            logger.warning("Damaged document %s/%s is left out of listings: %s", collection, key, reason)
+
+
 def _like(prefix: str) -> str:
     """A LIKE pattern (escape character ``\\``) for ids starting with ``prefix``."""
     return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -134,6 +170,8 @@ class SQLiteStore:
         #: Nesting depth of :meth:`transaction` (only the thread holding ``_lock`` changes it).
         self._depth = 0
         self._closed = False
+        #: Documents that listings left out because they cannot be read (C-10).
+        self.damaged = DamagedDocuments()
         self._connection = sqlite3.connect(self.database, isolation_level=None, check_same_thread=False, timeout=30)
         if self.database != ":memory:":
             self._connection.execute("PRAGMA journal_mode=WAL")
@@ -244,14 +282,14 @@ class SQLiteStore:
 
     def list(self, collection: str, model: type[ModelT], *, limit: int | None = None) -> list[ModelT]:
         """Documents of a collection, most recently updated first."""
-        query = "SELECT data FROM nodestro_documents WHERE collection = ? ORDER BY updated_at DESC, id"
+        query = "SELECT id, data FROM nodestro_documents WHERE collection = ? ORDER BY updated_at DESC, id"
         params: tuple[Any, ...] = (collection,)
         if limit is not None:
             query += " LIMIT ?"
             params = (collection, limit)
         with self._lock:
             rows = self._connection.execute(query, params).fetchall()
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, however many the collection holds."""
@@ -261,13 +299,16 @@ class SQLiteStore:
         if not wanted:
             return []
         marks = ", ".join("?" for _ in wanted)
+        # A document that is not valid JSON would make json_extract fail the whole query: it is returned instead,
+        # and left out (and reported) when it does not parse.
         with self._lock:
             rows = self._connection.execute(
-                f"SELECT data FROM nodestro_documents WHERE collection = ?"
-                f" AND json_extract(data, '$.{field}') IN ({marks}) ORDER BY updated_at, id",
+                f"SELECT id, data FROM nodestro_documents WHERE collection = ?"
+                f" AND CASE WHEN json_valid(data) THEN json_extract(data, '$.{field}') IN ({marks}) ELSE 1 END"
+                " ORDER BY updated_at, id",
                 (collection, *wanted),
             ).fetchall()
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]:
         """``(id, document)`` pairs of a collection, in id order."""
@@ -275,17 +316,17 @@ class SQLiteStore:
             rows = self._connection.execute(
                 "SELECT id, data FROM nodestro_documents WHERE collection = ? ORDER BY id", (collection,)
             ).fetchall()
-        return [(str(row[0]), model.model_validate_json(row[1])) for row in rows]
+        return self.damaged.parse(collection, rows, model)
 
     def list_prefix(self, collection: str, prefix: str, model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose id starts with ``prefix``, in id order."""
         pattern = _like(prefix)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT data FROM nodestro_documents WHERE collection = ? AND id LIKE ? ESCAPE '\\' ORDER BY id",
+                "SELECT id, data FROM nodestro_documents WHERE collection = ? AND id LIKE ? ESCAPE '\\' ORDER BY id",
                 (collection, pattern),
             ).fetchall()
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def delete_prefix(self, collection: str, prefix: str) -> int:
         pattern = _like(prefix)
@@ -426,6 +467,7 @@ __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "BeforeMigration",
+    "DamagedDocuments",
     "DocumentStore",
     "Migration",
     "ModelT",
