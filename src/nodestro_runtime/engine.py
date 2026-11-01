@@ -25,14 +25,18 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
+import contextvars
 from dataclasses import dataclass, field
 from decimal import Decimal
+import functools
 import json
 import logging
+import os
 import re
 import threading
 import time
 from typing import Any, Literal, TypeVar
+import uuid
 
 from orkexa import (
     CheckpointError,
@@ -131,8 +135,53 @@ _EVENT_SEQ = "run_event_seq"
 _MAX_SUBSCRIBER_BACKLOG = 10_000
 #: How long :meth:`RunManager.shutdown` waits for runs to stop by themselves.
 _SHUTDOWN_GRACE_SECONDS = 5.0
+#: Threads that execute the agents and orchestrator decisions of one :class:`RunManager`'s runs, including agents
+#: that wait in their thread for a tool approval (C-08). Configurable with :data:`RUN_THREADS_ENV`. The pool is
+#: separate from asyncio's default executor, so busy or waiting agents never delay the application's other
+#: background work (backups, uploads, a worker's lease renewal); an agent beyond the limit waits for a thread.
+DEFAULT_RUN_THREADS = 32
+RUN_THREADS_ENV = "NODESTRO_RUN_THREADS"
+#: How often a conditional write of a stored run is tried again after another process wrote the run meanwhile.
+_CAS_ATTEMPTS = 5
 
 T = TypeVar("T")
+
+
+def run_threads(environ: Mapping[str, str] | None = None) -> int:
+    """The size of a run manager's agent thread pool: ``NODESTRO_RUN_THREADS`` (at least 1), else the default."""
+    value = (os.environ if environ is None else environ).get(RUN_THREADS_ENV, "").strip()
+    if not value:
+        return DEFAULT_RUN_THREADS
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning("Ignoring %s=%r: not a whole number; using %s", RUN_THREADS_ENV, value, DEFAULT_RUN_THREADS)
+        return DEFAULT_RUN_THREADS
+
+
+class _FencedRun(Run):
+    """A run document as stored, with its write fence (C-02, C-06): a random token that every conditional write of
+    the run compares (compare-and-set) and replaces. Internal to the engine: the API's :class:`Run` ignores it, and a
+    plain ``put`` of a run leaves it out (the next conditional write then compares the status instead)."""
+
+    fence: str | None = None
+
+
+def _split(stored: _FencedRun) -> tuple[Run, str | None]:
+    """A stored run as a plain :class:`Run`, and its fence."""
+    values = dict(stored)
+    fence = values.pop("fence", None)
+    return Run.model_construct(**values), fence
+
+
+def _fenced(run: Run, fence: str) -> _FencedRun:
+    values = dict(run)
+    values["fence"] = fence
+    return _FencedRun.model_construct(**values)
+
+
+def _new_fence() -> str:
+    return uuid.uuid4().hex
 
 
 class RunCancelled(Exception):
@@ -766,6 +815,15 @@ class _RunContext:
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
+        #: Queue execution (a worker's claimed run, C-06): the fence of the stored run as this execution last wrote
+        #: it. Every write of the run is a compare-and-set on it, so a worker whose run was taken from it (its lease
+        #: expired and the reaper marked the run interrupted) never overwrites the run. ``None`` on the root
+        #: context: the runs are written without a condition (the desktop).
+        self.fence: str | None = None
+        #: Set (root context) when this execution lost its run (a fence did not match, or the worker lost its lease):
+        #: nothing of it is stored or announced any more, and it is cancelled.
+        self.fenced_out = False
+        self.fence_lock = threading.Lock()
 
     def check(self) -> None:
         if self.cancelled.is_set():
@@ -845,6 +903,13 @@ class RunManager:
         self.remote_poll = 0.25
         #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
         self.tool_gate: ToolGate | None = None
+        #: How many agents (and orchestrator decisions) of this manager's runs execute at the same time, each in a
+        #: thread of the manager's own pool (C-08; :data:`RUN_THREADS_ENV`). Read when the pool is first used.
+        self.run_threads = run_threads()
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
+        #: Runs whose execution in this process lost its fence (C-06), until :meth:`lost_fence` is asked.
+        self._fence_lost: set[str] = set()
         self._followers: dict[int, asyncio.Task[None]] = {}
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
@@ -1007,7 +1072,7 @@ class RunManager:
                     found.append((snapshot, version))
         return found
 
-    def _launch(self, run: Run, *, local: bool = False) -> Run:
+    def _launch(self, run: Run, *, local: bool = False, fence: str | None = None) -> Run:
         if self.dispatch is not None and not local:
             # Queue execution: the run is stored and a worker executes it (ADR-0004). A paused run whose decision
             # was recorded is queued again, so everybody waiting for it sees that it goes on. Several processes can
@@ -1030,10 +1095,11 @@ class RunManager:
         budget = _remaining(limit, run)
         context = _RunContext(run, self.tracker(budget), self.environment(run))
         context.loop = loop
+        context.fence = fence
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
         self._subscribers.setdefault(run.id, [])
-        self.store.put("runs", run.id, run)
+        self._save(context)
         self._loop = loop
         self._tasks[run.id] = loop.create_task(self._execute(context), name=f"run-{run.id}")
         return run
@@ -1064,33 +1130,85 @@ class RunManager:
             return elsewhere
         if run_id in self._contexts:
             raise NodestroError("run.not_executable", "This run is already executing here", status="running")
-        run = self.store.get("runs", run_id, Run)
-        if run is None:
+        stored = self.store.get("runs", run_id, _FencedRun)
+        if stored is None:
             raise KeyError(run_id)
+        run, fence = _split(stored)
         if run.status not in ("queued", "paused"):
             raise NodestroError("run.not_executable", "Only a queued or paused run can be executed", status=run.status)
-        return self._launch(run, local=True)
+        # The run becomes this execution's (C-06): from now on only a write that still finds this fence stores it.
+        claimed = self._replace_run(run, fence=fence, status=run.status)
+        if claimed is None:
+            raise NodestroError("run.not_executable", "This run changed while it was claimed", status=run.status)
+        return self._launch(run, local=True, fence=claimed)
 
     def interrupt(self, run_id: str) -> bool:
-        """Mark a run that stopped executing elsewhere (its worker died) as interrupted; it can be continued.
+        """Mark a run that stopped executing elsewhere (its worker died, or nothing executes it) as interrupted; it
+        can be continued. Its queued or running sub-workflow runs are interrupted with it.
 
-        Returns ``False`` for a run that is not queued or running (nothing to do)."""
-        run = self.store.get("runs", run_id, Run)
-        if run is None or run.status not in ("queued", "running") or run.id in self._contexts:
-            return False
-        _interrupt(run)
-        self.store.put("runs", run.id, run)
-        self._expire_approvals(run.id)
-        self._notify(run)
-        return True
+        Returns ``False`` for a run that is not queued or running (nothing to do). The write is conditional (C-06): a
+        worker that still executes the run cannot overwrite it afterwards, and a run that went on meanwhile (a
+        decision, another process) is not marked."""
+        for _attempt in range(_CAS_ATTEMPTS):
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None or stored.status not in ("queued", "running") or run_id in self._contexts:
+                return False
+            run, fence = _split(stored)
+            status = run.status
+            _interrupt(run)
+            if self._replace_run(run, fence=fence, status=status) is None:
+                continue  # written meanwhile: look again
+            self._expire_approvals(run.id)
+            for child_id in _child_ids(run):
+                with suppress(Exception):
+                    self.interrupt(child_id)
+            self._notify(run)
+            return True
+        logger.warning("Run %s changed during every attempt to mark it interrupted", run_id)
+        return False
 
     def cancel_unclaimed(self, run_id: str) -> bool:
         """Cancel a stored run that no worker executes (its queued job was withdrawn); ``False`` otherwise."""
-        run = self.store.get("runs", run_id, Run)
-        if run is None or run.status not in ("queued", "paused") or run.id in self._contexts:
+        if run_id in self._contexts:
             return False
-        self._cancel_stored(run)
+        return self._cancel_stored(run_id, ("queued", "paused"))
+
+    def lost_fence(self, run_id: str) -> bool:
+        """Whether the last execution of ``run_id`` in this process lost the run (C-06); asking forgets it."""
+        if run_id in self._fence_lost:
+            self._fence_lost.discard(run_id)
+            return True
+        return False
+
+    def abandon(self, run_id: str, *, because: str) -> bool:
+        """Stop executing a run that is no longer this process's (its worker lost the lease, C-06): nothing more of
+        the execution is stored or announced, and it is cancelled. ``False`` when it does not execute here."""
+        context = self._contexts.get(run_id)
+        if context is None:
+            return False
+        self._lose_fence(context.root, because)
         return True
+
+    def _replace_run(self, run: Run, *, fence: str | None, status: str) -> str | None:
+        """Store ``run`` in place of the stored run it was read from only if nobody wrote that one since: a
+        compare-and-set on the fence read with it, or (a run stored without one: the desktop, earlier versions) on
+        the status read with it. Returns the run's new fence, ``None`` when another write came first."""
+        new = _new_fence()
+        stored = _fenced(run, new)
+        if fence is not None:
+            done = self.store.replace_if("runs", run.id, stored, field="fence", expected=fence)
+        else:
+            done = self.store.replace_if("runs", run.id, stored, field="status", expected=status)
+        return new if done else None
+
+    def _lose_fence(self, root: _RunContext, because: str) -> None:
+        with root.fence_lock:
+            if root.fenced_out:
+                return
+            root.fenced_out = True
+        self._fence_lost.add(root.run.id)
+        logger.error("Run %s is no longer executed here (%s); it stops without storing", root.run.id, because)
+        root.cancelled.set()
 
     def root_of(self, run: Run) -> Run:
         """The top run of a sub-workflow's run (the run itself otherwise)."""
@@ -1113,9 +1231,16 @@ class RunManager:
         elsewhere = self._on_loop(lambda: self.decide(run_id, node_id, decision, comment, decided_by=decided_by))
         if elsewhere is not None:
             return elsewhere
-        run = self.get(run_id)
-        if run is None:
-            raise KeyError(run_id)
+        context = self._contexts.get(run_id)
+        fence: str | None = None
+        if context is not None:
+            run = context.run
+        else:
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None:
+                raise KeyError(run_id)
+            run, fence = _split(stored)
+        read_status = run.status
         node = next((item for item in run.workflow.nodes if item.id == node_id), None)
         if node is None or node.type != "approval":
             raise KeyError(node_id)
@@ -1128,15 +1253,20 @@ class RunManager:
         text = comment.strip()[:4000] if config.allow_comment else ""
         if decision == REJECTED and config.require_comment_on_reject and not text:
             raise NodestroError("approval.comment_required", "Please give a reason for the rejection")
-        if self._contexts.get(self.root_of(run).id) is None:
+        top = self.root_of(run)
+        if self._contexts.get(top.id) is None:
             # The run continues on an event loop: refuse before anything is recorded.
             _require_loop()
+            if top.status != "paused":
+                # Only a paused run continues: refused before anything is recorded (not after, C-02).
+                raise NodestroError("run.not_paused", "Only a paused run can continue", status=top.status)
         state.approval = ApprovalRecord(decision=decision, comment=text, decided_by=decided_by)  # type: ignore[arg-type]
-        context = self._contexts.get(run_id)
         if context is not None:
             self._emit(context, "approval_decided", node_id, decision=decision, comment=text, decided_by=decided_by)
-        else:
-            self.store.put("runs", run.id, run)
+        elif self._replace_run(run, fence=fence, status=read_status) is None:
+            # Another process (a second reviewer, a retried request) recorded a decision first (C-02): a
+            # compare-and-set lets exactly one decision win, and this one is refused before anything is queued.
+            raise NodestroError("approval.not_pending", "This approval was decided meanwhile")
         root = self.root_of(run)
         self.resume(root.id)
         return self.get(root.id) or root
@@ -1165,34 +1295,50 @@ class RunManager:
             and self.remote_cancel(stored)
         ):
             return True
-        if stored.status == "paused":
-            self._cancel_stored(stored)
-            return True
-        return False
+        # Paused, or stored as queued or running while nothing executes it (C-11: restored from a backup, imported,
+        # a queue entry that never arrived): it ends here as cancelled.
+        return self._cancel_stored(root.id, ("queued", "running", "paused"))
 
-    def _cancel_stored(self, run: Run) -> None:
-        """Cancel a paused or queued run that is not executing (its pending approvals end undecided)."""
-        for node in run.workflow.nodes:
-            state = run.nodes.get(node.id)
-            if state is None:
+    def _cancel_stored(self, run_id: str, statuses: tuple[str, ...] = ("paused",)) -> bool:
+        """Cancel a stored run in one of ``statuses`` that is not executing (its pending approvals end undecided,
+        nodes stored as running end cancelled); ``False`` when it is in none of them. The write is conditional: a
+        run another process changed meanwhile is looked at again."""
+        for _attempt in range(_CAS_ATTEMPTS):
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None or stored.status not in statuses:
+                return False
+            run, fence = _split(stored)
+            status = run.status
+            children: list[str] = []
+            for node in run.workflow.nodes:
+                state = run.nodes.get(node.id)
+                if state is None:
+                    continue
+                if state.status == "running":
+                    state.status = "cancelled"
+                    state.finished_at = now()
+                    _fail(state, problem("run.node_cancelled", "Cancelled"))
+                    children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
+                if state.status == "awaiting_approval":
+                    state.status = "cancelled"
+                    state.finished_at = now()
+                    _fail(state, problem("run.node_cancelled", "Cancelled"))
+                    children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
+                    if state.orchestration is not None:
+                        state.orchestration = _cancelled_orchestration(state.orchestration)
+            run.status = "cancelled"
+            run.finished_at = now()
+            _fail(run, problem("run.cancelled", "The run was cancelled"))
+            if self._replace_run(run, fence=fence, status=status) is None:
                 continue
-            if state.status == "awaiting_approval":
-                state.status = "cancelled"
-                state.finished_at = now()
-                _fail(state, problem("run.node_cancelled", "Cancelled"))
-                for child_id in [state.child_run_id, *state.child_run_ids]:
-                    child = self.store.get("runs", child_id, Run) if child_id else None
-                    if child is not None and child.status == "paused":
-                        self._cancel_stored(child)
-                if state.orchestration is not None:
-                    state.orchestration = _cancelled_orchestration(state.orchestration)
-        run.status = "cancelled"
-        run.finished_at = now()
-        _fail(run, problem("run.cancelled", "The run was cancelled"))
-        self.store.put("runs", run.id, run)
-        self.discard_tool_waits(run.id, because="cancelled")
-        self._forget_events(run.id)
-        self._notify(run)
+            for child_id in children:
+                self._cancel_stored(child_id, statuses)
+            self.discard_tool_waits(run.id, because="cancelled")
+            self._forget_events(run.id)
+            self._notify(run)
+            return True
+        logger.warning("Run %s changed during every attempt to cancel it", run_id)
+        return False
 
     # ---- runs paused at a tool call (M6b) ------------------------------------------------------------------------
 
@@ -1313,12 +1459,18 @@ class RunManager:
         are left alone.
         """
         count = 0
+        # A damaged run document is left out by ``find`` (and logged); one run that cannot be marked never stops the
+        # start (C-10).
         for run in self.store.find("runs", "status", ("queued", "running"), Run):
             if run.imported_at is not None or run.id in self._contexts:
                 continue
-            _interrupt(run)
-            self.store.put("runs", run.id, run)
-            self._expire_approvals(run.id)
+            try:
+                _interrupt(run)
+                self.store.put("runs", run.id, run)
+                self._expire_approvals(run.id)
+            except Exception:
+                logger.exception("Marking run %s as interrupted failed; it stays as stored", run.id)
+                continue
             count += 1
         return count
 
@@ -1419,13 +1571,16 @@ class RunManager:
         for context in list(self._contexts.values()):
             context.cancelled.set()
         tasks = [task for task in self._tasks.values() if not task.done()]
-        if not tasks:
-            return
-        _done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.wait(pending)
+        if tasks:
+            _done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending)
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            # Agents that did not stop yet end with their next model response or tool call.
+            executor.shutdown(wait=False)
 
     # ---- events --------------------------------------------------------------------
 
@@ -1436,8 +1591,9 @@ class RunManager:
             if state is not None and state.iteration:
                 data.setdefault("iteration", list(state.iteration))
         loop = context.root.loop or self._loop
-        if loop is None:
-            # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens.
+        if loop is None or context.root.fenced_out:
+            # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens. Or the run is no
+            # longer this process's (C-06): its stream belongs to whoever has it now.
             return
         if _in_loop(loop):
             self._publish(context.run.id, kind, node_id, data)
@@ -1483,7 +1639,30 @@ class RunManager:
     def _save(self, context: _RunContext) -> None:
         with context.lock:
             snapshot = context.run.model_copy(deep=True)
-        self.store.put("runs", snapshot.id, snapshot)
+        root = context.root
+        if root.fence is None:
+            self.store.put("runs", snapshot.id, snapshot)
+            return
+        # Queue execution (C-06): the run (and each sub-workflow run) is stored only while it is still this
+        # execution's: a compare-and-set on the fence this execution wrote last.
+        with root.fence_lock:
+            if root.fenced_out:
+                return
+            expected = context.fence
+            if expected is None and context is not root:
+                # A sub-workflow run's first write in this execution compares the fence it is stored with.
+                current = self.store.get("runs", snapshot.id, _FencedRun)
+                expected = current.fence if current is not None else None
+            fence = _new_fence()
+            if expected is None:
+                # A new sub-workflow run (or one stored without a fence): nothing to compare yet.
+                self.store.put("runs", snapshot.id, _fenced(snapshot, fence))
+                context.fence = fence
+                return
+            if self.store.replace_if("runs", snapshot.id, _fenced(snapshot, fence), field="fence", expected=expected):
+                context.fence = fence
+                return
+        self._lose_fence(root, "the stored run was changed by another process")
 
     # ---- execution -----------------------------------------------------------------
 
@@ -1541,29 +1720,53 @@ class RunManager:
             if not paused:
                 run.finished_at = now()
             self._save(context)
-            if not paused and self.after_run is not None:
-                try:
-                    self.after_run(run)
-                except Exception:  # result files are extra; the run's result stays valid
-                    logger.exception("Writing the result files of run %s failed", run.id)
-            self._notify(run)
-            self._emit(
-                context,
-                "run_paused" if paused else "run_finished",
-                status=run.status,
-                error=run.error,
-                error_code=run.error_code,
-                error_params=run.error_params,
-                output=run.output,
-                usage=run.usage.model_dump(mode="json"),
-            )
-            if paused:
-                # Its numbering continues when it resumes, also after a restart; its history is not needed.
+            if context.root.fenced_out:
+                # The run is no longer this process's (C-06): its end is not stored, announced or delivered here.
                 self._events.pop(run.id, None)
-                if run.id in self._seq:
-                    self.store.put_raw(_EVENT_SEQ, run.id, self._seq[run.id])
+                self._seq.pop(run.id, None)
+                self._subscribers.pop(run.id, None)
             else:
-                self._forget_events(run.id)
+                self._finished(context, paused)
+
+    def _finished(self, context: _RunContext, paused: bool) -> None:
+        """What follows a stored end (or pause) of an execution: result files, listeners, the last event."""
+        run = context.run
+        if not paused and self.after_run is not None:
+            try:
+                self.after_run(run)
+            except Exception:  # result files are extra; the run's result stays valid
+                logger.exception("Writing the result files of run %s failed", run.id)
+        self._notify(run)
+        self._emit(
+            context,
+            "run_paused" if paused else "run_finished",
+            status=run.status,
+            error=run.error,
+            error_code=run.error_code,
+            error_params=run.error_params,
+            output=run.output,
+            usage=run.usage.model_dump(mode="json"),
+        )
+        if paused:
+            # Its numbering continues when it resumes, also after a restart; its history is not needed.
+            self._events.pop(run.id, None)
+            if run.id in self._seq:
+                self.store.put_raw(_EVENT_SEQ, run.id, self._seq[run.id])
+        else:
+            self._forget_events(run.id)
+
+    async def _in_run_thread(self, call: Callable[..., T], /, *args: Any) -> T:
+        """``asyncio.to_thread`` on this manager's own agent pool (C-08; see :attr:`run_threads`)."""
+        executor = self._executor
+        if executor is None:
+            with self._executor_lock:
+                executor = self._executor
+                if executor is None:
+                    executor = self._executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, self.run_threads), thread_name_prefix="nodestro-run"
+                    )
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(executor, functools.partial(context.run, call, *args))
 
     def _forget_events(self, run_id: str) -> None:
         """Drop the event history of a run that finished: streams only replay events of live runs."""
@@ -2052,7 +2255,7 @@ class RunManager:
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
-        await asyncio.to_thread(
+        await self._in_run_thread(
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
         self._save(context)
@@ -2758,7 +2961,7 @@ class RunManager:
             return add_usage(prior, current) if prior is not None else current
 
         async def decide(prompt: str) -> Any:
-            return await asyncio.to_thread(self._decide_sync, context, node, prompt)
+            return await self._in_run_thread(self._decide_sync, context, node, prompt)
 
         def start_child(item: orchestration.Delegation) -> Run:
             snapshot, version = teams[item.member.id]
@@ -3323,6 +3526,11 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
 
 def _is_paused(run: Run) -> bool:
     return run.status == "paused"
+
+
+def _child_ids(run: Run) -> list[str]:
+    """The sub-workflow runs of a run's nodes."""
+    return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
 
 
 def _interrupt(run: Run) -> None:

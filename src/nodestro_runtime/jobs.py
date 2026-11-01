@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
+import concurrent.futures
 from datetime import datetime, timedelta
 import json
 import logging
@@ -352,6 +353,14 @@ class RunWorker:
         self.poll = poll
         self.flush_seconds = flush
         self._logs: dict[str, PostgresEventLog] = {}
+        #: The worker's own threads for its queue work (claims, lease renewal, event flushes; C-08), one per held run
+        #: and one for claims: they never wait behind agents or other work in asyncio's default executor.
+        self._queue_threads = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_runs + 1, thread_name_prefix="nodestro-lease"
+        )
+
+    async def _off_loop(self, call: Callable[..., Any], *args: Any) -> Any:
+        return await asyncio.get_running_loop().run_in_executor(self._queue_threads, call, *args)
 
     def _manager(self, tenant_id: str) -> Any:
         runs = self.workspaces(tenant_id).runs
@@ -392,21 +401,26 @@ class RunWorker:
         try:
             while not waiting.done():
                 await asyncio.wait({waiting}, timeout=self.flush_seconds)
-                await asyncio.to_thread(_flush_quietly, log)
-                if time.monotonic() - last_beat >= self.heartbeat_seconds and not waiting.done():
+                await self._off_loop(_flush_quietly, log)
+                if time.monotonic() - last_beat >= self.heartbeat_seconds and not waiting.done() and not lost:
                     last_beat = time.monotonic()
-                    beat = await asyncio.to_thread(self.queue.heartbeat, job.id, self.name)
+                    beat = await self._off_loop(self.queue.heartbeat, job.id, self.name)
                     if beat is None:
-                        # The lease was lost (the reaper marked the run interrupted): stop executing it here.
+                        # The lease was lost (the reaper marked the run interrupted, C-06): the run is no longer
+                        # this worker's. Its execution stops without storing anything more of it.
                         lost = True
                         logger.error("Job %s lost its lease; stopping run %s", job.id, job.ref)
-                        runs.cancel(job.ref)
+                        runs.abandon(job.ref, because=f"job {job.id} lost its lease")
                     elif beat.cancel_requested and not cancel_sent:
                         cancel_sent = True
                         runs.cancel(job.ref)
             run = waiting.result()
         finally:
             _flush_quietly(log)
+        if runs.lost_fence(job.ref) and not lost:
+            # The run was changed by another process while it executed here (C-06): its outcome was not stored.
+            self.queue.finish(job.id, self.name, "failed", "run.fence_lost: the run was changed elsewhere")
+            return
         if lost:
             return
         status: JobStatus = "done"
@@ -414,7 +428,8 @@ class RunWorker:
             status = "failed"
         elif run.status == "cancelled":
             status = "cancelled"
-        self.queue.finish(job.id, self.name, status, run.error if run is not None else "run missing")
+        if not self.queue.finish(job.id, self.name, status, run.error if run is not None else "run missing"):
+            logger.warning("Job %s of run %s was no longer this worker's when it ended", job.id, job.ref)
 
     @property
     def held(self) -> int:
@@ -433,7 +448,7 @@ class RunWorker:
         """Claim one job if :meth:`can_claim` and start executing it as a held run; ``None`` otherwise."""
         if not self.can_claim():
             return None
-        job = await asyncio.to_thread(self.queue.claim, self.name, (RUN_JOB,))
+        job: Job | None = await self._off_loop(self.queue.claim, self.name, (RUN_JOB,))
         if job is None:
             return None
         task = asyncio.ensure_future(self._execute(job))
@@ -484,8 +499,13 @@ def _flush_quietly(log: PostgresEventLog) -> None:
         logger.exception("Writing run events failed")
 
 
-def reap(queue: JobQueue, workspaces: WorkspaceOf) -> list[Job]:
-    """Mark the runs of jobs whose worker died as interrupted (any process may call it periodically)."""
+def reap(queue: JobQueue, workspaces: WorkspaceOf, *, orphans_after: timedelta | None = None) -> list[Job]:
+    """Mark the runs of jobs whose worker died as interrupted (any process may call it periodically).
+
+    Then the runs stored as queued or running that no active job executes (C-11: imported from a desktop, restored,
+    a job that was never queued, or a reaper that failed earlier) are marked interrupted too, once they have not
+    changed for ``orphans_after`` (default: twice the lease), so a run that is being queued right now is left alone.
+    Returns the reaped jobs."""
     reaped = queue.reap_expired()
     for job in reaped:
         if job.kind != RUN_JOB:
@@ -494,7 +514,33 @@ def reap(queue: JobQueue, workspaces: WorkspaceOf) -> list[Job]:
             workspaces(job.tenant_id).runs.interrupt(job.ref)
         except Exception:
             logger.exception("Marking run %s of tenant %s as interrupted failed", job.ref, job.tenant_id)
+    for tenant_id, run_id in orphaned_runs(
+        queue, older_than=queue.lease * 2 if orphans_after is None else orphans_after
+    ):
+        try:
+            if workspaces(tenant_id).runs.interrupt(run_id):
+                logger.warning(
+                    "Run %s of tenant %s was stored as executing without a job: interrupted", run_id, tenant_id
+                )
+        except Exception:
+            logger.exception("Marking run %s of tenant %s as interrupted failed", run_id, tenant_id)
     return reaped
+
+
+def orphaned_runs(queue: JobQueue, *, older_than: timedelta) -> list[tuple[str, str]]:
+    """``(tenant, run)`` of every top-level run stored as queued or running, unchanged for ``older_than``, that no
+    queued or running job executes (sub-workflow runs follow their top-level run; imported traces never execute)."""
+    rows = queue.database._query(
+        "SELECT d.tenant_id, d.id FROM nodestro_documents d"
+        " WHERE d.collection = 'runs' AND d.data ->> 'status' IN ('queued', 'running')"
+        " AND d.data ->> 'parent_run_id' IS NULL AND d.data ->> 'imported_at' IS NULL"
+        " AND d.updated_at < clock_timestamp() - %s"
+        " AND NOT EXISTS (SELECT 1 FROM nodestro_jobs j WHERE j.tenant_id = d.tenant_id AND j.kind = %s"
+        " AND j.ref = d.id AND j.status IN ('queued', 'running'))"
+        " ORDER BY d.tenant_id, d.id",
+        (older_than, RUN_JOB),
+    )
+    return [(str(row[0]), str(row[1])) for row in rows]
 
 
 class LeaderLock:
@@ -565,6 +611,7 @@ __all__ = [
     "QueuedRuns",
     "RunWorker",
     "ScheduleFirings",
+    "orphaned_runs",
     "reap",
     "worker_name",
 ]
