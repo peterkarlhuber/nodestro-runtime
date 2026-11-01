@@ -38,11 +38,13 @@ import hashlib
 import logging
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Literal
 
 from orkexa.dynamic import DockerSandbox, Sandbox
 from orkexa.providers.base import redact
 
+from . import bedrock as bedrock_auth
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -69,6 +71,8 @@ from .providers import (
     PROVIDERS,
     Connection,
     MissingApiKeyError,
+    bedrock_auth_methods,
+    bedrock_settings,
     check_base_url,
     check_capabilities,
     check_endpoint_allowed,
@@ -78,6 +82,7 @@ from .providers import (
     provider_of,
     provider_status,
     qualify,
+    verification_key,
 )
 from .python_envs import PythonEnvironments
 from .python_tools import EnvironmentGate
@@ -117,6 +122,11 @@ from .tool_library import ToolLibrary, make_sandbox
 from .tool_provenance import StoredProvenance
 from .usage_log import UsageLog
 from .versions import WorkflowVersion, WorkflowVersions
+
+#: The settings fields of Amazon Bedrock (``providers.bedrock``); never credentials.
+_BEDROCK_FIELDS = ("region", "auth", "profile_name", "data_residency")
+#: The shortest time between two explicit provider checks of one workspace (they call AWS).
+VERIFY_INTERVAL_SECONDS = 10.0
 
 #: The database file inside the data directory (unchanged since Nodestro 0.1).
 DATABASE = "nodestro.db"
@@ -210,6 +220,10 @@ class WorkspaceStorage:
     #: The server's reference prices (shared by every tenant, written only by the server's price sync). ``None``:
     #: the tenant sees Orkexa's built-in prices until the server provides them. Tenants never write to it.
     price_reference: DocumentStore | None = None
+    #: The operator's Amazon Bedrock rules for this tenant (its own role only, a forced data residency, the allowed
+    #: regions; :meth:`nodestro_runtime.bedrock.BedrockOperatorConfig.for_tenant`). ``None`` or a policy without a
+    #: role: Bedrock is not available to the tenant. The server's own AWS credentials are never used for a tenant.
+    bedrock: bedrock_auth.BedrockServerPolicy | None = None
 
 
 class Workspace:
@@ -300,6 +314,12 @@ class Workspace:
         # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
         self._environ: Mapping[str, str] | None = None if storage is None else {}
         self._endpoints: tuple[str, ...] | None = None if storage is None else storage.endpoints
+        # Amazon Bedrock: a tenant uses only the role its operator assigned to it (never the server's own chain).
+        self._server_tenant = storage is not None
+        self._bedrock_policy = storage.bedrock if storage is not None else None
+        self._bedrock_roles = bedrock_auth.RoleCache()
+        self._bedrock_checked = 0.0
+        self._bedrock_check_lock = threading.Lock()
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
@@ -362,6 +382,8 @@ class Workspace:
             reference_writable=storage is None,
             known_providers=PROVIDERS,
         )
+        # Bedrock prices depend on the region: the strict price mode checks the current connection's region.
+        self.pricing.conditions_source = self._price_conditions
         for priced in (self.runs, self.tester):
             priced.pricing = self.pricing
             priced.price_mode = self.price_mode
@@ -543,7 +565,7 @@ class Workspace:
         stored = self._providers(values)
         default_model = values.get("default_model") or DEFAULT_AGENT_MODEL
         return Settings(
-            providers=[provider_status(name, stored.get(name, {}), self._environ) for name in PROVIDERS],
+            providers=[self._provider_status(name, stored.get(name, {})) for name in PROVIDERS],
             default_provider=provider_of(default_model),
             default_model=default_model,
             assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
@@ -609,6 +631,17 @@ class Workspace:
             if name not in PROVIDERS:
                 raise NodestroError("provider.unknown", f"Unknown provider {name!r}", provider=name)
             entry = providers.setdefault(name, {})
+            if PROVIDERS[name].auth == "aws":
+                self._update_bedrock(entry, change)
+                continue
+            for key in _BEDROCK_FIELDS:
+                if change.get(key):
+                    raise NodestroError(
+                        "provider.field_not_supported",
+                        f"{key} is a setting of Amazon Bedrock, not of {PROVIDERS[name].label}",
+                        provider=name,
+                        field=key,
+                    )
             for key in ("api_key", "base_url"):
                 if change.get(key) is None:
                     continue
@@ -632,6 +665,228 @@ class Workspace:
         if changes.get("sandbox"):
             self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy, self._container_sandbox()))
         return self.settings()
+
+    # ---- Amazon Bedrock ------------------------------------------------------------
+
+    def _local_container(self) -> bool:
+        return not self._server_tenant and self.profile.kind == "local-container"
+
+    def _bedrock_policy_for_tenant(self) -> bedrock_auth.BedrockServerPolicy | None:
+        """The operator's policy, only if it was made for this workspace's own tenant."""
+        policy = self._bedrock_policy
+        if policy is None or policy.tenant_id != self.tenant_id:
+            return None
+        return policy
+
+    def _provider_status(self, name: str, stored: Mapping[str, Any]) -> Any:
+        return provider_status(
+            name,
+            stored,
+            self._environ,
+            server=self._server_tenant,
+            bedrock_policy=self._bedrock_policy_for_tenant(),
+            local_container=self._local_container(),
+        )
+
+    def _update_bedrock(self, entry: dict[str, Any], change: Mapping[str, Any]) -> None:
+        """Check and store a change of the Bedrock settings (region, sign-in, profile name, residency)."""
+        for key in ("api_key", "base_url"):
+            if change.get(key):
+                raise NodestroError(
+                    "provider.field_not_supported",
+                    f"Amazon Bedrock uses AWS credentials, not {key}: Nodestro neither stores AWS keys nor sends "
+                    "signed requests to custom endpoints",
+                    provider="bedrock",
+                    field=key,
+                )
+        if change.get("capabilities"):
+            raise NodestroError(
+                "provider.field_not_supported",
+                "Amazon Bedrock's capabilities come from Orkexa and cannot be declared",
+                provider="bedrock",
+                field="capabilities",
+            )
+        server = self._server_tenant
+        policy = self._bedrock_policy_for_tenant()
+        if server and (policy is None or policy.role is None) and any(change.get(key) for key in _BEDROCK_FIELDS):
+            raise bedrock_auth.not_available()
+        methods = bedrock_auth_methods(server=server, local_container=self._local_container())
+        before = {key: entry.get(key) for key in _BEDROCK_FIELDS}
+        if change.get("auth") is not None:
+            auth = change["auth"].strip()
+            if auth and auth not in bedrock_auth.AUTH_METHODS:
+                raise NodestroError(
+                    "provider.auth_invalid", f"Unknown AWS sign-in method {auth[:40]!r}", auth=auth[:40]
+                )
+            if auth and auth not in methods:
+                raise NodestroError(
+                    "provider.auth_not_allowed",
+                    f"The AWS sign-in method {auth!r} is not available here; allowed: {', '.join(methods)}",
+                    auth=auth,
+                    allowed=", ".join(methods),
+                )
+            if auth:
+                entry["auth"] = auth
+            else:
+                entry.pop("auth", None)
+        if change.get("profile_name") is not None:
+            name = change["profile_name"].strip()
+            if name and "profile" not in methods:
+                raise NodestroError(
+                    "provider.field_not_supported",
+                    "AWS profiles are a desktop setting; this installation signs in to AWS another way",
+                    provider="bedrock",
+                    field="profile_name",
+                )
+            if name:
+                entry["profile_name"] = bedrock_auth.check_profile_name(name)
+            else:
+                entry.pop("profile_name", None)
+        if change.get("region") is not None:
+            region = change["region"].strip()
+            if region:
+                entry["region"] = bedrock_auth.check_region(region)
+            else:
+                entry.pop("region", None)
+        if change.get("data_residency") is not None:
+            residency = change["data_residency"].strip()
+            if residency not in ("", "eu_only"):
+                raise NodestroError(
+                    "provider.data_residency_invalid", "Data residency must be eu_only or empty", value=residency[:40]
+                )
+            if not residency and server and policy is not None and policy.data_residency == "eu_only":
+                raise NodestroError(
+                    "provider.data_residency_forced",
+                    "The server's operator requires EU-only data residency for Amazon Bedrock; it cannot be relaxed",
+                )
+            if residency:
+                entry["data_residency"] = residency
+            else:
+                entry.pop("data_residency", None)
+        settings, problem = bedrock_settings(
+            entry, server=server, policy=policy, local_container=self._local_container()
+        )
+        if settings.region is not None:
+            if problem == "provider.region_not_allowed":
+                regions = policy.regions() if policy is not None else None
+                raise NodestroError(
+                    "provider.region_not_allowed",
+                    f"The region {settings.region} is not allowed on this server",
+                    region=settings.region,
+                    allowed=", ".join(regions or ()),
+                )
+            bedrock_auth.check_regions((settings.region,), settings.data_residency)
+        if {key: entry.get(key) for key in _BEDROCK_FIELDS} != before:
+            entry.pop("verification", None)  # a changed configuration has to be checked again
+
+    def _price_conditions(self, provider: str) -> dict[str, str]:
+        """The tariff conditions known before a request (Bedrock: the region of the settings in effect, read anew on
+        every call; for a server tenant its own region). Empty when Bedrock cannot be used."""
+        if provider not in PROVIDERS or PROVIDERS[provider].auth != "aws":
+            return {}
+        settings, problem = bedrock_settings(
+            self._providers().get(provider, {}),
+            server=self._server_tenant,
+            policy=self._bedrock_policy_for_tenant(),
+            local_container=self._local_container(),
+        )
+        if problem is not None or settings.region is None:
+            return {}
+        return {"aws_region": settings.region}
+
+    def _bedrock_connection(self, stored: Mapping[str, Any]) -> Connection:
+        policy = self._bedrock_policy_for_tenant()
+        server = self._server_tenant
+        settings, problem = bedrock_settings(
+            stored, server=server, policy=policy, local_container=self._local_container()
+        )
+        if problem == "provider.bedrock_not_available":
+            error = bedrock_auth.not_available()
+            raise MissingApiKeyError("bedrock", code=error.code, message=str(error))
+        if problem == "provider.not_configured":
+            raise MissingApiKeyError("bedrock")
+        if problem == "provider.auth_not_allowed":
+            raise MissingApiKeyError(
+                "bedrock",
+                code=problem,
+                message="The stored AWS sign-in method of Amazon Bedrock is not available here; choose another one",
+            )
+        if problem is not None:  # a region outside the operator's list or outside the EU with eu_only
+            raise NodestroError(
+                problem,
+                f"The Bedrock region {settings.region} is not allowed by the data residency or the operator",
+                region=settings.region or "",
+            )
+        client = self._client_factory("bedrock") if self._client_factory is not None else None
+        return Connection(
+            provider="bedrock",
+            client=client,
+            bedrock=settings,
+            session_factory=self._bedrock_session_factory(settings, policy),
+            require_session=server,
+        )
+
+    def _bedrock_session_factory(
+        self, settings: bedrock_auth.BedrockSettings, policy: bedrock_auth.BedrockServerPolicy | None
+    ) -> Callable[[], Any]:
+        """A new boto3 session per call: the tenant's assumed role on a server, the user's own chain on a desktop."""
+        if self._server_tenant:
+            if policy is None or policy.role is None or settings.region is None:
+                raise bedrock_auth.not_available()
+            credentials = self._bedrock_roles.get(policy, settings.region)
+            return credentials.session
+        return lambda: bedrock_auth.desktop_session(settings)
+
+    def verify_provider(self, provider: str, *, model: str | None = None) -> Any:
+        """Check a provider's configuration with free calls only and store the result (Amazon Bedrock).
+
+        STS ``GetCallerIdentity`` plus one Bedrock control-plane read (:func:`nodestro_runtime.bedrock.verify`;
+        ``model`` chooses ``GetInferenceProfile``/``GetFoundationModel`` instead of ``ListFoundationModels``); no
+        model is invoked. At most one check per :data:`VERIFY_INTERVAL_SECONDS` (``provider.verify_rate_limited``).
+        Returns the provider's status; the result names no AWS identity.
+        """
+        import time
+
+        if provider not in PROVIDERS:
+            raise NodestroError("provider.unknown", f"Unknown provider {provider!r}", provider=provider)
+        if PROVIDERS[provider].auth != "aws":
+            raise NodestroError(
+                "provider.verify_not_supported",
+                f"{PROVIDERS[provider].label} has no verification check",
+                provider=provider,
+            )
+        with self._bedrock_check_lock:  # two concurrent requests: only one of them checks
+            elapsed = time.monotonic() - self._bedrock_checked
+            if self._bedrock_checked and elapsed < VERIFY_INTERVAL_SECONDS:
+                raise NodestroError(
+                    "provider.verify_rate_limited",
+                    "The AWS settings were checked a moment ago; try again shortly",
+                    retry_after=int(VERIFY_INTERVAL_SECONDS - elapsed) + 1,
+                )
+            self._bedrock_checked = time.monotonic()
+        values = self.store.get_raw("settings", "app") or {}
+        stored = self._providers(values).get(provider, {})
+        connection_settings, _problem = bedrock_settings(
+            stored,
+            server=self._server_tenant,
+            policy=self._bedrock_policy_for_tenant(),
+            local_container=self._local_container(),
+        )
+        try:
+            connection = self._bedrock_connection(stored)
+            assert connection.bedrock is not None and connection.session_factory is not None
+            result = bedrock_auth.verify(connection.session_factory(), connection.bedrock, model=model)
+        except NodestroError as exc:
+            result = {"state": "failed", "checked_at": bedrock_auth.now_text(), "code": exc.code}
+        values = self.store.get_raw("settings", "app") or {}
+        providers = dict(values.get("providers") or {})
+        entry = dict(providers.get(provider) or {})
+        result["for"] = verification_key(connection_settings, self._bedrock_policy_for_tenant())
+        entry["verification"] = result
+        providers[provider] = entry
+        values["providers"] = providers
+        self.store.put_raw("settings", "app", values)
+        return self._provider_status(provider, self._providers(values).get(provider, {}))
 
     def reload_after_restore(self) -> None:
         """Pick up restored data that is cached in memory: the tool registry and its sandbox.
@@ -824,6 +1079,8 @@ class Workspace:
         if info is None:
             raise NodestroError("provider.unknown", f"Unknown provider {provider!r}", provider=provider)
         stored = self._providers().get(provider, {})
+        if info.auth == "aws":
+            return self._bedrock_connection(stored)
         key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
         if base_url and info.base_url:

@@ -157,7 +157,7 @@ def test_validation_drops_invalid_prices_and_keeps_the_rest(service: PricingServ
 
 def test_validation_checks_ids_providers_and_plausibility() -> None:
     codes = lambda price: {issue.code for issue in validate_price(price, known_providers=PROVIDERS)}  # noqa: E731
-    assert "pricing.unknown_provider" in codes(_price("m", "1", "2", provider="bedrock"))
+    assert "pricing.unknown_provider" in codes(_price("m", "1", "2", provider="azure"))
     assert "pricing.implausible_rate" in codes(_price("m", "20000", "2"))
     assert "pricing.zero_price" in codes(_price("m", "0", "0"))
     assert "pricing.cache_read_above_input" in codes(

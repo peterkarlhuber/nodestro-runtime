@@ -25,7 +25,8 @@ from .schemas import SanitizeReport
 
 SECRET_KEY = re.compile(
     r"(api[_-]?key|apikey|authorization|auth[_-]?token|access[_-]?token|refresh[_-]?token|token|secret|"
-    r"client[_-]?secret|password|passwd|passwort|pwd|cookie|session[_-]?id|private[_-]?key|x-api-key)$",
+    r"client[_-]?secret|password|passwd|passwort|pwd|cookie|session[_-]?id|private[_-]?key|x-api-key|"
+    r"secret[_-]?access[_-]?key)$",
     re.IGNORECASE,
 )
 
@@ -33,7 +34,11 @@ _SECRETS: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
     ("api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{10,}")),
     ("api_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}")),
-    ("api_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    # AWS: access key ids (long-term AKIA, temporary ASIA), session tokens, Bedrock API keys (long- and short-term).
+    ("api_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("token", re.compile(r"\b(?:IQoJb3JpZ2lu|FwoGZXIvYXdz|FQoGZXIvYXdz)[A-Za-z0-9+/=]{16,}")),
+    ("api_key", re.compile(r"\bABSK[A-Za-z0-9+/=]{16,}")),
+    ("api_key", re.compile(r"\bbedrock-api-key-[A-Za-z0-9+/=._%-]{8,}")),
     ("api_key", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b")),
     ("api_key", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b")),
     ("api_key", re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}")),
@@ -43,7 +48,8 @@ _SECRETS: list[tuple[str, re.Pattern[str]]] = [
 ]
 # "password: hunter2", "api_key=abc", "Passwort = geheim": the name stays, the value goes.
 _ASSIGNMENT = re.compile(
-    r"(?i)([\"']?)\b(password|passwort|passwd|pwd|secret|api[_-]?key|token|access[_-]?key|client[_-]?secret)\1"
+    r"(?i)([\"']?)\b(password|passwort|passwd|pwd|secret|api[_-]?key|token|access[_-]?key|client[_-]?secret|"
+    r"aws_secret_access_key|aws_session_token)\1"
     r"(\s*[:=]\s*)([\"']?)([^\s\"',;}]{4,})\4"
 )
 _PERSONAL: list[tuple[str, re.Pattern[str]]] = [

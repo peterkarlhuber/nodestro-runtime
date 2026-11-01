@@ -11,7 +11,7 @@ its cost is shown as unknown, never as zero.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa import MODEL_PRICING
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
@@ -45,6 +45,13 @@ class ModelInfo(BaseModel):
     price_quality: str | None = None
     price_source: str | None = None
     price_version: str | None = None
+    #: Amazon Bedrock: the region the shown base rates belong to and every region the price covers (``aws_region``
+    #: tariff); a region outside ``price_regions`` has an unknown cost.
+    price_region: str | None = None
+    price_regions: list[str] | None = None
+    #: Amazon Bedrock: what the model supports according to Orkexa (``CAPABILITY_NAMES``); ``None`` for the other
+    #: providers. Any typed model id gets the same values from :func:`model_capabilities`.
+    capabilities: dict[str, Literal["supported", "unsupported", "unknown"]] | None = None
 
 
 _MODEL_TEXT: dict[str, tuple[str, str, str]] = {
@@ -76,6 +83,24 @@ _OTHER_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
         "Gemini",
         "Google model (example; any Gemini model id can be entered)",
     ),
+)
+
+#: Suggested Amazon Bedrock models: EU cross-Region inference profiles (``eu.``) of current Claude and Amazon Nova
+#: models, ids as Orkexa's Bedrock documentation and tests use them. They are suggestions only: whether a model is
+#: enabled for an AWS account and region is not known until it is used (or checked with the settings' verification).
+_BEDROCK_SUGGESTION = " via Amazon Bedrock (EU inference profile; suggestion, model access must be enabled in AWS)"
+_BEDROCK_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("bedrock", "eu.anthropic.claude-sonnet-5-5", "Claude Sonnet 5.5 (Bedrock EU)", "Sonnet", "Claude Sonnet 5.5"),
+    ("bedrock", "eu.anthropic.claude-opus-5-5", "Claude Opus 5.5 (Bedrock EU)", "Opus", "Claude Opus 5.5"),
+    (
+        "bedrock",
+        "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "Claude Haiku 4.5 (Bedrock EU)",
+        "Haiku",
+        "Claude Haiku 4.5",
+    ),
+    ("bedrock", "eu.amazon.nova-pro-v1:0", "Amazon Nova Pro (Bedrock EU)", "Nova", "Amazon Nova Pro"),
+    ("bedrock", "eu.amazon.nova-lite-v1:0", "Amazon Nova Lite (Bedrock EU)", "Nova", "Amazon Nova Lite"),
 )
 
 
@@ -113,6 +138,10 @@ def _priced(
         info.cache_read_usd_per_mtok = float(rates.cache_read)
     info.price_quality = price.quality
     info.price_source = price.source
+    regional = price.tariff("aws_region")
+    if regional is not None:
+        info.price_region = regional.default
+        info.price_regions = [option.value for option in regional.options]
     if pricing is None:
         info.price_status = "current"
         info.price_version = snapshot.version
@@ -125,7 +154,8 @@ def _priced(
 
 
 def models(pricing: PricingService | None = None) -> list[ModelInfo]:
-    """The suggested models: Anthropic's (current generation first), then examples of other providers.
+    """The suggested models: Anthropic's (current generation first), then examples of other providers, then
+    Amazon Bedrock suggestions (EU inference profiles; never verified access, see :data:`_BEDROCK_MODELS`).
 
     Prices come from ``pricing`` (the workspace's catalog) or, without it, from Orkexa's built-in prices.
     """
@@ -150,7 +180,43 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
         )
     for provider, model_id, label, tier, description in _OTHER_MODELS:
         result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
+    for provider, model_id, label, tier, description in _BEDROCK_MODELS:
+        result.append(
+            _with_capabilities(
+                _priced(
+                    provider,
+                    model_id,
+                    label,
+                    tier,
+                    description + _BEDROCK_SUGGESTION,
+                    model_id.startswith("eu.anthropic.claude-sonnet"),
+                    snapshot=snapshot,
+                    pricing=pricing,
+                )
+            )
+        )
     return result
+
+
+def model_capabilities(model: str) -> dict[str, Literal["supported", "unsupported", "unknown"]] | None:
+    """Orkexa's capability values of a Bedrock model (``bedrock:<id>``, catalog or typed); ``None`` for the other
+    providers and for invalid names (their capabilities depend on the connection's declared values)."""
+    from .problems import NodestroError
+    from .providers import CAPABILITY_NAMES, Connection, check_model, provider_of
+
+    try:
+        qualified = check_model(model)
+    except NodestroError:
+        return None
+    if provider_of(qualified) != "bedrock":
+        return None
+    caps = Connection(provider="bedrock").model_capabilities(qualified)
+    return {name: getattr(caps, name) for name in CAPABILITY_NAMES}
+
+
+def _with_capabilities(info: ModelInfo) -> ModelInfo:
+    info.capabilities = model_capabilities(info.id)
+    return info
 
 
 class ServerToolInfo(BaseModel):

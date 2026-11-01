@@ -24,6 +24,67 @@ Live run chat and steering (LRC-1, 2026-11-01):
   or test series take instructions only with `always`. Not part of node fingerprints.
 - Sanitized trace exports mask or remove the chat (`chat` next to the run); importing a trace brings its chat along.
 
+Amazon Bedrock (2026-11-01):
+
+- New provider `bedrock` ("Amazon Bedrock (AWS)", `ProviderInfo.auth == "aws"`; the other providers get `auth`
+  `api_key`/`endpoint`, unchanged in behaviour). No API key and no base URL: settings `providers.bedrock` hold only
+  `region`, `auth` (`default_chain`/`profile` on a desktop, `default_chain` in Nodestro Local, `operator_role` for
+  server tenants), `profile_name` and `data_residency` (`eu_only`). Stable codes: `provider.region_invalid`,
+  `provider.auth_invalid`, `provider.auth_not_allowed`, `provider.field_not_supported`, `provider.profile_name_invalid`,
+  `provider.data_residency_invalid|_region|_forced`, `provider.region_not_allowed`, `provider.bedrock_not_available`.
+  `ProviderStatus` gains `auth`, `region`, `profile_name`, `data_residency(_forced)`, `auth_methods`,
+  `allowed_regions`, `operator_role` and `verification {state, checked_at, code}` (never an account, ARN or key).
+- `Workspace.verify_provider("bedrock", model=None)`: STS `GetCallerIdentity` plus one free Bedrock control-plane read
+  (`ListFoundationModels`, or `GetInferenceProfile`/`GetFoundationModel` for a given model), short timeouts, one retry,
+  at most every 10 s; never invokes a model. AWS failures map to `provider.aws_*` codes.
+- Server tenants never use the server's own AWS chain: `WorkspaceStorage.bedrock` (`BedrockServerPolicy`, built by
+  `BedrockOperatorConfig.from_env` from `NODESTRO_BEDROCK_TENANT_ROLES[_FILE]`, `NODESTRO_BEDROCK_DATA_RESIDENCY`,
+  `NODESTRO_BEDROCK_ALLOWED_REGIONS`; `tenant_storage(..., bedrock=)`) assigns one role per tenant, assumed with STS
+  (`ExternalId`, `RoleSessionName=nodestro-<tenant>`, regional endpoint, 30 min, deferred refreshable credentials, a
+  fresh session per agent). Options without a session are refused on a server.
+- Agents: `BedrockOptions` only from the connection; request options become `additional_model_request_fields` and
+  may not set region, profile, session, residency, endpoints or managed fields (`config.reserved_request_options`).
+  Anthropic-only options stay refused for Claude on Bedrock. Run errors drop IAM/STS identities; residency refusals
+  have the code `provider.data_residency_violation`. Pre-check codes `check.bedrock_not_configured`,
+  `check.bedrock_not_available`, `check.bedrock_settings_invalid`. Exports: `environment_connection(..., settings=)`
+  and `exported_settings()` (region + data residency only; `provider.region_missing`). Catalog: EU inference profile
+  suggestions. Orkexa pin: `3467940` (master with the Bedrock provider).
+- The workspace feeds the strict price mode the Bedrock region in effect (`PricingService.conditions_source`); the
+  pre-check reports `check.model_unpriced` when a Bedrock price does not cover that region; catalog entries show
+  `price_region`/`price_regions`.
+- Review fixes (PR #66): a tenant's AWS session reads nothing of the operator's AWS configuration (no
+  `AWS_PROFILE`, config or credentials file, `ca_bundle`, `credential_process`, credential chain or `AWS_*` settings;
+  only `AWS_CA_BUNDLE` from the server's environment is honoured, for corporate TLS proxies). On a server the
+  `bedrock-runtime` client is built from the tenant session in `Connection.agent_kwargs()` too, so an agent built
+  without options can never sign with the server's chain. Error texts (runs, agent tests, tool jobs) drop the account
+  of every ARN and bare account ids. Imports into a tenant drop Bedrock `auth`, `profile_name` and `verification`; a
+  stored check result counts only for the settings and role it was made for, and an invalid stored region counts as
+  not configured. Verification under a residency makes the run's static checks first. The strict price check uses
+  the region an agent was built for. `NODESTRO_BEDROCK_ALLOWED_REGIONS` lists the regions where inference may run
+  (destinations of cross-Region profiles included), not only the source regions.
+- Studio data: Bedrock catalog entries carry Orkexa's `capabilities` (`catalog.model_capabilities(model)` gives the
+  same for any typed `bedrock:` id; `None` for the other providers); `PriceEntry.regions` lists a price's
+  `aws_region` tariff values (base-rate region first).
+
+Amazon Bedrock, pricing and credential isolation:
+
+- Bedrock is its own price source (never Anthropic's list prices). A `bedrock` price must list its AWS regions as an
+  `aws_region` tariff (`pricing.region_required`, `pricing.invalid_region`); a region it does not list has an unknown
+  cost, never 0. `PricingService.conditions_source` tells the strict price mode the connection's region, so a Bedrock
+  request whose price does not cover it (or whose region is not known) is refused before it is sent
+  (`pricing.price_unknown`). Refusals keep model ids with colons (`...-v1:0`, ARNs) whole in `params.model`.
+- LiteLLM sync maps only regional Bedrock entries (`bedrock/<region>/<model id>`) into one price per model id with an
+  option per region; entries without a region (`anthropic.claude-...`, `eu.`/`global.` profiles), provisioned
+  throughput and ambiguous duplicates are left out (`LiteLLMSource.bedrock_unmapped`).
+- Reconciliation lists providers without a billing adapter under `not_reconciled`
+  (`pricing.reconciliation_not_supported` for Bedrock, whose bill also has charges usage does not report).
+- The subprocess sandbox gets `HOST_AWS_ENV` (no shared AWS credential/config files, no instance metadata), so an
+  AWS SDK in tool code never picks up the desktop user's AWS credentials; regression tests prove that no `AWS_*`
+  variable reaches uv, the subprocess, built-in and container sandboxes or MCP stdio servers. uv keeps the user's
+  shared AWS files (private package indexes through AWS CodeArtifact keep working); residual risk, unchanged from
+  before: a source build runs third-party code on the host with `HOME` and could read `~/.aws`. Trace exports also
+  hide temporary AWS keys, session tokens and Bedrock API keys.
+
 Backend audit (2026-11-01):
 
 - C-14 follow-up (re-verification found PostgreSQL reads slower than before the pool): a pooled connection is
