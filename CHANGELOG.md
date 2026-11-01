@@ -48,6 +48,16 @@ Backend audit (2026-11-01):
 - D-14: `engine.PLACEHOLDER` and `memory_spaces.SPACE_PATTERN` are public; the private names remain as aliases.
 - Tests: `test_worker_tool_changes.py` is skipped without a Docker daemon, except in CI or with
   `NODESTRO_REQUIRE_DOCKER=1`.
+- AD-01: a provider failure during a run has its own code: `run.provider_auth` (401/403), `run.provider_unreachable`,
+  `run.provider_rate_limited` (429) or `run.provider_overloaded` (503/529), with `params.provider` and `params.status`.
+  Other provider errors stay `run.api_error`.
+- AD-10: a graceful stop ends running runs as interrupted (`run.interrupted`, `params.cause = "shutdown"`) and they
+  can be continued; it no longer looks like a cancellation by a person. After a crash the step that was running is
+  marked interrupted instead of staying "waiting", and the resume plan says `resume.was_interrupted`.
+- X-02: a step keeps its start time when it continues after an approval, and each orchestrator team result names its
+  child run (`outcomes[].ref`).
+- AD-03: runs carry `warnings` (`{code, node_id, tool, count}`) for tool calls that were rejected, expired, refused or
+  failed.
 
 Security fixes from the independent MCP re-review (R-1, R-2, two test gaps):
 
