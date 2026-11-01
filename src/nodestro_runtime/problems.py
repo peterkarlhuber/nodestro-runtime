@@ -73,7 +73,9 @@ _LIBRARY_PATTERNS: list[tuple[re.Pattern[str], str, tuple[str, ...]]] = [
 ]
 
 
-_PRICED_MODEL = re.compile(r"\b(?:to|for) (?P<model>[\w.-]+:[\w./@-]+?)[\s;:,)]")
+#: ``provider:model`` in Orkexa's refusals. Model ids may contain colons (Bedrock: ``anthropic.claude-...-v1:0``,
+#: ARNs), so only a colon followed by a space or the end closes the name.
+_PRICED_MODEL = re.compile(r"\b(?:to|for) (?P<model>[\w.-]+:[\w./@:-]*[\w./@-])(?=[\s;,)]|:\s|:$|$)")
 
 
 def price_problem(exc: BaseException, message: str | None = None) -> Problem | None:

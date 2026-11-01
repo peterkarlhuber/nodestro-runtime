@@ -24,6 +24,12 @@ What a comparison can and cannot say:
   ``pending``; a day where Nodestro's estimate is incomplete is ``incomplete`` and is never presented as a
   deviation; billed lines without a model are reported per provider and day (``unattributed``).
 
+Providers without a billing adapter, such as Amazon Bedrock (AWS bills through Cost Explorer and the Cost and Usage
+Report, which need AWS credentials Nodestro does not ask for), are never compared: the report lists Nodestro's
+estimate for them under ``not_reconciled`` with ``pricing.reconciliation_not_supported``. Bedrock's estimate is also
+never complete: the AWS bill contains charges no usage record reports (Guardrails, model invocation logging and
+CloudWatch, data transfer, provisioned throughput, knowledge bases, Marketplace fees).
+
 A deviation is flagged (``warning``) when it is above ``relative_threshold`` *and* above ``absolute_threshold_usd``
 (defaults: 5 % and 1 USD).
 """
@@ -339,16 +345,74 @@ class ProviderResult(BaseModel):
     complete_until: datetime | None = None
 
 
+#: Providers with a billing adapter (:class:`OpenAICostsAdapter`, :class:`AnthropicCostAdapter`).
+RECONCILABLE_PROVIDERS = frozenset({"openai", "anthropic"})
+#: Why a provider's estimate cannot be complete compared with its bill, where Nodestro knows it.
+_UNREPORTED_CHARGES: Mapping[str, str] = {
+    "bedrock": (
+        "Amazon Bedrock has no billing adapter; compare with AWS Cost Explorer. The AWS bill also contains charges "
+        "usage does not report (Guardrails, model invocation logging and CloudWatch, data transfer, provisioned "
+        "throughput, knowledge bases, Marketplace fees), so this estimate is a lower bound"
+    ),
+}
+
+
+class UnreconciledProvider(BaseModel):
+    """A provider Nodestro estimated costs for in the period but did not compare with a bill."""
+
+    provider: str
+    #: ``pricing.reconciliation_not_supported``: no adapter exists (Bedrock); ``pricing.reconciliation_not_configured``:
+    #: an adapter exists but no admin key was given.
+    code: Literal["pricing.reconciliation_not_supported", "pricing.reconciliation_not_configured"]
+    estimated_usd: Decimal
+    requests: int
+    unpriced_requests: int
+    note: str
+
+
 class ReconciliationReport(BaseModel):
     created_at: datetime
     start: date
     end: date
     providers: list[ProviderResult]
+    #: Providers with estimates in the period that were not compared (never presented as matching their bill).
+    not_reconciled: list[UnreconciledProvider] = Field(default_factory=list)
     #: One row per provider and day (``model`` is ``None``) and, below it, per model.
     rows: list[ReconciliationRow]
     warnings: int
     relative_threshold: Decimal
     absolute_threshold_usd: Decimal
+
+
+def _unreconciled(estimates: Mapping[EstimateKey, Estimate], compared: set[str]) -> list[UnreconciledProvider]:
+    totals: dict[str, Estimate] = {}
+    for (_, provider, _), estimate in estimates.items():
+        if provider in compared:
+            continue
+        total = totals.setdefault(provider, Estimate())
+        total.requests += estimate.requests
+        total.known_usd += estimate.known_usd
+        total.unpriced_requests += estimate.unpriced_requests
+    found = []
+    for provider in sorted(totals):
+        total = totals[provider]
+        supported = provider in RECONCILABLE_PROVIDERS
+        note = _UNREPORTED_CHARGES.get(provider) or (
+            "No admin key of this provider's billing API was given"
+            if supported
+            else "Nodestro cannot fetch this provider's bill"
+        )
+        found.append(
+            UnreconciledProvider(
+                provider=provider,
+                code="pricing.reconciliation_not_configured" if supported else "pricing.reconciliation_not_supported",
+                estimated_usd=total.known_usd,
+                requests=total.requests,
+                unpriced_requests=total.unpriced_requests,
+                note=note,
+            )
+        )
+    return found
 
 
 class CostReconciliationService:
@@ -387,6 +451,7 @@ class CostReconciliationService:
             start=start,
             end=end,
             providers=providers,
+            not_reconciled=_unreconciled(estimates, {adapter.provider for adapter in self.adapters}),
             rows=rows,
             warnings=sum(1 for row in rows if row.status == "warning"),
             relative_threshold=self.settings.relative_threshold,
@@ -491,6 +556,7 @@ class CostReconciliationService:
 __all__ = [
     "ANTHROPIC_COST_URL",
     "OPENAI_COSTS_URL",
+    "RECONCILABLE_PROVIDERS",
     "AnthropicCostAdapter",
     "BilledLine",
     "CostAdapter",
@@ -502,6 +568,7 @@ __all__ = [
     "ReconciliationReport",
     "ReconciliationRow",
     "ReconciliationSettings",
+    "UnreconciledProvider",
     "get_json",
     "nodestro_estimates",
 ]
