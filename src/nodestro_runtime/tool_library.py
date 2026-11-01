@@ -46,6 +46,7 @@ from orkexa.dynamic import (
 )
 from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
+from orkexa.memory import MEMORY_TOOL_NAME
 from pydantic import BaseModel, Field, model_validator
 
 from .builtin_sandbox import LinuxSandbox
@@ -66,6 +67,9 @@ logger = logging.getLogger(__name__)
 
 ToolKind = Literal["builtin", "custom", "generated", "mcp"]
 _APPROVAL_TIMEOUT_SECONDS = 3600
+#: Names no own or generated tool may have: Orkexa's dynamic-agent tools and the agent's system memory tool
+#: (re-review R-2: a tool named ``memory`` would otherwise pass for the memory tool).
+RESERVED_NAMES: frozenset[str] = RESERVED_TOOL_NAMES | {MEMORY_TOOL_NAME}
 
 # Tools are technical artefacts: whatever language the requirement is written in, the code, the
 # names, the docstring (which becomes the tool description agents read) and the tests stay English.
@@ -197,6 +201,16 @@ class ToolJob(BaseModel):
     cost_usd: float | None = None
     created_at: datetime = Field(default_factory=now)
     finished_at: datetime | None = None
+
+
+class _ReservingToolBuilder(ToolBuilder):
+    """Orkexa's tool builder, refusing Nodestro's reserved names too (:data:`RESERVED_NAMES`, re-review R-2): the
+    Coding Agent gets the refusal as feedback and proposes another name."""
+
+    def _validate(self, proposal: Any) -> tuple[list[str], Any]:
+        if proposal.function_name in RESERVED_NAMES:
+            return [f"{proposal.function_name!r} is a reserved tool name; choose another"], None
+        return super()._validate(proposal)
 
 
 class _RecordingCodingAgent(CodingAgent):
@@ -653,6 +667,12 @@ class ToolLibrary:
             if self.mcp is None:
                 raise KeyError(name)
             return self.mcp.agent_tool(name, cancelled=cancelled, gated=gated)
+        if name == MEMORY_TOOL_NAME:
+            # Reserved for the agent's system memory tool (re-review R-2): an own or generated tool stored under this
+            # name before the reservation is never handed out (it stays listed, so it can be renamed or deleted).
+            raise NodestroError(
+                "tool.name_reserved", f"The name {name!r} is reserved for the memory tool; rename this tool", name=name
+            )
         registry = self.registry
         try:
             tool = registry.get_tool(name)
@@ -703,7 +723,7 @@ class ToolLibrary:
         errors = [problem("tool.code_check", text) for text in source.errors] + [
             problem("tool.test_check", text) for text in test_report.errors
         ]
-        if function_name in RESERVED_TOOL_NAMES or function_name in self.builtin:
+        if function_name in RESERVED_NAMES or function_name in self.builtin:
             errors.append(
                 problem(
                     "tool.name_reserved",
@@ -929,7 +949,7 @@ class ToolLibrary:
                 credentials={connection.provider: connection.settings()},
                 usage_tracker=tracker,
             )
-            builder = ToolBuilder(
+            builder = _ReservingToolBuilder(
                 coding_agent,
                 self.registry,
                 approver=CallbackApprover(approve),

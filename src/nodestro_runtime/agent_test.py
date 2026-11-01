@@ -24,18 +24,17 @@ from typing import Any, Literal
 
 from orkexa import EphemeralMemory, MemoryBackend, ToolCall
 from orkexa.dynamic import BudgetTracker, Sandbox
-from orkexa.memory import MEMORY_TOOL_NAME
 from pydantic import BaseModel, Field
 
 from . import tool_policy
-from .agent_builder import AgentBuilder
+from .agent_builder import AgentBuilder, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode
 from .engine import execute_agent, node_problem, render_task, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
 from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
-from .tool_approvals import ToolGate, tool_facts
+from .tool_approvals import CallBinding, ToolGate, bind_call, tool_facts
 
 #: Test results show at most this much of a tool result (the run view keeps 20,000 too).
 _MAX_TOOL_OUTPUT = 20_000
@@ -121,10 +120,13 @@ class AgentTester:
         """The per-call rules for one call of a test: ``None`` runs it, a string denies it (never waits).
 
         Like a run, the agent's own memory tool is not asked about: in a test it writes only to an ephemeral copy
-        (:meth:`_memory`). The test passes no other run-own tools (``extra_tools``)."""
-        if gate is None or call.name == MEMORY_TOOL_NAME:
+        (:meth:`_memory`). Whether a call really reaches it is decided by the agent's configuration, not by the name
+        (:func:`~nodestro_runtime.agent_builder.run_own_tool`, re-review R-2). The test passes no other run-own tools
+        (``extra_tools``)."""
+        bind_call(None)
+        if gate is None or run_own_tool(config, call.name):
             return None
-        capability, version, kind, _definition = tool_facts(self.builder.tools, call.name)
+        capability, version, kind, definition = tool_facts(self.builder.tools, call.name)
         situation = gate.call_context(run_id=test_id, node_id="agent-test", trigger="manual", trigger_ref=None)
         verdict = tool_policy.decide(
             tool=call.name,
@@ -138,6 +140,7 @@ class AgentTester:
         shown = capability.model_dump()
         if verdict.action == "allow":
             record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            bind_call(CallBinding(tool=call.name, capability=capability, definition_hash=definition))
             return None
         if verdict.action == "deny":
             record.approval = ToolCallApproval(

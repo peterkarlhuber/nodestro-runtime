@@ -26,6 +26,7 @@ from ..problems import NodestroError
 from ..release import McpToolRef
 from ..schemas import now
 from ..storage import DocumentStore
+from ..tool_approvals import ToolApprovals, bound_call, reclassified
 from . import oauth as oauth_flow
 from .hub import CallResult, Credential, Discovery, McpHub
 from .models import (
@@ -500,6 +501,7 @@ class McpService:
                 )
             if tool.status == "removed":
                 raise NodestroError("mcp.tool_removed", f"The server no longer offers {name}", name=name)
+            before = tool.capability()
             if access is not None:
                 tool.access = access
             if approve:
@@ -511,6 +513,9 @@ class McpService:
             else:
                 tool.status = "rejected"
             self.store.put(TOOLS, tool.key, tool)
+            if reclassified(before, tool.capability()):
+                # A pending approval was asked with the old classification: it no longer covers the call (R-1).
+                ToolApprovals(self.store).invalidate_tool(tool.tool_name, tool.capability())
         self.event(
             "tool_approved" if approve else "tool_rejected",
             actor=actor,
@@ -620,6 +625,30 @@ class McpService:
             result.append(tool)
         return result
 
+    def _usable_as_bound(
+        self, tool_name: str, *, gated: bool, expected_hash: str | None = None
+    ) -> tuple[McpServer, McpTool]:
+        """:meth:`check` plus the gate's binding of the current call (re-review R-1). A tool that changes data runs
+        in a gated call only with a binding that names its current classification and approved definition; a reading
+        tool with a binding must still be classified as bound (a tool reclassified from ``read`` after the gate
+        allowed it is refused). ``expected_hash``: the approved definition must also be this one (no new approval
+        between the first check and the send)."""
+        server, tool = self.check(tool_name, gated=gated)
+        binding = bound_call(tool_name)
+        stale = expected_hash is not None and tool.approved_hash != expected_hash
+        if binding is not None:
+            stale = stale or reclassified(binding.capability, tool.capability())
+            stale = stale or (binding.definition_hash is not None and binding.definition_hash != tool.approved_hash)
+        elif gated and tool.access != "read":
+            stale = True
+        if stale:
+            raise NodestroError(
+                "tool.approval_stale",
+                f"{tool_name} was classified or approved differently since the gate checked this call; it was not made",
+                name=tool_name,
+            )
+        return server, tool
+
     def call(
         self,
         tool_name: str,
@@ -628,9 +657,22 @@ class McpService:
         cancelled: Callable[[], bool] | None = None,
         gated: bool = False,
     ) -> tuple[McpServer, McpTool, CallResult]:
-        """Check the policy, call the tool and check the definition the server listed right before the call."""
-        server, tool = self.check(tool_name, gated=gated)
+        """Check the policy, call the tool and check the definition the server listed right before the call.
+
+        In a gated run the call runs only as the gate let it (:class:`~nodestro_runtime.tool_approvals.CallBinding`,
+        re-review R-1): the stored classification and approved definition must still be the ones the gate checked,
+        both here and again right before the request is sent (after listing the server's tools on the same
+        connection). A change that lands after the request was sent applies from the next call on."""
+        server, tool = self._usable_as_bound(tool_name, gated=gated)
         credential = self.credential(server)
+
+        def confirm() -> bool:
+            try:
+                self._usable_as_bound(tool_name, gated=gated, expected_hash=tool.approved_hash)
+            except NodestroError:
+                return False
+            return True
+
         try:
             result = self.hub.call_tool(
                 server,
@@ -639,9 +681,16 @@ class McpService:
                 arguments,
                 expected_hash=tool.approved_hash,
                 cancelled=cancelled,
+                confirm=confirm,
             )
         finally:
             self._keep_refreshed(server, credential)
+        if result.refused:
+            raise NodestroError(
+                "tool.approval_stale",
+                f"{tool_name} was classified or approved differently right before the call; it was not made",
+                name=tool_name,
+            )
         if result.definition is None:
             self._mark(tool, "removed", seen_hash=tool.approved_hash)
             raise NodestroError("mcp.tool_removed", f"{server.name} no longer offers {tool.name}", name=tool_name)
