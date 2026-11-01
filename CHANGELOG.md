@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Security fix: own and generated tools across processes (S-2 pilot finding F1):
+
+- **Behavior change:** a tool library now reads its tool directory again whenever another process changed it (a
+  cheap check of the record files' identity at every lookup). Before, every server worker kept the tools it read
+  when it opened a tenant: after a tool was changed or deleted in the API it still ran the old code, and an advance
+  approval or legacy exemption for the old version still let that code run, until the worker restarted.
+- Agents keep the tools they got when their step started (`PinnedTool`). Before each call the tool checks, past
+  every cache, that its version is still the current approved one; otherwise the call is refused ("the tool was
+  changed or deleted after this step started") and does not run. This covers a change during a running workflow
+  and during a waiting approval: an approval or advance approval never makes a different or deleted version run.
+  The per-call rules (`tool_policy.decide`) are unchanged and decide on the current version.
+- New versions are numbered from the current directory, so two processes no longer write the same version number.
+- Published releases are unaffected: they run their own frozen copy of the tools.
+
 Orchestrators: dynamic teams and approvals inside teams (Adaptive Orchestration M6b, orkexa ADR 0011):
 
 - **Behavior change:** a team that waits for an approval step no longer gets cancelled. The orchestrator node waits
