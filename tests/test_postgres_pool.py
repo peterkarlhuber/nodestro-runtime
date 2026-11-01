@@ -22,7 +22,7 @@ pytest.importorskip("psycopg")
 import psycopg
 
 from nodestro_runtime.jobs import LeaderLock
-from nodestro_runtime.storage_postgres import PostgresDatabase
+from nodestro_runtime.storage_postgres import POSTGRES_SCHEMA_VERSION, PostgresDatabase
 
 
 @pytest.fixture
@@ -66,6 +66,35 @@ def test_a_dropped_connection_is_replaced(database: PostgresDatabase) -> None:
         store.put_raw("x", "3", {"a": 3})
     assert sorted(key for key, _ in store.items("x", _Any)) == ["1", "2", "3"]
     assert database.ping()
+
+
+def test_a_write_on_a_connection_dropped_while_idle_succeeds(
+    database: PostgresDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writes are not retried (they may have been applied), so an idle connection is checked before it is used."""
+    import nodestro_runtime.storage_postgres as storage_postgres
+
+    store = database.store("acme")
+    store.put_raw("x", "1", {"a": 1})
+    pids = {row[0] for row in database._query("SELECT pg_backend_pid()")}
+    monkeypatch.setattr(storage_postgres, "CHECK_AFTER_IDLE", 0.0)
+    _terminate(pids)
+    time.sleep(0.2)
+    store.put_raw("x", "2", {"a": 2})
+    assert store.get_raw("x", "2") == {"a": 2}
+
+
+def test_a_connection_in_steady_use_is_not_checked(database: PostgresDatabase, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection used again within ``CHECK_AFTER_IDLE`` skips the check (one round trip less per query)."""
+    from psycopg_pool import ConnectionPool
+
+    checks: list[object] = []
+    monkeypatch.setattr(ConnectionPool, "check_connection", staticmethod(checks.append))
+    store = database.store("acme")
+    for index in range(20):
+        store.put_raw("x", str(index), {"a": index})
+        store.get_raw("x", str(index))
+    assert checks == []
 
 
 def test_every_pooled_connection_can_be_dropped(database: PostgresDatabase) -> None:
@@ -227,9 +256,10 @@ def test_the_session_lock_counts_like_postgresql(database: PostgresDatabase, sch
 def test_migrate_has_no_statement_time_limit(schema: str) -> None:
     database = PostgresDatabase(postgres_support.DSN, schema=schema, statement_timeout=0.2)
     try:
-        slow = {6: ("0006_slow.sql", "SELECT pg_sleep(0.5)")}
-        steps = {**{version: ("x", "SELECT 1") for version in range(1, 6)}, **slow}
-        assert database.migrate(migrations=steps, before_migration=lambda *_: None) == 5
-        assert database.schema_version == 6
+        current = POSTGRES_SCHEMA_VERSION
+        slow = {current + 1: ("slow.sql", "SELECT pg_sleep(0.5)")}
+        steps = {**{version: ("x", "SELECT 1") for version in range(1, current + 1)}, **slow}
+        assert database.migrate(migrations=steps, before_migration=lambda *_: None) == current
+        assert database.schema_version == current + 1
     finally:
         database.close()
