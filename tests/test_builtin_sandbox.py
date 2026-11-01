@@ -221,6 +221,22 @@ def test_a_tool_error_is_reported_and_the_next_call_works(sandbox: LinuxSandbox)
 
 
 @needs_sandbox
+def test_output_past_the_runner_is_bounded_in_the_host(sandbox: LinuxSandbox) -> None:
+    # The memory limit covers the confined child, not what the host reads from its stdout: reading stops at the
+    # response limit and the call is stopped (audit finding B-01).
+    flood = """
+    import os
+    block = b"x" * 1048576
+    for _ in range(256):
+        os.write(1, block)
+    return target
+    """
+    with pytest.raises(ToolExecutionError, match="bytes of output; the run was stopped"):
+        sandbox.call(tool(flood), "probe", {"target": ""})
+    assert sandbox.call(tool("return target"), "probe", {"target": "ok"}) == "ok"
+
+
+@needs_sandbox
 def test_start_up_overhead_is_measured(sandbox: LinuxSandbox) -> None:
     timings = measure(sandbox, calls=5)
     host = measure(SubprocessSandbox(acknowledge_unsafe=True), calls=5)  # trusted ping code only

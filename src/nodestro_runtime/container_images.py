@@ -38,7 +38,7 @@ import tempfile
 from typing import Any
 import uuid
 
-from orkexa.dynamic import DockerSandbox, SandboxError
+from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
 
 from .problems import NodestroError
 
@@ -372,24 +372,29 @@ class StreamedSandbox(DockerSandbox):
         files = {path.name: path.read_text(encoding="utf-8") for path in sorted(workdir.iterdir()) if path.is_file()}
         envelope = json.dumps({"files": files, "request": request})
         name = f"nodestro-sandbox-{uuid.uuid4().hex[:12]}"
+
+        def remove() -> None:
+            # Killing the docker client does not stop the container.
+            with contextlib.suppress(OSError):
+                subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
+
         try:
-            completed = subprocess.run(
+            # Bounded: tool code can write to the container's stdout directly, past the runner's limit.
+            code, output = run_bounded(
                 self.command(workdir, name),
-                input=envelope,
-                capture_output=True,
-                text=True,
-                env=self.environ,
+                envelope.encode("utf-8"),
                 timeout=self.timeout,
-                check=False,
+                max_stdout=response_limit(self.max_output_chars),
+                env=self.environ,
+                on_abort=remove,
             )
-        except subprocess.TimeoutExpired as exc:
-            subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
-            raise SandboxError(f"Timed out after {self.timeout:g} seconds") from exc
         except OSError as exc:
             raise SandboxError(f"Cannot start docker: {exc}") from exc
-        if not completed.stdout.strip():
-            raise SandboxError(f"Container exited with code {completed.returncode}: {completed.stderr[-1000:]}")
-        return completed.stdout
+        stdout = output.stdout.decode("utf-8", "replace")
+        if not stdout.strip():
+            stderr = output.stderr.decode("utf-8", "replace")
+            raise SandboxError(f"Container exited with code {code}: {stderr[-1000:]}")
+        return stdout
 
 
 class RuntimeImageSandbox(StreamedSandbox):

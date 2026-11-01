@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Backend audit (2026-11-01):
+
+- B-01: the built-in Linux sandbox and the container sandboxes (`StreamedSandbox`, `RuntimeImageSandbox`) read a
+  tool call's output with Orkexa's `communicate_bounded()` / `run_bounded()`: at most `response_limit()` bytes of
+  stdout and the end of stderr stay in the API or worker process. Code that wrote straight to the inherited stdout
+  could make the host buffer any amount (200 MiB raised the host's memory by ~600 MiB); such a call is now stopped
+  and its container removed. Orkexa pin: `c5753f2`.
+
 Security fixes from the independent MCP re-review (R-1, R-2, two test gaps):
 
 - R-1: a per-call approval now also covers the tool's classification (`access`, `reach`). Reclassifying a tool in

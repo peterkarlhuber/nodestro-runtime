@@ -20,7 +20,7 @@ from orkexa.dynamic import DockerSandbox, SubprocessSandbox
 from orkexa.errors import ToolExecutionError
 import pytest
 
-from nodestro_runtime.container_images import LOCK_LABEL, ContainerImages, lock_has_hashes
+from nodestro_runtime.container_images import LOCK_LABEL, ContainerImages, StreamedSandbox, lock_has_hashes
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import parse_lock
 from nodestro_runtime.testing import FakeUv
@@ -498,3 +498,28 @@ def test_without_docker_a_local_mcp_server_is_refused(tmp_path: Path) -> None:
         assert caught.value.code == "sandbox.isolation_required"
     finally:
         opened.close()
+
+
+def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
+    # The container's stdout is read with a limit: code that floods it past the runner is stopped and its
+    # container removed, so the API or worker process never buffers more than the response limit.
+    class Flooding(StreamedSandbox):
+        def command(self, workdir: Path, container_name: str) -> list[str]:
+            flood = "import os, sys\nsys.stdin.read()\nblock = b'x' * 1048576\nfor _ in range(64): os.write(1, block)\n"
+            return [sys.executable, "-c", flood]
+
+    removed: list[list[str]] = []
+    real_run = subprocess.run
+
+    def record(args: list[str], *rest: object, **options: object) -> object:
+        if args[1:3] == ["rm", "-f"]:
+            removed.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real_run(args, *rest, **options)  # type: ignore[call-overload]
+
+    sandbox = Flooding(image="nodestro-test", max_output_chars=10, timeout=20)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess, "run", record)
+        with pytest.raises(ToolExecutionError, match="more than 1048696 bytes of output"):
+            sandbox.call("def f() -> str:\n    return 'x'\n", "f", {})
+    assert len(removed) == 1 and removed[0][3].startswith("nodestro-sandbox-")
