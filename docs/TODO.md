@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 2 |
-| P3 Low | 20 |
+| P2 Medium | 3 |
+| P3 Low | 19 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -110,7 +110,7 @@ None known.
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
 - **What:** With fresh statistics the pooled store is about 12 % below the pre-audit single-connection throughput,
   and writes of one process still run one after another. Not measured on server hardware under load.
-- **Next step:** Load test on target hardware (see RT-020); then decide on parallel writes or a pool-free read path
+- **Next step:** Load test on target hardware (run in nodestro-server, SRV-013); then decide on parallel writes or a pool-free read path
   for single-process use.
 
 ### RT-009 · Usage entries are filtered and sorted in Python
@@ -204,8 +204,8 @@ None known.
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit sections 3 and 16, Bedrock and LRC-1 reports
 - **What:** Tests use scripted models only: no real provider calls (including a live AWS Bedrock smoke test and live
   run chat with real models), no load against PostgreSQL on server hardware, no multi-process test of every race fix.
-- **Next step:** Run the prepared Bedrock smoke test and a PostgreSQL load test once credentials and hardware are
-  approved.
+- **Next step:** Run the prepared Bedrock smoke test once credentials are approved; the PostgreSQL load test is
+  tracked in nodestro-server SRV-013.
 
 ## Documentation
 
@@ -223,15 +223,18 @@ None known.
 - **Priority:** P3 Low · **Status:** Needs decision · **Refs:** `pyproject.toml`, CI matrix
 - **What:** Python 3.10 reached end of life in October 2026, but the package and CI still target it, and MCP already
   needs 3.11 (`mcp.unavailable` on 3.10).
-- **Next step:** Decide on 3.11 as the minimum together with the dependent repositories, then update the
+- **Next step:** Decide on 3.11 as the minimum together with the dependent repositories (this entry holds the
+  platform decision; orkexa ORK-007, nodestro-api API-025 and nodestro-sdk SDK-013 follow it), then update the
   classifiers, ruff/mypy targets and CI matrix.
 
 ### RT-023 · Reproducible Python dependencies
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit D-05, `.github/dependabot.yml`
 - **What:** Dependencies are ranges without a lock or constraints file, so image rebuilds resolve differently over
-  time; Dependabot covers only GitHub Actions because the git-URL dependencies are private.
-- **Next step:** A hashed constraints file for CI and images, or a scheduled `pip-audit` plus upgrade check.
+  time; Dependabot covers only GitHub Actions (the `dependabot.yml` comment still calls the git-URL dependencies
+  private, which is no longer true).
+- **Next step:** A hashed constraints file for CI and images, or a scheduled `pip-audit` plus upgrade check. Decide
+  together with nodestro-studio ST-028 and nodestro-server SRV-014.
 
 ### RT-024 · German text in prompts and default names
 
@@ -243,12 +246,12 @@ None known.
 
 ### RT-029 · CI requires the `NODESTRO_READ` token although the dependencies are public
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #75, backend audit D-08 residual
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** #75, backend audit D-08 residual
 - **What:** The CI install steps exit when the `NODESTRO_READ` secret is missing and still call the components
   private. All Nodestro repositories and orkexa are public now, so runs without secrets (Dependabot, forks) fail early.
 - **Next step:** Install the git dependencies anonymously, make the token optional or remove it, fix the comments.
-- **Depends on:** none; the same change is tracked in nodestro-api #50, nodestro-sdk #47, nodestro-server #25,
-  nodestro-desktop #17 and nodestro-studio #85.
+- **Depends on:** none; the same change is tracked in nodestro-api #50, nodestro-sdk #47, nodestro-integrations #36,
+  nodestro-examples #40, nodestro-server #25, nodestro-desktop #17 and nodestro-studio #85.
 
 ## Later optimizations
 
@@ -292,15 +295,21 @@ None known.
 | — | orkexa | ORK-001 (orkexa #22), B-03: cancel `SubprocessSandbox`/`DockerSandbox` calls | Orkexa owns the change; then runtime passes the cancel signal through `sandbox_cancel` |
 | — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Afterwards the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
 | — | orkexa | A-05: redirects when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
-| RT-005 | nodestro-api, nodestro-sdk | decision response model | Follow the new run state |
-| RT-010 | nodestro-api | operator command for key rotation | Runtime provides `SecretBox` support |
-| RT-011 | nodestro-api, nodestro-studio | X-03 combined code list, translations | Runtime provides its catalog |
-| RT-012 | nodestro-api, nodestro-studio | AD-02 run cause in lists and banners | Runtime provides the field |
-| RT-014 | nodestro-api | leader cleanup task | API calls runtime retention |
-| RT-001 | nodestro-studio, nodestro-server | S-2 pilot and review | Review covers the whole approval flow |
+| RT-005 | nodestro-api, nodestro-sdk | API-018 (decision response model) | Follow the new run state |
+| RT-009 | nodestro-api | API-013 (`/api/usage` latency) | API uses the store-level filter |
+| RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
+| RT-011 | nodestro-api, nodestro-studio | API-016 (X-03 combined code list), translations | Runtime provides its catalog |
+| RT-012 | nodestro-api, nodestro-studio | API-018, ST-003 (AD-02 run cause in lists and banners) | Runtime provides the field |
+| RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
+| RT-015 | nodestro-api | API-021 (region in usage views) | Runtime records the region first |
+| RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
+| RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
+| RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
+| RT-022 | orkexa, nodestro-api, nodestro-sdk | ORK-007, API-025, SDK-013 | One platform decision, held here |
+| RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
-| RT-029 | all component repositories | `NODESTRO_READ` CI change (api #50, sdk #47, server #25, desktop #17, studio #85) | Same change everywhere |
+| RT-029 | all component repositories | `NODESTRO_READ` CI change (api #50, sdk #47, integrations #36, examples #40, server #25, desktop #17, studio #85) | Same change everywhere |
 
 ## Maintaining this file
 
