@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Live run chat fix (LRC-1, 2026-11-01):
+
+- Questions to a team leader are answered with any provider: the answer agent no longer turns off Anthropic's prompt
+  caching for other providers (that is an Anthropic-only option, so every non-Anthropic assistant model failed with
+  `config.anthropic_only`). New test: a team leader on Amazon Bedrock takes an instruction at its next decision and a
+  Bedrock assistant model answers a question (stubbed Converse, no AWS call).
+
 Live run chat and steering (LRC-1, 2026-11-01):
 
 - New `nodestro_runtime.run_chat`: a person can ask an orchestrator node of a running run read-only questions and

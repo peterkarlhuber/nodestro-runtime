@@ -918,7 +918,6 @@ def answer_question(
             effort="low",
             max_tool_rounds=0,
             max_tokens=1500,
-            cache_control=model.startswith("anthropic:"),
         )
         prompt = f"<<<snapshot\n{text}\nsnapshot>>>\n\nQuestion: {question.content}"
         try:
