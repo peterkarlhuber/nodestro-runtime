@@ -526,7 +526,8 @@ def _orchestrator_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckI
                 found.append(
                     _issue(
                         "check.orchestrator_member_approval",
-                        f"{label}: the team {child.name} pauses for approvals; an orchestrator stops it there",
+                        f"{label}: the team {child.name} pauses for approvals; the orchestrator waits for them",
+                        level="info",
                         node_id=node.id,
                         name=label,
                         workflow=child.name,

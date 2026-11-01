@@ -160,31 +160,6 @@ async def test_a_failing_team_is_shown_to_the_orchestrator(make: Make) -> None:
     assert step["error"].startswith("RuntimeError: Team failed")
 
 
-async def test_a_team_that_waits_for_an_approval_is_cancelled(make: Make) -> None:
-    ids: dict[str, str] = {}
-    workspace = make(
-        {
-            BOSS: [
-                parsed(lambda model: model(action="delegate", member=ids["t"], task="go")),
-                decision(action="finish", answer="stopped", reason="needs a person"),
-            ],
-            "TEAM": [text("draft")],
-        }
-    )
-    member = team(
-        workspace,
-        "TEAM",
-        "Team",
-        nodes=[{"id": "ok", "type": "approval", "label": "Check", "approval": {"instructions": "ok?"}}],
-        edges=[edge("w", "ok")],
-    )
-    ids["t"] = member.id
-    done = await run(workspace, boss(member))
-    lead = done.nodes["lead"]
-    assert "approval step" in lead.orchestration["steps"][0]["error"]
-    assert workspace.runs.get(lead.child_run_ids[0]).status == "cancelled"
-
-
 def test_checks_of_an_orchestrator() -> None:
     def codes(**config: Any) -> list[str]:
         flow = Workflow.model_validate(
@@ -290,7 +265,7 @@ async def test_capability_selection_adds_matching_teams_to_the_pool(make: Make) 
     ids["best"] = best.id
     other = team(workspace, "OTHER", "Other", capabilities=["research"])
     team(workspace, "NONE", "Unrelated", capabilities=["billing"])
-    team(
+    pausing = team(
         workspace,
         "PAUSE",
         "Pausing",
@@ -304,19 +279,20 @@ async def test_capability_selection_adds_matching_teams_to_the_pool(make: Make) 
 
     pinned = workspace.runs.pin_subworkflows(saved)
     members = pinned.nodes[1].orchestrator.members  # type: ignore[union-attr]
-    # Two matching tags first, then one; no approval team, no unrelated team; versions pinned.
+    # Two matching tags first, then one (a team with approvals too, AO M6b); no unrelated team; versions pinned.
     assert [(member.workflow_id, member.matched) for member in members] == [
         (best.id, ["research", "Summaries"]),
         (other.id, ["research"]),
+        (pausing.id, ["research"]),
     ]
     assert all(member.version == 1 for member in members)
     # Pinning the snapshot again (a team run, a release) never adds teams saved later.
     team(workspace, "LATE", "Late", capabilities=["research"])
     again = workspace.runs.pin_subworkflows(pinned)
-    assert [member.workflow_id for member in again.nodes[1].orchestrator.members] == [best.id, other.id]  # type: ignore[union-attr]
+    assert [member.workflow_id for member in again.nodes[1].orchestrator.members] == [best.id, other.id, pausing.id]  # type: ignore[union-attr]
     problems = preflight(workspace, saved).problems
     selected = next(issue for issue in problems if issue.code == "check.orchestrator_selected")
-    assert selected.params["teams"] == "Best, Late, Other"  # the saved workflow selects anew
+    assert selected.params["teams"] == "Best, Late, Other, Pausing"  # the saved workflow selects anew
 
     done = await run(workspace, flow)
     assert done.status == "succeeded", done.error

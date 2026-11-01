@@ -120,12 +120,18 @@ def approvals_in(runs: RunManager, run: Run) -> list[PendingApproval]:
 
 
 def approvals_of_tree(runs: RunManager, run: Run, depth: int = 0) -> list[PendingApproval]:
-    """The waiting approvals of a run and of its sub-workflows' runs."""
+    """The waiting approvals of a run and of its sub-workflows' and orchestrators' team runs."""
     found = approvals_in(runs, run)
     for state in run.nodes.values():
-        if state.child_run_id and state.status == "awaiting_approval" and depth < 6:
+        if state.status != "awaiting_approval" or depth >= 6:
+            continue
+        if state.child_run_id:
             child = runs.get(state.child_run_id)
             if child is not None:
+                found += approvals_of_tree(runs, child, depth + 1)
+        for child_id in state.child_run_ids:
+            child = runs.get(child_id)
+            if child is not None and child.status == "paused":
                 found += approvals_of_tree(runs, child, depth + 1)
     return found
 
