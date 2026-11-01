@@ -102,6 +102,7 @@ from .schemas import (
     RunEvent,
     RunIn,
     RunTrigger,
+    RunWarning,
     ToolCallApproval,
     ToolCallRecord,
     Usage,
@@ -1843,6 +1844,7 @@ class RunManager:
         else:
             run.status = "succeeded"
         run.output = self._run_output(run)
+        run.warnings = run_warnings(run)
 
     async def _run_graph(self, context: _RunContext) -> None:
         """Execute the nodes the ``orkexa.flow`` kernel dispatches until none is left to run.
@@ -3589,6 +3591,37 @@ def _is_paused(run: Run) -> bool:
 def _child_ids(run: Run) -> list[str]:
     """The sub-workflow runs of a run's nodes."""
     return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
+
+
+#: A tool's error text that starts with a problem code (``mcp.unreachable: Docs cannot be reached``).
+_CODED_TOOL_ERROR = re.compile(r"^(?P<code>[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+):")
+#: Approval verdicts that mean the call was not made.
+_REFUSED_CALLS = ("rejected", "expired", "denied")
+
+
+def run_warnings(run: Run) -> list[RunWarning]:
+    """The tool calls of a run's nodes that were refused, expired or failed, one warning per node, tool and code
+    (AD-03): a run can succeed although an agent had to answer without one of its tools."""
+    found: dict[tuple[str, str, str], RunWarning] = {}
+    for node in run.workflow.nodes:
+        state = run.nodes.get(node.id)
+        if state is None:
+            continue
+        for call in [item for earlier in state.earlier for item in earlier.tool_calls] + state.tool_calls:
+            approval = call.approval
+            if approval is not None and approval.status in _REFUSED_CALLS:
+                code = approval.code or f"tool.approval_{approval.status}"
+            elif call.is_error:
+                matched = _CODED_TOOL_ERROR.match(call.output or "")
+                code = matched.group("code") if matched else "tool.failed"
+            else:
+                continue
+            key = (node.id, call.name, code)
+            if key in found:
+                found[key].count += 1
+            else:
+                found[key] = RunWarning(code=code, node_id=node.id, tool=call.name)
+    return list(found.values())
 
 
 def _with_team_runs(record: dict[str, Any], team_runs: dict[tuple[int, int], str]) -> dict[str, Any]:

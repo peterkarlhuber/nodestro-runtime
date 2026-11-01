@@ -133,6 +133,11 @@ async def test_a_rejected_call_is_denied_with_the_comment(make: Make) -> None:
     record = call_of(done)
     assert record.is_error and "Wrong unit" in (record.output or "")
     assert record.approval.status == "rejected" and record.approval.code == "tool.approval_rejected"
+    # AD-03: the run succeeded without the call, and says so.
+    assert [(item.code, item.tool, item.count) for item in done.warnings] == [
+        ("tool.approval_rejected", record.name, 1)
+    ]
+    assert done.warnings[0].node_id in done.nodes
 
 
 async def test_an_unanswered_call_is_denied_at_the_deadline(make: Make) -> None:
@@ -142,6 +147,7 @@ async def test_an_unanswered_call_is_denied_at_the_deadline(make: Make) -> None:
     record = call_of(done)
     assert record.is_error and record.approval.status == "expired"
     assert record.approval.code == "tool.approval_timeout"
+    assert [(item.code, item.tool) for item in done.warnings] == [("tool.approval_timeout", record.name)]
     stored = ToolApprovals(workspace.store).get(done.id, record.approval.request_id)
     assert stored is not None and stored.status == "expired"
 

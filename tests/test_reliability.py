@@ -649,3 +649,26 @@ def test_the_same_requirements_give_the_same_lock_in_every_process(tmp_path: Pat
 def test_provider_failures_get_distinct_codes(error: Exception, code: str, params: dict[str, object]) -> None:
     found = node_problem(error)
     assert (found.code, found.params) == (code, params)
+
+
+def test_run_warnings_name_failed_and_refused_tool_calls() -> None:
+    """AD-03: one warning per node, tool and code; a coded tool error keeps its code; successful calls none."""
+    from nodestro_runtime.schemas import NodeRun, ToolCallApproval, ToolCallRecord
+
+    flow = Workflow(name="w", nodes=[{"id": "a", "type": "agent", "agent": {"name": "A"}}])
+    calls = [
+        ToolCallRecord(id="1", name="docs__search", output="mcp.unreachable: Docs cannot be reached", is_error=True),
+        ToolCallRecord(id="2", name="docs__search", output="mcp.unreachable: Docs cannot be reached", is_error=True),
+        ToolCallRecord(id="3", name="calc", output="ZeroDivisionError", is_error=True),
+        ToolCallRecord(id="4", name="calc", output="4"),
+        ToolCallRecord(
+            id="5", name="send", is_error=True, approval=ToolCallApproval(status="denied", code="tool.not_granted")
+        ),
+    ]
+    run = Run(workflow_id=flow.id, workflow_name="w", workflow=flow, nodes={"a": NodeRun(tool_calls=calls)})
+    found = [(item.code, item.node_id, item.tool, item.count) for item in engine.run_warnings(run)]
+    assert found == [
+        ("mcp.unreachable", "a", "docs__search", 2),
+        ("tool.failed", "a", "calc", 1),
+        ("tool.not_granted", "a", "send", 1),
+    ]

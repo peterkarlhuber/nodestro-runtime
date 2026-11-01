@@ -606,6 +606,19 @@ class ToolCallRecord(_Model):
     approval: ToolCallApproval | None = None
 
 
+class RunWarning(_Model):
+    """Something a run that ended went without (AD-03): e.g. a tool call that was refused, timed out or failed.
+
+    ``code`` is the call's problem code (``tool.approval_rejected``, ``tool.approval_timeout``, ``tool.not_granted``,
+    ``mcp.unreachable``, ...; ``tool.failed`` when the tool's error has no code); ``count`` calls of ``tool`` in
+    ``node_id`` had it."""
+
+    code: str
+    node_id: str
+    tool: str | None = None
+    count: int = 1
+
+
 class EvaluationRecord(_Model):
     passed: bool
     attempts: int
@@ -749,6 +762,8 @@ class Run(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    #: What the run went without although it may have succeeded (AD-03): refused, expired or failed tool calls.
+    warnings: list[RunWarning] = Field(default_factory=list)
     output: Any = None
     nodes: dict[str, NodeRun] = Field(default_factory=dict)
     #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
@@ -800,6 +815,7 @@ class RunSummary(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[RunWarning] = Field(default_factory=list)
     imported_at: datetime | None = None
     source_run_id: str | None = None
     sanitized: SanitizeReport | None = None
