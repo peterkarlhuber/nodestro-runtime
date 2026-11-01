@@ -35,7 +35,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .problems import NodestroError
-from .storage import BeforeMigration, ModelT
+from .storage import BeforeMigration, DamagedDocuments, ModelT
 
 try:  # optional: nodestro-runtime[postgres]
     import psycopg
@@ -498,6 +498,8 @@ class PostgresStore:
         self.tenant_id = tenant_id
         self._owns_database = owns_database
         self._closed = False
+        #: Documents listings left out because they do not fit the model (C-10; jsonb always holds valid JSON).
+        self.damaged = DamagedDocuments()
 
     @classmethod
     def connect(cls, conninfo: str, tenant_id: str, *, schema: str | None = None) -> PostgresStore:
@@ -588,14 +590,15 @@ class PostgresStore:
         """Documents of a collection, most recently updated first."""
         self._check()
         query = (
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " ORDER BY updated_at DESC, id"
         )
         params: tuple[Any, ...] = (self.tenant_id, collection)
         if limit is not None:
             query += " LIMIT %s"
             params = (*params, limit)
-        return [model.model_validate_json(row[0]) for row in self.database._query(query, params)]
+        rows = self.database._query(query, params)
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, in update order."""
@@ -607,11 +610,11 @@ class PostgresStore:
             return []
         # The field is a literal (checked above), so the expression indexes of migrations 0001 and 0005 apply.
         rows = self.database._query(
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             f" AND jsonb_typeof(data -> '{field}') = 'string' AND data ->> '{field}' = ANY(%s) ORDER BY updated_at, id",
             (self.tenant_id, collection, wanted),
         )
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]:
         """``(id, document)`` pairs of a collection, in id order."""
@@ -620,17 +623,17 @@ class PostgresStore:
             "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s ORDER BY id",
             (self.tenant_id, collection),
         )
-        return [(str(row[0]), model.model_validate_json(row[1])) for row in rows]
+        return self.damaged.parse(collection, rows, model)
 
     def list_prefix(self, collection: str, prefix: str, model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose id starts with ``prefix`` (literally), in id order."""
         self._check()
         rows = self.database._query(
-            "SELECT " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
             " AND starts_with(id, %s) ORDER BY id",
             (self.tenant_id, collection, prefix),
         )
-        return [model.model_validate_json(row[0]) for row in rows]
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def delete_prefix(self, collection: str, prefix: str) -> int:
         self._check()
