@@ -2205,7 +2205,9 @@ class RunManager:
         run = context.run
         state = run.nodes[node.id]
         inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
-        state.started_at = now()
+        # A step that continues after a decision (paused at an approval) keeps when it began (X-02).
+        if state.status != "awaiting_approval" or state.started_at is None:
+            state.started_at = now()
         if node.type == "start":
             state.status = "succeeded"
             state.output = self._start_output(run)
@@ -2954,6 +2956,8 @@ class RunManager:
             max_team=min(config.max_team, len(pool.members)),
         )
         recorded: orchestration.OrchestrationState | None = None
+        #: The team run of each assignment started here, by (step, slot): the record's outcomes name it (X-02).
+        team_runs: dict[tuple[int, int], str] = {}
         if state.status == "awaiting_approval" and state.orchestration is not None:
             recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
             task = recorded.task
@@ -3005,6 +3009,7 @@ class RunManager:
             )
             self.store.put("runs", child.id, child)
             state.child_run_ids.append(child.id)
+            team_runs[(item.step, item.slot)] = child.id
             self._emit(
                 context,
                 "orchestration_delegated",
@@ -3036,7 +3041,7 @@ class RunManager:
             return self._team_result(child, item.member, context)
 
         def on_step(current: orchestration.OrchestrationState) -> None:
-            state.orchestration = current.model_dump(mode="json")
+            state.orchestration = _with_team_runs(current.model_dump(mode="json"), team_runs)
             if current.paused:
                 assert current.pending is not None
                 self._emit(context, "orchestration_waiting", node.id, pending=current.pending.model_dump(mode="json"))
@@ -3584,6 +3589,23 @@ def _is_paused(run: Run) -> bool:
 def _child_ids(run: Run) -> list[str]:
     """The sub-workflow runs of a run's nodes."""
     return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
+
+
+def _with_team_runs(record: dict[str, Any], team_runs: dict[tuple[int, int], str]) -> dict[str, Any]:
+    """An orchestration record whose outcomes name the team run that produced them (X-02).
+
+    Orkexa sets an outcome's ``ref`` only for an assignment that waited and continued; a team run that ended at once
+    is added here from the runs started for each (step, slot). Orkexa uses ``ref`` only to continue a waiting
+    outcome, so naming finished ones changes nothing in the orchestration."""
+    groups = [(step.get("index"), step.get("outcomes") or []) for step in record.get("steps") or []]
+    pending = record.get("pending")
+    if pending:
+        groups.append((pending.get("index"), pending.get("outcomes") or []))
+    for index, outcomes in groups:
+        for slot, outcome in enumerate(outcomes):
+            if outcome.get("ref") is None and (index, slot) in team_runs:
+                outcome["ref"] = team_runs[(index, slot)]
+    return record
 
 
 def _interrupt(run: Run, *, shutdown: bool = False) -> None:
