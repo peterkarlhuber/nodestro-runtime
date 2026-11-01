@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+Amazon Bedrock (2026-11-01):
+
+- New provider `bedrock` ("Amazon Bedrock (AWS)", `ProviderInfo.auth == "aws"`; the other providers get `auth`
+  `api_key`/`endpoint`, unchanged in behaviour). No API key and no base URL: settings `providers.bedrock` hold only
+  `region`, `auth` (`default_chain`/`profile` on a desktop, `default_chain` in Nodestro Local, `operator_role` for
+  server tenants), `profile_name` and `data_residency` (`eu_only`). Stable codes: `provider.region_invalid`,
+  `provider.auth_invalid`, `provider.auth_not_allowed`, `provider.field_not_supported`, `provider.profile_name_invalid`,
+  `provider.data_residency_invalid|_region|_forced`, `provider.region_not_allowed`, `provider.bedrock_not_available`.
+  `ProviderStatus` gains `auth`, `region`, `profile_name`, `data_residency(_forced)`, `auth_methods`,
+  `allowed_regions`, `operator_role` and `verification {state, checked_at, code}` (never an account, ARN or key).
+- `Workspace.verify_provider("bedrock", model=None)`: STS `GetCallerIdentity` plus one free Bedrock control-plane read
+  (`ListFoundationModels`, or `GetInferenceProfile`/`GetFoundationModel` for a given model), short timeouts, one retry,
+  at most every 10 s; never invokes a model. AWS failures map to `provider.aws_*` codes.
+- Server tenants never use the server's own AWS chain: `WorkspaceStorage.bedrock` (`BedrockServerPolicy`, built by
+  `BedrockOperatorConfig.from_env` from `NODESTRO_BEDROCK_TENANT_ROLES[_FILE]`, `NODESTRO_BEDROCK_DATA_RESIDENCY`,
+  `NODESTRO_BEDROCK_ALLOWED_REGIONS`; `tenant_storage(..., bedrock=)`) assigns one role per tenant, assumed with STS
+  (`ExternalId`, `RoleSessionName=nodestro-<tenant>`, regional endpoint, 30 min, deferred refreshable credentials, a
+  fresh session per agent). Options without a session are refused on a server.
+- Agents: `BedrockOptions` only from the connection; request options become `additional_model_request_fields` and
+  may not set region, profile, session, residency, endpoints or managed fields (`config.reserved_request_options`).
+  Anthropic-only options stay refused for Claude on Bedrock. Run errors drop IAM/STS identities; residency refusals
+  have the code `provider.data_residency_violation`. Pre-check codes `check.bedrock_not_configured`,
+  `check.bedrock_not_available`, `check.bedrock_settings_invalid`. Exports: `environment_connection(..., settings=)`
+  and `exported_settings()` (region + data residency only; `provider.region_missing`). Catalog: EU inference profile
+  suggestions. Orkexa pin: `3467940` (master with the Bedrock provider).
+
 Backend audit (2026-11-01):
 
 - C-14 follow-up (re-verification found PostgreSQL reads slower than before the pool): a pooled connection is

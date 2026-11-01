@@ -78,6 +78,24 @@ _OTHER_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
     ),
 )
 
+#: Suggested Amazon Bedrock models: EU cross-Region inference profiles (``eu.``) of current Claude and Amazon Nova
+#: models, ids as Orkexa's Bedrock documentation and tests use them. They are suggestions only: whether a model is
+#: enabled for an AWS account and region is not known until it is used (or checked with the settings' verification).
+_BEDROCK_SUGGESTION = " via Amazon Bedrock (EU inference profile; suggestion, model access must be enabled in AWS)"
+_BEDROCK_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("bedrock", "eu.anthropic.claude-sonnet-5-5", "Claude Sonnet 5.5 (Bedrock EU)", "Sonnet", "Claude Sonnet 5.5"),
+    ("bedrock", "eu.anthropic.claude-opus-5-5", "Claude Opus 5.5 (Bedrock EU)", "Opus", "Claude Opus 5.5"),
+    (
+        "bedrock",
+        "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "Claude Haiku 4.5 (Bedrock EU)",
+        "Haiku",
+        "Claude Haiku 4.5",
+    ),
+    ("bedrock", "eu.amazon.nova-pro-v1:0", "Amazon Nova Pro (Bedrock EU)", "Nova", "Amazon Nova Pro"),
+    ("bedrock", "eu.amazon.nova-lite-v1:0", "Amazon Nova Lite (Bedrock EU)", "Nova", "Amazon Nova Lite"),
+)
+
 
 def _priced(
     provider: str,
@@ -125,7 +143,8 @@ def _priced(
 
 
 def models(pricing: PricingService | None = None) -> list[ModelInfo]:
-    """The suggested models: Anthropic's (current generation first), then examples of other providers.
+    """The suggested models: Anthropic's (current generation first), then examples of other providers, then
+    Amazon Bedrock suggestions (EU inference profiles; never verified access, see :data:`_BEDROCK_MODELS`).
 
     Prices come from ``pricing`` (the workspace's catalog) or, without it, from Orkexa's built-in prices.
     """
@@ -150,6 +169,19 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
         )
     for provider, model_id, label, tier, description in _OTHER_MODELS:
         result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
+    for provider, model_id, label, tier, description in _BEDROCK_MODELS:
+        result.append(
+            _priced(
+                provider,
+                model_id,
+                label,
+                tier,
+                description + _BEDROCK_SUGGESTION,
+                model_id.startswith("eu.anthropic.claude-sonnet"),
+                snapshot=snapshot,
+                pricing=pricing,
+            )
+        )
     return result
 
 

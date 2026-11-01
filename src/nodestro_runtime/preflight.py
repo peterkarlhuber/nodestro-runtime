@@ -291,8 +291,14 @@ def _node_issues(
     return found
 
 
-#: Pre-check codes of a provider without settings (no key, no endpoint).
-PROVIDER_CHECKS = ("check.api_key_missing", "check.provider_not_configured")
+#: Pre-check codes of a provider without settings (no key, no endpoint; Bedrock: no region or sign-in, or no role
+#: assigned by a server's operator).
+PROVIDER_CHECKS = (
+    "check.api_key_missing",
+    "check.provider_not_configured",
+    "check.bedrock_not_configured",
+    "check.bedrock_not_available",
+)
 
 
 def _priced(model: str, snapshot: PriceSnapshot = BUILTIN_SNAPSHOT) -> bool:
@@ -327,10 +333,29 @@ def _provider_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue
     for provider in sorted(providers):
         if provider not in PROVIDERS or provider in configured:
             continue  # an unknown provider is reported by the agent's own check
+        if PROVIDERS[provider].auth == "aws":
+            found += _bedrock_issues(nodestro)
+            continue
         exc = MissingApiKeyError(provider)
         code = "check.api_key_missing" if exc.code == "api_key_missing" else "check.provider_not_configured"
         found.append(_issue(code, str(exc), level="error", **exc.params))
     return found
+
+
+def _bedrock_issues(nodestro: Workspace) -> list[CheckIssue]:
+    """Why Amazon Bedrock cannot be used (its own codes: settings missing, no operator role, a refused region)."""
+    try:
+        nodestro.connection("bedrock")
+    except MissingApiKeyError as exc:
+        code = (
+            "check.bedrock_not_available"
+            if exc.code == "provider.bedrock_not_available"
+            else "check.bedrock_not_configured"
+        )
+        return [_issue(code, str(exc), level="error", **{**exc.params, "reason": exc.code})]
+    except NodestroError as exc:
+        return [_issue("check.bedrock_settings_invalid", str(exc), level="error", **{**exc.params, "reason": exc.code})]
+    return []
 
 
 def _flow_issues(workflow: Workflow) -> list[CheckIssue]:
