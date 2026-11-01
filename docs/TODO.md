@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 2 |
-| P3 Low | 19 |
+| P3 Low | 20 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -241,6 +241,15 @@ None known.
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
 
+### RT-029 · CI requires the `NODESTRO_READ` token although the dependencies are public
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #75, backend audit D-08 residual
+- **What:** The CI install steps exit when the `NODESTRO_READ` secret is missing and still call the components
+  private. All Nodestro repositories and orkexa are public now, so runs without secrets (Dependabot, forks) fail early.
+- **Next step:** Install the git dependencies anonymously, make the token optional or remove it, fix the comments.
+- **Depends on:** none; the same change is tracked in nodestro-api #50, nodestro-sdk #47, nodestro-server #25,
+  nodestro-desktop #17 and nodestro-studio #85.
+
 ## Later optimizations
 
 None known.
@@ -289,6 +298,9 @@ None known.
 | RT-012 | nodestro-api, nodestro-studio | AD-02 run cause in lists and banners | Runtime provides the field |
 | RT-014 | nodestro-api | leader cleanup task | API calls runtime retention |
 | RT-001 | nodestro-studio, nodestro-server | S-2 pilot and review | Review covers the whole approval flow |
+| — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
+| — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
+| RT-029 | all component repositories | `NODESTRO_READ` CI change (api #50, sdk #47, server #25, desktop #17, studio #85) | Same change everywhere |
 
 ## Maintaining this file
 
@@ -299,4 +311,4 @@ None known.
 - Accepted risks stay listed with their reason until the risk is removed or re-evaluated.
 - Re-review the whole file before each release and update the "Last full review" line.
 - Security issues that are not yet fixed are described only in general terms here. Report details privately
-  (see SECURITY.md or GitHub private vulnerability reporting), never in this file or in public issues.
+  (GitHub private vulnerability reporting), never in this file or in public issues.
