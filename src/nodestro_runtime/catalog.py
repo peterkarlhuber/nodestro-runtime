@@ -45,6 +45,10 @@ class ModelInfo(BaseModel):
     price_quality: str | None = None
     price_source: str | None = None
     price_version: str | None = None
+    #: Amazon Bedrock: the region the shown base rates belong to and every region the price covers (``aws_region``
+    #: tariff); a region outside ``price_regions`` has an unknown cost.
+    price_region: str | None = None
+    price_regions: list[str] | None = None
 
 
 _MODEL_TEXT: dict[str, tuple[str, str, str]] = {
@@ -131,6 +135,10 @@ def _priced(
         info.cache_read_usd_per_mtok = float(rates.cache_read)
     info.price_quality = price.quality
     info.price_source = price.source
+    regional = price.tariff("aws_region")
+    if regional is not None:
+        info.price_region = regional.default
+        info.price_regions = [option.value for option in regional.options]
     if pricing is None:
         info.price_status = "current"
         info.price_version = snapshot.version

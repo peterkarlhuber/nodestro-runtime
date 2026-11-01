@@ -27,6 +27,10 @@ Amazon Bedrock (2026-11-01):
   `check.bedrock_not_available`, `check.bedrock_settings_invalid`. Exports: `environment_connection(..., settings=)`
   and `exported_settings()` (region + data residency only; `provider.region_missing`). Catalog: EU inference profile
   suggestions. Orkexa pin: `3467940` (master with the Bedrock provider).
+- The workspace feeds the strict price mode the Bedrock region in effect (`PricingService.conditions_source`); the
+  pre-check reports `check.model_unpriced` when a Bedrock price does not cover that region; catalog entries show
+  `price_region`/`price_regions`.
+
 Amazon Bedrock, pricing and credential isolation:
 
 - Bedrock is its own price source (never Anthropic's list prices). A `bedrock` price must list its AWS regions as an

@@ -379,6 +379,8 @@ class Workspace:
             reference_writable=storage is None,
             known_providers=PROVIDERS,
         )
+        # Bedrock prices depend on the region: the strict price mode checks the current connection's region.
+        self.pricing.conditions_source = self._price_conditions
         for priced in (self.runs, self.tester):
             priced.pricing = self.pricing
             priced.price_mode = self.price_mode
@@ -773,6 +775,21 @@ class Workspace:
             bedrock_auth.check_regions((settings.region,), settings.data_residency)
         if {key: entry.get(key) for key in _BEDROCK_FIELDS} != before:
             entry.pop("verification", None)  # a changed configuration has to be checked again
+
+    def _price_conditions(self, provider: str) -> dict[str, str]:
+        """The tariff conditions known before a request (Bedrock: the region of the settings in effect, read anew on
+        every call; for a server tenant its own region). Empty when Bedrock cannot be used."""
+        if provider not in PROVIDERS or PROVIDERS[provider].auth != "aws":
+            return {}
+        settings, problem = bedrock_settings(
+            self._providers().get(provider, {}),
+            server=self._server_tenant,
+            policy=self._bedrock_policy_for_tenant(),
+            local_container=self._local_container(),
+        )
+        if problem is not None or settings.region is None:
+            return {}
+        return {"aws_region": settings.region}
 
     def _bedrock_connection(self, stored: Mapping[str, Any]) -> Connection:
         policy = self._bedrock_policy_for_tenant()

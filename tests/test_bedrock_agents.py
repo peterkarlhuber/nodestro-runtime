@@ -386,3 +386,77 @@ def test_secret_keys_and_repr_hold_no_aws_values(tmp_path: Path, monkeypatch: py
         assert "never-shown-secret" not in json.dumps(workspace.settings().model_dump())
     finally:
         workspace.close()
+
+
+# ---- prices per region -------------------------------------------------------------------
+
+
+def _regional_price() -> Any:
+    from orkexa.pricing import ModelPrice, Tariff, TariffOption, TokenRates
+
+    return ModelPrice(
+        provider="bedrock",
+        model="eu.anthropic.claude-sonnet-5-5",
+        rates=TokenRates.of("3", "15"),
+        tariffs=(Tariff("aws_region", "eu-central-1", (TariffOption("eu-central-1"), TariffOption("eu-west-1"))),),
+        source="acme-aws-contract",
+        quality="contract",
+    )
+
+
+def test_price_conditions_follow_the_current_region(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "ws", integrations=[])
+    try:
+        assert workspace.pricing.request_conditions("bedrock") == {}  # not configured
+        assert workspace.pricing.request_conditions("anthropic") == {}
+        workspace.update_settings(SettingsIn.model_validate({"providers": {"bedrock": {"region": "eu-west-1"}}}))
+        assert workspace.pricing.request_conditions("bedrock") == {"aws_region": "eu-west-1"}
+        workspace.update_settings(SettingsIn.model_validate({"providers": {"bedrock": {"region": "eu-north-1"}}}))
+        assert workspace.pricing.request_conditions("bedrock") == {"aws_region": "eu-north-1"}
+    finally:
+        workspace.close()
+
+
+def test_preflight_and_catalog_check_the_price_region(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "ws", integrations=[])
+    try:
+        workspace.pricing.set_override(_regional_price())
+        flow = WorkflowIn.model_validate(
+            {
+                "name": "Priced",
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "a", "type": "agent", "label": "A", "agent": {"name": "A", "model": CLAUDE}},
+                    {"id": "out", "type": "output"},
+                ],
+                "edges": [{"id": "e1", "source": "start", "target": "a"}, {"id": "e2", "source": "a", "target": "out"}],
+            }
+        )
+        saved = workspace.save_workflow(flow)
+
+        def unpriced(region: str) -> bool:
+            workspace.update_settings(SettingsIn.model_validate({"providers": {"bedrock": {"region": region}}}))
+            return "check.model_unpriced" in {item.code for item in preflight(workspace, saved).problems}
+
+        assert unpriced("eu-central-1") is False
+        assert unpriced("eu-west-1") is False
+        assert unpriced("eu-north-1") is True  # the price does not cover this region
+        shown = {info.id: info for info in models(workspace.pricing)}[CLAUDE]
+        assert shown.price_region == "eu-central-1" and shown.price_regions == ["eu-central-1", "eu-west-1"]
+    finally:
+        workspace.close()
+
+
+def test_strict_price_mode_prices_bedrock_by_the_connection_region(
+    workspace: Workspace, runtime: ScriptedRuntime
+) -> None:
+    workspace.pricing.set_override(_regional_price())
+    workspace.update_settings(SettingsIn.model_validate({"price_mode": "strict"}))
+    runtime.answers = [[{"text": "priced"}]]
+    result, _ = workspace.tester.run(AgentTestIn(agent=AgentConfig(name="P", model=CLAUDE), input="x"))
+    assert result.status == "succeeded", result.error
+    assert result.usage.known_cost_usd is not None and result.usage.known_cost_usd > 0
+    workspace.update_settings(SettingsIn.model_validate({"providers": {"bedrock": {"region": "eu-north-1"}}}))
+    refused, _ = workspace.tester.run(AgentTestIn(agent=AgentConfig(name="P", model=CLAUDE), input="x"))
+    assert refused.status == "failed" and refused.error_code == "pricing.price_unknown"
+    assert len(runtime.calls) == 1  # refused before the request

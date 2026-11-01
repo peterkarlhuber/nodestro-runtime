@@ -11,7 +11,7 @@ Each finding names the node or connection it belongs to, so the editor can mark 
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,6 +23,7 @@ from .agent_builder import ConfigIssue
 from .engine import _PLACEHOLDER, MAX_DEPTH, _usable_team, check_workflow, node_label, start_fields
 from .graph import BRANCHING, ancestors, comment_sources, data_sources, workflow_refs
 from .orchestrator import select_teams
+from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
@@ -301,12 +302,22 @@ PROVIDER_CHECKS = (
 )
 
 
-def _priced(model: str, snapshot: PriceSnapshot = BUILTIN_SNAPSHOT) -> bool:
-    """Whether ``snapshot`` (default: Orkexa's built-in prices) has a price for a model."""
+def _priced(
+    model: str,
+    snapshot: PriceSnapshot = BUILTIN_SNAPSHOT,
+    conditions: Callable[[str], Mapping[str, str]] | None = None,
+) -> bool:
+    """Whether ``snapshot`` (default: Orkexa's built-in prices) has a price for a model that covers the request
+    conditions known before a run (``conditions(provider)``, e.g. Bedrock's ``aws_region``)."""
     try:
-        return snapshot.lookup(provider_of(model), model_id(model)).found
+        provider = provider_of(model)
+        lookup = snapshot.lookup(provider, model_id(model))
     except NodestroError:
         return True  # an invalid name is reported by the agent's own check
+    if lookup.price is None:
+        return False
+    known = dict(conditions(provider)) if conditions is not None else {}
+    return not (known and missing_conditions(lookup.price, known))
 
 
 def agent_models(workflow: Workflow) -> set[str]:
@@ -782,7 +793,15 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
     problems: list[CheckIssue] = [
         *check_workflow(workflow),
         *_connection_issues(workflow),
-        *_node_issues(workflow, known_files, partial(_priced, snapshot=nodestro.pricing.effective_snapshot())),
+        *_node_issues(
+            workflow,
+            known_files,
+            partial(
+                _priced,
+                snapshot=nodestro.pricing.effective_snapshot(),
+                conditions=nodestro.pricing.request_conditions,
+            ),
+        ),
         *_flow_issues(workflow),
         *_subworkflow_issues(nodestro, workflow),
         *_orchestrator_issues(nodestro, workflow),
