@@ -8,7 +8,7 @@ Backend audit (2026-11-01):
   tool call's output with Orkexa's `communicate_bounded()` / `run_bounded()`: at most `response_limit()` bytes of
   stdout and the end of stderr stay in the API or worker process. Code that wrote straight to the inherited stdout
   could make the host buffer any amount (200 MiB raised the host's memory by ~600 MiB); such a call is now stopped
-  and its container removed. Orkexa pin: `c5753f2`.
+  and its container removed. Orkexa pin: `6e69b9c` (master with the bounded-output fix).
 - B-02: continuing a run (`resume.plan`) asks for `confirm_side_effects` for every tool call that may have run: the
   calls of child runs of sub-workflow and orchestrator nodes (recursively), of earlier loop executions, and calls that
   had started when the process stopped. Before a call the gate lets through runs, the engine writes a small note (tool,
