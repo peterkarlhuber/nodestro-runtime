@@ -11,7 +11,8 @@ that confines itself before it reads any tool code (:mod:`nodestro_runtime.sandb
   display server), no ``ptrace``, no System V IPC, no signals, priority, affinity or limit changes aimed at another
   process, no namespaces, mounts, keyrings, BPF, ``io_uring`` and other kernel interfaces.
 - **Resource limits**: address space, CPU time, file size, open files, processes (also threads); the host adds a
-  wall-clock timeout and a limit for the total size of ``tmp``, and kills the process on cancel or timeout.
+  wall-clock timeout and a limit for the total size of ``tmp``, and kills the process on timeout or when the run
+  of the call is cancelled (:mod:`nodestro_runtime.sandbox_cancel`).
 - **An empty environment**: no API keys, tokens or other variables of the Nodestro process.
 
 It needs no user namespaces, so Ubuntu's AppArmor restriction of unprivileged user namespaces does not affect it,
@@ -44,7 +45,7 @@ import orkexa
 from orkexa.dynamic import BoundedOutput, Sandbox, communicate_bounded, response_limit
 from orkexa.dynamic.errors import SandboxError
 
-from . import sandbox_confine
+from . import sandbox_cancel, sandbox_confine
 
 #: Linux distributions (``ID`` and ``VERSION_ID`` of ``/etc/os-release``) on which every security and
 #: compatibility test of the built-in sandbox passed on x86-64, with the distribution's own kernel and AppArmor.
@@ -158,7 +159,9 @@ class LinuxSandbox(Sandbox):
     # --- runs ----------------------------------------------------------------------------------------------------
 
     def cancel(self) -> None:
-        """Kill every call this sandbox is running."""
+        """Kill every call this sandbox is running, of every run that uses it.
+
+        Cancelling one run stops only that run's call (:mod:`nodestro_runtime.sandbox_cancel`)."""
         with self._lock:
             for process in self._processes:
                 _kill(process)
@@ -220,7 +223,10 @@ class LinuxSandbox(Sandbox):
                 reader.join(0.05)
                 if not reader.is_alive():
                     break
-                if time.monotonic() > deadline:
+                if sandbox_cancel.requested():
+                    # Only this call: the sandbox is shared with other runs (see :mod:`.sandbox_cancel`).
+                    problem = "The run was cancelled; the call was stopped"
+                elif time.monotonic() > deadline:
                     problem = f"Timed out after {self.timeout:g} seconds"
                 else:
                     size, entries = _usage(tmp)

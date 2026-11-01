@@ -137,9 +137,12 @@ touched.
 editor shows, `nodestro_runtime.preflight`), refuses a run that would fail for a known reason and returns the
 queued run. `await workspace.wait(run_id)` returns it once it finished or paused. `workspace.cancel(run_id)`
 stops a running or paused run, and also ends a run stored as queued or running that nothing executes (for example
-one restored from a backup taken while it ran). Agents and orchestrator decisions execute in a thread pool of the
-run manager, separate from asyncio's default executor: `NODESTRO_RUN_THREADS` (default 32) sets how many run at the
-same time (agents waiting for a tool approval included); further agents wait for a free thread.
+one restored from a backup taken while it ran). A tool call of a cancelled run that is running in the built-in Linux
+sandbox or in a container sandbox Nodestro built (`StreamedSandbox`) is stopped as well
+(`nodestro_runtime.sandbox_cancel`); calls in Orkexa's process or Docker sandbox end at their timeout. Agents and
+orchestrator decisions execute in a thread pool of the run manager, separate from asyncio's default executor:
+`NODESTRO_RUN_THREADS` (default 32) sets how many run at the same time (agents waiting for a tool approval
+included); further agents wait for a free thread.
 
 **Approvals.** An approval node pauses the run (`status == "paused"`, the node is `awaiting_approval`) until
 a person decides with `workspace.decide(run_id, node_id, "approved" | "rejected", comment)`. Nothing is ever
@@ -151,7 +154,10 @@ carried out on that loop.
 **Continuing.** `await workspace.resume(run_id)` continues a failed or cancelled run as a new linked run. A
 step's earlier result is reused only when its fingerprint (configuration, connections, tool code, inputs and
 files, sub-workflow version) is unchanged; reused steps cost nothing again. Steps that run again after they
-had called own tools need `confirm=True`.
+had called tools need `confirm=True`: this includes the tools called in the child runs of sub-workflow and
+orchestrator steps and calls that had started when the process stopped (each call is noted in the store before it
+runs, `nodestro_runtime.tool_journal`). Not counted are Nodestro's read-only built-in tools, calls that ended with an
+error and calls that never ran because they waited for a person's approval or were refused.
 
 **Errors.** Expected failures raise `nodestro_runtime.problems.NodestroError` (a `ValueError`) with a stable
 `code`, `params` and an English message, for example `api_key_missing`, `workflow.blocked` or

@@ -35,11 +35,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any
 import uuid
 
 from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
 
+from . import sandbox_cancel
 from .problems import NodestroError
 
 #: The repository of environment images (the tag is the image key).
@@ -378,6 +380,22 @@ class StreamedSandbox(DockerSandbox):
             with contextlib.suppress(OSError):
                 subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
 
+        # A cancelled run removes this call's container (only this one: the sandbox is shared with other runs);
+        # the docker client then ends and the call fails (:mod:`nodestro_runtime.sandbox_cancel`).
+        check = sandbox_cancel.current()
+        done = threading.Event()
+        stopped = threading.Event()
+
+        def watch() -> None:
+            while not done.wait(0.1):
+                if sandbox_cancel.requested(check):
+                    stopped.set()
+                    remove()
+                    return
+
+        watcher = threading.Thread(target=watch, daemon=True) if check is not None else None
+        if watcher is not None:
+            watcher.start()
         try:
             # Bounded: tool code can write to the container's stdout directly, past the runner's limit.
             code, output = run_bounded(
@@ -390,6 +408,12 @@ class StreamedSandbox(DockerSandbox):
             )
         except OSError as exc:
             raise SandboxError(f"Cannot start docker: {exc}") from exc
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.join()
+        if stopped.is_set():
+            raise SandboxError("The run was cancelled; the call's container was removed")
         stdout = output.stdout.decode("utf-8", "replace")
         if not stdout.strip():
             stderr = output.stderr.decode("utf-8", "replace")

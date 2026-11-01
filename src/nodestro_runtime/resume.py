@@ -13,6 +13,12 @@ node whether its earlier result can be taken over:
   nobody is asked twice, and nothing a person did not decide is ever approved;
 - a node that runs again after it had already called tools of its own (which might have
   effects outside Nodestro) is reported, and continuing needs an explicit confirmation.
+  This counts the calls of every execution of the node (loops), the calls of the child runs
+  of sub-workflow and orchestrator nodes (and of their children), and calls that started
+  but whose node never stored its result because the process stopped
+  (:mod:`nodestro_runtime.tool_journal`). Only Nodestro's own read-only built-in tools
+  (:data:`~nodestro_runtime.tool_policy.BUILTIN_CAPABILITIES`), calls that ended with an
+  error and calls that were still waiting for (or were refused) a person's approval are left out.
 
 Reused nodes count no cost in the new run: their cost stays with the earlier run, so the
 usage dashboard never counts it twice. When nothing can be reused safely, the plan says
@@ -25,12 +31,14 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from . import tool_journal
 from .engine import node_label
 from .graph import continuation, data_sources
 from .launcher import launch
 from .preflight import PROVIDER_CHECKS, preflight
 from .problems import CheckIssue, NodestroError
-from .schemas import NodeRun, Run, RunIn, Usage, Workflow, total_cost
+from .schemas import NodeRun, Run, RunIn, ToolCallRecord, Usage, Workflow, total_cost
+from .tool_policy import BUILTIN_CAPABILITIES
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -163,7 +171,8 @@ def plan(ctx: Workspace, run_id: str) -> ResumePlan:
     known_files = ctx.file_catalog()
     starts = {node.id for node in workflow.nodes if node.type == "start"}
     missing_files = [file_id for file_id in source.file_ids if file_id not in known_files]
-    custom = set(ctx.tools.builtin)
+    started = _started(ctx, source.id)
+    seen = {source.id}
     for node, action, reason in continuation(workflow, source.nodes, current_prints):
         old = source.nodes.get(node.id)
         entry = ResumeNode(
@@ -175,10 +184,8 @@ def plan(ctx: Workspace, run_id: str) -> ResumePlan:
         )
         if action == "reuse" and old is not None:
             entry.saved_cost_usd = old.usage.estimated_cost_usd
-        if entry.action != "reuse" and old is not None:
-            entry.side_effects = sorted(
-                {call.name for call in old.tool_calls if call.name not in custom and not call.is_error}
-            )
+        if entry.action != "reuse":
+            entry.side_effects = sorted(_node_effects(ctx, old, started.get(node.id, set()), seen))
         if entry.action != "reuse" and missing_files and node.agent is not None:
             sources = data_sources(workflow, node.id)
             if not sources or any(item in starts for item in sources):
@@ -217,6 +224,55 @@ def plan(ctx: Workspace, run_id: str) -> ResumePlan:
         )
     result.possible = not any(item.level == "error" for item in issues)
     return result
+
+
+def _started(ctx: Workspace, run_id: str) -> dict[str, set[str]]:
+    """Per node: the tools whose calls started in the run, as far as its node never stored them (a crash)."""
+    found: dict[str, set[str]] = {}
+    for item in tool_journal.started(ctx.store, run_id):
+        if item.name not in BUILTIN_CAPABILITIES:
+            found.setdefault(item.node_id, set()).add(item.name)
+    return found
+
+
+def _node_effects(ctx: Workspace, state: NodeRun | None, started: set[str], seen: set[str]) -> set[str]:
+    """The tools a node called that may have had effects outside Nodestro: in every execution of the node, in the
+    child runs of sub-workflows and orchestrators (recursively), and calls that started before a crash."""
+    names = set(started)
+    if state is None:
+        return names
+    for execution in (state, *state.earlier):
+        names.update(call.name for call in execution.tool_calls if _may_have_run(call))
+        children = [execution.child_run_id] if execution.child_run_id else []
+        for child_id in [*children, *execution.child_run_ids]:
+            names.update(_run_effects(ctx, child_id, seen))
+    return names
+
+
+#: Approval states of a call that never ran: asked and not (yet) approved, or refused.
+_NOT_RUN = frozenset({"pending", "rejected", "expired", "cancelled", "denied"})
+
+
+def _may_have_run(call: ToolCallRecord) -> bool:
+    """Whether a recorded call ran (or may have) and can have had effects; a call that waited for a person when the
+    run stopped is stored with its question, but it never ran."""
+    if call.name in BUILTIN_CAPABILITIES or call.is_error:
+        return False
+    return call.approval is None or call.approval.status not in _NOT_RUN
+
+
+def _run_effects(ctx: Workspace, run_id: str, seen: set[str]) -> set[str]:
+    """Every tool call of a child run that may have had effects (the whole child runs again with its node)."""
+    if run_id in seen:
+        return set()
+    seen.add(run_id)
+    child = ctx.runs.get(run_id)
+    started = _started(ctx, run_id)
+    names = {name for node_names in started.values() for name in node_names}
+    if child is not None:
+        for state in child.nodes.values():
+            names.update(_node_effects(ctx, state, set(), seen))
+    return names
 
 
 def _request(source: Run) -> RunIn:
