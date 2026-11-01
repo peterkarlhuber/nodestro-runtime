@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 import ipaddress
 import os
+import re
 import socket
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -35,6 +36,11 @@ _6TO4 = ipaddress.ip_network("2002::/16")
 _LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"})
 
 #: The operator's egress allow-list: comma-separated origins (``https://host[:port]``).
+#: The most bytes one HTTP response of an MCP server (JSON-RPC, SSE stream, OAuth and metadata documents) may have.
+#: Counted on the wire while it is read, before anything is parsed; compressed answers are not accepted, so the bytes
+#: counted are the bytes parsed (independent review M-2, threat model T11).
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
 ENDPOINTS_ENV = "NODESTRO_MCP_ENDPOINTS"
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -144,7 +150,9 @@ class EgressPolicy:
         try:
             scheme, host, port = _normal_origin(url)
         except ValueError:
-            raise NodestroError("mcp.url_invalid", f"Not a valid http(s) address: {url}", url=url) from None
+            raise NodestroError(
+                "mcp.url_invalid", f"Not a valid http(s) address: {redact_url(url)}", url=redact_url(url)
+            ) from None
         parts = urlsplit(url.strip())
         if parts.username or parts.password:
             raise NodestroError("mcp.url_credentials", "The address must not contain a user name or password")
@@ -155,7 +163,7 @@ class EgressPolicy:
             raise NodestroError(
                 "mcp.https_required",
                 "MCP servers are reached over https only (http only for a local development server on this computer)",
-                url=url,
+                url=redact_url(url),
             )
         if loopback and not (allow_loopback and self.loopback_possible):
             raise NodestroError("mcp.address_refused", f"The address {host} is refused", host=host, reason="loopback")
@@ -179,6 +187,15 @@ def _literal(host: str) -> IPAddress | None:
         return ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return None
+
+
+def is_loopback_url(url: str) -> bool:
+    """Whether ``url`` names this computer (a loopback name or literal)."""
+    try:
+        _scheme, host, _port = _normal_origin(url)
+    except ValueError:
+        return False
+    return host in _LOOPBACK_NAMES or _is_loopback_literal(host)
 
 
 def _is_loopback_literal(host: str) -> bool:
@@ -282,6 +299,87 @@ class GuardedBackend:
         await anyio.sleep(seconds)
 
 
+_SECRET_NAMES = re.compile(
+    r"(key|token|secret|passw|pwd|auth|signature|sig$|credential|session|bearer|jwt|access|private|code$)", re.I
+)
+_SECRET_VALUE = re.compile(r"^[A-Za-z0-9_\-.~+/=]{20,}$")
+
+
+def _looks_secret(value: str) -> bool:
+    """A long token-like value: at least 20 characters of a token alphabet with letters and digits mixed."""
+    value = value.strip()
+    if not _SECRET_VALUE.match(value):
+        return False
+    return any(c.isdigit() for c in value) and any(c.isalpha() for c in value)
+
+
+def url_secret_problem(url: str) -> str | None:
+    """Why ``url`` seems to carry a credential (``query``, ``path``, ``fragment``), or ``None``.
+
+    Server addresses are stored and shown in the clear, so keys belong in the sealed token, never in the address
+    (ADR-0007 D-3; independent review M-1). Query parameters with credential-like names or token-like values, long
+    token-like path segments and any fragment are refused."""
+    from urllib.parse import parse_qsl
+
+    parts = urlsplit(url.strip())
+    if parts.fragment:
+        return "fragment"
+    for name, value in parse_qsl(parts.query, keep_blank_values=True):
+        if _SECRET_NAMES.search(name) or _looks_secret(value):
+            return "query"
+    if parts.query and not parse_qsl(parts.query, keep_blank_values=True) and _looks_secret(parts.query):
+        return "query"
+    for segment in parts.path.split("/"):
+        if len(segment) >= 24 and _looks_secret(segment):
+            return "path"
+    return None
+
+
+def redact_url(url: str) -> str:
+    """``url`` without query and fragment, for events, logs and error texts."""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return "(invalid address)"
+    if not parts.scheme or not parts.netloc:
+        return url.split("?", 1)[0].split("#", 1)[0][:200]
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    path = "/".join(
+        "…" if len(segment) >= 24 and _looks_secret(segment) else segment for segment in parts.path.split("/")
+    )
+    hidden = "?…" if parts.query else ""
+    return f"{parts.scheme}://{host}{port}{path}{hidden}"
+
+
+def response_too_large(limit: int) -> NodestroError:
+    return NodestroError(
+        "mcp.response_too_large",
+        f"The MCP server's answer is larger than {limit // (1024 * 1024)} MB and was not read",
+        limit=limit,
+    )
+
+
+def _capped_stream(stream: Any, limit: int) -> Any:
+    """``stream`` (a response body) that stops with ``mcp.response_too_large`` once more than ``limit`` bytes
+    arrived, before the reader holds them all."""
+    import httpx2
+
+    class _Capped(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> Any:
+            total = 0
+            async for chunk in stream:
+                total += len(chunk)
+                if total > limit:
+                    raise response_too_large(limit)
+                yield chunk
+
+        async def aclose(self) -> None:
+            await stream.aclose()
+
+    return _Capped()
+
+
 def guarded_client(
     policy: EgressPolicy,
     url: str,
@@ -291,11 +389,16 @@ def guarded_client(
     headers: dict[str, str] | None = None,
     resolver: Resolver | None = None,
     verify: Any = True,
+    max_response_bytes: int | None = None,
 ) -> Any:
-    """An ``httpx2.AsyncClient`` for one MCP endpoint: request-level checks plus :class:`GuardedBackend`."""
+    """An ``httpx2.AsyncClient`` for one MCP endpoint: request-level checks plus :class:`GuardedBackend`.
+
+    Every response body is limited to ``max_response_bytes`` on the wire (a larger ``Content-Length`` is refused
+    before the body is read) and must not be compressed, so the limit also bounds what is decoded and parsed."""
     import httpcore2
     import httpx2
 
+    limit: int = MAX_RESPONSE_BYTES if max_response_bytes is None else max_response_bytes
     policy.check_url(url, allow_loopback=allow_loopback)
     backend = GuardedBackend(allow_loopback=allow_loopback and policy.loopback_possible)
     if resolver is not None:
@@ -317,6 +420,19 @@ def guarded_client(
             policy.check_url(str(request.url), allow_loopback=allow_loopback)
             response = await super().handle_async_request(request)
             backend.statuses.append(int(response.status_code))
+            encoding = response.headers.get("content-encoding", "identity").strip().lower()
+            declared = response.headers.get("content-length")
+            too_long = declared is not None and declared.strip().isdigit() and int(declared) > limit
+            if encoding not in ("", "identity") or too_long:
+                await response.aclose()
+                if too_long:
+                    raise response_too_large(limit)
+                raise NodestroError(
+                    "mcp.protocol_error",
+                    f"The MCP server sent a compressed answer ({encoding}), which is not accepted",
+                    detail="content-encoding",
+                )
+            response.stream = _capped_stream(response.stream, limit)
             return response
 
     client = httpx2.AsyncClient(
@@ -324,7 +440,8 @@ def guarded_client(
         trust_env=False,
         follow_redirects=False,
         timeout=httpx2.Timeout(timeout, connect=min(timeout, 15.0)),
-        headers=headers,
+        # No compression: the size limit counts the bytes that are parsed (independent review M-2).
+        headers={**(headers or {}), "Accept-Encoding": "identity"},
     )
     client.nodestro_backend = backend  # type: ignore[attr-defined]
     return client

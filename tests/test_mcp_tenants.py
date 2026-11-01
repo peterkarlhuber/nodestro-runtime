@@ -47,7 +47,14 @@ def test_tenants_never_see_each_others_servers_tools_or_tokens(
         server = alpha.mcp.add(McpServerIn(name="CRM", url=f"{ENDPOINT}/mcp", auth="bearer", token="alpha-token"))
         assert server.token_storage == "vault"
         alpha.mcp.apply_discovery(server, [ToolDefinition(name="lookup", description="Find a customer")])
-        alpha.mcp.decide(server.id, "lookup", approve=True, access="read", actor="alice")
+        alpha.mcp.decide(
+            server.id,
+            "lookup",
+            approve=True,
+            expected_hash=alpha.mcp.tool(server.id, "lookup").hash,
+            access="read",
+            actor="alice",
+        )
         assert [tool.name for tool in alpha.mcp.usable()] == ["lookup"]
         assert alpha.mcp.token(alpha.mcp.server(server.id)) == "alpha-token"
         # Beta sees nothing and cannot use alpha's tool by name.

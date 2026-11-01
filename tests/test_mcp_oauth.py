@@ -274,7 +274,14 @@ def test_an_agent_call_uses_and_refreshes_the_oauth_token(
     server_id = add(service, protected.url)
     sign_in(service, auth, server_id)
     asyncio.run(service.adiscover(server_id))
-    service.decide(server_id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server_id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     time.sleep(1.2)
     _server, _tool, result = service.call("mcp__docs__search", {"query": "invoices"})
     assert "results for invoices" in result.text and not result.is_error

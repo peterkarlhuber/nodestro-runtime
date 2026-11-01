@@ -2302,6 +2302,21 @@ class RunManager:
         )
         self._save(context)
         if final.status == "approved":
+            # The approval binds the call to the tool as it was asked about (arguments, version, MCP definition
+            # hash). An administrator may have approved another MCP definition while the person decided (independent
+            # review L-4): then this approval does not cover the call that would run now. Own tools are bound to their
+            # version by the tool object itself (it refuses to run after a change).
+            if is_mcp_tool(call.name) and _current_hash(context.env.builder.tools, call) != final.arguments_hash:
+                gate.approvals.audit("stale", final, outcome="changed")
+                return self._deny_call(
+                    context,
+                    node_id,
+                    call,
+                    record,
+                    "tool.approval_stale",
+                    "The tool changed while this call waited for its approval, so it was not made",
+                    shown,
+                )
             return None
         if final.status == "rejected":
             return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
@@ -3012,6 +3027,8 @@ class RunManager:
                     (lambda: EphemeralMemory(checkpoint.memory or {})) if checkpoint is not None else EphemeralMemory
                 ),
                 resume=checkpoint.turn if checkpoint is not None else None,
+                # before_tool asks the tool gate for every call except the run's own tools (S-2).
+                gated=gate is not None,
             )
             state.output = outcome.output
             state.memory = outcome.memory
@@ -3150,6 +3167,7 @@ def execute_agent(
     cancelled: Callable[[], bool] | None = None,
     attended: bool = True,
     resume: Mapping[str, Any] | None = None,
+    gated: bool = False,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -3157,7 +3175,8 @@ def execute_agent(
     call raises :class:`AgentSuspended` with the checkpoint and the run memory.
 
     Used by workflow runs and by the agent test in the inspector, so both behave the same.
-    Agent and judge each use the connection of their own provider.
+    Agent and judge each use the connection of their own provider. ``gated`` must be true only when the
+    ``before_tool`` hook applies the shared per-call approval rules to every call (MCP tools that change data need it).
     """
     built = builder.build(
         config,
@@ -3171,6 +3190,7 @@ def execute_agent(
         extra_tools=extra_tools,
         cancelled=cancelled,
         attended=attended,
+        gated=gated,
     )
     agent = built.agent
     evaluation: EvaluationRecord | None = None

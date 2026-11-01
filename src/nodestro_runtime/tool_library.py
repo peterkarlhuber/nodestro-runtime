@@ -632,19 +632,27 @@ class ToolLibrary:
             return self.mcp is not None and self.mcp.find(name) is not None
         return name in self.registry
 
-    def tool(self, name: str, *, sandbox: Sandbox | None = None, cancelled: Callable[[], bool] | None = None) -> Tool:
+    def tool(
+        self,
+        name: str,
+        *,
+        sandbox: Sandbox | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        gated: bool = False,
+    ) -> Tool:
         """A ready-to-use tool (generated ones run in the sandbox).
 
         ``sandbox`` replaces the registry's sandbox for custom and generated tools, e.g. one
         whose interpreter is a workflow's Python environment with approved libraries.
 
         MCP tools are checked against the MCP policy (``mcp.*`` refusals); ``cancelled`` stops a running MCP call
-        when the run is cancelled.
+        when the run is cancelled. ``gated`` is true only for callers that ask the per-call approval gate before every
+        call (the run engine); MCP tools that change data are refused otherwise.
         """
         if is_mcp_tool(name):
             if self.mcp is None:
                 raise KeyError(name)
-            return self.mcp.agent_tool(name, cancelled=cancelled)
+            return self.mcp.agent_tool(name, cancelled=cancelled, gated=gated)
         registry = self.registry
         try:
             tool = registry.get_tool(name)

@@ -101,7 +101,14 @@ def test_older_handshake_versions_are_negotiated(
         server_id = add(service, legacy)
         _stored, discovery = discover(service, server_id)
         assert discovery.protocol_version == version
-        service.decide(server_id, "search", approve=True, access="read", actor="admin")
+        service.decide(
+            server_id,
+            "search",
+            approve=True,
+            expected_hash=service.tool(server_id, "search").hash,
+            access="read",
+            actor="admin",
+        )
         _server, _tool, result = service.call("mcp__test-catalog__search", {"query": "q"})
         assert result.text == "results for q"
     finally:
@@ -111,7 +118,14 @@ def test_older_handshake_versions_are_negotiated(
 def approve_search(service: McpService, server: LoopbackServer) -> str:
     server_id = add(service, server)
     discover(service, server_id)
-    service.decide(server_id, "search", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        "search",
+        approve=True,
+        expected_hash=service.tool(server_id, "search").hash,
+        access="read",
+        actor="admin",
+    )
     return server_id
 
 
@@ -145,10 +159,19 @@ def test_tools_that_change_data_are_not_usable_before_per_call_approval(
 ) -> None:
     server_id = add(service, server)
     discover(service, server_id)
-    service.decide(server_id, "delete_page", approve=True, access="write", actor="admin")
+    service.decide(
+        server_id,
+        "delete_page",
+        approve=True,
+        expected_hash=service.tool(server_id, "delete_page").hash,
+        access="write",
+        actor="admin",
+    )
     assert code(lambda: service.check("mcp__test-catalog__delete_page")) == "mcp.write_not_supported"
     # Annotations never decide: an approval without classification stays "write".
-    service.decide(server_id, "injection", approve=True, actor="admin")
+    service.decide(
+        server_id, "injection", approve=True, expected_hash=service.tool(server_id, "injection").hash, actor="admin"
+    )
     assert service.tool(server_id, "injection").access == "write"
     assert code(lambda: service.check("mcp__test-catalog__injection")) == "mcp.write_not_supported"
 
@@ -195,7 +218,14 @@ def test_timeouts_output_limits_and_cancel(service: McpService, server: Loopback
     server_id = add(service, server, timeout_seconds=1.0, max_output_chars=1000)
     discover(service, server_id)
     for name in ("slow", "big"):
-        service.decide(server_id, name, approve=True, access="read", actor="admin")
+        service.decide(
+            server_id,
+            name,
+            approve=True,
+            expected_hash=service.tool(server_id, name).hash,
+            access="read",
+            actor="admin",
+        )
     started = time.monotonic()
     assert code(lambda: service.call("mcp__test-catalog__slow", {"seconds": 30})) == "mcp.timeout"
     assert time.monotonic() - started < 10
@@ -218,7 +248,14 @@ def test_timeouts_output_limits_and_cancel(service: McpService, server: Loopback
 def test_tool_errors_come_back_as_errors(service: McpService, server: LoopbackServer) -> None:
     server_id = add(service, server)
     discover(service, server_id)
-    service.decide(server_id, "fails", approve=True, access="read", actor="admin")
+    service.decide(
+        server_id,
+        "fails",
+        approve=True,
+        expected_hash=service.tool(server_id, "fails").hash,
+        access="read",
+        actor="admin",
+    )
     _srv, _tool, result = service.call("mcp__test-catalog__fails", {})
     assert result.is_error and "fails" in result.text
 

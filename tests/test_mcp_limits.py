@@ -72,7 +72,14 @@ def approve(service: McpService, url: str, *names: str) -> str:
     server_id = service.add(McpServerIn(name="Catalog", url=url, allow_loopback=True), actor="admin").id
     asyncio.run(service.adiscover(server_id, actor="admin"))
     for name in names:
-        service.decide(server_id, name, approve=True, access="read", actor="admin")
+        service.decide(
+            server_id,
+            name,
+            approve=True,
+            expected_hash=service.tool(server_id, name).hash,
+            access="read",
+            actor="admin",
+        )
     return server_id
 
 
@@ -174,7 +181,16 @@ def test_closing_the_hub_stops_its_thread_and_refuses_later_calls(make: Any, ser
 def test_tools_that_change_data_are_usable_while_the_shared_gate_is_on(make: Any, server: LoopbackServer) -> None:
     service = make()
     server_id = approve(service, server.url)
-    service.decide(server_id, "delete_page", approve=True, access="write", actor="admin")
+    service.decide(
+        server_id,
+        "delete_page",
+        approve=True,
+        expected_hash=service.tool(server_id, "delete_page").hash,
+        access="write",
+        actor="admin",
+    )
     assert code(lambda: service.check("mcp__catalog__delete_page")) == "mcp.write_not_supported"
     service.write_gate = True
-    assert service.call("mcp__catalog__delete_page", {"page_id": "7"})[2].text == "deleted 7"
+    # The switch alone is not enough: only a caller that asks before every call (gated) may run it (review H-1).
+    assert code(lambda: service.call("mcp__catalog__delete_page", {"page_id": "7"})) == "mcp.write_not_supported"
+    assert service.call("mcp__catalog__delete_page", {"page_id": "7"}, gated=True)[2].text == "deleted 7"
