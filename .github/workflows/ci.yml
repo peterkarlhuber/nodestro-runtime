@@ -19,7 +19,7 @@ jobs:
     # PostgreSQL storage (ADR-0002) runs the storage contract against a real server; a missing database fails.
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_PASSWORD: nodestro-ci
         ports:
@@ -33,15 +33,16 @@ jobs:
       NODESTRO_TEST_POSTGRES: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
       NODESTRO_REQUIRE_POSTGRES: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
       # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
-      - name: Grant read access to the private repositories
+      # The token exists only in this step's environment: no global Git configuration, nothing for later steps.
+      - name: Install with read access to the private repositories
         env:
           NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
         run: |
@@ -49,12 +50,24 @@ jobs:
             echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
             exit 1
           fi
-          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
-      - run: pip install -e ".[dev]"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
+          pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
       - run: pytest
+      # Known vulnerabilities in the installed dependencies (as orkexa's CI checks them). Blocking: an advisory that
+      # was reviewed and cannot be fixed yet goes into PIP_AUDIT_IGNORE (space-separated IDs, with the reason here).
+      - name: Dependency audit
+        if: matrix.python == '3.13'
+        env:
+          PIP_AUDIT_IGNORE: ""
+        run: |
+          pip install pip-audit==2.10.1
+          args=(); for id in $PIP_AUDIT_IGNORE; do args+=(--ignore-vuln "$id"); done
+          pip-audit --skip-editable --progress-spinner off "${args[@]}"
 
   docker:
     # Tools with libraries and local MCP servers (WP-8) in the Docker sandbox (ADR-0006 point 6): a real image is built
@@ -65,15 +78,16 @@ jobs:
       NODESTRO_DOCKER_TESTS: "1"
       NODESTRO_REQUIRE_DOCKER: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
           cache: pip
       # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
-      - name: Grant read access to the private repositories
+      # The token exists only in this step's environment: no global Git configuration, nothing for later steps.
+      - name: Install with read access to the private repositories
         env:
           NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
         run: |
@@ -81,8 +95,10 @@ jobs:
             echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
             exit 1
           fi
-          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
-      - run: pip install -e ".[dev]"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
+          pip install -e ".[dev]"
       - run: docker info
       - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
 
@@ -95,15 +111,16 @@ jobs:
     env:
       NODESTRO_REQUIRE_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
           cache: pip
       # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
-      - name: Grant read access to the private repositories
+      # The token exists only in this step's environment: no global Git configuration, nothing for later steps.
+      - name: Install with read access to the private repositories
         env:
           NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
         run: |
@@ -111,8 +128,10 @@ jobs:
             echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
             exit 1
           fi
-          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
-      - run: pip install -e ".[dev]"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
+          pip install -e ".[dev]"
       - name: Kernel features
         run: |
           id; uname -r; cat /sys/kernel/security/lsm; echo
@@ -131,14 +150,17 @@ jobs:
     # The wheel installs on its own and contains what the package needs at run time.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
+      - run: pip install build==1.6.1
+      - run: python -m build
       # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
-      - name: Grant read access to the private repositories
+      # The token exists only in this step's environment: no global Git configuration, nothing for later steps.
+      - name: Install the wheel into a fresh environment (private dependencies read with NODESTRO_READ)
         env:
           NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
         run: |
@@ -146,13 +168,13 @@ jobs:
             echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
             exit 1
           fi
-          git config --global url."https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"
-      - run: pip install build
-      - run: python -m build
-      - name: Install the wheel into a fresh environment
-        run: |
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
           python -m venv "$RUNNER_TEMP/wheel"
           "$RUNNER_TEMP/wheel/bin/pip" install dist/*.whl
+      - name: Check the installed wheel
+        run: |
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wheel/bin/python" -c "import nodestro_runtime as p; print(p.__name__, p.__version__)"
           # The PostgreSQL migrations are package data; the module imports without the optional driver.
@@ -166,7 +188,7 @@ jobs:
           EOF
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wheel/bin/python" quickstart.py
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
