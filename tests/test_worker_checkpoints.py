@@ -153,3 +153,55 @@ async def test_racing_decisions_and_resumes_run_the_call_once(
         assert sum(1 for item in done.nodes["a"].tool_calls if item.name == TOOL) == 1
     finally:
         await serving.close()
+
+
+async def test_a_decision_and_every_sweep_continue_the_run_once(
+    connect: Callable[[], Any], processes: Callable[..., Process], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodestro_runtime.jobs import RUN_JOB, QueuedRuns
+    from nodestro_runtime.schemas import Run
+    from nodestro_runtime.tool_approvals import CHECKPOINTS_ENV, ENABLE_ENV, audit_events
+
+    monkeypatch.setenv(ENABLE_ENV, "1")
+    monkeypatch.setenv(CHECKPOINTS_ENV, "1")  # the sweeps see the switch on
+
+    entries = script(AGENT=asking())
+    api_db, other_db, worker_db = connect(), connect(), connect()
+    api = Api(checkpointing(processes, api_db, entries), JobQueue(api_db))
+    second = Api(checkpointing(processes, other_db, entries), JobQueue(other_db))
+    serving = Serving(worker_of(checkpointing(processes, worker_db, entries), worker_db))
+    try:
+        run_id, request = await paused(api, "AGENT")
+        other = second.process("alpha")
+        QueuedRuns(second.queue, "alpha", other.runs).attach()
+        # The decision is stored; nobody has continued the run yet.
+        ToolApprovals(api.process("alpha").store).decide(
+            run_id, request.id, approved=True, by="usr", arguments=request.arguments_hash
+        )
+        stale = other.store.get("runs", run_id, Run)  # what a process read just before another one continued it
+        assert stale is not None and stale.status == "paused"
+        jobs_before = len(api.queue.jobs("alpha", RUN_JOB, run_id))
+
+        # The decide route and the sweeps of two processes continue the same run at the same moment.
+        results = await asyncio.gather(
+            asyncio.to_thread(api.process("alpha").runs._continue_paused, run_id),
+            asyncio.to_thread(other.runs._continue_paused, run_id),
+            asyncio.to_thread(api.process("alpha").runs.sweep_tool_waits),
+            asyncio.to_thread(other.runs.sweep_tool_waits),
+        )
+        continued = [results[0], results[1], run_id in results[2], run_id in results[3]]
+        assert continued.count(True) == 1, continued
+        # A process that read the paused run before cannot queue it again or write its stale copy over it.
+        with pytest.raises(NodestroError) as error:
+            other.runs._launch(stale)
+        assert error.value.code == "run.not_paused"
+
+        done = await api.until(run_id, ("succeeded", "failed"))
+        assert done.status == "succeeded", done.error
+        assert call_of(done).output == "sent hi"
+        assert sum(1 for item in done.nodes["a"].tool_calls if item.name == TOOL) == 1
+        assert len(api.queue.jobs("alpha", RUN_JOB, run_id)) == jobs_before + 1  # one job for the continue
+        kinds = [event.kind for event in audit_events(api.process("alpha").store) if event.run_id == run_id]
+        assert kinds.count("resumed") == 1 and kinds.count("executed") == 1
+    finally:
+        await serving.close()

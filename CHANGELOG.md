@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Fix: continuing a paused run from several processes at once (Evolution review of api #40):
+
+- A paused run is queued again by a compare-and-set from `paused` (`replace_if` on `status`). When a decision and
+  the deadline sweeps of several workers continue the same run at the same moment, exactly one of them queues it
+  (one job, one `resumed` audit per request); the others get `run.not_paused` and change nothing. Before, a process
+  that had read the run as `paused` could write its stale copy over a run that already went on before its enqueue
+  failed. The requests a continue answers are read before the run goes on, and only the process that queued it
+  audits them.
+
 Runs paused at a tool call that waits for a person (M6b, behind a second switch, default off):
 
 - New switch `NODESTRO_TOOL_APPROVAL_CHECKPOINTS=1`, effective only together with `NODESTRO_TOOL_APPROVALS=1`. While it

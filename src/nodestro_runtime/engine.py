@@ -1007,9 +1007,17 @@ class RunManager:
     def _launch(self, run: Run, *, local: bool = False) -> Run:
         if self.dispatch is not None and not local:
             # Queue execution: the run is stored and a worker executes it (ADR-0004). A paused run whose decision
-            # was recorded is queued again, so everybody waiting for it sees that it goes on.
+            # was recorded is queued again, so everybody waiting for it sees that it goes on. Several processes can
+            # continue the same paused run at once (a decision and the sweeps of every worker): only the one whose
+            # compare-and-set from ``paused`` wins queues it, so there is one job and no stale run document
+            # written over a run that already goes on.
+            was = run.status
             run.status = "queued"
-            self.store.put("runs", run.id, run)
+            if was == "paused":
+                if not self.store.replace_if("runs", run.id, run, field="status", expected="paused"):
+                    raise NodestroError("run.not_paused", "This run already continues elsewhere", status="queued")
+            else:
+                self.store.put("runs", run.id, run)
             self.dispatch(run)
             return run
         loop = _require_loop()
@@ -1222,15 +1230,19 @@ class RunManager:
         root = self.root_of(run)
         if root.status != "paused" or root.id in self._contexts:
             return False
+        # What this continue answers, read before the run goes on (a worker may reach the calls at once).
+        answered = [item for item in approvals.of_run(run_id) if item.checkpointed and item.use == "open"]
         try:
             self.resume(root.id)
-        except NodestroError:  # no event loop here (``run.no_event_loop``): the next sweep continues it
+        except NodestroError:
+            # No event loop here (``run.no_event_loop``: the next sweep continues it), or another process
+            # continued it first (``run.not_paused``): only the process that queued the run audits.
             return False
-        for item in approvals.of_run(run_id):
-            if not item.checkpointed or item.use != "open":
-                continue
+        except KeyError:
+            return False
+        for item in answered:
             if item.status == "approved":
-                # Marked when the resumed turn reaches the call (executed or stale), so audited once.
+                # Marked when the resumed turn reaches the call (executed or stale).
                 approvals.audit("resumed", item, outcome=item.status)
             elif item.status in ("rejected", "expired") and approvals.use(item, "closed") is not None:
                 # Never usable again: closing it (compare-and-set) audits it once, not at every later continue.
