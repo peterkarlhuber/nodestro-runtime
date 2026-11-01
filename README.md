@@ -114,8 +114,12 @@ nothing when it opens, because API and worker processes open the same tenant at 
 coordinates them through PostgreSQL: `QueuedRuns(queue, tenant, workspace.runs).attach()` makes an API process
 store and queue runs instead of executing them; `RunWorker(queue, workspaces).serve(stop)` claims run jobs
 (`FOR UPDATE SKIP LOCKED`), executes them, renews their leases and writes their events to `nodestro_run_events`
-(`PostgresEventLog`); `reap(queue, workspaces)` marks the runs of jobs whose lease expired as interrupted. Such a
-run is never executed again by itself. `LeaderLock` and `ScheduleFirings` let exactly one process fire each
+(`PostgresEventLog`); `reap(queue, workspaces)` marks the runs of jobs whose lease expired as interrupted, and also
+top-level runs stored as queued or running that no active job executes (imported, restored, a job that never
+arrived) once they have not changed for twice the lease. Such a run is never executed again by itself. Every write
+of a run by a worker is a compare-and-set on a fence in the stored run, so a worker whose lease expired (or whose
+run was interrupted meanwhile) stops its execution without overwriting the run; it renews its lease and flushes
+events on threads of its own. `LeaderLock` and `ScheduleFirings` let exactly one process fire each
 schedule slot once. Only runs go through the queue so far.
 
 **Operating profile.** A workspace serves one of two profiles (`nodestro_runtime.profile`): `desktop`, the
@@ -132,18 +136,28 @@ touched.
 **Running.** `await workspace.run(workflow, RunIn(...))` checks the workflow first (the same pre-check the
 editor shows, `nodestro_runtime.preflight`), refuses a run that would fail for a known reason and returns the
 queued run. `await workspace.wait(run_id)` returns it once it finished or paused. `workspace.cancel(run_id)`
-stops a running or paused run.
+stops a running or paused run, and also ends a run stored as queued or running that nothing executes (for example
+one restored from a backup taken while it ran). A tool call of a cancelled run that is running in the built-in Linux
+sandbox or in a container sandbox Nodestro built (`StreamedSandbox`) is stopped as well
+(`nodestro_runtime.sandbox_cancel`); calls in Orkexa's process or Docker sandbox end at their timeout. Agents and
+orchestrator decisions execute in a thread pool of the run manager, separate from asyncio's default executor:
+`NODESTRO_RUN_THREADS` (default 32) sets how many run at the same time (agents waiting for a tool approval
+included); further agents wait for a free thread.
 
 **Approvals.** An approval node pauses the run (`status == "paused"`, the node is `awaiting_approval`) until
 a person decides with `workspace.decide(run_id, node_id, "approved" | "rejected", comment)`. Nothing is ever
-approved automatically, a decision is recorded once, and a pending approval survives restarts. `decide`,
+approved automatically, a decision is recorded once (also when two processes of a server decide at the same
+moment: the second gets `approval.not_pending`), and a pending approval survives restarts. `decide`,
 `cancel` and starting a run may also be called from another thread while the event loop runs; they are
 carried out on that loop.
 
 **Continuing.** `await workspace.resume(run_id)` continues a failed or cancelled run as a new linked run. A
 step's earlier result is reused only when its fingerprint (configuration, connections, tool code, inputs and
 files, sub-workflow version) is unchanged; reused steps cost nothing again. Steps that run again after they
-had called own tools need `confirm=True`.
+had called tools need `confirm=True`: this includes the tools called in the child runs of sub-workflow and
+orchestrator steps and calls that had started when the process stopped (each call is noted in the store before it
+runs, `nodestro_runtime.tool_journal`). Not counted are Nodestro's read-only built-in tools, calls that ended with an
+error and calls that never ran because they waited for a person's approval or were refused.
 
 **Errors.** Expected failures raise `nodestro_runtime.problems.NodestroError` (a `ValueError`) with a stable
 `code`, `params` and an English message, for example `api_key_missing`, `workflow.blocked` or
@@ -219,7 +233,10 @@ arguments and the certificate authority in `NODESTRO_BUILD_CA_FILE` (or `SSL_CER
 copies the database to `<data_dir>/backups/pre-migration-<from>-to-<to>-<time>.db` first (or calls
 `Workspace(before_migration=...)`), then runs every step in one transaction; a failing backup or step leaves the
 database unchanged (`storage.backup_failed`, `storage.migration_failed`), and a database of a newer release is
-refused (`storage.schema_too_new`).
+refused (`storage.schema_too_new`). A damaged document (JSON that does not parse, or data that does not fit the
+model) is left out of `list`, `items`, `list_prefix` and `find` of `SQLiteStore` and logged once as a warning with its
+collection and id (`SQLiteStore.damaged` keeps them); the start-up recovery skips it too. `get` of that one document
+still raises.
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `pip install "nodestro-runtime[postgres]"` (psycopg 3) and is not

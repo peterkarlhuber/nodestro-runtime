@@ -35,11 +35,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any
 import uuid
 
-from orkexa.dynamic import DockerSandbox, SandboxError
+from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
 
+from . import sandbox_cancel
 from .problems import NodestroError
 
 #: The repository of environment images (the tag is the image key).
@@ -372,24 +374,51 @@ class StreamedSandbox(DockerSandbox):
         files = {path.name: path.read_text(encoding="utf-8") for path in sorted(workdir.iterdir()) if path.is_file()}
         envelope = json.dumps({"files": files, "request": request})
         name = f"nodestro-sandbox-{uuid.uuid4().hex[:12]}"
+
+        def remove() -> None:
+            # Killing the docker client does not stop the container.
+            with contextlib.suppress(OSError):
+                subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
+
+        # A cancelled run removes this call's container (only this one: the sandbox is shared with other runs);
+        # the docker client then ends and the call fails (:mod:`nodestro_runtime.sandbox_cancel`).
+        check = sandbox_cancel.current()
+        done = threading.Event()
+        stopped = threading.Event()
+
+        def watch() -> None:
+            while not done.wait(0.1):
+                if sandbox_cancel.requested(check):
+                    stopped.set()
+                    remove()
+                    return
+
+        watcher = threading.Thread(target=watch, daemon=True) if check is not None else None
+        if watcher is not None:
+            watcher.start()
         try:
-            completed = subprocess.run(
+            # Bounded: tool code can write to the container's stdout directly, past the runner's limit.
+            code, output = run_bounded(
                 self.command(workdir, name),
-                input=envelope,
-                capture_output=True,
-                text=True,
-                env=self.environ,
+                envelope.encode("utf-8"),
                 timeout=self.timeout,
-                check=False,
+                max_stdout=response_limit(self.max_output_chars),
+                env=self.environ,
+                on_abort=remove,
             )
-        except subprocess.TimeoutExpired as exc:
-            subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
-            raise SandboxError(f"Timed out after {self.timeout:g} seconds") from exc
         except OSError as exc:
             raise SandboxError(f"Cannot start docker: {exc}") from exc
-        if not completed.stdout.strip():
-            raise SandboxError(f"Container exited with code {completed.returncode}: {completed.stderr[-1000:]}")
-        return completed.stdout
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.join()
+        if stopped.is_set():
+            raise SandboxError("The run was cancelled; the call's container was removed")
+        stdout = output.stdout.decode("utf-8", "replace")
+        if not stdout.strip():
+            stderr = output.stderr.decode("utf-8", "replace")
+            raise SandboxError(f"Container exited with code {code}: {stderr[-1000:]}")
+        return stdout
 
 
 class RuntimeImageSandbox(StreamedSandbox):

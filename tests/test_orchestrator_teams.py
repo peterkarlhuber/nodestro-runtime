@@ -131,6 +131,7 @@ async def test_a_team_waiting_for_an_approval_pauses_the_orchestrator_and_contin
     assert paused.status == "paused", paused.error
     lead = paused.nodes["lead"]
     assert lead.status == "awaiting_approval" and lead.finished_at is None
+    began = lead.started_at
     record = lead.orchestration
     assert record["pending"]["outcomes"][0]["status"] == "waiting" and not record["steps"]
     child_id = lead.child_run_ids[0]
@@ -144,6 +145,7 @@ async def test_a_team_waiting_for_an_approval_pauses_the_orchestrator_and_contin
     assert done.status == "succeeded", done.error
     lead = done.nodes["lead"]
     assert lead.output == "Approved draft" and lead.child_run_ids == [child_id]  # the same team run continued
+    assert lead.started_at == began  # X-02: continuing after the decision keeps when the step began
     step = lead.orchestration["steps"][0]
     assert step["outcomes"][0]["status"] == "succeeded" and step["outcomes"][0]["ref"] == child_id
     assert lead.orchestration["pending"] is None

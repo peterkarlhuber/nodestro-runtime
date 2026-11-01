@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+Backend audit (2026-11-01):
+
+- B-01: the built-in Linux sandbox and the container sandboxes (`StreamedSandbox`, `RuntimeImageSandbox`) read a
+  tool call's output with Orkexa's `communicate_bounded()` / `run_bounded()`: at most `response_limit()` bytes of
+  stdout and the end of stderr stay in the API or worker process. Code that wrote straight to the inherited stdout
+  could make the host buffer any amount (200 MiB raised the host's memory by ~600 MiB); such a call is now stopped
+  and its container removed. Orkexa pin: `6e69b9c` (master with the bounded-output fix).
+- B-02: continuing a run (`resume.plan`) asks for `confirm_side_effects` for every tool call that may have run: the
+  calls of child runs of sub-workflow and orchestrator nodes (recursively), of earlier loop executions, and calls that
+  had started when the process stopped. Before a call the gate lets through runs, the engine writes a small note (tool,
+  call id, time, SHA-256 of the arguments; never the arguments) to the new collection `tool_call_journal`
+  (`nodestro_runtime.tool_journal`); a node's notes are deleted once its state is stored. Only the read-only built-in
+  tools (`BUILTIN_CAPABILITIES`), failed calls and calls that never ran are not counted; extension tools now count.
+- B-03: cancelling a run (also by `limits.max_duration_s`) stops its running sandbox call: the built-in Linux sandbox
+  kills the call's process group, `StreamedSandbox`/`RuntimeImageSandbox` remove the call's container. Only that run's
+  call is stopped (`nodestro_runtime.sandbox_cancel`); Orkexa's `SubprocessSandbox` and `DockerSandbox` calls still end
+  at their timeout.
+- C-01, A-03, C-14: `PostgresDatabase` keeps a pool of connections (`psycopg_pool`, `NODESTRO_DATABASE_POOL_SIZE`,
+  default 8) and checks each before use, so a dropped connection is replaced instead of failing every later call until
+  a restart. Reads run in parallel, so one slow request no longer stalls every tenant of the process; writes of one
+  process still run one after another. Every connection has `statement_timeout`
+  (`NODESTRO_DATABASE_STATEMENT_TIMEOUT`, 30 s, 0 = off) and `idle_in_transaction_session_timeout`
+  (`NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT`, 300 s); migrations have no statement limit. Session advisory locks
+  use a dedicated connection, and `LeaderLock` notices a lost connection. New: `PostgresDatabase.ping()`.
+- C-02, C-06: run writes are fenced across processes. An approval decision is stored with a compare-and-set, so of two
+  concurrent decisions exactly one is recorded and the other is refused with `approval.not_pending`; a decision for a
+  run that is no longer paused is refused (`run.not_paused`) before anything is written. A worker whose lease expired
+  or whose run was interrupted meanwhile stops without overwriting the run (`run.fence_lost`).
+- C-03: `DocumentStore.lock(collection, key)` serializes read-modify-write steps inside a transaction across processes.
+  Workflow version numbers, `Workspace.save_workflow` and the legacy approval stamp use it.
+- C-05, C-14: SQLite schema version 1 adds an index for `list()` and partial expression indexes for `find()` on
+  `status` and `trigger_ref` (existing data directories are backed up first). PostgreSQL migration 0005 indexes
+  `trigger_ref`, and `find()` names the field literally so the expression indexes apply.
+- C-08: agents and orchestrator decisions run in the run manager's own thread pool (`NODESTRO_RUN_THREADS`, default
+  32) instead of asyncio's default executor; workers renew leases and flush events on threads of their own.
+- C-10: SQLite and PostgreSQL listings leave out documents that do not fit the model, log them once and count them in
+  `store.damaged`, instead of failing the whole list; start-up recovery skips them. Reading one directly still raises.
+- C-11: `jobs.reap` also marks top-level runs stored as queued or running without an active job as interrupted (after
+  twice the lease), and `cancel` ends a stored live run that nothing executes (for example after a restore).
+- A-05: on a server, OpenAI-compatible endpoints (`compatible`, `ollama`, `vllm`) get a client that never follows
+  redirects, so an allowed endpoint cannot send requests to an address outside the allowlist.
+- A-07: on a server, deleting a tenant's Python environment never removes its container image (operators prune unused
+  images); on the desktop an image is removed only when no other environment uses it.
+- D-14: `engine.PLACEHOLDER` and `memory_spaces.SPACE_PATTERN` are public; the private names remain as aliases.
+- Tests: `test_worker_tool_changes.py` is skipped without a Docker daemon, except in CI or with
+  `NODESTRO_REQUIRE_DOCKER=1`.
+- AD-01: a provider failure during a run has its own code: `run.provider_auth` (401/403), `run.provider_unreachable`,
+  `run.provider_rate_limited` (429) or `run.provider_overloaded` (503/529), with `params.provider` and `params.status`.
+  Other provider errors stay `run.api_error`.
+- AD-10: a graceful stop ends running runs as interrupted (`run.interrupted`, `params.cause = "shutdown"`) and they
+  can be continued; it no longer looks like a cancellation by a person. After a crash the step that was running is
+  marked interrupted instead of staying "waiting", and the resume plan says `resume.was_interrupted`.
+- X-02: a step keeps its start time when it continues after an approval, and each orchestrator team result names its
+  child run (`outcomes[].ref`).
+- AD-03: runs carry `warnings` (`{code, node_id, tool, count}`) for tool calls that were rejected, expired, refused or
+  failed.
+
 Security fixes from the independent MCP re-review (R-1, R-2, two test gaps):
 
 - R-1: a per-call approval now also covers the tool's classification (`access`, `reach`). Reclassifying a tool in

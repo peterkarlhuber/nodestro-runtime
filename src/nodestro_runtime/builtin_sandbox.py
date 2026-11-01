@@ -11,7 +11,8 @@ that confines itself before it reads any tool code (:mod:`nodestro_runtime.sandb
   display server), no ``ptrace``, no System V IPC, no signals, priority, affinity or limit changes aimed at another
   process, no namespaces, mounts, keyrings, BPF, ``io_uring`` and other kernel interfaces.
 - **Resource limits**: address space, CPU time, file size, open files, processes (also threads); the host adds a
-  wall-clock timeout and a limit for the total size of ``tmp``, and kills the process on cancel or timeout.
+  wall-clock timeout and a limit for the total size of ``tmp``, and kills the process on timeout or when the run
+  of the call is cancelled (:mod:`nodestro_runtime.sandbox_cancel`).
 - **An empty environment**: no API keys, tokens or other variables of the Nodestro process.
 
 It needs no user namespaces, so Ubuntu's AppArmor restriction of unprivileged user namespaces does not affect it,
@@ -41,10 +42,10 @@ import time
 from typing import ClassVar
 
 import orkexa
-from orkexa.dynamic import Sandbox
+from orkexa.dynamic import BoundedOutput, Sandbox, communicate_bounded, response_limit
 from orkexa.dynamic.errors import SandboxError
 
-from . import sandbox_confine
+from . import sandbox_cancel, sandbox_confine
 
 #: Linux distributions (``ID`` and ``VERSION_ID`` of ``/etc/os-release``) on which every security and
 #: compatibility test of the built-in sandbox passed on x86-64, with the distribution's own kernel and AppArmor.
@@ -158,7 +159,9 @@ class LinuxSandbox(Sandbox):
     # --- runs ----------------------------------------------------------------------------------------------------
 
     def cancel(self) -> None:
-        """Kill every call this sandbox is running."""
+        """Kill every call this sandbox is running, of every run that uses it.
+
+        Cancelling one run stops only that run's call (:mod:`nodestro_runtime.sandbox_cancel`)."""
         with self._lock:
             for process in self._processes:
                 _kill(process)
@@ -200,11 +203,15 @@ class LinuxSandbox(Sandbox):
             raise SandboxError(f"Cannot start the sandbox interpreter {self.python}: {exc}") from exc
         with self._lock:
             self._processes.add(process)
-        result: dict[str, bytes] = {}
+        result: dict[str, BoundedOutput] = {}
+        max_stdout = response_limit(self.max_output_chars)
 
         def communicate() -> None:
-            out, err = process.communicate(request.encode("utf-8"))
-            result["out"], result["err"] = out, err
+            # Bounded: the confined code can write to the inherited stdout directly, and the child's memory
+            # limit does not cover what this (host) process buffers.
+            result["output"] = communicate_bounded(
+                process, request.encode("utf-8"), max_stdout=max_stdout, on_overflow=lambda: _kill(process)
+            )
 
         reader = threading.Thread(target=communicate, daemon=True)
         reader.start()
@@ -216,7 +223,10 @@ class LinuxSandbox(Sandbox):
                 reader.join(0.05)
                 if not reader.is_alive():
                     break
-                if time.monotonic() > deadline:
+                if sandbox_cancel.requested():
+                    # Only this call: the sandbox is shared with other runs (see :mod:`.sandbox_cancel`).
+                    problem = "The run was cancelled; the call was stopped"
+                elif time.monotonic() > deadline:
                     problem = f"Timed out after {self.timeout:g} seconds"
                 else:
                     size, entries = _usage(tmp)
@@ -233,9 +243,12 @@ class LinuxSandbox(Sandbox):
             with self._lock:
                 self._processes.discard(process)
             probe.unlink(missing_ok=True)
+        output = result.get("output")
+        if not problem and output is not None and output.overflow:
+            problem = f"The sandbox wrote more than {max_stdout} bytes of output; the run was stopped"
         if problem:
             raise SandboxError(problem)
-        out, err = result.get("out", b""), result.get("err", b"")
+        out, err = (output.stdout, output.stderr) if output is not None else (b"", b"")
         stderr = err.decode("utf-8", "replace")
         if process.returncode == sandbox_confine.EXIT_UNAVAILABLE and sandbox_confine.MARKER in stderr:
             detail = stderr.split(sandbox_confine.MARKER, 1)[1].strip().splitlines()[0]

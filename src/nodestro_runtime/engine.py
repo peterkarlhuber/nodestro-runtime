@@ -25,16 +25,21 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
+import contextvars
 from dataclasses import dataclass, field
 from decimal import Decimal
+import functools
 import json
 import logging
+import os
 import re
 import threading
 import time
 from typing import Any, Literal, TypeVar
+import uuid
 
 from orkexa import (
+    AuthenticationError,
     CheckpointError,
     ContentBlock,
     Criterion,
@@ -42,7 +47,9 @@ from orkexa import (
     Evaluator,
     MemoryBackend,
     OrkexaError,
+    ProviderConnectionError,
     ProviderError,
+    RateLimitError,
     Tool,
     ToolCall,
     ToolCallSuspended,
@@ -58,7 +65,7 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, tool_checkpoints, tool_policy
+from . import contracts, flow_driver, graph, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -95,6 +102,7 @@ from .schemas import (
     RunEvent,
     RunIn,
     RunTrigger,
+    RunWarning,
     ToolCallApproval,
     ToolCallRecord,
     Usage,
@@ -120,7 +128,9 @@ from .tool_approvals import (
 
 logger = logging.getLogger(__name__)
 
-_PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+#: A ``{{ name }}`` placeholder in a prompt template (group 1: the name); the HTTP API finds them with it too.
+PLACEHOLDER = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_PLACEHOLDER = PLACEHOLDER  # the name before it was public
 #: Events of a live run kept for late subscribers; beyond it ``text`` and ``thinking`` deltas are
 #: no longer kept (they are still published, and the node state holds the whole text).
 _MAX_EVENT_HISTORY = 5000
@@ -131,8 +141,53 @@ _EVENT_SEQ = "run_event_seq"
 _MAX_SUBSCRIBER_BACKLOG = 10_000
 #: How long :meth:`RunManager.shutdown` waits for runs to stop by themselves.
 _SHUTDOWN_GRACE_SECONDS = 5.0
+#: Threads that execute the agents and orchestrator decisions of one :class:`RunManager`'s runs, including agents
+#: that wait in their thread for a tool approval (C-08). Configurable with :data:`RUN_THREADS_ENV`. The pool is
+#: separate from asyncio's default executor, so busy or waiting agents never delay the application's other
+#: background work (backups, uploads, a worker's lease renewal); an agent beyond the limit waits for a thread.
+DEFAULT_RUN_THREADS = 32
+RUN_THREADS_ENV = "NODESTRO_RUN_THREADS"
+#: How often a conditional write of a stored run is tried again after another process wrote the run meanwhile.
+_CAS_ATTEMPTS = 5
 
 T = TypeVar("T")
+
+
+def run_threads(environ: Mapping[str, str] | None = None) -> int:
+    """The size of a run manager's agent thread pool: ``NODESTRO_RUN_THREADS`` (at least 1), else the default."""
+    value = (os.environ if environ is None else environ).get(RUN_THREADS_ENV, "").strip()
+    if not value:
+        return DEFAULT_RUN_THREADS
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning("Ignoring %s=%r: not a whole number; using %s", RUN_THREADS_ENV, value, DEFAULT_RUN_THREADS)
+        return DEFAULT_RUN_THREADS
+
+
+class _FencedRun(Run):
+    """A run document as stored, with its write fence (C-02, C-06): a random token that every conditional write of
+    the run compares (compare-and-set) and replaces. Internal to the engine: the API's :class:`Run` ignores it, and a
+    plain ``put`` of a run leaves it out (the next conditional write then compares the status instead)."""
+
+    fence: str | None = None
+
+
+def _split(stored: _FencedRun) -> tuple[Run, str | None]:
+    """A stored run as a plain :class:`Run`, and its fence."""
+    values = dict(stored)
+    fence = values.pop("fence", None)
+    return Run.model_construct(**values), fence
+
+
+def _fenced(run: Run, fence: str) -> _FencedRun:
+    values = dict(run)
+    values["fence"] = fence
+    return _FencedRun.model_construct(**values)
+
+
+def _new_fence() -> str:
+    return uuid.uuid4().hex
 
 
 class RunCancelled(Exception):
@@ -763,9 +818,21 @@ class _RunContext:
         self.flow_stop: flow.Stop | None = None
         #: Set when the run's time limit was reached and its running nodes were cancelled.
         self.timed_out = False
+        #: Set (root context) when the process stops gracefully (SIGTERM, quitting the app): the run ends as
+        #: interrupted, not as cancelled by a person (AD-10).
+        self.shutting_down = False
         self.fingerprints: dict[str, str] = {}
         #: The event loop the run executes on (events from worker threads are handed to it).
         self.loop: asyncio.AbstractEventLoop | None = root.loop if root is not None else None
+        #: Queue execution (a worker's claimed run, C-06): the fence of the stored run as this execution last wrote
+        #: it. Every write of the run is a compare-and-set on it, so a worker whose run was taken from it (its lease
+        #: expired and the reaper marked the run interrupted) never overwrites the run. ``None`` on the root
+        #: context: the runs are written without a condition (the desktop).
+        self.fence: str | None = None
+        #: Set (root context) when this execution lost its run (a fence did not match, or the worker lost its lease):
+        #: nothing of it is stored or announced any more, and it is cancelled.
+        self.fenced_out = False
+        self.fence_lock = threading.Lock()
 
     def check(self) -> None:
         if self.cancelled.is_set():
@@ -845,6 +912,13 @@ class RunManager:
         self.remote_poll = 0.25
         #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
         self.tool_gate: ToolGate | None = None
+        #: How many agents (and orchestrator decisions) of this manager's runs execute at the same time, each in a
+        #: thread of the manager's own pool (C-08; :data:`RUN_THREADS_ENV`). Read when the pool is first used.
+        self.run_threads = run_threads()
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
+        #: Runs whose execution in this process lost its fence (C-06), until :meth:`lost_fence` is asked.
+        self._fence_lost: set[str] = set()
         self._followers: dict[int, asyncio.Task[None]] = {}
         self._contexts: dict[str, _RunContext] = {}
         self._events: dict[str, list[RunEvent]] = {}
@@ -1007,7 +1081,7 @@ class RunManager:
                     found.append((snapshot, version))
         return found
 
-    def _launch(self, run: Run, *, local: bool = False) -> Run:
+    def _launch(self, run: Run, *, local: bool = False, fence: str | None = None) -> Run:
         if self.dispatch is not None and not local:
             # Queue execution: the run is stored and a worker executes it (ADR-0004). A paused run whose decision
             # was recorded is queued again, so everybody waiting for it sees that it goes on. Several processes can
@@ -1030,10 +1104,11 @@ class RunManager:
         budget = _remaining(limit, run)
         context = _RunContext(run, self.tracker(budget), self.environment(run))
         context.loop = loop
+        context.fence = fence
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
         self._subscribers.setdefault(run.id, [])
-        self.store.put("runs", run.id, run)
+        self._save(context)
         self._loop = loop
         self._tasks[run.id] = loop.create_task(self._execute(context), name=f"run-{run.id}")
         return run
@@ -1064,33 +1139,85 @@ class RunManager:
             return elsewhere
         if run_id in self._contexts:
             raise NodestroError("run.not_executable", "This run is already executing here", status="running")
-        run = self.store.get("runs", run_id, Run)
-        if run is None:
+        stored = self.store.get("runs", run_id, _FencedRun)
+        if stored is None:
             raise KeyError(run_id)
+        run, fence = _split(stored)
         if run.status not in ("queued", "paused"):
             raise NodestroError("run.not_executable", "Only a queued or paused run can be executed", status=run.status)
-        return self._launch(run, local=True)
+        # The run becomes this execution's (C-06): from now on only a write that still finds this fence stores it.
+        claimed = self._replace_run(run, fence=fence, status=run.status)
+        if claimed is None:
+            raise NodestroError("run.not_executable", "This run changed while it was claimed", status=run.status)
+        return self._launch(run, local=True, fence=claimed)
 
     def interrupt(self, run_id: str) -> bool:
-        """Mark a run that stopped executing elsewhere (its worker died) as interrupted; it can be continued.
+        """Mark a run that stopped executing elsewhere (its worker died, or nothing executes it) as interrupted; it
+        can be continued. Its queued or running sub-workflow runs are interrupted with it.
 
-        Returns ``False`` for a run that is not queued or running (nothing to do)."""
-        run = self.store.get("runs", run_id, Run)
-        if run is None or run.status not in ("queued", "running") or run.id in self._contexts:
-            return False
-        _interrupt(run)
-        self.store.put("runs", run.id, run)
-        self._expire_approvals(run.id)
-        self._notify(run)
-        return True
+        Returns ``False`` for a run that is not queued or running (nothing to do). The write is conditional (C-06): a
+        worker that still executes the run cannot overwrite it afterwards, and a run that went on meanwhile (a
+        decision, another process) is not marked."""
+        for _attempt in range(_CAS_ATTEMPTS):
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None or stored.status not in ("queued", "running") or run_id in self._contexts:
+                return False
+            run, fence = _split(stored)
+            status = run.status
+            _interrupt(run)
+            if self._replace_run(run, fence=fence, status=status) is None:
+                continue  # written meanwhile: look again
+            self._expire_approvals(run.id)
+            for child_id in _child_ids(run):
+                with suppress(Exception):
+                    self.interrupt(child_id)
+            self._notify(run)
+            return True
+        logger.warning("Run %s changed during every attempt to mark it interrupted", run_id)
+        return False
 
     def cancel_unclaimed(self, run_id: str) -> bool:
         """Cancel a stored run that no worker executes (its queued job was withdrawn); ``False`` otherwise."""
-        run = self.store.get("runs", run_id, Run)
-        if run is None or run.status not in ("queued", "paused") or run.id in self._contexts:
+        if run_id in self._contexts:
             return False
-        self._cancel_stored(run)
+        return self._cancel_stored(run_id, ("queued", "paused"))
+
+    def lost_fence(self, run_id: str) -> bool:
+        """Whether the last execution of ``run_id`` in this process lost the run (C-06); asking forgets it."""
+        if run_id in self._fence_lost:
+            self._fence_lost.discard(run_id)
+            return True
+        return False
+
+    def abandon(self, run_id: str, *, because: str) -> bool:
+        """Stop executing a run that is no longer this process's (its worker lost the lease, C-06): nothing more of
+        the execution is stored or announced, and it is cancelled. ``False`` when it does not execute here."""
+        context = self._contexts.get(run_id)
+        if context is None:
+            return False
+        self._lose_fence(context.root, because)
         return True
+
+    def _replace_run(self, run: Run, *, fence: str | None, status: str) -> str | None:
+        """Store ``run`` in place of the stored run it was read from only if nobody wrote that one since: a
+        compare-and-set on the fence read with it, or (a run stored without one: the desktop, earlier versions) on
+        the status read with it. Returns the run's new fence, ``None`` when another write came first."""
+        new = _new_fence()
+        stored = _fenced(run, new)
+        if fence is not None:
+            done = self.store.replace_if("runs", run.id, stored, field="fence", expected=fence)
+        else:
+            done = self.store.replace_if("runs", run.id, stored, field="status", expected=status)
+        return new if done else None
+
+    def _lose_fence(self, root: _RunContext, because: str) -> None:
+        with root.fence_lock:
+            if root.fenced_out:
+                return
+            root.fenced_out = True
+        self._fence_lost.add(root.run.id)
+        logger.error("Run %s is no longer executed here (%s); it stops without storing", root.run.id, because)
+        root.cancelled.set()
 
     def root_of(self, run: Run) -> Run:
         """The top run of a sub-workflow's run (the run itself otherwise)."""
@@ -1113,9 +1240,16 @@ class RunManager:
         elsewhere = self._on_loop(lambda: self.decide(run_id, node_id, decision, comment, decided_by=decided_by))
         if elsewhere is not None:
             return elsewhere
-        run = self.get(run_id)
-        if run is None:
-            raise KeyError(run_id)
+        context = self._contexts.get(run_id)
+        fence: str | None = None
+        if context is not None:
+            run = context.run
+        else:
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None:
+                raise KeyError(run_id)
+            run, fence = _split(stored)
+        read_status = run.status
         node = next((item for item in run.workflow.nodes if item.id == node_id), None)
         if node is None or node.type != "approval":
             raise KeyError(node_id)
@@ -1128,15 +1262,20 @@ class RunManager:
         text = comment.strip()[:4000] if config.allow_comment else ""
         if decision == REJECTED and config.require_comment_on_reject and not text:
             raise NodestroError("approval.comment_required", "Please give a reason for the rejection")
-        if self._contexts.get(self.root_of(run).id) is None:
+        top = self.root_of(run)
+        if self._contexts.get(top.id) is None:
             # The run continues on an event loop: refuse before anything is recorded.
             _require_loop()
+            if top.status != "paused":
+                # Only a paused run continues: refused before anything is recorded (not after, C-02).
+                raise NodestroError("run.not_paused", "Only a paused run can continue", status=top.status)
         state.approval = ApprovalRecord(decision=decision, comment=text, decided_by=decided_by)  # type: ignore[arg-type]
-        context = self._contexts.get(run_id)
         if context is not None:
             self._emit(context, "approval_decided", node_id, decision=decision, comment=text, decided_by=decided_by)
-        else:
-            self.store.put("runs", run.id, run)
+        elif self._replace_run(run, fence=fence, status=read_status) is None:
+            # Another process (a second reviewer, a retried request) recorded a decision first (C-02): a
+            # compare-and-set lets exactly one decision win, and this one is refused before anything is queued.
+            raise NodestroError("approval.not_pending", "This approval was decided meanwhile")
         root = self.root_of(run)
         self.resume(root.id)
         return self.get(root.id) or root
@@ -1165,34 +1304,50 @@ class RunManager:
             and self.remote_cancel(stored)
         ):
             return True
-        if stored.status == "paused":
-            self._cancel_stored(stored)
-            return True
-        return False
+        # Paused, or stored as queued or running while nothing executes it (C-11: restored from a backup, imported,
+        # a queue entry that never arrived): it ends here as cancelled.
+        return self._cancel_stored(root.id, ("queued", "running", "paused"))
 
-    def _cancel_stored(self, run: Run) -> None:
-        """Cancel a paused or queued run that is not executing (its pending approvals end undecided)."""
-        for node in run.workflow.nodes:
-            state = run.nodes.get(node.id)
-            if state is None:
+    def _cancel_stored(self, run_id: str, statuses: tuple[str, ...] = ("paused",)) -> bool:
+        """Cancel a stored run in one of ``statuses`` that is not executing (its pending approvals end undecided,
+        nodes stored as running end cancelled); ``False`` when it is in none of them. The write is conditional: a
+        run another process changed meanwhile is looked at again."""
+        for _attempt in range(_CAS_ATTEMPTS):
+            stored = self.store.get("runs", run_id, _FencedRun)
+            if stored is None or stored.status not in statuses:
+                return False
+            run, fence = _split(stored)
+            status = run.status
+            children: list[str] = []
+            for node in run.workflow.nodes:
+                state = run.nodes.get(node.id)
+                if state is None:
+                    continue
+                if state.status == "running":
+                    state.status = "cancelled"
+                    state.finished_at = now()
+                    _fail(state, problem("run.node_cancelled", "Cancelled"))
+                    children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
+                if state.status == "awaiting_approval":
+                    state.status = "cancelled"
+                    state.finished_at = now()
+                    _fail(state, problem("run.node_cancelled", "Cancelled"))
+                    children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
+                    if state.orchestration is not None:
+                        state.orchestration = _cancelled_orchestration(state.orchestration)
+            run.status = "cancelled"
+            run.finished_at = now()
+            _fail(run, problem("run.cancelled", "The run was cancelled"))
+            if self._replace_run(run, fence=fence, status=status) is None:
                 continue
-            if state.status == "awaiting_approval":
-                state.status = "cancelled"
-                state.finished_at = now()
-                _fail(state, problem("run.node_cancelled", "Cancelled"))
-                for child_id in [state.child_run_id, *state.child_run_ids]:
-                    child = self.store.get("runs", child_id, Run) if child_id else None
-                    if child is not None and child.status == "paused":
-                        self._cancel_stored(child)
-                if state.orchestration is not None:
-                    state.orchestration = _cancelled_orchestration(state.orchestration)
-        run.status = "cancelled"
-        run.finished_at = now()
-        _fail(run, problem("run.cancelled", "The run was cancelled"))
-        self.store.put("runs", run.id, run)
-        self.discard_tool_waits(run.id, because="cancelled")
-        self._forget_events(run.id)
-        self._notify(run)
+            for child_id in children:
+                self._cancel_stored(child_id, statuses)
+            self.discard_tool_waits(run.id, because="cancelled")
+            self._forget_events(run.id)
+            self._notify(run)
+            return True
+        logger.warning("Run %s changed during every attempt to cancel it", run_id)
+        return False
 
     # ---- runs paused at a tool call (M6b) ------------------------------------------------------------------------
 
@@ -1201,6 +1356,10 @@ class RunManager:
         deleted, so nothing it waited for can run later."""
         ToolApprovals(self.store).close_checkpointed(run_id, because=because)
         tool_checkpoints.delete_run(self.store, run_id)
+        if self.store.get_raw("runs", run_id) is None:
+            # Only for a deleted run: the notes of started calls are what lets continuing a failed or cancelled
+            # run ask before it calls tools again (:mod:`nodestro_runtime.tool_journal`).
+            tool_journal.delete_run(self.store, run_id)
 
     def decide_tool_call(
         self,
@@ -1313,12 +1472,18 @@ class RunManager:
         are left alone.
         """
         count = 0
+        # A damaged run document is left out by ``find`` (and logged); one run that cannot be marked never stops the
+        # start (C-10).
         for run in self.store.find("runs", "status", ("queued", "running"), Run):
             if run.imported_at is not None or run.id in self._contexts:
                 continue
-            _interrupt(run)
-            self.store.put("runs", run.id, run)
-            self._expire_approvals(run.id)
+            try:
+                _interrupt(run)
+                self.store.put("runs", run.id, run)
+                self._expire_approvals(run.id)
+            except Exception:
+                logger.exception("Marking run %s as interrupted failed; it stays as stored", run.id)
+                continue
             count += 1
         return count
 
@@ -1417,15 +1582,19 @@ class RunManager:
         Paused runs are not affected: they wait in the database for their approval.
         """
         for context in list(self._contexts.values()):
+            context.root.shutting_down = context.shutting_down = True
             context.cancelled.set()
         tasks = [task for task in self._tasks.values() if not task.done()]
-        if not tasks:
-            return
-        _done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.wait(pending)
+        if tasks:
+            _done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending)
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            # Agents that did not stop yet end with their next model response or tool call.
+            executor.shutdown(wait=False)
 
     # ---- events --------------------------------------------------------------------
 
@@ -1436,8 +1605,9 @@ class RunManager:
             if state is not None and state.iteration:
                 data.setdefault("iteration", list(state.iteration))
         loop = context.root.loop or self._loop
-        if loop is None:
-            # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens.
+        if loop is None or context.root.fenced_out:
+            # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens. Or the run is no
+            # longer this process's (C-06): its stream belongs to whoever has it now.
             return
         if _in_loop(loop):
             self._publish(context.run.id, kind, node_id, data)
@@ -1483,7 +1653,30 @@ class RunManager:
     def _save(self, context: _RunContext) -> None:
         with context.lock:
             snapshot = context.run.model_copy(deep=True)
-        self.store.put("runs", snapshot.id, snapshot)
+        root = context.root
+        if root.fence is None:
+            self.store.put("runs", snapshot.id, snapshot)
+            return
+        # Queue execution (C-06): the run (and each sub-workflow run) is stored only while it is still this
+        # execution's: a compare-and-set on the fence this execution wrote last.
+        with root.fence_lock:
+            if root.fenced_out:
+                return
+            expected = context.fence
+            if expected is None and context is not root:
+                # A sub-workflow run's first write in this execution compares the fence it is stored with.
+                current = self.store.get("runs", snapshot.id, _FencedRun)
+                expected = current.fence if current is not None else None
+            fence = _new_fence()
+            if expected is None:
+                # A new sub-workflow run (or one stored without a fence): nothing to compare yet.
+                self.store.put("runs", snapshot.id, _fenced(snapshot, fence))
+                context.fence = fence
+                return
+            if self.store.replace_if("runs", snapshot.id, _fenced(snapshot, fence), field="fence", expected=expected):
+                context.fence = fence
+                return
+        self._lose_fence(root, "the stored run was changed by another process")
 
     # ---- execution -----------------------------------------------------------------
 
@@ -1520,7 +1713,10 @@ class RunManager:
         except asyncio.CancelledError:
             # The task itself was cancelled (shutdown): the run must not stay "running" in the database.
             context.cancelled.set()
-            _abandon(run)
+            if context.root.shutting_down:
+                _interrupt(run, shutdown=True)
+            else:
+                _abandon(run)
             raise
         except Exception as exc:
             logger.exception("Run %s failed", run.id)
@@ -1541,29 +1737,53 @@ class RunManager:
             if not paused:
                 run.finished_at = now()
             self._save(context)
-            if not paused and self.after_run is not None:
-                try:
-                    self.after_run(run)
-                except Exception:  # result files are extra; the run's result stays valid
-                    logger.exception("Writing the result files of run %s failed", run.id)
-            self._notify(run)
-            self._emit(
-                context,
-                "run_paused" if paused else "run_finished",
-                status=run.status,
-                error=run.error,
-                error_code=run.error_code,
-                error_params=run.error_params,
-                output=run.output,
-                usage=run.usage.model_dump(mode="json"),
-            )
-            if paused:
-                # Its numbering continues when it resumes, also after a restart; its history is not needed.
+            if context.root.fenced_out:
+                # The run is no longer this process's (C-06): its end is not stored, announced or delivered here.
                 self._events.pop(run.id, None)
-                if run.id in self._seq:
-                    self.store.put_raw(_EVENT_SEQ, run.id, self._seq[run.id])
+                self._seq.pop(run.id, None)
+                self._subscribers.pop(run.id, None)
             else:
-                self._forget_events(run.id)
+                self._finished(context, paused)
+
+    def _finished(self, context: _RunContext, paused: bool) -> None:
+        """What follows a stored end (or pause) of an execution: result files, listeners, the last event."""
+        run = context.run
+        if not paused and self.after_run is not None:
+            try:
+                self.after_run(run)
+            except Exception:  # result files are extra; the run's result stays valid
+                logger.exception("Writing the result files of run %s failed", run.id)
+        self._notify(run)
+        self._emit(
+            context,
+            "run_paused" if paused else "run_finished",
+            status=run.status,
+            error=run.error,
+            error_code=run.error_code,
+            error_params=run.error_params,
+            output=run.output,
+            usage=run.usage.model_dump(mode="json"),
+        )
+        if paused:
+            # Its numbering continues when it resumes, also after a restart; its history is not needed.
+            self._events.pop(run.id, None)
+            if run.id in self._seq:
+                self.store.put_raw(_EVENT_SEQ, run.id, self._seq[run.id])
+        else:
+            self._forget_events(run.id)
+
+    async def _in_run_thread(self, call: Callable[..., T], /, *args: Any) -> T:
+        """``asyncio.to_thread`` on this manager's own agent pool (C-08; see :attr:`run_threads`)."""
+        executor = self._executor
+        if executor is None:
+            with self._executor_lock:
+                executor = self._executor
+                if executor is None:
+                    executor = self._executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, self.run_threads), thread_name_prefix="nodestro-run"
+                    )
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(executor, functools.partial(context.run, call, *args))
 
     def _forget_events(self, run_id: str) -> None:
         """Drop the event history of a run that finished: streams only replay events of live runs."""
@@ -1609,6 +1829,8 @@ class RunManager:
             run.status = "failed"
             steps = run.workflow.limits.max_steps
             _fail(run, problem("run.step_limit", f"The run reached its limit of {steps} steps", max_steps=steps))
+        elif context.cancelled.is_set() and context.root.shutting_down:
+            _interrupt(run, shutdown=True)
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
@@ -1626,6 +1848,7 @@ class RunManager:
         else:
             run.status = "succeeded"
         run.output = self._run_output(run)
+        run.warnings = run_warnings(run)
 
     async def _run_graph(self, context: _RunContext) -> None:
         """Execute the nodes the ``orkexa.flow`` kernel dispatches until none is left to run.
@@ -1988,7 +2211,9 @@ class RunManager:
         run = context.run
         state = run.nodes[node.id]
         inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
-        state.started_at = now()
+        # A step that continues after a decision (paused at an approval) keeps when it began (X-02).
+        if state.status != "awaiting_approval" or state.started_at is None:
+            state.started_at = now()
         if node.type == "start":
             state.status = "succeeded"
             state.output = self._start_output(run)
@@ -2052,10 +2277,17 @@ class RunManager:
         )
         state.prompt = prompt
         self._emit(context, "node_started", node.id, prompt=prompt, model=config.model)
-        await asyncio.to_thread(
+        # Stored as running before the agent works (AD-10): after a crash the recovery finds the step that was
+        # running, instead of a step that looks as if it was never reached.
+        self._save(context)
+        await self._in_run_thread(
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
         )
         self._save(context)
+        if state.tool_calls and not context.root.fenced_out:
+            # The call records are stored with the node now; the notes written before each call are not needed.
+            # A run another process took over (C-06) was not stored here: its notes stay for that process.
+            tool_journal.clear_node(self.store, run.id, node.id)
 
     def _prompt_values(self, run: Run, *, mark_empty: bool = True) -> dict[str, Any]:
         """The run's form values as task placeholders show them (file names, empty fields marked)."""
@@ -2734,6 +2966,8 @@ class RunManager:
             max_team=min(config.max_team, len(pool.members)),
         )
         recorded: orchestration.OrchestrationState | None = None
+        #: The team run of each assignment started here, by (step, slot): the record's outcomes name it (X-02).
+        team_runs: dict[tuple[int, int], str] = {}
         if state.status == "awaiting_approval" and state.orchestration is not None:
             recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
             task = recorded.task
@@ -2758,7 +2992,7 @@ class RunManager:
             return add_usage(prior, current) if prior is not None else current
 
         async def decide(prompt: str) -> Any:
-            return await asyncio.to_thread(self._decide_sync, context, node, prompt)
+            return await self._in_run_thread(self._decide_sync, context, node, prompt)
 
         def start_child(item: orchestration.Delegation) -> Run:
             snapshot, version = teams[item.member.id]
@@ -2785,6 +3019,7 @@ class RunManager:
             )
             self.store.put("runs", child.id, child)
             state.child_run_ids.append(child.id)
+            team_runs[(item.step, item.slot)] = child.id
             self._emit(
                 context,
                 "orchestration_delegated",
@@ -2816,7 +3051,7 @@ class RunManager:
             return self._team_result(child, item.member, context)
 
         def on_step(current: orchestration.OrchestrationState) -> None:
-            state.orchestration = current.model_dump(mode="json")
+            state.orchestration = _with_team_runs(current.model_dump(mode="json"), team_runs)
             if current.paused:
                 assert current.pending is not None
                 self._emit(context, "orchestration_waiting", node.id, pending=current.pending.model_dump(mode="json"))
@@ -2992,13 +3227,18 @@ class RunManager:
             calls[call.id] = record
             denial = None
             bind_call(None)  # every call gets its own binding (or none) from the gate below
-            if gate is not None and not run_own_tool(config, call.name, extra_tools):
+            own = run_own_tool(config, call.name, extra_tools)
+            if gate is not None and not own:
                 if checkpointing and call.resumed:
                     denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
                 else:
                     denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
             elif call.resumed:
                 pass  # an own tool never waits, so it is never resumed
+            if denial is None and not own:
+                # Stored before the call runs: if the process dies now, the run still shows that this node may
+                # have had effects outside Nodestro, and continuing it asks first (audit B-02).
+                tool_journal.record(self.store, context.run.id, node_id, iteration, call.id, call.name, call.input)
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
             return denial
 
@@ -3048,6 +3288,8 @@ class RunManager:
                 _proposal_tool(state, config, lambda: self._emit(context, "knowledge_proposed", node_id))
             )
         suspended = False
+        # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
+        cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
             outcome = execute_agent(
                 context.env.builder,
@@ -3100,6 +3342,7 @@ class RunManager:
             state.status = "failed"
             _fail(state, node_problem(exc))
         finally:
+            sandbox_cancel.reset(cancel_token)
             if checkpointing and not suspended:
                 # The turn ended (or failed): what it waited for is over, nothing of it may run later.
                 if gate is not None and (resuming or checkpoint is not None):
@@ -3307,11 +3550,47 @@ def node_problem(exc: BaseException) -> Problem:
     if isinstance(exc, BudgetExceededError):
         return problem("run.budget_exceeded", text)
     if isinstance(exc, ProviderError):
-        return problem("run.api_error", text, status=exc.status_code or "", provider=exc.provider or "")
+        return provider_problem(exc, text)
     if isinstance(exc, OrkexaError):
         return problem(f"run.agent.{kind}", text, type=kind)
     found = library_problem(exc, code="run.failed")
     return found.model_copy(update={"message": text})
+
+
+# HTTP statuses that mean "the provider is temporarily out of capacity" (Anthropic 529, 503).
+_OVERLOADED_STATUSES = frozenset({503, 529})
+
+
+def provider_problem(exc: ProviderError, text: str) -> Problem:
+    """A provider failure as a code the UI can act on (AD-01).
+
+    Orkexa already sorts SDK exceptions into subclasses by HTTP status (``provider_error``):
+    ``AuthenticationError`` (401/403), ``ProviderConnectionError`` (connection, DNS, timeout),
+    ``RateLimitError`` (429) and ``ProviderServerError`` (5xx/529). The codes are:
+
+    - ``run.provider_auth``: the key is missing, wrong, expired or lacks permission.
+    - ``run.provider_unreachable``: no answer (offline, DNS, proxy, timeout).
+    - ``run.provider_rate_limited``: too many requests or tokens for the account.
+    - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
+      ``overloaded`` error inside a stream, which arrives without that status).
+    - ``run.api_error``: anything else (other 4xx/5xx), as before.
+
+    ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
+    provider answered (``run.api_error`` keeps ``""`` for an unknown status, as before).
+    """
+    provider = exc.provider or ""
+    status = exc.status_code
+    known: dict[str, Any] = {"provider": provider} if status is None else {"provider": provider, "status": status}
+    if isinstance(exc, AuthenticationError) or status in (401, 403):
+        return problem("run.provider_auth", text, **known)
+    if isinstance(exc, ProviderConnectionError):
+        return problem("run.provider_unreachable", text, **known)
+    if isinstance(exc, RateLimitError) or status == 429:
+        return problem("run.provider_rate_limited", text, **known)
+    client_error = status is not None and 400 <= status < 500
+    if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
+        return problem("run.provider_overloaded", text, **known)
+    return problem("run.api_error", text, status=status or "", provider=provider)
 
 
 def _fail(target: NodeRun | Run, found: Problem) -> None:
@@ -3325,16 +3604,82 @@ def _is_paused(run: Run) -> bool:
     return run.status == "paused"
 
 
-def _interrupt(run: Run) -> None:
-    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable."""
+def _child_ids(run: Run) -> list[str]:
+    """The sub-workflow runs of a run's nodes."""
+    return [child for state in run.nodes.values() for child in [state.child_run_id, *state.child_run_ids] if child]
+
+
+#: A tool's error text that starts with a problem code (``mcp.unreachable: Docs cannot be reached``).
+_CODED_TOOL_ERROR = re.compile(r"^(?P<code>[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+):")
+#: Approval verdicts that mean the call was not made.
+_REFUSED_CALLS = ("rejected", "expired", "denied")
+
+
+def run_warnings(run: Run) -> list[RunWarning]:
+    """The tool calls of a run's nodes that were refused, expired or failed, one warning per node, tool and code
+    (AD-03): a run can succeed although an agent had to answer without one of its tools."""
+    found: dict[tuple[str, str, str], RunWarning] = {}
+    for node in run.workflow.nodes:
+        state = run.nodes.get(node.id)
+        if state is None:
+            continue
+        for call in [item for earlier in state.earlier for item in earlier.tool_calls] + state.tool_calls:
+            approval = call.approval
+            if approval is not None and approval.status in _REFUSED_CALLS:
+                code = approval.code or f"tool.approval_{approval.status}"
+            elif call.is_error:
+                matched = _CODED_TOOL_ERROR.match(call.output or "")
+                code = matched.group("code") if matched else "tool.failed"
+            else:
+                continue
+            key = (node.id, call.name, code)
+            if key in found:
+                found[key].count += 1
+            else:
+                found[key] = RunWarning(code=code, node_id=node.id, tool=call.name)
+    return list(found.values())
+
+
+def _with_team_runs(record: dict[str, Any], team_runs: dict[tuple[int, int], str]) -> dict[str, Any]:
+    """An orchestration record whose outcomes name the team run that produced them (X-02).
+
+    Orkexa sets an outcome's ``ref`` only for an assignment that waited and continued; a team run that ended at once
+    is added here from the runs started for each (step, slot). Orkexa uses ``ref`` only to continue a waiting
+    outcome, so naming finished ones changes nothing in the orchestration."""
+    groups = [(step.get("index"), step.get("outcomes") or []) for step in record.get("steps") or []]
+    pending = record.get("pending")
+    if pending:
+        groups.append((pending.get("index"), pending.get("outcomes") or []))
+    for index, outcomes in groups:
+        for slot, outcome in enumerate(outcomes):
+            if outcome.get("ref") is None and (index, slot) in team_runs:
+                outcome["ref"] = team_runs[(index, slot)]
+    return record
+
+
+def _interrupt(run: Run, *, shutdown: bool = False) -> None:
+    """A run whose execution stopped with its process: failed with ``run.interrupted``, continuable (AD-10).
+
+    - A step that was running fails with ``run.interrupted`` (continuing the run runs it again).
+    - ``shutdown``: the process stopped gracefully and the steps were stopped as cancelled first; a started step
+      that was cancelled that way is interrupted too, one that never started is "not reached" (``waiting``) again,
+      as after a crash. ``params.cause`` is ``shutdown`` (a crash or lost worker has no cause).
+    """
+    params = {"cause": "shutdown"} if shutdown else {}
     for state in run.nodes.values():
-        if state.status == "running":
+        stopped = shutdown and state.status == "cancelled" and state.error_code in (None, "run.node_cancelled")
+        if stopped and state.started_at is None:
+            state.status = "waiting"
+            state.finished_at = None
+            state.error = state.error_code = None
+            state.error_params = {}
+        elif state.status == "running" or stopped:
             state.status = "failed"
-            state.finished_at = now()
-            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran"))
+            state.finished_at = state.finished_at or now()
+            _fail(state, problem("run.interrupted", "Nodestro stopped while this ran", **params))
     run.status = "failed"
     run.finished_at = now()
-    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran"))
+    _fail(run, problem("run.interrupted", "Nodestro stopped while this ran", **params))
 
 
 def _abandon(run: Run) -> None:
