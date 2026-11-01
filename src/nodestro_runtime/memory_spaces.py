@@ -18,7 +18,9 @@ from pydantic import BaseModel
 from .problems import NodestroError
 from .sqlite_tables import clear_memory, memory_totals
 
-_SPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}")
+#: A valid memory space name (the HTTP API checks names with it too).
+SPACE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}")
+_SPACE = SPACE_PATTERN  # the name before it was public
 _PREFIX = "nodestro:"
 
 
