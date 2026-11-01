@@ -410,7 +410,7 @@ class UvRunner:
         environment.update({"UV_CACHE_DIR": str(self.cache_dir), "NO_COLOR": "1", "UV_NO_PROGRESS": "1"})
         return environment
 
-    def _run(self, args: list[str], log: Callable[[str], None], *, timeout: float = 900) -> str:
+    def _run(self, args: list[str], log: Callable[[str], None], *, timeout: float = 900, cwd: str | None = None) -> str:
         if self.binary is None:
             raise UvError("uv is not available")
         log("$ uv " + " ".join(args))
@@ -422,6 +422,7 @@ class UvRunner:
                 env=self._environment(),
                 timeout=timeout,
                 check=False,
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired as exc:
             raise UvError(f"uv did not finish within {timeout:g} seconds") from exc
@@ -458,13 +459,15 @@ class UvRunner:
             source.write_text("\n".join(requirements) + "\n", encoding="utf-8")
             if previous:
                 output.write_text(previous, encoding="utf-8")
+            # Relative names (uv runs in the directory): the lock's ``# via -r requirements.in`` is the same in every
+            # process, so the same requirements give the same lock and the same container image (S-2 pilot F5).
             self._run(
                 [
                     "pip",
                     "compile",
-                    str(source),
+                    source.name,
                     "-o",
-                    str(output),
+                    output.name,
                     "--universal",
                     "--python-version",
                     python,
@@ -475,6 +478,7 @@ class UvRunner:
                     *([] if builds else ["--no-build"]),
                 ],
                 log,
+                cwd=directory,
             )
             return output.read_text(encoding="utf-8")
 
