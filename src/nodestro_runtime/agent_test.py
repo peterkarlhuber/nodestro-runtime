@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from orkexa import EphemeralMemory, MemoryBackend, ToolCall
 from orkexa.dynamic import BudgetTracker, Sandbox
+from orkexa.memory import MEMORY_TOOL_NAME
 from pydantic import BaseModel, Field
 
 from . import tool_policy
@@ -117,8 +118,11 @@ class AgentTester:
     def _gate(
         self, gate: ToolGate | None, config: AgentConfig, call: ToolCall, record: ToolCallRecord, test_id: str
     ) -> str | None:
-        """The per-call rules for one call of a test: ``None`` runs it, a string denies it (never waits)."""
-        if gate is None:
+        """The per-call rules for one call of a test: ``None`` runs it, a string denies it (never waits).
+
+        Like a run, the agent's own memory tool is not asked about: in a test it writes only to an ephemeral copy
+        (:meth:`_memory`). The test passes no other run-own tools (``extra_tools``)."""
+        if gate is None or call.name == MEMORY_TOOL_NAME:
             return None
         capability, version, kind, _definition = tool_facts(self.builder.tools, call.name)
         situation = gate.call_context(run_id=test_id, node_id="agent-test", trigger="manual", trigger_ref=None)
