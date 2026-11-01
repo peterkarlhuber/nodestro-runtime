@@ -18,7 +18,7 @@ import pytest
 
 from nodestro_runtime import run_chat
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.run_chat import RunChat, RunMessage, answer_question, guidance_block
+from nodestro_runtime.run_chat import RunChat, RunMessage, answer_question, guidance_block, targets_of
 from nodestro_runtime.run_views import approvals_of_tree
 from nodestro_runtime.schemas import NodeRun, Run, RunIn, Workflow, WorkflowIn
 from nodestro_runtime.testing import ScriptedClient, parsed, text
@@ -168,6 +168,9 @@ async def test_questions_and_instructions_while_parallel_teams_work(make: Make) 
     live = workspace.runs.get(started.id)
     assert live is not None and live.status == "running"
     assert live.nodes["lead"].orchestration is None or not live.nodes["lead"].orchestration.get("steps")
+    (target,) = targets_of(workspace.runs.get, live)
+    assert target.decisions == 0 and target.deciding  # the first decision is made; its teams work
+    assert sorted((item.name, item.step) for item in target.teams) == [("Legal", 0), ("Research", 0)]
     entries = [entry for entry in workspace.usage_log.entries() if entry.source == "run_chat"]
     assert len(entries) == 1 and entries[0].ref == started.id and entries[0].request == question.id
     assert workspace.runs.chat.get(started.id, question.id).status == "answered"  # type: ignore[union-attr]

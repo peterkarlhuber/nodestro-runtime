@@ -249,11 +249,14 @@ class ChatTarget(BaseModel):
     node_id: str
     label: str
     workflow_name: str
-    #: Workflow names from the top-level run down to the run of this orchestrator.
+    #: Workflow names from the top-level run down to, and including, the run of this orchestrator.
     path: list[str] = Field(default_factory=list)
     depth: int = 0
     status: str
+    #: Decisions recorded so far (a decision whose teams still work is not recorded yet; see ``deciding``).
     decisions: int = 0
+    #: Whether a decision was made and its teams work now (it is decision number ``decisions + 1``).
+    deciding: bool = False
     max_decisions: int = 0
     #: Whether it takes instructions now; ``steering_code`` says why not.
     steering: bool = False
@@ -691,6 +694,8 @@ def _team_activities(get_run: Callable[[str], Run | None], run: Run, node: Node,
     for slot, outcome in enumerate(pending.get("outcomes") or []):
         if isinstance(outcome, dict) and outcome.get("ref"):
             places[str(outcome["ref"])] = (int(pending.get("index", 0)), slot)
+    # The teams of a decision in progress are not in the record yet: they belong to the next step.
+    deciding = len(record.get("steps") or []) if state.current_decision is not None else -1
     found = []
     for child_id in state.child_run_ids:
         child = get_run(child_id)
@@ -703,7 +708,7 @@ def _team_activities(get_run: Callable[[str], Run | None], run: Run, node: Node,
             and child.nodes.get(item.id) is not None
             and child.nodes[item.id].status in ("running", "awaiting_approval")
         ]
-        step, slot = places.get(child.id, (-1, -1))
+        step, slot = places.get(child.id, (deciding, -1))
         found.append(
             TeamActivity(
                 child_run_id=child.id,
@@ -742,6 +747,7 @@ def targets_of(get_run: Callable[[str], Run | None], root: Run) -> list[ChatTarg
                     depth=depth,
                     status=state.status if state is not None else "waiting",
                     decisions=len(record.get("steps") or []),
+                    deciding=state is not None and state.current_decision is not None and state.status == "running",
                     max_decisions=node.orchestrator.max_decisions,
                     steering=refusal is None,
                     steering_code=refusal,
