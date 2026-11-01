@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -316,6 +317,82 @@ class _LinkedProvenance:
         """Nothing to forget: the records belong to the source library."""
 
 
+_Fingerprint = tuple[tuple[str, str, int, int, int, int], ...]
+
+
+def _fingerprint(path: Path | None) -> _Fingerprint:
+    """A cheap identity of the registry files under ``path``: name, inode, change times and size of each.
+
+    Records are replaced atomically (a new file, so a new inode), so any save, approval or revocation by another
+    process changes it."""
+    if path is None:
+        return ()
+    entries = []
+    try:
+        files = list(path.glob("*/v*.json"))
+    except OSError:
+        files = []
+    for file in files:
+        try:
+            stat = file.stat()
+        except OSError:
+            continue
+        entries.append((file.parent.name, file.name, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size))
+    return tuple(sorted(entries))
+
+
+def _stored_current(path: Path, name: str) -> tuple[int, str] | None:
+    """Version and code of the latest approved, intact version of ``name`` as stored now, read past every cache;
+    ``None`` when there is none (deleted or never stored)."""
+    best: tuple[int, str] | None = None
+    try:
+        files = list((path / name).glob("v*.json"))
+    except OSError:
+        return None
+    for file in files:
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("name") != name or data.get("status") != "approved":
+            continue
+        code, version = data.get("code"), data.get("version")
+        if not isinstance(code, str) or not isinstance(version, int) or data.get("kind") != "generated":
+            continue
+        if data.get("sha256") != hashlib.sha256(code.encode("utf-8")).hexdigest():
+            continue
+        if best is None or version > best[0]:
+            best = (version, code)
+    return best
+
+
+class PinnedTool(SandboxedTool):
+    """A stored tool bound to the version it was built from (F1).
+
+    Agents get their tools when a step starts and keep them for the whole step. Before every call this checks, past
+    every cache, that this version is still the current approved one, so a tool that another process changed or
+    deleted in the meantime never runs in its old form: the call is refused and the step can be started again. The
+    per-call rules (S-2) decide on the current version, so an approval or advance approval never makes a different
+    version run."""
+
+    def __init__(self, *, version: int, path: Path, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.version = version
+        self.path = path
+
+    def current(self) -> bool:
+        stored = _stored_current(self.path, str(self.name))
+        return stored is not None and stored == (self.version, self.code)
+
+    def execute(self, payload: dict[str, Any]) -> str:
+        if not self.current():
+            raise ToolExecutionError(
+                f"{self.name}: the tool was changed or deleted after this step started (version {self.version}), "
+                "so this call was not made; start the run again to use the current version"
+            )
+        return super().execute(payload)
+
+
 class ToolLibrary:
     """All tools agents can use, plus the jobs that generate new ones."""
 
@@ -341,32 +418,54 @@ class ToolLibrary:
             protected = (str(Path(path).resolve().parent),) if path is not None else ()
         self.protected = protected
         self.provenance: ToolProvenance = provenance or MemoryProvenance()
-        self.registry = ToolRegistry(path, sandbox=sandbox or make_sandbox("subprocess", self.policy))
+        self._lock = threading.RLock()
         self.builtin: dict[str, Tool] = {}
         for tool in (*BUILTIN_TOOLS, *extra_tools):
             assert tool.name is not None
-            self.registry.register_trusted(tool)
             self.builtin[tool.name] = tool
+        self._seen: _Fingerprint = ()
+        self._registry = self._load(
+            Path(path) if path is not None else None, sandbox or make_sandbox("subprocess", self.policy)
+        )
         self.jobs: dict[str, ToolJob] = {}
         #: Python dependencies of generated tools; ``None`` allows the standard library only.
         self.dependencies: DependencyGate | None = None
         self._decisions: dict[str, _Decision] = {}
-        self._lock = threading.RLock()
         #: Code that is untrusted but not stored as a tool, e.g. pending tool drafts (set by the workspace).
         self.untrusted_sources: Callable[[], Iterable[str]] = lambda: ()
         #: Tools of connected MCP servers (:mod:`nodestro_runtime.mcp`); ``None`` when MCP is not set up.
         self.mcp: McpService | None = None
+
+    def _load(self, path: Path | None, sandbox: Sandbox) -> ToolRegistry:
+        seen = _fingerprint(path)
+        registry = ToolRegistry(path, sandbox=sandbox)
+        for tool in self.builtin.values():
+            registry.register_trusted(tool)
+        self._seen = seen
+        return registry
+
+    @property
+    def registry(self) -> ToolRegistry:
+        """The tool registry, read again from disk whenever another process changed its files (F1).
+
+        Several processes (the API and every worker of a server) share one tool directory; without this a process
+        would keep using the tools it read at its start until it restarts."""
+        registry = self._registry
+        if registry.path is not None and _fingerprint(registry.path) != self._seen:
+            with self._lock:
+                if self._registry is registry:
+                    self._registry = self._load(registry.path, registry.sandbox)
+                registry = self._registry
+        return registry
 
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
 
     def reload(self, sandbox: Sandbox | None = None) -> None:
         """Read the tools again from disk, e.g. after a backup was restored."""
-        registry = ToolRegistry(self.registry.path, sandbox=sandbox or self.registry.sandbox)
-        for tool in self.builtin.values():
-            registry.register_trusted(tool)
         with self._lock:
-            self.registry = registry
+            current = self._registry
+            self._registry = self._load(current.path, sandbox or current.sandbox)
 
     # ---- catalog -----------------------------------------------------------------
 
@@ -546,25 +645,29 @@ class ToolLibrary:
             if self.mcp is None:
                 raise KeyError(name)
             return self.mcp.agent_tool(name, cancelled=cancelled)
+        registry = self.registry
         try:
-            tool = self.registry.get_tool(name)
+            tool = registry.get_tool(name)
+            record = registry.record(name)
         except RegistryError:
             raise KeyError(name) from None
-        if isinstance(tool, SandboxedTool):
-            routed = self._require(self.trust(name), sandbox or self.registry.sandbox, name)
-            sandbox = routed if routed is not self.registry.sandbox else sandbox
-        if sandbox is not None and isinstance(tool, SandboxedTool):
-            assert tool.input_schema is not None and tool.name is not None and tool.description is not None
-            return SandboxedTool(
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.input_schema,
-                output_schema=tool.output_schema,
-                code=tool.code,
-                function_name=tool.function_name,
-                sandbox=sandbox,
-            )
-        return tool
+        if not isinstance(tool, SandboxedTool):
+            return tool
+        routed = self._require(self.trust(name), sandbox or registry.sandbox, name)
+        sandbox = routed if routed is not registry.sandbox else sandbox
+        assert tool.input_schema is not None and tool.name is not None and tool.description is not None
+        made: dict[str, Any] = dict(
+            name=tool.name,
+            description=tool.description,
+            input_schema=tool.input_schema,
+            output_schema=tool.output_schema,
+            code=tool.code,
+            function_name=tool.function_name,
+            sandbox=sandbox or tool.sandbox,
+        )
+        if registry.path is None:
+            return SandboxedTool(**made) if sandbox is not None else tool
+        return PinnedTool(version=record.version, path=registry.path, **made)
 
     def catalog(self) -> list[dict[str, str]]:
         return self.registry.catalog()
@@ -656,7 +759,8 @@ class ToolLibrary:
             )
             return result, None
         with self._lock:
-            record = self.registry.add_generated(
+            registry = self.registry
+            record = registry.add_generated(
                 name=result.name,
                 function_name=function_name,
                 description=result.description,
@@ -670,8 +774,8 @@ class ToolLibrary:
                 self.provenance.record_authored(record.name, record.version)
             for older in existing:
                 if older.status == "approved":
-                    self.registry.set_status(older.name, older.version, "revoked")
-            self.registry.approve(record.name, record.version)
+                    registry.set_status(older.name, older.version, "revoked")
+            registry.approve(record.name, record.version)
         return result, self._info(record.name)
 
     def delete(self, name: str) -> None:
