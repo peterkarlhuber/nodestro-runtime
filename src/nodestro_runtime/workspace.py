@@ -73,6 +73,7 @@ from .providers import (
     check_capabilities,
     check_endpoint_allowed,
     check_model,
+    endpoint_client,
     env_key,
     provider_of,
     provider_status,
