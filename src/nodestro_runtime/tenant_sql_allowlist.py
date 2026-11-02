@@ -113,6 +113,13 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ),
     (
         "nodestro_runtime/axentra_platform.py",
+        "SELECT tenant_id, collection, id, coalesce(raw, data::text) FROM nodestro_documents WHERE collection = ANY(%s) AND (strpos(data::text, %s) > 0 OR strpos(data::text, %s) > 0) ORDER BY tenant_id, collection, id",
+    ): (
+        "start check (secret_key_problems, SR-04): decrypts up to five stored secrets per key, each under its own "
+        "tenant_id, to prove the configured key bytes; returns problems with locations only, never values"
+    ),
+    (
+        "nodestro_runtime/axentra_platform.py",
         "SELECT count(*) FROM nodestro_documents d JOIN nodestro_tenants t ON t.id = d.tenant_id LEFT JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.nodestro_id = d.tenant_id WHERE d.collection = 'usage_log' AND coalesce((d.data -> 'usage' ->> 'requests')::bigint, 0) > 0 AND (d.data ->> 'at')::timestamptz >= now() - make_interval(days => %(days)s) AND NOT EXISTS (SELECT 1 FROM axentra_usage_events e WHERE e.product_id = %(product)s AND e.tenant_id = l.axentra_id AND e.idempotency_key = 'nodestro:usage:' || d.id || ':nodestro.ai.requests')",
     ): ("operator usage reconcile: counts usage-log entries of every tenant missing in Axentra; counts only"),
     (

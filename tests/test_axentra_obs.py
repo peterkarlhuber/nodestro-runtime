@@ -375,6 +375,43 @@ def test_stored_secret_formats_and_the_rollback_checks(database: Any) -> None:
     assert caught.value.code == "profile.invalid"
 
 
+def test_the_start_refuses_a_key_with_other_bytes_under_a_known_key_id(database: Any) -> None:
+    """SR-04: the start compared key ids only; new bytes under the old id "k1" started without an error and made every
+    axs1 value unreadable. Now a few stored values per key are decrypted, so the key bytes are compared."""
+    legacy = SecretBox(b"L" * 32)
+    ring, _keys = _ring("k1")
+    _seed_secrets(database, _keyring_box(ring, legacy))
+    database.store("beta").put_raw(
+        "pricing_billing", "openai", {"admin_key": legacy.encrypt("beta", "pricing.billing.openai.admin_key", "a")}
+    )
+    config = AxentraConfig(enabled=True, keyring=ring)
+    axentra_platform.require_readable_secrets(database, config, _keyring_box(ring, legacy))  # the right keys
+    assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy)) == []
+
+    impostor, _ = _ring("k1")  # same key id, other bytes
+    assert impostor.split(":", 1)[0] == "k1" and impostor != ring
+    impostor_config = AxentraConfig(enabled=True, keyring=impostor)
+    assert secrets_rollback_problems(impostor_config, stored_secret_formats(database)) == []  # ids alone: passes
+    with pytest.raises(NodestroError) as caught:
+        axentra_platform.require_readable_secrets(database, impostor_config, _keyring_box(impostor, legacy))
+    (problem,) = caught.value.params["problems"]
+    assert (problem["field"], problem["value"]) == ("NODESTRO_AXENTRA_KEYRING", "k1")
+    assert "alpha/" in problem["reason"] and impostor.split(":", 1)[1] not in str(caught.value.params)
+    assert "sk-1" not in str(caught.value.params)
+
+    # Another v1 key (NODESTRO_SECRET_KEY changed) is refused the same way, with Axentra on or off.
+    other_legacy = SecretBox(b"M" * 32)
+    (v1,) = axentra_platform.secret_key_problems(database, _keyring_box(ring, other_legacy))
+    assert (v1["field"], v1["value"]) == ("NODESTRO_SECRET_KEY", "v1") and "beta/pricing_billing/openai" in v1["reason"]
+    (v1_off,) = axentra_platform.secret_key_problems(database, other_legacy)
+    assert v1_off["field"] == "NODESTRO_SECRET_KEY"
+
+    # One damaged value does not stop the start while another value proves the key.
+    store = database.store("alpha")
+    store.put_raw("mcp_servers", "srv0", {"id": "srv0", "token_sealed": "axs1.k1.AAAA.BBBB"})
+    assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy)) == []
+
+
 def test_reencrypting_with_v1_moves_axs1_values_back_so_axentra_can_be_switched_off(database: Any) -> None:
     legacy = SecretBox(b"L" * 32)
     ring, _ = _ring("k1")
