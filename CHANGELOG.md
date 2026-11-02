@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+The resolve path on a real Docker engine (RT-038; 2026-11-02):
+
+- `tests/test_resolve_real_engine.py` runs `ContainerImages.compile_in_container` against a real daemon
+  (`NODESTRO_DOCKER_TESTS=1`; a new step of the CI `docker` job): the self-test with the resolve limits before any
+  resolve container, the refusal paths (unproven daemon, shape and limits mismatch), digest pinning and run by image
+  id, the effective limits from `docker container inspect` and from inside the container, wheel-only resolution,
+  `deps.source_build_disabled` before any docker call off the desktop, timeout, cancel, cleanup and proxy credentials.
+- Fix: the resolve container is checked against the shape its sandbox's self-test ran (the sandbox's limits), not
+  against `_RESOLVE_LIMITS` directly, so a sandbox that proved other limits starts nothing (`sandbox.shape_mismatch`).
+- Automatic mode's refusal detail says "start Docker" only when Docker is missing or unreachable; a running Docker
+  that failed a check is told so instead.
+- Fix: the resolve container's `/tmp` is really executable. Docker mounts a tmpfs `noexec` unless its options say
+  `exec`, so dropping `noexec` had no effect; the `exec_tmp` allowance now replaces `noexec` with `exec` in
+  `_resolve_args` and in `check_shape`. `/work` stays `noexec`.
+- Orkexa pin `0861c1b2b79209c388a5e996035e5676a96f6d75` (orkexa #38): the self-test reports the container's own
+  environment (`/proc/self/environ`), so the coerced `LC_CTYPE` of uv's resolver image (no `LANG`) no longer refuses
+  every daemon. Only that file changed since `dec66eb` (plus CI and docs in #37).
+
 Axentra pin: `f3ed8d22a8bd45faff84204786e01da32ece4034` (axentra #28, #27: secret-free OIDC `return_to`, `POST`
 OIDC start, encoded-token redaction; 2026-11-02).
 
