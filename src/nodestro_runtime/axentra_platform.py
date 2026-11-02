@@ -881,7 +881,8 @@ class AxentraEvents:
         outcome: str,
         details: dict[str, Any],
     ) -> None:
-        self.link.services.platform.audit.record(
+        audit_log: Any = self.link.services.platform.audit  # typed loosely: Axentra is optional (3.10)
+        audit_log.record(
             tx,
             None,
             action,
@@ -889,7 +890,7 @@ class AxentraEvents:
             target_id=target_id,
             product_id=self.link.services.product_id,
             tenant_id=ax_tenant,
-            outcome=outcome,  # type: ignore[arg-type]
+            outcome=outcome,
             details=details,
             actor_override=self._actor(actor),
         )
