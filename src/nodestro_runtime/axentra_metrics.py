@@ -203,7 +203,7 @@ class ServerMetrics:
         return found
 
     @contextmanager
-    def _connection(self) -> Iterator[Any]:
+    def _bounded_transaction(self) -> Iterator[Any]:
         with self.database._transaction() as connection:
             connection.execute(f"SET LOCAL statement_timeout = {int(QUERY_TIMEOUT_MS)}")
             yield connection
@@ -213,7 +213,7 @@ class ServerMetrics:
         from .storage_postgres import POSTGRES_SCHEMA_VERSION
 
         snapshot: dict[str, Any] = {}
-        with self._connection() as connection:
+        with self._bounded_transaction() as connection:
             snapshot["jobs"] = connection.execute(
                 "SELECT kind, status, count(*) FROM nodestro_jobs GROUP BY kind, status"
             ).fetchall()
