@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 5 |
+| P2 Medium | 6 |
 | P3 Low | 21 |
 | P4 Optional | 6 |
 
@@ -71,13 +71,42 @@ None known.
   `ContainerImages.compile_in_container`
 - **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
   for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
-  bind mounts, proxy variables only, no capabilities, `nobody`, read-only with a tmpfs, input on stdin, lock on
-  stdout). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
+  bind mounts, proxy variables only and without credentials, no capabilities, `nobody`, read-only with a tmpfs,
+  limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-035). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
   (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
   (which refuses containers with network and foreign images). Studio has no text for the `reason` parameter yet.
 - **Next step:** Add a real-Docker test of the resolve
   container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
+
+### RT-035 · Containers that run package code: hardened shape, residual network risk of the resolver
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** security review DS-1, DS-5, DS-7, DS-9 (2026-11-02),
+  `ContainerImages.missing_modules`, `ContainerImages.compile_in_container`, `container_images.bounded_run`,
+  `container_images.default_base`
+- **What (done 2026-11-02):** The module check after an image build (`missing_modules`) runs package code (`.pth`
+  files run at interpreter start, even with `-I`), so it now runs exactly like a tool call: Orkexa's `run_args`
+  shape with the installation's owner and deadline labels, the image by its id, only after preflight and self-test
+  (`sandbox.unavailable` otherwise), bounded output, killed and removed after 120 s or on cancel (`deps.image_failed`).
+  The resolve container for source builds (`compile_in_container`) pulls uv's image by digest, checks the digest, runs
+  it by id with `--pull never` after the same preflight and self-test, with the owner and deadline labels (the reaper
+  removes orphans), private IPC, ulimits (nofile, fsize 1 GiB, core 0), no logging, bounded output and stop/removal on
+  timeout or cancel; proxy URLs reach it without user name or password (`strip_credentials`). Every docker CLI call of
+  `ContainerImages` reads at most 16 MiB of stdout and the last 256 KiB of stderr (`bounded_run`; more kills the CLI).
+  A Python version without a pinned base image is refused (`deps.python_unsupported`) instead of building on the
+  unpinned `python:<v>-slim` tag.
+- **Residual risk:** The resolve container still has network (Docker's default bridge, or
+  `NODESTRO_DOCKER_BUILD_NETWORK`) while untrusted build scripts run in it: they can reach the package index, the
+  internet, hosts on the LAN, ports the host publishes on the bridge and, on cloud VMs, the instance metadata service.
+  A pre-download on the host with `--network none` for the build is not feasible as is: the dependencies of a package
+  that has only a source distribution are known only after its build script ran, so resolving and building cannot be
+  separated in one step. A proxy that needs credentials no longer works for the resolver (credentials are not passed
+  into code that can read them). `/tmp` in the resolve container is executable (compilers and build tools run there).
+  The resolver is used only for plans a person explicitly accepted (library dialog), never for generated tools.
+- **Next step:** Offer an egress-filtered build network (only the package index or the proxy reachable; metadata and
+  RFC 1918 ranges blocked) and make it the default where it can be created; or resolve iteratively (download the
+  hashed sdists on the host side, build their metadata in a `--network none` container, repeat until closed). Add a
+  real-Docker test of `missing_modules` and the resolve container in the CI `docker` job.
 
 ### RT-033 · Docker-first sandbox status: follow-ups
 

@@ -20,6 +20,9 @@ system, no capabilities, ``nobody``, private IPC, memory/CPU/process/file limits
 id, code and Orkexa's runner on stdin, and only after the daemon passed Orkexa's preflight and in-container self-test.
 If Docker or the image is missing, or the daemon does not prove the sandbox's limits, the call fails; there is never a
 fallback to a host subprocess.
+The module check after a build (:meth:`ContainerImages.missing_modules`) runs package code, so it runs the same way.
+Every docker CLI call reads bounded output (:func:`bounded_run`), and an image is only built on a base image pinned by
+digest (:data:`BASE_IMAGES`; other Python versions are refused).
 
 Proxies and an extra certificate authority for the download stage come from the host: ``HTTP(S)_PROXY`` /
 ``NO_PROXY`` are passed as build arguments, and the file in ``NODESTRO_BUILD_CA_FILE`` (or ``SSL_CERT_FILE``) is
@@ -38,6 +41,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -47,16 +51,20 @@ import tempfile
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-from orkexa.dynamic import DockerSandbox, SandboxError, SandboxProbe
+from orkexa.dynamic import BoundedOutput, DockerSandbox, SandboxError, SandboxProbe, communicate_bounded, run_bounded
 from orkexa.dynamic.docker import (
     BOOTSTRAP,
+    DEADLINE_LABEL,
+    OWNER_LABEL,
     ContainerLimits,
     copy_runner,
     run_args,
     runner_files,
     runner_fingerprint,
+    stop_container,
 )
 from orkexa.providers.base import redact
 
@@ -136,9 +144,110 @@ _RESOLVE = (
 )
 
 
+#: Seconds the module check of a built image (:meth:`ContainerImages.missing_modules`) may take.
+_VERIFY_TIMEOUT = 120.0
+#: Most bytes of stdout the host reads from the module check and from the resolve container (the lock); more stops
+#: the container.
+_VERIFY_STDOUT = 1024 * 1024
+_RESOLVE_STDOUT = 8 * 1024 * 1024
+#: Seconds a resolve container may outlive its timeout before the reaper removes it (its deadline label).
+_RESOLVE_GRACE = 60.0
+#: Most bytes of stdout the host keeps from one docker CLI call (:func:`bounded_run`; more kills the CLI) and how
+#: much of the end of its stderr it keeps.
+MAX_CLI_STDOUT = 16 * 1024 * 1024
+MAX_CLI_STDERR = 256 * 1024
+
+
 def default_base(python_version: str) -> str:
-    """The pinned base image of a Python version (:data:`BASE_IMAGES`); other versions fall back to the plain tag."""
-    return BASE_IMAGES.get(python_version, f"python:{python_version}-slim")
+    """The pinned base image of a Python version (:data:`BASE_IMAGES`).
+
+    A version without a pinned base image is refused (``deps.python_unsupported``): an image is never built on an
+    unpinned tag such as ``python:<version>-slim``, whose content the upstream registry can change at any time."""
+    base = BASE_IMAGES.get(python_version)
+    if base is None:
+        raise NodestroError(
+            "deps.python_unsupported",
+            f"There is no pinned base image for Python {python_version} (supported: {', '.join(BASE_IMAGES)}); "
+            "environment images are only built on base images pinned by digest",
+            version=python_version,
+        )
+    return base
+
+
+class OutputLimitExceeded(subprocess.SubprocessError):
+    """A docker CLI call wrote more than :data:`MAX_CLI_STDOUT` bytes to stdout; it was killed."""
+
+
+def bounded_run(
+    args: list[str],
+    *,
+    timeout: float | None = None,
+    env: Mapping[str, str] | None = None,
+    input: str | None = None,
+    max_stdout: int | None = None,
+    max_stderr: int | None = None,
+    **_ignored: Any,
+) -> subprocess.CompletedProcess[str]:
+    """:func:`subprocess.run` for the docker CLI (``capture_output=True, text=True``) that never holds more than
+    ``max_stdout`` bytes of stdout and the last ``max_stderr`` bytes of stderr (defaults: :data:`MAX_CLI_STDOUT`,
+    :data:`MAX_CLI_STDERR`).
+
+    More stdout kills the process and raises :class:`OutputLimitExceeded`; a timeout kills it and raises
+    :class:`subprocess.TimeoutExpired`. A daemon, a gateway or a build that floods its output therefore cannot exhaust
+    the memory of the API or worker process."""
+    process = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(env) if env is not None else None,
+    )
+    data = (input or "").encode("utf-8")
+    max_stdout = MAX_CLI_STDOUT if max_stdout is None else max_stdout
+    max_stderr = MAX_CLI_STDERR if max_stderr is None else max_stderr
+    result: dict[str, BoundedOutput] = {}
+
+    def communicate() -> None:
+        result["output"] = communicate_bounded(process, data, max_stdout=max_stdout, max_stderr=max_stderr)
+
+    reader = threading.Thread(target=communicate, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():
+        with contextlib.suppress(OSError):
+            process.kill()
+        reader.join(10)
+        with contextlib.suppress(subprocess.SubprocessError):
+            process.wait(10)
+        raise subprocess.TimeoutExpired(args, timeout or 0.0)
+    process.wait()
+    output = result["output"]
+    if output.overflow:
+        raise OutputLimitExceeded(
+            f"{Path(args[0]).name} {args[1] if len(args) > 1 else ''} wrote more than "
+            f"{max_stdout} bytes of output and was stopped"
+        )
+    return subprocess.CompletedProcess(
+        args,
+        process.returncode if process.returncode is not None else -1,
+        output.stdout.decode("utf-8", "replace"),
+        output.stderr.decode("utf-8", "replace"),
+    )
+
+
+def strip_credentials(url: str) -> str:
+    """``url`` without a user name and password (``http://user:secret@proxy:3128`` -> ``http://proxy:3128``).
+
+    Values that are not URLs (``NO_PROXY`` lists) are returned unchanged."""
+    if "@" not in url:
+        return url
+    if "://" not in url:  # proxy:3128 written without a scheme
+        return url.rsplit("@", 1)[1]
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""  # not a URL Nodestro can clean: rather no proxy than a leaked password
+    return urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[-1]))
 
 
 _DOCKERFILE = """\
@@ -197,16 +306,21 @@ class ContainerImages:
         docker: str = "docker",
         base: Callable[[str], str] = default_base,
         environ: Mapping[str, str] | None = None,
-        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        run: Callable[..., subprocess.CompletedProcess[str]] = bounded_run,
         usage_file: Path | None = None,
         keep: Callable[[], Iterable[str]] | None = None,
         collect: bool = True,
         owner: str = OWNER,
+        sandbox_class: type[StreamedSandbox] | None = None,
     ) -> None:
         """``usage_file`` keeps when each image was last used (for :meth:`gc`); ``keep`` names images that are
         never collected (those of installed environments); ``collect=False`` turns the collection after a build
         off (a server, whose daemon serves every tenant). ``owner`` labels the sandbox containers of
-        :meth:`sandbox` (an installation's own, :func:`~nodestro_runtime.docker_status.installation_owner`)."""
+        :meth:`sandbox` (an installation's own, :func:`~nodestro_runtime.docker_status.installation_owner`).
+
+        ``run`` runs one docker CLI call (default :func:`bounded_run`: bounded output); ``sandbox_class`` makes the
+        sandboxes of :meth:`sandbox`, :meth:`missing_modules` and :meth:`compile_in_container` (tests pass a
+        stand-in)."""
         self.docker = docker
         self.owner = owner
         self.base = base
@@ -215,13 +329,20 @@ class ContainerImages:
         self.usage_file = usage_file
         self.keep = keep
         self.collect = collect
+        self.sandbox_class = sandbox_class or StreamedSandbox
         self._usage_lock = threading.Lock()
         self._noted: dict[str, float] = {}
 
     # ---- names --------------------------------------------------------------------------------
 
     def tag(self, lock: str, python_version: str) -> str:
-        key = _sha(json.dumps([_sha(lock), python_version, self.base(python_version), orkexa_fingerprint()]))
+        try:
+            base = self.base(python_version)
+        except NodestroError:
+            # No pinned base: the tag only names an image that is never built (build() refuses), so lookups such as
+            # "is it installed?" answer no instead of failing.
+            base = f"unpinned:{python_version}"
+        key = _sha(json.dumps([_sha(lock), python_version, base, orkexa_fingerprint()]))
         return f"{IMAGE_REPOSITORY}:{key[:32]}"
 
     # ---- docker -------------------------------------------------------------------------------
@@ -251,6 +372,8 @@ class ContainerImages:
             )
         except subprocess.TimeoutExpired as exc:
             raise NodestroError("deps.image_failed", f"docker {args[0]} timed out") from exc
+        except OutputLimitExceeded as exc:
+            raise NodestroError("deps.image_failed", f"docker {args[0]} stopped: {exc}") from exc
         except OSError as exc:
             raise NodestroError("sandbox.unavailable", f"Cannot start docker: {exc}") from exc
         output = (completed.stdout or "") + (completed.stderr or "")
@@ -299,6 +422,13 @@ class ContainerImages:
                 "This environment was approved before container images existed; approve it again to use it in the "
                 "Docker sandbox",
             )
+        base = self.base(python_version)  # deps.python_unsupported: never an unpinned base
+        if not _PINNED.fullmatch(base):
+            raise NodestroError(
+                "deps.python_unsupported",
+                f"The base image {base} is not pinned by digest; environment images are only built on pinned ones",
+                version=python_version,
+            )
         tag = self.tag(lock, python_version)
         if self.lock_of(tag) == _sha(lock):
             self.note_use(tag)
@@ -313,7 +443,7 @@ class ContainerImages:
             copy_runner(context)  # context/orkexa/...: the runner, copied to /opt/orkexa/orkexa
             (context / "Dockerfile").write_text(
                 _DOCKERFILE.format(
-                    base=self.base(python_version),
+                    base=base,
                     label=LOCK_LABEL,
                     lock_sha=_sha(lock),
                     ca="COPY ca.pem /build/ca.pem\nENV PIP_CERT=/build/ca.pem\n" if ca is not None else "",
@@ -502,21 +632,53 @@ class ContainerImages:
         """Resolve ``requirements`` like :meth:`~nodestro_runtime.python_envs.UvRunner.compile`, but in a container,
         so the build scripts of packages without a wheel never run on the host. Returns the lock (with hashes).
 
-        The container has network (the only thing it is for: the package index), no bind mount, no host variable
-        but the proxy settings (passed by name, their values never on a command line), no capabilities, no new
-        privileges, user ``nobody``, a read-only root file system with a ``tmpfs`` ``/tmp``, memory/CPU/process
-        limits. The requirements, the previous lock and a certificate authority (``NODESTRO_BUILD_CA_FILE`` or
-        ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout. The image is uv's, pinned by digest
-        (:data:`UV_IMAGE`); an image that is not pinned by a real digest is refused (``deps.build_unavailable``).
+        The build scripts are untrusted code, so the container is as close to the sandbox's shape
+        (:func:`orkexa.dynamic.docker.run_args`) as a build allows: no bind mount, no capabilities, no new
+        privileges, user ``nobody``, a read-only root file system with a ``tmpfs`` ``/tmp`` (executable: compilers
+        and build tools run there), private IPC, memory (without swap), CPU, process, open-file, file-size and core
+        limits, no logging, never pulled (the image is pulled by its digest first and run by its id), and the labels
+        ``org.orkexa.sandbox=<owner>`` and ``org.orkexa.deadline``, so the reaper removes a container a crashed
+        process left behind. The host reads at most :data:`_RESOLVE_STDOUT` bytes of the lock and the end of
+        stderr; a timeout, too much output or a cancelled call kills and removes the container.
+
+        It is the only container with network: the resolver needs the package index, and a package's metadata is
+        only known after its build script ran. The network is Docker's default one (or
+        ``NODESTRO_DOCKER_BUILD_NETWORK``; an operator can point it at an egress-filtered network). No host variable
+        reaches it but the proxy settings, **without** a user name or password (:func:`strip_credentials`): the build
+        code could read them. The requirements, the previous lock and a certificate authority
+        (``NODESTRO_BUILD_CA_FILE`` or ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout.
+
+        It runs only after the daemon passed Orkexa's preflight and the in-container self-test for the resolver image
+        (``sandbox.unavailable`` otherwise). The image is uv's, pinned by digest (:data:`UV_IMAGE`); an image that is
+        not pinned by a real digest is refused (``deps.build_unavailable``).
 
         Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when Docker is
-        missing (``sandbox.unavailable``) or the image is not pinned."""
+        missing or not proven (``sandbox.unavailable``), the image is not pinned or cannot be pulled
+        (``deps.build_unavailable``) or the container was stopped (``deps.image_failed``)."""
         image = image or UV_IMAGE
         if image.endswith(_UV_IMAGE_PLACEHOLDER) or not _PINNED.fullmatch(image):
             raise NodestroError(
                 "deps.build_unavailable",
                 "Building packages from source in a container is not set up in this version (the resolver image is "
                 "not pinned), and Nodestro never runs build scripts on this computer",
+            )
+        environ = self._cli_environment()
+        image_id = self._pinned_image(image, log)
+        sandbox = self.sandbox_class(
+            image=image_id,
+            timeout=_RESOLVE_TIMEOUT,
+            memory_mb=2048,
+            cpus=2.0,
+            pids_limit=256,
+            docker=self.docker,
+            environ=environ,
+            owner=self.owner,
+        )
+        probe = sandbox.self_test()  # preflight and self-test on this daemon, for this image: or nothing runs
+        if not probe.available:
+            raise NodestroError(
+                "sandbox.unavailable",
+                f"The Docker sandbox is not proven on this daemon ({probe.reason}): {probe.detail}",
             )
         ca = self._certificate_authority()
         envelope = json.dumps(
@@ -527,58 +689,142 @@ class ContainerImages:
                 "ca": ca.read_text(encoding="utf-8", errors="replace") if ca is not None else "",
             }
         )
+        proxies: dict[str, str] = {}
+        for variable in _PROXY_VARIABLES:
+            value = environ.get(variable, "")
+            cleaned = strip_credentials(value)
+            if cleaned != value:
+                log(f"The credentials in {variable} are not passed to the resolver container (build code reads it)")
+            if cleaned:
+                proxies[variable] = cleaned
         name = f"nodestro-resolve-{uuid.uuid4().hex[:12]}"
-        environ = self._cli_environment()
-        proxies = [variable for variable in _PROXY_VARIABLES if environ.get(variable)]
-        # Network only for this step: Docker's default network, or the one image builds use.
-        network = self.environ.get("NODESTRO_DOCKER_BUILD_NETWORK")
         args = [
-            *("run", "--rm", "-i", "--pull", "missing", "--name", name),
-            *(("--network", network) if network else ()),
-            *("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534"),
-            *("--pids-limit", "256", "--memory", "2048m", "--memory-swap", "2048m", "--cpus", "2"),
-            *("--tmpfs", "/tmp:rw,nosuid,size=1024m,uid=65534,gid=65534,mode=0700"),
-            *(item for variable in proxies for item in ("--env", variable)),
-            image,
-            *("python", "-I", "-B", "-c", _RESOLVE, json.dumps(proxies)),
+            *self._resolve_args(name, image_id, proxies),
+            "python",
+            "-I",
+            "-B",
+            "-c",
+            _RESOLVE,
+            json.dumps(list(proxies)),
         ]
         log(f"$ uv pip compile (in a container of {image.split('@', 1)[0]})")
         try:
-            return self._docker(args, timeout=_RESOLVE_TIMEOUT, log=lambda line: log(redact(line)), stdin=envelope)
-        except _DockerFailed as exc:
-            if _daemon_unreachable(exc.output):
-                raise NodestroError("sandbox.unavailable", "Docker is not running") from None
-            raise ResolveError(redact(exc.output)) from None
-        except NodestroError:
-            # A timed-out docker client leaves its container running.
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                self._run(
-                    [self.docker, "rm", "-f", name],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                    env=environ,
-                )
-            raise
+            code, output = sandbox.run_container(args, name, envelope.encode("utf-8"), max_stdout=_RESOLVE_STDOUT)
+        except SandboxError as exc:  # timed out, too much output or cancelled: the container was removed
+            raise NodestroError("deps.image_failed", f"Resolving in a container stopped: {exc}") from None
+        stdout = output.stdout.decode("utf-8", "replace")
+        stderr = output.stderr.decode("utf-8", "replace")
+        for line in stderr.splitlines()[-200:]:
+            log(redact(line))
+        if code != 0:
+            explanation = (stderr + stdout).strip()[-2000:] or f"exit code {code}"
+            if _daemon_unreachable(explanation):
+                raise NodestroError("sandbox.unavailable", "Docker is not running")
+            raise ResolveError(redact(explanation))
+        return stdout
+
+    def _resolve_args(self, name: str, image_id: str, proxies: Mapping[str, str]) -> list[str]:
+        """``docker run`` up to the image for the resolve container (see :meth:`compile_in_container`)."""
+        network = self.environ.get("NODESTRO_DOCKER_BUILD_NETWORK")
+        deadline = math.ceil(time.time() + _RESOLVE_TIMEOUT + _RESOLVE_GRACE)
+        fsize = 1024 * 1024 * 1024
+        return [
+            self.docker,
+            *("run", "--rm", "-i", "--pull", "never", "--name", name),
+            *(("--network", network) if network else ()),
+            *("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534"),
+            *("--ipc", "private", "--shm-size", "64m"),
+            *("--ulimit", "nofile=4096:4096", "--ulimit", f"fsize={fsize}:{fsize}", "--ulimit", "core=0:0"),
+            *("--log-driver", "none"),
+            *("--pids-limit", "256", "--memory", "2048m", "--memory-swap", "2048m", "--cpus", "2"),
+            *("--tmpfs", "/tmp:rw,nosuid,nodev,size=1024m,uid=65534,gid=65534,mode=0700"),
+            *("--label", f"{OWNER_LABEL}={self.owner}", "--label", f"{DEADLINE_LABEL}={deadline}"),
+            *(item for variable, value in proxies.items() for item in ("--env", f"{variable}={value}")),
+            image_id,
+        ]
+
+    def _pinned_image(self, image: str, log: Callable[[str], None]) -> str:
+        """The id of the local image ``image`` (``repository[:tag]@sha256:<digest>``), pulled by its digest when it is
+        missing; refused unless the local image carries exactly that digest (``deps.build_unavailable``)."""
+        named, _, digest = image.partition("@")
+        repository = _repository(named)
+        reference = f"{repository}@{digest}"
+
+        def inspect() -> tuple[str, list[str]] | None:
+            try:
+                output = self._docker(["image", "inspect", "--format", "{{.Id}}|{{json .RepoDigests}}", reference])
+            except _DockerFailed as exc:
+                if _daemon_unreachable(exc.output):
+                    raise NodestroError("sandbox.unavailable", "Docker is not running") from None
+                return None
+            found_id, _, digests = output.strip().partition("|")
+            try:
+                listed: Any = json.loads(digests or "[]")
+            except ValueError:
+                listed = []
+            return found_id, [str(item) for item in listed] if isinstance(listed, list) else []
+
+        found = inspect()
+        if found is None:
+            log(f"$ docker pull {reference}")
+            try:
+                self._docker(["pull", reference], timeout=_RESOLVE_TIMEOUT)
+            except _DockerFailed as exc:
+                if _daemon_unreachable(exc.output):
+                    raise NodestroError("sandbox.unavailable", "Docker is not running") from None
+                raise NodestroError(
+                    "deps.build_unavailable", f"Cannot pull the resolver image {reference}: {exc.output[-500:]}"
+                ) from None
+            found = inspect()
+        image_id, digests = found if found is not None else ("", [])
+        pinned = any(
+            entry.partition("@")[2] == digest and _repository(entry.partition("@")[0]) == repository
+            for entry in digests
+        )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) or not pinned:
+            raise NodestroError(
+                "deps.build_unavailable", f"The local resolver image does not carry the digest {digest} of {repository}"
+            )
+        return image_id
 
     def missing_modules(self, tag: str, modules: Iterable[str]) -> list[str]:
-        """The modules that cannot be found in the image (checked without network, as ``nobody``)."""
+        """The modules that cannot be found in the image.
+
+        The check runs package code (a package's ``.pth`` files run when the interpreter starts, even with ``-I``),
+        so it runs exactly like a tool call: in the sandbox's container shape
+        (:func:`orkexa.dynamic.docker.run_args`: no network, read-only, no capabilities, ``nobody``, limits, the
+        owner and deadline labels), the image by its id, only after the daemon passed Orkexa's preflight and the
+        self-test for this image (``sandbox.unavailable`` otherwise), with bounded output, and stopped and removed
+        after :data:`_VERIFY_TIMEOUT` seconds (``deps.image_failed``)."""
         names = sorted({name for name in modules if name})
         script = (
             "import importlib.util, json, sys; "
             "print(json.dumps([n for n in json.loads(sys.argv[1]) if importlib.util.find_spec(n) is None]))"
         )
-        output = self._docker(
-            [
-                *("run", "--rm", "--pull", "never", "--network", "none", "--read-only", tag),
-                *("python", "-I", "-c", script, json.dumps(names)),
-            ],
-            timeout=120,
-        )
+        sandbox = self.sandbox(tag, timeout=_VERIFY_TIMEOUT)
         try:
-            found: Any = json.loads(output.strip().splitlines()[-1])
+            image_id = sandbox.ready_image()
+        except SandboxError as exc:
+            raise NodestroError("sandbox.unavailable", f"The image {tag} cannot be checked: {exc}") from None
+        name = f"nodestro-sandbox-verify-{uuid.uuid4().hex[:12]}"
+        command = ["python", "-I", "-B", "-c", script, json.dumps(names)]
+        try:
+            code, output = sandbox.run_container(
+                [*sandbox.shaped_run(name, image_id), *command], name, max_stdout=_VERIFY_STDOUT
+            )
+        except SandboxError as exc:
+            raise NodestroError("deps.image_failed", f"Checking the modules of {tag} stopped: {exc}") from None
+        stdout = output.stdout.decode("utf-8", "replace")
+        if code != 0:
+            stderr = output.stderr.decode("utf-8", "replace")
+            raise NodestroError(
+                "deps.image_failed", f"Checking the modules of {tag} failed (exit code {code}): {stderr[-500:]}"
+            )
+        try:
+            found: Any = json.loads(stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
+            return names
+        if not isinstance(found, list):
             return names
         return [str(item) for item in found]
 
@@ -589,7 +835,7 @@ class ContainerImages:
     def sandbox(self, tag: str, *, timeout: float = 60.0, memory_mb: int = 2048) -> StreamedSandbox:
         """A sandbox whose calls run in the image ``tag`` (Orkexa's container flags, no network, never pulled)."""
         self.note_use(tag)
-        return StreamedSandbox(
+        return self.sandbox_class(
             image=tag,
             timeout=timeout,
             memory_mb=memory_mb,
@@ -659,6 +905,43 @@ class StreamedSandbox(DockerSandbox):
         probe = super().self_test(image=image)
         docker_status.record_proof(self.docker, self.environ, probe)
         return probe
+
+    def ready_image(self) -> str:
+        """The id of this sandbox's image once the daemon passed the preflight and the self-test for it (the gate of
+        every tool call); raises :class:`SandboxError` otherwise."""
+        return self._require_ready()
+
+    def shaped_run(self, name: str, image_id: str) -> list[str]:
+        """``docker run`` up to the image for one container of this sandbox's shape
+        (:func:`orkexa.dynamic.docker.run_args` with this sandbox's limits and owner); the command follows."""
+        return run_args(self.docker, name, image_id, self.limits(), owner=self.owner)
+
+    def run_container(
+        self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int
+    ) -> tuple[int, BoundedOutput]:
+        """Run the docker command ``args`` (which starts the container ``name``) with ``data`` on stdin, as a tool call
+        runs (:func:`orkexa.dynamic.run_bounded`): at most ``max_stdout`` bytes of stdout and the end of stderr are
+        read, and a timeout (:attr:`timeout`), more output or a cancelled call (:meth:`cancel`,
+        :mod:`nodestro_runtime.sandbox_cancel`) kills the client and removes the container
+        (:func:`orkexa.dynamic.docker.stop_container`). Returns the exit code and the output; raises
+        :class:`SandboxError` when it was stopped or docker cannot be started."""
+
+        def remove() -> None:
+            stop_container(self.docker, name, env=self.environ)  # killing the client does not stop the container
+
+        try:
+            with self._call_scope() as stop:
+                return run_bounded(
+                    args,
+                    data,
+                    timeout=self.timeout,
+                    max_stdout=max_stdout,
+                    env=self.environ,
+                    on_abort=remove,
+                    stop=stop,
+                )
+        except OSError as exc:
+            raise SandboxError(f"Cannot start docker: {exc}") from exc
 
 
 class RuntimeImageSandbox(StreamedSandbox):
@@ -746,6 +1029,16 @@ _DAEMON_UNREACHABLE = (
 )
 
 
+def _repository(name: str) -> str:
+    """``docker.io/library/python:3.12-slim`` -> ``python``: an image name without its tag, as Docker lists it."""
+    head, _, last = name.rpartition("/")
+    name = (f"{head}/" if head else "") + last.split(":", 1)[0]
+    for prefix in ("docker.io/library/", "index.docker.io/library/", "docker.io/", "library/"):
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
 def _daemon_unreachable(output: str) -> bool:
     """Whether the docker client's ``output`` says it could not reach a daemon (old and new CLI wording)."""
     lowered = output.lower()
@@ -774,16 +1067,22 @@ __all__ = [
     "GC_MAX_IMAGES",
     "IMAGE_REPOSITORY",
     "LOCK_LABEL",
+    "MAX_CLI_STDERR",
+    "MAX_CLI_STDOUT",
     "MAX_IMAGE_GB",
     "MCP_OWNER",
     "OWNER",
     "UV_IMAGE",
     "ContainerImages",
     "LocalImageSandbox",
+    "OutputLimitExceeded",
     "ResolveError",
     "RuntimeImageSandbox",
     "StreamedSandbox",
+    "bounded_run",
+    "default_base",
     "lock_has_hashes",
     "orkexa_fingerprint",
     "sandbox_run_args",
+    "strip_credentials",
 ]

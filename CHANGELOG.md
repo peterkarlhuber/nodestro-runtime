@@ -23,6 +23,27 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+Security: containers that run package code (security review DS-1, DS-5, DS-7, DS-9; RT-035):
+
+- DS-1: the module check after an image build (`ContainerImages.missing_modules`) ran the image by tag with a plain
+  `docker run` (no limits, no labels, unbounded output; after 120 s only the CLI was killed and the container kept
+  running). Package `.pth` files run at interpreter start, so it now runs like a tool call: Orkexa's `run_args` shape
+  (no network, read-only, no capabilities, `nobody`, memory/CPU/process/file limits) with the owner and deadline
+  labels, the image by its id, only after preflight and self-test (`sandbox.unavailable` otherwise), bounded output,
+  and the container is killed and removed on timeout or cancel (`deps.image_failed`). A failing check is an error,
+  no longer read as "all modules missing". New `StreamedSandbox.ready_image`, `shaped_run` and `run_container`.
+- DS-5: the resolve container for accepted source builds (`ContainerImages.compile_in_container`) pulls uv's image by
+  its digest, checks the digest and runs it by id with `--pull never`, only after preflight and self-test for that
+  image; it adds private IPC, ulimits (nofile, fsize, core), no logging, the owner and deadline labels (the reaper
+  removes orphans), bounded output and removal on timeout or cancel. Proxy URLs reach it without user name or
+  password (`strip_credentials`; a proxy that needs credentials no longer works for the resolver). It keeps network
+  for the package index; the residual risk is documented in `docs/TODO.md` (RT-035).
+- DS-7: every docker CLI call of `ContainerImages` reads at most 16 MiB of stdout and the last 256 KiB of stderr
+  (`bounded_run`, the new default `run`; more kills the CLI and fails with `deps.image_failed`).
+- DS-9: a Python version without a pinned base image is refused with the new code `deps.python_unsupported` instead
+  of building on the unpinned `python:<version>-slim` tag; `build` also refuses a custom base that is not pinned by
+  digest. `tag` still names such an image (lookups answer "not built").
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence

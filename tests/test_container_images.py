@@ -17,7 +17,7 @@ import tempfile
 import time
 from typing import Any
 
-from orkexa.dynamic import DockerSandbox, SubprocessSandbox
+from orkexa.dynamic import BoundedOutput, DockerSandbox, SandboxError, SandboxProbe, SubprocessSandbox
 from orkexa.dynamic.docker import (
     BOOTSTRAP,
     DEADLINE_LABEL,
@@ -43,6 +43,8 @@ six==1.17.0 \\
     # via -r requirements.in
 """
 PLAIN = "six==1.17.0\n    # via -r requirements.in\n"
+#: The image id the stand-in's preflight and self-test answer with (containers run images by id).
+IMAGE_ID = "sha256:" + "cd" * 32
 
 
 class FakeDocker:
@@ -67,11 +69,52 @@ class FakeDocker:
         self.resolves: list[tuple[list[str], str]] = []
         self.resolve_lock = HASHED
         self.resolve_error = ""
+        #: Images pulled by digest; the sandbox gate (preflight and self-test) per image, and whether it fails;
+        #: containers run through the sandbox: (arguments, name, timeout, the docker CLI's environment).
+        self.pulled: set[str] = set()
+        self.gates: list[str] = []
+        self.not_proven = False
+        self.check_exit = 0
+        self.containers: list[tuple[list[str], str, float, dict[str, str]]] = []
+
+    def sandbox_class(self) -> type[StreamedSandbox]:
+        """A :class:`StreamedSandbox` whose preflight and self-test are this stand-in's (Orkexa tests the real ones)
+        and whose containers run through it; :meth:`StreamedSandbox.run_container` itself is tested below."""
+        fake = self
+
+        class FakeSandbox(StreamedSandbox):
+            def self_test(self, *, image: str | None = None) -> SandboxProbe:
+                fake.gates.append(image or self.image)
+                if fake.not_proven:
+                    return SandboxProbe("docker", False, "self-test", "the container showed no seccomp filter")
+                return SandboxProbe("docker", True, facts=(("image_id", IMAGE_ID),))
+
+            def ready_image(self) -> str:
+                probe = self.self_test()
+                if not probe.available:
+                    raise SandboxError(f"The Docker sandbox is not available ({probe.reason}): {probe.detail}")
+                return IMAGE_ID
+
+            def run_container(
+                self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int
+            ) -> tuple[int, BoundedOutput]:
+                fake.containers.append((args, name, self.timeout, dict(self.environ or {})))
+                done = fake(args, input=data.decode())
+                return done.returncode, BoundedOutput(done.stdout.encode(), done.stderr.encode(), False)
+
+        return FakeSandbox
 
     def __call__(self, args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
         self.environments.append(dict(options.get("env") or {}))
         command = args[1:]
+        if command[:2] == ["image", "inspect"] and "@sha256:" in command[-1]:
+            if command[-1] not in self.pulled:
+                return subprocess.CompletedProcess(args, 1, "", "No such image")
+            return subprocess.CompletedProcess(args, 0, f"{IMAGE_ID}|{json.dumps([command[-1]])}\n", "")
+        if command[0] == "pull":
+            self.pulled.add(command[-1])
+            return subprocess.CompletedProcess(args, 0, "pulled\n", "")
         if command[:2] == ["image", "inspect"]:
             tag = command[-1]
             if tag not in self.images:
@@ -111,6 +154,8 @@ class FakeDocker:
                 return subprocess.CompletedProcess(args, 2, "", self.resolve_error)
             return subprocess.CompletedProcess(args, 0, self.resolve_lock, "resolved\n")
         if command[0] == "run":
+            if self.check_exit:
+                return subprocess.CompletedProcess(args, self.check_exit, "", "Killed")
             return subprocess.CompletedProcess(args, 0, json.dumps(self.missing) + "\n", "")
         if command[:2] == ["image", "rm"]:
             if command[-1] in self.in_use:
@@ -126,7 +171,12 @@ def docker() -> FakeDocker:
 
 
 def images(docker: FakeDocker, **environ: str) -> ContainerImages:
-    return ContainerImages(docker="/usr/bin/docker", environ={"PATH": "/usr/bin", **environ}, run=docker)
+    return ContainerImages(
+        docker="/usr/bin/docker",
+        environ={"PATH": "/usr/bin", **environ},
+        run=docker,
+        sandbox_class=docker.sandbox_class(),
+    )
 
 
 # ---- locks and tags ----------------------------------------------------------------------------
@@ -405,6 +455,7 @@ def test_resolving_in_a_container_is_locked_down_and_uses_only_stdin_and_stdout(
     built = images(
         docker,
         HTTPS_PROXY="http://user:secret@proxy:3128",
+        NO_PROXY="localhost,.internal",
         NODESTRO_BUILD_CA_FILE=str(ca),
         ANTHROPIC_API_KEY="sk-secret",
         AWS_SECRET_ACCESS_KEY="aws-secret",
@@ -414,37 +465,115 @@ def test_resolving_in_a_container_is_locked_down_and_uses_only_stdin_and_stdout(
         ["six==1.17.0"], python="3.12", previous="six==1.16.0\n", log=lines.append, image=PINNED_UV
     )
     assert lock == HASHED
+    # The image is pulled by its digest (never by tag), checked to carry it, and run by its id after the daemon
+    # passed the preflight and self-test for exactly that image.
+    pinned = "ghcr.io/astral-sh/uv@sha256:" + "ab" * 32
+    assert docker.pulled == {pinned} and docker.gates == [IMAGE_ID]
     ((args, stdin),) = docker.resolves
+    ((_, name, timeout, cli_environment),) = docker.containers
     run = args[1:]
-    image = run.index(PINNED_UV)
+    image = run.index(IMAGE_ID)
     flags, command = run[:image], run[image + 1 :]
+    assert PINNED_UV not in run and name.startswith("nodestro-resolve-") and timeout == 900
     for flag in ("--read-only", "--rm", "-i"):
         assert flag in flags
     pairs = [(flags[index], flags[index + 1]) for index in range(len(flags) - 1)]
     expected = [
+        ("--name", name),
         ("--cap-drop", "ALL"),
         ("--security-opt", "no-new-privileges"),
         ("--user", "65534:65534"),
-        ("--pull", "missing"),
-        ("--env", "HTTPS_PROXY"),
+        ("--pull", "never"),
+        ("--ipc", "private"),
+        ("--log-driver", "none"),
+        ("--memory", "2048m"),
+        ("--memory-swap", "2048m"),
+        ("--pids-limit", "256"),
+        ("--ulimit", "core=0:0"),
+        ("--label", f"{OWNER_LABEL}=nodestro"),
     ]
     for pair in expected:
         assert pair in pairs, pair
+    deadline = [value for flag, value in pairs if flag == "--label" and value.startswith(DEADLINE_LABEL + "=")]
+    assert len(deadline) == 1 and 0 < int(deadline[0].split("=")[1]) - time.time() <= 900 + 61
     assert [flag for flag in flags if flag in ("-v", "--volume", "--mount", "--privileged", "--env-file")] == []
-    # Network only for this step (Docker's default), but nothing of the host: the only variable is a proxy, by name.
+    # Network only for this step (Docker's default), but nothing of the host: the only variables are the proxy
+    # settings, without the proxy's credentials (the build code could read them).
     assert "--network" not in flags
-    assert [flags[index + 1] for index, flag in enumerate(flags) if flag in ("--env", "-e")] == ["HTTPS_PROXY"]
+    assert [flags[index + 1] for index, flag in enumerate(flags) if flag in ("--env", "-e")] == [
+        "HTTPS_PROXY=http://proxy:3128",
+        "NO_PROXY=localhost,.internal",
+    ]
     assert not any("secret" in item for item in args)
+    assert any("credentials in HTTPS_PROXY" in line for line in lines)
     tmpfs = [flags[index + 1] for index, flag in enumerate(flags) if flag == "--tmpfs"]
     assert len(tmpfs) == 1 and tmpfs[0].startswith("/tmp:")
     assert command[:4] == ["python", "-I", "-B", "-c"]
+    assert json.loads(command[5]) == ["HTTPS_PROXY", "NO_PROXY"]
     envelope = json.loads(stdin)
     assert envelope == {"requirements": "six==1.17.0\n", "previous": "six==1.16.0\n", "python": "3.12", "ca": "CERT"}
-    # The docker CLI gets the proxy (to pass it on) but no provider or cloud keys.
-    environment = docker.environments[-1]
-    assert environment["HTTPS_PROXY"] and "ANTHROPIC_API_KEY" not in environment
-    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    # The docker CLI gets the proxy (to reach its daemon) but no provider or cloud keys.
+    for environment in (cli_environment, *docker.environments):
+        assert "ANTHROPIC_API_KEY" not in environment and "AWS_SECRET_ACCESS_KEY" not in environment
     compile(command[4], "<resolve>", "exec")  # the script that runs in the container is valid Python
+    # A second resolve finds the pulled image and pulls nothing.
+    built.compile_in_container(["six"], python="3.12", previous="", log=print, image=PINNED_UV)
+    assert [call for call in docker.calls if call[1] == "pull"] == [["/usr/bin/docker", "pull", pinned]]
+
+
+def test_resolving_in_a_container_needs_a_proven_daemon(docker: FakeDocker) -> None:
+    docker.not_proven = True
+    with pytest.raises(NodestroError) as caught:
+        images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "sandbox.unavailable" and "seccomp" in str(caught.value)
+    assert docker.resolves == [] and docker.containers == []  # no build script ran
+
+
+def test_a_resolver_image_without_its_digest_is_refused(docker: FakeDocker) -> None:
+    original = docker.__call__
+
+    def wrong_digest(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        done = original(args, **options)
+        if args[1:3] == ["image", "inspect"] and done.returncode == 0 and "@sha256:" in args[-1]:
+            return subprocess.CompletedProcess(
+                args, 0, f"{IMAGE_ID}|" + json.dumps(["ghcr.io/evil/uv@sha256:" + "ab" * 32]), ""
+            )
+        return done
+
+    built = images(docker)
+    built._run = wrong_digest
+    with pytest.raises(NodestroError) as caught:
+        built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "deps.build_unavailable" and docker.resolves == []
+
+
+def test_proxy_credentials_are_stripped() -> None:
+    from nodestro_runtime.container_images import strip_credentials
+
+    assert strip_credentials("http://user:p%40ss@proxy.example:3128/") == "http://proxy.example:3128/"
+    assert strip_credentials("user:pass@proxy:3128") == "proxy:3128"
+    assert strip_credentials("http://proxy:3128") == "http://proxy:3128"
+    assert strip_credentials("localhost,.internal") == "localhost,.internal"
+    assert strip_credentials("http://[bad@host") == ""  # cannot be cleaned: rather no proxy
+
+
+def test_a_stopped_resolve_is_reported_and_its_container_removed(tmp_path: Path) -> None:
+    """A resolve that times out (or floods its output) is killed and its container removed (the real
+    :meth:`StreamedSandbox.run_container`, with a docker CLI stand-in that never ends)."""
+    log = tmp_path / "docker.log"
+    cli = _fake_cli(tmp_path, log, run="import time; time.sleep(30)")
+    built = ContainerImages(docker=str(cli), environ={"PATH": os.environ["PATH"]})
+    from nodestro_runtime import container_images
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(container_images, "_RESOLVE_TIMEOUT", 1.0)
+        patch.setattr(StreamedSandbox, "self_test", _passing_self_test)
+        with pytest.raises(NodestroError) as caught:
+            built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "deps.image_failed" and "Timed out" in str(caught.value)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    name = next(call[call.index("--name") + 1] for call in calls if call[0] == "run")
+    assert ["kill", name] in calls and ["rm", "-f", name] in calls
 
 
 def test_a_failed_resolve_in_a_container_carries_uv_s_explanation(docker: FakeDocker) -> None:
@@ -500,6 +629,30 @@ def test_without_docker_an_accepted_source_build_stays_refused(
     plan = python.plan("tool", "show", python.needed_for_sources([("show", TOOL, "")]))
     assert plan.error is not None and plan.error.code == "deps.build_required"
     assert plan.error.params == {"name": "tablib", "reason": "sandbox.unavailable"} and not plan.lock
+
+
+def _fake_cli(tmp_path: Path, log: Path, *, run: str) -> Path:
+    """A docker CLI stand-in (a script): logs every call as JSON, answers image inspect / pull / kill / rm / ps, and
+    runs ``run`` (Python) for ``docker run``."""
+    script = tmp_path / "docker"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        f"with open({str(log)!r}, 'a') as handle:\n"
+        "    handle.write(json.dumps(args) + '\\n')\n"
+        "if args[:2] == ['image', 'inspect']:\n"
+        f"    print({IMAGE_ID!r} + '|' + json.dumps([args[-1]]))\n"
+        "    sys.exit(0)\n"
+        "if args[0] != 'run':\n"
+        "    sys.exit(0)\n" + run + "\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _passing_self_test(self: StreamedSandbox, *, image: str | None = None) -> SandboxProbe:
+    return SandboxProbe("docker", True, facts=(("image_id", IMAGE_ID),))
 
 
 # ---- environments in the Docker sandbox -------------------------------------------------------
@@ -562,6 +715,133 @@ def test_a_missing_module_in_the_image_fails_the_installation(workspace: Workspa
     assert env is not None and env.install.status == "failed"
     assert env.install.error is not None and env.install.error.code == "deps.module_missing"
     assert workspace.python.sandbox(scope) is None
+
+
+def test_the_module_check_runs_in_the_sandbox_shape_after_the_gate(docker: FakeDocker) -> None:
+    """DS-1: the check runs package code (``.pth`` files run at interpreter start), so it runs like a tool call: the
+    image by its id, in Orkexa's one container shape with the owner's labels, after preflight and self-test."""
+    built = ContainerImages(
+        docker="/usr/bin/docker",
+        environ={"PATH": "/usr/bin"},
+        run=docker,
+        owner="nodestro-desk1",
+        sandbox_class=docker.sandbox_class(),
+    )
+    tag = built.build(HASHED, "3.13")
+    docker.missing = ["not_a_module"]
+    assert built.missing_modules(tag, ["six", "not_a_module"]) == ["not_a_module"]
+    assert docker.gates == [tag]
+    ((args, name, timeout, _),) = docker.containers
+    assert name.startswith("nodestro-sandbox-verify-") and timeout == 120
+    image = args.index(IMAGE_ID)
+    limits = ContainerLimits(memory_mb=2048, cpus=1.0, pids=64, lifetime_s=180)
+    expected = run_args("/usr/bin/docker", name, IMAGE_ID, limits, owner="nodestro-desk1")
+    assert [item for item in args[: image + 1] if not item.startswith(DEADLINE_LABEL)] == [
+        item for item in expected if not item.startswith(DEADLINE_LABEL)
+    ]
+    assert f"{OWNER_LABEL}=nodestro-desk1" in args and tag not in args
+    assert args[image + 1 : image + 5] == ["python", "-I", "-B", "-c"]
+    # No plain docker run of the tag is left.
+    assert not [call for call in docker.calls if call[1] == "run" and call not in [c[0] for c in docker.containers]]
+
+
+def test_the_module_check_needs_a_proven_daemon(docker: FakeDocker) -> None:
+    built = images(docker)
+    tag = built.build(HASHED, "3.13")
+    docker.not_proven = True
+    with pytest.raises(NodestroError) as caught:
+        built.missing_modules(tag, ["six"])
+    assert caught.value.code == "sandbox.unavailable" and docker.containers == []
+
+
+def test_a_failing_module_check_is_an_error_not_a_result(docker: FakeDocker) -> None:
+    built = images(docker)
+    tag = built.build(HASHED, "3.13")
+    docker.check_exit = 137  # e.g. killed by the memory limit
+    with pytest.raises(NodestroError) as caught:
+        built.missing_modules(tag, ["six"])
+    assert caught.value.code == "deps.image_failed" and "137" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        ("import time; time.sleep(30)", "Timed out"),
+        ("import os\nfor _ in range(64): os.write(1, b'x' * 65536)", "more than 4096 bytes"),
+    ],
+)
+def test_a_module_check_that_hangs_or_floods_is_stopped_and_removed(tmp_path: Path, run: str, expected: str) -> None:
+    """The real :meth:`StreamedSandbox.run_container` (Orkexa's run_bounded): bounded output, a wall-clock limit, and
+    the container killed and removed (the CLI's death alone would leave it running)."""
+    from nodestro_runtime import container_images
+
+    log = tmp_path / "docker.log"
+    built = ContainerImages(docker=str(_fake_cli(tmp_path, log, run=run)), environ={"PATH": os.environ["PATH"]})
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(container_images, "_VERIFY_TIMEOUT", 1.0)
+        patch.setattr(container_images, "_VERIFY_STDOUT", 4096)
+        patch.setattr(StreamedSandbox, "self_test", _passing_self_test)
+        with pytest.raises(NodestroError) as caught:
+            built.missing_modules("nodestro-env:" + "a" * 32, ["six"])
+    assert caught.value.code == "deps.image_failed" and expected in str(caught.value)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    (started,) = [call for call in calls if call[0] == "run"]
+    name = started[started.index("--name") + 1]
+    assert started[started.index("--network") + 1] == "none" and IMAGE_ID in started
+    assert ["kill", name] in calls and ["rm", "-f", name] in calls
+
+
+# ---- bounded docker CLI output (DS-7) and pinned base images only (DS-9) -------------------------
+
+
+def test_the_docker_cli_s_output_is_bounded() -> None:
+    from nodestro_runtime.container_images import OutputLimitExceeded, bounded_run
+
+    flood = "import os, sys\nsys.stderr.write('e' * 300000)\nfor _ in range(64): os.write(1, b'x' * 65536)\n"
+    with pytest.raises(OutputLimitExceeded):
+        bounded_run([sys.executable, "-c", flood], timeout=30, max_stdout=100_000)
+    tail = bounded_run(
+        [sys.executable, "-c", "import sys; sys.stderr.write('e' * 300000 + 'END'); print(sys.stdin.read())"],
+        timeout=30,
+        input="hello",
+        max_stderr=1000,
+    )
+    assert tail.returncode == 0 and tail.stdout == "hello\n"
+    assert len(tail.stderr) == 1000 and tail.stderr.endswith("END")
+    with pytest.raises(subprocess.TimeoutExpired):
+        bounded_run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+
+
+def test_a_flooding_docker_cli_fails_the_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nodestro_runtime import container_images
+
+    script = tmp_path / "docker"
+    script.write_text(f"#!{sys.executable}\nimport os\nwhile True: os.write(1, b'x' * 65536)\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(container_images, "MAX_CLI_STDOUT", 1024 * 1024)
+    with pytest.raises(NodestroError) as caught:
+        ContainerImages(docker=str(script), environ={"PATH": os.environ["PATH"]}).build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_failed" and "more than 1048576 bytes" in str(caught.value)
+
+
+def test_a_python_version_without_a_pinned_base_is_refused(docker: FakeDocker) -> None:
+    from nodestro_runtime.container_images import default_base
+
+    with pytest.raises(NodestroError) as caught:
+        default_base("3.99")
+    assert caught.value.code == "deps.python_unsupported" and caught.value.params == {"version": "3.99"}
+    built = images(docker)
+    assert built.tag(HASHED, "3.99").startswith("nodestro-env:")  # lookups answer "not built", never fail
+    assert not built.exists(built.tag(HASHED, "3.99"))
+    with pytest.raises(NodestroError) as refused:
+        built.build(HASHED, "3.99")
+    assert refused.value.code == "deps.python_unsupported"
+    # A base that is not pinned by digest is refused too, before docker builds anything.
+    unpinned = ContainerImages(docker="/usr/bin/docker", base=lambda version: f"python:{version}-slim", run=docker)
+    with pytest.raises(NodestroError) as tagged:
+        unpinned.build(HASHED, "3.13")
+    assert tagged.value.code == "deps.python_unsupported"
+    assert not [call for call in docker.calls if call[1] == "build"]
 
 
 def test_an_environment_approved_without_hashes_must_be_approved_again(
