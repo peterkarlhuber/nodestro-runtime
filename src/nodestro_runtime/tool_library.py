@@ -12,6 +12,12 @@ provenance runs only in an isolating sandbox, never in a host subprocess.
 Generating a tool takes a while and ends with a human decision, so it runs as a
 :class:`ToolJob` in a background thread: ``ToolBuilder`` does the work, and its
 ``CallbackApprover`` waits until the user approves or rejects in the UI.
+
+:meth:`ToolLibrary.cancel_jobs` stops every job that has not ended (the API calls it when the tenant is suspended,
+with ``identity.tenant_suspended``, security review NF-1): the job is ``failed`` at once with that code as its
+``message_code``, a model request not sent yet is not sent, a sandbox test that runs is killed (its container
+removed), a wait for a decision ends, the generated tool is never registered, and nothing the thread does later
+changes the job again.
 """
 
 from __future__ import annotations
@@ -49,8 +55,9 @@ from orkexa.dynamic.coding_agent import DEFAULT_CODING_PROMPT
 from orkexa.dynamic.policy import RESERVED_TOOL_NAMES
 from orkexa.memory import MEMORY_TOOL_NAME
 from orkexa.providers.base import redact
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from . import sandbox_cancel
 from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
@@ -210,16 +217,49 @@ class ToolJob(BaseModel):
     cost_usd: float | None = None
     created_at: datetime = Field(default_factory=now)
     finished_at: datetime | None = None
+    #: The code :meth:`ToolLibrary.cancel_jobs` stopped the job with; once set, the job's state never changes again.
+    _stop_code: str | None = PrivateAttr(default=None)
+
+
+#: Guards the state of every tool job: its thread, a decision and :meth:`ToolLibrary.cancel_jobs` write it.
+_JOB_STATE = threading.Lock()
+
+
+class _JobStopped(Exception):
+    """The job was stopped by :meth:`ToolLibrary.cancel_jobs`; raised in its thread to end it."""
+
+
+def _check_stopped(job: ToolJob) -> None:
+    if job._stop_code is not None:
+        raise _JobStopped(job._stop_code)
+
+
+def _update(job: ToolJob, **fields: Any) -> bool:
+    """Set ``fields`` of ``job`` unless the job was stopped; returns whether they were set."""
+    with _JOB_STATE:
+        if job._stop_code is not None:
+            return False
+        for name, value in fields.items():
+            setattr(job, name, value)
+        return True
 
 
 class _ReservingToolBuilder(ToolBuilder):
     """Orkexa's tool builder, refusing Nodestro's reserved names too (:data:`RESERVED_NAMES`, re-review R-2): the
-    Coding Agent gets the refusal as feedback and proposes another name."""
+    Coding Agent gets the refusal as feedback and proposes another name. A stopped job ends after the tests, before
+    its tool is added to the registry."""
+
+    job: ToolJob | None = None
 
     def _validate(self, proposal: Any) -> tuple[list[str], Any]:
         if proposal.function_name in RESERVED_NAMES:
             return [f"{proposal.function_name!r} is a reserved tool name; choose another"], None
-        return super()._validate(proposal)
+        if self.job is not None:
+            _check_stopped(self.job)
+        result = super()._validate(proposal)
+        if self.job is not None:
+            _check_stopped(self.job)  # e.g. its sandbox test was killed (SandboxCancelled is reported as a failure)
+        return result
 
 
 class _RecordingCodingAgent(CodingAgent):
@@ -232,11 +272,20 @@ class _RecordingCodingAgent(CodingAgent):
         self.job = job
         self.on_proposal = on_proposal
 
+        def on_request(_request: Any) -> None:
+            _check_stopped(job)  # cancel_jobs: a request not sent yet is never sent
+
+        self.agent.on_request = on_request
+
     def ask_again(self, feedback: str) -> ToolProposal:
         """A corrected proposal without the attempt bookkeeping (dependency feedback)."""
-        return self._record(super().propose("", feedback=feedback))
+        _check_stopped(self.job)
+        proposal = super().propose("", feedback=feedback)
+        _check_stopped(self.job)  # an answer that arrives after cancel_jobs is not used
+        return self._record(proposal)
 
     def propose(self, requirement: str, *, feedback: str | None = None) -> ToolProposal:
+        _check_stopped(self.job)
         number = len(self.job.attempts) + 1
         if feedback is None:
             _step(self.job, problem("job.writing", "The Coding Agent is writing code and tests"))
@@ -245,7 +294,9 @@ class _RecordingCodingAgent(CodingAgent):
                 self.job,
                 problem("job.fixing", f"Attempt {number}: the Coding Agent is correcting its proposal", attempt=number),
             )
-        proposal = self._record(super().propose(requirement, feedback=feedback))
+        answer = super().propose(requirement, feedback=feedback)
+        _check_stopped(self.job)  # an answer that arrives after cancel_jobs is not used
+        proposal = self._record(answer)
         if self.on_proposal is not None:
             proposal = self.on_proposal(proposal)
         _step(
@@ -255,21 +306,23 @@ class _RecordingCodingAgent(CodingAgent):
         return proposal
 
     def _record(self, proposal: ToolProposal) -> ToolProposal:
-        number = len(self.job.attempts) + 1
-        self.job.attempts.append(
-            ToolAttempt(
-                number=number,
-                function_name=proposal.function_name,
-                description=proposal.description,
-                code=proposal.code,
-                tests=proposal.tests,
+        with _JOB_STATE:
+            number = len(self.job.attempts) + 1
+            self.job.attempts.append(
+                ToolAttempt(
+                    number=number,
+                    function_name=proposal.function_name,
+                    description=proposal.description,
+                    code=proposal.code,
+                    tests=proposal.tests,
+                )
             )
-        )
         return proposal
 
 
 def _step(job: ToolJob, found: Problem) -> None:
-    job.message, job.message_code, job.message_params = found.message, found.code, found.params
+    """Show the job's current step (nothing changes once the job was stopped)."""
+    _update(job, message=found.message, message_code=found.code, message_params=found.params)
 
 
 class _Decision:
@@ -279,6 +332,13 @@ class _Decision:
         #: The answer to a dependency overview: "approve", "without" or "cancel".
         self.dependencies = threading.Event()
         self.dependency_choice = "cancel"
+        #: Set by :meth:`ToolLibrary.cancel_jobs`: ends the waits and the sandbox call of the job.
+        self.stop = threading.Event()
+        #: The person's approval or rejection was taken (the tool is being registered or rejected): the job is no
+        #: longer stopped.
+        self.committed = False
+        #: The job's thread has ended.
+        self.done = False
 
 
 DependencyChoice = Literal["approve", "without", "cancel"]
@@ -1077,18 +1137,20 @@ class ToolLibrary:
         on_finished: Callable[[ToolJob, UsageTracker], None] | None = None,
     ) -> None:
         def approve(request: ApprovalRequest) -> bool:
-            job.approval = {
-                "name": request.name,
-                "summary": request.summary,
-                **request.details,
-                "dependencies": job.dependencies,
-            }
-            job.status = "awaiting_approval"
+            approval = {"name": request.name, "summary": request.summary, **request.details}
+            _update(job, approval={**approval, "dependencies": job.dependencies}, status="awaiting_approval")
             _step(job, problem("job.awaiting_approval", "All tests passed. Please review code and tests and approve."))
-            if not decision.event.wait(_APPROVAL_TIMEOUT_SECONDS):
-                _step(job, problem("job.timeout", "No decision within an hour; rejected."))
-                return False
-            return decision.approved
+            # cancel_jobs sets the event too: a stopped job does not wait for the rest of the hour.
+            answered = decision.event.wait(_APPROVAL_TIMEOUT_SECONDS)
+            with self._lock:
+                if job._stop_code is not None:
+                    return False  # the builder rejects the record in the registry; the job stays stopped
+                if not answered:
+                    _step(job, problem("job.timeout", "No decision within an hour; rejected."))
+                    return False
+                # Taken under the lock cancel_jobs holds: the person's decision is carried out, not stopped half-way.
+                decision.committed = True
+                return decision.approved
 
         builder: ToolBuilder | None = None
         coding_agent: _RecordingCodingAgent | None = None
@@ -1105,10 +1167,12 @@ class ToolLibrary:
             """Third-party packages: resolve, ask the user, install, before the tests run."""
             gate = self.dependencies
             assert builder is not None and coding_agent is not None
-            builder.extra_imports, builder.test_sandbox, job.dependencies = frozenset(), None, []
+            builder.extra_imports, builder.test_sandbox = frozenset(), None
+            _update(job, dependencies=[])
             if gate is None:
                 return proposal
             for _round in range(4):
+                _check_stopped(job)
                 outcome = gate.prepare(proposal.function_name, proposal.code, proposal.tests)
                 if outcome.feedback:
                     _step(job, problem("job.dependency_feedback", "Some imports cannot be resolved; correcting"))
@@ -1117,22 +1181,25 @@ class ToolLibrary:
                 if outcome.ready:
                     builder.extra_imports = frozenset(outcome.extra_imports)
                     builder.test_sandbox = outcome.sandbox
-                    job.dependencies = outcome.packages
+                    _update(job, dependencies=outcome.packages)
                     return proposal
                 # Cleared before the job asks, so the answer to this round is never taken for an old one.
-                decision.dependencies.clear()
-                job.dependency_plan = outcome.plan
-                job.status = "awaiting_dependencies"
+                with self._lock:
+                    if not decision.stop.is_set():  # cancel_jobs sets it too; it must stay set
+                        decision.dependencies.clear()
+                _update(job, dependency_plan=outcome.plan, status="awaiting_dependencies")
                 _step(
                     job,
                     problem("job.awaiting_dependencies", "The tool needs third-party libraries. Please review them."),
                 )
-                if not decision.dependencies.wait(_APPROVAL_TIMEOUT_SECONDS):
+                answered = decision.dependencies.wait(_APPROVAL_TIMEOUT_SECONDS)
+                _check_stopped(job)
+                if not answered:
                     _step(job, problem("job.timeout", "No decision within an hour; rejected."))
                     raise ApprovalDeniedError("No decision about the libraries")
                 choice = decision.dependency_choice
                 plan = job.dependency_plan or {}
-                job.status, job.dependency_plan = "running", None
+                _update(job, status="running", dependency_plan=None)
                 if choice == "cancel":
                     _step(job, problem("job.rejected", "The tool was rejected and not saved."))
                     raise ApprovalDeniedError("The libraries were not approved")
@@ -1146,9 +1213,12 @@ class ToolLibrary:
                     )
                     continue
                 _step(job, problem("job.installing", "Installing the approved libraries"))
+                _check_stopped(job)  # an installation that already runs is stopped by cancel_installs
                 gate.install(str(plan.get("id")), lambda _line: None)
             raise ApprovalDeniedError("The libraries could not be prepared")
 
+        # A sandbox test of this job is killed (its container removed) once cancel_jobs sets the stop event.
+        cancel_token = sandbox_cancel.bind(decision.stop.is_set)
         try:
             coding_agent = _RecordingCodingAgent(
                 job,
@@ -1166,9 +1236,9 @@ class ToolLibrary:
                 policy=DynamicPolicy(max_generated_tools=1),
                 max_attempts=3,
             )
+            builder.job = job
             tool = builder.build(job.requirement)
-            job.tool_name = tool.name
-            job.status = "approved"
+            _update(job, tool_name=tool.name, status="approved")
             _step(
                 job,
                 problem(
@@ -1177,29 +1247,68 @@ class ToolLibrary:
                     name=tool.name,
                 ),
             )
+        except _JobStopped:
+            logger.info("Tool job %s was stopped (%s)", job.id, job._stop_code)
         except ApprovalDeniedError:
-            job.status = "rejected"
-            if job.message_code != "job.timeout":
+            if _update(job, status="rejected") and job.message_code != "job.timeout":
                 _step(job, problem("job.rejected", "The tool was rejected and not saved."))
         except Exception as exc:  # the job reports every failure to the UI
-            logger.exception("Tool job %s failed", job.id)
-            job.status = "failed"
+            if job._stop_code is not None:  # e.g. its installation was stopped too: the job stays stopped
+                logger.info("Tool job %s was stopped (%s): %s", job.id, job._stop_code, type(exc).__name__)
+            else:
+                logger.exception("Tool job %s failed", job.id)
             # Shown to the user (GET /api/jobs): no credentials and, on a server, no AWS identity of the operator.
-            job.error = redact_identity(redact(f"{type(exc).__name__}: {exc}"))
+            _update(job, status="failed", error=redact_identity(redact(f"{type(exc).__name__}: {exc}")))
             if isinstance(exc, NodestroError) and exc.code.startswith("sandbox."):
                 # E.g. ``sandbox.isolation_required``: reported with its code; the code was not run.
                 _step(job, exc.problem)
             else:
                 _step(job, problem("job.failed", "The tool could not be created."))
         finally:
+            sandbox_cancel.reset(cancel_token)
             cost = tracker.usage.estimated_cost_usd
-            job.cost_usd = float(cost) if cost is not None else None
-            job.finished_at = now()
+            with _JOB_STATE:
+                # The usage of a stopped job is recorded too (a request that was sent is paid for).
+                job.cost_usd = float(cost) if cost is not None else None
+                job.finished_at = job.finished_at or now()
+            with self._lock:
+                decision.done = True
             if on_finished is not None:
                 try:
                     on_finished(job, tracker)
                 except Exception:  # recording usage must never break the job
                     logger.exception("Recording the usage of tool job %s failed", job.id)
+
+    def cancel_jobs(self, code: str) -> list[str]:
+        """Stop every job that has not ended (its tenant was suspended, security review NF-1).
+
+        Each job is ``failed`` at once, with ``code`` as its ``message_code``, and stays so: a model request not sent
+        yet is not sent and an answer that arrives later is not used, a sandbox test that runs is killed (its
+        container removed), a wait for a decision ends at once and the generated tool is never registered (a record
+        already proposed for approval is rejected). A job whose approval or rejection was already taken finishes
+        carrying it out and is not stopped. An installation of libraries the job started is stopped by
+        :meth:`~nodestro_runtime.python_envs.PythonEnvironments.cancel_installs`. Idempotent; returns the ids
+        stopped."""
+        stopped: list[str] = []
+        with self._lock:
+            for job_id, decision in self._decisions.items():
+                job = self.jobs.get(job_id)
+                if job is None or decision.done or decision.committed or decision.stop.is_set():
+                    continue
+                if job.status not in ("running", "awaiting_dependencies", "awaiting_approval"):
+                    continue
+                with _JOB_STATE:
+                    found = problem(code, "The job was stopped")
+                    job.status, job.error = "failed", found.message
+                    job.message, job.message_code, job.message_params = found.message, found.code, found.params
+                    job.approval = job.dependency_plan = None
+                    job.finished_at = now()
+                    job._stop_code = code
+                decision.stop.set()
+                decision.event.set()
+                decision.dependencies.set()
+                stopped.append(job_id)
+        return stopped
 
     def decide(self, job_id: str, approved: bool) -> ToolJob:
         with self._lock:
