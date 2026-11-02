@@ -156,7 +156,11 @@ def _volume_inputs(database: Any, data_root: Path, tenant: str) -> InputFiles:
 
 
 def _axentra_rows(database: Any) -> list[tuple[Any, ...]]:
-    return database._query("SELECT id, tenant_id, status, sha256, size, stored_inert FROM axentra_files ORDER BY id")
+    """Axentra's file rows as the owner sees them: a check of the test, not a product read (those go through Axentra's
+    tenant scope); the runtime role sees no row without that scope (row-level security)."""
+    return postgres_support.owner_of(database)._query(
+        "SELECT id, tenant_id, status, sha256, size, stored_inert FROM axentra_files ORDER BY id"
+    )
 
 
 def test_uploads_go_to_axentra_with_stable_ids_and_one_object_per_content(files: Any, tmp_path: Path) -> None:
