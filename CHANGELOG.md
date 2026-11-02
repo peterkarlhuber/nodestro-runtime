@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+Axentra pin: `f3ed8d22a8bd45faff84204786e01da32ece4034` (axentra #28, #27: secret-free OIDC `return_to`, `POST`
+OIDC start, encoded-token redaction; 2026-11-02).
+
+Static tenant SQL check: the gaps of security review round 3 closed (#89; 2026-11-02):
+
+- `tenant_sql_check` fails closed on the remaining bypasses: adjacent constants are joined without a gap (a table
+  name split as `"nodestro_" + "documents"` or after a prefix constant, SR-01d); `+=` on a parameter, on `self.q`,
+  `Q["a"]` or a class attribute; closures, lambdas and `nonlocal`; `"%s OR true" % q`; items of literal containers
+  (`QS[0] + QS[1]`); lower-case SQL (`or true`) and comments after an unknown part; fragments such as `" OR true"`
+  outside a known statement (SR-01a/b). The SQL rules also refuse an inner alias that hides an outer one, SQL inside
+  strings (`DO`, `query_to_xml`), a non-parameter `tenant_id` in `INSERT`, an upsert without `tenant_id` in its
+  conflict target, and `SET tenant_id`. Every review probe is a regression test; the real runtime and API code has
+  no new finding. `docs/AXENTRA.md` states what the check guarantees and the remaining isolation risk without RLS.
+
+Stopping a suspended tenant's tool generation jobs (security review round 3, NF-1; 2026-11-02):
+
+- `ToolLibrary.cancel_jobs(code)` stops every tool job that has not ended: it is `failed` at once with `code` as its
+  `message_code` (the API passes `identity.tenant_suspended`) and never changes again. A model request not sent yet
+  is not sent and a late answer is not used; a running sandbox test is killed through the job's sandbox cancel check
+  (a container is killed and removed); a wait for an approval or for libraries ends at once; the tool is never
+  registered (a record already proposed for approval is rejected). A decision that was already taken is carried out.
+  Idempotent; returns the ids stopped. Tests: `tests/test_tool_job_cancel.py`.
+
 Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-11-02):
 
 - `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so

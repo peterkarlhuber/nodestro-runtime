@@ -258,10 +258,6 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ),
     (
         "nodestro_runtime/tenant_sql_check.py",
-        "{node.relation.relname}: INSERT without tenant_id in the column list",
-    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
-    (
-        "nodestro_runtime/tenant_sql_check.py",
         "{ref.table} (as {ref.name}) is not bound to one tenant by a top-level `tenant_id = <param>` conjunct",
     ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
     (
