@@ -31,7 +31,7 @@ from .memory_spaces import BrowsableMemory
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
 
 if TYPE_CHECKING:
-    from .server_settings import SecretBox
+    from .server_settings import TenantSecrets
     from .workspace import WorkspaceStorage
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
@@ -355,7 +355,7 @@ def knowledge_tables(database: PostgresDatabase, tenant_id: str, *, namespace: s
 def tenant_storage(
     database: PostgresDatabase,
     tenant_id: str,
-    secrets: SecretBox | None = None,
+    secrets: TenantSecrets | None = None,
     endpoints: tuple[str, ...] = (),
     bedrock: BedrockOperatorConfig | None = None,
 ) -> WorkspaceStorage:

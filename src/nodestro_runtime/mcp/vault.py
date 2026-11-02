@@ -14,7 +14,7 @@ import binascii
 import os
 
 from ..problems import NodestroError
-from ..server_settings import SecretBox
+from ..server_settings import SecretBox, TenantSecrets
 
 VAULT_KEY_ENV = "NODESTRO_VAULT_KEY"
 _KEY_BYTES = 32
@@ -44,7 +44,7 @@ def vault_box_from_env(environ: dict[str, str] | None = None) -> SecretBox | Non
 class TokenVault:
     """Seals and opens MCP tokens of one tenant; ``persistent`` tells whether tokens can be stored at all."""
 
-    def __init__(self, box: SecretBox | None, tenant_id: str) -> None:
+    def __init__(self, box: TenantSecrets | None, tenant_id: str) -> None:
         self._box = box
         self.tenant_id = tenant_id
 

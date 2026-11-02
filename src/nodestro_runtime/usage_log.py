@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from .cost_tracking import stale_requests
 from .engine import usage_of
+from .platform_events import platform_events
 from .schemas import Usage, new_id, now
 from .storage import DocumentStore
 
@@ -101,6 +102,8 @@ class UsageLog:
             model = f"{record.provider}:{record.model}" if record.provider else record.model
             by_model.setdefault(model, []).append(record)
         entries = []
+        sink = platform_events(self.store)
+        tenant = str(getattr(self.store, "tenant_id", ""))
         with self.store.transaction():  # one operation: all of its entries or none
             for model, group in by_model.items():
                 entry = UsageEntry(
@@ -114,6 +117,8 @@ class UsageLog:
                     usage=usage_of(summarize_usage(group), group, stale_requests=stale_requests(tracker, group)),
                 )
                 self.store.put(_COLLECTION, entry.id, entry)
+                if sink is not None:  # the mirror commits with the entry (see .platform_events)
+                    sink.usage(tenant, entry)
                 entries.append(entry)
         return entries
 

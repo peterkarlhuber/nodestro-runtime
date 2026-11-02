@@ -106,7 +106,7 @@ from .schemas import (
     WorkflowIn,
     now,
 )
-from .server_settings import SecretBox, is_encrypted
+from .server_settings import TenantSecrets, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_approvals import (
     ToolApprovalEvent,
@@ -215,7 +215,7 @@ class WorkspaceStorage:
     knowledge: KnowledgeTables
     memory: MemoryTables
     #: Encrypts the tenant's provider keys at rest (ADR-0003 point 6); ``None`` stores them as given (tests).
-    secrets: SecretBox | None = None
+    secrets: TenantSecrets | None = None
     #: The model endpoints (origins) the operator allows for the endpoint providers (``compatible``, ``ollama``,
     #: ``vllm``); any other base URL is refused, so a tenant cannot make the server reach internal services.
     endpoints: tuple[str, ...] = ()
@@ -292,7 +292,7 @@ class Workspace:
         )
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
-        self._secrets: SecretBox | None = None
+        self._secrets: TenantSecrets | None = None
         if storage is None:
             database = data_dir / DATABASE
             self._sqlite = Store(database)
