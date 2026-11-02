@@ -72,7 +72,9 @@ def test_workspace_starts_and_reports_the_sandbox(tmp_path: Path) -> None:
         assert settings.sandbox_selection.os in {"linux", "macos", "windows"}
         if not sys.platform.startswith("linux") and not settings.docker_available:
             assert settings.sandbox_selection.blocked
-            assert settings.sandbox_selection.reason == "no-isolation"
+            # Docker-first: `auto` names Docker's own reason (docker-missing, docker-unreachable, ...).
+            reason = settings.sandbox_selection.reason or ""
+            assert reason.startswith("docker-"), reason
 
 
 def test_untrusted_code_is_refused_without_isolation() -> None:
