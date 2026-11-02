@@ -177,10 +177,15 @@ def select(
                 "Automatic mode runs AI-generated code in Docker; its preflight and self-test are still running, so "
                 "AI-generated code is refused until they passed."
             )
-        else:
+        elif status.reason in ("docker-missing", "docker-unreachable", None):
             detail = (
                 f"Automatic mode runs AI-generated code only in Docker, which is not available ({status.detail}); "
                 "AI-generated code is refused. To run it, start Docker."
+            )
+        else:
+            detail = (
+                f"Automatic mode runs AI-generated code only in Docker, which did not pass Nodestro's checks "
+                f"({status.detail}); AI-generated code is refused. Settings → Sandbox shows which check failed."
             )
         return result("", "subprocess", status.reason or "docker-unreachable", detail)
     if mode == "linux":

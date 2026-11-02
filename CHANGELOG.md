@@ -11,6 +11,8 @@ The resolve path on a real Docker engine (RT-038; 2026-11-02):
   `deps.source_build_disabled` before any docker call off the desktop, timeout, cancel, cleanup and proxy credentials.
 - Fix: the resolve container is checked against the shape its sandbox's self-test ran (the sandbox's limits), not
   against `_RESOLVE_LIMITS` directly, so a sandbox that proved other limits starts nothing (`sandbox.shape_mismatch`).
+- Automatic mode's refusal detail says "start Docker" only when Docker is missing or unreachable; a running Docker
+  that failed a check is told so instead.
 - Fix: the resolve container's `/tmp` is really executable. Docker mounts a tmpfs `noexec` unless its options say
   `exec`, so dropping `noexec` had no effect; the `exec_tmp` allowance now replaces `noexec` with `exec` in
   `_resolve_args` and in `check_shape`. `/work` stays `noexec`.

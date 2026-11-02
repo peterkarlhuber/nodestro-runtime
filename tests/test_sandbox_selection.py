@@ -82,6 +82,8 @@ def test_docker_mode_and_servers_run_everything_in_containers(monkeypatch: pytes
     # Without a proven Docker a server runs no tool code either, and says why.
     refused = sandbox_selection.select(SERVER, "auto", docker_status.unavailable_status("docker-limits", "no pids"))
     assert refused.blocked and refused.reason == "docker-limits" and "no pids" in refused.detail
+    # A running Docker that failed a check is not told to "start Docker".
+    assert "start Docker" not in refused.detail and "did not pass" in refused.detail
 
 
 @pytest.mark.parametrize("reason", docker_status.DOCKER_REASONS)
