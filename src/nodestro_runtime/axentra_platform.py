@@ -19,6 +19,10 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
                                             row-level security is then no defense in depth); default refused
 ``NODESTRO_SECRETS_FORMAT``                 ``v1`` (default) or ``axs1``: format of newly written tenant secrets
                                             (``axs1`` = Axentra keyring with rotation; needs NODESTRO_AXENTRA=on)
+``NODESTRO_AXENTRA_AUDIT``                  ``1``: mirror the approval audit trail and MCP events into Axentra's
+                                            audit log (same transaction; needs NODESTRO_AXENTRA=on)
+``NODESTRO_AXENTRA_USAGE``                  ``1``: mirror the AI usage ledger into Axentra meters (``nodestro.ai.*``;
+                                            same transaction, idempotent; needs NODESTRO_AXENTRA=on)
 ==========================================  ================================================================
 
 :class:`KeyringSecretBox` reads both secret formats (``nodestro:enc:v1:`` and Axentra's ``axs1.<kid>.…``) and writes
@@ -93,6 +97,10 @@ class AxentraConfig:
     config_file: str | None = None
     allow_superuser: bool = False
     secrets_format: SecretsFormat = "v1"
+    #: Mirror audit events (tool approvals, MCP) into Axentra's audit log.
+    audit: bool = False
+    #: Mirror the AI usage ledger into Axentra's usage meters.
+    usage: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str], problems: list[dict[str, str]]) -> AxentraConfig:
@@ -112,6 +120,15 @@ class AxentraConfig:
         superuser = environ.get("NODESTRO_AXENTRA_ALLOW_SUPERUSER", "").strip().lower()
         if superuser not in _ON | _OFF:
             problem("NODESTRO_AXENTRA_ALLOW_SUPERUSER", superuser, "NODESTRO_AXENTRA_ALLOW_SUPERUSER must be 1 or 0")
+        mirrors: dict[str, bool] = {}
+        for name in ("audit", "usage"):
+            variable = f"NODESTRO_AXENTRA_{name.upper()}"
+            value = environ.get(variable, "").strip().lower()
+            if value not in _ON | _OFF:
+                problem(variable, value, f"{variable} must be 1 or 0")
+            elif value in _ON and not enabled:
+                problem(variable, value, f"{variable}=1 needs NODESTRO_AXENTRA=on")
+            mirrors[name] = value in _ON
         config_file = environ.get("NODESTRO_AXENTRA_CONFIG", "").strip() or None
         keyring, ref = "", ""
         direct = environ.get("NODESTRO_AXENTRA_KEYRING", "").strip()
@@ -156,6 +173,8 @@ class AxentraConfig:
             config_file=config_file,
             allow_superuser=superuser in _ON,
             secrets_format=fmt,  # type: ignore[arg-type]
+            audit=mirrors["audit"],
+            usage=mirrors["usage"],
         )
 
 
@@ -657,6 +676,391 @@ class AxentraLink:
         return {"tenants": len(rows), "already_linked": linked, "created": created}
 
 
+# ---- audit and usage mirrors (M3) ---------------------------------------------------------------
+
+#: The Axentra meters the usage mirror writes (key, unit, what a quantity of the meter is).
+USAGE_METERS: tuple[tuple[str, str, str], ...] = (
+    ("nodestro.ai.requests", "requests", "AI requests made outside workflow runs"),
+    ("nodestro.ai.input_tokens", "tokens", "Input tokens of AI requests made outside workflow runs"),
+    ("nodestro.ai.output_tokens", "tokens", "Output tokens of AI requests made outside workflow runs"),
+    ("nodestro.ai.cost_usd", "USD", "Fully priced cost of AI requests made outside workflow runs"),
+)
+#: How far back Axentra accepts usage (``axentra.usage.service.MAX_BACKDATE`` is 400 days), with a margin.
+USAGE_RECONCILE_DAYS = 395
+_MICRO = 10**6
+
+
+def usage_quantities(usage: Any) -> dict[str, Any]:
+    """The meter quantities of one usage entry's :class:`~nodestro_runtime.schemas.Usage` (zeros left out).
+
+    The cost is mirrored only when it is complete (``estimated_cost_usd`` known and not marked incomplete), rounded
+    to micro-dollars: an unknown or partial cost is never billed as if it were the whole cost."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    found: dict[str, Any] = {}
+    for meter, value in (
+        ("nodestro.ai.requests", usage.requests),
+        ("nodestro.ai.input_tokens", usage.input_tokens),
+        ("nodestro.ai.output_tokens", usage.output_tokens),
+    ):
+        if value:
+            found[meter] = int(value)
+    cost = usage.estimated_cost_usd
+    if cost is not None and usage.cost_complete is not False and cost > 0:
+        found["nodestro.ai.cost_usd"] = Decimal(str(cost)).quantize(Decimal(1) / _MICRO, rounding=ROUND_HALF_UP)
+    return found
+
+
+def usage_key(entry_id: str, meter: str) -> str:
+    """The idempotency key of one mirrored quantity: replaying it never counts twice."""
+    return f"nodestro:usage:{entry_id}:{meter}"
+
+
+@dataclass
+class MirrorStats:
+    """What the mirror did since the process started (``failed``: kept in Nodestro, written by reconcile)."""
+
+    audit: int = 0
+    usage: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
+class AxentraEvents:
+    """The :class:`~nodestro_runtime.platform_events.PlatformEvents` sink of a server with Axentra switched on.
+
+    Called inside the Nodestro transaction that stores the record: Axentra's services are joined to that transaction
+    (:meth:`AxentraLink.joined`), and each mirror runs in its own savepoint. A failing mirror rolls back only its
+    savepoint and is logged (``stats.failed``); the Nodestro record and the rest of the caller's transaction are kept,
+    and :meth:`reconcile` writes what is missing later. Tenants without a ``nodestro_tenants`` row (the price
+    reference pseudo tenant, ...) are not mirrored."""
+
+    def __init__(self, link: AxentraLink, *, audit: bool, usage: bool) -> None:
+        self.link = link
+        self.audit_enabled = audit
+        self.usage_enabled = usage
+        self.stats = MirrorStats()
+        self._meters_ready = False
+
+    # -- set-up ------------------------------------------------------------------------------------
+
+    def ensure_meters(self) -> list[str]:
+        """Create the ``nodestro.ai.*`` meters that are missing (idempotent, safe across processes)."""
+        from axentra.core.context import Principal
+        from axentra.core.errors import Conflict
+
+        platform = self.link.services.platform
+        product_id = self.link.services.product_id
+        system = Principal.system("nodestro")
+        existing = {meter.key for meter in platform.usage.list_meters(system, product_id)}
+        created = []
+        for key, unit, description in USAGE_METERS:
+            if key in existing:
+                continue
+            try:
+                platform.usage.create_meter(
+                    system, product_id, key=key, name=key, unit=unit, description=description, reset_period="month"
+                )
+                created.append(key)
+            except Conflict:  # another process created it first
+                pass
+        self._meters_ready = True
+        return created
+
+    # -- the sink ------------------------------------------------------------------------------------
+
+    def audit(
+        self,
+        tenant_id: str,
+        *,
+        event_id: str,
+        at: Any,
+        action: str,
+        actor: str | None,
+        target_type: str,
+        target_id: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> None:
+        if not self.audit_enabled:
+            return
+        self._guarded(
+            "audit",
+            event_id,
+            lambda tx, ax_tenant: self._audit(
+                tx,
+                ax_tenant,
+                action,
+                actor,
+                target_type,
+                target_id,
+                outcome,
+                {**details, "nodestro_at": at.isoformat()},
+            ),
+            tenant_id,
+        )
+
+    def usage(self, tenant_id: str, entry: Any) -> None:
+        if not self.usage_enabled:
+            return
+        self._guarded("usage", entry.id, lambda tx, ax_tenant: self._usage(tx, ax_tenant, entry), tenant_id)
+
+    # -- internals -----------------------------------------------------------------------------------
+
+    def _tenant(self, tenant_id: str) -> str | None:
+        found = self.link.tenant(tenant_id)
+        if found is not None:
+            return found
+        rows = self.link.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
+        if not rows:
+            return None
+        return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
+
+    def _guarded(self, what: str, record_id: str, write: Callable[[Any, str], None], tenant_id: str) -> None:
+        from axentra.data.database import DbScope, join
+
+        try:
+            # A savepoint: a failure (also while creating the Axentra tenant) rolls back the mirror only.
+            with self.link.joined() as connection, connection.transaction():
+                ax_tenant = self._tenant(tenant_id) if tenant_id else None
+                if ax_tenant is None:
+                    self.stats.skipped += 1
+                    return
+                with join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx:
+                    write(tx, ax_tenant)
+        except Exception:
+            self.stats.failed += 1
+            logger.exception("Could not mirror %s record %s of tenant %s into Axentra", what, record_id, tenant_id)
+            return
+        if what == "audit":
+            self.stats.audit += 1
+        else:
+            self.stats.usage += 1
+
+    def _actor(self, actor: str | None) -> tuple[str, str, str]:
+        if actor:
+            user = self.link.lookup("user", actor)
+            if user is not None:
+                return ("user", user, actor)
+        return ("system", "nodestro", actor or "system")
+
+    def _audit(
+        self,
+        tx: Any,
+        ax_tenant: str,
+        action: str,
+        actor: str | None,
+        target_type: str,
+        target_id: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> None:
+        self.link.services.platform.audit.record(
+            tx,
+            None,
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            product_id=self.link.services.product_id,
+            tenant_id=ax_tenant,
+            outcome=outcome,  # type: ignore[arg-type]
+            details=details,
+            actor_override=self._actor(actor),
+        )
+
+    def _usage(self, tx: Any, ax_tenant: str, entry: Any) -> None:
+        from axentra.core.context import Principal
+
+        if not self._meters_ready:
+            raise RuntimeError("the nodestro.ai.* meters are not set up (ensure_meters)")
+        platform = self.link.services.platform
+        properties = {"source": entry.source, "model": entry.model, "estimated": bool(entry.estimated)}
+        for meter, quantity in usage_quantities(entry.usage).items():
+            platform.usage.record_in(
+                tx,
+                Principal.system("nodestro"),
+                self.link.services.product_id,
+                ax_tenant,
+                meter,
+                quantity,
+                usage_key(entry.id, meter),
+                occurred_at=entry.at,
+                properties=properties,
+            )
+
+    # -- reconciliation ------------------------------------------------------------------------------
+
+    def reconcile(self, *, dry_run: bool = False, tenant: str | None = None) -> dict[str, Any]:
+        """Write the mirrors that are missing (a failed mirror, records from before the switch was on).
+
+        Idempotent and resumable: usage replays its idempotency keys (nothing is counted twice; entries older than
+        :data:`USAGE_RECONCILE_DAYS` are reported, not written, because Axentra refuses them); an audit event is
+        written only when no Axentra event carries its ``nodestro_event`` id. Nodestro's records are only read."""
+        from datetime import datetime, timedelta, timezone
+
+        from .tool_approvals import AUDIT, ToolApprovalEvent, audit_details
+        from .usage_log import UsageLog
+
+        report: dict[str, Any] = {
+            "dry_run": dry_run,
+            "tenants": 0,
+            "audit_missing": 0,
+            "usage_missing": 0,
+            "usage_too_old": 0,
+            "written": 0,
+            "failed": 0,
+        }
+        if self.usage_enabled and not dry_run and not self._meters_ready:
+            self.ensure_meters()
+        oldest = datetime.now(timezone.utc) - timedelta(days=USAGE_RECONCILE_DAYS)
+        params: tuple[Any, ...] = ()
+        query = "SELECT id FROM nodestro_tenants"
+        if tenant is not None:
+            query += " WHERE id = %s"
+            params = (tenant,)
+        for (tenant_id,) in self.link.database._query(query + " ORDER BY id", params):
+            tenant_id = str(tenant_id)
+            report["tenants"] += 1
+            store = self.link.database.store(tenant_id)
+            failed_before = self.stats.failed
+            if self.audit_enabled:
+                known = self._mirrored_events(tenant_id)
+                for _, event in store.items(AUDIT, ToolApprovalEvent):
+                    if event.id in known:
+                        continue
+                    report["audit_missing"] += 1
+                    if not dry_run:
+                        with store.transaction():
+                            self.audit(
+                                tenant_id,
+                                event_id=event.id,
+                                at=event.at,
+                                action=f"nodestro.tool_approval.{event.kind}",
+                                actor=event.actor,
+                                target_type="run" if event.run_id else "tool_pre_grant",
+                                target_id=event.run_id or event.pre_grant_id or "",
+                                outcome="denied" if event.kind == "decision_refused" else "success",
+                                details=audit_details(event),
+                            )
+                # MCP events are read as stored documents: the core never imports the MCP client (see
+                # tests/test_mcp_architecture.py); addresses keep only scheme and host here.
+                for data in self._documents(tenant_id, "mcp_events"):
+                    event_id = str(data.get("id", ""))
+                    if not event_id or event_id in known:
+                        continue
+                    report["audit_missing"] += 1
+                    if not dry_run:
+                        with store.transaction():
+                            self.audit(
+                                tenant_id,
+                                event_id=event_id,
+                                at=datetime.fromisoformat(str(data["at"])),
+                                action=f"nodestro.mcp.{data.get('kind', 'event')}",
+                                actor=data.get("actor"),
+                                target_type="mcp_server" if data.get("server_id") else "",
+                                target_id=str(data.get("server_id") or ""),
+                                outcome="success",
+                                details=_stored_mcp_details(data),
+                            )
+            if self.usage_enabled:
+                recorded = self._mirrored_usage(tenant_id)
+                for entry in UsageLog(store).entries():
+                    wanted = set(usage_quantities(entry.usage))
+                    if wanted <= recorded.get(entry.id, set()):
+                        continue
+                    if entry.at < oldest:
+                        report["usage_too_old"] += 1
+                        continue
+                    report["usage_missing"] += 1
+                    if not dry_run:
+                        with store.transaction():
+                            self.usage(tenant_id, entry)
+            written = report["audit_missing"] + report["usage_missing"]
+            report["failed"] += self.stats.failed - failed_before
+            report["written"] = 0 if dry_run else written - report["failed"]
+        return report
+
+    def _documents(self, tenant_id: str, collection: str) -> list[dict[str, Any]]:
+        rows = self.link.database._query(
+            "SELECT data FROM nodestro_documents WHERE tenant_id = %s AND collection = %s AND data IS NOT NULL",
+            (tenant_id, collection),
+        )
+        return [row[0] for row in rows if isinstance(row[0], dict)]
+
+    def _mirrored_events(self, tenant_id: str) -> set[str]:
+        ax_tenant = self.link.tenant(tenant_id)
+        if ax_tenant is None:
+            return set()
+        from axentra.data.database import DbScope, join
+
+        with (
+            self.link.joined() as connection,
+            join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx,
+        ):
+            rows = tx.all(
+                "SELECT details->>'nodestro_event' AS event FROM axentra_audit_events"
+                " WHERE product_id = %s AND tenant_id = %s AND action LIKE 'nodestro.%%'"
+                " AND details ? 'nodestro_event'",
+                (self.link.services.product_id, ax_tenant),
+            )
+        return {str(row["event"]) for row in rows}
+
+    def _mirrored_usage(self, tenant_id: str) -> dict[str, set[str]]:
+        ax_tenant = self.link.tenant(tenant_id)
+        if ax_tenant is None:
+            return {}
+        from axentra.data.database import DbScope, join
+
+        with (
+            self.link.joined() as connection,
+            join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx,
+        ):
+            rows = tx.all(
+                "SELECT idempotency_key FROM axentra_usage_events"
+                " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:usage:%%'",
+                (self.link.services.product_id, ax_tenant),
+            )
+        found: dict[str, set[str]] = {}
+        for row in rows:
+            _, _, entry_id, meter = str(row["idempotency_key"]).split(":", 3)
+            found.setdefault(entry_id, set()).add(meter)
+        return found
+
+
+def _address_only(url: str) -> str:
+    """``scheme://host[:port]`` of ``url``: an address stored before redaction never reaches the mirror whole."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return "(invalid address)"
+    return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "(address)"
+
+
+def _stored_mcp_details(data: dict[str, Any]) -> dict[str, Any]:
+    details: dict[str, Any] = {"nodestro_event": data.get("id"), "nodestro_actor": data.get("actor")}
+    if data.get("tool") is not None:
+        details["tool"] = data["tool"]
+    for key, value in (data.get("details") or {}).items():
+        details[key] = _address_only(value) if key == "url" and isinstance(value, str) else value
+    return details
+
+
+def attach_platform_events(database: PostgresDatabase, link: AxentraLink) -> AxentraEvents | None:
+    """Attach the audit/usage mirror to ``database`` when ``NODESTRO_AXENTRA_AUDIT`` or ``..._USAGE`` is on."""
+    config = link.services.config
+    if not (config.audit or config.usage):
+        return None
+    events = AxentraEvents(link, audit=config.audit, usage=config.usage)
+    if config.usage:
+        events.ensure_meters()
+    database.platform_events = events
+    return events
+
+
 def from_environment(environ: Mapping[str, str] | None = None) -> AxentraConfig:
     """:class:`AxentraConfig` from ``environ`` (default ``os.environ``); ``profile.invalid`` lists every problem."""
     problems: list[dict[str, str]] = []
@@ -675,11 +1079,14 @@ __all__ = [
     "MODULES",
     "PRODUCT_SLUG",
     "SECRET_FIELDS",
+    "USAGE_METERS",
     "AxentraConfig",
+    "AxentraEvents",
     "AxentraLink",
     "AxentraServices",
     "KeyringSecretBox",
     "ReencryptReport",
+    "attach_platform_events",
     "available",
     "axentra_version",
     "build_settings",
@@ -688,4 +1095,6 @@ __all__ = [
     "reencrypt_tenant_secrets",
     "secret_context",
     "tenant_slug",
+    "usage_key",
+    "usage_quantities",
 ]

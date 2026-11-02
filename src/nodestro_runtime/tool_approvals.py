@@ -38,6 +38,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, Field
 
 from .mcp_access import UNATTENDED_TRIGGERS
+from .platform_events import platform_events
 from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
@@ -156,8 +157,38 @@ class ToolApprovalEvent(BaseModel):
 
 
 def record_audit(store: DocumentStore, event: ToolApprovalEvent) -> ToolApprovalEvent:
-    store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
+    """Store ``event``; with a platform sink (:mod:`.platform_events`) its mirror commits in the same transaction."""
+    sink = platform_events(store)
+    if sink is None:
+        store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
+        return event
+    with store.transaction():
+        store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
+        sink.audit(
+            str(getattr(store, "tenant_id", "")),
+            event_id=event.id,
+            at=event.at,
+            action=f"nodestro.tool_approval.{event.kind}",
+            actor=event.actor,
+            target_type="run" if event.run_id else "tool_pre_grant",
+            target_id=event.run_id or event.pre_grant_id or "",
+            outcome="denied" if event.kind == "decision_refused" else "success",
+            details=audit_details(event),
+        )
     return event
+
+
+def audit_details(event: ToolApprovalEvent) -> dict[str, Any]:
+    """What the platform mirror of ``event`` keeps: ids, the tool, the result and the arguments' hash (never the
+    arguments themselves); ``details`` are Nodestro's own, already free of secrets and arguments."""
+    found: dict[str, Any] = {"nodestro_event": event.id, "nodestro_actor": event.actor}
+    for name in ("tool", "run_id", "request_id", "pre_grant_id", "outcome", "arguments_hash"):
+        value = getattr(event, name)
+        if value is not None:
+            found[name] = value
+    if event.details:
+        found["details"] = event.details
+    return found
 
 
 def audit_events(store: DocumentStore, *, limit: int = 200) -> list[ToolApprovalEvent]:

@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 3 |
+| P2 Medium | 4 |
 | P3 Low | 19 |
 | P4 Optional | 6 |
 
@@ -103,6 +103,17 @@ None known.
 - **Next step:** Extract one clearly bounded part (tool approvals, persistence or resume) with the next functional
   change to it; no big-bang refactor.
 
+### RT-030 · Axentra migration follow-ups
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`
+- **What:** The server profile can use Axentra (off by default) for keyring secrets, tenant links and the audit and
+  usage mirrors. Open: identity on Axentra (users, external identities, sessions; no merge by e-mail), API keys,
+  a dedicated database role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, mirroring run usage (needs a per-run
+  idempotency key and a billing decision), Axentra-side enforcement of limits, and a staging run of
+  migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
+- **Next step:** Finish the identity mirror, then an independent security review before any switch is turned on in
+  production. No switch is activated in production by this work.
+
 ## Performance
 
 ### RT-008 · PostgreSQL store throughput and serialized writes
@@ -124,12 +135,15 @@ None known.
 
 ### RT-010 · Rotation of the server secret key
 
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** `server_settings.py` module docstring, README
-- **What:** Changing `NODESTRO_SECRET_KEY` makes every stored tenant secret unreadable; there is no way to re-encrypt
-  with a new key, for example after a suspected key exposure.
-- **Next step:** Let `SecretBox` accept an old key for decryption during a transition and add a re-encrypt
-  function; the operator command lives in nodestro-api.
-- **Depends on:** nodestro-api (operator CLI)
+- **Priority:** P2 Medium · **Status:** In progress · **Refs:** `server_settings.py`, `axentra_platform.py`,
+  `docs/AXENTRA.md`
+- **What:** Changing `NODESTRO_SECRET_KEY` makes every stored tenant secret unreadable.
+- **Done (2026-11-02, Axentra migration):** with `NODESTRO_AXENTRA=on` and `NODESTRO_SECRETS_FORMAT=axs1` tenant
+  secrets use Axentra's keyring (several keys, rotation); `reencrypt_tenant_secrets` (operator command
+  `nodestro-server secrets reencrypt`) moves v1 values and older keyring keys to the active key, resumable and
+  without ever overwriting an unreadable value. Tested on PostgreSQL.
+- **Next step:** Servers that keep the v1 format still cannot rotate `NODESTRO_SECRET_KEY`; decide whether the
+  keyring becomes the default for new servers (then v1 is read-only), and run the procedure on a staging copy.
 
 ### RT-011 · Machine-readable catalog of error codes (X-03)
 
@@ -231,6 +245,9 @@ None known.
 - **Next step:** Decide on 3.11 as the minimum together with the dependent repositories (this entry holds the
   platform decision; orkexa ORK-007, nodestro-api API-025 and nodestro-sdk SDK-013 follow it), then update the
   classifiers, ruff/mypy targets and CI matrix.
+- **Interim decision (2026-11-02, Axentra migration):** Axentra (3.11+) is installed only through the `postgres` and
+  `dev` extras with the marker `python_version >= '3.11'`; the server image runs 3.13. On 3.10 the package, the
+  desktop and Local Docker keep working and `NODESTRO_AXENTRA=on` is refused. 3.10 is not dropped by this change.
 
 ### RT-023 · Reproducible Python dependencies
 

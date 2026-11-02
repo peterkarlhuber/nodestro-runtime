@@ -177,6 +177,9 @@ class PostgresDatabase:
             DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT,
             minimum=0,
         )
+        #: Mirrors audit events and AI usage into a platform backend (:mod:`~nodestro_runtime.platform_events`);
+        #: ``None``: nothing is mirrored. A server sets it when ``NODESTRO_AXENTRA_AUDIT`` or ``..._USAGE`` is on.
+        self.platform_events: Any = None
         self._conninfo = conninfo
         self._connect_kwargs: dict[str, Any] = {"autocommit": True, "connect_timeout": connect_timeout}
         #: Serializes the transactions (and so the writes) of this process, as with one connection: a thread that
@@ -562,6 +565,11 @@ class PostgresStore:
 
     def transaction(self) -> Any:
         return self.database.transaction()
+
+    @property
+    def platform_events(self) -> Any:
+        """The database's platform event sink (:mod:`~nodestro_runtime.platform_events`), ``None`` when off."""
+        return self.database.platform_events
 
     def _check(self) -> None:
         if self._closed:

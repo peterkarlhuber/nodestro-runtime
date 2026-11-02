@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
+
+- New `nodestro_runtime.axentra_platform` and `docs/AXENTRA.md`. `NODESTRO_AXENTRA=on` opens Axentra in the server's
+  PostgreSQL database (product `nodestro`, single-product mode, keyring from `NODESTRO_AXENTRA_KEYRING[_FILE]`).
+  `nodestro-runtime[postgres]` and `[dev]` install `axentra[oidc]` from a pinned commit on Python 3.11+ only; 3.10
+  keeps working without it.
+- Tenant secrets: `KeyringSecretBox` reads `nodestro:enc:v1:` and Axentra `axs1` values and writes the format of
+  `NODESTRO_SECRETS_FORMAT` (`v1` default). `reencrypt_tenant_secrets` moves provider keys, MCP tokens, pending OAuth
+  state and billing admin keys to the active key: resumable, idempotent, never overwrites an unreadable value.
+- PostgreSQL migration `0007_axentra_links` (`nodestro_axentra_ids`, schema version 7) and `AxentraLink`: Nodestro
+  tenants are linked to Axentra tenants in the same transaction (advisory lock, unique slugs, idempotent backfill).
+- Audit and usage mirrors (`NODESTRO_AXENTRA_AUDIT`, `NODESTRO_AXENTRA_USAGE`): tool approval events, MCP events
+  and usage ledger entries are mirrored into Axentra in the same transaction as Nodestro's record, in a savepoint
+  that never fails Nodestro's write; `AxentraEvents.reconcile` writes what is missing, idempotently. New
+  `nodestro_runtime.platform_events` (the sink protocol; never imports Axentra), `PostgresDatabase.platform_events`.
+- New `tests/test_axentra_platform.py` and `tests/test_axentra_mirror.py`.
+
 Automatic sandbox selection (sandbox architecture Phase E, 2026-11-02):
 
 - The desktop `sandbox` setting has a new mode `auto`, the default when nothing was chosen. Untrusted (AI-generated)

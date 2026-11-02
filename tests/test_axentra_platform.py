@@ -86,9 +86,7 @@ def test_the_keyring_comes_from_the_environment_or_a_file_and_stays_out_of_repr(
 def test_axentra_settings_follow_nodestros_server(tmp_path: Path) -> None:
     config_file = tmp_path / "axentra.toml"
     config_file.write_text('[product]\nslug = "other"\n[security]\nsession_idle_minutes = 30\n')
-    config = AxentraConfig(
-        enabled=True, keyring=f"k1:{_key()}", keyring_ref="env:RING", config_file=str(config_file)
-    )
+    config = AxentraConfig(enabled=True, keyring=f"k1:{_key()}", keyring_ref="env:RING", config_file=str(config_file))
     built = axentra_platform.build_settings(
         config, database_url="postgresql://u@db/n", public_origin="https://studio.example", schema="tenant_data"
     )
