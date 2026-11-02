@@ -131,6 +131,7 @@ def _services(database: Any, **config: Any) -> Any:
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        database=database,
     )
     services.migrate()
     services.start()
@@ -573,7 +574,7 @@ def test_metrics_show_pools_jobs_schema_and_backlog_without_tenant_data(runs: tu
     text = metrics.render()
     for line in (
         'nodestro_db_pool_size{pool="nodestro"}',
-        'nodestro_db_pool_in_use{pool="axentra"}',
+        'nodestro_db_pool_in_use{pool="nodestro"}',
         'nodestro_jobs{kind="run",status="queued"} 1',
         'nodestro_schema_version{runner="nodestro",version="current"}',
         "nodestro_axentra_migrations_pending 0",
@@ -585,6 +586,7 @@ def test_metrics_show_pools_jobs_schema_and_backlog_without_tenant_data(runs: tu
         assert line in text, line
     for private in ("alpha", "beta", "run_ok", "wf_1", "Check"):
         assert private not in text
+    assert 'pool="axentra"' not in text  # Axentra borrows Nodestro's pool: one series, not a duplicate
     shared = axentra_metrics.ServerMetrics(
         database, events.link.services, pools=lambda: {"shared": database._pool}
     ).render()

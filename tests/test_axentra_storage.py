@@ -129,6 +129,7 @@ def open_services(database: Any, tmp_path: Path, storage: str, **config: Any) ->
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        database=database,
     )
     services.migrate()
     services.start()

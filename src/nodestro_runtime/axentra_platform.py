@@ -360,9 +360,10 @@ class AxentraServices:
     ``database``: the process's :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Axentra then borrows its
     pool (``axentra.data.Database.on_pool``): one connection budget per process (``NODESTRO_DATABASE_POOL_SIZE``),
     the same role, ``search_path`` and time limits; Axentra's scope settings are transaction-local, so nothing of
-    them stays on a connection Nodestro gets back. Without it (``migrate`` and other commands that only need the
-    migration runner), Axentra builds its own pool, opened by :meth:`start` only. ``migration_url``: the owner role's
-    connection for Axentra's migrations (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
+    them stays on a connection Nodestro gets back. :meth:`start` needs it: Axentra never opens a pool of its own in a
+    Nodestro process. Without it only what needs no pool works (``migrate``: Axentra's migration runner opens its own
+    connections; the settings). ``migration_url``: the owner role's connection for Axentra's migrations
+    (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
     """
 
     def __init__(
@@ -398,6 +399,12 @@ class AxentraServices:
     def start(self) -> None:
         from axentra.core.errors import AxentraError
 
+        if self.database is None:
+            # A second pool would break the process's connection budget (one pool per process, M10).
+            raise NodestroError(
+                "axentra.unavailable",
+                "Axentra starts only on the process's database pool (AxentraServices(database=...))",
+            )
         try:
             # Stricter than Axentra's own check (production only), and before anything is written: row-level security
             # must apply to the runtime role in every environment, unless the operator allowed a privileged role.
