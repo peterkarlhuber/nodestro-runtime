@@ -146,6 +146,51 @@ jobs:
       - name: Security probes and compatibility checks
         run: python -m nodestro_runtime.sandbox_probes --env-python "$RUNNER_TEMP/env/bin/python"
 
+  builtin-sandbox-arm64:
+    # Linux on AArch64 (a real arm64 runner): the built-in sandbox's seccomp filter and probes use x86-64 system call
+    # numbers, so it must report itself unavailable here and its confinement script must refuse before any code runs
+    # (docs/sandbox-arm64.md). Untrusted code then needs Docker. The job fails if the sandbox ever becomes available
+    # on this architecture without its own evidence.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      # The Nodestro components and orkexa are private: pip clones them with a token that can read them.
+      # The token exists only in this step's environment: no global Git configuration, nothing for later steps.
+      - name: Install with read access to the private repositories
+        env:
+          NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
+        run: |
+          if [ -z "$NODESTRO_READ" ]; then
+            echo "::error::Secret NODESTRO_READ is missing: a token with read access to orkexa and the nodestro repositories."
+            exit 1
+          fi
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
+          pip install -e ".[dev]"
+      - name: Kernel features
+        run: |
+          id; uname -m; uname -r; cat /sys/kernel/security/lsm; echo
+          python -c "import platform, struct; print(platform.machine(), struct.calcsize('P') * 8, 'bit')"
+          python -c "from nodestro_runtime.sandbox_confine import landlock_abi; print('landlock ABI', landlock_abi())"
+      - name: The sandbox fails closed on AArch64
+        run: pytest -v tests/test_sandbox_arch.py tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+      - name: The probe command reports the sandbox unavailable (exit status 2, reason platform)
+        run: |
+          set +e
+          python -I -m nodestro_runtime.sandbox_probes --json > "$RUNNER_TEMP/probes.json"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/probes.json"
+          test "$code" = 2
+          python -c "import json, sys; s = json.load(open(sys.argv[1]))['status']; assert not s['available'] and s['reason'] == 'platform', s" "$RUNNER_TEMP/probes.json"
+
   package:
     # The wheel installs on its own and contains what the package needs at run time.
     runs-on: ubuntu-latest
