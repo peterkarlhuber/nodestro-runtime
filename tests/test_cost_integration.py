@@ -60,9 +60,9 @@ def _flow(model: str = "anthropic:claude-sonnet-5-5") -> WorkflowIn:
     )
 
 
-async def _run(workspace: Workspace, flow: WorkflowIn) -> Any:
+async def _run(workspace: Workspace, flow: WorkflowIn, *, trigger: Any = "manual") -> Any:
     saved = workspace.save_workflow(flow)
-    started = await workspace.run(saved, RunIn(input="x"))
+    started = await workspace.run(saved, RunIn(input="x"), trigger=trigger)
     return await workspace.wait(started.id, timeout=20)
 
 
@@ -274,7 +274,8 @@ async def test_strict_mode_refuses_a_request_that_could_exceed_the_budget(make: 
     workspace = make({"A": [text("ok")]})
     workspace.update_settings(SettingsIn(price_mode="strict"))
     # 16,000 output tokens could cost far more than one cent, so the request is not sent.
-    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}))
+    # Unattended: refused and failed as before (an attended run waits for a budget decision instead).
+    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}), trigger="schedule")
     assert done.status == "failed"
     assert done.usage.requests == 0
     assert done.nodes["a"].error_code == "run.budget_exceeded"
@@ -282,6 +283,7 @@ async def test_strict_mode_refuses_a_request_that_could_exceed_the_budget(make: 
 
 async def test_standard_mode_runs_an_oversized_request_alone_and_reports_it(make: Make) -> None:
     workspace = make({"A": [text("ok")]})
-    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}))
+    # Unattended runs keep the standard mode's behaviour; attended runs ask before such a request (BUDGET-1).
+    done = await _run(workspace, _flow().model_copy(update={"budget_usd": 0.01}), trigger="schedule")
     assert done.status == "succeeded", done.error
     assert done.usage.uncapped_requests == 1 and done.budget_hard_maximum is False
