@@ -42,10 +42,10 @@ jobs:
             export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
             export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
           fi
-          # Windows ARM64: cryptography (needed by google-auth through orkexa) publishes win_arm64 wheels only up to
-          # 46.x; newer versions would be compiled from source, which needs Rust and OpenSSL on the runner.
+          # Windows ARM64: cryptography (needed by google-auth through orkexa) published win_arm64 wheels last for
+          # 46.0.3; newer versions would be compiled from source, which needs Rust and OpenSSL on the runner.
           if [ "$RUNNER_OS" = "Windows" ] && [ "$RUNNER_ARCH" = "ARM64" ]; then
-            echo "cryptography<47" > "$RUNNER_TEMP/constraints.txt"
+            echo "cryptography==46.0.3" > "$RUNNER_TEMP/constraints.txt"
             export PIP_CONSTRAINT="$RUNNER_TEMP/constraints.txt"
           fi
           # Without the dev extra: psycopg-binary (the server profile) has no Windows ARM64 wheel, and the desktop
