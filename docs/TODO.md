@@ -119,6 +119,12 @@ None known.
   Input files (`NODESTRO_FILES_BACKEND=axentra`, M8): open are a staging run of `files migrate/verify` against a real
   S3 bucket (tested only with moto's S3 server) and quota defaults per plan. Knowledge files are deliberately not
   moved (already in PostgreSQL with their search index).
+  rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys,
+  mirroring run usage (needs a per-run idempotency key and a billing decision), Axentra-side enforcement of limits,
+  and a staging run of migrate/backfill/reencrypt/reconcile with restore under the owner/runtime roles of
+  `docs/AXENTRA.md` ("Database roles"). Jobs stay Nodestro's (different guarantees, see the doc). Decided, not
+  pursued: running Nodestro's migrations on Axentra's runner (M9) and row-level security on `nodestro_*` tables (M10);
+  the reasons and measurements are in the doc.
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 

@@ -23,6 +23,25 @@ Identity completion (Axentra migration M5, risks 7 and 10; off by default):
   `editor`/`operator` are applied with Axentra's `ax.access_definitions` (`ACCESS_REVISION`, content hash pinned by a
   test) instead of creating roles at every start; a conflicting revision stops the start (`identity.access_conflict`).
   In `axentra` mode `Session.permissions` comes from Axentra's role definitions. Needs Axentra with migration `0009`.
+Database roles, one connection pool, migration checksums (Axentra migration, work package dbinfra):
+
+- `grant_runtime_role(owner_database, role)` and `inspect_role` in `storage_postgres`: a runtime role gets data
+  privileges only (tables, sequences, functions, default privileges for later migrations; schema versions
+  read-only); refused for the owner itself, superusers, `BYPASSRLS` and table-owning roles.
+  `PostgresDatabase.role_info()`. `ServerSettings` reads `NODESTRO_DATABASE_MIGRATION_URL[_FILE]` (the owner role;
+  default: `NODESTRO_DATABASE_URL`).
+- `AxentraServices(database=..., migration_url=...)`: Axentra borrows the `PostgresDatabase` pool
+  (`PostgresDatabase.shared_pool()`, Axentra `Database.on_pool`) and migrates with the owner's connection; its serving
+  gate reads through the runtime pool. `start()` refuses a superuser, `BYPASSRLS` or table-owning role in every
+  environment unless `NODESTRO_AXENTRA_ALLOW_SUPERUSER=1`, before writing anything.
+- Migrations record a SHA-256 checksum per file (`nodestro_schema_migrations.checksum`, added by the runner); a changed
+  applied migration is refused (`storage.migration_changed`) by `migrate` and `require_current_schema`; rows of
+  earlier releases are adopted once. `migrate` no longer needs the CREATE privilege on the database when its schema
+  exists.
+- Tests: `tests/test_database_roles.py`, `tests/test_tenant_filters.py`, checksum cases in
+  `tests/test_storage_postgres.py`; `NODESTRO_TEST_RUNTIME_ROLE=1` runs every PostgreSQL test as a runtime role
+  (migrations as the owner). Measurements: `tests/bench_shared_pool.py`, `tests/bench_nodestro_rls.py`
+  (`docs/AXENTRA.md`). Needs Axentra with `Database.on_pool` and the `joined`/`join` scope fix.
 
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 

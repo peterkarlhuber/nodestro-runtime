@@ -22,7 +22,7 @@ pytest.importorskip("psycopg")
 import psycopg
 
 from nodestro_runtime.jobs import LeaderLock
-from nodestro_runtime.storage_postgres import POSTGRES_SCHEMA_VERSION, PostgresDatabase
+from nodestro_runtime.storage_postgres import POSTGRES_SCHEMA_VERSION, PostgresDatabase, postgres_migrations
 
 
 @pytest.fixture
@@ -258,7 +258,7 @@ def test_migrate_has_no_statement_time_limit(schema: str) -> None:
     try:
         current = POSTGRES_SCHEMA_VERSION
         slow = {current + 1: ("slow.sql", "SELECT pg_sleep(0.5)")}
-        steps = {**{version: ("x", "SELECT 1") for version in range(1, current + 1)}, **slow}
+        steps = {**postgres_migrations(), **slow}
         assert database.migrate(migrations=steps, before_migration=lambda *_: None) == current
         assert database.schema_version == current + 1
     finally:

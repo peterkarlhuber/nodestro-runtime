@@ -69,7 +69,7 @@ def mirror(database: PostgresDatabase, services: Any) -> AxentraIdentityStore:
 
 
 def _count(database: PostgresDatabase, sql: str, *params: Any) -> int:
-    return int(database._query(sql, params)[0][0])
+    return int(postgres_support.owner_of(database)._query(sql, params)[0][0])
 
 
 def _seed(identity: IdentityStore) -> dict[str, Any]:
@@ -129,7 +129,7 @@ def test_the_store_follows_the_switch(database: PostgresDatabase, services: Any)
     assert caught.value.code == "profile.invalid"
     mirrored = open_identity_store(database, config, services)
     assert isinstance(mirrored, AxentraIdentityStore) and mirrored.mode == "mirror"
-    roles = {row[0] for row in database._query("SELECT key FROM axentra_roles")}
+    roles = {row[0] for row in postgres_support.owner_of(database)._query("SELECT key FROM axentra_roles")}
     assert roles == set(CUSTOM_ROLES)
 
 
@@ -153,7 +153,7 @@ def test_every_write_reaches_both_sides(database: PostgresDatabase, mirror: Axen
     assert identity_readiness(mirror) == []
     roles = {
         row[0]: row[1]
-        for row in database._query(
+        for row in postgres_support.owner_of(database)._query(
             "SELECT l.nodestro_id, m.role FROM axentra_memberships m JOIN nodestro_axentra_ids l"
             " ON l.kind = 'user' AND l.axentra_id = m.user_id JOIN nodestro_axentra_ids t ON t.kind = 'tenant'"
             " AND t.axentra_id = m.tenant_id WHERE t.nodestro_id = 'acme'"
@@ -211,12 +211,12 @@ def test_a_failing_nodestro_write_rolls_back_the_axentra_write(
     user = mirror.login(ISSUER, "sub-1")
     mirror.set_role("acme", user.id, "owner")
     before = _count(database, "SELECT count(*) FROM axentra_audit_events")
-    database._write(
+    postgres_support.owner_of(database)._write(
         "CREATE FUNCTION refuse_session() RETURNS trigger LANGUAGE plpgsql AS"
         " $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
         (),
     )
-    database._write(
+    postgres_support.owner_of(database)._write(
         "CREATE TRIGGER refuse BEFORE INSERT ON nodestro_sessions FOR EACH ROW EXECUTE FUNCTION refuse_session()", ()
     )
     with pytest.raises(psycopg.Error):
@@ -266,7 +266,7 @@ def test_two_issuers_with_one_address_stay_two_people(database: PostgresDatabase
         "Alice@Example.com",
         "alice@example.com",
     )  # Nodestro keeps both addresses
-    rows = database._query(
+    rows = postgres_support.owner_of(database)._query(
         "SELECT l.nodestro_id, u.email, i.provider FROM nodestro_axentra_ids l JOIN axentra_users u ON u.id ="
         " l.axentra_id JOIN axentra_user_identities i ON i.user_id = u.id WHERE l.kind = 'user' ORDER BY i.provider"
     )
@@ -280,7 +280,7 @@ def test_two_issuers_with_one_address_stay_two_people(database: PostgresDatabase
     mirror.login(ISSUER, "alice", email=None, name="Alice")
     mirror.login(OTHER, "alice-elsewhere", email="alice@example.com", name="Alice too")
     emails = dict(
-        database._query(
+        postgres_support.owner_of(database)._query(
             "SELECT l.nodestro_id, u.email FROM nodestro_axentra_ids l JOIN axentra_users u ON u.id = l.axentra_id"
         )
     )
@@ -369,11 +369,13 @@ def test_axentra_mode_reads_axentra(database: PostgresDatabase, services: Any) -
     assert axentra.members("acme") == plain.members("acme")
     owner = seeded["people"]["owner"]
     # A change made on Axentra's side alone is what axentra mode sees (and what reconcile reports).
-    database._write("UPDATE axentra_memberships SET role = 'viewer' WHERE role = 'tenant_admin'", ())
+    postgres_support.owner_of(database)._write(
+        "UPDATE axentra_memberships SET role = 'viewer' WHERE role = 'tenant_admin'", ()
+    )
     admin = seeded["people"]["admin"]
     assert axentra.role("acme", admin.id) == "viewer" and plain.role("acme", admin.id) == "admin"
     assert axentra.session(seeded["tokens"]["admin"]).role == "viewer"  # type: ignore[union-attr]
-    database._write(
+    postgres_support.owner_of(database)._write(
         "UPDATE axentra_users SET status = 'disabled' WHERE id = %s", (axentra.link.lookup("user", owner.id),)
     )
     assert axentra.session(seeded["tokens"]["owner"]) is None
@@ -453,11 +455,13 @@ def test_reconcile_finds_drift(database: PostgresDatabase, services: Any) -> Non
     seeded = _seed(IdentityStore(database))
     store = _store(database, services, "mirror")
     backfill_identity(store)
-    database._write("DELETE FROM axentra_memberships WHERE role = 'operator'", ())
-    database._write(
+    postgres_support.owner_of(database)._write("DELETE FROM axentra_memberships WHERE role = 'operator'", ())
+    postgres_support.owner_of(database)._write(
         "UPDATE axentra_sessions SET revoked_at = now() WHERE id IN (SELECT id FROM axentra_sessions LIMIT 1)", ()
     )
-    database._write("UPDATE axentra_users SET name = 'Somebody else' WHERE email = 'admin@example.com'", ())
+    postgres_support.owner_of(database)._write(
+        "UPDATE axentra_users SET name = 'Somebody else' WHERE email = 'admin@example.com'", ()
+    )
     IdentityStore(database).create_tenant("late", "Created while the mirror was off")
     report = reconcile_identity(store).as_dict()
     assert not report["ok"]
