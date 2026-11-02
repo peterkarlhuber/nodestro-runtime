@@ -908,6 +908,11 @@ class RunManager:
         self.remote_cancel: Callable[[Run], bool] | None = None
         #: Receives every event of the runs executing in this process (the server's event table).
         self.event_sink: Callable[[RunEvent], None] | None = None
+        #: Queue execution (C-06, M11): whether this process still holds the job of a top-level run it executes,
+        #: asked right before every model request and tool call, so a worker whose lease was lost (a stalled
+        #: heartbeat) never pays for a model call or makes a call with outside effects for a run that is no longer
+        #: its own. ``None``: not asked (the desktop, runs not claimed from the queue).
+        self.owns: Callable[[str], bool] | None = None
         #: Reads the stored events of a run executing in another process: ``(run_id, after_seq)`` -> the next
         #: events in order (the server's event table). With it, :meth:`subscribe` and :meth:`is_live` follow such
         #: runs, and :meth:`wait` waits for them.
@@ -1215,6 +1220,22 @@ class RunManager:
         else:
             done = self.store.replace_if("runs", run.id, stored, field="status", expected=status)
         return new if done else None
+
+    def _check_owned(self, context: _RunContext) -> None:
+        """Stop a queue execution whose worker no longer holds the run's job before it calls a model or a tool
+        (C-06, M11): the run is no longer this process's, so nothing more is paid for, done outside or stored.
+        A failing check counts as lost (an effect outside Nodestro is never risked on a guess)."""
+        owns = self.owns
+        root = context.root
+        if owns is not None and root.fence is not None and not root.fenced_out:
+            try:
+                owned = owns(root.run.id)
+            except Exception:
+                logger.exception("Checking whether this process still holds run %s failed", root.run.id)
+                owned = False
+            if not owned:
+                self._lose_fence(root, "the worker no longer holds the run's job")
+        context.check()
 
     def _lose_fence(self, root: _RunContext, because: str) -> None:
         with root.fence_lock:
@@ -3259,7 +3280,7 @@ class RunManager:
         assert config is not None
 
         def on_request(_args: dict[str, Any]) -> None:
-            context.check()
+            self._check_owned(context)
             context.tracker.check()
 
         agent = AgentConfig(
@@ -3323,7 +3344,7 @@ class RunManager:
             self._emit(context, "thinking", node_id, delta=delta)
 
         def on_request(_args: dict[str, Any]) -> None:
-            context.check()
+            self._check_owned(context)
             context.tracker.check()
 
         def before_tool(call: ToolCall) -> str | None:
@@ -3349,6 +3370,9 @@ class RunManager:
             elif call.resumed:
                 pass  # an own tool never waits, so it is never resumed
             if denial is None and not own:
+                # Asked after the gate (a person may have decided long after the call was asked for): a worker that
+                # lost the run's job meanwhile never makes the call (M11).
+                self._check_owned(context)
                 # Stored before the call runs: if the process dies now, the run still shows that this node may
                 # have had effects outside Nodestro, and continuing it asks first (audit B-02).
                 tool_journal.record(self.store, context.run.id, node_id, iteration, call.id, call.name, call.input)

@@ -151,9 +151,41 @@ as closed. Axentra's own HTTP API and admin functions are not exposed through No
 
 ## What stays Nodestro's
 
-- **Jobs.** Nodestro's job queue keeps its guarantees: one active job per `(tenant, kind, ref)`, the run fence
-  (compare-and-set), interruption on lease loss, never a blind retry of model calls or external writes. Axentra's
-  jobs are at-least-once with a reaper that re-queues, so they are not a drop-in replacement.
+- **Jobs: M11 closed by architecture decision (variant B, final).** Run execution stays on Nodestro's own queue
+  (`nodestro_runtime.jobs`, `nodestro_api.worker`, tables `nodestro_jobs`, `nodestro_run_events`,
+  `nodestro_schedule_firings`) permanently; there is no `AxentraQueue` adapter and no switch for it. Axentra's jobs,
+  events and schedules remain the infrastructure for generic work of the platform, never for work that calls a
+  model or a tool. Variant A (Axentra gets configurable at-most-once semantics that fully cover Nodestro) was
+  evaluated and rejected:
+  - *The guarantee is not a queue property.* "Never pay twice, never write outside twice" comes from the queue
+    **together with** the run fence (a compare-and-set on the run document in `nodestro_documents`), the
+    `run.interrupted` state and its sub-workflow cascade, the tool journal and the continue confirmation
+    (`resume.plan`), the tool-approval checkpoints and a worker capacity model in which waiting runs keep their slot
+    (`WaitingSlots`). Moving only the queue would leave all of these in Nodestro and add a callback from Axentra's
+    reaper (interrupt the run) and into its claim loop (capacity), across two transactions and two schemas.
+  - *What Axentra would have to add is Nodestro's semantics, not a generic feature.* "No retry" is already possible
+    there (`max_attempts=1`: a lost lease makes the job `dead`); what is missing is a unique *active* key per piece
+    of work (Axentra's idempotency keys deduplicate for good), an `interrupted` outcome with a domain callback, a
+    claim gate fed by the product's own capacity, and asyncio-held runs instead of one thread per job. Only the
+    first is generally useful, and no other Axentra product needs it today.
+  - *Tenancy.* Axentra jobs are scoped by Axentra product and tenant with row-level security; with
+    `NODESTRO_IDENTITY_BACKEND=nodestro` (the default) or a 3.10 server without the package there is no Axentra
+    tenant to scope a run to, and the queue must work there.
+  - *Cost and risk without gain.* M11 would have meant draining the queue at the switch, rewriting the worker and
+    re-proving every property below, for one table less. Axentra's default semantics, used naively, would have
+    re-run a handler after a lease loss while the old worker was still running it (proven by axentra
+    `tests/integration/test_job_delivery_semantics.py`).
+
+  The evidence is a set of tests on real PostgreSQL: `tests/test_job_delivery.py` (a worker killed with SIGKILL
+  during a model call; a stalled worker whose run was interrupted makes no further model or tool call; an external
+  write before a lost lease is repeated only after a person confirms; four parallel workers execute twelve runs
+  exactly once each; cancel and resume reuse finished steps; a nested sub-workflow of a worker that lost its lease
+  stores and calls nothing more), together with `test_jobs.py` (one active job, `SKIP LOCKED`, owner-only renewal,
+  reaped once, schedule slots, leader lock), `test_run_fencing.py`, `test_worker_approvals.py` (capacity slots, a
+  killed worker while a question waits, load), `test_worker_checkpoints.py` (paused calls resumed exactly once) and
+  `test_resume_side_effects.py`. Since this decision a queue execution also asks the queue whether its worker still
+  holds the job before every model request and every tool call (`RunManager.owns`, `RunWorker.owns`), so a worker
+  with a stalled heartbeat stops before it acts, not only at its next renewal.
 - **Workflow, run, knowledge and memory data**, tool approvals, MCP, execution permissions and the Studio UI.
 
 ## Rollback

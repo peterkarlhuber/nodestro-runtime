@@ -9,6 +9,10 @@ processes (:class:`RunWorker`) claim jobs and execute them.
 - A claimed job has a **lease** that the worker renews with :meth:`JobQueue.heartbeat`. When a worker dies, its
   lease expires and :func:`reap` marks the job and its run as **interrupted**. Such a job is never executed again
   automatically: model calls cost money and tools have side effects, so a person decides whether to continue.
+  Before every model request and tool call, an executing run asks whether its worker still holds the job
+  (:meth:`RunWorker.owns`, which also renews the lease): a worker whose heartbeat stalled stops there instead of
+  acting for a run that the reaper already interrupted. This queue is deliberately not Axentra's at-least-once job
+  queue (M11 / G-8, ``docs/AXENTRA.md``).
 - **Cancelling** a queued job withdraws it at once; a running job gets ``cancel_requested``, which its worker reads
   with the next heartbeat and passes to the run.
 - A worker **holds** at most ``max_runs`` runs (default 2), of which at most ``max_waiting`` (default 1) may wait for a
@@ -353,6 +357,8 @@ class RunWorker:
         self.poll = poll
         self.flush_seconds = flush
         self._logs: dict[str, PostgresEventLog] = {}
+        #: The job of every run executing here, by ``(tenant, run)``: what :meth:`owns` asks the queue about.
+        self._jobs: dict[tuple[str, str], int] = {}
         #: The worker's own threads for its queue work (claims, lease renewal, event flushes; C-08), one per held run
         #: and one for claims: they never wait behind agents or other work in asyncio's default executor.
         self._queue_threads = concurrent.futures.ThreadPoolExecutor(
@@ -371,10 +377,18 @@ class RunWorker:
         gate = getattr(runs, "tool_gate", None)
         if gate is not None:
             gate.slots = self.slots
+        runs.owns = lambda run_id: self.owns(tenant_id, run_id)
         runs.dispatch = None
         runs.remote_cancel = None
         runs.remote_events = None
         return runs
+
+    def owns(self, tenant_id: str, run_id: str) -> bool:
+        """Whether this worker still holds the job of a run it executes (renewing its lease); the run manager asks
+        before every model request and tool call (M11), so a worker that lost its lease stops before it pays for
+        or does anything more, not only at its next heartbeat."""
+        job_id = self._jobs.get((tenant_id, run_id))
+        return job_id is not None and self.queue.heartbeat(job_id, self.name) is not None
 
     async def run_once(self) -> Job | None:
         """Claim one job and execute it to its end (or pause); ``None`` when the queue was empty."""
@@ -385,6 +399,15 @@ class RunWorker:
         return job
 
     async def _execute(self, job: Job) -> None:
+        key = (job.tenant_id, job.ref)
+        self._jobs[key] = job.id
+        try:
+            await self._execute_held(job)
+        finally:
+            if self._jobs.get(key) == job.id:
+                del self._jobs[key]
+
+    async def _execute_held(self, job: Job) -> None:
         try:
             runs = self._manager(job.tenant_id)
             runs.execute_claimed(job.ref)

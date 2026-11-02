@@ -256,6 +256,14 @@ None known.
 - **Interim decision (2026-11-02, Axentra migration):** Axentra (3.11+) is installed only through the `postgres` and
   `dev` extras with the marker `python_version >= '3.11'`; the server image runs 3.13. On 3.10 the package, the
   desktop and Local Docker keep working and `NODESTRO_AXENTRA=on` is refused. 3.10 is not dropped by this change.
+- **Review (2026-11-02):** no shipped artifact runs 3.10: the desktop bundles python-build-standalone 3.13
+  (nodestro-desktop `scripts/build_backend.sh`), the server and Local Docker images use `python:3.13-slim`
+  (nodestro-server `image/Dockerfile`). Raising the minimum affects only pip installs of the libraries and the CI
+  legs. Recommendation: 3.11 in all Python repositories at once (orkexa first, then runtime, examples,
+  integrations, api, sdk, studio), then drop the 3.10 workarounds: the `mcp` and `axentra` markers, the
+  `tomllib` fallback in `python_deps.py` and studio `scripts/check_versions.py`, the `sys.version_info` guards in
+  `axentra_platform.py`, the MCP test skips, the 3.10 sandbox base image in `container_images.py`, and orkexa's
+  `pymdown-extensions` split (the `mcp.unavailable` error code stays: it is part of the API contract).
 
 ### RT-023 · Reproducible Python dependencies
 
