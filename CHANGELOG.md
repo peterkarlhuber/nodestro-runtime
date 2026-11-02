@@ -43,7 +43,7 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
   `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
 - New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
 
-Axentra pin: `06d33055b2bc4c33eac22bcfb84d5facd5276ce8` (security review fixes SR-02/SR-04/SR-05/SR-06 with migration
+Axentra pin: `a8ea5d535feb63fda3a2ea66701c232c093849ee` (webhook backoff settings and the setup_already_completed/email_taken codes; security review fixes SR-02/SR-04/SR-05/SR-06 with migration
 0011, session resolution in one transaction, P1 fixes for suspended tenants and invitation links; replaces `f6ae01d`).
 
 Previous Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
