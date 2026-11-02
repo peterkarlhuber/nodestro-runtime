@@ -521,10 +521,10 @@ def test_resolving_in_a_container_is_locked_down_and_uses_only_stdin_and_stdout(
     network = proven.index("--network")
     allowed = proven[:network] + proven[network + 2 :]
     tmp = next(item for item in allowed if item.startswith("/tmp:"))
-    allowed[allowed.index(tmp)] = tmp.replace("noexec,", "")
+    allowed[allowed.index(tmp)] = tmp.replace("noexec,", "exec,")
     allowed[-1:-1] = ["--env", "HTTPS_PROXY=http://proxy:3128", "--env", "NO_PROXY=localhost,.internal"]
     assert args[: image + 2] == allowed
-    assert "/tmp:rw,nosuid,nodev,size=1024m" in flags
+    assert "/tmp:rw,exec,nosuid,nodev,size=1024m" in flags
     assert "/work:rw,noexec,nosuid,nodev,size=1024m,mode=1777" in flags
     assert command[:4] == ["python", "-I", "-B", "-c"]
     assert json.loads(command[5]) == ["HTTPS_PROXY", "NO_PROXY"]
@@ -612,10 +612,10 @@ def test_the_resolve_shape_is_the_proven_one_with_only_the_allowed_differences()
     ):
         check_shape(candidate, proven, allow=RESOLVE_ALLOWANCES)
     shaped = _resolve_shape()
-    assert "--network" not in shaped and "/tmp:rw,nosuid,nodev,size=1024m" in shaped
+    assert "--network" not in shaped and "/tmp:rw,exec,nosuid,nodev,size=1024m" in shaped
     # Everything else is exactly Orkexa's: drop the two allowed differences and the lists are equal.
     network = proven.index("--network")
-    assert _replace(shaped, "/tmp:rw,nosuid,nodev,size=1024m", "/tmp:rw,noexec,nosuid,nodev,size=1024m") == (
+    assert _replace(shaped, "/tmp:rw,exec,nosuid,nodev,size=1024m", "/tmp:rw,noexec,nosuid,nodev,size=1024m") == (
         proven[:network] + proven[network + 2 :]
     )
 
@@ -641,7 +641,8 @@ def test_the_resolve_shape_is_the_proven_one_with_only_the_allowed_differences()
         pytest.param(lambda a: _replace(a, "65534:65534", "0:0"), id="root-user"),
         pytest.param(lambda a: _replace(a, "2048m", "4096m"), id="more-memory"),
         pytest.param(
-            lambda a: _replace(a, "/tmp:rw,nosuid,nodev,size=1024m", "/tmp:rw,exec,nosuid,size=1024m"), id="tmp-suid"
+            lambda a: _replace(a, "/tmp:rw,exec,nosuid,nodev,size=1024m", "/tmp:rw,exec,nosuid,size=1024m"),
+            id="tmp-suid",
         ),
         pytest.param(
             lambda a: _replace(
@@ -671,7 +672,7 @@ def test_without_allowances_only_the_exact_proven_shape_passes() -> None:
     check_shape(list(proven), proven)
     for candidate in (
         _without(proven, "--network", "none"),  # Docker's default network
-        _replace(proven, "/tmp:rw,noexec,nosuid,nodev,size=1024m", "/tmp:rw,nosuid,nodev,size=1024m"),
+        _replace(proven, "/tmp:rw,noexec,nosuid,nodev,size=1024m", "/tmp:rw,exec,nosuid,nodev,size=1024m"),
         _with(proven, "--env", "HTTPS_PROXY=http://proxy:3128"),
         [*proven[:2], *reversed(proven[2:-1]), proven[-1]],
     ):
@@ -694,6 +695,28 @@ def test_a_resolve_container_that_left_the_proven_shape_never_starts(
     with pytest.raises(NodestroError) as caught:
         images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
     assert caught.value.code == "sandbox.shape_mismatch"
+    assert docker.resolves == [] and docker.containers == []
+
+
+def test_a_resolve_container_whose_limits_were_not_the_proven_ones_never_starts(docker: FakeDocker) -> None:
+    """The shape a resolve container is checked against is the one its self-test ran with (the sandbox's limits):
+    a sandbox that proved other limits than the resolve container would get is refused before it starts."""
+    from dataclasses import replace
+
+    from nodestro_runtime import container_images
+
+    proving = docker.sandbox_class()
+
+    class OtherLimits(proving):  # type: ignore[misc, valid-type]
+        def limits(self) -> ContainerLimits:
+            return replace(container_images._RESOLVE_LIMITS, memory_mb=4096)
+
+    built = images(docker)
+    built.sandbox_class = OtherLimits
+    with pytest.raises(NodestroError) as caught:
+        built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "sandbox.shape_mismatch"
+    assert docker.gate_limits == [replace(container_images._RESOLVE_LIMITS, memory_mb=4096)]
     assert docker.resolves == [] and docker.containers == []
 
 
