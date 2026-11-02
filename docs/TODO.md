@@ -116,6 +116,9 @@ None known.
   migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
   Rejected: moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
   source), e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch).
+  Input files (`NODESTRO_FILES_BACKEND=axentra`, M8): open are a staging run of `files migrate/verify` against a real
+  S3 bucket (tested only with moto's S3 server) and quota defaults per plan. Knowledge files are deliberately not
+  moved (already in PostgreSQL with their search index).
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 

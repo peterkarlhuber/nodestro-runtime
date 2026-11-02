@@ -33,6 +33,9 @@ to 3.11 is tracked as RT-022.
 | `NODESTRO_AXENTRA_NOTIFY` | `0` | `1`: in-app inbox notifications (failed run, pending tool approval, budget decision) through Axentra's notify module; never e-mail. Needs `on`; see [Notifications](#notifications) |
 | `NODESTRO_METRICS_TOKEN` / `_FILE` | – | Bearer token of `GET /api/metrics` (at least 32 characters); unset: no endpoint. Needs the package, not `on`; see [Observability](#observability-m7) |
 | `NODESTRO_IDENTITY_BACKEND` | `nodestro` | `mirror`: Nodestro answers, every identity write also goes to Axentra in the same transaction; `axentra`: Axentra answers, both are written. Needs `on`; see [Identity](#identity-and-tenancy-m5) |
+| `NODESTRO_FILES_BACKEND` | `volume` | `axentra`: the bytes of input files are stored through Axentra's storage (local directory or S3). Needs `on`; see [Files](#files-m8) |
+| `NODESTRO_FILES_SOURCE_REMOVAL` | `0` | `1` allows `nodestro-server files remove-source` to delete migrated volume files |
+| `NODESTRO_FILES_SOURCE_RETENTION_DAYS` | `30` | Days a migrated volume file stays as the fallback before `remove-source` may delete it |
 
 Every invalid combination stops the server with `profile.invalid` and names every problem.
 
@@ -332,6 +335,103 @@ server and **nothing is migrated now**. The integration boundary for when public
   auth.too_many_failures` and `limit.requests` (with `Retry-After`), `403 auth.scope`, `404 publication.not_found`.
   Axentra's problem types are mapped to these and never exposed.
 
+## Files (M8)
+
+`NODESTRO_FILES_BACKEND=axentra` stores the bytes of **input files** (run dialog, test cases, schedules, batches,
+published APIs) through Axentra's `StorageService` (`nodestro_runtime.axentra_storage`). The metadata stays Nodestro's
+document (`input_files`, ids `in_<12 hex>`), the blob id stays the first 16 hex digits of the SHA-256, so every file
+reference, run, test case and API response is unchanged. Agent delivery (`file_delivery.py`), the studio and the REST
+API read through `InputFiles` in the API and the worker processes alike.
+
+**Where the bytes go.** Axentra's own `[storage]` settings in `NODESTRO_AXENTRA_CONFIG` choose the backend:
+
+```toml
+[storage]
+backend = "local"                       # or "s3"
+local_path = "/var/lib/nodestro-files"  # absolute; shared by API and workers (check refuses a relative path)
+# s3_bucket = "nodestro-files"  s3_region = "eu-central-1"  s3_endpoint_url = "https://s3.example"  s3_prefix = "nodestro"
+# s3_access_key_ref = "env:AWS_ACCESS_KEY_ID"  s3_secret_key_ref = "env:AWS_SECRET_ACCESS_KEY"  (or the AWS default chain)
+max_file_bytes = 52428800               # Axentra's default (50 MB) equals Nodestro's upload limit
+# default_quota_bytes = ...  default_quota_files = ...   per-tenant quotas
+```
+
+Objects are keyed `<product>/<axentra tenant>/<file>`; the Axentra tenant is the linked one (`nodestro_axentra_ids`,
+created on first use). The mapping blob -> Axentra file is one document per blob in the tenant's collection
+`file_objects` (tenant-isolated like every Nodestro document; no schema migration). Identical content of a tenant is
+stored once.
+
+**What Axentra adds.**
+
+- Size limit and **quotas** per tenant (bytes and files; an upload and its cached extraction count as two files). A
+  refused upload is reported like any refused file (`input.too_large`, `input.quota_exceeded`); nothing is stored.
+  When only the cached extraction does not fit, the file is kept and its text is read again on use.
+- **Content-type policy (G-7).** Executable, HTML, SVG and script files are *blocked* types in Axentra. Nodestro has
+  always accepted code and markup files as inputs (agents read them as text), so at start Nodestro sets product
+  `nodestro` to `store_inert` unless the product already has a policy of its own. Such files are stored as opaque
+  `application/octet-stream` objects, and `GET /api/inputs/{id}/content` serves them as `application/octet-stream`
+  (always `attachment`, `nosniff`, sandboxing CSP, as before). An operator who sets the product to `refuse` gets
+  `input.blocked_type` for them.
+- **Integrity.** Axentra hashes every object while streaming it; Nodestro compares the SHA-256 on every read and
+  never serves a changed object (`input.integrity`; a missing object is `input.content_missing`).
+- An audit event per upload and delete (`storage.file.*`, actor `system`/`nodestro.files`).
+
+**Not included.** Knowledge files: on a server they already live in PostgreSQL (`nodestro_files` and `nodestro_chunks`, with
+the search index, in one transaction, covered by `pg_dump`); moving them would split the bytes from their index without
+a gain. Result files are documents. Axentra's HTTP routes and signed download URLs are not exposed: downloads stay on
+Nodestro's routes. Desktop and Local Docker never use any of this (they never import Axentra).
+
+**What is still shared.** With the S3 backend API and workers share nothing on disk for files uploaded after the
+switch. With the local backend `local_path` must be one directory shared by API and workers (as the data volume
+was). Until `files remove-source` ran, files from before the switch (and files imported from a desktop with
+`postgres_import`) are read from the data volume, so keep it shared until then. Tools and Python environments stay
+on the data volume.
+
+**Procedure.**
+
+1. Back up (`nodestro-server backup DIR`). Set `[storage]` in `NODESTRO_AXENTRA_CONFIG` and
+   `NODESTRO_FILES_BACKEND=axentra`; `nodestro-server check` must print `ready`. Restart `api` and `worker`: new uploads
+   go to Axentra; older files are read from the volume (fallback).
+2. `nodestro-server files migrate --dry-run [--tenant ID]` counts the volume blobs to copy; `files migrate` copies
+   them (resumable, idempotent; each copy is read back and its SHA-256 compared before the mapping is recorded; a
+   damaged volume file is reported, not copied; the volume file is **never** deleted). Exit code 2 when a file failed.
+3. `nodestro-server files verify` reads every object back, compares the SHA-256 and records `verified_at`; it reports
+   failures, volume blobs not migrated yet (`pending`) and Axentra objects without a mapping (`orphans`, e.g. from an
+   interrupted upload; they are reported, never deleted automatically).
+4. Later, after the fallback period: `NODESTRO_FILES_SOURCE_REMOVAL=1 nodestro-server files remove-source --dry-run`,
+   then without `--dry-run`. A volume file is deleted only when its object was migrated, verified by `files verify`,
+   the fallback period (`NODESTRO_FILES_SOURCE_RETENTION_DAYS`, default 30) since its migration has passed and a fresh
+   read still matches; otherwise it is kept (`kept`) or reported (`failed`).
+
+`files migrate` needs `NODESTRO_FILES_BACKEND=axentra`: while the volume backend runs, a deleted file would only be
+deleted on the volume and its copy would stay in Axentra.
+
+**Deletes.** Deleting an input file (or the cleanup of unused files) removes every copy: the Axentra object, the
+mapping and a volume copy. Concurrent migration never resurrects a file deleted while it was copied (both take the
+blob's lock).
+
+**Backup and restore.** The database dump contains the input file documents, the mappings and Axentra's file rows.
+With the local backend `nodestro-server backup DIR` also writes `nodestro-files-<time>.tar.gz` of `local_path`
+(uploads in progress left out). With S3, back up the bucket (versioning or replication); objects are immutable, a
+delete removes them. Restore the dump and the archive (or bucket) of the same time, then `files verify` must print
+`"ok": true` (a restore drill does exactly this in `nodestro-api/tests/test_server_files.py`). The desktop backup
+(`nodestro_api.backup`) is unchanged: the desktop never uses Axentra storage.
+
+**Rollback.** `nodestro-server files export-volume [--dry-run]` copies every file that exists only in Axentra back to
+the volume (idempotent); then `NODESTRO_FILES_BACKEND=volume` and restart. Mappings and objects stay; switching
+forward again later reuses them (`files migrate` copies only what is new).
+
+**Cost (measured, one machine, PostgreSQL 16 local, medians).** Per blob operation (put / get / delete, ms):
+
+| Backend | 10 KB | 1 MB | 20 MB |
+|---|---|---|---|
+| volume | 0.4 / 0.1 / 0.3 | 2.7 / 0.3 / 1.5 | 35 / 12 / 2.2 |
+| Axentra local | 11.6 / 1.7 / 8.8 | 15.7 / 3.8 / 10.4 | 112 / 53 / 26 |
+| Axentra S3 (moto server, local) | 26 / 11.5 / 25 | 32 / 14 / 23 | 432 / 92 / 30 |
+
+Axentra adds a fixed ~10 ms per upload (pending row, quota row lock, activation and audit in their own transactions,
+`fsync`) and a few ms per read (authorization, row lookup, SHA-256 check). An upload stores two objects (the file and
+its extraction). The moto numbers show the protocol overhead only, not a real S3 latency.
+
 ## What stays Nodestro's
 
 - **Jobs: M11 closed by architecture decision (variant B, final).** Run execution stays on Nodestro's own queue
@@ -373,7 +473,8 @@ server and **nothing is migrated now**. The integration boundary for when public
 
 ## Rollback
 
-Every switch can be turned off again without data changes: `NODESTRO_AXENTRA_AUDIT=0`, `..._USAGE=0`,
+Every switch can be turned off again without data changes: `NODESTRO_FILES_BACKEND=volume` (after
+`files export-volume`, see [Files](#files-m8)), `NODESTRO_AXENTRA_AUDIT=0`, `..._USAGE=0`,
 `..._RUN_USAGE=0`, `..._NOTIFY=0`, `NODESTRO_IDENTITY_BACKEND=mirror` or `nodestro` (see above), `NODESTRO_AXENTRA=off`.
 
 **Secrets (req. 4.5).** `axs1` values can only be read with the keyring, which is only read with

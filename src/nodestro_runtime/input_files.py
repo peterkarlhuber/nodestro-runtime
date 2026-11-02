@@ -9,7 +9,9 @@ Storage reuses what exists:
 
 - the bytes live in an ``orkexa`` :class:`~orkexa.LocalFileStore` below
   ``<data dir>/inputs`` (content-addressed, so identical content is stored once, atomic
-  writes, owner-only permissions) and not in the SQLite database;
+  writes, owner-only permissions) and not in the SQLite database. A server can hand in
+  another :class:`BlobStore` with the same ids instead
+  (:mod:`nodestro_runtime.axentra_storage`, ``NODESTRO_FILES_BACKEND=axentra``);
 - the metadata (name, format, size, checks, structure) is a document per upload in the
   collection ``input_files``; ids look like ``in_<12 hex>``;
 - what Nodestro reads from a file (:func:`nodestro_runtime.file_formats.extract`) is computed once
@@ -72,6 +74,18 @@ class FileStoreLike(Protocol):
     def info(self, file_id: str) -> StoredFile: ...
 
     def list(self, query: str | None = None) -> list[StoredFile]: ...
+
+
+class BlobStore(Protocol):
+    """Where the bytes of input files live; a blob id is the first 16 hex digits of the content's SHA-256."""
+
+    def put(self, data: bytes, *, name: str, media_type: str) -> str: ...
+
+    def get_bytes(self, file_id: str) -> bytes: ...
+
+    def __contains__(self, file_id: object) -> bool: ...
+
+    def delete(self, file_id: str) -> None: ...
 
 
 def is_input_id(value: object) -> bool:
@@ -177,11 +191,13 @@ class InputFiles:
         root: Path,
         *,
         ocr: Callable[[], documents.OcrRunner | None] = lambda: None,
+        blobs: BlobStore | None = None,
     ) -> None:
-        """``ocr`` returns the OCR for scanned PDFs when it is switched on (``None``: off)."""
+        """``ocr`` returns the OCR for scanned PDFs when it is switched on (``None``: off). ``blobs`` holds the
+        bytes (``None``: the volume below ``root``)."""
         self.store = store
         self.root = root
-        self.blobs = _Blobs(root)
+        self.blobs: BlobStore = _Blobs(root) if blobs is None else blobs
         self.ocr = ocr
         self._lock = threading.RLock()
         self._extracted: OrderedDict[str, Extracted] = OrderedDict()
@@ -209,9 +225,14 @@ class InputFiles:
         spec = detect(name, data)
         extracted = extract(name, data, spec=spec, ocr=self.ocr())
         blob = self.blobs.put(data, name=name, media_type=spec.media_type)
-        cached = self.blobs.put(
-            extracted.model_dump_json().encode("utf-8"), name=f"{blob}.extract.json", media_type="application/json"
-        )
+        cached: str | None
+        try:
+            cached = self.blobs.put(
+                extracted.model_dump_json().encode("utf-8"), name=f"{blob}.extract.json", media_type="application/json"
+            )
+        except FileFormatError:
+            # A blob store with limits (size, quota) may refuse the cache; the extraction is then recomputed on use.
+            cached = None
         item = InputFile(
             id=f"{PREFIX}{uuid.uuid4().hex[:12]}",
             blob=blob,
@@ -255,6 +276,13 @@ class InputFiles:
 
     def data(self, file_id: str) -> bytes:
         return self.blobs.get_bytes(self.get(file_id).blob)
+
+    def download_type(self, file_id: str) -> str:
+        """The media type a download of the file is served with: ``application/octet-stream`` when the blob store
+        keeps it as an inert attachment (an executable, HTML, SVG or script type), else the stored one."""
+        item = self.get(file_id)
+        inert = getattr(self.blobs, "inert", None)
+        return "application/octet-stream" if inert is not None and inert(item.blob) else item.media_type
 
     def extracted(self, file_id: str) -> Extracted:
         """What Nodestro read from the file (computed once per content, then reused)."""

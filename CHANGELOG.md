@@ -53,6 +53,14 @@ Axentra platform services in the server profile (Axentra migration, 2026-11-02; 
   answers, both written), `backfill_identity`, `reconcile_identity` and `identity_readiness`. Same session tokens on
   both sides, never a merge by e-mail, Nodestro ids and contracts unchanged. `AxentraLink.ensure_tenant` reads slugs
   in Axentra's platform scope (row-level security); `AxentraLink.tenant` caches only committed links.
+- Input files in Axentra's storage (M8, `NODESTRO_FILES_BACKEND`, default `volume`): new
+  `nodestro_runtime.axentra_storage` (`AxentraFiles`, `AxentraBlobs`) stores input file bytes through Axentra's
+  `StorageService` (local or S3) with tenant isolation, quotas, the size limit, the G-7 content-type policy
+  (`store_inert` for product `nodestro` unless it has its own), and a SHA-256 check on every read; ids and references
+  unchanged, the volume is the read fallback. Resumable `migrate`, `verify`, guarded `remove_sources`
+  (`NODESTRO_FILES_SOURCE_REMOVAL`, `NODESTRO_FILES_SOURCE_RETENTION_DAYS`) and `export_to_volume` (rollback).
+  `InputFiles(blobs=...)`, `InputFiles.download_type`, `WorkspaceStorage.input_blobs`, `AxentraConfig.modules`.
+  Tests: `tests/test_axentra_storage.py` (also against moto's S3 server when installed).
 - New `tests/test_axentra_platform.py`, `tests/test_axentra_mirror.py` and `tests/test_axentra_identity.py`;
   `tests/test_identity_store.py` runs against all three identity backends.
 

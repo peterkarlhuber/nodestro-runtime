@@ -30,6 +30,9 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
 ``NODESTRO_IDENTITY_BACKEND``               ``nodestro`` (default), ``mirror`` or ``axentra``: where users,
                                             tenants, memberships and sessions live (``mirror``/``axentra`` need
                                             NODESTRO_AXENTRA=on; see :mod:`nodestro_runtime.axentra_identity`)
+``NODESTRO_FILES_BACKEND``                  ``volume`` (default) or ``axentra``: where the bytes of input files
+                                            live (``axentra`` needs NODESTRO_AXENTRA=on; see
+                                            :mod:`nodestro_runtime.axentra_storage`)
 ==========================================  ================================================================
 
 :class:`KeyringSecretBox` reads both secret formats (``nodestro:enc:v1:`` and Axentra's ``axs1.<kid>.…``) and writes
@@ -64,23 +67,30 @@ logger = logging.getLogger(__name__)
 #: The Axentra product Nodestro's tenants belong to (single-product mode).
 PRODUCT_SLUG = "nodestro"
 PRODUCT_NAME = "Nodestro"
-#: Axentra modules Nodestro uses; the others (billing, notify, storage, search, data, events) stay off until a
-#: migration step needs them, so Axentra does not start background behaviour nobody asked for.
+#: Axentra modules Nodestro uses; the others (billing, notify, search, data, events) stay off until a migration step
+#: needs them, so Axentra does not start background behaviour nobody asked for. ``storage`` is added only with
+#: ``NODESTRO_FILES_BACKEND=axentra`` (:attr:`AxentraConfig.modules`).
 MODULES = ("identity", "tenancy", "access", "audit", "usage")
 #: Prefix of Axentra ciphertexts (``axs1.<kid>.<nonce>.<ciphertext>``).
 AXS1_PREFIX = "axs1."
 SecretsFormat = Literal["v1", "axs1"]
 IdentityBackend = Literal["nodestro", "mirror", "axentra"]
 IDENTITY_BACKENDS: tuple[IdentityBackend, ...] = ("nodestro", "mirror", "axentra")
+FilesBackend = Literal["volume", "axentra"]
+FILES_BACKENDS: tuple[FilesBackend, ...] = ("volume", "axentra")
+#: Days a migrated volume file is kept as the fallback before ``files remove-source`` may delete it.
+DEFAULT_SOURCE_RETENTION_DAYS = 30
 _ON = frozenset({"1", "on", "true", "yes"})
 _OFF = frozenset({"", "0", "off", "false", "no"})
 
 
 def modules(config: AxentraConfig) -> tuple[str, ...]:
-    """The Axentra modules this server switches on: :data:`MODULES`, plus ``notify`` with ``NODESTRO_AXENTRA_NOTIFY``
+    """The Axentra modules this server switches on: :attr:`AxentraConfig.modules` (``storage`` with the Axentra
+    file backend), plus ``notify`` with ``NODESTRO_AXENTRA_NOTIFY``
     (Nodestro uses only its in-app inbox channel; Axentra's provider stays ``local`` unless its own config file says
     otherwise, and Nodestro creates no e-mail templates)."""
-    return (*MODULES, "notify") if config.notify else MODULES
+    base = config.modules
+    return (*base, "notify") if config.notify else base
 
 
 def available() -> bool:
@@ -125,6 +135,17 @@ class AxentraConfig:
     notify: bool = False
     #: Where identity records live (``NODESTRO_IDENTITY_BACKEND``, see :mod:`nodestro_runtime.axentra_identity`).
     identity_backend: IdentityBackend = "nodestro"
+    #: Where input file bytes live (``NODESTRO_FILES_BACKEND``, see :mod:`nodestro_runtime.axentra_storage`).
+    files_backend: FilesBackend = "volume"
+    #: ``NODESTRO_FILES_SOURCE_REMOVAL=1``: ``files remove-source`` may delete migrated volume files (default off).
+    files_source_removal: bool = False
+    #: ``NODESTRO_FILES_SOURCE_RETENTION_DAYS``: the fallback period before a migrated volume file may be removed.
+    files_source_retention_days: int = DEFAULT_SOURCE_RETENTION_DAYS
+
+    @property
+    def modules(self) -> tuple[str, ...]:
+        """The Axentra modules this configuration uses (``storage`` only for ``NODESTRO_FILES_BACKEND=axentra``)."""
+        return MODULES + (("storage",) if self.files_backend == "axentra" else ())
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str], problems: list[dict[str, str]]) -> AxentraConfig:
@@ -147,6 +168,27 @@ class AxentraConfig:
                 "NODESTRO_IDENTITY_BACKEND", backend, "NODESTRO_IDENTITY_BACKEND must be nodestro, mirror or axentra"
             )
             backend = "nodestro"
+        files = environ.get("NODESTRO_FILES_BACKEND", "").strip().lower() or "volume"
+        if files not in FILES_BACKENDS:
+            problem("NODESTRO_FILES_BACKEND", files, "NODESTRO_FILES_BACKEND must be volume or axentra")
+            files = "volume"
+        removal = environ.get("NODESTRO_FILES_SOURCE_REMOVAL", "").strip().lower()
+        if removal not in _ON | _OFF:
+            problem("NODESTRO_FILES_SOURCE_REMOVAL", removal, "NODESTRO_FILES_SOURCE_REMOVAL must be 1 or 0")
+        retention_text = environ.get("NODESTRO_FILES_SOURCE_RETENTION_DAYS", "").strip()
+        retention = DEFAULT_SOURCE_RETENTION_DAYS
+        if retention_text:
+            try:
+                retention = int(retention_text)
+                if retention < 0:
+                    raise ValueError
+            except ValueError:
+                problem(
+                    "NODESTRO_FILES_SOURCE_RETENTION_DAYS",
+                    retention_text,
+                    "NODESTRO_FILES_SOURCE_RETENTION_DAYS must be a whole number of days (0 or more)",
+                )
+                retention = DEFAULT_SOURCE_RETENTION_DAYS
         superuser = environ.get("NODESTRO_AXENTRA_ALLOW_SUPERUSER", "").strip().lower()
         if superuser not in _ON | _OFF:
             problem("NODESTRO_AXENTRA_ALLOW_SUPERUSER", superuser, "NODESTRO_AXENTRA_ALLOW_SUPERUSER must be 1 or 0")
@@ -184,6 +226,8 @@ class AxentraConfig:
                     backend,
                     f"NODESTRO_IDENTITY_BACKEND={backend} needs NODESTRO_AXENTRA=on",
                 )
+            if files != "volume":
+                problem("NODESTRO_FILES_BACKEND", files, f"NODESTRO_FILES_BACKEND={files} needs NODESTRO_AXENTRA=on")
             return cls(secrets_format=fmt)  # type: ignore[arg-type]
         if not available():
             problem(
@@ -216,6 +260,9 @@ class AxentraConfig:
             run_usage=mirrors["run_usage"],
             notify=mirrors["notify"],
             identity_backend=backend,  # type: ignore[arg-type]
+            files_backend=files,  # type: ignore[arg-type]
+            files_source_removal=removal in _ON,
+            files_source_retention_days=retention,
         )
 
 
