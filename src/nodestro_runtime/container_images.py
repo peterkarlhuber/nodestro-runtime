@@ -21,6 +21,8 @@ id, code and Orkexa's runner on stdin, and only after the daemon passed Orkexa's
 If Docker or the image is missing, or the daemon does not prove the sandbox's limits, the call fails; there is never a
 fallback to a host subprocess.
 The module check after a build (:meth:`ContainerImages.missing_modules`) runs package code, so it runs the same way.
+Source builds that a person accepted (:meth:`ContainerImages.compile_in_container`) run in a container with network;
+they are off unless the desktop profile turns them on (``deps.source_build_disabled``, RT-038).
 Every docker CLI call reads bounded output (:func:`bounded_run`), and an image is only built on a base image pinned by
 digest (:data:`BASE_IMAGES`; other Python versions are refused).
 
@@ -312,6 +314,7 @@ class ContainerImages:
         collect: bool = True,
         owner: str = OWNER,
         sandbox_class: type[StreamedSandbox] | None = None,
+        source_builds: bool = False,
     ) -> None:
         """``usage_file`` keeps when each image was last used (for :meth:`gc`); ``keep`` names images that are
         never collected (those of installed environments); ``collect=False`` turns the collection after a build
@@ -320,7 +323,12 @@ class ContainerImages:
 
         ``run`` runs one docker CLI call (default :func:`bounded_run`: bounded output); ``sandbox_class`` makes the
         sandboxes of :meth:`sandbox`, :meth:`missing_modules` and :meth:`compile_in_container` (tests pass a
-        stand-in)."""
+        stand-in).
+
+        ``source_builds`` allows :meth:`compile_in_container` (source builds a person accepted, in a container with
+        network). It is off unless the caller turns it on: only the desktop profile does
+        (:class:`~nodestro_runtime.python_envs.PythonEnvironments`), because no filtered build network exists yet
+        (RT-038)."""
         self.docker = docker
         self.owner = owner
         self.base = base
@@ -330,6 +338,7 @@ class ContainerImages:
         self.keep = keep
         self.collect = collect
         self.sandbox_class = sandbox_class or StreamedSandbox
+        self.source_builds = source_builds
         self._usage_lock = threading.Lock()
         self._noted: dict[str, float] = {}
 
@@ -643,7 +652,7 @@ class ContainerImages:
 
         It is the only container with network: the resolver needs the package index, and a package's metadata is
         only known after its build script ran. The network is Docker's default one (or
-        ``NODESTRO_DOCKER_BUILD_NETWORK``; an operator can point it at an egress-filtered network). No host variable
+        ``NODESTRO_DOCKER_BUILD_NETWORK``), and it is not filtered (RT-038). No host variable
         reaches it but the proxy settings, **without** a user name or password (:func:`strip_credentials`): the build
         code could read them. The requirements, the previous lock and a certificate authority
         (``NODESTRO_BUILD_CA_FILE`` or ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout.
@@ -652,9 +661,22 @@ class ContainerImages:
         (``sandbox.unavailable`` otherwise). The image is uv's, pinned by digest (:data:`UV_IMAGE`); an image that is
         not pinned by a real digest is refused (``deps.build_unavailable``).
 
-        Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when Docker is
-        missing or not proven (``sandbox.unavailable``), the image is not pinned or cannot be pulled
-        (``deps.build_unavailable``) or the container was stopped (``deps.image_failed``)."""
+        Source builds are off unless :attr:`source_builds` is set (only the desktop profile sets it): the network of
+        this container is not filtered, so on a server or in Nodestro Local Docker build scripts could reach the LAN,
+        ports the host publishes and a cloud's instance metadata service (RT-038). Then nothing is started, pulled or
+        inspected (``deps.source_build_disabled``).
+
+        Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when source builds
+        are off (``deps.source_build_disabled``), Docker is missing or not proven (``sandbox.unavailable``), the image
+        is not pinned or cannot be pulled (``deps.build_unavailable``) or the container was stopped
+        (``deps.image_failed``)."""
+        if not self.source_builds:
+            # Before any docker call: no pull, no self-test, no container.
+            raise NodestroError(
+                "deps.source_build_disabled",
+                "Building packages from source is turned off here: build scripts would run with unfiltered network "
+                "access, and only the desktop profile allows that (after a person accepted the build)",
+            )
         image = image or UV_IMAGE
         if image.endswith(_UV_IMAGE_PLACEHOLDER) or not _PINNED.fullmatch(image):
             raise NodestroError(

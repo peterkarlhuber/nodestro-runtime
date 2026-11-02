@@ -625,6 +625,7 @@ class PythonEnvironments:
         images: ContainerImages | None = None,
         mcp_exists: Callable[[str], bool] = lambda _id: True,
         remove_images: bool = True,
+        source_builds: bool = False,
     ) -> None:
         """``images`` builds the container images of the Docker sandbox (tests pass a stand-in).
 
@@ -634,9 +635,15 @@ class PythonEnvironments:
 
         ``remove_images=False`` (a server): deleting an environment never removes its container image. Images are
         content-addressed and the Docker daemon is shared by every tenant, so another tenant's environment with the
-        same lock may use the image; unused images are the operator's to remove (``docker image prune``)."""
+        same lock may use the image; unused images are the operator's to remove (``docker image prune``).
+
+        ``source_builds`` allows plans that a person accepted to build packages from source in a container
+        (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`). That container has
+        unfiltered network, so only the desktop profile turns it on (:class:`~nodestro_runtime.workspace.Workspace`);
+        everywhere else such a plan reports ``deps.source_build_disabled`` before any container starts (RT-038)."""
         self.store = store
         self.remove_images = remove_images
+        self._source_builds = source_builds
         self.root = root
         self.images = images if images is not None else ContainerImages()
         #: Image tag -> the lock hash it was found with (images are immutable, so a hit stays valid).
@@ -666,12 +673,24 @@ class PythonEnvironments:
         this store names. On a server (``remove_images=False``) every tenant shares the daemon: no collection."""
         self._images = images
         if isinstance(images, ContainerImages):
+            images.source_builds = self._source_builds
             if images.usage_file is None:
                 images.usage_file = self.root / "image-usage.json"
             if images.keep is None:
                 images.keep = self._image_tags
             if not self.remove_images:
                 images.collect = False
+
+    @property
+    def source_builds(self) -> bool:
+        """Whether accepted source builds may run in a container (desktop profile only; see ``__init__``)."""
+        return self._source_builds
+
+    @source_builds.setter
+    def source_builds(self, allowed: bool) -> None:
+        self._source_builds = allowed
+        if isinstance(self._images, ContainerImages):
+            self._images.source_builds = allowed
 
     # ---- identity and paths ----------------------------------------------------------
 
@@ -890,8 +909,9 @@ class PythonEnvironments:
         Resolving never runs a package's build script on this computer (``--no-build``). A package
         without a wheel reports ``deps.build_required``. Plans a person asked for (``builds``, the
         library dialog where ``deps.build_required`` sends them) are then resolved again in a container
-        (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`); plans made
-        without one (a generated tool's libraries, ``builds=False``) are not.
+        (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`) on the desktop, and report
+        ``deps.source_build_disabled`` elsewhere (:attr:`source_builds`); plans made without one (a generated tool's
+        libraries, ``builds=False``) are not.
 
         ``trust`` as in :meth:`status`; it stays with the plan (on this server only) and decides where approving it
         installs the libraries (:meth:`backend`).
@@ -940,16 +960,28 @@ class PythonEnvironments:
     def _compile_in_container(
         self, lines: list[str], previous: str, required: Problem, log: Callable[[str], None]
     ) -> str | Problem:
-        """The lock of ``lines`` resolved in a container (a person accepted the source build); a problem if not."""
+        """The lock of ``lines`` resolved in a container (a person accepted the source build); a problem if not.
+
+        Outside the desktop profile source builds are off (:attr:`source_builds`): the plan reports
+        ``deps.source_build_disabled`` and no container is started (RT-038)."""
+        name = required.params.get("name", "A package")
+        if not self.source_builds:
+            return problem(
+                "deps.source_build_disabled",
+                f"{name} is only available as source code. Building packages from source is turned off on this "
+                "installation: the build would run with unfiltered network access (only the desktop allows it)",
+                name=name,
+            )
         try:
             return self.images.compile_in_container(lines, python=current_python_version(), previous=previous, log=log)
         except ResolveError as exc:
             return explain_uv_error(exc.output)
         except NodestroError as exc:
+            if exc.code == "deps.source_build_disabled":
+                return problem(exc.code, str(exc), name=name)
             if exc.code not in ("sandbox.unavailable", "deps.build_unavailable"):
                 return exc.problem
             # Still the package's problem (the UI explains it by its name), with the reason it was not built.
-            name = required.params.get("name", "A package")
             return problem(
                 "deps.build_required",
                 f"{name} is only available as source code. Its build script runs only in a container, which is not "

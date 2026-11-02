@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+Source builds only on the desktop (R-1, RT-038; 2026-11-02):
+
+- Python packages that must be built from source are resolved in a container with unfiltered network. Outside the
+  desktop profile (a server tenant, Nodestro Local Docker) that is now off by default: a plan a person accepted
+  reports `deps.source_build_disabled` (parameter `name`) and no container is pulled, tested or started.
+  `PythonEnvironments(source_builds=...)` and `ContainerImages(source_builds=...)` default to `False`; `Workspace`
+  turns it on for the desktop profile only. Wheels-only plans and image builds are unchanged. There is no switch to
+  turn it on elsewhere; RT-040 and `docs/build-network.md` describe the filtered build network it would need.
+
 Python 3.11 minimum (2026-11-02):
 
 - Python 3.11 is now the minimum (3.10 reached end of life in October 2026): `requires-python`, classifiers, ruff

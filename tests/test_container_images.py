@@ -170,12 +170,14 @@ def docker() -> FakeDocker:
     return FakeDocker()
 
 
-def images(docker: FakeDocker, **environ: str) -> ContainerImages:
+def images(docker: FakeDocker, *, source_builds: bool = True, **environ: str) -> ContainerImages:
+    """Container images on the stand-in; source builds on, as on the desktop (the default is off)."""
     return ContainerImages(
         docker="/usr/bin/docker",
         environ={"PATH": "/usr/bin", **environ},
         run=docker,
         sandbox_class=docker.sandbox_class(),
+        source_builds=source_builds,
     )
 
 
@@ -562,7 +564,7 @@ def test_a_stopped_resolve_is_reported_and_its_container_removed(tmp_path: Path)
     :meth:`StreamedSandbox.run_container`, with a docker CLI stand-in that never ends)."""
     log = tmp_path / "docker.log"
     cli = _fake_cli(tmp_path, log, run="import time; time.sleep(30)")
-    built = ContainerImages(docker=str(cli), environ={"PATH": os.environ["PATH"]})
+    built = ContainerImages(docker=str(cli), environ={"PATH": os.environ["PATH"]}, source_builds=True)
     from nodestro_runtime import container_images
 
     with pytest.MonkeyPatch.context() as patch:
@@ -608,6 +610,7 @@ def test_an_accepted_source_build_is_resolved_in_a_container(
         "tablib==1.0 \\\n    --hash=sha256:" + "1" * 64 + "\n    # via -r requirements.in\n"
         "pydantic==2.0.0 \\\n    --hash=sha256:" + "2" * 64 + "\n    # via -r requirements.in\n"
     )
+    assert python.source_builds is True  # the desktop profile (unchanged by R-1)
     plan = python.plan("tool", "show", needed)
     assert runner.builds == [False, False]  # uv on the host never builds
     assert plan.error is None and plan.lock == docker.resolve_lock and len(docker.resolves) == 1
@@ -629,6 +632,84 @@ def test_without_docker_an_accepted_source_build_stays_refused(
     plan = python.plan("tool", "show", python.needed_for_sources([("show", TOOL, "")]))
     assert plan.error is not None and plan.error.code == "deps.build_required"
     assert plan.error.params == {"name": "tablib", "reason": "sandbox.unavailable"} and not plan.lock
+
+
+def test_source_builds_are_off_unless_turned_on_and_refused_before_docker(docker: FakeDocker) -> None:
+    """R-1: the resolve container has unfiltered network, so a :class:`ContainerImages` refuses source builds unless
+    its owner turns them on (only the desktop profile does), before any docker call: no pull, no self-test, no
+    container."""
+    default = ContainerImages(docker="/usr/bin/docker", environ={"PATH": "/usr/bin"}, run=docker)
+    assert default.source_builds is False
+    for built in (default, images(docker, source_builds=False)):
+        with pytest.raises(NodestroError) as caught:
+            built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+        assert caught.value.code == "deps.source_build_disabled"
+    assert docker.calls == [] and docker.gates == [] and docker.containers == [] and docker.resolves == []
+
+
+def _server_workspace(tmp_path: Path) -> Workspace:
+    from bedrock_support import tenant_storage
+
+    return Workspace(
+        tmp_path / "tenant",
+        python_runner=FakeUv(INDEX),
+        integrations=[],
+        storage=tenant_storage(tmp_path / "db", "alpha"),
+    )
+
+
+def _local_container_workspace(tmp_path: Path) -> Workspace:
+    from nodestro_runtime.profile import RuntimeProfile
+
+    profile = RuntimeProfile(kind="local-container", data_dir=tmp_path / "data")
+    return Workspace(profile=profile, python_runner=FakeUv(INDEX), integrations=[])
+
+
+@pytest.mark.parametrize("opened", [_server_workspace, _local_container_workspace], ids=["server", "local-container"])
+def test_accepted_source_builds_are_refused_outside_the_desktop(
+    opened: Callable[[Path], Workspace], tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-1: on a server and in Nodestro Local Docker a plan a person accepted does not build from source (no filtered
+    build network exists yet, RT-038): it reports ``deps.source_build_disabled`` and docker is never asked to pull,
+    test or run anything. Packages with wheels still resolve."""
+    from nodestro_runtime import container_images
+
+    monkeypatch.setattr(container_images, "UV_IMAGE", PINNED_UV)
+    workspace = opened(tmp_path)
+    try:
+        python = workspace.python
+        python.sandbox_kind = lambda: "docker"
+        python.images = images(docker)  # source builds on: the environments turn them off again
+        assert python.source_builds is False and python.images.source_builds is False
+        runner = python.runner
+        assert isinstance(runner, FakeUv)
+        runner.source_only = {"tablib"}
+        needed = python.needed_for_sources([("show", TOOL, "")])
+        plan = python.plan("tool", "show", needed)  # builds=True: the library dialog, a person accepted
+        assert plan.error is not None and plan.error.code == "deps.source_build_disabled"
+        assert plan.error.params == {"name": "tablib"} and not plan.lock
+        # Even a ContainerImages turned on by hand is not reached: the environments refuse first.
+        python.images.source_builds = True
+        again = python.plan("tool", "show", needed)
+        assert again.error is not None and again.error.code == "deps.source_build_disabled"
+        assert runner.builds == [False, False]  # uv on the host never builds either
+        assert docker.resolves == [] and docker.gates == [] and docker.containers == [] and docker.pulled == set()
+        assert not [call for call in docker.calls if call[1] in ("run", "pull", "create", "start")]
+        # Wheels only (no source build needed): unchanged.
+        runner.source_only = set()
+        wheels = python.plan("tool", "show", needed)
+        assert wheels.error is None and "tablib" in wheels.lock and docker.resolves == []
+    finally:
+        workspace.close()
+
+
+def test_the_desktop_keeps_its_accepted_source_builds(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "data", python_runner=FakeUv(INDEX), integrations=[])
+    try:
+        assert workspace.sandbox_policy.profile == "desktop"
+        assert workspace.python.source_builds is True and workspace.python.images.source_builds is True
+    finally:
+        workspace.close()
 
 
 def _fake_cli(tmp_path: Path, log: Path, *, run: str) -> Path:
