@@ -128,7 +128,7 @@ None known.
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 
-### RT-031 · Run budget decisions: remaining gaps
+### RT-035 · Run budget decisions: remaining gaps
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** `docs/BUDGET.md`, orkexa ORK-022
 - **What:** Requests inside orkexa batches and `run_agent` sub-agents cannot suspend and fail with
