@@ -198,7 +198,7 @@ class AxentraFiles:
                 inert_extensions=sorted(policy.inert_extensions),
             )
             return "store_inert"
-        return policy.blocked_types
+        return str(policy.blocked_types)
 
     def start(self) -> AxentraFiles:
         self.check()
