@@ -15,27 +15,33 @@ How it works:
   ``str % values`` (``%s`` replaced by the text of its value from a literal tuple, a literal dict or a single value),
   ``str.join`` (of a literal list, or of a name holding one), an item of a literal tuple, list or dict that nothing
   changes (``QS[0]``), and psycopg's ``sql.SQL(...).format(...)`` / ``sql.Identifier`` / ``sql.Placeholder`` /
-  ``sql.Composed``; a string method that changes the text (``.replace``, ``.lower`` ...) adds an unknown part.
-- A name is resolved to every value it can hold where it is read -- inside a string expression and also on its own,
-  as in ``q += " OR ..."; db._query(q)`` or ``q = q + ...``: module constants (and assignments of functions that
-  declare it ``global``), the assignments and ``+=`` of the same function before the read (and after it, in a loop
-  around it), each conditional assignment or ``+=`` taken and not taken, ``for`` loops over a tuple of strings. A
-  parameter starts as an unknown part, and its ``+=`` follow it. A closure or lambda reads a name of the enclosing
-  function with every value it can hold there (any assignment may be the last one, any ``+=`` may have happened); a
-  ``nonlocal`` assignment of a nested function counts like a ``global`` one. A ``+=`` that a loop (or a nested
-  function) repeats, or ``q = q + ...`` in a loop, is an unknown part. Every combination is one variant, and every
-  variant is checked; more than :data:`MAX_VARIANTS` is reported as ``dynamic``.
+  ``sql.Composed``; a string method that changes the text (``.replace``, ``.lower`` ...) adds an unknown part. A
+  changing method with arguments is checked on any receiver (``self.BASE.replace(...)``, ``Q["a"].replace(...)``,
+  ``base().replace(...)``, ``str.replace(BASE, ...)``); when the text it changes is not known, the text of its
+  arguments follows the unknown part (``.replace("tenant_id = %s", "true")`` is SQL).
+- A name is resolved to every value it can hold where it is read -- inside a string expression and also on its own, as
+  in ``q += " OR ..."; db._query(q)`` or ``q = q + ...``: module names (and assignments of functions that declare them
+  ``global``) with the values they hold at that point of the module where the module reads them, and with every value
+  they are ever assigned where a function reads them (it may run between two assignments), the assignments and ``+=``
+  of the same function before the read (and after it, in a loop around it), each conditional assignment or ``+=``
+  taken and not taken, ``for`` loops over a tuple of strings. A parameter starts as an unknown part, and its ``+=``
+  follow it. A closure or lambda reads a name of the enclosing function with every value it can hold there (any
+  assignment may be the last one, any ``+=`` may have happened); a ``nonlocal`` assignment of a nested function counts
+  like a ``global`` one. A ``+=`` that a loop (or a nested function) repeats, or ``q = q + ...`` in a loop, is an
+  unknown part. Every combination is one variant, and every variant is checked; more than :data:`MAX_VARIANTS` is
+  reported as ``dynamic``.
 - ``+=`` on a target that is not followed as a name (``self.q``, ``Q["a"]``, a name in a class body) is checked as an
   unknown part followed by its value.
 - Each variant whose known parts name a tenant table, that starts like a data statement and contains a part that
   cannot be resolved, or that starts with a part that cannot be resolved (an imported fragment, ``self.BASE``, a
-  function's result, a parameter) followed by SQL, is a candidate. SQL means a keyword in capitals, a comment
-  (``--`` before a space or the end, ``/*``), or a keyword in lower case in a SQL shape (``or true``, ``and id =
-  %s``, ``union select``, ``limit %s``, ``; delete``). A text that is not part of a known statement and continues one
-  (``" OR true"`` as a class attribute, a tuple item or a call argument: it starts with ``OR``, ``AND``, ``WHERE``,
-  ``UNION``, ``LIMIT``, ``ORDER BY`` ... and holds SQL) is a candidate too. A candidate with an unresolved part is
-  reported as ``dynamic``; one that the PostgreSQL parser rejects is reported as ``unparsed``. Neither passes
-  silently: such a text passes only when it is fixed or through an allowlist entry with its reason.
+  function's result, a parameter; space, parentheses or a SQL comment may come before it) followed by SQL, is a
+  candidate. SQL means a keyword in capitals, a comment (``--`` before a space or the end, ``/*``), or a keyword in
+  lower case in a SQL shape (``or true``, ``or (1=1)``, ``and id = %s``, ``union select``, ``limit %s``,
+  ``; delete``). A text that is not part of a known statement and continues one (``" OR true"`` as a class attribute, a
+  tuple item or a call argument: after its leading comments it starts with ``OR``, ``AND``, ``WHERE``, ``UNION``,
+  ``LIMIT``, ``ORDER BY``, an operator such as ``IS NOT NULL`` ... and holds SQL) is a candidate too. A candidate with
+  an unresolved part is reported as ``dynamic``; one that the PostgreSQL parser rejects is reported as ``unparsed``.
+  Neither passes silently: such a text passes only when it is fixed or through an allowlist entry with its reason.
 - A parsed candidate passes when every reference to a tenant table (its name in any case) -- in ``FROM``, joins,
   ``USING``, the target of ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level
   ``AND`` conjunct of its statement's ``WHERE`` (or of an inner join's ``ON``) of the form ``<ref>.tenant_id =
@@ -57,7 +63,9 @@ risk"): that the parameter is the right tenant (the store bound to one tenant pa
 scanned packages or read at run time (a file, a setting, the database); and SQL that only run-time data puts
 together without a known part that shows it -- an argument of a helper that runs whatever it is given (checked at the
 callers that pass a literal text), a text made only of unknown parts whose fragments live in another package, a
-lower-case keyword without a SQL shape after an unknown part (``{BASE} or deleted``), ``getattr``/``eval``.
+lower-case keyword without a SQL shape after an unknown part (``{BASE} or deleted``), text other than space,
+parentheses and comments in front of an unknown part (``f"tag {BASE} OR true"``), a changing method whose text and
+arguments are both unknown (``base().replace(old, new)`` with parameters), ``getattr``/``eval``.
 """
 
 from __future__ import annotations
@@ -477,9 +485,24 @@ class _Scope:
         if enclosing is not None:
             return enclosing._closure_values(name, depth)
         events = self._events(self.module, name)
-        if events:
+        if not events:
+            return [[Hole(name)]]
+        if self.function is None:
+            # Read while the module runs (at module level or in a class body): the values the name holds at this point
+            # of the module, not its last one (security review R4-4).
+            around = [loop for loop in self._loops(self.module) if _inside(position, loop)]
+            before = [e for e in events if e.position <= position]
+            after = [
+                dataclasses.replace(e, conditional=True)
+                for e in events
+                if e.position > position and any(loop in around for loop in e.loops)
+            ]
+            if before or after:
+                return self._variants(before, after, around, name, depth)
             return self._variants(events, [], [], name, depth)
-        return [[Hole(name)]]
+        # Read in a function, which may run at any point of the module's life (while it is imported, between two
+        # assignments, or later): every assignment may be the last one, every `+=` may have happened (R4-4).
+        return self._variants([dataclasses.replace(e, conditional=True) for e in events], [], [], name, depth)
 
     def _variants(
         self, before: list[_Event], after: list[_Event], around: list[ast.AST], name: str, depth: int
@@ -665,12 +688,35 @@ class _Scope:
         if isinstance(func, ast.Attribute) and func.attr == "as_string":
             return self.render(func.value, position, depth + 1)
         if isinstance(func, ast.Attribute) and func.attr in _SAME_TEXT | _CHANGED_TEXT:
-            receiver = self.render(func.value, position, depth + 1)
+            receiver_node, arguments = func.value, list(node.args)
+            if _is_str_type(receiver_node) and arguments:
+                receiver_node, arguments = arguments[0], arguments[1:]  # ``str.replace(BASE, ...)``
+            receiver = self.render(receiver_node, position, depth + 1)
             if receiver is None:
                 return None
-            if func.attr in ("encode", "decode") or (func.attr in _SAME_TEXT and not node.args and not node.keywords):
+            if func.attr in ("encode", "decode") or (func.attr in _SAME_TEXT and not arguments and not node.keywords):
                 return receiver
-            return [[*variant, Hole(f".{func.attr}(...)")] for variant in receiver]
+            changed = Hole(f".{func.attr}(...)")
+            if not any(all(isinstance(p, Hole) or not p.strip() for p in variant) for variant in receiver):
+                return [[*variant, changed] for variant in receiver]
+            # The text that is changed is not known (``self.BASE``, ``base()``, a parameter ...): its arguments are
+            # the only part that shows what the change does, so their text follows it (``.replace("tenant_id = %s",
+            # "true")`` is SQL; security review R4-3).
+            shown_parts: list[list[list[Any]]] = [[[changed]]]
+            for argument in [*arguments, *(k.value for k in node.keywords)]:
+                shown_argument = self.render(argument, position, depth + 1)
+                if shown_argument is None:
+                    return None
+                shown_parts.append([[" ", *variant] for variant in shown_argument])
+            shown = _product(shown_parts)
+            if shown is None:
+                return None
+            results = [
+                [*variant, *tail] if all(isinstance(p, Hole) or not p.strip() for p in variant) else [*variant, changed]
+                for variant in receiver
+                for tail in shown
+            ]
+            return results if len(results) <= MAX_VARIANTS else None
         return [[Hole(ast.unparse(node))]]
 
     def _render_percent(self, node: ast.BinOp, position: Position, depth: int) -> list[list[Any]] | None:
@@ -966,6 +1012,10 @@ def _is_string_root(node: ast.AST) -> bool:
         return _is_string_root(node.left) or _is_string_root(node.right)
     if isinstance(node, ast.Call):
         func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _CHANGED_TEXT and node.args:
+            # On any receiver (``self.BASE.replace(...)``, ``Q["a"].replace(...)``, ``base().replace(...)``,
+            # ``str.replace(BASE, ...)``): a changed text, checked as such with its arguments (R4-3).
+            return True
         if isinstance(func, ast.Attribute) and func.attr in (
             "format",
             "join",
@@ -977,6 +1027,26 @@ def _is_string_root(node: ast.AST) -> bool:
             return isinstance(func.value, ast.Name) or _is_string_root(func.value)
         return any(_is_sql_attr(func, name) for name in ("SQL", "Composed"))
     return False
+
+
+def _is_str_type(node: ast.AST) -> bool:
+    """``str`` or ``bytes`` as the receiver of a method called on the type (``str.replace(text, ...)``)."""
+    return isinstance(node, ast.Name) and node.id in ("str", "bytes")
+
+
+def _changed_text_parts(node: ast.expr) -> list[ast.expr]:
+    """The receiver and the arguments of a changing method (``base("...").replace(a, b)``): searched for strings of
+    their own, since the rendering of the call may show them only as an unknown part (a string it does use is part of
+    it and not checked twice)."""
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return []
+    if node.func.attr not in _CHANGED_TEXT or not node.args:
+        return []
+    receiver = node.func.value
+    parts = [*node.args, *(k.value for k in node.keywords)]
+    if isinstance(receiver, ast.Name) or _is_string_root(receiver):
+        return parts
+    return [receiver, *parts]
 
 
 def _docstring_ids(tree: ast.Module) -> set[int]:
@@ -992,18 +1062,19 @@ def _roots(tree: ast.Module) -> Iterator[tuple[ast.expr, ast.AST | None]]:
     """The outermost string expressions of a module with their enclosing function."""
     skip = _docstring_ids(tree)
 
-    def visit(node: ast.AST, function: ast.AST | None) -> Iterator[tuple[ast.expr, ast.AST | None]]:
-        for child in ast.iter_child_nodes(node):
+    def visit(nodes: Iterable[ast.AST], function: ast.AST | None) -> Iterator[tuple[ast.expr, ast.AST | None]]:
+        for child in nodes:
             if id(child) in skip:
                 continue
             if isinstance(child, ast.expr) and _is_string_root(child):
                 yield child, function
                 # Arguments of .format()/sql calls are part of the root; other nested strings are their own roots.
+                yield from visit(_changed_text_parts(child), function)
                 continue
             inner = child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) else function
-            yield from visit(child, inner)
+            yield from visit(ast.iter_child_nodes(child), inner)
 
-    yield from visit(tree, None)
+    yield from visit(ast.iter_child_nodes(tree), None)
 
 
 def _text(pieces: list[Any]) -> tuple[str, bool]:
@@ -1075,7 +1146,7 @@ _SQL_WORDS = re.compile(rf"\b(?:{_KEYWORDS}|tenant_id)\b")
 #: SQL in lower case: only a keyword in a SQL shape counts (``or true``, ``and id = %s``, ``union select``), since
 #: ``or``, ``and``, ``not`` and ``where`` are English too (``f"{name} must be yes or no"``).
 _SQL_LOWER_CASE = re.compile(
-    r"\b(?:or|and|not|where)\s+(?:true|false|null|%s|%\(\w+\)s|\$\d"
+    r"\b(?:or|and|not|where)\s+\(*\s*(?:true|false|null|%s|%\(\w+\)s|\$\d"
     r"|[\w.]+\s*(?:=|<>|!=|<|>|::|\bis\b|\bin\b|\blike\b|\bilike\b))"
     r"|\bunion\s+(?:all\s+)?select\b|\blimit\s+(?:\d|%s|\$\d)|\bon\s+conflict\b"
     r"|;\s*(?:select|insert|update|delete|drop|truncate|copy)\b",
@@ -1083,12 +1154,27 @@ _SQL_LOWER_CASE = re.compile(
 )
 #: A comment, which hides the rest of a statement (``--`` before a space or the end; ``--flag`` is a command line).
 _SQL_COMMENT = re.compile(r"--(?=\s|$)|/\*")
-#: The start of a text that continues a statement: a condition, a set operation, a clause or a second statement.
+#: The start of a text that continues a statement (after its leading comments, :func:`_after_comments`): a condition,
+#: an operator of one (`` IS NOT NULL OR true``; ``is``, ``not`` and ``in`` only in a SQL shape, as they are English
+#: too), a set operation, a clause or a second statement.
 _CONTINUATION = re.compile(
     r"[\s()]*(?:(?:OR|AND|WHERE|UNION|INTERSECT|EXCEPT|LIMIT|OFFSET|ORDER\s+BY|GROUP\s+BY|HAVING|RETURNING|JOIN"
-    r"|ON\s+CONFLICT)\b|;)",
+    r"|ON\s+CONFLICT)\b|;|=|<>|!=|IN\s*\(|IS\s+(?:NOT\s+)?(?:NULL|TRUE|FALSE|UNKNOWN|DISTINCT)\b"
+    r"|NOT\s+(?:NULL|IN|LIKE|ILIKE|BETWEEN)\b|(?-i:LIKE|ILIKE|BETWEEN)\b)",
     re.IGNORECASE,
 )
+#: A SQL comment at the start of a text, with the space and parentheses around it: a block comment, or a line comment
+#: that ends in this text (one that does not end here hides what follows too).
+_LEADING_COMMENT = re.compile(r"[\s()]*(?:/\*.*?\*/|--[^\n]*\n)", re.S)
+
+
+def _after_comments(text: str) -> str:
+    """``text`` without the SQL comments it starts with (``/* tag */ ``, ``-- tag\\n``; security review R4-5)."""
+    while True:
+        match = _LEADING_COMMENT.match(text)
+        if match is None:
+            return text
+        text = text[match.end() :]
 
 
 def _known(pieces: list[Any]) -> str:
@@ -1107,8 +1193,8 @@ def _hole_led_sql(pieces: list[Any]) -> bool:
     """Whether a text starts with an unknown part (an imported fragment, ``self.BASE``, a function's result, a
     parameter) and its known parts hold SQL: its statement is not known, so it is reported."""
     for piece in pieces:
-        if isinstance(piece, str) and not piece.strip(" (\n\t"):
-            continue
+        if isinstance(piece, str) and not _after_comments(piece).strip(" (\n\t"):
+            continue  # space, parentheses or a comment in front of the unknown part (R4-5)
         if not isinstance(piece, Hole):
             return False
         break
@@ -1122,7 +1208,7 @@ def _continues_statement(pieces: list[Any]) -> bool:
     tuple or a call argument): the statement it is appended to is not known, so it is reported."""
     if not pieces or not isinstance(pieces[0], str):
         return False
-    text = _known(pieces)
+    text = _after_comments(_known(pieces))
     return bool(_CONTINUATION.match(text)) and _sql_like(text)
 
 

@@ -64,6 +64,7 @@ from .container_images import (
 )
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
+from .sandbox_cancel import requested as _work_stopped
 from .sandbox_policy import HOST_AWS_ENV, Isolation, TrustClass
 from .schemas import Workflow, WorkflowIn, new_id, now
 from .storage import DocumentStore
@@ -1091,7 +1092,16 @@ class PythonEnvironments:
         """Mark the scope as installing (after storing an approved plan); refuses a second installation.
 
         Called with ``_lock`` held, so two requests at the same time never both start one.
+
+        Refused when the work that asks for it was stopped: the cancel check bound to the calling thread
+        (:mod:`nodestro_runtime.sandbox_cancel`; a tool job binds its stop, security review NF-1/R4-7) is set. The
+        check runs under ``_lock``, as :meth:`cancel_installs` does: a stop that lands after it finds the installation
+        registered and stops it before its next step, so a stopped job never starts an installation.
         """
+        if _work_stopped():
+            raise NodestroError(
+                "deps.install_stopped", "The installation was not started: the work that asked for it was stopped"
+            )
         if approve is None:
             env = self.get(scope)
             assert env is not None

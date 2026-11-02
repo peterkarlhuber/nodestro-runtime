@@ -9,7 +9,7 @@ with its reason, matched on the whole normalized text.
 
 The check reads source only; it runs the same with and without ``NODESTRO_TEST_RUNTIME_ROLE``. What it guarantees and
 what it does not: the check's module docstring and ``docs/AXENTRA.md`` ("Remaining isolation risk"). Every bypass of
-the security review (rounds 1 to 3, issue #89) is a regression test below.
+the security review (rounds 1 to 4; round 3: issue #89) is a regression test below.
 """
 
 from __future__ import annotations
@@ -895,3 +895,106 @@ def test_a_fragment_outside_a_known_statement_passes_only_when_fixed_or_allowlis
     assert report.findings == [] and len(report.allowed) == 1
     # The value of a followed `name += ...` is checked where the name is read, not as a fragment.
     _assert_clean(_scan(f"def f(db):\n    q = {_BASE}\n    q += ' AND id = %s'\n    db.execute(q)\n", tmp_path))
+
+
+# --- security review round 4: the probes that still passed, each one a regression test ----------------------------
+
+#: name -> (source, the kind of finding it must produce). Sources that import ``BASE`` get a ``frag.py`` next to them.
+ROUND4_PROBES = {
+    # R4-3: a text changed by ``.replace()`` (or another changing method) on a receiver that is not a name
+    "self.BASE.replace": (
+        f"class S:\n    BASE = {_BASE}\n\n    def f(self, db):\n"
+        '        db.execute(self.BASE.replace("tenant_id = %s", "true"))\n',
+        "dynamic",
+    ),
+    "Q[item].replace": (
+        f'Q = {{"a": {_BASE}}}\n\ndef f(db):\n    db.execute(Q["a"].replace("tenant_id = %s", "true"))\n',
+        "dynamic",
+    ),
+    "base().replace": (
+        f'def base():\n    return {_BASE}\n\ndef f(db):\n    db.execute(base().replace("tenant_id = %s", "true"))\n',
+        "dynamic",
+    ),
+    "str.replace(BASE, ...)": (
+        f'BASE = {_BASE}\n\ndef f(db):\n    db.execute(str.replace(BASE, "tenant_id = %s", "true"))\n',
+        "dynamic",
+    ),
+    "imported fragment .replace with constant arguments": (
+        'from .frag import BASE\n\nOLD = "tenant_id = %s"\nNEW = "true"\n\n'
+        "def f(db):\n    db.execute(BASE.replace(OLD, NEW))\n",
+        "dynamic",
+    ),
+    "SQL in an argument of .replace on a known text": (
+        'def f(db):\n    db.execute("x".replace("x", "DELETE FROM nodestro_documents"))\n',
+        "leak",
+    ),
+    # R4-4: a module-level name read before it is assigned again (the value at the read, not the last one)
+    "module-level read before a reassignment": (
+        f'Q = {_BASE}\nQ += " OR true"\nWIDE = Q\nQ = {_BASE}\n\ndef f(db):\n    db.execute(WIDE)\n',
+        "leak",
+    ),
+    "module-level call before a reassignment": (
+        f'Q = {_BASE}\nQ += " OR true"\nrun(Q)\nQ = {_BASE}\n',
+        "leak",
+    ),
+    "function reads a module name that is reassigned": (
+        f'Q = {_BASE}\nQ += " OR true"\n\ndef f(db):\n    db.execute(Q)\n\nf(None)\nQ = {_BASE}\n',
+        "leak",
+    ),
+    # R4-5: a comment in front of an unknown part, and fragments that start with a comment or an operator
+    "block comment before an unknown part": (
+        'from .frag import BASE\n\ndef f(db):\n    db.execute(f"/* tag */ {BASE} OR true")\n',
+        "dynamic",
+    ),
+    "line comment before an unknown part": (
+        'from .frag import BASE\n\ndef f(db):\n    db.execute(f"-- tag\\n{BASE} OR true")\n',
+        "dynamic",
+    ),
+    "fragment that starts with a comment": ('class S:\n    WIDE = "/**/OR true"\n', "dynamic"),
+    "fragment that starts with IS": ('class S:\n    WIDE = " IS NOT NULL OR true"\n', "dynamic"),
+    "fragment that starts with is, lower case": ('class S:\n    WIDE = " is not null or true"\n', "dynamic"),
+    # R4-6: lower-case condition in parentheses after an unknown part
+    "lower-case or (1=1)": ('from .frag import BASE\n\ndef f(db):\n    db.execute(f"{BASE} or (1=1)")\n', "dynamic"),
+    "lower-case and (true)": (
+        'from .frag import BASE\n\ndef f(db):\n    db.execute(BASE + " and (true)")\n',
+        "dynamic",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROUND4_PROBES))
+def test_the_round4_probes_are_caught(name: str, tmp_path: Path) -> None:
+    source, kind = ROUND4_PROBES[name]
+    report = _scan_probe(source, tmp_path)
+    assert kind in [f.kind for f in report.findings], (name, [str(f) for f in report.findings])
+
+
+ROUND4_CLEAN = {
+    "text methods that are not SQL": (
+        "class S:\n    def f(self, name, path):\n"
+        "        a = self.name.replace('-', '_').lower()\n"
+        "        b = str.replace(name, ' ', '')\n"
+        "        c = path().removesuffix('.py').upper()\n"
+        "        return a, b, c, self.items['x'].strip()\n"
+    ),
+    "a module name assigned once and read in a function": (
+        f"Q = {_BASE}\n\ndef f(db):\n    db.execute(Q)\n    db.execute(Q + ' AND id = %s')\n"
+    ),
+    "a module name completed before it is read": (
+        f'Q = {_BASE}\nQ += " AND id = %s"\nrun(Q)\n\ndef f(db):\n    db.execute(Q)\n'
+    ),
+    "messages with comments, is and parentheses": (
+        "def f(name, exe):\n"
+        "    print(f'-- {name} --')\n"
+        "    print(f'/* {name} */ is a comment')\n"
+        "    print(f'{name} or (optionally) the path')\n"
+        "    print(' is not set or empty')\n"
+        "    print(' is not allowed in a sandbox container', ' in the settings or (optionally) here')\n"
+        "    print(f'{exe} and (if needed) {name}')\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROUND4_CLEAN))
+def test_the_round4_controls_pass(name: str, tmp_path: Path) -> None:
+    _assert_clean(_scan_probe(ROUND4_CLEAN[name], tmp_path))

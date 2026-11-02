@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
+`return_to` tokens are never adopted; 2026-11-02).
+
 The resolve path on a real Docker engine (RT-038; 2026-11-02):
 
 - `tests/test_resolve_real_engine.py` runs `ContainerImages.compile_in_container` against a real daemon
@@ -22,6 +25,27 @@ The resolve path on a real Docker engine (RT-038; 2026-11-02):
 
 Axentra pin: `f3ed8d22a8bd45faff84204786e01da32ece4034` (axentra #28, #27: secret-free OIDC `return_to`, `POST`
 OIDC start, encoded-token redaction; 2026-11-02).
+
+Security review round 4: Lows R4-3 to R4-7 handled (2026-11-02):
+
+- A stopped tool generation job never starts an installation of libraries (R4-7): besides the job's own check before
+  `gate.install`, `PythonEnvironments` refuses to start an installation (`deps.install_stopped`, nothing stored)
+  while the cancel check bound to the calling thread is set; a tool job binds its stop there. The check runs under
+  the lock `cancel_installs` takes, so a stop that lands between the job's check and the start (or before `prepare`
+  installs an approved environment that is missing) is caught, and an installation registered before the stop is
+  found by `cancel_installs`. Documented, not changed: an approval or rejection of the tool taken before the stop is
+  carried out, and a job keeps working until the API's suspension check (5 s by default) sees the suspension. Tests
+  in `tests/test_tool_job_cancel.py` stop a job between the library approval and the installation, and before an
+  approved environment is installed again.
+- `tenant_sql_check` (R4-3 to R4-6): a changing method with arguments (`.replace()` ...) is checked on any receiver
+  (`self.BASE`, `Q["a"]`, `base()`, `str.replace(BASE, ...)`), with the text of its arguments when the text it
+  changes is not known; a module name is resolved to its value at the point where the module reads it, and to every
+  value it is ever assigned where a function reads it; SQL comments in front of an unknown part are skipped;
+  fragments that start with a comment or an operator (`"/**/OR true"`, `" IS NOT NULL OR true"`) and lower-case
+  conditions in parentheses (`or (1=1)`) are reported. The real runtime and API code has no new finding. Not fixed,
+  listed in `docs/AXENTRA.md` ("Remaining isolation risk"): a change whose text and arguments are both unknown, and
+  text other than space, parentheses and comments in front of an unknown part. Probes: `ROUND4_PROBES` and
+  `ROUND4_CLEAN` in `tests/test_tenant_filters.py`.
 
 Static tenant SQL check: the gaps of security review round 3 closed (#89; 2026-11-02):
 

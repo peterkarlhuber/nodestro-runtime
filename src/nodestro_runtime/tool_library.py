@@ -16,8 +16,16 @@ Generating a tool takes a while and ends with a human decision, so it runs as a
 :meth:`ToolLibrary.cancel_jobs` stops every job that has not ended (the API calls it when the tenant is suspended,
 with ``identity.tenant_suspended``, security review NF-1): the job is ``failed`` at once with that code as its
 ``message_code``, a model request not sent yet is not sent, a sandbox test that runs is killed (its container
-removed), a wait for a decision ends, the generated tool is never registered, and nothing the thread does later
-changes the job again.
+removed), a wait for a decision ends, the generated tool is never registered, no installation of libraries starts
+for it, and nothing the thread does later changes the job again.
+
+What it does not cover (security review round 4, R4-7): the approval or rejection of the tool the person gave before
+the stop (taken under the library's lock, ``committed``) is carried out, by design, and an installation that already
+started is stopped by :meth:`~nodestro_runtime.python_envs.PythonEnvironments.cancel_installs` only before its next
+step (a running ``uv`` or ``docker build`` command finishes first). On a server the API calls :meth:`cancel_jobs`
+when its suspension check sees the suspended tenant (every ``suspension_check`` seconds, 5 by default): until then a
+job keeps working (its model requests, sandbox tests and an installation whose libraries were approved before the
+suspension), although every request of the suspended tenant, a decision included, is refused at once.
 """
 
 from __future__ import annotations
@@ -1172,6 +1180,9 @@ class ToolLibrary:
             if gate is None:
                 return proposal
             for _round in range(4):
+                # A stopped job prepares nothing. ``prepare`` may install an approved environment that is missing; a
+                # stop that lands after this check is caught where the installation starts (``_begin_install`` checks
+                # the job's stop, bound below, under the lock ``cancel_installs`` takes; R4-7).
                 _check_stopped(job)
                 outcome = gate.prepare(proposal.function_name, proposal.code, proposal.tests)
                 if outcome.feedback:
@@ -1213,11 +1224,15 @@ class ToolLibrary:
                     )
                     continue
                 _step(job, problem("job.installing", "Installing the approved libraries"))
-                _check_stopped(job)  # an installation that already runs is stopped by cancel_installs
+                # A stopped job starts no installation: checked here and again, under the lock cancel_installs takes,
+                # where the installation starts (``_begin_install``, the job's stop bound below; R4-7). An installation
+                # that started before the stop is stopped by cancel_installs.
+                _check_stopped(job)
                 gate.install(str(plan.get("id")), lambda _line: None)
             raise ApprovalDeniedError("The libraries could not be prepared")
 
-        # A sandbox test of this job is killed (its container removed) once cancel_jobs sets the stop event.
+        # A sandbox test of this job is killed (its container removed) once cancel_jobs sets the stop event, and no
+        # installation of libraries starts for the job after that (PythonEnvironments._begin_install checks it).
         cancel_token = sandbox_cancel.bind(decision.stop.is_set)
         try:
             coding_agent = _RecordingCodingAgent(
@@ -1286,9 +1301,11 @@ class ToolLibrary:
         yet is not sent and an answer that arrives later is not used, a sandbox test that runs is killed (its
         container removed), a wait for a decision ends at once and the generated tool is never registered (a record
         already proposed for approval is rejected). A job whose approval or rejection was already taken finishes
-        carrying it out and is not stopped. An installation of libraries the job started is stopped by
-        :meth:`~nodestro_runtime.python_envs.PythonEnvironments.cancel_installs`. Idempotent; returns the ids
-        stopped."""
+        carrying it out and is not stopped. No installation of libraries starts for a stopped job (the check runs
+        under the lock of :class:`~nodestro_runtime.python_envs.PythonEnvironments`, where the installation would
+        start); one the job started before is stopped by
+        :meth:`~nodestro_runtime.python_envs.PythonEnvironments.cancel_installs`, which the caller calls after this
+        method. Idempotent; returns the ids stopped."""
         stopped: list[str] = []
         with self._lock:
             for job_id, decision in self._decisions.items():

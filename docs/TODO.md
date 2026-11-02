@@ -304,7 +304,9 @@ None known.
   - an organizationally independent security review: the separate agent's review was accepted on 2026-11-02 (condition
     SR-01 met, its Lows fixed and re-reviewed, the round-3 gaps of the static tenant SQL check fixed in #89, a suspended
     tenant's tool generation jobs stopped (NF-1, nodestro-api #69), the remaining isolation risk without RLS stated in
-    the doc); an external sign-off is still outstanding;
+    the doc); round 4 accepted too, its Lows R4-3 to R4-7 handled (no installation starts for a stopped tool job;
+    the tenant SQL check's misses fixed or listed in the remaining isolation risk); an external sign-off is still
+    outstanding;
   - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
     `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
     against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);

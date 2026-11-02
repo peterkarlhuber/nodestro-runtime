@@ -19,12 +19,18 @@ from typing import Any
 from orkexa import UsageTracker
 from orkexa.dynamic import SubprocessSandbox
 import pytest
+from test_docker_first import CODE as LIBRARY_CODE
+from test_docker_first import INDEX, _Images
+from test_docker_first import TESTS as LIBRARY_TESTS
 
+from nodestro_runtime import docker_status, sandbox_cancel
 from nodestro_runtime.container_images import StreamedSandbox
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.providers import Connection
-from nodestro_runtime.testing import ContainerDouble, ScriptedClient, parsed
+from nodestro_runtime.python_tools import EnvironmentGate
+from nodestro_runtime.testing import ContainerDouble, FakeUv, ScriptedClient, StaticDockerMonitor, parsed
 from nodestro_runtime.tool_library import DependencyGate, DependencyOutcome, ToolJob, ToolLibrary
+from nodestro_runtime.workspace import Workspace
 
 CODE = "suspended"
 CODER = "expert Python developer"  # in the Coding Agent's system prompt
@@ -45,8 +51,8 @@ TOOL = '''def add_numbers(a: int, b: int) -> int:
 TESTS = "from tool import add_numbers\n\n\ndef test_add():\n    assert add_numbers(2, 3) == 5\n"
 
 
-def _proposal(code: str = TOOL, name: str = NAME) -> Any:
-    tests = TESTS.replace(NAME, name)
+def _proposal(code: str = TOOL, name: str = NAME, tests: str | None = None) -> Any:
+    tests = TESTS.replace(NAME, name) if tests is None else tests
     return parsed(lambda model: model(function_name=name, description="Adds numbers.", code=code, tests=tests))
 
 
@@ -274,3 +280,116 @@ def test_a_job_whose_approval_was_taken_registers_its_tool(library: ToolLibrary)
     _until(lambda: decision.committed or finished.event.is_set())
     assert library.cancel_jobs(CODE) == []
     assert finished.event.wait(10) and job.status == "approved" and NAME in library
+
+
+# ---- R4-7: a stopped job never starts an installation ------------------------------------------------------------
+
+
+@pytest.fixture
+def python_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Workspace, _Images]]:
+    """A workspace whose Python environments build container images (a stand-in) with a stand-in ``uv``."""
+    monitor = StaticDockerMonitor(docker_status.approved_status())
+    monkeypatch.setattr(docker_status, "monitor_for", lambda *a, **k: monitor)
+    workspace = Workspace(tmp_path / "data", python_runner=FakeUv(INDEX), integrations=[])
+    images = _Images()
+    workspace.python.images = images  # type: ignore[assignment]
+    sandbox = ContainerDouble()  # the job's tests run in a stand-in container (Docker's self-test is not run here)
+    workspace.tools.container_fallback = lambda: sandbox
+    try:
+        yield workspace, images
+    finally:
+        workspace.close()
+
+
+class _StopFirst(EnvironmentGate):
+    """The real gate; the stop lands right after the job's own last check, just before the installation starts
+    (as the API stops a suspended tenant's work: ``cancel_jobs``, then ``cancel_installs``)."""
+
+    def __init__(self, workspace: Workspace, *, before: str) -> None:
+        super().__init__(workspace.python)
+        self.workspace, self.before = workspace, before
+        self.stopped: list[str] = []
+
+    def _stop(self) -> None:
+        self.stopped += self.workspace.tools.cancel_jobs(CODE)
+        self.stopped += self.workspace.python.cancel_installs(CODE)
+
+    def prepare(self, name: str, code: str, tests: str) -> DependencyOutcome:
+        if self.before == "prepare":
+            self._stop()
+        return super().prepare(name, code, tests)
+
+    def install(self, plan_id: str, log: Callable[[str], None]) -> None:
+        if self.before == "install":
+            self._stop()
+        super().install(plan_id, log)
+
+
+def _library_job(workspace: Workspace, gate: EnvironmentGate) -> tuple[ToolJob, _Finished]:
+    workspace.tools.dependencies = gate
+    job, _client, finished = _start(workspace.tools, [_proposal(LIBRARY_CODE, "show", LIBRARY_TESTS)])
+    return job, finished
+
+
+def test_a_job_stopped_between_the_library_approval_and_the_installation_installs_nothing(
+    python_workspace: tuple[Workspace, _Images],
+) -> None:
+    workspace, images = python_workspace
+    gate = _StopFirst(workspace, before="install")
+    job, finished = _library_job(workspace, gate)
+    _until(lambda: job.status == "awaiting_dependencies")
+    plan = job.dependency_plan
+    assert plan is not None
+    workspace.tools.decide_dependencies(job.id, "approve")
+    assert finished.event.wait(10)
+    _assert_stopped(job)
+    assert gate.stopped == [job.id]  # no installation ran yet when the work was stopped
+    assert images.builds == [] and images.checked == []  # the installation never started
+    env = workspace.python.get(plan["scope"])
+    assert env is None or (env.install.status != "installing" and not env.approvals)
+    assert workspace.python.cancel_installs(CODE) == []
+    assert "show" not in workspace.tools.registry
+
+
+def test_a_job_stopped_before_its_approved_environment_is_installed_installs_nothing(
+    python_workspace: tuple[Workspace, _Images],
+) -> None:
+    workspace, images = python_workspace
+    python = workspace.python
+    # The libraries were approved and installed before; the image is gone, so preparing would install it again.
+    needed = python.needed_for_sources([("show", LIBRARY_CODE, LIBRARY_TESTS)])
+    plan = python.plan("tool", "show", needed, trust="untrusted")
+    assert plan.error is None and plan.lock
+    assert python.approve(plan.id, wait=True).install.status == "installed"
+    built = list(images.builds)
+    images.built.clear()
+    python._images_ready.clear()
+    assert python.status("tool", "show", needed, trust="untrusted").state == "install_needed"
+    gate = _StopFirst(workspace, before="prepare")
+    job, finished = _library_job(workspace, gate)
+    assert finished.event.wait(10)
+    _assert_stopped(job)
+    assert gate.stopped == [job.id]
+    assert images.builds == built  # no installation started for the stopped job
+    env = python.get(plan.scope)
+    assert env is not None and env.install.status != "installing"
+
+
+def test_an_installation_is_refused_while_the_work_that_asks_for_it_is_stopped(
+    python_workspace: tuple[Workspace, _Images],
+) -> None:
+    workspace, images = python_workspace
+    python = workspace.python
+    needed = python.needed_for_sources([("show", LIBRARY_CODE, LIBRARY_TESTS)])
+    plan = python.plan("tool", "show", needed, trust="untrusted")
+    token = sandbox_cancel.bind(lambda: True)
+    try:
+        with pytest.raises(NodestroError) as error:
+            python.approve(plan.id, wait=True)
+    finally:
+        sandbox_cancel.reset(token)
+    assert error.value.code == "deps.install_stopped"
+    assert python.get(plan.scope) is None and images.builds == []  # nothing stored, nothing started
+    assert python.cancel_installs(CODE) == []
+    # Work that was not stopped installs as before.
+    assert python.approve(plan.id, wait=True).install.status == "installed" and images.builds
