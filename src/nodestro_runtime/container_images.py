@@ -188,6 +188,7 @@ def _exec_tmp(value: str) -> str:
     """The ``/tmp:<options>`` tmpfs value with ``noexec`` replaced by ``exec`` (the ``exec_tmp`` allowance)."""
     return "/tmp:" + ",".join("exec" if item == "noexec" else item for item in value[5:].split(","))
 
+
 #: What the resolve container may differ in (it is started only on the desktop profile, RT-038).
 RESOLVE_ALLOWANCES: frozenset[ShapeAllowance] = frozenset({"network", "exec_tmp", "proxy_env"})
 #: ``docker run`` flags of the proven shape that take no value.

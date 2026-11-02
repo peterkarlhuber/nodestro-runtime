@@ -61,6 +61,10 @@ def test_auto_falls_back_to_docker_and_otherwise_refuses(monkeypatch: pytest.Mon
     assert without.blocked and without.untrusted == "" and without.reason == "docker-unreachable"
     assert "start Docker" in without.detail
     assert without.os == "macos"
+    # A running Docker that failed a check is not told to "start Docker".
+    failed = sandbox_selection.select(DESKTOP, "auto", docker_status.unavailable_status("docker-selftest", "cgroup v1"))
+    assert failed.blocked and failed.reason == "docker-selftest"
+    assert "start Docker" not in failed.detail and "did not pass" in failed.detail and "cgroup v1" in failed.detail
 
 
 def test_an_explicit_subprocess_choice_never_uses_docker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -82,8 +86,6 @@ def test_docker_mode_and_servers_run_everything_in_containers(monkeypatch: pytes
     # Without a proven Docker a server runs no tool code either, and says why.
     refused = sandbox_selection.select(SERVER, "auto", docker_status.unavailable_status("docker-limits", "no pids"))
     assert refused.blocked and refused.reason == "docker-limits" and "no pids" in refused.detail
-    # A running Docker that failed a check is not told to "start Docker".
-    assert "start Docker" not in refused.detail and "did not pass" in refused.detail
 
 
 @pytest.mark.parametrize("reason", docker_status.DOCKER_REASONS)
