@@ -468,6 +468,20 @@ class AxentraServices:
     def secret_box(self, legacy: SecretBox | None) -> KeyringSecretBox:
         return KeyringSecretBox(legacy, self.platform.secrets, write=self.config.secrets_format)
 
+    def reencrypt_columns(self, *, dry_run: bool) -> dict[str, Any]:
+        """Re-encrypt Axentra's own keyring columns (login states, webhook secrets, notification messages and the
+        inbox; security review SR-05) under the active key: ``axentra secrets reencrypt`` for this server. The
+        report counts values per key id before the run (``by_kid``; ``?``: not a keyring value)."""
+        self.platform.db.open()
+        report = self.platform.reencrypt_secrets(dry_run=dry_run)
+        return dict(report.as_dict())
+
+    def kids_in_use(self) -> dict[str, int]:
+        """Values per key id in Axentra's own keyring columns (a dry run of :meth:`reencrypt_columns`), for the start
+        check: a keyring that lacks one of them would make those values unreadable."""
+        found = self.reencrypt_columns(dry_run=True).get("by_kid", {})
+        return {str(kid): int(n) for kid, n in found.items() if kid != "?"}
+
 
 def keyring_secret_box(config: AxentraConfig, legacy: SecretBox | None) -> KeyringSecretBox:
     """The tenant secret box for ``config`` without opening the database (only the keyring is needed)."""
@@ -740,14 +754,19 @@ def stored_secret_formats(database: PostgresDatabase) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def secrets_rollback_problems(config: AxentraConfig, formats: Mapping[str, int]) -> list[dict[str, str]]:
+def secrets_rollback_problems(
+    config: AxentraConfig, formats: Mapping[str, int], axentra_kids: Mapping[str, int] | None = None
+) -> list[dict[str, str]]:
     """Why this configuration cannot read every stored tenant secret (empty: it can), as ``profile.invalid`` problems.
 
     The start refuses (instead of reading values as ``secrets.unreadable`` and inviting people to enter them again):
     ``NODESTRO_AXENTRA=off`` while ``axs1`` values exist (the keyring is only read with ``on``), and a keyring that
     lacks a key id still in use (a key removed before ``secrets reencrypt`` reported ``pending: 0``). v1 values are
-    always readable: ``NODESTRO_SECRET_KEY`` is required in every configuration."""
+    always readable: ``NODESTRO_SECRET_KEY`` is required in every configuration. ``axentra_kids``: the key ids of
+    Axentra's own keyring columns (:meth:`AxentraServices.kids_in_use`, SR-05), counted like Nodestro's values."""
     in_use = {kind.split(":", 1)[1]: count for kind, count in formats.items() if kind.startswith("axs1:")}
+    for kid, count in (axentra_kids or {}).items():
+        in_use[kid] = in_use.get(kid, 0) + count
     if not in_use:
         return []
     total = sum(in_use.values())
@@ -855,12 +874,17 @@ def secret_key_problems(
     return problems
 
 
-def require_readable_secrets(database: PostgresDatabase, config: AxentraConfig, box: Any | None = None) -> None:
+def require_readable_secrets(
+    database: PostgresDatabase,
+    config: AxentraConfig,
+    box: Any | None = None,
+    axentra_kids: Mapping[str, int] | None = None,
+) -> None:
     """Refuse to serve (``profile.invalid``) when the configuration cannot read every stored tenant secret
     (:func:`secrets_rollback_problems`) or, given the secret ``box``, when a configured key is not the one the stored
     values were encrypted with (:func:`secret_key_problems`); ``check``, ``api`` and ``worker`` call it after the
     schema check."""
-    problems = secrets_rollback_problems(config, stored_secret_formats(database))
+    problems = secrets_rollback_problems(config, stored_secret_formats(database), axentra_kids)
     if not problems and box is not None:
         problems = secret_key_problems(database, box)
     if problems:
