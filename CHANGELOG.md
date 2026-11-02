@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+macOS and Windows start (sandbox architecture Phase A, 2026-11-02):
+
+- The runtime imports and starts on macOS and Windows again. `sandbox_confine.py` looked up `prctl` with ctypes at
+  import time (macOS: `AttributeError: dlsym(RTLD_DEFAULT, prctl): symbol not found`) and imported the POSIX-only
+  `resource` module (Windows: `ModuleNotFoundError`); every import of the workspace went through it. The C library is
+  now looked up on first use and only on Linux, `resource` is imported after the platform check, and `_kill` falls
+  back to `Popen.kill` without `os.killpg`. The Linux confinement (Landlock, seccomp, limits, order of the steps) is
+  unchanged. Off Linux the built-in sandbox reports reason `platform` and untrusted code is still refused.
+- New `tests/test_platform_start.py` and workflow `Platforms` on macOS arm64 and x86-64, Windows x64 and ARM64 and
+  Linux: imports every module, opens a workspace, checks the sandbox report and the refusal of untrusted code, runs
+  user-authored code in the subprocess sandbox, and simulates macOS and Windows on Linux.
+
 Live run chat fix (LRC-1, 2026-11-01):
 
 - Questions to a team leader are answered with any provider: the answer agent no longer turns off Anthropic's prompt

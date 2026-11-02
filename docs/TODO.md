@@ -195,9 +195,10 @@ None known.
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** `sandbox_policy.py`
-- **What:** The built-in sandbox is Linux-only. On macOS and Windows untrusted (AI-generated) tools need Docker; the
-  runtime itself is not tested on these systems at all.
-- **Next step:** Test the runtime on macOS and Windows; decide whether a native isolation is wanted there.
+- **What:** The built-in sandbox is Linux-only. On macOS and Windows untrusted (AI-generated) tools need Docker.
+  Since 2026-11-02 the runtime imports and starts on macOS (arm64, x86-64) and Windows (x64, ARM64), tested by the
+  `Platforms` workflow; before that, the import of `sandbox_confine.py` failed on both.
+- **Next step:** Native isolation for macOS and Windows (cross-platform sandbox architecture, in progress).
 
 ### RT-020 · Real providers and PostgreSQL at scale
 
