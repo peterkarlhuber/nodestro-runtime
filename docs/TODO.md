@@ -77,8 +77,9 @@ None known.
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
   (which refuses containers with network and foreign images); outside the desktop source builds are off
   (`deps.source_build_disabled`, RT-038). Studio has no text for the `reason` parameter yet.
-- **Next step:** Add a real-Docker test of the resolve container in the CI `docker` job. The gateway offers a resolve
-  container only together with a proven filtered build network (RT-040).
+- **Next step:** The real-Docker test of the resolve container exists (`tests/test_resolve_real_engine.py`, CI
+  `docker` job); its approved path waits for the RT-038 real-engine findings. The gateway offers a resolve container
+  only together with a proven filtered build network (RT-040).
 
 ### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
 
@@ -122,12 +123,45 @@ None known.
   A pre-download on the host with `--network none` for the build is not feasible as is: the dependencies of a package
   that has only a source distribution are known only after its build script ran, so resolving and building cannot be
   separated in one step. A proxy that needs credentials no longer works for the resolver (credentials are not passed
-  into code that can read them). `/tmp` in the resolve container is executable (compilers and build tools run there).
-  The resolver is used only for plans a person explicitly accepted (library dialog), never for generated tools.
-- **Next step:** RT-040 (a proven filtered build network, or iterative resolving without network). Add a real-Docker
-  test of `missing_modules` and the resolve container in the CI `docker` job (it would also show that uv runs with
-  the sealed `/run` and `/var/tmp` and the `/tmp` mode Docker gives a tmpfs without `mode=`). Studio needs texts for
-  `deps.source_build_disabled` and `sandbox.shape_mismatch`.
+  into code that can read them). `/tmp` in the resolve container is meant to be executable (compilers and build tools
+  run there), but is not yet (see the real-engine findings below). The resolver is used only for plans a person
+  explicitly accepted (library dialog), never for generated tools.
+- **Real-engine test (added 2026-11-02; not yet run in CI):** `tests/test_resolve_real_engine.py` runs
+  `compile_in_container` against a real daemon (`NODESTRO_DOCKER_TESTS=1`, a separate step of the CI `docker`
+  job). On any daemon it proves: the self-test runs first, in the pinned image by its id and with exactly
+  `_RESOLVE_LIMITS`; a resolve shape with an extra flag and a sandbox that proved other limits are refused with no
+  resolve container created (checked with `docker events`): by the self-test on an unproven daemon, by the shape
+  check (`sandbox.shape_mismatch`) on a proven one; a moved local tag of the
+  resolver's name is never tested or run; off the desktop an accepted source build reports
+  `deps.source_build_disabled` with no docker CLI call, container or pull; the desktop plan falls back to
+  `deps.build_required` (reason `sandbox.unavailable`) on an unproven daemon; nothing of the module's owner, no
+  resolve container and no volume is left. On a daemon that proves the resolve sandbox it also proves: a pure-Python
+  wheel (`six==1.17.0`) resolves to its hashed lock in the real container; the running container's limits from
+  `docker container inspect` and from inside (cgroup v2 memory, swap, pids and CPU; ulimits; uid/gid; capabilities;
+  no-new-privileges; seccomp; read-only root; tmpfs options and sizes; sealed `/run` and `/var/tmp`; no mount, no
+  volume, no host variable; Docker's default network) are the proven shape up to `RESOLVE_ALLOWANCES`; a timed-out
+  and a cancelled resolve are stopped and their containers removed; proxy credentials appear nowhere (run command,
+  inspect output, the container's environment, its output, the installation log), and only credential-free proxy
+  variables reach it. Locally (cgroup v1) the approved-path tests skip with the self-test's refusal.
+- **Real-engine findings (2026-11-02, open):**
+  - The resolve self-test refuses every daemon, cgroup v2 included: the pinned `UV_IMAGE` sets no `LANG`, so Python's
+    C-locale coercion (PEP 538) puts `LC_CTYPE=C.UTF-8` into the self-test's environment, and Orkexa's
+    `evaluate_self_test` refuses it ("unexpected environment variables: LC_CTYPE"). The environment images on
+    `python:<v>-slim` set `LANG=C.UTF-8` and are not affected. Until this is fixed, desktop source builds fail with
+    `deps.build_required` (reason `sandbox.unavailable`) and the approved-path tests fail in CI. Fix options (owner
+    decision): Orkexa accepts the coerced `LC_CTYPE` (an Orkexa change and a new pin), or a resolver image that sets
+    `LANG` (a new `UV_IMAGE` pin).
+  - `/tmp` of the resolve container is not executable: Docker mounts a `--tmpfs` `noexec` unless its options say
+    `exec`, so dropping `noexec` (the `exec_tmp` allowance) has no effect (seen on Docker 29.9;
+    `test_build_tools_can_run_programs_from_the_resolve_container_s_tmp`). Making it executable means `exec` in
+    `_resolve_args` and in the `exec_tmp` normalization of `check_shape`; it widens what build code can do, so it
+    waits for an owner decision.
+  - Fixed: the resolve container's proven shape is built from the sandbox's own limits (what its self-test ran), not
+    from the constant, so a sandbox that proved other limits is refused (`sandbox.shape_mismatch`).
+- **Next step:** Decide and fix the two open findings, then see the real-engine test pass in the CI `docker` job.
+  RT-040 (a proven filtered build network, or iterative resolving without network) stays open and is not approved.
+  A real-Docker test of `missing_modules` is still missing. Studio needs texts for `deps.source_build_disabled` and
+  `sandbox.shape_mismatch`.
 
 ### RT-040 · A filtered build network, so servers can build Python packages from source again
 

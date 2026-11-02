@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+The resolve path on a real Docker engine (RT-038; 2026-11-02):
+
+- `tests/test_resolve_real_engine.py` runs `ContainerImages.compile_in_container` against a real daemon
+  (`NODESTRO_DOCKER_TESTS=1`; a new step of the CI `docker` job): the self-test with the resolve limits before any
+  resolve container, the refusal paths (unproven daemon, shape and limits mismatch), digest pinning and run by image
+  id, the effective limits from `docker container inspect` and from inside the container, wheel-only resolution,
+  `deps.source_build_disabled` before any docker call off the desktop, timeout, cancel, cleanup and proxy credentials.
+- Fix: the resolve container is checked against the shape its sandbox's self-test ran (the sandbox's limits), not
+  against `_RESOLVE_LIMITS` directly, so a sandbox that proved other limits starts nothing (`sandbox.shape_mismatch`).
+- Found, not fixed (owner decisions, see RT-038 in `docs/TODO.md`): the self-test refuses the pinned resolver image
+  on every daemon (Python's C-locale coercion sets `LC_CTYPE`, which Orkexa refuses), and the resolve container's
+  `/tmp` stays `noexec` (Docker's tmpfs default) although the `exec_tmp` allowance means it to be executable.
+
 Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-11-02):
 
 - `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so

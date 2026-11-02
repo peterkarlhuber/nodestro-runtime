@@ -101,6 +101,12 @@ jobs:
           pip install -e ".[dev]"
       - run: docker info
       - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
+      # The dependency-resolve path (RT-038) on this engine: the pinned resolver image from ghcr.io by digest, its
+      # self-test with the resolve limits, the resolve container's effective limits, network and environment, timeout,
+      # cancel and cleanup, and one pure-Python wheel resolved from PyPI. Under NODESTRO_REQUIRE_DOCKER an unproven
+      # daemon fails these tests instead of skipping them.
+      - name: Dependency resolve on the real engine
+        run: pytest -v tests/test_resolve_real_engine.py
 
   builtin-sandbox:
     # Security probes and compatibility checks of the built-in Linux sandbox (Landlock + seccomp, ADR-0006) as the
