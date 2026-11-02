@@ -1369,8 +1369,13 @@ class AxentraEvents:
             params = (tenant,)
         for (tenant_id,) in self.link.database._query(query + " ORDER BY id", params):
             tenant_id = str(tenant_id)
-            recorded = self._mirrored_runs(tenant_id)
-            for run in settled_runs(self.link.database, tenant_id, since=since):
+            candidates = settled_runs(self.link.database, tenant_id, since=since)
+            if not candidates:
+                continue
+            # A periodic pass reads the mirrored events of its candidate runs only (by key, through the unique
+            # index): reading every run event of the tenant made each pass grow with all runs ever settled.
+            recorded = self._mirrored_runs(tenant_id, None if full else [run.id for run in candidates])
+            for run in candidates:
                 report["runs"] += 1
                 wanted = usage_quantities(run.usage)
                 if not wanted:
@@ -1397,21 +1402,33 @@ class AxentraEvents:
             self._settled_until = started - timedelta(minutes=5)
         return report
 
-    def _mirrored_runs(self, tenant_id: str) -> dict[str, dict[str, Decimal]]:
+    def _mirrored_runs(self, tenant_id: str, run_ids: list[str] | None = None) -> dict[str, dict[str, Decimal]]:
+        """The mirrored quantities per run and meter of the tenant: every run's, or (``run_ids``) only those runs'."""
         ax_tenant = self.link.tenant(tenant_id)
         if ax_tenant is None:
             return {}
         from axentra.data.database import DbScope, join
 
+        product = self.link.services.product_id
+        rows: list[Any] = []
         with (
             self.link.joined() as connection,
-            join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx,
+            join(connection, DbScope.tenant(product, ax_tenant)) as tx,
         ):
-            rows = tx.all(
-                "SELECT idempotency_key, quantity FROM axentra_usage_events"
-                " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:run:%%'",
-                (self.link.services.product_id, ax_tenant),
-            )
+            if run_ids is None:
+                rows = tx.all(
+                    "SELECT idempotency_key, quantity FROM axentra_usage_events"
+                    " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:run:%%'",
+                    (product, ax_tenant),
+                )
+            else:
+                keys = [run_usage_key(run_id, meter) for run_id in run_ids for meter, _unit, _text in USAGE_METERS]
+                for start in range(0, len(keys), 2000):
+                    rows += tx.all(
+                        "SELECT idempotency_key, quantity FROM axentra_usage_events"
+                        " WHERE product_id = %s AND tenant_id = %s AND idempotency_key = ANY(%s)",
+                        (product, ax_tenant, keys[start : start + 2000]),
+                    )
         found: dict[str, dict[str, Decimal]] = {}
         for row in rows:
             _, _, run_id, meter = str(row["idempotency_key"]).split(":", 3)

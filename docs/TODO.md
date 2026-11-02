@@ -194,7 +194,9 @@ None known.
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
 - **What:** With fresh statistics the pooled store is about 12 % below the pre-audit single-connection throughput,
-  and writes of one process still run one after another. Not measured on server hardware under load.
+  and writes of one process still run one after another. Not measured on server hardware under load. Local numbers
+  (one 4-CPU machine, before and after Axentra) are in `docs/AXENTRA.md`, "Performance": with Axentra identity an
+  API process is CPU-bound at about 40 % of the requests per second of the Axentra-off configuration.
 - **Next step:** Load test on target hardware (run in nodestro-server, SRV-013); then decide on parallel writes or a pool-free read path
   for single-process use.
 
