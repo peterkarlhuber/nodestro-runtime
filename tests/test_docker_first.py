@@ -33,7 +33,9 @@ from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEM
 from nodestro_runtime.workspace import Workspace
 
 DESKTOP = SandboxPolicy("desktop")
-INDEX = {"tablib": [("1.0", [], "tablib\ndef show(text):\n    return 'T:' + text\n")]}
+INDEX: dict[str, list[tuple[str, list[str], str]]] = {
+    "tablib": [("1.0", [], "tablib\ndef show(text):\n    return 'T:' + text\n")]
+}
 CODE = '''# /// script
 # dependencies = ["tablib"]
 # ///

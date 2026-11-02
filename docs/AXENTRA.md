@@ -193,7 +193,7 @@ run by `tests/test_tenant_filters.py` of the runtime and of the API:
 
 What the check guarantees: every text in `nodestro_runtime` and `nodestro_api` that is, or may become, a statement on
 a tenant table, as far as its parts are written in that source, is proven bound to one tenant, reported, or
-allowlisted with a reason. Each bypass found by the security review (rounds 1 to 3) is a regression test in
+allowlisted with a reason. Each bypass found by the security review (rounds 1 to 4) is a regression test in
 `tests/test_tenant_filters.py`. What it does not guarantee: that the bound parameter is the caller's tenant (the store
 object bound to one tenant passes it), and the cases below.
 
@@ -208,7 +208,17 @@ slip through it:
 - SQL that run-time data puts together without a known part that shows it: an argument of a helper that runs whatever
   it is given (checked only at the callers that pass a literal text), a text made only of unknown parts whose SQL
   fragments live in another package, a lower-case keyword without a SQL shape after an unknown part
-  (`f"{BASE} or deleted"`), SQL reached through `getattr`, `eval` or a container the check does not follow;
+  (`f"{BASE} or deleted"`), SQL reached through `getattr`, `eval`, `globals()`, a name assigned from another module
+  (`frag.BASE = ...`) or a container the check does not follow;
+- from the round-4 review (R4-3 to R4-6): R4-4 (a module name read with its last value instead of its value at the
+  read; a function now reads every value the name is ever assigned) and R4-6 (lower-case `or (1=1)` after an unknown
+  part) are fixed; only the general cases above stay open there. R4-3 is fixed for every receiver
+  (`self.BASE.replace(...)`, `Q["a"].replace(...)`, `base().replace(...)`, `str.replace(BASE, ...)`), but a change
+  whose text and arguments are both unknown (`base().replace(old, new)` with parameters) shows nothing and still slips
+  through. R4-5 is fixed for SQL comments in front of an unknown part (`/* tag */ {BASE} OR true`, `-- tag\n{BASE}
+  ...`) and for fragments such as `"/**/OR true"` and `" IS NOT NULL OR true"`, but other text in front of an unknown
+  part (`f"tag {BASE} OR true"`) still slips through: ordinary messages have the same shape (`f"The setting {key} is
+  not allowed in a sandbox container"`), so reporting it would flag them;
 - a wrong tenant value in a correctly shaped statement (a store created for the wrong tenant), and the allowlisted
   cross-tenant statements themselves (each has a reason; a changed statement no longer matches and is reviewed again).
 
@@ -347,10 +357,16 @@ identity). A suspended tenant is closed, not deleted:
   (`server_app.stop_tenant_work`, stop code `identity.tenant_suspended`): batches, benchmarks with their judge,
   assistant answers, architect drafts, tool generation jobs (`ToolLibrary.cancel_jobs`: the job is `failed` at once
   with `message_code` `identity.tenant_suspended`; no further model request, a running sandbox test is killed and its
-  container removed, a wait for a decision ends, the tool is never registered; security review NF-1), live run chat answers (`RunChat.cancel_answers`: the question fails at once and
-  a late answer is not stored) and Python environment installations (`PythonEnvironments.cancel_installs`: stopped
+  container removed, a wait for a decision ends, the tool is never registered, and no installation of libraries starts
+  for it: `PythonEnvironments` checks the job's stop again where an installation starts, under the lock
+  `cancel_installs` takes, which `stop_tenant_work` calls after `cancel_jobs`; security review NF-1, R4-7. An approval
+  or rejection of the tool taken before the stop is carried out by design, and until the check sees the suspension (at
+  most `suspension_check` seconds, 5 by default) a job keeps working (an installation of libraries approved before
+  the suspension may start), although every request of the tenant, a decision
+  included, is refused at once), live run chat answers (`RunChat.cancel_answers`: the question fails at once and a
+  late answer is not stored) and Python environment installations (`PythonEnvironments.cancel_installs`: stopped
   before their next step; a `uv` or `docker build` command already running finishes, bounded by its timeout, but its
-  result is never checked or used). Security review SR-03, SR-03a, NF-1.
+  result is never checked or used). Security review SR-03, SR-03a, NF-1, R4-7.
 - In `axentra` mode a tenant counts as suspended when **either** side says so: a suspension made directly in Axentra
   closes it at once (fail closed), and resuming it needs Nodestro's command when Nodestro's side is suspended. In
   `nodestro`/`mirror` mode Nodestro's status decides (`mirror` writes it to Axentra too). The backfill copies a

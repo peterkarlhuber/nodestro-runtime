@@ -10,6 +10,10 @@ threads that run tool calls), and a sandbox that supports it polls :func:`reques
   :mod:`orkexa.dynamic.lifecycle`, ORK-001): they kill the call's process group, or kill and remove its container.
   The container sandboxes Nodestro builds (:class:`nodestro_runtime.container_images.StreamedSandbox`) are Orkexa
   ``DockerSandbox`` instances, so this covers them, and so does :meth:`orkexa.dynamic.Sandbox.cancel`.
+
+A tool generation job binds its stop the same way (:meth:`nodestro_runtime.tool_library.ToolLibrary.cancel_jobs`),
+and :class:`nodestro_runtime.python_envs.PythonEnvironments` refuses to start an installation while the bound check
+is set (security review R4-7): stopped work never starts one.
 """
 
 from __future__ import annotations
