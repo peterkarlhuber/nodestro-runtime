@@ -112,6 +112,9 @@ None known.
   a dedicated database role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, mirroring run usage (needs a per-run
   idempotency key and a billing decision), Axentra-side enforcement of limits, and a staging run of
   migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
+  Input files (`NODESTRO_FILES_BACKEND=axentra`, M8): open are a staging run of `files migrate/verify` against a real
+  S3 bucket (tested only with moto's S3 server) and quota defaults per plan. Knowledge files are deliberately not
+  moved (already in PostgreSQL with their search index).
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 
