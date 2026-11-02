@@ -240,7 +240,7 @@ async def test_event_numbering_continues_after_a_restart(tmp_path: Path) -> None
 # ---- Python libraries of generated tools -----------------------------------------------------
 
 
-def test_generated_tools_never_build_a_package_while_resolving(make: Make) -> None:
+def test_generated_tools_never_build_a_package_while_resolving(make: Make, tmp_path: Path) -> None:
     from nodestro_runtime.testing import FakeUv
 
     uv = FakeUv({"onlysource": [("1.0", [], "onlysource\nX = 1\n")]})
@@ -259,11 +259,12 @@ def test_generated_tools_never_build_a_package_while_resolving(make: Make) -> No
     assert unbuilt.error is not None and unbuilt.error.code == "deps.build_required"
     assert unbuilt.error.params == {"name": "onlysource"}
     # A person who asks for the plan accepts the source build, but it never runs on the host: uv still resolves with
-    # --no-build, and the build would run in a container, which is refused while the resolver image is not pinned.
+    # --no-build, and the build would run in a container, which needs Docker (missing here, whatever the host has).
+    workspace.python.images.docker = str(tmp_path / "no-docker")
     plan = workspace.python.plan("tool", "measure", needed)
     assert uv.builds == [False, False] and not plan.lock
     assert plan.error is not None and plan.error.code == "deps.build_required"
-    assert plan.error.params == {"name": "onlysource", "reason": "deps.build_unavailable"}
+    assert plan.error.params == {"name": "onlysource", "reason": "sandbox.unavailable"}
 
 
 def test_uv_never_builds_on_the_host_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

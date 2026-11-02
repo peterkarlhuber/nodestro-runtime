@@ -83,9 +83,13 @@ BASE_IMAGES: dict[str, str] = {
 _BUILD_TIMEOUT = 1800.0
 #: The image that resolves requirements in a container when a package has to be built from source to read its
 #: dependencies (:meth:`ContainerImages.compile_in_container`): uv's official image with Python, pinned by digest.
-#: The digest is a placeholder until it is pinned on purpose (RT-032); with it, building from source is refused.
-#: Pin with ``docker buildx imagetools inspect ghcr.io/astral-sh/uv:<version>-python3.13-bookworm-slim``.
-UV_IMAGE = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:" + "0" * 64
+#: The digest is the multi-arch index of ``0.9.5-python3.13-bookworm-slim`` (linux/amd64 and linux/arm64), checked
+#: against ghcr.io on 2026-11-02. A placeholder digest is refused. Update with
+#: ``docker buildx imagetools inspect ghcr.io/astral-sh/uv:<version>-python3.13-bookworm-slim``.
+UV_IMAGE = (
+    "ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim"
+    "@sha256:60d8ee2c1f7ffce050822adcb44907514e39f29d2d7b37732e8fca9f4f6113af"
+)
 _UV_IMAGE_PLACEHOLDER = "@sha256:" + "0" * 64
 _PINNED = re.compile(r"^[a-z0-9./:_-]+@sha256:[0-9a-f]{64}$")
 _RESOLVE_TIMEOUT = 900.0
@@ -488,7 +492,7 @@ class ContainerImages:
         privileges, user ``nobody``, a read-only root file system with a ``tmpfs`` ``/tmp``, memory/CPU/process
         limits. The requirements, the previous lock and a certificate authority (``NODESTRO_BUILD_CA_FILE`` or
         ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout. The image is uv's, pinned by digest
-        (:data:`UV_IMAGE`); while the digest is a placeholder, this is refused (``deps.build_unavailable``).
+        (:data:`UV_IMAGE`); an image that is not pinned by a real digest is refused (``deps.build_unavailable``).
 
         Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when Docker is
         missing (``sandbox.unavailable``) or the image is not pinned."""
@@ -527,8 +531,7 @@ class ContainerImages:
         try:
             return self._docker(args, timeout=_RESOLVE_TIMEOUT, log=lambda line: log(redact(line)), stdin=envelope)
         except _DockerFailed as exc:
-            lowered = exc.output.lower()
-            if "cannot connect to the docker daemon" in lowered or "is the docker daemon running" in lowered:
+            if _daemon_unreachable(exc.output):
                 raise NodestroError("sandbox.unavailable", "Docker is not running") from None
             raise ResolveError(redact(exc.output)) from None
         except NodestroError:
@@ -798,6 +801,19 @@ class _DockerFailed(Exception):
         self.output = output
 
 
+_DAEMON_UNREACHABLE = (
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "failed to connect to the docker api",  # Docker CLI 28 and later
+)
+
+
+def _daemon_unreachable(output: str) -> bool:
+    """Whether the docker client's ``output`` says it could not reach a daemon (old and new CLI wording)."""
+    lowered = output.lower()
+    return any(marker in lowered for marker in _DAEMON_UNREACHABLE)
+
+
 def _explain(output: str) -> tuple[str, str]:
     lowered = output.lower()
     if "no matching distribution" in lowered or "could not find a version" in lowered:
@@ -810,7 +826,7 @@ def _explain(output: str) -> tuple[str, str]:
             "deps.hash_mismatch",
             "A downloaded package did not match the approved lock file; nothing was installed",
         )
-    if "cannot connect to the docker daemon" in lowered or "is the docker daemon running" in lowered:
+    if _daemon_unreachable(output):
         return ("sandbox.unavailable", "Docker is not running")
     return ("deps.image_failed", f"Building the container image failed: {output[-500:]}")
 

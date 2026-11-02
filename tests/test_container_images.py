@@ -187,6 +187,10 @@ def test_the_image_downloads_with_hashes_and_installs_offline(docker: FakeDocker
         ("ERROR: Could not find a version that satisfies the requirement six==1.17.0", "deps.wheels_required"),
         ("ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.", "deps.hash_mismatch"),
         ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "sandbox.unavailable"),
+        (
+            "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct",
+            "sandbox.unavailable",
+        ),
         ("something else", "deps.image_failed"),
     ],
 )
@@ -344,10 +348,16 @@ def test_environments_keep_their_images_when_unused_ones_are_collected(
 PINNED_UV = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:" + "ab" * 32
 
 
-def test_resolving_in_a_container_is_refused_while_the_image_is_a_placeholder(docker: FakeDocker) -> None:
+def test_the_resolver_image_is_pinned_by_digest() -> None:
     from nodestro_runtime.container_images import UV_IMAGE
 
-    for image in (None, UV_IMAGE, "ghcr.io/astral-sh/uv:latest"):
+    name, _, digest = UV_IMAGE.partition("@sha256:")
+    assert name.startswith("ghcr.io/astral-sh/uv:") and len(digest) == 64 and set(digest) != {"0"}
+
+
+def test_resolving_in_a_container_is_refused_for_an_unpinned_or_placeholder_image(docker: FakeDocker) -> None:
+    placeholder = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:" + "0" * 64
+    for image in (placeholder, "ghcr.io/astral-sh/uv:latest"):
         with pytest.raises(NodestroError) as caught:
             images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=image)
         assert caught.value.code == "deps.build_unavailable"

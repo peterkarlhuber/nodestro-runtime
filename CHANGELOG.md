@@ -8,11 +8,12 @@ No package build scripts on the host (Docker-first plan R4, 2026-11-02):
   with `--no-build`, so no package's build script runs on the host. `PythonEnvironments.plan` always resolves with
   `--no-build` on the host; `builds` now means that a person accepted a source build (`deps.build_required`).
 - New `ContainerImages.compile_in_container`: for such an accepted plan, `uv pip compile --generate-hashes` runs in a
-  container of uv's image, pinned by digest (`UV_IMAGE`), with network only for that step, no bind mounts, only the
+  container of uv's image, pinned by its multi-arch digest (`UV_IMAGE`, uv 0.9.5), with network only for that step, no bind mounts, only the
   proxy variables (by name), `--cap-drop ALL`, `no-new-privileges`, user `65534`, a read-only root and a tmpfs `/tmp`;
-  requirements, the previous lock and the build CA travel on stdin, the lock comes back on stdout. While the digest
-  is a placeholder it is refused (`deps.build_unavailable`), and the plan reports `deps.build_required` with the
-  parameter `reason` (also `sandbox.unavailable` without Docker). Container image builds keep `--only-binary=:all:`.
+  requirements, the previous lock and the build CA travel on stdin, the lock comes back on stdout. An image without a
+  real digest is refused (`deps.build_unavailable`); if it cannot run, the plan reports `deps.build_required` with the
+  parameter `reason` (`sandbox.unavailable` without Docker). The Docker CLI 28 wording "failed to connect to the docker
+  API" now also counts as Docker not running. Container image builds keep `--only-binary=:all:`.
   Tracked follow-ups: RT-032.
 
 Environment image caps and collection (Docker-first plan R3, 2026-11-02):

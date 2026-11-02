@@ -72,12 +72,11 @@ None known.
 - **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
   for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
   bind mounts, proxy variables only, no capabilities, `nobody`, read-only with a tmpfs, input on stdin, lock on
-  stdout). The uv image's digest in `UV_IMAGE` is still a placeholder, so this is refused for now and such packages
-  report `deps.build_required` (reason `deps.build_unavailable`). It also cannot run through the sandbox gateway
-  (which refuses containers with network and foreign images), and without Docker there is no source build at all.
-  Studio has no text for the `reason` parameter yet.
-- **Next step:** Pin `UV_IMAGE` on purpose (`docker buildx imagetools inspect
-  ghcr.io/astral-sh/uv:<version>-python3.13-bookworm-slim`, amd64 and arm64), add a real-Docker test of the resolve
+  stdout). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
+  (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
+  packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
+  (which refuses containers with network and foreign images). Studio has no text for the `reason` parameter yet.
+- **Next step:** Add a real-Docker test of the resolve
   container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
 
 ## Bugs and reliability
