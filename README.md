@@ -29,7 +29,7 @@ Nodestro API and studio and may change between versions.
 
 ## Installation
 
-Requires Python 3.10 or newer (CI tests 3.10 and 3.13).
+Requires Python 3.11 or newer (CI tests 3.11 and 3.13).
 
 ```bash
 pip install "nodestro-runtime @ git+https://github.com/peterkarlhuber/nodestro-runtime.git@<commit>"
@@ -261,8 +261,8 @@ desktop database into an empty tenant (without tool provenance: imported tools a
 
 `workspace.mcp` connects agents to the tools of remote MCP servers over Streamable HTTP (ADR-0007 in the studio
 repository; package `nodestro_runtime.mcp`). The official MCP SDK negotiates the protocol version: `server/discover`
-at 2026-07-28, otherwise the `initialize` handshake (2025-11-25 and older). It needs Python 3.11 or later; on 3.10
-servers cannot be reached (`mcp.unavailable`).
+at 2026-07-28, otherwise the `initialize` handshake (2025-11-25 and older). The SDK is a dependency of the package; an
+installation without it cannot reach servers (`mcp.unavailable`).
 
 ```python
 from nodestro_runtime.mcp.models import McpServerIn

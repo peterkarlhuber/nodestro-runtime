@@ -106,7 +106,6 @@ def test_compressed_answers_are_not_accepted_and_not_asked_for(http: Any) -> Non
 
 def test_an_oversized_tool_result_fails_the_call_without_reading_it_all(monkeypatch: pytest.MonkeyPatch) -> None:
     """End to end through the MCP SDK: a tool answer larger than the limit fails the call with a stable code."""
-    pytest.importorskip("mcp")
     from mcp_support import serve
 
     from nodestro_runtime.mcp import netguard

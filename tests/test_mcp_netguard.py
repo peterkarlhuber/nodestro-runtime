@@ -141,7 +141,6 @@ def _get(client, url: str) -> int:  # type: ignore[no-untyped-def]
 
 @pytest.fixture
 def plain_server():  # type: ignore[no-untyped-def]
-    pytest.importorskip("mcp")
     from mcp_support import serve
 
     server = serve()
@@ -188,7 +187,6 @@ def test_redirects_to_other_origins_are_checked_again() -> None:
 
 
 def test_tls_verifies_the_configured_name_not_the_address(tmp_path: Path) -> None:
-    pytest.importorskip("mcp")
     import ssl
 
     from mcp_support import self_signed, serve

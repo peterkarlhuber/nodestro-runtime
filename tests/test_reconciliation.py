@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,7 @@ from nodestro_runtime.workspace import Workspace
 
 DAY = date(2026, 10, 1)
 NEXT = date(2026, 10, 2)
-LATER = datetime(2026, 10, 20, tzinfo=timezone.utc)
+LATER = datetime(2026, 10, 20, tzinfo=UTC)
 
 
 class Recorder:
@@ -49,7 +49,7 @@ class Recorder:
 
 
 def _unix(day: date) -> int:
-    return int(datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    return int(datetime.combine(day, datetime.min.time(), tzinfo=UTC).timestamp())
 
 
 def test_openai_costs_are_read_per_day_and_model_across_pages() -> None:
@@ -118,7 +118,7 @@ def test_anthropic_costs_are_cents_split_into_31_day_windows_with_a_watermark() 
     adapter = AnthropicCostAdapter("sk-ant-admin-test", workspace_ids=("wrkspc_1",), get=get)
     report = adapter.fetch(date(2026, 9, 1), date(2026, 10, 10))
     assert [line.amount_usd for line in report.lines] == [Decimal("12.34"), Decimal("0.66"), Decimal("1")]
-    assert report.complete_until == datetime(2026, 10, 30, 10, tzinfo=timezone.utc)
+    assert report.complete_until == datetime(2026, 10, 30, 10, tzinfo=UTC)
     url, headers, params = get.calls[0]
     assert url == ANTHROPIC_COST_URL and headers["x-api-key"] == "sk-ant-admin-test"
     assert headers["anthropic-beta"] == ANTHROPIC_ANALYTICS_BETA
@@ -205,13 +205,13 @@ def test_an_incomplete_estimate_is_never_a_deviation() -> None:
 
 
 def test_days_not_final_yet_are_pending() -> None:
-    watermark = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)  # the provider has data up to noon of DAY
+    watermark = datetime(2026, 10, 1, 12, tzinfo=UTC)  # the provider has data up to noon of DAY
     report = _service([_line("50")], _estimate("10"), complete_until=watermark).reconcile(DAY, NEXT)
     assert {row.status for row in report.rows} == {"pending"}
     recent = CostReconciliationService(
         [FixedAdapter("anthropic", [_line("50")])],
         lambda _s, _e: _estimate("10"),
-        clock=lambda: datetime(2026, 10, 2, 12, tzinfo=timezone.utc),  # within the two settle days
+        clock=lambda: datetime(2026, 10, 2, 12, tzinfo=UTC),  # within the two settle days
     )
     assert recent.reconcile(DAY, NEXT).rows[0].status == "pending"
 
@@ -279,7 +279,7 @@ async def test_nodestro_estimates_cover_runs_and_the_usage_ledger(tmp_path: Path
         started = await workspace.run(saved, RunIn(input="x"))
         done = await workspace.wait(started.id, timeout=20)
         assert done.status == "succeeded", done.error
-        today = done.created_at.astimezone(timezone.utc).date()
+        today = done.created_at.astimezone(UTC).date()
         found = nodestro_estimates(workspace, today, date.fromordinal(today.toordinal() + 1))
         [(key, estimate)] = found.items()
         assert key[1] == "anthropic" and estimate.requests == 1

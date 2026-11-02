@@ -405,25 +405,14 @@ None known.
 
 ## Technical debt
 
-### RT-022 · Python 3.10 support after its end of life
+### RT-022 · Python 3.14 untested
 
-- **Priority:** P3 Low · **Status:** Needs decision · **Refs:** `pyproject.toml`, CI matrix
-- **What:** Python 3.10 reached end of life in October 2026, but the package and CI still target it, and MCP already
-  needs 3.11 (`mcp.unavailable` on 3.10).
-- **Next step:** Decide on 3.11 as the minimum together with the dependent repositories (this entry holds the
-  platform decision; orkexa ORK-007, nodestro-api API-025 and nodestro-sdk SDK-013 follow it), then update the
-  classifiers, ruff/mypy targets and CI matrix.
-- **Interim decision (2026-11-02, Axentra migration):** Axentra (3.11+) is installed only through the `postgres` and
-  `dev` extras with the marker `python_version >= '3.11'`; the server image runs 3.13. On 3.10 the package, the
-  desktop and Local Docker keep working and `NODESTRO_AXENTRA=on` is refused. 3.10 is not dropped by this change.
-- **Review (2026-11-02):** no shipped artifact runs 3.10: the desktop bundles python-build-standalone 3.13
-  (nodestro-desktop `scripts/build_backend.sh`), the server and Local Docker images use `python:3.13-slim`
-  (nodestro-server `image/Dockerfile`). Raising the minimum affects only pip installs of the libraries and the CI
-  legs. Recommendation: 3.11 in all Python repositories at once (orkexa first, then runtime, examples,
-  integrations, api, sdk, studio), then drop the 3.10 workarounds: the `mcp` and `axentra` markers, the
-  `tomllib` fallback in `python_deps.py` and studio `scripts/check_versions.py`, the `sys.version_info` guards in
-  `axentra_platform.py`, the MCP test skips, the 3.10 sandbox base image in `container_images.py`, and orkexa's
-  `pymdown-extensions` split (the `mcp.unavailable` error code stays: it is part of the API contract).
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `pyproject.toml`, CI matrix 3.11/3.13
+- **What:** Python 3.11 is the minimum of all Nodestro repositories and orkexa since 2026-11-02 (3.10 reached end of
+  life in October 2026). 3.14 is not in the CI matrices or classifiers: every dependency installs on 3.14 (checked
+  2026-11-02), but orkexa's sandbox policy test fails there (ORK-007).
+- **Next step:** After ORK-007, add 3.14 to the matrices and classifiers of all Python repositories at once.
+- **Depends on:** orkexa ORK-007
 
 ### RT-023 · Reproducible Python dependencies
 
@@ -503,7 +492,7 @@ None known.
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
-| RT-022 | orkexa, nodestro-api, nodestro-sdk | ORK-007, API-025, SDK-013 | One platform decision, held here |
+| RT-022 | orkexa | ORK-007 | Orkexa's sandbox review for 3.14 comes first |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |

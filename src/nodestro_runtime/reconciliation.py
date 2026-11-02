@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 import logging
@@ -137,7 +137,7 @@ class CostAdapter(Protocol):
 
 
 def _midnight(day: date) -> datetime:
-    return datetime.combine(day, time(0), tzinfo=timezone.utc)
+    return datetime.combine(day, time(0), tzinfo=UTC)
 
 
 @dataclass
@@ -166,7 +166,7 @@ class OpenAICostsAdapter:
         for _ in range(_MAX_PAGES):
             body = self.get(OPENAI_COSTS_URL, headers, [*params, *((("page", page),) if page else ())])
             for bucket in body.get("data") or []:
-                day = datetime.fromtimestamp(int(bucket["start_time"]), tz=timezone.utc).date()
+                day = datetime.fromtimestamp(int(bucket["start_time"]), tz=UTC).date()
                 for result in bucket.get("results") or []:
                     amount = result.get("amount") or {}
                     if str(amount.get("currency", "usd")).lower() != "usd":
@@ -282,7 +282,7 @@ def nodestro_estimates(ctx: Workspace, start: date, end: date) -> dict[EstimateK
     found: dict[EstimateKey, Estimate] = {}
     begin, finish = _midnight(start), _midnight(end)
     for summary in ctx.store.list("runs", RunSummary):
-        created = summary.created_at.astimezone(timezone.utc)
+        created = summary.created_at.astimezone(UTC)
         # Imported traces were paid elsewhere; sub-workflow runs are counted in their parent run.
         if not begin <= created < finish or summary.imported_at is not None or summary.parent_run_id is not None:
             continue
@@ -292,7 +292,7 @@ def nodestro_estimates(ctx: Workspace, start: date, end: date) -> dict[EstimateK
         for model, usage in models_of_run(ctx, run).items():
             _add_estimate(found, created.date(), model, usage)
     for entry in ctx.usage_log.entries(begin):
-        at = entry.at.astimezone(timezone.utc)
+        at = entry.at.astimezone(UTC)
         if at < finish:
             _add_estimate(found, at.date(), entry.model, entry.usage)
     return found

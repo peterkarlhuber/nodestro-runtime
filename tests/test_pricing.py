@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,7 +25,7 @@ from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.providers import PROVIDERS
 from nodestro_runtime.storage import DocumentStore, SQLiteStore
 
-T0 = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
 
 class Clock:
@@ -109,7 +109,7 @@ def service(store: DocumentStore, clock: Clock) -> PricingService:
 
 
 def test_a_new_catalog_uses_orkexas_built_in_prices(service: PricingService, clock: Clock) -> None:
-    clock.now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    clock.now = datetime(2026, 11, 1, tzinfo=UTC)
     assert service.reference_snapshot() is BUILTIN_SNAPSHOT
     entry = service.entry("anthropic", "claude-sonnet-5-5")
     assert entry is not None

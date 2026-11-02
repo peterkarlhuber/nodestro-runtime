@@ -8,11 +8,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp_support import LoopbackServer, build_server, serve
+import pytest
 
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import McpServerIn

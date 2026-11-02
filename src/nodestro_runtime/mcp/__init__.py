@@ -7,6 +7,6 @@
 - :mod:`.service`: configuration, discovery, approvals and the policy check.
 - :mod:`.tools`: MCP tools as Orkexa tools.
 
-The MCP SDK needs Python 3.11 or later; on older interpreters the configuration can be read and edited, but no
-server can be reached (``mcp.unavailable``).
+The MCP SDK is a dependency of the package; in an installation without it the configuration can be read and edited,
+but no server can be reached (``mcp.unavailable``).
 """

@@ -6,11 +6,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp_support import LoopbackServer, serve
+import pytest
 
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import EVENTS, SERVERS, McpEvent, McpServer, McpServerIn

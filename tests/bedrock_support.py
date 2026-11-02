@@ -8,7 +8,7 @@ recording function. :func:`no_network` makes any HTTP send of botocore fail the 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +76,7 @@ def assume_role_response(key: str = STS_KEY) -> dict[str, Any]:
             "AccessKeyId": key,
             "SecretAccessKey": STS_SECRET,
             "SessionToken": STS_TOKEN,
-            "Expiration": datetime.now(timezone.utc) + timedelta(minutes=30),
+            "Expiration": datetime.now(UTC) + timedelta(minutes=30),
         },
         "AssumedRoleUser": {
             "AssumedRoleId": "AROAEXAMPLEID:nodestro-alpha",

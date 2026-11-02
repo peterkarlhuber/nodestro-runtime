@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Python 3.11 minimum (2026-11-02):
+
+- Python 3.11 is now the minimum (3.10 reached end of life in October 2026): `requires-python`, classifiers, ruff
+  `py311`, mypy 3.11, CI matrix 3.11/3.13.
+- `mcp` is an unconditional dependency (its 3.10 marker is gone); `axentra` keeps living only in the `postgres` and
+  `dev` extras, never in the base dependencies (the desktop and Local Docker do not install it). `mcp.unavailable`
+  stays as an error code for an installation without the SDK.
+- Removed 3.10 workarounds: the `tomllib` fallback in `python_deps.py`, the `sys.version_info` guards in
+  `axentra_platform.py`, the `pytest.importorskip("mcp")` guards of the MCP tests, the mypy override for `mcp`.
+  `ruff --select UP` for 3.11 (`datetime.UTC`, `TimeoutError`).
+- Python 3.14 is not added yet: RT-022.
+
 - Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
   probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty
   `noexec` tmpfs mounts on `/run` and `/var/tmp`, which the sandbox gateway now allows too.

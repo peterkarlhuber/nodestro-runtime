@@ -7,7 +7,7 @@ Approval decisions must never be lost or overwritten by a racing writer: every c
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import multiprocessing
 from typing import Any
 
@@ -55,7 +55,7 @@ def _contend(dsn: str, schema: str, tenant: str, who: str, status: str, start: A
 
 def test_one_decision_wins_across_processes(schema: str) -> None:
     store = PostgresStore.connect(postgres_support.DSN, "tenant-a", schema=schema)
-    deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    deadline = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
     store.put("tool_approvals", "run_1:call_1", Request(id="run_1:call_1", deadline=deadline))
     context = multiprocessing.get_context("spawn")
     start = context.Event()
@@ -81,7 +81,7 @@ def test_one_decision_wins_across_processes(schema: str) -> None:
 
 def test_a_decision_after_the_deadline_is_refused_by_the_database_clock(schema: str) -> None:
     store = PostgresStore.connect(postgres_support.DSN, "tenant-a", schema=schema)
-    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     store.put("tool_approvals", "r", Request(id="r", deadline=past))
     other = PostgresStore.connect(postgres_support.DSN, "tenant-a", schema=schema)
     late = Request(id="r", status="approved", by="late")
@@ -94,7 +94,7 @@ def test_a_decision_after_the_deadline_is_refused_by_the_database_clock(schema: 
 def test_tenants_cannot_decide_each_others_requests(schema: str) -> None:
     owner = PostgresStore.connect(postgres_support.DSN, "tenant-a", schema=schema)
     stranger = PostgresStore.connect(postgres_support.DSN, "tenant-b", schema=schema)
-    deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    deadline = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
     owner.put("tool_approvals", "r", Request(id="r", deadline=deadline))
     forged = Request(id="r", status="approved", by="intruder")
     assert not stranger.replace_if("tool_approvals", "r", forged, field="status", expected="pending")

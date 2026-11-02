@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 import hashlib
 import logging
@@ -187,7 +187,7 @@ def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, 
 
     The copy is written under a temporary name and renamed when complete, so a backup that exists is whole."""
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     target_path = directory / f"pre-migration-{current}-to-{target}-{stamp}.db"
     partial = target_path.with_suffix(".db.partial")
     try:

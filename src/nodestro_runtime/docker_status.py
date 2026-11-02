@@ -40,7 +40,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import contextlib
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import hashlib
 import logging
 import os
@@ -395,7 +395,7 @@ class DockerMonitor:
                 probe = self.sandbox().self_test()
             except SandboxError as exc:
                 probe = SandboxProbe("docker", False, "self-test", str(exc))
-            remembered = (self._clock(), probe, datetime.now(timezone.utc))
+            remembered = (self._clock(), probe, datetime.now(UTC))
             with self._lock:
                 self._self_tests = {fingerprint: remembered}  # only the current daemon matters
         _, probe, tested_at = remembered

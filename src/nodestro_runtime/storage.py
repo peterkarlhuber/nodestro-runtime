@@ -18,7 +18,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import json
 import logging
 from pathlib import Path
@@ -79,7 +79,7 @@ def _in_future(value: Any) -> bool:
         return False
     if moment.tzinfo is None:
         return False
-    return moment > datetime.now(timezone.utc)
+    return moment > datetime.now(UTC)
 
 
 @runtime_checkable

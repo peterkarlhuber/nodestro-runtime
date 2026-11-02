@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import hashlib
 import json
 import logging
@@ -566,7 +566,7 @@ VerificationState = Literal["not_configured", "configured", "verified", "failed"
 
 
 def now_text() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def verify(session: Any, settings: BedrockSettings, model: str | None = None) -> dict[str, Any]:

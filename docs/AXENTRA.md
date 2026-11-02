@@ -12,11 +12,11 @@ API keys, tenant ids, run and workflow ids, the REST API and the SDK stay as the
 
 ## Installation and Python versions
 
-`nodestro-runtime[postgres]` (and `[dev]`) installs `axentra[oidc]` from a pinned commit, with the marker
-`python_version >= '3.11'`. Axentra needs Python 3.11; Nodestro still supports 3.10 for the desktop, Local Docker
-and library use. On 3.10 the server starts without Axentra and refuses `NODESTRO_AXENTRA=on` with
-`profile.invalid`. The server image uses Python 3.13 and so always has the package. Raising Nodestro's own minimum
-to 3.11 is tracked as RT-022.
+Nodestro and Axentra both need Python 3.11 or newer (3.10 reached end of life in October 2026).
+`nodestro-runtime[postgres]` (and `[dev]`) installs `axentra[oidc]` from a pinned commit; Axentra is not a base
+dependency, so the desktop, Local Docker and library use never install it. Without the package the server starts
+without Axentra and refuses `NODESTRO_AXENTRA=on` with `profile.invalid`. The server image uses Python 3.13 and
+always has the package.
 
 ## Settings
 
@@ -117,8 +117,8 @@ from the one applied (`storage.migration_changed`); rows of earlier releases are
 match; the shipped files never changed since 0001, checked in git history). Axentra's `MigrationRunner` was not
 adopted as the runner of the `nodestro` namespace because:
 
-- the runner must work without Axentra: Python 3.10, `NODESTRO_AXENTRA=off` (no `axentra_*` tables may be created),
-  and a server that switches Axentra off again. Running Axentra's runner only when Axentra is on would mean two
+- the runner must work without Axentra: an installation without the package, `NODESTRO_AXENTRA=off` (no
+  `axentra_*` tables may be created), and a server that switches Axentra off again. Running Axentra's runner only when Axentra is on would mean two
   bookkeeping tables for the same schema and a reverse adoption on every switch back;
 - Nodestro applies all pending steps in **one** transaction (a failure leaves the database unchanged); Axentra
   commits per step;
@@ -664,7 +664,7 @@ role. 50 tenants, 2,000 users, 3,537 memberships, 10,000 sessions unless noted.
     claim gate fed by the product's own capacity, and asyncio-held runs instead of one thread per job. Only the
     first is generally useful, and no other Axentra product needs it today.
   - *Tenancy.* Axentra jobs are scoped by Axentra product and tenant with row-level security; with
-    `NODESTRO_IDENTITY_BACKEND=nodestro` (the default) or a 3.10 server without the package there is no Axentra
+    `NODESTRO_IDENTITY_BACKEND=nodestro` (the default) or a server without the package there is no Axentra
     tenant to scope a run to, and the queue must work there.
   - *Cost and risk without gain.* M11 would have meant draining the queue at the switch, rewriting the worker and
     re-proving every property below, for one table less. Axentra's default semantics, used naively, would have

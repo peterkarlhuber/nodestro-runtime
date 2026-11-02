@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -30,7 +30,7 @@ from nodestro_runtime.pricing_sync import (
 from nodestro_runtime.providers import PROVIDERS
 from nodestro_runtime.storage import SQLiteStore
 
-T0 = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
 #: A small cost map in LiteLLM's format (the values are test data, not real prices).
 COST_MAP: dict[str, Any] = {

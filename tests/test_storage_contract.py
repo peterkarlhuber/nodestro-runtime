@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable, Iterator
+from datetime import UTC
 from pathlib import Path
 import sqlite3
 import threading
@@ -628,9 +629,9 @@ class Request(BaseModel):
 
 
 def _later(seconds: float) -> str:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
 
 
 def test_replace_if_changes_only_the_expected_state(store: DocumentStore) -> None:

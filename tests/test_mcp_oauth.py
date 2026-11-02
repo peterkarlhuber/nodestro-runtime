@@ -10,12 +10,9 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp_oauth_support import AuthServer, serve_auth_server, serve_protected
 from mcp_support import LoopbackServer, serve
+import pytest
 
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import EVENTS, SERVERS, McpEvent, McpServer, McpServerIn

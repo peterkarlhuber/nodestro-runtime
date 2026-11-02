@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,7 +16,7 @@ from nodestro_runtime.tool_policy import (
     wants_question,
 )
 
-AT = datetime(2026, 10, 31, 20, 0, tzinfo=timezone.utc)
+AT = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
 READ = ToolCapability(access="read", reach="external", source="author")
 WRITE = ToolCapability(access="write", reach="internal", source="author")
 DESTRUCTIVE = ToolCapability(access="destructive", reach="external", source="author")
