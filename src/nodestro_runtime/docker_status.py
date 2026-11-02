@@ -25,6 +25,14 @@ their containers), then every :data:`REAP_INTERVAL` seconds those past their dea
 installation (:func:`installation_owner`: ``nodestro-<id>``), so two installations on one daemon (two desktop users,
 a desktop and Nodestro Local Docker) never remove each other's containers. A server's API and worker processes share
 the owner :data:`OWNER` and only ever remove expired containers.
+
+The local MCP servers' containers carry the installation's MCP owner (:func:`mcp_owner`), which the tool reaper never
+touches (they live as long as their connection, up to :data:`MCP_LIFETIME`). The same reaper thread removes them
+separately (:meth:`DockerMonitor.reap_mcp_once`): every :data:`REAP_INTERVAL` seconds those past their deadline, and at
+the start of a process that owns its containers also every one created before the reaper started. That process holds
+the data directory's exclusive lock (:class:`~nodestro_runtime.workspace.DataDirectoryLock`) and the owner names that
+data directory and installation, so the process that started such a container is gone; a container this process
+starts later has a later deadline and is kept, and another installation's containers have another owner.
 """
 
 from __future__ import annotations
@@ -39,13 +47,22 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from orkexa.dynamic import DockerSandbox, SandboxError, SandboxProbe
-from orkexa.dynamic.docker import DockerHost, DockerProbeError, host_fingerprint, inspect_host, preflight, reap
+from orkexa.dynamic.docker import (
+    DockerHost,
+    DockerProbeError,
+    host_fingerprint,
+    inspect_host,
+    list_sandbox_containers,
+    preflight,
+    reap,
+)
 
 if TYPE_CHECKING:  # the schemas import the sandbox policy, which imports this module
     from .schemas import SandboxBackendStatus
@@ -65,6 +82,8 @@ RETRY_FAILED = 300.0
 REAP_INTERVAL = 60.0
 #: Seconds a passed check counts for :func:`daemon_proven` without being confirmed again.
 PROOF_TTL = 600.0
+#: Seconds a local MCP server's container may exist (its deadline label; it lives as long as its connection).
+MCP_LIFETIME = 7 * 24 * 3600.0
 
 DockerState = Literal["approved", "unavailable", "checking"]
 
@@ -421,12 +440,16 @@ class DockerMonitor:
 
     def start_reaper(self, *, remove_all_first: bool) -> None:
         """Start the reaper thread once: first all of this owner's containers (``remove_all_first``: the process owns
-        them, e.g. a desktop), then every ``reap_interval`` seconds those past their deadline."""
+        them, e.g. a desktop), then every ``reap_interval`` seconds those past their deadline. The local MCP servers'
+        containers of the installation are reaped alongside (:meth:`reap_mcp_once`): at the start with
+        ``remove_all_first`` every one started before this call, then those past their deadline."""
         with self._lock:
             if self._reaper is not None or self._stop.is_set():
                 return
+            # MCP containers whose deadline is earlier than one started now were started before this reaper.
+            started = time.time() if remove_all_first else None
             self._reaper = threading.Thread(
-                target=self._reap_loop, args=(remove_all_first,), name="nodestro-docker-reaper", daemon=True
+                target=self._reap_loop, args=(remove_all_first, started), name="nodestro-docker-reaper", daemon=True
             )
             self._reaper.start()
 
@@ -441,14 +464,68 @@ class DockerMonitor:
             logger.debug("Reaping sandbox containers failed: %s", exc)
             return 0
 
-    def _reap_loop(self, remove_all_first: bool) -> None:
+    def mcp_container_owner(self) -> str | None:
+        """The owner label of this installation's local MCP servers' containers (``None``: the tool owner is not one
+        of Nodestro's, so there is none)."""
+        try:
+            return mcp_owner(self.owner)
+        except ValueError:
+            return None
+
+    def reap_mcp_once(self, *, started_before: float | None = None) -> int:
+        """Remove this installation's local MCP server containers past their deadline (or without a valid one), and
+        with ``started_before`` (a time) also those started before it: their deadline is earlier than
+        ``started_before + MCP_LIFETIME``. Only a process that holds the data directory's lock passes it (at its
+        start), so no running connection owns such a container. 0 when Docker cannot be asked."""
+        owner = self.mcp_container_owner()
+        if owner is None or (shutil.which(self.docker) is None and not os.path.isabs(self.docker)):
+            return 0
+        try:
+            containers = list_sandbox_containers(self.docker, owner, env=self.environ)
+        except (SandboxError, ValueError, OSError) as exc:
+            logger.debug("Listing the MCP server containers failed: %s", exc)
+            return 0
+        now = time.time()
+        removed = 0
+        for container in containers:
+            expired = container.deadline is None or container.deadline <= now
+            orphaned = (
+                started_before is not None
+                and container.deadline is not None
+                and container.deadline < started_before + MCP_LIFETIME
+            )
+            if (expired or orphaned) and self._remove(container.id):
+                removed += 1
+        return removed
+
+    def _remove(self, container_id: str) -> bool:
+        try:
+            done = subprocess.run(
+                [self.docker, "rm", "-f", container_id],
+                capture_output=True,
+                check=False,
+                timeout=30,
+                env=self.environ,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Removing the container %s failed: %s", container_id, exc)
+            return False
+        return done.returncode == 0
+
+    def _reap_loop(self, remove_all_first: bool, started: float | None = None) -> None:
         removed = self.reap_once(remove_all=remove_all_first)
         if removed:
             logger.info("Removed %d sandbox container(s) left behind by an earlier run", removed)
+        removed = self.reap_mcp_once(started_before=started)
+        if removed:
+            logger.info("Removed %d MCP server container(s) left behind or expired", removed)
         while not self._stop.wait(self.reap_interval):
             removed = self.reap_once()
             if removed:
                 logger.info("Removed %d expired sandbox container(s)", removed)
+            removed = self.reap_mcp_once()
+            if removed:
+                logger.info("Removed %d expired MCP server container(s)", removed)
 
     def close(self) -> None:
         """Stop the reaper (and further checks)."""
@@ -503,6 +580,7 @@ def reset_monitors() -> None:
 __all__ = [
     "CHECKING",
     "DOCKER_REASONS",
+    "MCP_LIFETIME",
     "OWNER",
     "PREFLIGHT_TTL",
     "REAP_INTERVAL",

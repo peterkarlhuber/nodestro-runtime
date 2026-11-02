@@ -21,7 +21,6 @@ from datetime import datetime
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 import sys
 import threading
@@ -64,6 +63,7 @@ from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
 
 if TYPE_CHECKING:
+    from .docker_status import DockerStatus
     from .mcp.models import McpTool
     from .mcp.service import McpService
 
@@ -308,8 +308,9 @@ class DependencyGate:
 def make_sandbox(
     kind: str, policy: SandboxPolicy | None = None, container: Callable[[], Sandbox] | None = None
 ) -> Sandbox:
-    """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess (``subprocess`` and
-    ``auto``; in ``auto`` the workspace also sets :attr:`ToolLibrary.container_fallback`).
+    """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess (``auto``, ``subprocess``
+    and ``linux``; in ``auto`` the workspace also sets :attr:`ToolLibrary.container_fallback`, in ``linux``
+    :attr:`ToolLibrary.sandbox_mode` moves code that needs isolation to the built-in Linux sandbox).
 
     ``container`` builds the container sandbox (the workspace's: Nodestro's runtime image, every profile); without it
     Orkexa's default ``DockerSandbox`` is used. The subprocess sandbox runs only trusted and user-authored code; the
@@ -454,9 +455,15 @@ class ToolLibrary:
         self.untrusted_sources: Callable[[], Iterable[str]] = lambda: ()
         #: Tools of connected MCP servers (:mod:`nodestro_runtime.mcp`); ``None`` when MCP is not set up.
         self.mcp: McpService | None = None
-        #: The ``auto`` sandbox mode on the desktop: a container sandbox for code that needs isolation when the
-        #: built-in Linux sandbox is not available (``None`` while Docker is not running or in other modes).
+        #: The ``auto`` sandbox mode on the desktop: the container sandbox for code that needs isolation (Docker-first,
+        #: ADR-0006); ``None`` while Docker has not passed its checks or in other modes.
         self.container_fallback: Callable[[], Sandbox | None] | None = None
+        #: The desktop's ``sandbox`` setting (set by the workspace): ``auto``, ``subprocess``, ``linux`` or ``docker``.
+        #: Code that needs isolation is moved to the built-in Linux sandbox only in ``linux`` mode (chosen explicitly);
+        #: ``None`` (a library without a workspace) never moves it there.
+        self.sandbox_mode: str | None = None
+        #: The Docker sandbox's status (set by the workspace), for the reason of a refusal in ``auto`` mode.
+        self.docker_status: Callable[[], DockerStatus] | None = None
 
     def _load(self, path: Path | None, sandbox: Sandbox) -> ToolRegistry:
         seen = _fingerprint(path)
@@ -561,7 +568,12 @@ class ToolLibrary:
             existing = ()
         if existing and self.trust(function_name) != "user-authored":
             return "untrusted"
-        digest = code_digest(code)
+        return self.digest_trust(code_digest(code))
+
+    def digest_trust(self, digest: str) -> TrustClass:
+        """``untrusted`` for code (by :func:`~nodestro_runtime.tool_provenance.code_digest`) identical to a stored
+        untrusted tool, a pending tool draft or a tool job's attempt; ``user-authored`` otherwise (see
+        :meth:`editor_trust`, which also looks at the tool stored under the name)."""
         if digest in self._untrusted_digests():
             return "untrusted"
         return "user-authored"
@@ -586,40 +598,89 @@ class ToolLibrary:
         return _LinkedProvenance(self)
 
     def _require(self, trust: TrustClass, sandbox: Sandbox, name: str) -> Sandbox:
-        """The sandbox code of class ``trust`` runs in, instead of ``sandbox`` (ADR-0006).
+        """The sandbox code of class ``trust`` runs in, instead of ``sandbox`` (ADR-0006, Docker-first).
 
-        ``sandbox`` itself if the policy allows it; on the desktop, code that needs isolation but was given a host
-        subprocess (the default sandbox or a Python environment's interpreter) runs in the built-in Linux sandbox
-        with the same interpreter, if this computer passed its checks. Otherwise ``sandbox.isolation_required`` is
-        raised: there is no fallback to the host subprocess."""
+        ``sandbox`` itself if the policy allows it. Otherwise, on the desktop, code that needs isolation but was given
+        a host subprocess (the default sandbox or a Python environment's interpreter) runs
+
+        * in ``auto`` mode: in a container (:attr:`container_fallback`) once Docker passed its preflight and
+          self-test; the built-in Linux sandbox is never chosen automatically;
+        * in ``linux`` mode (chosen explicitly): in the built-in Linux sandbox with Nodestro's own interpreter, if this
+          computer passed its checks (:meth:`_isolated`);
+        * in ``subprocess`` mode: nowhere.
+
+        Otherwise ``sandbox.isolation_required`` is raised: there is no fallback to the host subprocess, and none
+        from Docker to the built-in Linux sandbox."""
         if self.policy.allows(trust, sandbox):
             return sandbox
-        isolated = self._isolated(sandbox)
-        if isolated is not None and self.policy.allows(trust, isolated):
-            return isolated
+        if self.sandbox_mode == "linux":
+            isolated = self._isolated(sandbox)
+            if isolated is not None and self.policy.allows(trust, isolated):
+                return isolated
         fallback = self._fallback(sandbox)
         if fallback is not None and self.policy.allows(trust, fallback):
             return fallback
+        self._refuse(trust, sandbox, name)
+        return sandbox  # pragma: no cover - _refuse() raised
+
+    def _refuse(self, trust: TrustClass, sandbox: Sandbox, name: str) -> None:
+        """Raise ``sandbox.isolation_required`` with the reason of the desktop's sandbox mode."""
+        desktop_host = self.policy.profile == "desktop" and isinstance(sandbox, SubprocessSandbox)
+        label = f"{name!r} " if name else ""
+        if desktop_host and self.sandbox_mode == "auto":
+            status = self.docker_status() if self.docker_status is not None else None
+            if status is not None and status.approved:
+                # Docker is proven, but this container sandbox not (yet): its own self-test decides.
+                reason, detail = "docker-selftest", "the container sandbox has not passed its self-test"
+            else:
+                reason = (status.reason if status is not None else "") or "docker-unreachable"
+                detail = status.detail if status is not None and status.detail else "Docker has not passed its checks"
+            raise NodestroError(
+                "sandbox.isolation_required",
+                f"The tool code {label}is {trust} and runs only in a Docker container in Automatic mode; Docker has "
+                f"not passed its preflight and in-container self-test on this computer ({detail}), so nothing is run. "
+                "Start Docker, see Settings, Sandbox.",
+                name=name,
+                trust=trust,
+                reason=reason,
+            )
+        if desktop_host and self.sandbox_mode == "subprocess":
+            raise NodestroError(
+                "sandbox.isolation_required",
+                f"The tool code {label}is {trust}; the Subprocess mode runs only code a person wrote, on this computer "
+                "without isolation, so it is not run. Choose Automatic (Docker) under Settings, Sandbox.",
+                name=name,
+                trust=trust,
+                reason="subprocess-mode",
+            )
         self.policy.require(trust, sandbox, name=name)
-        return sandbox  # pragma: no cover - require() raised
 
     def _fallback(self, sandbox: Sandbox) -> Sandbox | None:
-        """The ``auto`` mode's container for code without third-party libraries (a Python environment's
-        interpreter has packages the container image lacks, so its code is not moved)."""
+        """The ``auto`` mode's container for code that needs isolation, instead of a host subprocess.
+
+        Also instead of a Python environment's interpreter: untrusted code never uses a host environment (its scope is a
+        container image, :meth:`~nodestro_runtime.python_envs.PythonEnvironments.backend`), so code that reaches a host
+        environment of a workflow whose libraries only a person's tools need uses none of them."""
         if self.container_fallback is None or not isinstance(sandbox, SubprocessSandbox):
-            return None
-        if os.path.realpath(sandbox.python) != os.path.realpath(sys.executable):
             return None
         return self.container_fallback()
 
     def _isolated(self, sandbox: Sandbox) -> Sandbox | None:
+        """The built-in Linux sandbox instead of a host subprocess (``linux`` mode only), always with Nodestro's own
+        interpreter.
+
+        Never with a Python environment's interpreter: an interpreter runs the ``.pth`` files of its environment's
+        site-packages while it starts, before the sandbox confines it, so third-party code would run on the host as
+        the user. Untrusted code gets no host environment in ``linux`` mode (third-party libraries are refused there,
+        :meth:`~nodestro_runtime.python_envs.PythonEnvironments.backend`); code that reaches one (a workflow whose
+        libraries only a person's tools need) runs without its libraries."""
         if not isinstance(sandbox, SubprocessSandbox) or not self.policy.builtin_available():
             return None
         return LinuxSandbox(
             timeout=max(sandbox.timeout, 15.0),
             memory_mb=sandbox.memory_mb,
             max_output_chars=sandbox.max_output_chars,
-            python=sandbox.python,
+            python=sys.executable,
             env=dict(sandbox.env),
             protected=self.protected,
         )

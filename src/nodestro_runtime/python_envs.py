@@ -19,6 +19,15 @@ Python installation is never changed.
   old environment only when everything succeeded and every needed module can be found.
 * Approvals carry the id of this Nodestro installation: a definition that comes from an
   export, or a backup restored on another computer, must be approved again here.
+
+Where an environment is built (:meth:`PythonEnvironments.backend`, ADR-0006, Docker-first): a host virtual
+environment runs its packages' code on this computer as the user (``.pth`` files run whenever its interpreter starts,
+also for the import check), so only scopes whose code is not ``untrusted`` (every tool that needs the libraries is a
+person's own or trusted) get one, and only on the desktop outside Docker mode. A scope with untrusted (AI-generated)
+code is a container image in ``auto`` mode, built and checked in containers only, and refused with Docker's reason
+while Docker has not passed its checks; in ``subprocess`` and ``linux`` mode it is refused: no host environment is
+built or started for it. In ``linux`` mode the built-in Linux sandbox could not confine an environment's interpreter
+before its ``.pth`` files run, so untrusted code cannot use third-party libraries there.
 """
 
 from __future__ import annotations
@@ -46,7 +55,6 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
-from .builtin_sandbox import LinuxSandbox
 from .container_images import (
     ContainerImages,
     ResolveError,
@@ -56,11 +64,13 @@ from .container_images import (
 )
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
-from .sandbox_policy import HOST_AWS_ENV, Isolation
+from .sandbox_policy import HOST_AWS_ENV, Isolation, TrustClass
 from .schemas import Workflow, WorkflowIn, new_id, now
 from .storage import DocumentStore
+from .tool_provenance import code_digest
 
 if TYPE_CHECKING:
+    from .docker_status import DockerStatus
     from .tool_library import ToolLibrary
 
 logger = logging.getLogger(__name__)
@@ -124,6 +134,8 @@ EnvState = Literal[
 ]
 PackageStatus = Literal["approved", "new", "changed", "runtime", "removed"]
 ChangeKind = Literal["approved", "installed", "install_failed", "removed", "imported", "copied", "cleaned"]
+#: Where a scope's environment is built: a host virtual environment, a container image, or nowhere (refused).
+Backend = Literal["venv", "image", "refused"]
 
 
 def current_python_version() -> str:
@@ -174,6 +186,11 @@ class Needed(BaseModel):
     issues: list[ToolIssue] = Field(default_factory=list)
     #: Tool name -> top-level modules of its third-party imports (for the static check).
     modules: dict[str, list[str]] = Field(default_factory=dict)
+    #: Tool name -> :func:`~nodestro_runtime.tool_provenance.code_digest` of the code the requirements come from
+    #: (whether that code is untrusted, :meth:`PythonEnvironments.scope_trust`). Never shown.
+    digests: dict[str, str] = Field(default_factory=dict, exclude=True)
+    #: The trust class of the scope's code, where the caller knows it (a tool job: ``untrusted``). Never shown.
+    trust: TrustClass | None = Field(default=None, exclude=True)
 
     @property
     def blocking(self) -> list[ToolIssue]:
@@ -603,12 +620,17 @@ class PythonEnvironments:
         *,
         runner: Any | None = None,
         sandbox_kind: Callable[[], str] = lambda: "subprocess",
+        docker_state: Callable[[], DockerStatus] | None = None,
         workflow_exists: Callable[[str], bool] = lambda _id: True,
         images: ContainerImages | None = None,
         mcp_exists: Callable[[str], bool] = lambda _id: True,
         remove_images: bool = True,
     ) -> None:
         """``images`` builds the container images of the Docker sandbox (tests pass a stand-in).
+
+        ``sandbox_kind`` is the sandbox setting in effect (:mod:`.sandbox_selection`), ``docker_state`` the Docker
+        sandbox's status (``auto`` mode: images are built only once Docker passed its preflight and self-test; without
+        it Docker counts as not proven).
 
         ``remove_images=False`` (a server): deleting an environment never removes its container image. Images are
         content-addressed and the Docker daemon is shared by every tenant, so another tenant's environment with the
@@ -622,6 +644,7 @@ class PythonEnvironments:
         self.tools = tools
         self.runner = runner if runner is not None else UvRunner(root / "cache")
         self.sandbox_kind = sandbox_kind
+        self.docker_state = docker_state
         self.workflow_exists = workflow_exists
         self.mcp_exists = mcp_exists
         self._plans: dict[str, tuple[Plan, Needed]] = {}
@@ -697,6 +720,7 @@ class PythonEnvironments:
         requirements: dict[str, NeededRequirement] = {}
         needed = Needed()
         for tool, code, tests in sources:
+            needed.digests[tool] = code_digest(code)
             dependencies = self.analyze(code, tests)
             if dependencies.import_names():
                 needed.modules[tool] = sorted(dependencies.import_names())
@@ -760,7 +784,11 @@ class PythonEnvironments:
         sha = data.get("lock_sha")
         return sha if isinstance(sha, str) else None
 
-    def status(self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "") -> DependencyStatus:
+    def status(
+        self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "", trust: TrustClass | None = None
+    ) -> DependencyStatus:
+        """What the scope's libraries need now. ``trust`` is the class of the code that needs them where the caller
+        knows it; otherwise :meth:`scope_trust` decides (unknown code counts as untrusted)."""
         scope = scope_of(kind, ref)
         env = self.get(scope)
         result = DependencyStatus(
@@ -781,7 +809,13 @@ class PythonEnvironments:
             result.state = "unsupported"
             result.problem = problem("deps.uv_missing", "uv was not found; reinstall Nodestro or install uv")
             return result
-        pending, reasons = self._pending(env, needed)
+        backend = self.backend(kind, self.scope_trust(needed.requirements, needed.digests, trust or needed.trust))
+        refused = self._refusal(backend)
+        if refused is not None:
+            # Nothing is planned, approved, built or started for code that could not use the libraries (ADR-0006).
+            result.state, result.problem = "unsupported", refused
+            return result
+        pending, reasons = self._pending(env, needed, backend)
         result.pending, result.reasons = pending, reasons
         if pending or reasons:
             result.state = "approval_needed"
@@ -789,7 +823,7 @@ class PythonEnvironments:
         assert env is not None
         if env.install.status == "installing":
             result.state = "installing"
-        elif self._ready(env):
+        elif self._ready(env, backend):
             result.state = "ready"
         elif env.install.status == "failed" and env.install.lock_sha == _sha(env.lock):
             result.state = "failed"
@@ -797,7 +831,7 @@ class PythonEnvironments:
             result.state = "install_needed"
         return result
 
-    def _pending(self, env: PythonEnvironment | None, needed: Needed) -> tuple[list[str], list[str]]:
+    def _pending(self, env: PythonEnvironment | None, needed: Needed, backend: Backend) -> tuple[list[str], list[str]]:
         """Needed packages without a valid approval, and why."""
         if env is None or not env.lock:
             return [item.name for item in needed.requirements], ["new"]
@@ -830,14 +864,23 @@ class PythonEnvironments:
             foreign = any(item.installation != self.installation for item in env.approvals)
             reasons.add("other_installation" if foreign else "new")
             pending += [item.name for item in missing if item.name not in pending and item.direct]
-        if self.containers() and not lock_has_hashes(env.lock):
+        if backend == "image" and not lock_has_hashes(env.lock):
             # Approved before container images existed: resolving again adds the hashes the image build needs.
             reasons.add("hashes")
         return pending, sorted(reasons)
 
     # ---- plans -------------------------------------------------------------------------
 
-    def plan(self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "", builds: bool = True) -> Plan:
+    def plan(
+        self,
+        kind: ScopeKind,
+        ref: str,
+        needed: Needed,
+        *,
+        label: str = "",
+        builds: bool = True,
+        trust: TrustClass | None = None,
+    ) -> Plan:
         """Resolve all versions for the approval overview; nothing is installed.
 
         Resolving never runs a package's build script on this computer (``--no-build``). A package
@@ -845,7 +888,12 @@ class PythonEnvironments:
         library dialog where ``deps.build_required`` sends them) are then resolved again in a container
         (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`); plans made
         without one (a generated tool's libraries, ``builds=False``) are not.
+
+        ``trust`` as in :meth:`status`; it stays with the plan (on this server only) and decides where approving it
+        installs the libraries (:meth:`backend`).
         """
+        if trust is not None:
+            needed = needed.model_copy(update={"trust": trust})
         scope = scope_of(kind, ref)
         plan = Plan(
             scope=scope, kind=kind, ref=ref, label=label, requirements=needed.requirements, issues=needed.issues
@@ -991,12 +1039,13 @@ class PythonEnvironments:
             raise NodestroError("deps.plan_invalid", "This overview has nothing to approve")
         with self._lock:
             env = self._begin_install(plan.scope, approve=(plan, needed))
+        trust = self.scope_trust(needed.requirements, needed.digests, needed.trust)
         if wait:
-            self._install(env.scope, needed.all_modules(), log)
+            self._install(env.scope, needed.all_modules(), log, trust)
             return self.get(env.scope) or env
         threading.Thread(
             target=self._install,
-            args=(env.scope, needed.all_modules(), log),
+            args=(env.scope, needed.all_modules(), log, trust),
             name=f"python-env-{env.scope}",
             daemon=True,
         ).start()
@@ -1055,8 +1104,12 @@ class PythonEnvironments:
 
     # ---- installation ----------------------------------------------------------------
 
-    def install(self, scope: str, modules: Iterable[str] = (), *, wait: bool = True) -> PythonEnvironment:
-        """(Re)build the environment from the approved lock; no new versions, no new approvals."""
+    def install(
+        self, scope: str, modules: Iterable[str] = (), *, wait: bool = True, trust: TrustClass | None = None
+    ) -> PythonEnvironment:
+        """(Re)build the environment from the approved lock; no new versions, no new approvals.
+
+        ``trust`` as in :meth:`status`; without it the stored tools that need the libraries decide."""
         env = self.get(scope)
         if env is None or not env.lock:
             raise NodestroError("deps.no_definition", "There is nothing approved to install for this environment")
@@ -1068,15 +1121,18 @@ class PythonEnvironments:
                 f"Approval needed first: {', '.join(missing) or 'Python version changed'}",
                 packages=", ".join(missing),
             )
+        resolved = self.scope_trust(env.requirements, {}, trust)
         with self._lock:
             env = self._begin_install(scope)
         if wait:
-            self._install(scope, modules, None)
+            self._install(scope, modules, None, resolved)
             return self.get(scope) or env
-        threading.Thread(target=self._install, args=(scope, list(modules), None), daemon=True).start()
+        threading.Thread(target=self._install, args=(scope, list(modules), None, resolved), daemon=True).start()
         return env
 
-    def _install(self, scope: str, modules: Iterable[str], log: Callable[[str], None] | None) -> None:
+    def _install(
+        self, scope: str, modules: Iterable[str], log: Callable[[str], None] | None, trust: TrustClass = "untrusted"
+    ) -> None:
         with self._scope_lock(scope):
             env = self.get(scope)
             if env is None:
@@ -1094,8 +1150,10 @@ class PythonEnvironments:
                 state.step = code
                 self._update_install(scope, state)
 
-            if self.containers():
-                self._build_image(scope, env, state, list(modules), write, step)
+            backend = self.backend(env.kind, trust)
+            if backend != "venv":
+                # Untrusted code's libraries never become a host environment (DS-2): a container image or nothing.
+                self._build_image(scope, env, state, list(modules), write, step, refused=self._refusal(backend))
                 return
 
             target = self.env_dir(scope)
@@ -1159,10 +1217,15 @@ class PythonEnvironments:
         modules: list[str],
         write: Callable[[str], None],
         step: Callable[[str], None],
+        *,
+        refused: Problem | None = None,
     ) -> None:
-        """The Docker sandbox's installation: the container image of the lock (ADR-0006 point 6)."""
+        """The Docker sandbox's installation: the container image of the lock (ADR-0006 point 6), built and checked
+        in containers only. ``refused``: why it may not be built here (nothing is run, the installation fails)."""
         kind: ChangeKind
         try:
+            if refused is not None:
+                raise _InstallProblem(refused)
             step("deps.step.install")
             tag = self.images.build(env.lock, env.python_version, log=write)
             step("deps.step.verify")
@@ -1236,35 +1299,126 @@ class PythonEnvironments:
             env.install = state
             self._put(env)
 
-    def ensure(self, kind: ScopeKind, ref: str, needed: Needed) -> DependencyStatus:
+    def ensure(self, kind: ScopeKind, ref: str, needed: Needed, *, trust: TrustClass | None = None) -> DependencyStatus:
         """Make an approved environment usable, installing it from the lock if needed."""
-        status = self.status(kind, ref, needed)
+        trust = self.scope_trust(needed.requirements, needed.digests, trust or needed.trust)
+        status = self.status(kind, ref, needed, trust=trust)
         if status.state == "install_needed":
-            self.install(status.scope, needed.all_modules())
-            status = self.status(kind, ref, needed)
+            self.install(status.scope, needed.all_modules(), trust=trust)
+            status = self.status(kind, ref, needed, trust=trust)
         return status
 
     # ---- sandbox ----------------------------------------------------------------------
 
     def containers(self) -> bool:
-        """Whether environments are container images (the Docker sandbox) rather than virtual environments."""
+        """Whether every environment is a container image: the Docker sandbox (Docker mode, a server, Nodestro Local
+        Docker). Local MCP servers (WP-8) need it. In ``auto`` mode scopes with untrusted code are container images
+        too (:meth:`backend`)."""
         return self.sandbox_kind() == "docker"
 
-    def isolation(self) -> Isolation:
-        """How the environments' sandboxes can isolate tool code (ADR-0006): with the Docker sandbox every environment
-        is a container image (``container``); otherwise the environment's interpreter runs in a host subprocess,
-        which the tool library replaces with the built-in Linux sandbox for code that needs isolation where that
-        sandbox is available (``kernel``); without it only ``user-authored`` code may use third-party libraries
-        (``none``)."""
-        if self.containers():
-            return "container"
-        return "kernel" if LinuxSandbox.status().available else "none"
+    def scope_trust(
+        self, requirements: Iterable[NeededRequirement], digests: Mapping[str, str], trust: TrustClass | None = None
+    ) -> TrustClass:
+        """The class of the code that needs a scope's libraries: ``trust`` where the caller knows it, otherwise
+        ``untrusted`` unless every tool that needs them is a person's own (or trusted) code.
 
-    def _ready(self, env: PythonEnvironment) -> bool:
-        """Whether the approved lock of ``env`` is installed (as a virtual environment or a container image)."""
-        if not env.lock:
+        A tool counts by its code (``digests``, :meth:`ToolLibrary.editor_trust`: code identical to AI-generated code
+        is untrusted) where that is known, otherwise by the stored tool (:meth:`ToolLibrary.trust`); a name that is
+        no stored tool (an MCP server, a deleted tool) and has no code is untrusted."""
+        if trust is not None:
+            return trust
+        names = list(dict.fromkeys(name for item in requirements for name in item.required_by))
+        if not names:
+            return "untrusted"
+        for name in names:
+            if name in digests:
+                stored = name in self.tools and name not in self.tools.builtin
+                found = (
+                    "untrusted"
+                    if stored and self.tools.trust(name) != "user-authored"
+                    else self.tools.digest_trust(digests[name])
+                )
+            else:
+                found = self.tools.trust(name)
+            if found == "untrusted":
+                return "untrusted"
+        return "user-authored"
+
+    def backend(self, kind: ScopeKind, trust: TrustClass) -> Backend:
+        """Where the environment of a scope of ``kind`` whose code is of class ``trust`` is built (ADR-0006,
+        Docker-first; DS-2).
+
+        * Docker mode (and every server profile): a container image.
+        * A person's own (or trusted) code on the desktop: a host virtual environment, as before.
+        * Untrusted code in ``auto`` mode: a container image (installed and import-checked in containers; refused
+          with Docker's reason while Docker has not passed its checks, :meth:`_refusal`).
+        * Untrusted code in ``subprocess`` mode, and in ``linux`` mode (the built-in sandbox cannot confine an
+          environment's interpreter before its ``.pth`` files run): refused. A local MCP server's scope counts as
+          untrusted.
+        """
+        mode = self.sandbox_kind()
+        if mode == "docker":
+            return "image"
+        if kind != "mcp" and trust != "untrusted":
+            return "venv"
+        return "image" if mode == "auto" else "refused"
+
+    def _docker_approved(self) -> DockerStatus | None:
+        """The Docker status when it is not approved (``None`` when it is)."""
+        from .docker_status import unavailable_status
+
+        found = self.docker_state() if self.docker_state is not None else None
+        if found is not None and found.approved:
+            return None
+        return found if found is not None else unavailable_status("docker-unreachable", "Docker is not reachable")
+
+    def _refusal(self, backend: Backend) -> Problem | None:
+        """Why libraries of the ``backend`` cannot be installed or used now; ``None`` if they can."""
+        if backend == "refused":
+            mode = self.sandbox_kind()
+            where = (
+                "the built-in Linux sandbox cannot use a Python environment"
+                if mode == "linux"
+                else "the Subprocess mode runs only code a person wrote"
+            )
+            return problem(
+                "sandbox.libraries_need_isolation",
+                f"AI-generated (or unknown) code needs these libraries; {where}, and libraries for such code are never "
+                "installed or started on this computer. Choose Automatic and start Docker.",
+                mode=mode,
+            )
+        if backend == "image" and self.sandbox_kind() == "auto":
+            docker = self._docker_approved()
+            if docker is not None:
+                reason = docker.reason or "docker-unreachable"
+                return problem(
+                    "sandbox.isolation_required",
+                    "AI-generated (or unknown) code needs these libraries; in Automatic mode they are installed only "
+                    f"in a Docker container, and Docker has not passed its checks ({docker.detail or reason}). Start "
+                    "Docker, see Settings, Sandbox.",
+                    reason=reason,
+                )
+        return None
+
+    def isolation(self) -> Isolation:
+        """How the sandboxes of untrusted code's environments isolate it (ADR-0006, Docker-first): ``container`` in
+        Docker mode, and in ``auto`` mode once Docker passed its preflight and self-test; otherwise ``none``: such code
+        gets no third-party libraries (only a person's own code may use a host environment). The built-in Linux
+        sandbox (``linux`` mode) gives no environment isolation: an interpreter runs its environment's ``.pth`` files
+        before the sandbox confines it."""
+        mode = self.sandbox_kind()
+        if mode == "docker":
+            return "container"
+        if mode == "auto" and self._docker_approved() is None:
+            return "container"
+        return "none"
+
+    def _ready(self, env: PythonEnvironment, backend: Backend) -> bool:
+        """Whether the approved lock of ``env`` is installed where ``backend`` says (a virtual environment or a
+        container image)."""
+        if not env.lock or backend == "refused":
             return False
-        if not self.containers():
+        if backend == "venv":
             return self._installed_sha(env.scope) == _sha(env.lock)
         if not lock_has_hashes(env.lock):
             return False
@@ -1280,13 +1434,19 @@ class PythonEnvironments:
             return True
         return False
 
-    def sandbox(self, scope: str) -> Sandbox | None:
+    def sandbox(self, scope: str, *, trust: TrustClass | None = None) -> Sandbox | None:
         """A sandbox that runs tool code with the scope's environment, if it is installed: a container of its image
-        (Docker sandbox, no network) or a host subprocess with its interpreter."""
+        (no network) or, for a person's own code only (:meth:`backend`), a host subprocess with its interpreter.
+
+        ``trust`` as in :meth:`status`; without it the stored tools that need the libraries decide, so a host
+        environment built for a person's code is never handed out once AI-generated code needs those libraries."""
         env = self.get(scope)
-        if env is None or not self._ready(env):
+        if env is None:
             return None
-        if self.containers():
+        backend = self.backend(env.kind, self.scope_trust(env.requirements, {}, trust))
+        if not self._ready(env, backend) or self._refusal(backend) is not None:
+            return None
+        if backend == "image":
             return self.images.sandbox(self.images.tag(env.lock, env.python_version))
         return SubprocessSandbox(
             timeout=60.0,
@@ -1309,7 +1469,7 @@ class PythonEnvironments:
         if not self.containers():
             return None
         env = self.get(scope)
-        if env is None or not self._ready(env):
+        if env is None or not self._ready(env, "image"):
             return None
         return self.images.tag(env.lock, env.python_version)
 
@@ -1374,7 +1534,7 @@ class PythonEnvironments:
         the same lock (the image is content-addressed, so they share it). Never on a server (``remove_images=False``):
         there, environments of other tenants may share it too."""
         env = self.get(scope)
-        if env is None or not env.lock or not self.remove_images or not self.containers():
+        if env is None or not env.lock or not self.remove_images or self.sandbox_kind() not in ("docker", "auto"):
             return
         tag = self.images.tag(env.lock, env.python_version)
         for other in self.all():
@@ -1547,7 +1707,11 @@ def _satisfies(version: str, spec: str) -> bool:
 
 
 def verify_imports(interpreter: Path, modules: Iterable[str]) -> list[str]:
-    """Modules the environment's interpreter cannot find (without importing them)."""
+    """Modules the environment's interpreter cannot find (without importing them).
+
+    The interpreter starts on this computer as the user and runs the ``.pth`` files of the environment's packages: only
+    for host environments of a person's own code (:meth:`PythonEnvironments.backend`). Untrusted code's libraries are
+    checked in their container image instead (:meth:`ContainerImages.missing_modules`)."""
     names = sorted({name for name in modules if name})
     script = (
         "import importlib.util, json, sys\n"

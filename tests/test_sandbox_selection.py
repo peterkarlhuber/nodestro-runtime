@@ -37,13 +37,19 @@ def _on(monkeypatch: pytest.MonkeyPatch, system: str) -> None:
 # ---- selection --------------------------------------------------------------------------
 
 
-def test_linux_with_the_builtin_sandbox_uses_it_in_every_desktop_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_linux_uses_the_builtin_sandbox_only_when_it_was_chosen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docker-first (DS-3): ``auto`` never picks the built-in sandbox, ``subprocess`` never runs untrusted code."""
     _on(monkeypatch, "linux")
     _builtin(monkeypatch, True)
-    for mode in ("auto", "subprocess"):
-        selection = sandbox_selection.select(DESKTOP, mode, docker_available=True)
-        assert selection.untrusted == "linux-builtin" and selection.user_authored == "subprocess"
-        assert not selection.blocked
+    chosen = sandbox_selection.select(DESKTOP, "linux", docker_available=True)
+    assert chosen.untrusted == "linux-builtin" and chosen.user_authored == "subprocess"
+    assert not chosen.blocked
+    auto = sandbox_selection.select(DESKTOP, "auto", docker_available=True)
+    assert auto.untrusted == "docker" and auto.user_authored == "subprocess"
+    without_docker = sandbox_selection.select(DESKTOP, "auto", docker_available=False)
+    assert without_docker.blocked and without_docker.untrusted == "" and without_docker.reason == "docker-unreachable"
+    subprocess_mode = sandbox_selection.select(DESKTOP, "subprocess", docker_available=True)
+    assert subprocess_mode.blocked and subprocess_mode.untrusted == ""
 
 
 def test_auto_falls_back_to_docker_and_otherwise_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -51,7 +57,8 @@ def test_auto_falls_back_to_docker_and_otherwise_refuses(monkeypatch: pytest.Mon
     with_docker = sandbox_selection.select(DESKTOP, "auto", docker_available=True)
     assert with_docker.untrusted == "docker" and with_docker.user_authored == "subprocess"
     without = sandbox_selection.select(DESKTOP, "auto", docker_available=False)
-    assert without.blocked and without.untrusted == "" and without.reason == "no-isolation"
+    # Refused with Docker's reason (Docker-first), not silently run elsewhere.
+    assert without.blocked and without.untrusted == "" and without.reason == "docker-unreachable"
     assert "start Docker" in without.detail
     assert without.os == "macos"
 
@@ -60,7 +67,7 @@ def test_an_explicit_subprocess_choice_never_uses_docker(monkeypatch: pytest.Mon
     _on(monkeypatch, "windows")
     selection = sandbox_selection.select(DESKTOP, "subprocess", docker_available=True)
     assert selection.blocked and selection.reason == "no-isolation"
-    assert "choose Automatic or Docker" in selection.detail
+    assert "choose Automatic and start Docker" in selection.detail
 
 
 def test_docker_mode_and_servers_run_everything_in_containers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,7 +92,7 @@ def test_docker_is_approved_only_after_preflight_and_self_test(monkeypatch: pyte
     row = sandbox_selection.backends(DESKTOP, status)[1]
     assert (row.name, row.state, row.reason, row.available) == ("docker", state, reason, False)
     auto = sandbox_selection.select(DESKTOP, "auto", status)
-    assert auto.blocked and auto.reason == "no-isolation" and auto.untrusted == ""
+    assert auto.blocked and auto.reason == reason and auto.untrusted == ""
     docker = sandbox_selection.select(DESKTOP, "docker", status)
     assert docker.blocked and docker.reason == reason
     approved = sandbox_selection.backends(DESKTOP, docker_status.approved_status())[1]
@@ -149,18 +156,19 @@ def test_auto_runs_untrusted_code_in_the_fallback_container(tmp_path: Path) -> N
     assert ("call", NAME) in container.calls
 
 
-def test_no_fallback_without_docker_and_none_for_another_interpreter(tmp_path: Path) -> None:
+def test_no_fallback_without_docker_and_never_a_host_interpreter(tmp_path: Path) -> None:
     tools = ToolLibrary(tmp_path / "tools", sandbox=SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True))
     _untrusted(tools)
     tools.container_fallback = lambda: None  # Docker not running
     with pytest.raises(NodestroError) as error:
         tools.run(NAME, {"celsius": 100})
     assert error.value.code == "sandbox.isolation_required"
-    # A Python environment's interpreter has packages the container lacks: its code is never moved there.
+    # A host Python environment's interpreter is never used for untrusted code: it goes to the container instead
+    # (untrusted code's own libraries are a container image, never a host environment; DS-2).
     other = SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True, python=str(tmp_path / "venv" / "python"))
     container = ContainerDouble()
     tools.container_fallback = lambda: container
-    assert tools._fallback(other) is None
+    assert tools._fallback(other) is container
 
 
 # ---- the workspace and stored settings ------------------------------------------------------
@@ -192,7 +200,12 @@ def test_a_new_installation_starts_in_auto(tmp_path: Path, monkeypatch: pytest.M
 
 @pytest.mark.parametrize(
     ("stored", "expected", "fallback"),
-    [("subprocess", "subprocess", False), ("docker", "docker", False), ("auto", "auto", True)],
+    [
+        ("subprocess", "subprocess", False),
+        ("linux", "linux", False),
+        ("docker", "docker", False),
+        ("auto", "auto", True),
+    ],
 )
 def test_stored_choices_are_kept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored: Any, expected: str, fallback: bool
@@ -206,6 +219,7 @@ def test_stored_choices_are_kept(
     try:
         assert reopened.settings().sandbox == expected
         assert (reopened.tools.container_fallback is not None) is fallback
+        assert reopened.tools.sandbox_mode == expected
     finally:
         reopened.close()
 

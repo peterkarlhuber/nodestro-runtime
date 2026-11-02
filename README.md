@@ -184,10 +184,15 @@ executed. There is no setting, environment variable or confirmation that lifts t
 tool generation does not start, tool drafts cannot be tested or approved, and agents that use untrusted tools fail
 the workflow check before a run starts. Provenance is stored per tool (`tool_provenance`); editing an untrusted tool,
 re-creating it under the same name or copying its code into a new tool keeps it untrusted, tools stored before this
-release are untrusted, and a restored backup makes every restored tool untrusted. In the process sandbox, untrusted
-tools cannot use third-party libraries (`sandbox.libraries_need_isolation`), because the library environments run as
-host processes. In the Docker sandbox they can: there an approved environment is a container image (see below). In
-the server profile, only containers run tool code.
+release are untrusted, and a restored backup makes every restored tool untrusted. On the desktop the `sandbox`
+setting is Docker-first (`sandbox_selection`): `auto` (default) runs untrusted code in Docker once Docker passed its
+preflight and self-test and refuses it otherwise with Docker's reason; `linux` (chosen explicitly) uses the built-in
+Linux sandbox; `subprocess` runs only code a person wrote; `docker` runs everything in containers. Untrusted code's
+third-party libraries are never a host environment: in `auto` and `docker` mode they are a container image, built and
+import-checked in containers (refused while Docker is not proven); in `subprocess` and `linux` mode they are refused
+(`sandbox.libraries_need_isolation`), because a host environment's interpreter runs its packages' `.pth` files before
+any sandbox confines it. Only environments whose code is a person's own are host environments. In the server profile,
+only containers run tool code.
 
 **Server settings and tenant secrets (plan step PR-12).** `ServerSettings.from_env` reads `NODESTRO_DATABASE_URL`,
 `NODESTRO_PUBLIC_ORIGIN` (`https://`; `http://` only for loopback), `NODESTRO_OIDC_ISSUER`,

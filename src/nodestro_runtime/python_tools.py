@@ -37,11 +37,16 @@ def state_problem(status: DependencyStatus) -> Problem:
 class ToolEnvironment:
     """The dependencies of one tool's code and the sandbox its tests need."""
 
-    def __init__(self, python: PythonEnvironments, name: str, code: str, tests: str) -> None:
+    def __init__(
+        self, python: PythonEnvironments, name: str, code: str, tests: str, *, trust: TrustClass | None = None
+    ) -> None:
+        """``trust`` is the class of ``code`` where the caller knows it; otherwise the code decides
+        (:meth:`PythonEnvironments.scope_trust`). Untrusted code's libraries never become a host environment."""
         self.python = python
         self.name = name
         self.needed: Needed = python.needed_for_sources([(name, code, tests)])
-        self.status: DependencyStatus = python.status("tool", name, self.needed, label=name)
+        self.trust: TrustClass = python.scope_trust(self.needed.requirements, self.needed.digests, trust)
+        self.status: DependencyStatus = python.status("tool", name, self.needed, label=name, trust=self.trust)
 
     @property
     def third_party(self) -> bool:
@@ -50,8 +55,8 @@ class ToolEnvironment:
     def ensure(self) -> None:
         """Install an approved environment that is missing (no new versions, no new approvals)."""
         if self.status.state == "install_needed":
-            self.python.install(self.status.scope, self.needed.all_modules())
-            self.status = self.python.status("tool", self.name, self.needed, label=self.name)
+            self.python.install(self.status.scope, self.needed.all_modules(), trust=self.trust)
+            self.status = self.python.status("tool", self.name, self.needed, label=self.name, trust=self.trust)
 
     @property
     def ready(self) -> bool:
@@ -59,7 +64,9 @@ class ToolEnvironment:
 
     @property
     def sandbox(self) -> Sandbox | None:
-        return self.python.sandbox(scope_of("tool", self.name)) if self.needed.requirements else None
+        if not self.needed.requirements:
+            return None
+        return self.python.sandbox(scope_of("tool", self.name), trust=self.trust)
 
     @property
     def extra_imports(self) -> set[str]:
@@ -67,11 +74,12 @@ class ToolEnvironment:
 
 
 def libraries_problem(name: str) -> Problem:
-    """Why code that needs isolation cannot use third-party libraries yet (ADR-0006)."""
+    """Why code that needs isolation cannot use third-party libraries yet (ADR-0006, Docker-first)."""
     return problem(
         "sandbox.libraries_need_isolation",
-        f"The tool {name!r} is AI-generated or of unknown origin and needs third-party libraries; such tools run "
-        "only in an isolating sandbox, and neither the built-in Linux sandbox nor Docker is available here",
+        f"The tool {name!r} is AI-generated or of unknown origin and needs third-party libraries; such libraries "
+        "are installed and run only in a Docker container (Automatic or Docker mode, once Docker passed its checks), "
+        "never on this computer and not in the built-in Linux sandbox",
         name=name,
     )
 
@@ -100,7 +108,7 @@ def check_with_dependencies(
     (:meth:`ToolLibrary.editor_trust`)."""
     if trust is None:
         trust = tools.editor_trust(function_name, code)
-    environment = ToolEnvironment(python, function_name, code, tests)
+    environment = ToolEnvironment(python, function_name, code, tests, trust=trust)
     if needs_isolated_libraries(tools, python, trust, environment.needed):
         # Nothing is approved, installed or run for code that could not use the libraries anyway.
         extra = environment.extra_imports
@@ -144,7 +152,7 @@ def save_with_dependencies(
     ``untrusted``)."""
     if trust is None:
         trust = "untrusted" if requirement else tools.editor_trust(function_name, code)
-    environment = ToolEnvironment(python, function_name, code, tests)
+    environment = ToolEnvironment(python, function_name, code, tests, trust=trust)
     if needs_isolated_libraries(tools, python, trust, environment.needed):
         return check_with_dependencies(tools, python, code, tests, function_name, trust=trust), None
     environment.ensure()
@@ -166,7 +174,7 @@ def tool_run_sandbox(tools: ToolLibrary, python: PythonEnvironments, name: str) 
     info = tools.get(name)
     if info.code is None:
         return None
-    environment = ToolEnvironment(python, name, info.code, info.tests or "")
+    environment = ToolEnvironment(python, name, info.code, info.tests or "", trust=info.trust)
     if not environment.needed.requirements:
         return None
     if needs_isolated_libraries(tools, python, info.trust, environment.needed):
@@ -193,7 +201,8 @@ class EnvironmentGate(DependencyGate):
         self.python = python
 
     def prepare(self, name: str, code: str, tests: str) -> DependencyOutcome:
-        environment = ToolEnvironment(self.python, name, code, tests)
+        # A tool job's code is generated: untrusted, whatever it looks like (ADR-0006).
+        environment = ToolEnvironment(self.python, name, code, tests, trust="untrusted")
         if environment.needed.blocking:
             issues = "\n".join(issue.message for issue in environment.needed.blocking)
             return DependencyOutcome(feedback=f"{issues}\n{_FEEDBACK}")
@@ -219,7 +228,7 @@ class EnvironmentGate(DependencyGate):
                 packages=[item.name for item in environment.needed.requirements],
             )
         # Generated code chose these packages, no person did yet: never run a package's build script here.
-        plan = self.python.plan("tool", name, environment.needed, label=name, builds=False)
+        plan = self.python.plan("tool", name, environment.needed, label=name, builds=False, trust="untrusted")
         return DependencyOutcome(plan=plan.model_dump(mode="json", exclude={"lock"}))
 
     def install(self, plan_id: str, log: Callable[[str], None]) -> None:

@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 5 |
-| P3 Low | 21 |
+| P2 Medium | 7 |
+| P3 Low | 22 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -71,13 +71,42 @@ None known.
   `ContainerImages.compile_in_container`
 - **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
   for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
-  bind mounts, proxy variables only, no capabilities, `nobody`, read-only with a tmpfs, input on stdin, lock on
-  stdout). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
+  bind mounts, proxy variables only and without credentials, no capabilities, `nobody`, read-only with a tmpfs,
+  limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-038). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
   (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
   (which refuses containers with network and foreign images). Studio has no text for the `reason` parameter yet.
 - **Next step:** Add a real-Docker test of the resolve
   container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
+
+### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** security review DS-1, DS-5, DS-7, DS-9 (2026-11-02),
+  `ContainerImages.missing_modules`, `ContainerImages.compile_in_container`, `container_images.bounded_run`,
+  `container_images.default_base`
+- **What (done 2026-11-02):** The module check after an image build (`missing_modules`) runs package code (`.pth`
+  files run at interpreter start, even with `-I`), so it now runs exactly like a tool call: Orkexa's `run_args`
+  shape with the installation's owner and deadline labels, the image by its id, only after preflight and self-test
+  (`sandbox.unavailable` otherwise), bounded output, killed and removed after 120 s or on cancel (`deps.image_failed`).
+  The resolve container for source builds (`compile_in_container`) pulls uv's image by digest, checks the digest, runs
+  it by id with `--pull never` after the same preflight and self-test, with the owner and deadline labels (the reaper
+  removes orphans), private IPC, ulimits (nofile, fsize 1 GiB, core 0), no logging, bounded output and stop/removal on
+  timeout or cancel; proxy URLs reach it without user name or password (`strip_credentials`). Every docker CLI call of
+  `ContainerImages` reads at most 16 MiB of stdout and the last 256 KiB of stderr (`bounded_run`; more kills the CLI).
+  A Python version without a pinned base image is refused (`deps.python_unsupported`) instead of building on the
+  unpinned `python:<v>-slim` tag.
+- **Residual risk:** The resolve container still has network (Docker's default bridge, or
+  `NODESTRO_DOCKER_BUILD_NETWORK`) while untrusted build scripts run in it: they can reach the package index, the
+  internet, hosts on the LAN, ports the host publishes on the bridge and, on cloud VMs, the instance metadata service.
+  A pre-download on the host with `--network none` for the build is not feasible as is: the dependencies of a package
+  that has only a source distribution are known only after its build script ran, so resolving and building cannot be
+  separated in one step. A proxy that needs credentials no longer works for the resolver (credentials are not passed
+  into code that can read them). `/tmp` in the resolve container is executable (compilers and build tools run there).
+  The resolver is used only for plans a person explicitly accepted (library dialog), never for generated tools.
+- **Next step:** Offer an egress-filtered build network (only the package index or the proxy reachable; metadata and
+  RFC 1918 ranges blocked) and make it the default where it can be created; or resolve iteratively (download the
+  hashed sdists on the host side, build their metadata in a `--network none` container, repeat until closed). Add a
+  real-Docker test of `missing_modules` and the resolve container in the CI `docker` job.
 
 ### RT-033 · Docker-first sandbox status: follow-ups
 
@@ -96,6 +125,27 @@ None known.
 - **Next step:** A1/S1/ST1 in nodestro-api, nodestro-sdk and nodestro-studio; a real-daemon test of the background
   check in the CI `docker` job; decide whether a tool call should wait (bounded) for a running first check.
 
+### RT-036 · Docker-first for untrusted code and its libraries (DS-2, DS-3): follow-ups
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** security review DS-2, DS-3; product decision 2026-11-02
+  (Docker-first); `sandbox_selection.py`, `tool_library.ToolLibrary._require`, `python_envs.PythonEnvironments.backend`
+- **What:** Done 2026-11-02: the desktop's `auto` mode runs untrusted code only in Docker (refused with Docker's reason
+  otherwise, never the built-in Linux sandbox automatically); the new `linux` mode is the only one that uses the
+  built-in Linux sandbox, always with Nodestro's own interpreter; `subprocess` never runs untrusted code (reason
+  `subprocess-mode`). Untrusted code's libraries are never a host venv (no `uv pip sync`, no host `verify_imports`):
+  container images in `auto`/`docker`, refused in `subprocess`/`linux` (`sandbox.libraries_need_isolation`, param
+  `mode`). Open: Studio and the API need texts for the `linux` mode, the reason `subprocess-mode`, the `auto` refusal
+  now carrying Docker's reason instead of `no-isolation`, and the status `unsupported` with
+  `sandbox.isolation_required` / `sandbox.libraries_need_isolation`; installations that chose `subprocess` to use the
+  built-in sandbox must choose `linux` (no automatic migration); host venvs that earlier releases built for untrusted
+  scopes stay on disk unused until `cleanup`/removal; local MCP servers still need Docker mode (`containers()`), also
+  in `auto` with Docker approved; a scope's trust for an unsaved tool comes from the code digest the caller passes
+  (`Needed.digests`), so an API plan without code (reinstall) falls back to the stored tools (unknown counts as
+  untrusted).
+- **Next step:** API/SDK/Studio texts and the `linux` choice in the settings; decide whether `auto` should also allow
+  local MCP servers once Docker is approved; optionally run the built-in sandbox with an environment's packages by
+  starting the interpreter with `-S` and adding site-packages after confinement.
+
 ### RT-034 · Container reaper: follow-ups
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.DockerMonitor.start_reaper`,
@@ -104,14 +154,30 @@ None known.
   Nodestro Local Docker is its own (`nodestro-<12 hex digits of SHA-256 of the resolved data directory and the
   installation id>`, done 2026-11-02): such an installation removes all of its own containers at the start
   (`reap(owner, remove_all=True)`), then the expired ones every 60 s, and never touches another installation's
-  containers on the same daemon. Local MCP servers use `nodestro-mcp-<id>` and are never reaped (they live as long as
-  their connection). A server's API and worker processes share the owner `nodestro` and reap only expired
+  containers on the same daemon. Local MCP servers use `nodestro-mcp-<id>`, which the tool reaper never touches; they
+  are reaped separately (RT-037). A server's API and worker processes share the owner `nodestro` and reap only expired
   containers. Open: through the sandbox gateway containers cannot be listed, so there the gateway's own reconcile does
   the work; containers an earlier release left with the owner `nodestro` on a desktop are no longer removed at the
   start (they have a deadline; a server on the same daemon removes them once expired, otherwise `docker rm`); a copy of
   a data directory (with its `python/installation-id`) at the same path on the same daemon, e.g. a second Nodestro
   Local Docker container on a copied volume, shares the owner.
 - **Next step:** A real-daemon test of the reaper (two owners on one daemon) in the CI `docker` job.
+
+### RT-037 · Local MCP containers and the sandbox gateway: residual risks (DS-4, DS-11)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** security review DS-4, DS-11; `mcp.stdio.prove`,
+  `docker_status.DockerMonitor.reap_mcp_once`, `sandbox_gateway.Gateway.require_limits`
+- **What:** Done 2026-11-02: every local MCP server container start needs Orkexa's preflight and the self-test of its
+  image in the container's exact shape, and runs the image by the checked id; this installation's MCP containers are
+  reaped at the start (all started before the reaper, safe because the process holds the data directory lock) and
+  once expired (every 60 s). The gateway drops request environment variables, checks a tagged image's lock label and
+  creates it by id, and confirms the daemon's limits and seccomp profile again after 5 s. Open: a server's processes
+  share `nodestro-mcp` and reap only expired MCP containers (deadline 7 days); through the sandbox gateway containers
+  cannot be listed, so its own reconcile (`max_lifetime`, 600 s by default) also ends MCP connections older than that;
+  a daemon reconfigured between the preflight and a container start is noticed only at the next start; the gateway
+  still inspects and removes `nodestro-env:*` tags without the lock-label check.
+- **Next step:** Real-daemon test of the MCP proof and reaper in the CI `docker` job; decide whether the gateway
+  should exempt MCP containers from `max_lifetime` or give them their own limit.
 
 ## Bugs and reliability
 

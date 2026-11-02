@@ -34,6 +34,8 @@ from nodestro_runtime.container_images import ContainerImages
 from nodestro_runtime.sandbox_gateway import LABEL, TMPFS, Gateway, GatewayConfig, Refused, plan_build, plan_create
 
 IMAGE = "nodestro-env:430e566d2514a584ae2837cde6129325"
+#: The id of IMAGE on the stand-in daemon.
+TAGGED_ID = "sha256:" + "5e" * 32
 CONFIG = GatewayConfig(instance="test")
 HASH = "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
 LOCK = f"six==1.17.0 \\\n    --hash=sha256:{HASH}\n    # via -r requirements.in\n"
@@ -575,8 +577,11 @@ class FakeDaemon:
         self.security_options = ["name=seccomp,profile=builtin", "name=cgroupns"]
         #: What ``/images/json`` lists (the environment images on the daemon).
         self.images: list[dict[str, Any]] = []
-        #: What ``/images/<ref>/json`` answers per reference (404 for others).
-        self.inspected: dict[str, dict[str, Any]] = {}
+        #: What ``/images/<ref>/json`` answers per reference (404 for others): the environment image IMAGE, which
+        #: Nodestro built (its lock label), has the id TAGGED_ID.
+        self.inspected: dict[str, dict[str, Any]] = {
+            IMAGE: {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": {"Labels": {gw.LOCK_LABEL: "1" * 64}}}
+        }
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -852,12 +857,73 @@ async def test_nothing_starts_when_the_daemon_cannot_enforce_limits(
     assert daemon.created == 0 and instance.containers == {}
     answer = await _send(listen, b"POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
     assert not any(target.startswith("/build") for _, target, _ in daemon.requests)
-    daemon.limits = True  # asked again until the daemon confirms them, then remembered
+    daemon.limits = True  # asked again until the daemon confirms them, then remembered for LIMITS_TTL seconds
     answer = await _send(listen, _post("/v1.51/containers/create", body()))
     assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
     daemon.limits = False
     answer = await _send(listen, _post("/v1.51/containers/create", body()))
     assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 2
+
+
+def test_no_environment_variable_of_a_request_reaches_the_container() -> None:
+    request = body(Env=["OPENAI_API_KEY=sk-secret", "HTTP_PROXY=http://proxy:3128", "PYTHONPATH=/evil"])
+    _query, raw = plan_create({}, request, CONFIG)
+    assert json.loads(raw)["Env"] == []
+    with pytest.raises(Refused):
+        plan_create({}, body(Env="A=1"), CONFIG)  # still a malformed request
+
+
+async def test_a_tagged_image_runs_only_when_it_is_a_nodestro_image_and_by_its_id(
+    gateway: tuple[FakeDaemon, str, Gateway],
+) -> None:
+    daemon, listen, _ = gateway
+    lock = {"Labels": {gw.LOCK_LABEL: "1" * 64}}
+    for wrong in (
+        None,  # no such image
+        {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": {"Labels": {}}},  # tagged nodestro-env, but no lock label
+        {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": {"Labels": {gw.LOCK_LABEL: "not-a-hash"}}},
+        {"Id": TAGGED_ID, "RepoTags": ["nodestro-env:" + "f" * 32], "Config": lock},  # the tag is not the image's
+        {"Id": "not-an-id", "RepoTags": [IMAGE], "Config": lock},
+    ):
+        if wrong is None:
+            daemon.inspected.pop(IMAGE, None)
+        else:
+            daemon.inspected[IMAGE] = wrong
+        answer = await _send(listen, _post("/v1.51/containers/create?name=nodestro-sandbox-aaaa", body()))
+        assert answer.startswith(b"HTTP/1.1 404") and b"not one of Nodestro's sandbox images" in answer, wrong
+    assert daemon.created == 0
+    daemon.inspected[IMAGE] = {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": lock}
+    answer = await _send(listen, _post("/v1.51/containers/create?name=nodestro-sandbox-aaaa", body()))
+    assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
+    # The container runs the image that was checked: a tag moved afterwards changes nothing.
+    assert json.loads(daemon.requests[-1][2])["Image"] == TAGGED_ID
+
+
+async def test_the_daemon_s_limits_and_seccomp_are_checked_again_after_the_ttl(
+    gateway: tuple[FakeDaemon, str, Gateway],
+) -> None:
+    from nodestro_runtime import docker_status
+
+    assert gw.LIMITS_TTL == docker_status.PREFLIGHT_TTL  # the runtime's preflight interval
+    daemon, listen, instance = gateway
+    now = [1000.0]
+    instance._clock = lambda: now[0]
+    assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
+    # The daemon is switched to an unconfined seccomp profile: noticed once the confirmation is older than the TTL.
+    daemon.security_options = ["name=seccomp,profile=unconfined"]
+    now[0] += gw.LIMITS_TTL / 2
+    assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
+    now[0] += gw.LIMITS_TTL
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and b"seccomp" in answer and daemon.created == 2
+    # A refusal is not remembered as a confirmation: fixed, the daemon is asked again at once.
+    daemon.security_options = ["name=seccomp,profile=builtin"]
+    daemon.containers.clear()
+    assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
+    daemon.limits = False
+    now[0] += gw.LIMITS_TTL
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and b"resource limits" in answer
 
 
 async def test_expired_and_leftover_containers_are_removed(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
