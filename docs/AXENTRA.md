@@ -345,10 +345,12 @@ identity). A suspended tenant is closed, not deleted:
   tool-wait sweeps for it. The check is `IdentityStore.tenant_active`, answered by the identity backend.
 - API processes stop what its context started in the background within `suspension_check` seconds
   (`server_app.stop_tenant_work`, stop code `identity.tenant_suspended`): batches, benchmarks with their judge,
-  assistant answers, architect drafts, live run chat answers (`RunChat.cancel_answers`: the question fails at once and
+  assistant answers, architect drafts, tool generation jobs (`ToolLibrary.cancel_jobs`: the job is `failed` at once
+  with `message_code` `identity.tenant_suspended`; no further model request, a running sandbox test is killed and its
+  container removed, a wait for a decision ends, the tool is never registered; security review NF-1), live run chat answers (`RunChat.cancel_answers`: the question fails at once and
   a late answer is not stored) and Python environment installations (`PythonEnvironments.cancel_installs`: stopped
   before their next step; a `uv` or `docker build` command already running finishes, bounded by its timeout, but its
-  result is never checked or used). Security review SR-03, SR-03a.
+  result is never checked or used). Security review SR-03, SR-03a, NF-1.
 - In `axentra` mode a tenant counts as suspended when **either** side says so: a suspension made directly in Axentra
   closes it at once (fail closed), and resuming it needs Nodestro's command when Nodestro's side is suspended. In
   `nodestro`/`mirror` mode Nodestro's status decides (`mirror` writes it to Axentra too). The backfill copies a

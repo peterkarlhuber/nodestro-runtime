@@ -13,6 +13,15 @@ Static tenant SQL check: the gaps of security review round 3 closed (#89; 2026-1
   conflict target, and `SET tenant_id`. Every review probe is a regression test; the real runtime and API code has
   no new finding. `docs/AXENTRA.md` states what the check guarantees and the remaining isolation risk without RLS.
 
+Stopping a suspended tenant's tool generation jobs (security review round 3, NF-1; 2026-11-02):
+
+- `ToolLibrary.cancel_jobs(code)` stops every tool job that has not ended: it is `failed` at once with `code` as its
+  `message_code` (the API passes `identity.tenant_suspended`) and never changes again. A model request not sent yet
+  is not sent and a late answer is not used; a running sandbox test is killed through the job's sandbox cancel check
+  (a container is killed and removed); a wait for an approval or for libraries ends at once; the tool is never
+  registered (a record already proposed for approval is rejected). A decision that was already taken is carried out.
+  Idempotent; returns the ids stopped. Tests: `tests/test_tool_job_cancel.py`.
+
 Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-11-02):
 
 - `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so
