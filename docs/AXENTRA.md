@@ -313,10 +313,11 @@ Nobody has to log in again: sessions are copied with their hash.
 **Rollback.** `axentra` -> `mirror` -> `nodestro` is a restart each; Nodestro's tables are current in both modes.
 Writes made in `nodestro` mode after a switch back are not mirrored: run the backfill again before switching forward.
 
-**Limits.** Session resolution in `axentra` mode costs three short reads instead of one; when Axentra notes a use on
-its own (`resolve_session`, at most once a minute) Nodestro's `last_seen_at` may lag up to about two minutes (it only
-matters for idle expiry after a rollback); the permissions of `axentra` mode add one short read (the product's
-permission catalog). In `axentra` mode the tenant list, roles, permissions and members come from Axentra, the user
+**Limits.** Session resolution in `axentra` mode is two Axentra transactions (Axentra's `resolve_session`, then
+Nodestro's membership/tenant read with the product's permission catalog) instead of one statement: about 1.3-1.9 ms
+instead of 0.2-0.4 ms, see [Performance](#performance); when Axentra notes a use on its own (`resolve_session`, at
+most once a minute) Nodestro's `last_seen_at` may lag up to about two minutes (it only matters for idle expiry after
+a rollback). In `axentra` mode the tenant list, roles, permissions and members come from Axentra, the user
 profile (`/api/auth/me` name and address) from Nodestro's row. Axentra's own HTTP API and admin functions are not
 exposed through Nodestro.
 
@@ -537,6 +538,64 @@ forward again later reuses them (`files migrate` copies only what is new).
 Axentra adds a fixed ~10 ms per upload (pending row, quota row lock, activation and audit in their own transactions,
 `fsync`) and a few ms per read (authorization, row lookup, SHA-256 check). An upload stores two objects (the file and
 its extraction). The moto numbers show the protocol overhead only, not a real S3 latency.
+
+## Performance
+
+Measured on one machine (4 CPUs, local PostgreSQL 16, Python 3.13) with the scripts `nodestro-api/tests/bench_*.py`
+(run each with `python tests/bench_x.py`; shared set-up in `tests/perf_support.py`; raw JSON and a summary in the
+project's `axentra-migration/performance/` folder). *before*: every switch off, one role. *after*: `on`, identity
+`mirror`/`axentra`, audit, usage, run usage, inbox, files on Axentra (local), `axs1` secrets, runtime role + owner
+role. 50 tenants, 2,000 users, 3,537 memberships, 10,000 sessions unless noted.
+
+| What | before | mirror | axentra |
+|---|---|---|---|
+| Session resolution, sequential p50 / p99 (ms) | 0.43 / 1.7 | 0.34 / 3.4 | 1.93 / 6.9 |
+| ... same session again within the minute (no touch) p50 | 0.16 | 0.15 | 1.25 |
+| ... resolutions/s, 1 / 8 / 32 threads, pool 8 | 2,560 / 2,860 / 3,210 | 1,070 / 1,040 / 1,070 | 390 / 394 / 391 |
+| `GET /api/auth/me` p50 (ms, real API process) | 2.7 | 2.5 | 4.2 |
+| `GET /api/workflows` / upload 10 KB / download p50 (ms) | 4.5 / 4.6 / 3.4 | 4.5 / 5.3 / 5.7 | 6.0 / 6.6 / 6.5 |
+| `POST /api/auth/switch` p50 (ms) | 4.2 | 11.7 | 11.2 |
+| API mix, 8 clients, pool 8: requests/s, p95 (ms) | 340, 31 | 266, 69 | 135, 87 |
+| Audit event / usage entry write p50 (ms) | 0.63 / 1.0 | | 2.3 / 17.4 |
+| API process RSS after start / after load (MiB) | 105 / 124 | 118 / 137 | 115 / 132 |
+| Worker process RSS after start / after load (MiB) | 91 / 141 | | 104 / 147 |
+
+- **Fixed while measuring.** (1) The identity reads of `axentra` mode joined `nodestro_axentra_ids` (collation `"C"`)
+  to Axentra's id columns (database default): PostgreSQL could not use Axentra's indexes and read every membership,
+  so `/api/auth/me` took 22 ms at 3,537 memberships and grew with all tenants' memberships; now 4.2 ms (the reads
+  filter on Axentra's ids, `tests/test_axentra_identity_indexes.py`). (2) The worker's periodic run usage pass read
+  the mirrored events of every run ever settled (0.25 s at 2,000 runs, 0.70 s at 10,000, growing); now it reads only
+  its candidates (0.04 s, flat; `tests/test_axentra_run_usage_reads.py`). (3) Axentra resolves a session in one
+  transaction instead of two (Axentra commit `69c06a5`, needs a pin bump): with (1), sequential resolution 2.8 -> 1.9
+  ms and 270 -> 390 resolutions/s.
+- **Accepted: the cost of `axentra` mode per request (~1.5-2 ms CPU).** Axentra answers (validity, revocation,
+  disabled users, roles, permissions from the versioned definitions) through its own service API, one transaction
+  each; a single combined statement would duplicate Axentra's session rules in Nodestro. The process is CPU-bound
+  (the GIL), not pool-bound: under load an API process serves about 40 % of the requests per second of `before`
+  (110-137 vs 300-330 requests/s with 16 clients and a worker load; pool 16 removes the pool waits in both and
+  changes little). Scale with more API processes; the connection budget per process stays `NODESTRO_DATABASE_POOL_SIZE`.
+- **Accepted: the usage mirror (+16 ms per usage entry, 4 meters).** Axentra's `UsageService.record_in` runs about 15
+  statements per meter (authorization, meter, idempotency, counters, quota) inside the caller's transaction, so the
+  process's write lock is held that long. Usage entries are written once per AI operation (seconds of model time);
+  run usage is settled by the leader in the background (35 runs/s). A batch `record_in` is an Axentra follow-up.
+  Audit mirror: +1.7 ms. A failing mirror costs 2.4 ms and keeps Nodestro's record.
+- **Mirror mode** answers from Nodestro's tables (same latency as before); its cost is in writes: a session touch
+  (once a minute per session) and a tenant switch (11.7 vs 4.2 ms) are written on both sides.
+- **Connections: no new bottleneck.** One pool per process; backends per server equal for both configurations at
+  every pool size (4/8/16: max 12-13 / 15-16 / 23); no pool timeouts, no errors; worker pools at a mean of 0.1-0.6
+  connections; no thread holds two connections at once (`tests/bench_shared_pool.py`).
+- **Workers are unchanged.** 1/2/4 workers x 200 runs (fake model 200 ms, one executing run per worker): 4.1/7.5/12.9
+  runs/s before, 3.4/7.6/12.9 after; job time p50 233 vs 234 ms. A worker killed with SIGKILL under load (3 workers,
+  200 runs): its one running run ends `run.interrupted` after the lease, the other 199 succeed, 200 model calls, none
+  twice, in both configurations.
+- **Migration commands** (killed with SIGKILL at about 40 % and run again: all counts equal, no duplicates, the reruns
+  find nothing to do): `backfill-identity` 24.8 s (15,587 records, 630/s; rerun 13 s), `reconcile-identity` 0.12 s,
+  `secrets reencrypt` 5,000 documents 6.3 s, `files migrate` 4,000 blobs (16 MB) 44 s, `files verify` 13 s,
+  `axentra reconcile` 2,000 audit events + 2,000 usage entries + 2,000 runs 60 s. Peak RSS growth of each command
+  under 4 MiB (they stream). A `files migrate` killed mid-copy leaves at most one Axentra object without a mapping,
+  which `files verify` reports as an orphan (never deleted automatically).
+- Axentra adds about 10 MiB to a process after start (its import and services) and a transient start peak (about
+  +60 MiB RSS high-water mark while the services start); nothing grows under load.
 
 ## What stays Nodestro's
 

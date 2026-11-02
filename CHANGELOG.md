@@ -5,6 +5,17 @@
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+Performance (Axentra migration, requirement 15, 2026-11-02; numbers in `docs/AXENTRA.md`, "Performance"):
+
+- Fix: the identity reads of `NODESTRO_IDENTITY_BACKEND=axentra` compared `nodestro_axentra_ids` (collation `"C"`)
+  with Axentra's id columns, so PostgreSQL could not use Axentra's indexes and read every membership of the product
+  on each session resolution and `/api/auth/me` (22 ms at 3,500 memberships, growing). They now filter on Axentra's
+  ids (`/api/auth/me` 4.2 ms). Test: `tests/test_axentra_identity_indexes.py`.
+- Fix: the worker's periodic run usage pass (`NODESTRO_AXENTRA_RUN_USAGE=1`) read the mirrored events of every run
+  ever settled; it now reads only its candidate runs' events by key (0.04 s instead of 0.7 s at 10,000 runs, flat).
+  Test: `tests/test_axentra_run_usage_reads.py`.
+- Measured with Axentra `69c06a5` (session resolution in one transaction; needs a pin bump to take effect).
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence
