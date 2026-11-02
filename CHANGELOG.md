@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Security review fixes (SR-01, SR-03, SR-04, SR-05, SR-07, SR-08, SR-09):
+
+- `tests/test_tenant_filters.py` parses every SQL statement of the runtime and the API with PostgreSQL's grammar
+  (`pglast`, a dev dependency) and requires a tenant binding for each tenant table, which it reads from the
+  migrations; statements it cannot build or parse fail, exceptions are listed one by one with their reason in
+  `tenant_sql_allowlist.py` (new `tenant_sql_check.py`).
+- `RunWorker` takes `tenant_active`: `owns()` is false for a suspended tenant's run, so it makes no further call.
+- The start checks that each keyring key and `NODESTRO_SECRET_KEY` decrypts sample stored values, and counts the key
+  ids of Axentra's own encrypted columns; `AxentraServices.reencrypt_columns` / `kids_in_use`.
+- Run usage settlement: a run id that does not fit an idempotency key is settled under its SHA-256; a run that fails
+  is quarantined and retried while the watermark moves on.
+- The volume catalog of input files is rewritten under an exclusive `flock` on `catalog.lock`.
+- `AxentraFiles.verify` fails on leftovers (`orphans`, new `unreferenced`), new `AxentraFiles.cleanup` removes them;
+  `FileObject.used_at`; `AxentraFiles.check` creates the local storage directory.
+- Every path that creates an Axentra tenant cuts its name to 200 characters (`axentra_platform.axentra_tenant_name`,
+  `NAME_LIMIT`).
+
 Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 
 - An attended run whose next model request does not fit its budget pauses before the request is sent instead of
