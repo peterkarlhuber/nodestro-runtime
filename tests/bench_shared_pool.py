@@ -5,7 +5,8 @@
 
 Runs the same API-and-worker-like load twice in one process, once per mode:
 
-- ``separate``: Axentra opens its own pool (before M10: ``pool_max`` 10 next to Nodestro's ``--pool``);
+- ``separate``: Axentra opens its own pool (before M10: ``pool_max`` 10 next to Nodestro's ``--pool``). Since M12
+  :meth:`AxentraServices.start` refuses that, so this baseline starts Axentra's facade directly;
 - ``shared``: Axentra borrows Nodestro's pool (``AxentraServices(database=...)``).
 
 Load per API thread, in a loop: an Axentra service call (authorization read + tenant listing: two Axentra
@@ -84,7 +85,12 @@ def run(mode: str, dsn: str, schema: str, args: argparse.Namespace, key: str) ->
         schema=schema,
         database=database if mode == "shared" else None,
     )
-    services.start()
+    if mode == "shared":
+        services.start()
+    else:  # the pre-M10 baseline: Axentra on a pool of its own (AxentraServices.start refuses it)
+        services.platform.db.open()
+        services.platform.start()
+        services._product_id = services.platform.single_product().id
     link = AxentraLink(services, database)
     held, peak = Held(), [0]
     _counting(database._pool, held, peak)

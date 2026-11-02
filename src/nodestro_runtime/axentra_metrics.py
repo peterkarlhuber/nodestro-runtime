@@ -7,7 +7,8 @@ it for ``GET /api/metrics`` (:mod:`nodestro_api.server_app`). The endpoint is of
 
 What is measured, never per tenant, user, run or workflow (every label value comes from a small fixed set):
 
-- connection pools by name (``pool="nodestro"``, ``pool="axentra"``): size, idle, in use, waiting clients, errors;
+- the process's connection pool (``pool="nodestro"``; Axentra borrows it, so it has no pool of its own): size, idle,
+  in use, waiting clients, errors;
 - integration operations of this process (:func:`count_operation`): mirror writes by kind and outcome, identity
   resolutions by outcome, secret decryptions by format and outcome;
 - read from the database at most once a minute (:class:`axentra.observability.metrics.CachedCallback`): jobs by kind
@@ -166,8 +167,8 @@ class ServerMetrics:
     """Nodestro's metrics on Axentra's registry for one server process (see the module documentation).
 
     ``database`` is Nodestro's database; ``services`` Axentra's started services (``None`` with
-    ``NODESTRO_AXENTRA=off``). ``pools`` overrides where the pools come from (default: Nodestro's pool and Axentra's,
-    one series per distinct pool object, so pools merged into one are shown once)."""
+    ``NODESTRO_AXENTRA=off``). ``pools`` overrides where the pools come from (default: Nodestro's pool, which Axentra
+    borrows: :meth:`AxentraServices.start` refuses to run on a pool of its own)."""
 
     def __init__(
         self,
@@ -191,16 +192,9 @@ class ServerMetrics:
     # -- sources ---------------------------------------------------------------------------------------------------
 
     def _pools(self) -> dict[str, Any]:
-        found: dict[str, Any] = {}
-        seen: set[int] = set()
-        candidates = [("nodestro", getattr(self.database, "_pool", None))]
-        if self.services is not None:
-            candidates.append(("axentra", getattr(self.services.platform.db, "pool", None)))
-        for name, pool in candidates:
-            if pool is not None and id(pool) not in seen:
-                seen.add(id(pool))
-                found[name] = pool
-        return found
+        # Axentra's database is only a view of this pool (``Database.on_pool``): one series, not a duplicate.
+        pool = getattr(self.database, "_pool", None)
+        return {"nodestro": pool} if pool is not None else {}
 
     @contextmanager
     def _bounded_transaction(self) -> Iterator[Any]:

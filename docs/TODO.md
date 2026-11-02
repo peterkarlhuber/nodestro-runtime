@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 5 |
-| P3 Low | 21 |
+| P2 Medium | 6 |
+| P3 Low | 23 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -165,28 +165,39 @@ None known.
 
 ### RT-030 · Axentra migration follow-ups
 
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`
-- **What:** The server profile can use Axentra (off by default) for keyring secrets, tenant links and the audit and
-  usage mirrors, and identity (`NODESTRO_IDENTITY_BACKEND=mirror|axentra`, backfill and reconcile). Open: a staging
-  rehearsal of the identity switch on a production copy, API keys
-  when publication comes to the server (decision and boundary in the doc, "API keys (M6)"), a dedicated database
-  role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, limit enforcement in the budget admission with reservations
-  (design in the doc, "Usage"; run usage is mirrored, enforcement stays off), a Studio view of the inbox
-  (`/api/notifications`), worker-side metrics (the worker has no listener), and a staging run of
-  migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
-  Rejected: moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
-  source), e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch).
-  Input files (`NODESTRO_FILES_BACKEND=axentra`, M8): open are a staging run of `files migrate/verify` against a real
-  S3 bucket (tested only with moto's S3 server) and quota defaults per plan. Knowledge files are deliberately not
-  moved (already in PostgreSQL with their search index).
-  rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys,
-  mirroring run usage (needs a per-run idempotency key and a billing decision), Axentra-side enforcement of limits,
-  and a staging run of migrate/backfill/reencrypt/reconcile with restore under the owner/runtime roles of
-  `docs/AXENTRA.md` ("Database roles"). Jobs stay Nodestro's (different guarantees, see the doc). Decided, not
-  pursued: running Nodestro's migrations on Axentra's runner (M9) and row-level security on `nodestro_*` tables (M10);
-  the reasons and measurements are in the doc.
-- **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
-  turned on in production. No switch is activated in production by this work.
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`,
+  nodestro-server SRV-019
+- **What:** Every Axentra integration of the server profile is merged and off by default; none is active in
+  production. Open:
+  - the independent security review (running; identity mirror and Axentra login first);
+  - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
+    `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
+    against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);
+  - production activation decisions per switch, after the review and the rehearsal;
+  - API keys when publication comes to the server (boundary decided in the doc, "API keys (M6)");
+  - limit enforcement in the budget admission with reservations (design in the doc, "Usage"; quotas are
+    informational until then) and quota defaults per plan;
+  - a Studio view of the inbox (`/api/notifications` exists) and process counters of the worker (it has no metrics
+    listener; its side shows only in the database-derived metrics).
+- **Rejected:** moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
+  source); e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch); shadow
+  modes and database mirror triggers from the migration plan (the identity mirror writes both sides in one
+  transaction, so there is nothing to compare or trigger); moving knowledge files (already in PostgreSQL with their
+  search index); running jobs on Axentra (M11, variant A), Nodestro's migrations on Axentra's runner (M9) and
+  row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
+- **Next step:** Finish the independent review, then the staging rehearsal. No switch is activated in production by
+  this work.
+
+### RT-036 · Axentra contract step (M12): remove the legacy paths
+
+- **Priority:** P3 Low · **Status:** Blocked (on production evidence per switch, RT-030) · **Refs:** `docs/AXENTRA.md`
+  ("Legacy paths and their removal preconditions")
+- **What:** The old implementations stay while they are the default, the rollback target or needed without Axentra:
+  `IdentityStore` reads with `nodestro_memberships` and `nodestro_login_states`, Nodestro's OIDC client, the server's
+  v1 tenant secrets and the server's volume copies of input files. The doc's table names each path and its removal
+  precondition.
+- **Next step:** Per path, once its precondition holds (production evidence, reconciliation with no difference,
+  review passed): remove the code and drop the tables in a new migration, with a backup and a restore drill.
 
 ### RT-035 · Run budget decisions: remaining gaps
 

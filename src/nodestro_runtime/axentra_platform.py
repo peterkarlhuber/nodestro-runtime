@@ -361,9 +361,10 @@ class AxentraServices:
     ``database``: the process's :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Axentra then borrows its
     pool (``axentra.data.Database.on_pool``): one connection budget per process (``NODESTRO_DATABASE_POOL_SIZE``),
     the same role, ``search_path`` and time limits; Axentra's scope settings are transaction-local, so nothing of
-    them stays on a connection Nodestro gets back. Without it (``migrate`` and other commands that only need the
-    migration runner), Axentra builds its own pool, opened by :meth:`start` only. ``migration_url``: the owner role's
-    connection for Axentra's migrations (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
+    them stays on a connection Nodestro gets back. :meth:`start` needs it: Axentra never opens a pool of its own in a
+    Nodestro process. Without it only what needs no pool works (``migrate``: Axentra's migration runner opens its own
+    connections; the settings). ``migration_url``: the owner role's connection for Axentra's migrations
+    (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
     """
 
     def __init__(
@@ -399,6 +400,12 @@ class AxentraServices:
     def start(self) -> None:
         from axentra.core.errors import AxentraError
 
+        if self.database is None:
+            # A second pool would break the process's connection budget (one pool per process, M10).
+            raise NodestroError(
+                "axentra.unavailable",
+                "Axentra starts only on the process's database pool (AxentraServices(database=...))",
+            )
         try:
             # Stricter than Axentra's own check (production only), and before anything is written: row-level security
             # must apply to the runtime role in every environment, unless the operator allowed a privileged role.
@@ -465,9 +472,6 @@ class AxentraServices:
             )
 
     # ---- secrets -------------------------------------------------------------------------------------
-
-    def secret_box(self, legacy: SecretBox | None) -> KeyringSecretBox:
-        return KeyringSecretBox(legacy, self.platform.secrets, write=self.config.secrets_format)
 
     def reencrypt_columns(self, *, dry_run: bool) -> dict[str, Any]:
         """Re-encrypt Axentra's own keyring columns (login states, webhook secrets, notification messages and the
@@ -947,12 +951,6 @@ class AxentraLink:
         )
         return str(rows[0][0]) if rows else None
 
-    def reverse(self, kind: str, axentra_id: str) -> str | None:
-        rows = self.database._query(
-            "SELECT nodestro_id FROM nodestro_axentra_ids WHERE kind = %s AND axentra_id = %s", (kind, axentra_id)
-        )
-        return str(rows[0][0]) if rows else None
-
     def link(self, connection: Any, kind: str, nodestro_id: str, axentra_id: str) -> None:
         connection.execute(
             "INSERT INTO nodestro_axentra_ids (kind, nodestro_id, axentra_id) VALUES (%s, %s, %s)",
@@ -1020,18 +1018,6 @@ class AxentraLink:
         if outermost:
             self._tenants[nodestro_id] = axentra_id
         return axentra_id
-
-    def backfill_tenants(self) -> dict[str, Any]:
-        """Link every Nodestro tenant (``nodestro_tenants``) to an Axentra tenant; idempotent and resumable."""
-        rows = self.database._query("SELECT id, name FROM nodestro_tenants ORDER BY id")
-        created, linked = 0, 0
-        for tenant_id, name in rows:
-            if self.tenant(str(tenant_id)) is not None:
-                linked += 1
-                continue
-            self.ensure_tenant(str(tenant_id), str(name))
-            created += 1
-        return {"tenants": len(rows), "already_linked": linked, "created": created}
 
 
 # ---- audit and usage mirrors (M3) ---------------------------------------------------------------

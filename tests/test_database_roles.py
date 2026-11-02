@@ -312,6 +312,23 @@ def test_axentra_services_work_on_the_shared_pool(linked: Any) -> None:
     assert link.services.schema_problems() == []  # the serving gate reads through the runtime role's pool
 
 
+def test_axentra_never_starts_on_a_pool_of_its_own(roles: Roles) -> None:
+    services = AxentraServices(
+        AxentraConfig(enabled=True, keyring=f"k1:{_key()}"),
+        database_url=roles.runtime_dsn,
+        migration_url=roles.owner_dsn,
+        public_origin="http://localhost:8000",
+        schema=roles.schema,
+    )
+    try:
+        with pytest.raises(NodestroError) as caught:
+            services.start()
+        assert caught.value.code == "axentra.unavailable" and "database pool" in str(caught.value)
+        assert services.platform.db.pool.closed  # Axentra opened no pool of its own
+    finally:
+        services.close()
+
+
 # ---- one pool: no scope crosses from one tenant to the next on the same connection --------------------------------
 
 
