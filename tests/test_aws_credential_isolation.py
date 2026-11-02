@@ -174,7 +174,7 @@ def test_mcp_stdio_servers_get_no_aws_credentials() -> None:
     from mcp.client.stdio import get_default_environment
 
     cli = ContainerImages(docker="docker")._cli_environment()
-    launch = stdio.launch(image="img", module="server", args=[], memory_mb=256, docker_env=cli)
+    launch = stdio.launch(image="sha256:" + "0" * 64, module="server", args=[], memory_mb=256, docker_env=cli)
     # The MCP SDK starts the relay with its default variables plus the launch's: this is the relay's environment.
     _assert_clean(get_default_environment() | launch.env)
     assert not {"-e", "--env", "--env-file"} & set(launch.args)

@@ -790,9 +790,21 @@ def test_a_local_mcp_server_gets_its_packages_through_the_same_approval(
     env = workspace.python.get(plan.scope)
     assert env is not None
     tag = workspace.python.images.tag(env.lock, env.python_version)
+    # Installed is not enough: the daemon must pass the preflight and the self-test of the image (DS-4).
+    with pytest.raises(NodestroError) as caught:
+        mcp.stdio_launch(server)
+    assert caught.value.code == "sandbox.isolation_required" and caught.value.params["reason"]
+    proved: list[str] = []
+    image_id = "sha256:" + "cd" * 32
+
+    def proof(image: str, **_: object) -> str:
+        proved.append(image)
+        return image_id
+
+    mcp.stdio_proof = proof
     started = mcp.stdio_launch(server)
     run = started.args[started.args.index("--") + 1 :]
-    assert tag in run and run[run.index("--network") + 1] == "none"
+    assert proved == [tag] and image_id in run and tag not in run and run[run.index("--network") + 1] == "none"
     assert [item.scope for item in workspace.python.python_status().environments if item.orphaned] == []
     mcp.remove(server.id)
     assert workspace.python.get(plan.scope) is None

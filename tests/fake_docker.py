@@ -18,7 +18,8 @@ def main() -> int:
     if argv[:1] == ["rm"]:
         return 0
     assert argv[:1] == ["run"], argv
-    image = next(index for index, item in enumerate(argv) if item.startswith("nodestro-env:"))
+    # The stdio server's container runs its proven image by id (sha256:...), never by tag.
+    image = next(index for index, item in enumerate(argv) if item.startswith("sha256:"))
     command = argv[image + 1 :]
     assert command[:4] == ["python", "-I", "-B", "-m"], command
     os.execv(sys.executable, [sys.executable, "-B", "-m", *command[4:]])
