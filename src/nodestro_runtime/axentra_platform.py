@@ -15,8 +15,12 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
                                             encrypts); required with ``NODESTRO_AXENTRA=on``
 ``NODESTRO_AXENTRA_CONFIG``                 optional Axentra TOML file for Axentra's own knobs; Nodestro's
                                             values (database, product, mode, keyring) always win
-``NODESTRO_AXENTRA_ALLOW_SUPERUSER``        ``1`` lets Axentra run on a superuser / ``BYPASSRLS`` role (its
-                                            row-level security is then no defense in depth); default refused
+``NODESTRO_AXENTRA_ALLOW_SUPERUSER``        ``1`` lets Axentra run on a superuser / ``BYPASSRLS`` role or one that
+                                            owns the tables (its row-level security is then no defense in
+                                            depth); default refused in every environment: run ``api`` and
+                                            ``worker`` as a runtime role (``nodestro-server db
+                                            grant-runtime-role``) and ``migrate`` as the owner
+                                            (``NODESTRO_DATABASE_MIGRATION_URL``)
 ``NODESTRO_SECRETS_FORMAT``                 ``v1`` (default) or ``axs1``: format of newly written tenant secrets
                                             (``axs1`` = Axentra keyring with rotation; needs NODESTRO_AXENTRA=on)
 ``NODESTRO_AXENTRA_AUDIT``                  ``1``: mirror the approval audit trail and MCP events into Axentra's
@@ -210,12 +214,22 @@ def _with_search_path(conninfo: str, schema: str | None) -> str:
     return make_conninfo("", **parts)
 
 
-def build_settings(config: AxentraConfig, *, database_url: str, public_origin: str, schema: str | None = None) -> Any:
+def build_settings(
+    config: AxentraConfig,
+    *,
+    database_url: str,
+    public_origin: str,
+    schema: str | None = None,
+    migration_url: str | None = None,
+) -> Any:
     """Axentra's :class:`~axentra.config.settings.Settings` for Nodestro's server (``config.enabled`` only).
 
     The operator's ``NODESTRO_AXENTRA_CONFIG`` file is read first; Nodestro then fixes what must agree with it:
-    the database (the server's own, same schema), single-product mode with product ``nodestro``, the modules and the
-    environment (production for an https origin). The keyring is passed to Axentra directly, never as a setting."""
+    the database (the server's own, same schema; migrations with ``migration_url``, the owner role, when given),
+    single-product mode with product ``nodestro``, the modules and the environment (production for an https origin).
+    A role that bypasses row-level security or owns the tables is allowed only with ``NODESTRO_AXENTRA_ALLOW_SUPERUSER``
+    (checked by :meth:`AxentraServices.start` in every environment). The keyring is passed to Axentra directly, never
+    as a setting."""
     from axentra.config.settings import load_settings
 
     production = public_origin.startswith("https://")
@@ -225,7 +239,14 @@ def build_settings(config: AxentraConfig, *, database_url: str, public_origin: s
         "mode": "single",
         "modules": list(MODULES),
         "product": {"slug": PRODUCT_SLUG, "name": PRODUCT_NAME},
-        "database": {"url": url, "allow_superuser": config.allow_superuser},
+        "database": {
+            "url": url,
+            "migration_url": _with_search_path(migration_url, schema) if migration_url else None,
+            "migration_url_ref": None,
+            "url_ref": None,
+            "allow_superuser": config.allow_superuser,
+            "allow_table_owner": config.allow_superuser,
+        },
         # The keyring is not a setting here: Nodestro validated it and hands it to Axentra (AxentraServices).
         "security": {"public_url": public_origin, "master_keys_ref": None, "master_keys": None},
         "observability": {"otel_service_name": "nodestro"},
@@ -263,18 +284,42 @@ class AxentraServices:
     """Axentra opened for one Nodestro server process (API, worker or an operator command).
 
     ``platform`` is the :class:`axentra.platform.Axentra` facade (services as attributes). Construction opens
-    nothing; :meth:`start` opens the pool, checks the database role and creates/confirms the product ``nodestro``.
+    nothing; :meth:`start` checks the database role and creates/confirms the product ``nodestro``.
+
+    ``database``: the process's :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Axentra then borrows its
+    pool (``axentra.data.Database.on_pool``): one connection budget per process (``NODESTRO_DATABASE_POOL_SIZE``),
+    the same role, ``search_path`` and time limits; Axentra's scope settings are transaction-local, so nothing of
+    them stays on a connection Nodestro gets back. Without it (``migrate`` and other commands that only need the
+    migration runner), Axentra builds its own pool, opened by :meth:`start` only. ``migration_url``: the owner role's
+    connection for Axentra's migrations (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
     """
 
-    def __init__(self, config: AxentraConfig, *, database_url: str, public_origin: str, schema: str | None = None):
+    def __init__(
+        self,
+        config: AxentraConfig,
+        *,
+        database_url: str,
+        public_origin: str,
+        schema: str | None = None,
+        migration_url: str | None = None,
+        database: PostgresDatabase | None = None,
+    ):
         if not config.enabled:
             raise NodestroError("axentra.disabled", "Axentra is not switched on (NODESTRO_AXENTRA)")
         from axentra.config.secrets import Keyring
+        from axentra.data.database import Database
         from axentra.platform import Axentra
 
         self.config = config
-        self.settings = build_settings(config, database_url=database_url, public_origin=public_origin, schema=schema)
-        self.platform = Axentra(self.settings, keyring=Keyring.parse(config.keyring))
+        self.settings = build_settings(
+            config, database_url=database_url, public_origin=public_origin, schema=schema, migration_url=migration_url
+        )
+        self.database = database
+        shared = None
+        if database is not None:
+            pool = database.shared_pool()
+            shared = Database.on_pool(pool, url=_with_search_path(pool.conninfo, schema))
+        self.platform = Axentra(self.settings, keyring=Keyring.parse(config.keyring), database=shared)
         self._product_id: str | None = None
 
     # ---- lifecycle ---------------------------------------------------------------------------------
@@ -283,8 +328,15 @@ class AxentraServices:
         from axentra.core.errors import AxentraError
 
         try:
+            # Stricter than Axentra's own check (production only), and before anything is written: row-level security
+            # must apply to the runtime role in every environment, unless the operator allowed a privileged role.
+            self.platform.db.open()
+            self.platform.db.check_role(
+                allow_superuser=self.config.allow_superuser, allow_table_owner=self.config.allow_superuser
+            )
             self.platform.start()
         except AxentraError as exc:
+            self.platform.close()
             raise NodestroError("axentra.unavailable", f"Axentra cannot start: {exc}") from None
         product = self.platform.single_product()
         if product is None:  # pragma: no cover - start() creates it in single mode
@@ -312,7 +364,10 @@ class AxentraServices:
         from axentra.core.errors import AxentraError
 
         try:
-            self.platform.migration_runner().require_current()
+            if self.database is not None:  # through the runtime role's pool: serving processes need no owner URL
+                self.platform.require_current_schema()
+            else:
+                self.platform.migration_runner().require_current()
         except AxentraError as exc:
             return [str(exc)]
         return []

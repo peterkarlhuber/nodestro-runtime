@@ -98,6 +98,8 @@ def _link(database: Any, *, audit: bool = True, usage: bool = True) -> Any:
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        migration_url=postgres_support.DSN,
+        database=database,
     )
     services.migrate()
     services.start()
@@ -120,7 +122,7 @@ def mirrored(database: Any) -> Iterator[tuple[Any, AxentraEvents]]:
 
 
 def _audit_rows(database: Any) -> list[tuple[Any, ...]]:
-    return database._query(
+    return postgres_support.owner_of(database)._query(
         "SELECT action, outcome, actor_kind, actor_display, target_type, target_id, details, tenant_id"
         " FROM axentra_audit_events WHERE action LIKE %s ORDER BY occurred_at, id",
         ("nodestro.%",),
@@ -128,7 +130,7 @@ def _audit_rows(database: Any) -> list[tuple[Any, ...]]:
 
 
 def _usage_rows(database: Any) -> dict[str, Decimal]:
-    rows = database._query(
+    rows = postgres_support.owner_of(database)._query(
         "SELECT m.key, sum(e.quantity) FROM axentra_usage_events e JOIN axentra_usage_meters m ON m.id = e.meter_id"
         " GROUP BY m.key"
     )
@@ -185,9 +187,9 @@ def test_a_linked_user_is_the_actor_of_the_mirror(mirrored: tuple[Any, AxentraEv
         events.link.link(connection, "user", "usr_9", "usr_axentra9")
     record_audit(database.store("alpha"), _event(actor="usr_9"))
     assert _audit_rows(database)[0][2:4] == ("user", "usr_9")
-    assert database._query("SELECT actor_id FROM axentra_audit_events WHERE action LIKE %s", ("nodestro.%",)) == [
-        ("usr_axentra9",)
-    ]
+    assert postgres_support.owner_of(database)._query(
+        "SELECT actor_id FROM axentra_audit_events WHERE action LIKE %s", ("nodestro.%",)
+    ) == [("usr_axentra9",)]
 
 
 def test_mcp_events_are_mirrored_with_redacted_addresses(mirrored: tuple[Any, AxentraEvents]) -> None:
@@ -287,7 +289,8 @@ def test_records_from_before_the_switch_are_reconciled(database: Any) -> None:
         again = events.reconcile()
         assert (again["audit_missing"], again["usage_missing"], again["written"]) == (0, 0, 0)
         assert entry.id in {
-            str(row[0]).split(":")[2] for row in database._query("SELECT idempotency_key FROM axentra_usage_events")
+            str(row[0]).split(":")[2]
+            for row in postgres_support.owner_of(database)._query("SELECT idempotency_key FROM axentra_usage_events")
         }
     finally:
         database.platform_events = None
@@ -298,7 +301,12 @@ def test_tenants_without_a_nodestro_tenant_row_are_not_mirrored(mirrored: tuple[
     database, events = mirrored
     record_audit(database.store("nodestro-price-reference"), _event())
     assert _audit_rows(database) == [] and events.stats.skipped == 1
-    assert database._query("SELECT count(*) FROM axentra_tenants WHERE slug LIKE %s", ("nodestro-price%",))[0][0] == 0
+    assert (
+        postgres_support.owner_of(database)._query(
+            "SELECT count(*) FROM axentra_tenants WHERE slug LIKE %s", ("nodestro-price%",)
+        )[0][0]
+        == 0
+    )
 
 
 def test_the_mirrors_stay_detached_when_switched_off(database: Any) -> None:

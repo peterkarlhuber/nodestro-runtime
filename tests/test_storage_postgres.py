@@ -22,6 +22,7 @@ from nodestro_runtime.storage_postgres import (  # noqa: E402 - needs the option
     POSTGRES_SCHEMA_VERSION,
     PostgresDatabase,
     PostgresStore,
+    migration_checksum,
     postgres_migrations,
 )
 
@@ -245,7 +246,7 @@ def test_a_missing_step_is_refused(database: PostgresDatabase) -> None:
 
 def test_a_database_of_a_newer_release_is_refused(database: PostgresDatabase) -> None:
     database.migrate()
-    database._write(
+    postgres_support.owner_of(database)._write(  # a runtime role may only read the schema versions
         "INSERT INTO nodestro_schema_migrations (version, name) VALUES (%s, 'future.sql')",
         (POSTGRES_SCHEMA_VERSION + 5,),
     )
@@ -254,6 +255,54 @@ def test_a_database_of_a_newer_release_is_refused(database: PostgresDatabase) ->
     assert caught.value.code == "storage.schema_too_new"
     with pytest.raises(NodestroError):
         database.require_current_schema()
+
+
+def _recorded(database: PostgresDatabase) -> dict[int, tuple[str, str | None]]:
+    rows = database._query("SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version")
+    return {int(version): (str(name), checksum) for version, name, checksum in rows}
+
+
+def test_migrations_are_recorded_with_their_checksums(database: PostgresDatabase) -> None:
+    database.migrate()
+    shipped = postgres_migrations()
+    assert _recorded(database) == {
+        version: (name, migration_checksum(step)) for version, (name, step) in shipped.items()
+    }
+
+
+@pytest.mark.parametrize("old_table", [False, True], ids=["null-checksums", "table-without-checksum-column"])
+def test_rows_written_before_checksums_are_adopted(database: PostgresDatabase, old_table: bool) -> None:
+    """A database migrated by a release before checksums: the unchanged files' checksums are recorded, once."""
+    database.migrate()
+    owner = postgres_support.owner_of(database)
+    if old_table:
+        owner._write("ALTER TABLE nodestro_schema_migrations DROP COLUMN checksum", ())
+    else:
+        owner._write("UPDATE nodestro_schema_migrations SET checksum = NULL", ())
+    database.require_current_schema()  # unverified rows do not stop a server; migrate adopts them
+    assert database.migrate() == POSTGRES_SCHEMA_VERSION
+    assert all(checksum for _name, checksum in _recorded(database).values())
+    database.require_current_schema()
+
+
+@pytest.mark.parametrize("change", ["checksum", "name"])
+def test_a_changed_applied_migration_is_refused(database: PostgresDatabase, change: str) -> None:
+    database.migrate()
+    owner = postgres_support.owner_of(database)
+    if change == "checksum":
+        owner._write("UPDATE nodestro_schema_migrations SET checksum = %s WHERE version = 2", ("0" * 64,))
+    else:  # an old row (no checksum yet) whose file was replaced by another one
+        owner._write(
+            "UPDATE nodestro_schema_migrations SET name = '0002_other.sql', checksum = NULL WHERE version = 2", ()
+        )
+    for attempt in (database.migrate, database.require_current_schema):
+        with pytest.raises(NodestroError) as caught:
+            attempt()
+        assert caught.value.code == "storage.migration_changed"
+        assert caught.value.params["changed"] == [
+            f"0002 ({'0002_knowledge_memory.sql' if change == 'checksum' else '0002_other.sql'})"
+        ]
+    assert _recorded(database)[2][1] == ("0" * 64 if change == "checksum" else None)  # nothing was adopted
 
 
 def test_migrate_refuses_to_run_inside_a_transaction(database: PostgresDatabase) -> None:

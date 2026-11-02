@@ -109,9 +109,11 @@ None known.
 - **What:** The server profile can use Axentra (off by default) for keyring secrets, tenant links and the audit and
   usage mirrors, and identity (`NODESTRO_IDENTITY_BACKEND=mirror|axentra`, backfill and reconcile). Open: a staging
   rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys,
-  a dedicated database role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, mirroring run usage (needs a per-run
-  idempotency key and a billing decision), Axentra-side enforcement of limits, and a staging run of
-  migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
+  mirroring run usage (needs a per-run idempotency key and a billing decision), Axentra-side enforcement of limits,
+  and a staging run of migrate/backfill/reencrypt/reconcile with restore under the owner/runtime roles of
+  `docs/AXENTRA.md` ("Database roles"). Jobs stay Nodestro's (different guarantees, see the doc). Decided, not
+  pursued: running Nodestro's migrations on Axentra's runner (M9) and row-level security on `nodestro_*` tables (M10);
+  the reasons and measurements are in the doc.
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 

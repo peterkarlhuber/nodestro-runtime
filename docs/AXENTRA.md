@@ -25,7 +25,8 @@ to 3.11 is tracked as RT-022.
 | `NODESTRO_AXENTRA` | `off` | `on`: open Axentra in the same PostgreSQL database (tables `axentra_*` next to `nodestro_*`), one product `nodestro`, single-product mode |
 | `NODESTRO_AXENTRA_KEYRING` / `_FILE` | – | Axentra keyring `kid:base64key[,kid2:...]`; the first key encrypts. Required with `on` |
 | `NODESTRO_AXENTRA_CONFIG` | – | Optional Axentra TOML file for Axentra's own knobs; Nodestro's values (database, product, mode, keyring) always win. `AXENTRA__*` variables are ignored |
-| `NODESTRO_AXENTRA_ALLOW_SUPERUSER` | `0` | `1` lets Axentra run on a superuser or `BYPASSRLS` role. Its row-level security is then no defense in depth; production uses a dedicated role |
+| `NODESTRO_AXENTRA_ALLOW_SUPERUSER` | `0` | `1` lets Axentra run on a superuser, `BYPASSRLS` or table-owning role (development only). Its row-level security is then no defense in depth. Refused otherwise in every environment: see [Database roles](#database-roles) |
+| `NODESTRO_DATABASE_MIGRATION_URL` / `_FILE` | – | The owner role's connection: `migrate`, the backup and `db grant-runtime-role` use it; `NODESTRO_DATABASE_URL` is then the runtime role. Without it every command uses `NODESTRO_DATABASE_URL` (one role, as before) |
 | `NODESTRO_SECRETS_FORMAT` | `v1` | `axs1`: new tenant secrets are written with the Axentra keyring (rotation). Needs `on` |
 | `NODESTRO_AXENTRA_AUDIT` | `0` | `1`: mirror the approval audit trail and MCP events into Axentra's audit log. Needs `on` |
 | `NODESTRO_AXENTRA_USAGE` | `0` | `1`: mirror the AI usage ledger into Axentra meters `nodestro.ai.*`. Needs `on` |
@@ -36,13 +37,118 @@ Every invalid combination stops the server with `profile.invalid` and names ever
 ## Schema and migrations
 
 `nodestro-server migrate` applies Nodestro's migrations and then Axentra's (namespaced, checksummed, under Axentra's
-advisory lock). One backup (`--backup-dir` runs `pg_dump`, `--backup-taken` states one was made) covers both runners;
+advisory lock), as the owner role ([Database roles](#database-roles)). One backup (`--backup-dir` runs `pg_dump`, `--backup-taken` states one was made) covers both runners;
 a new, empty database needs none. `check`, `api` and `worker` refuse to start while either schema is behind
 (`storage.schema_mismatch`). Switching Axentra off again needs nothing: its tables stay and are not read.
 
 Nodestro migration `0007_axentra_links` adds `nodestro_axentra_ids(kind, nodestro_id, axentra_id)`: the only
 mapping between Nodestro ids and Axentra ids (`tenant`, `user`, `session`, `api_key`), unique in both directions.
 Nodestro ids never change.
+
+One connection pool per process: Axentra borrows the pool of Nodestro's `PostgresDatabase`
+(`axentra.data.Database.on_pool`, see [One connection pool](#one-connection-pool-m10)).
+
+## Database roles
+
+Row-level security on Axentra's tables protects only a role that is not a superuser, has no `BYPASSRLS` and **owns
+no table** (`FORCE ROW LEVEL SECURITY` binds an owner too, but an owner can switch it off, change policies or drop the
+table). A server therefore uses two roles:
+
+| Role | Used by | Attributes and privileges |
+|---|---|---|
+| owner (for example `nodestro_owner`) | `migrate`, `backup` (and the pre-migration `pg_dump`), `db grant-runtime-role`, `db roles` via `NODESTRO_DATABASE_MIGRATION_URL` | owns the schema and every table; `NOSUPERUSER`, `BYPASSRLS` (so that `pg_dump` can read Axentra's forced-RLS tables; it gains nothing an owner could not take anyway) |
+| runtime (for example `nodestro_app`) | `api`, `worker`, `check` and the operator commands via `NODESTRO_DATABASE_URL` | `NOSUPERUSER NOBYPASSRLS`, owns nothing; `SELECT, INSERT, UPDATE, DELETE` on the tables, sequences, functions, read-only on `nodestro_schema_migrations` and `axentra_schema_migrations` |
+
+- `nodestro-server migrate` checks the runtime role first (refused, nothing migrated: superuser, `BYPASSRLS`, owns
+  tables) and grants it afterwards (`grant_runtime_role`, idempotent; default privileges cover later migrations).
+  `nodestro-server db grant-runtime-role [ROLE]` does the same on its own, `db roles` shows both roles (exit code 3
+  when RLS does not fully apply to the runtime role).
+- `check`, `api` and `worker` refuse a runtime role that bypasses RLS or owns tables (`storage.role_unsafe`) when
+  `NODESTRO_AXENTRA=on` (unless `NODESTRO_AXENTRA_ALLOW_SUPERUSER=1`) or a separate migration role is configured;
+  `AxentraServices.start` checks the same in every environment before writing anything.
+- Proof: `tests/test_database_roles.py` (runtime: cannot `ALTER ... NO FORCE / DISABLE ROW LEVEL SECURITY`, change
+  policies, alter, drop or truncate tables, create objects, fake schema versions, `SET ROLE` the owner or give itself
+  `BYPASSRLS`; sees no Axentra row without a scope, cannot write into another tenant; `row_security = off` fails
+  instead of bypassing) and nodestro-api `tests/test_server_roles.py` (migrate as owner, serve as runtime, the backup,
+  refusals). `NODESTRO_TEST_RUNTIME_ROLE=1` runs every PostgreSQL test of this repository with migrations as the
+  owner and everything else as such a runtime role (`tests/postgres_support.py`).
+- Found that way: Axentra's audit/usage mirror did not work under a non-superuser role (an Axentra transaction inside
+  `Database.joined` emptied the scope of the enclosing `join`, so the meter was invisible); fixed in Axentra, see its
+  CHANGELOG. **The runtime pin must include that fix before any mirror runs under a runtime role.**
+
+## One connection pool (M10)
+
+`AxentraServices(database=...)` makes Axentra borrow the `PostgresDatabase` pool (`Database.on_pool`); `api`,
+`worker`, `check` and the operator commands always pass it, so a process has one budget, `NODESTRO_DATABASE_POOL_SIZE`
+(default 8), plus Nodestro's one connection for session advisory locks. Only `migrate` and `axentra status` (no pool
+needed) open nothing but the migration runners' own connections.
+
+- Axentra's scope settings are transaction-local (`set_config(..., true)`); each Axentra transaction is an explicit
+  block on the autocommit connection. A connection handed back to Nodestro carries no scope, after a commit, a
+  rollback or an error; `joined`/`join` nest and restore the scope that was in effect
+  (`tests/test_database_roles.py`: pool of one connection, the same backend alternating tenants, Nodestro and
+  Axentra; six threads on two connections).
+- Measured with `tests/bench_shared_pool.py` (local PostgreSQL 16, 8 s per mode; API loop = an Axentra service call,
+  a Nodestro read, a Nodestro write, a joined audit mirror; worker loop = a Nodestro transaction with a lock):
+
+  | Load (API threads / worker threads / pool) | Connections max (mean), separate pools | Connections max (mean), shared | ops/s separate / shared | API loop p50 ms separate / shared |
+  |---|---|---|---|---|
+  | 4 / 1 / 8 | 8 (6.7) | 4 (4.0) | 190 / 204 | 27.3 / 24.5 |
+  | 16 / 2 / 8 | 9 (8.9) | 6 (6.0) | 139 / 138 | 126 / 125 |
+  | 16 / 2 / 4 | 9 (9.0) | 4 (4.0) | 160 / 163 | 105 / 106 |
+  | 40 / 2 / 8 | 12 (11.9) | 7 (7.0) | 118 / 118 | 339 / 337 |
+
+  No errors and no pool timeouts in either mode; no thread ever held two pooled connections at once (no
+  hold-and-wait, so one pool cannot starve itself). Throughput is bounded by Nodestro's per-process write
+  serialization, not by connections. Before, the worst case per process was 8 + 10 (Axentra's `pool_max`) + 1.
+
+## Migrations (M9: decided, Nodestro keeps its runner)
+
+Nodestro's PostgreSQL migrations stay on Nodestro's runner, now with checksums: each applied migration is recorded
+with the SHA-256 of its file; `migrate`, `check`, `api` and `worker` refuse a shipped migration whose file differs
+from the one applied (`storage.migration_changed`); rows of earlier releases are adopted once (the file name must
+match; the shipped files never changed since 0001, checked in git history). Axentra's `MigrationRunner` was not
+adopted as the runner of the `nodestro` namespace because:
+
+- the runner must work without Axentra: Python 3.10, `NODESTRO_AXENTRA=off` (no `axentra_*` tables may be created),
+  and a server that switches Axentra off again. Running Axentra's runner only when Axentra is on would mean two
+  bookkeeping tables for the same schema and a reverse adoption on every switch back;
+- Nodestro applies all pending steps in **one** transaction (a failure leaves the database unchanged); Axentra
+  commits per step;
+- Nodestro's schema versions are a gap-free sequence that other work packages extend in parallel; the gate
+  (`storage.schema_mismatch`, `storage.schema_too_new`) is exact, as `require_current` would be.
+
+What Axentra's runner adds was taken over where it matters (checksums and drift detection); its advisory lock,
+before-apply backup and forward-only rules Nodestro already had. One backup still covers both runners; both run as
+the owner role. Desktop and Local Docker use SQLite (no PostgreSQL migrations).
+
+## Row-level security on Nodestro's tables (M10: decided, not enabled)
+
+Measured with `tests/bench_nodestro_rls.py` (20,000 documents of 20 tenants, runtime role, local socket; p50 in µs):
+
+| Statement | today (autocommit) | FORCE RLS, `BEGIN` + `set_config` + statement + `COMMIT` | same, one pipeline | policy cost alone |
+|---|---|---|---|---|
+| point read | 85 | 236 | 211 | 57 (inside a transaction) |
+| 1,000-row listing | 1,997 | 1,721 | 1,769 | 1,549 |
+| upsert | 327 | 555 | 654 | 70 (no commit) |
+
+The policy itself is cheap; the cost is that every read and single write must become a transaction to carry a
+transaction-local tenant setting (three more round trips per statement, about 2.5x on a local socket and
+milliseconds over a network; a pipeline saves the round trips but not the commit). Not enabled, because:
+
+- the gain is small: the setting would come from the same store object that already puts `tenant_id` into every
+  statement, so it catches only a forgotten filter, not a wrong store; and any role can call `set_config`, so it
+  does not stop SQL injection either;
+- many paths are cross-tenant by design and would run in a bypass scope anyway: the worker's claim, lease renewal and
+  finish by job id, the reaper, housekeeping, the schedule leader, session lookup by token hash before a tenant is
+  known, the global user table;
+- it would change the store's connection model (autocommit reads with retry on a lost connection) in every module
+  that writes SQL (storage, knowledge, jobs, identity), which other work packages change at the same time.
+
+Instead, `tests/test_tenant_filters.py` fails when a PostgreSQL statement on a tenant-data table (`nodestro_documents`,
+`_files`, `_chunks`, `_memory_files`, `_run_events`) does not mention `tenant_id`; the only exception is the run-event
+housekeeping (by age, every tenant). The runtime role cannot alter the tables either. Revisit when Nodestro's store
+runs inside per-request transactions anyway.
 
 ## Tenant secrets and key rotation
 

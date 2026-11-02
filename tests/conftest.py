@@ -17,6 +17,10 @@ _UNAVAILABLE = SandboxStatus(False, "untested-system", "not available in this te
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "real_sandbox_status: use the computer's real built-in sandbox status")
+    import postgres_support
+
+    if postgres_support.RUNTIME_ROLE_MODE and postgres_support.DSN:
+        postgres_support.install_runtime_role_mode()
 
 
 @pytest.fixture(autouse=True)

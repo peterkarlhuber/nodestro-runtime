@@ -15,6 +15,11 @@ unsafe one with ``profile.invalid``, listing every problem at once. Nothing has 
 ``NODESTRO_SECRET_KEY`` (or ``_FILE``)    at least 32 random bytes, base64: encrypts tenant secrets at rest
 ========================================  ==================================================================
 
+Optional: ``NODESTRO_DATABASE_MIGRATION_URL`` (or ``_FILE``) is the connection of the **owner** role that owns the
+tables and runs ``nodestro-server migrate``, the backup and ``db grant-runtime-role``; ``api``, ``worker`` and the
+other commands use ``NODESTRO_DATABASE_URL``, which then names a runtime role without DDL rights (no superuser, no
+``BYPASSRLS``, owns no table). Without it every command uses ``NODESTRO_DATABASE_URL`` (one role, as before).
+
 Optional Axentra platform services (``NODESTRO_AXENTRA``, ``NODESTRO_AXENTRA_KEYRING``, ``NODESTRO_SECRETS_FORMAT``,
 ...) are read by :class:`~nodestro_runtime.axentra_platform.AxentraConfig` in the same pass; all of them are off by
 default.
@@ -73,6 +78,19 @@ class ServerSettings:
     secret_key: bytes = field(repr=False)
     #: Optional Axentra platform services (off by default).
     axentra: AxentraConfig = field(default_factory=AxentraConfig)
+    #: The owner role's connection for migrations, backups and grants (``NODESTRO_DATABASE_MIGRATION_URL``);
+    #: empty: the runtime connection (``database_url``) is used for everything.
+    migration_database_url: str = field(default="", repr=False)
+
+    @property
+    def migration_url(self) -> str:
+        """The connection of ``migrate``, the pre-migration backup and ``db grant-runtime-role``."""
+        return self.migration_database_url or self.database_url
+
+    @property
+    def separate_migration_role(self) -> bool:
+        """Whether migrations run with their own connection (the owner role) instead of the runtime one."""
+        return bool(self.migration_database_url) and self.migration_database_url != self.database_url
 
     @property
     def redirect_uri(self) -> str:
@@ -99,7 +117,7 @@ class ServerSettings:
         environ = os.environ if environ is None else environ
         problems: list[dict[str, str]] = []
 
-        def value(name: str, *, secret: bool = False) -> str:
+        def value(name: str, *, secret: bool = False, optional: bool = False) -> str:
             direct = environ.get(name, "").strip()
             path = environ.get(f"{name}_FILE", "").strip()
             if direct and path:
@@ -114,12 +132,13 @@ class ServerSettings:
                 if not text:
                     problems.append(_problem(f"{name}_FILE", path, f"the file in {name}_FILE is empty"))
                 return text
-            if not direct:
+            if not direct and not optional:
                 hint = f" (or {name}_FILE)" if secret else ""
                 problems.append(_problem(name, "", f"{name}{hint} is required"))
             return direct
 
         database_url = value("NODESTRO_DATABASE_URL", secret=True)
+        migration_url = value("NODESTRO_DATABASE_MIGRATION_URL", secret=True, optional=True)
         origin = _origin(environ.get("NODESTRO_PUBLIC_ORIGIN", "").strip(), "NODESTRO_PUBLIC_ORIGIN", problems)
         issuer = _origin(
             environ.get("NODESTRO_OIDC_ISSUER", "").strip(), "NODESTRO_OIDC_ISSUER", problems, path_allowed=True
@@ -159,6 +178,7 @@ class ServerSettings:
             oidc_client_secret=client_secret,
             secret_key=key,
             axentra=axentra,
+            migration_database_url=migration_url,
         )
 
 

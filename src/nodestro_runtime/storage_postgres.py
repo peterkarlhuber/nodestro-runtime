@@ -15,9 +15,16 @@ writes consistent, and :meth:`PostgresStore.lock` serializes read-modify-write s
 
 Migrations (forward only) are the numbered SQL files in ``nodestro_runtime/migrations/postgres``. They run under a
 PostgreSQL advisory lock, so several processes starting at once apply each step exactly once, and are recorded in
-``nodestro_schema_migrations``. A database written by a newer release is refused (``storage.schema_too_new``). Before
-a database that already has a schema is migrated, ``before_migration`` must write a backup (operators: ``pg_dump``);
-a fresh database needs none.
+``nodestro_schema_migrations`` with the SHA-256 checksum of each file. A database written by a newer release is
+refused (``storage.schema_too_new``), and so is a shipped migration whose file differs from the one that was applied
+(``storage.migration_changed``: never edit an applied migration, add a new one); rows written before checksums were
+recorded are adopted with the checksum of the unchanged file the first time this release migrates. Before a database
+that already has a schema is migrated, ``before_migration`` must write a backup (operators: ``pg_dump``); a fresh
+database needs none.
+
+Database roles (server profile): migrations run as the **owner** role of the tables; ``api`` and ``worker`` run as a
+**runtime** role with data privileges only (:func:`grant_runtime_role`, :meth:`PostgresDatabase.role_info`), so the
+row-level security of Axentra's tables in the same schema applies to them and they cannot change the schema.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+import hashlib
 from importlib import resources
 import json
 import os
@@ -134,6 +142,18 @@ def postgres_migrations() -> dict[int, tuple[str, str]]:
 
 #: The schema version this release reads and writes on PostgreSQL (the newest shipped migration).
 POSTGRES_SCHEMA_VERSION = max(postgres_migrations())
+
+
+def migration_checksum(step: PostgresStep) -> str | None:
+    """The SHA-256 of a migration's SQL text (as recorded in ``nodestro_schema_migrations.checksum``); ``None`` for a
+    step given as a function (tests), which cannot be compared."""
+    return hashlib.sha256(step.encode("utf-8")).hexdigest() if isinstance(step, str) else None
+
+
+#: Data privileges of the runtime role (never DDL), see :func:`grant_runtime_role`.
+RUNTIME_TABLE_PRIVILEGES = "SELECT, INSERT, UPDATE, DELETE"
+#: Bookkeeping tables of the migration runners (Nodestro's and Axentra's): read-only for the runtime role.
+SCHEMA_VERSION_TABLES = ("nodestro_schema_migrations", "axentra_schema_migrations")
 
 
 class PostgresDatabase:
@@ -451,14 +471,22 @@ class PostgresDatabase:
                 db.execute("SET LOCAL statement_timeout = 0")
                 # The lock first: CREATE ... IF NOT EXISTS is not safe against a concurrent creator.
                 db.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK,))
-                if self.schema is not None:
+                if (
+                    self.schema is not None
+                    and not self._query("SELECT to_regnamespace(%s) IS NOT NULL", (self.schema,))[0][0]
+                ):
+                    # Only when missing: CREATE SCHEMA IF NOT EXISTS needs the CREATE privilege on the database even
+                    # when the schema exists, which an owner role that was given only its schema does not have.
                     db.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
                 db.execute(
                     "CREATE TABLE IF NOT EXISTS nodestro_schema_migrations ("
                     " version integer PRIMARY KEY, name text NOT NULL,"
-                    " applied_at timestamptz NOT NULL DEFAULT now())"
+                    " applied_at timestamptz NOT NULL DEFAULT now(), checksum text)"
                 )
+                if not self._has_checksums():  # a table of a release before checksums
+                    db.execute("ALTER TABLE nodestro_schema_migrations ADD COLUMN IF NOT EXISTS checksum text")
                 current = self.schema_version
+                self._verify_applied(steps, adopt=True)
                 if current == target:
                     return current
                 if current > target:
@@ -504,7 +532,8 @@ class PostgresDatabase:
                             else:
                                 change(db)
                             db.execute(
-                                "INSERT INTO nodestro_schema_migrations (version, name) VALUES (%s, %s)", (step, name)
+                                "INSERT INTO nodestro_schema_migrations (version, name, checksum) VALUES (%s, %s, %s)",
+                                (step, name, migration_checksum(change)),
                             )
                         if current > 0:
                             # Fresh statistics for the changed indexes: without them the planner may pick a wrong
@@ -520,8 +549,51 @@ class PostgresDatabase:
                     ) from exc
                 return current
 
+    def _has_checksums(self) -> bool:
+        rows = self._query(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('nodestro_schema_migrations')"
+            " AND attname = 'checksum' AND NOT attisdropped)"
+        )
+        return bool(rows and rows[0][0])
+
+    def _verify_applied(self, steps: Mapping[int, tuple[str, PostgresStep]], *, adopt: bool) -> None:
+        """Refuse applied migrations whose shipped file differs (``storage.migration_changed``); with ``adopt``
+        (under the migration lock), record the checksum of rows written before checksums were kept, after checking
+        that the file name is the one that was applied."""
+        if not self._has_checksums():
+            return
+        changed: builtins.list[str] = []
+        adopted: builtins.list[tuple[str, int]] = []
+        for version, name, checksum in self._query(
+            "SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version"
+        ):
+            if version not in steps:
+                continue  # newer than this release: refused as storage.schema_too_new
+            shipped_name, step = steps[version]
+            shipped = migration_checksum(step)
+            if shipped is None:
+                continue
+            if name != shipped_name or (checksum is not None and checksum != shipped):
+                changed.append(f"{version:04d} ({name})")
+            elif checksum is None:
+                adopted.append((shipped, version))
+        if changed:
+            raise NodestroError(
+                "storage.migration_changed",
+                "Applied migrations differ from the files of this release: " + ", ".join(changed) + ". An applied "
+                "migration is never edited; restore a backup made with the release that applied them",
+                changed=changed,
+            )
+        if adopt and adopted:
+            for checksum, version in adopted:
+                self._write(
+                    "UPDATE nodestro_schema_migrations SET checksum = %s WHERE version = %s AND checksum IS NULL",
+                    (checksum, version),
+                )
+
     def require_current_schema(self) -> None:
-        """Refuse to serve a database that is not at :data:`POSTGRES_SCHEMA_VERSION` (``storage.schema_mismatch``)."""
+        """Refuse to serve a database that is not at :data:`POSTGRES_SCHEMA_VERSION` (``storage.schema_mismatch``) or
+        whose applied migrations differ from this release's files (``storage.migration_changed``)."""
         found = self.schema_version
         if found != POSTGRES_SCHEMA_VERSION:
             raise NodestroError(
@@ -531,6 +603,158 @@ class PostgresDatabase:
                 found=found,
                 supported=POSTGRES_SCHEMA_VERSION,
             )
+        self._verify_applied(postgres_migrations(), adopt=False)
+
+    # ---- database roles ----------------------------------------------------------------------------
+
+    def role_info(self) -> dict[str, Any]:
+        """How row-level security applies to this connection's role: ``superuser`` and ``bypass_rls`` (ignore every
+        policy), ``table_owner`` (owns, or may act as the owner of, a table of its schema: it could switch row-level
+        security off, alter or drop the table) and ``role`` (its name)."""
+        rows = self._query(
+            "SELECT current_user::text, r.rolsuper, r.rolbypassrls,"
+            " EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+            "   WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
+            "   AND pg_has_role(current_user, c.relowner, 'MEMBER'))"
+            " FROM pg_roles r WHERE r.rolname = current_user"
+        )
+        role, superuser, bypass, owner = rows[0] if rows else ("", False, False, False)
+        return {"role": role, "superuser": bool(superuser), "bypass_rls": bool(bypass), "table_owner": bool(owner)}
+
+    def shared_pool(self) -> SharedPool:
+        """This database's pool for another library of the same process (Axentra: ``Database.on_pool``), so the
+        process keeps one connection budget; see :class:`SharedPool`."""
+        return SharedPool(self)
+
+
+class SharedPool:
+    """The pool of a :class:`PostgresDatabase`, lent to Axentra (``axentra.data.Database.on_pool``).
+
+    Connections are the database's own (``autocommit``, tuple rows, its ``search_path`` and time limits); Axentra
+    runs each of its transactions as an explicit block on one of them and sets only transaction-local settings, so a
+    connection comes back with nothing of Axentra's. Lending never opens, resizes or closes the pool: the
+    :class:`PostgresDatabase` does. Nodestro's own transactions are not affected (the process lock serializes only
+    them, as before)."""
+
+    def __init__(self, database: PostgresDatabase) -> None:
+        self._database = database
+
+    @property
+    def conninfo(self) -> str:
+        return self._database._conninfo
+
+    @contextmanager
+    def connection(self, timeout: float | None = None) -> Iterator[Any]:
+        if self._database.closed:
+            raise RuntimeError("The database is closed")
+        with self._database._connection(timeout=timeout) as connection:
+            yield connection
+
+    def get_stats(self) -> dict[str, int]:
+        return dict(self._database._pool.get_stats())
+
+    @property
+    def max_size(self) -> int:
+        return int(self._database._pool.max_size)
+
+
+def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
+    """Give the runtime role ``role`` data access (no DDL) to every table of the schema, now and for the tables the
+    owner creates later (default privileges): ``USAGE`` on the schema, ``SELECT, INSERT, UPDATE, DELETE`` on tables,
+    ``USAGE, SELECT`` on sequences, ``EXECUTE`` on functions, and ``CONNECT`` on the database when the owner may grant
+    it. Covers Nodestro's and Axentra's tables alike. Idempotent.
+
+    ``owner`` is connected as the owner role (``NODESTRO_DATABASE_MIGRATION_URL``). Refused (``storage.role_unsafe``,
+    nothing granted) when ``role`` is the owner itself, a superuser, has ``BYPASSRLS`` or owns tables of the schema:
+    row-level security would not apply to it. Returns what applies to the role afterwards."""
+    report = inspect_role(owner, role)
+    problems = [
+        reason
+        for reason, flag in (
+            ("is the owner role itself", role == report["owner"]),
+            ("is a superuser", report["superuser"]),
+            ("has BYPASSRLS", report["bypass_rls"]),
+            (f"owns tables ({', '.join(report['owned_tables'][:5])})", bool(report["owned_tables"])),
+        )
+        if flag
+    ]
+    if problems:
+        raise NodestroError(
+            "storage.role_unsafe",
+            f"The runtime role {role!r} {' and '.join(problems)}; row-level security would not apply to it",
+            role=role,
+        )
+    target = sql.Identifier(role)
+    schema = sql.Identifier(report["schema"])
+    with owner._transaction() as connection:
+        for statement in (
+            "GRANT USAGE ON SCHEMA {schema} TO {role}",
+            "GRANT " + RUNTIME_TABLE_PRIVILEGES + " ON ALL TABLES IN SCHEMA {schema} TO {role}",
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}",
+            "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT " + RUNTIME_TABLE_PRIVILEGES + " ON TABLES TO {role}",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT USAGE, SELECT ON SEQUENCES TO {role}",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
+        ):
+            connection.execute(sql.SQL(statement).format(schema=schema, role=target))
+        # The schema versions are the migration runners' (owner role): the runtime role reads them for the schema
+        # gate and cannot fake them.
+        for table in SCHEMA_VERSION_TABLES:
+            if connection.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
+                connection.execute(
+                    sql.SQL("REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON {} FROM {}").format(
+                        sql.Identifier(table), target
+                    )
+                )
+    if not report["connect"]:
+        try:
+            with owner._transaction() as connection:
+                connection.execute(
+                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(report["database"]), target)
+                )
+        except psycopg.errors.InsufficientPrivilege:
+            pass  # reported as connect: false; the database's owner grants it
+    return inspect_role(owner, role)
+
+
+def inspect_role(database: PostgresDatabase, role: str) -> dict[str, Any]:
+    """How row-level security applies to ``role`` in ``database``'s schema (read-only): whether it is a superuser,
+    has ``BYPASSRLS``, which tables it owns, whether it may connect and create objects; plus the connecting role
+    (``owner``), the schema and the database. ``storage.role_missing`` when the role does not exist."""
+    rows = database._query(
+        "SELECT current_user::text, current_schema()::text, current_database()::text, r.rolsuper, r.rolbypassrls"
+        " FROM pg_roles r WHERE r.rolname = %s",
+        (role,),
+    )
+    if not rows:
+        raise NodestroError("storage.role_missing", f"The database role {role!r} does not exist", role=role)
+    owner, schema, dbname, superuser, bypass = rows[0]
+    tables = database._query(
+        "SELECT c.relname, pg_has_role(%s, c.relowner, 'MEMBER') FROM pg_class c"
+        " JOIN pg_namespace n ON n.oid = c.relnamespace"
+        " WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') ORDER BY c.relname",
+        (role,),
+    )
+    privileges = database._query(
+        "SELECT has_database_privilege(%s, current_database(), 'CONNECT'),"
+        " has_schema_privilege(%s, current_schema(), 'CREATE')",
+        (role, role),
+    )
+    connect, create = privileges[0] if privileges else (False, False)
+    owned = [str(name) for name, own in tables if own]
+    return {
+        "role": role,
+        "owner": owner,
+        "schema": schema,
+        "database": dbname,
+        "tables": len(tables),
+        "superuser": bool(superuser),
+        "bypass_rls": bool(bypass),
+        "owned_tables": owned,
+        "connect": bool(connect),
+        "can_create": bool(create),
+        "restricted": not (superuser or bypass or owned),
+    }
 
 
 class PostgresStore:
@@ -730,5 +954,9 @@ __all__ = [
     "PostgresDatabase",
     "PostgresStep",
     "PostgresStore",
+    "SharedPool",
+    "grant_runtime_role",
+    "inspect_role",
+    "migration_checksum",
     "postgres_migrations",
 ]
