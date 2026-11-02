@@ -607,8 +607,14 @@ def _require_docker() -> None:
         if os.environ.get("NODESTRO_REQUIRE_DOCKER") == "1":
             pytest.fail("NODESTRO_REQUIRE_DOCKER=1 but NODESTRO_DOCKER_TESTS is not set")
         pytest.skip("set NODESTRO_DOCKER_TESTS=1 (needs Docker and network for the image build)")
-    if not DockerSandbox.available():
-        pytest.fail("NODESTRO_DOCKER_TESTS=1 but Docker is not available")
+    from orkexa.dynamic.docker import DockerProbeError, inspect_host, preflight
+
+    try:
+        ready = preflight(inspect_host()).available
+    except DockerProbeError:
+        ready = False
+    if not ready:  # the runtime's images are built by the tests; Orkexa's own image is not needed
+        pytest.fail("NODESTRO_DOCKER_TESTS=1 but the Docker daemon does not pass Orkexa's preflight")
 
 
 REAL_TOOL = '''import six

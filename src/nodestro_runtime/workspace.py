@@ -41,11 +41,11 @@ import sys
 import threading
 from typing import Any, Literal
 
-from orkexa.dynamic import DockerSandbox, Sandbox
+from orkexa.dynamic import Sandbox
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
-from . import sandbox_selection
+from . import docker_status, sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -53,6 +53,7 @@ from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
 from .container_images import ContainerImages, RuntimeImageSandbox
 from .cost_tracking import PricedTracker, PriceMode
+from .docker_status import DockerMonitorLike, DockerStatus
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
@@ -100,6 +101,7 @@ from .schemas import (
     Run,
     RunIn,
     RunTrigger,
+    SandboxBackendStatus,
     Settings,
     SettingsIn,
     Workflow,
@@ -349,7 +351,6 @@ class Workspace:
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
         self._client_factory = client_factory
-        self._docker: bool | None = None
         self.runs = RunManager(
             self.store,
             self.builder,
@@ -406,6 +407,14 @@ class Workspace:
         )
         # Local MCP servers (WP-8) run in a container of their approved packages' image, never on the host.
         self.mcp.python = self.python
+        # Docker's preflight and self-test run in the background (never in a settings read), shared by every workspace
+        # of the process; the reaper removes Nodestro's left-over containers: all of them at the start where this
+        # process owns them (desktop, Nodestro Local Docker), and expired ones every minute.
+        self.docker_monitor: DockerMonitorLike = docker_status.monitor_for(
+            self._runtime_sandbox, environ=ContainerImages()._cli_environment()
+        )
+        self.docker_monitor.start_reaper(remove_all_first=storage is None)
+        self.docker_monitor.status()
         self.tools.dependencies = EnvironmentGate(self.python)
         self.tool_drafts.python = self.python
         self.runs.tool_sandbox = self.python.workflow_sandbox
@@ -523,7 +532,12 @@ class Workspace:
         daemon may run elsewhere or in a VM; no image anybody builds by hand; Orkexa's ``orkexa-sandbox`` image is not
         used)."""
         # The Python environments are created after the tool library; the image is resolved on the first call.
-        return lambda: RuntimeImageSandbox(
+        return self._runtime_sandbox
+
+    def _runtime_sandbox(self) -> RuntimeImageSandbox:
+        """The container sandbox for tool code without libraries: Nodestro's runtime image (built on first use, no
+        image to build by hand, no bind mounts). Its self-test also proves the daemon (:attr:`docker_monitor`)."""
+        return RuntimeImageSandbox(
             lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
         )
 
@@ -542,13 +556,11 @@ class Workspace:
         self.tools.container_fallback = self._auto_container if auto else None
 
     def _auto_container(self) -> Sandbox | None:
-        """In ``auto`` mode: a container for untrusted code without libraries, while Docker is running. Nodestro's
-        runtime image (built on first use, no image to build by hand, no bind mounts)."""
-        if not self._docker_available():
+        """In ``auto`` mode: a container for untrusted code without libraries, while Docker passed its preflight and
+        self-test (:meth:`docker_status`)."""
+        if not self._docker_state().approved:
             return None
-        return RuntimeImageSandbox(
-            lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
-        )
+        return self._runtime_sandbox()
 
     def _providers(self, values: dict[str, Any] | None = None, *, sealed: bool = False) -> dict[str, dict[str, Any]]:
         """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key.
@@ -582,6 +594,7 @@ class Workspace:
         budget = values.get("default_budget_usd", 2.0)
         stored = self._providers(values)
         default_model = values.get("default_model") or DEFAULT_AGENT_MODEL
+        docker = self._docker_state()  # one snapshot; never waits for the daemon
         return Settings(
             providers=[self._provider_status(name, stored.get(name, {})) for name in PROVIDERS],
             default_provider=provider_of(default_model),
@@ -589,12 +602,10 @@ class Workspace:
             assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
             default_budget_usd=budget,
             sandbox=self._sandbox_kind(),
-            docker_available=self._docker_available(),
+            docker_available=docker.approved,
             builtin_sandbox=self._builtin_sandbox(),
-            sandbox_selection=sandbox_selection.select(
-                self.sandbox_policy, self._sandbox_kind(), self._docker_available()
-            ),
-            sandbox_backends=sandbox_selection.backends(self.sandbox_policy, self._docker_available()),
+            sandbox_selection=sandbox_selection.select(self.sandbox_policy, self._sandbox_kind(), docker),
+            sandbox_backends=sandbox_selection.backends(self.sandbox_policy, docker),
             language=values.get("language") if values.get("language") in LANGUAGES else None,
             architect_budget_usd=values.get("architect_budget_usd", 2.0),
             architect_max_repairs=int(values.get("architect_max_repairs") or 0)
@@ -628,10 +639,19 @@ class Workspace:
             available=status.available, reason=status.reason, detail=status.detail, system=status.system
         )
 
+    def _docker_state(self, *, refresh: bool = False, wait: float = 0.0) -> DockerStatus:
+        return self.docker_monitor.status(refresh=refresh, wait=wait)
+
+    def docker_status(self, refresh: bool = False, *, wait: float = 0.0) -> SandboxBackendStatus:
+        """The Docker sandbox on this computer (:mod:`nodestro_runtime.docker_status`), from the background check: it
+        never waits for the daemon unless ``wait`` (seconds) is given. ``checking`` until the first check finished;
+        ``approved`` only after the preflight and the in-container self-test passed. ``refresh`` checks again now
+        (in the background), the self-test included."""
+        return self._docker_state(refresh=refresh, wait=wait).backend()
+
     def _docker_available(self) -> bool:
-        if self._docker is None:
-            self._docker = DockerSandbox.available()
-        return self._docker
+        """Whether Docker passed its preflight and self-test (the earlier flag; never blocks)."""
+        return self._docker_state().approved
 
     def update_settings(self, update: SettingsIn) -> Settings:
         values = self.store.get_raw("settings", "app") or {}

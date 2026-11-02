@@ -60,6 +60,8 @@ from orkexa.dynamic.docker import (
 )
 from orkexa.providers.base import redact
 
+from . import docker_status
+from .docker_status import OWNER
 from .image_limits import (
     GC_MAX_GB,
     GC_MAX_IMAGES,
@@ -589,8 +591,6 @@ class ContainerImages:
         )
 
 
-#: The owner label (``org.orkexa.sandbox``) of Nodestro's tool containers; the reaper removes only these.
-OWNER = "nodestro"
 #: The owner label of local MCP servers' containers: they live as long as their connection, so the tool containers'
 #: reaper never touches them.
 MCP_OWNER = "nodestro-mcp"
@@ -641,6 +641,13 @@ class StreamedSandbox(DockerSandbox):
     def __init__(self, *, environ: Mapping[str, str] | None = None, owner: str = OWNER, **options: Any) -> None:
         options.pop("transport", None)  # always stdin: a mount needs the daemon to see this computer's files
         super().__init__(transport="stdin", owner=owner, environ=environ, **options)
+
+    def self_test(self, *, image: str | None = None) -> SandboxProbe:
+        """Orkexa's self-test; a pass also proves the daemon for the sandbox policy
+        (:func:`nodestro_runtime.docker_status.daemon_proven`)."""
+        probe = super().self_test(image=image)
+        docker_status.record_proof(self.docker, self.environ, probe)
+        return probe
 
 
 class RuntimeImageSandbox(StreamedSandbox):

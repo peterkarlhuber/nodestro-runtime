@@ -10,16 +10,26 @@ from __future__ import annotations
 
 import pytest
 
+from nodestro_runtime import docker_status
 from nodestro_runtime.builtin_sandbox import LinuxSandbox, SandboxStatus
+from nodestro_runtime.testing import StaticDockerMonitor
 
 _UNAVAILABLE = SandboxStatus(False, "untested-system", "not available in this test", "", 0)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "real_sandbox_status: use the computer's real built-in sandbox status")
+    config.addinivalue_line("markers", "real_docker_status: use the computer's real Docker status (background check)")
 
 
 @pytest.fixture(autouse=True)
 def _builtin_sandbox_status(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     if request.node.get_closest_marker("real_sandbox_status") is None:
         monkeypatch.setattr(LinuxSandbox, "status", staticmethod(lambda refresh=False: _UNAVAILABLE))
+
+
+@pytest.fixture(autouse=True)
+def _docker_sandbox_status(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    docker_status.reset_monitors()
+    if request.node.get_closest_marker("real_docker_status") is None:
+        monkeypatch.setattr(docker_status, "monitor_for", lambda *args, **kwargs: StaticDockerMonitor())

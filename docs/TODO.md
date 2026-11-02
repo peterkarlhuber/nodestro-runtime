@@ -79,6 +79,36 @@ None known.
 - **Next step:** Add a real-Docker test of the resolve
   container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
 
+### RT-033 · Docker-first sandbox status: follow-ups
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.py`,
+  [docs/docker-sandbox.md](docker-sandbox.md)
+- **What:** The Docker backend is `approved` only after Orkexa's preflight (TTL 5 s) and the in-container self-test in
+  Nodestro's runtime image (once per daemon fingerprint) passed, checked in a background thread: the settings never
+  wait for `docker info`; until the first check finished the state is `checking`. A container sandbox counts as
+  isolating (`isolation_of`) only for a proven daemon; untrusted code is refused otherwise, and every call still
+  checks itself (Orkexa). New schema fields `engine`, `rootless`, `cgroup_version`, `checks`, `tested_at` and the
+  reasons `docker-*`. Open: the first self-test needs the runtime image, which is built on demand (network, uv), so the
+  first start with Docker stays `checking` until that build finished (or reports `docker-image`); a call made while
+  `checking` is refused instead of waiting; the API endpoints (`/api/sandbox/status`, `/api/sandbox/self-test`, plan
+  A1), the SDK models and the Studio texts for the new reasons and fields are not there yet; the status was tested with
+  stand-ins only (no daemon in the development container).
+- **Next step:** A1/S1/ST1 in nodestro-api, nodestro-sdk and nodestro-studio; a real-daemon test of the background
+  check in the CI `docker` job; decide whether a tool call should wait (bounded) for a running first check.
+
+### RT-034 · Container reaper: follow-ups
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.DockerMonitor.start_reaper`
+- **What:** Tool containers carry `org.orkexa.sandbox=nodestro` and a deadline label. A desktop and Nodestro Local
+  Docker remove all of them at the start (`reap(owner, remove_all=True)`, only that owner), every process then
+  removes the expired ones every 60 s. Local MCP servers use the owner `nodestro-mcp` and are never reaped (they live
+  as long as their connection). Open: a server's API and worker processes share a daemon, so they reap only expired
+  containers and never all at start; through the sandbox gateway containers cannot be listed, so there the gateway's
+  own reconcile does the work; two installations on one daemon share the owner `nodestro` (a desktop start would
+  remove a second installation's running containers).
+- **Next step:** An installation id in the owner label (e.g. `nodestro-<id>`), and a real-daemon test of the reaper in
+  the CI `docker` job.
+
 ## Bugs and reliability
 
 ### RT-031 · Environment image caps and collection: follow-ups
@@ -242,15 +272,15 @@ None known.
 
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** `sandbox_policy.py`
-- **What:** The built-in sandbox is Linux-only. On macOS and Windows untrusted (AI-generated) tools need Docker.
-  Since 2026-11-02 the runtime imports and starts on macOS (arm64, x86-64) and Windows (x64, ARM64), tested by the
-  `Platforms` workflow; before that, the import of `sandbox_confine.py` failed on both.
-  Since Phase E the `auto` mode (default) uses Docker automatically when it is running and reports why code is
-  blocked otherwise; Orkexa's macOS sandbox is implemented and self-tested on macOS 26 arm64 but experimental and
-  not used (no independent review); Windows has no native sandbox (ADR-0009 in the studio repo).
-- **Next step:** Independent security review of the macOS sandbox before it may be released; a Windows backend
-  (AppContainer + Job Object, or MXC) as a separate decision.
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `sandbox_policy.py`, `sandbox_selection.py`, Orkexa ADR 0012
+- **What:** The built-in sandbox is Linux-only. On macOS and Windows untrusted (AI-generated) tools need Docker, which
+  is the default sandbox for such code (Docker-first). Since 2026-11-02 the runtime imports and starts on macOS
+  (arm64, x86-64) and Windows (x64, ARM64), tested by the `Platforms` workflow. The `auto` mode (default) uses Docker
+  once it passed its preflight and in-container self-test (RT-033) and reports why code is blocked otherwise.
+  Orkexa's macOS (Seatbelt) sandbox was removed (not releasable): Nodestro reports `macos-seatbelt` as `unavailable`
+  with the reason `removed` and never probes or uses it. Windows has no native sandbox (ADR-0009 in the studio repo).
+- **Next step:** A Windows backend (AppContainer + Job Object, or MXC) as a separate decision; no macOS-native backend
+  is planned.
 
 ### RT-020 · Real providers and PostgreSQL at scale
 

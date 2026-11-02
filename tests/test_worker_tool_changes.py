@@ -36,9 +36,12 @@ from nodestro_runtime.storage_postgres import PostgresDatabase
 
 
 def _docker_daemon() -> bool:
-    from orkexa.dynamic import DockerSandbox
+    from orkexa.dynamic.docker import DockerProbeError, inspect_host, preflight
 
-    return bool(DockerSandbox.available())
+    try:
+        return preflight(inspect_host()).available
+    except DockerProbeError:
+        return False
 
 
 _DOCKER_REQUIRED = os.environ.get("NODESTRO_REQUIRE_DOCKER") == "1" or os.environ.get("GITHUB_ACTIONS") == "true"
@@ -46,6 +49,16 @@ pytestmark = pytest.mark.skipif(
     not _DOCKER_REQUIRED and not _docker_daemon(),
     reason="needs a Docker daemon (a server runs tool code in containers)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _docker_proven(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about tool changes between processes: the daemon counts as proven for the policy (the background
+    check is tested in test_docker_status.py); every container call still runs Orkexa's preflight and self-test."""
+    from nodestro_runtime import sandbox_policy
+
+    monkeypatch.setattr(sandbox_policy, "self_test_passed", lambda sandbox: True)
+
 
 TOOL = "celsius_to_fahrenheit"
 SCHEDULE = "sch_pilot"

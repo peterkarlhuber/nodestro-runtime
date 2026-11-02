@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Docker-first sandbox status (Docker-first plan R2, 2026-11-02):
+
+- New `nodestro_runtime.docker_status`: `DockerMonitor` checks Docker in a background thread, Orkexa's preflight at
+  most every 5 s and the in-container self-test (in the runtime image) once per daemon fingerprint (a failed one again
+  after 5 min or on request). `Workspace.docker_status(refresh=False) -> SandboxBackendStatus` never waits for
+  `docker info` (a first settings read used to run it inline with a 10 s timeout); it reports `checking` until the
+  first check finished. One monitor per daemon and process (`monitor_for`), shared by a server's tenants.
+- Docker is `approved` only after preflight and self-test passed; `sandbox_policy.isolation_of` returns `container`
+  only for a sandbox whose daemon passed them (`docker_status.daemon_proven`, never blocking), otherwise untrusted
+  code is refused (`sandbox.isolation_required`, parameter `reason`). Docker mode, servers and Nodestro Local Docker
+  report `blocked` with the Docker reason until then (they used to report `docker` regardless).
+- `sandbox_selection.backends()` / `select()` take the Docker status; the earlier bool (`docker_available`) still
+  works (`True` counts as proven). `Settings.docker_available` is now "preflight and self-test passed".
+- `SandboxBackendStatus` (additive, all optional): `engine`, `rootless`, `cgroup_version`, `checks`
+  (`SandboxCheck`: `name`, `ok`, `detail`), `tested_at`; state `checking`; reasons `docker-missing`,
+  `docker-unreachable`, `docker-limits`, `docker-seccomp`, `docker-rootless-cgroup`, `docker-os-type`,
+  `docker-selftest`, `docker-image`, `docker-checking`. A rootful daemon on Linux carries a note that docker group
+  membership is root-equivalent (see `docs/docker-sandbox.md`).
+- Reaper: a desktop and Nodestro Local Docker remove all of their `nodestro`-labelled containers at the start, then
+  every process removes expired ones every 60 s (only that owner).
+- macOS: Orkexa's Seatbelt sandbox was removed; `macos-seatbelt` is reported as `unavailable` with the reason
+  `removed` (never probed); the `MacOSSandbox` import is gone.
+- Tests: workspaces get a static "Docker missing" monitor unless a module is marked `real_docker_status`
+  (`testing.StaticDockerMonitor`); `ContainerDouble` counts as self-tested. Tracked follow-ups: RT-033, RT-034.
+
 One container shape from Orkexa (Docker-first plan R1, 2026-11-02; needs Orkexa PR #31):
 
 - `sandbox_run_args` (same signature, new optional `owner` and `lifetime_s`) is now Orkexa's
