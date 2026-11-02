@@ -131,6 +131,7 @@ def _services(database: Any, **config: Any) -> Any:
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        database=database,
     )
     services.migrate()
     services.start()
@@ -232,6 +233,59 @@ def test_finished_runs_are_settled_once_per_run_and_meter(runs: tuple[Any, Axent
         (run_usage_key("run_api", "nodestro.ai.requests"),),
     )
     assert props == [({"source": "api_run", "status": "succeeded", "workflow_id": "wf_1"},)]
+
+
+def test_a_run_id_that_does_not_fit_a_key_is_settled_under_its_hash(runs: tuple[Any, AxentraEvents]) -> None:
+    """SR-07: a run id of more than 170 characters or with non-ASCII characters made an idempotency key Axentra
+    refuses; such a run was never settled and held the watermark for every tenant."""
+    database, events = runs
+    long_id, umlaut = "run_" + "x" * 300, "run_über"
+    _run(database, "alpha", long_id, "succeeded", _usage(2, 0.02))
+    _run(database, "alpha", umlaut, "succeeded", _usage(3, 0.03))
+    _run(database, "beta", "run_ok", "succeeded", _usage(1, 0.01))
+    assert run_usage_key("run_ok", "nodestro.ai.requests") == "nodestro:run:run_ok:nodestro.ai.requests"
+    hashed = run_usage_key(umlaut, "nodestro.ai.requests")
+    assert hashed.startswith("nodestro:run:h.") and hashed == run_usage_key(umlaut, "nodestro.ai.requests")
+    assert len(run_usage_key(long_id, "nodestro.ai.cost_usd")) <= 200
+    assert reconciliation_backlog(events.link.services)["runs"] == 3
+    report = events.settle_runs()
+    assert (report["missing"], report["written"], report["failed"], report["quarantined"]) == (3, 3, 0, 0)
+    assert _totals(database)["nodestro.ai.requests"] == 6
+    # Mapped back: nothing is missing, nothing is counted again, and the backlog query uses the same key rule.
+    assert events.settle_runs(since=now().replace(year=2000))["missing"] == 0
+    assert events.settle_runs(full=True)["missing"] == 0
+    assert reconciliation_backlog(events.link.services)["runs"] == 0
+    assert _totals(database)["nodestro.ai.requests"] == 6
+
+
+def test_a_run_that_cannot_be_settled_is_quarantined_and_the_watermark_moves(
+    runs: tuple[Any, AxentraEvents], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, events = runs
+    _run(database, "alpha", "run_bad", "succeeded", _usage(2, 0.02))
+    _run(database, "beta", "run_good", "succeeded", _usage(1, 0.01))
+    real = events.settle_run
+
+    def failing(tenant_id: str, run: Any) -> str:
+        return "failed" if run.id == "run_bad" else real(tenant_id, run)
+
+    monkeypatch.setattr(events, "settle_run", failing)
+    first = events.settle_runs()
+    assert (first["written"], first["failed"], first["quarantined"]) == (1, 1, 1)
+    watermark = events._settled_until
+    assert watermark is not None  # one bad run no longer holds every tenant back
+    # Later passes start at the watermark and still retry the quarantined run (here outside every later window).
+    from datetime import timedelta
+
+    events._settled_until = now() + timedelta(hours=1)
+    second = events.settle_runs()
+    assert (second["runs"], second["failed"], second["quarantined"]) == (1, 1, 1)
+    assert events.quarantine[("alpha", "run_bad")][1] == 2
+    monkeypatch.setattr(events, "settle_run", real)
+    third = events.settle_runs()
+    assert (third["written"], third["quarantined"]) == (1, 0) and events.quarantine == {}
+    assert _totals(database)["nodestro.ai.requests"] == 3  # each run once
+    assert events.settle_runs(full=True)["missing"] == 0
 
 
 def test_a_crash_after_the_write_and_a_replay_count_nothing_twice(runs: tuple[Any, AxentraEvents]) -> None:
@@ -373,6 +427,43 @@ def test_stored_secret_formats_and_the_rollback_checks(database: Any) -> None:
     with pytest.raises(NodestroError) as caught:
         axentra_platform.require_readable_secrets(database, off)
     assert caught.value.code == "profile.invalid"
+
+
+def test_the_start_refuses_a_key_with_other_bytes_under_a_known_key_id(database: Any) -> None:
+    """SR-04: the start compared key ids only; new bytes under the old id "k1" started without an error and made every
+    axs1 value unreadable. Now a few stored values per key are decrypted, so the key bytes are compared."""
+    legacy = SecretBox(b"L" * 32)
+    ring, _keys = _ring("k1")
+    _seed_secrets(database, _keyring_box(ring, legacy))
+    database.store("beta").put_raw(
+        "pricing_billing", "openai", {"admin_key": legacy.encrypt("beta", "pricing.billing.openai.admin_key", "a")}
+    )
+    config = AxentraConfig(enabled=True, keyring=ring)
+    axentra_platform.require_readable_secrets(database, config, _keyring_box(ring, legacy))  # the right keys
+    assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy)) == []
+
+    impostor, _ = _ring("k1")  # same key id, other bytes
+    assert impostor.split(":", 1)[0] == "k1" and impostor != ring
+    impostor_config = AxentraConfig(enabled=True, keyring=impostor)
+    assert secrets_rollback_problems(impostor_config, stored_secret_formats(database)) == []  # ids alone: passes
+    with pytest.raises(NodestroError) as caught:
+        axentra_platform.require_readable_secrets(database, impostor_config, _keyring_box(impostor, legacy))
+    (problem,) = caught.value.params["problems"]
+    assert (problem["field"], problem["value"]) == ("NODESTRO_AXENTRA_KEYRING", "k1")
+    assert "alpha/" in problem["reason"] and impostor.split(":", 1)[1] not in str(caught.value.params)
+    assert "sk-1" not in str(caught.value.params)
+
+    # Another v1 key (NODESTRO_SECRET_KEY changed) is refused the same way, with Axentra on or off.
+    other_legacy = SecretBox(b"M" * 32)
+    (v1,) = axentra_platform.secret_key_problems(database, _keyring_box(ring, other_legacy))
+    assert (v1["field"], v1["value"]) == ("NODESTRO_SECRET_KEY", "v1") and "beta/pricing_billing/openai" in v1["reason"]
+    (v1_off,) = axentra_platform.secret_key_problems(database, other_legacy)
+    assert v1_off["field"] == "NODESTRO_SECRET_KEY"
+
+    # One damaged value does not stop the start while another value proves the key.
+    store = database.store("alpha")
+    store.put_raw("mcp_servers", "srv0", {"id": "srv0", "token_sealed": "axs1.k1.AAAA.BBBB"})
+    assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy)) == []
 
 
 def test_reencrypting_with_v1_moves_axs1_values_back_so_axentra_can_be_switched_off(database: Any) -> None:
@@ -573,7 +664,7 @@ def test_metrics_show_pools_jobs_schema_and_backlog_without_tenant_data(runs: tu
     text = metrics.render()
     for line in (
         'nodestro_db_pool_size{pool="nodestro"}',
-        'nodestro_db_pool_in_use{pool="axentra"}',
+        'nodestro_db_pool_in_use{pool="nodestro"}',
         'nodestro_jobs{kind="run",status="queued"} 1',
         'nodestro_schema_version{runner="nodestro",version="current"}',
         "nodestro_axentra_migrations_pending 0",
@@ -585,6 +676,7 @@ def test_metrics_show_pools_jobs_schema_and_backlog_without_tenant_data(runs: tu
         assert line in text, line
     for private in ("alpha", "beta", "run_ok", "wf_1", "Check"):
         assert private not in text
+    assert 'pool="axentra"' not in text  # Axentra borrows Nodestro's pool: one series, not a duplicate
     shared = axentra_metrics.ServerMetrics(
         database, events.link.services, pools=lambda: {"shared": database._pool}
     ).render()
@@ -599,3 +691,27 @@ def test_identity_resolutions_are_counted(database: Any) -> None:
     before = axentra_metrics.operation_counts().get(("identity_resolve", "none", ""), 0)
     assert store.session("not-a-token") is None
     assert axentra_metrics.operation_counts()[("identity_resolve", "none", "")] == before + 1
+
+
+def test_a_tenant_with_a_long_name_gets_its_axentra_tenant_from_events_and_notifications(database: Any) -> None:
+    """Axentra stores at most 200 characters of a name; every path that creates the Axentra tenant cuts it."""
+    from identity_support import create_tenants
+
+    from nodestro_runtime.axentra_notify import AxentraNotifications
+
+    long_name = "N" * 300
+    create_tenants(database, [("events", long_name), ("notes", long_name)])
+    services = _services(database, notify=True, usage=True)
+    try:
+        link = axentra_platform.AxentraLink(services, database)
+        events = axentra_platform.AxentraEvents(link, audit=True, usage=True)
+        created = {"events": events._tenant("events"), "notes": AxentraNotifications(link)._tenant("notes")}
+        for tenant, axentra_tenant in created.items():
+            assert axentra_tenant is not None and link.tenant(tenant) == axentra_tenant
+        rows = _owner(database)._query(
+            "SELECT name FROM axentra_tenants WHERE id IN (%s, %s)", (created["events"], created["notes"])
+        )
+        assert [row[0] for row in rows] == [axentra_platform.axentra_tenant_name("x", long_name)] * 2
+        assert len(rows[0][0]) == axentra_platform.NAME_LIMIT
+    finally:
+        services.close()

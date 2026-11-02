@@ -515,6 +515,7 @@ def test_everything_works_under_row_level_security(database: PostgresDatabase) -
         database_url=dsn,
         public_origin="http://localhost:8000",
         schema=schema,
+        database=plain_db,
     )
     try:
         services.start()  # refuses superuser/BYPASSRLS roles: this one is subject to RLS

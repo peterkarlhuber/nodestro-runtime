@@ -30,9 +30,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
+import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -41,6 +43,11 @@ import uuid
 
 from orkexa import LocalFileStore, StoredFile
 from pydantic import BaseModel, Field
+
+try:  # POSIX; on Windows (desktop only, one process) the in-process lock is enough
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 from . import documents
 from .file_formats import (
@@ -161,8 +168,36 @@ class CleanupResult(BaseModel):
     kept_in_use: int = 0
 
 
+CATALOG_LOCK = "catalog.lock"
+
+
 class _Blobs(LocalFileStore):
-    """The bytes of input files; any format (the library's ``add`` accepts only what Claude reads)."""
+    """The bytes of input files; any format (the library's ``add`` accepts only what Claude reads).
+
+    The catalog (``catalog.json``) is read, changed and rewritten on every save and removal. Several processes
+    share one volume on a server (the API, workers and commands such as ``files remove-source``), so each such
+    step holds an exclusive ``flock`` on ``catalog.lock`` next to it: no process loses another one's update
+    (security review SR-08)."""
+
+    @contextlib.contextmanager
+    def _catalog_locked(self) -> Iterator[None]:
+        if fcntl is None:  # pragma: no cover - Windows
+            yield
+            return
+        descriptor = os.open(self.root / CATALOG_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)  # closing releases the lock
+
+    def _save(self, entry: StoredFile, data: bytes | None) -> None:
+        with self._catalog_locked():
+            super()._save(entry, data)
+
+    def _remove(self, file_id: str) -> None:
+        with self._catalog_locked():
+            super()._remove(file_id)
 
     def put(self, data: bytes, *, name: str, media_type: str) -> str:
         digest = hashlib.sha256(data).hexdigest()

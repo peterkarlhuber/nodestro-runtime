@@ -23,13 +23,18 @@ The mapping blob -> Axentra file is a document per blob in the tenant's collecti
 change, tenant-isolated like every Nodestro document). A blob without a mapping is read from the volume: during the
 transition (and for files imported from a desktop) the volume is the fallback.
 
-Migration (``nodestro-server files migrate|verify|remove-source|export-volume``):
+Migration (``nodestro-server files migrate|verify|cleanup|remove-source|export-volume``):
 
 - :meth:`AxentraFiles.migrate` copies volume blobs into Axentra: per tenant, resumable and idempotent (a blob with a
   mapping is skipped), ``dry_run`` only counts. Each copy is read back and its SHA-256 compared before the mapping is
   recorded; the volume file is **never** deleted.
 - :meth:`AxentraFiles.verify` reads every mapped object back, compares the SHA-256, records ``verified_at`` and
-  reports missing or damaged objects, volume blobs not migrated yet and Axentra objects without a mapping.
+  reports missing or damaged objects, volume blobs not migrated yet and leftovers older than
+  :data:`LEFTOVER_GRACE`: Axentra objects without a mapping (a copy or an upload that was cut off) and mappings no
+  input file uses (a file deleted while the backend was ``volume``). A leftover makes the report not ``ok``.
+- :meth:`AxentraFiles.cleanup` removes those leftovers (each checked again under its blob's lock; a mapping that
+  an upload reused within the grace period stays). Run it after switching back from ``volume`` to ``axentra``, so
+  deletes made in between reach Axentra too (security review SR-09).
 - :meth:`AxentraFiles.remove_sources` deletes a migrated volume file only when ``NODESTRO_FILES_SOURCE_REMOVAL=1``
   (off by default), the object was verified by ``verify``, the fallback period
   (``NODESTRO_FILES_SOURCE_RETENTION_DAYS``, default 30) since its migration has passed, and a fresh read still
@@ -54,7 +59,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from .file_formats import FileFormatError
-from .input_files import _Blobs
+from .input_files import COLLECTION as INPUT_FILES
+from .input_files import InputFile, _Blobs
 from .problems import NodestroError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -69,6 +75,9 @@ COLLECTION = "file_objects"
 BLOB_KEY = "nodestro_blob"
 _BLOB = re.compile(r"^[0-9a-f]{16}$")
 _MIB = 1024 * 1024
+#: How old a leftover (an Axentra object without a mapping, a mapping no input file uses) must be before ``files
+#: verify`` reports it and ``files cleanup`` removes it: younger ones may belong to an upload or a copy in flight.
+LEFTOVER_GRACE = timedelta(hours=1)
 
 
 class FileObject(BaseModel):
@@ -88,6 +97,8 @@ class FileObject(BaseModel):
     verified_at: datetime | None = None
     #: When ``files remove-source`` deleted the volume copy.
     source_removed_at: datetime | None = None
+    #: The last upload of the same content that reused this mapping (``files cleanup`` keeps a mapping used lately).
+    used_at: datetime | None = None
 
 
 def _sha256(data: bytes) -> str:
@@ -114,7 +125,14 @@ class FilesReport:
     removed: int = 0
     kept: int = 0
     failed: list[dict[str, str]] = field(default_factory=list)
+    #: Axentra objects without a mapping (a copy or an upload that was cut off).
     orphans: list[dict[str, str]] = field(default_factory=list)
+    #: Mappings no input file uses any more (a delete made while the backend was ``volume``, security review SR-09).
+    unreferenced: list[dict[str, str]] = field(default_factory=list)
+    #: Leftovers younger than :data:`LEFTOVER_GRACE` (not listed, not removed).
+    recent: int = 0
+    #: A listed leftover makes the report not ``ok`` (``verify``; a ``cleanup --dry-run`` only lists them).
+    leftovers_fail: bool = False
 
     def fail(self, tenant: str, blob: str, reason: str) -> None:
         self.failed.append({"tenant": tenant, "blob": blob, "reason": reason})
@@ -133,7 +151,9 @@ class FilesReport:
             "kept": self.kept,
             "failed": list(self.failed),
             "orphans": list(self.orphans),
-            "ok": not self.failed,
+            "unreferenced": list(self.unreferenced),
+            "recent": self.recent,
+            "ok": not self.failed and not (self.leftovers_fail and (self.orphans or self.unreferenced)),
         }
 
 
@@ -174,7 +194,8 @@ class AxentraFiles:
 
     def check(self) -> None:
         """Refuse a configuration that would lose files: a relative local directory depends on the working
-        directory of each process (``profile.invalid``)."""
+        directory of each process (``profile.invalid``). The local directory is created when it is missing (owner
+        only), so a fresh installation can be backed up before its first upload."""
         cfg = self.storage.cfg
         if cfg.backend == "local" and not Path(cfg.local_path).is_absolute():
             raise NodestroError(
@@ -182,6 +203,8 @@ class AxentraFiles:
                 "Axentra's storage.local_path must be an absolute directory shared by the API and the workers "
                 f"(set it in NODESTRO_AXENTRA_CONFIG; found {cfg.local_path!r})",
             )
+        if cfg.backend == "local":
+            Path(cfg.local_path).mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def ensure_policy(self) -> str:
         """Product ``nodestro`` keeps blocked types (executables, HTML, SVG, scripts) as inert attachments unless
@@ -218,7 +241,9 @@ class AxentraFiles:
         rows = self.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
         if not rows:
             raise NodestroError("identity.tenant_unknown", f"No tenant {tenant_id}", tenant=tenant_id)
-        return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
+        from .axentra_platform import axentra_tenant_name
+
+        return self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, str(rows[0][0])))
 
     def lookup(self, tenant_id: str, blob: str) -> FileObject | None:
         if not _BLOB.match(blob):
@@ -317,6 +342,21 @@ class AxentraFiles:
         except Exception:
             logger.exception("Deleting Axentra file %s failed; files verify reports it as an orphan", file_id)
 
+    def reuse(self, tenant_id: str, blob: str) -> FileObject | None:
+        """The mapping of ``blob`` for another upload of the same content, marked as used now (``files cleanup``
+        never removes a mapping an upload may be about to reference)."""
+        if not _BLOB.match(blob):
+            return None
+        store = self.database.store(tenant_id)
+        with store.transaction():
+            store.lock(COLLECTION, blob)
+            current = store.get(COLLECTION, blob, FileObject)
+            if current is None:
+                return None
+            current = current.model_copy(update={"used_at": _now()})
+            store.put(COLLECTION, blob, current)
+        return current
+
     def record(self, tenant_id: str, item: FileObject, *, source: Path | None = None) -> FileObject:
         """Record ``item`` unless the blob is mapped already (then the new object is discarded and the existing
         mapping returned). With ``source`` (migration), only while that volume file still exists: a file deleted
@@ -327,7 +367,8 @@ class AxentraFiles:
             store.lock(COLLECTION, item.blob)
             existing = store.get(COLLECTION, item.blob, FileObject)
             if existing is not None:
-                winner = existing
+                winner = existing.model_copy(update={"used_at": _now()})
+                store.put(COLLECTION, item.blob, winner)
             elif source is not None and not source.is_file():
                 winner = None
             else:
@@ -412,10 +453,11 @@ class AxentraFiles:
         logger.info("Input file migration%s: %s", " (dry run)" if dry_run else "", report.as_dict())
         return report
 
-    def verify(self, data_root: Path, *, tenant: str | None = None) -> FilesReport:
+    def verify(self, data_root: Path, *, tenant: str | None = None, now: datetime | None = None) -> FilesReport:
         """Read every mapped object back and compare its SHA-256 (records ``verified_at``); report volume blobs not
-        migrated yet (``pending``) and Axentra objects without a mapping (``orphans``)."""
-        report = FilesReport()
+        migrated yet (``pending``) and the leftovers :meth:`cleanup` removes: Axentra objects without a mapping
+        (``orphans``) and mappings no input file uses (``unreferenced``). Either makes the report not ``ok``."""
+        report = FilesReport(leftovers_fail=True)
         for tenant_id in self._tenants(tenant):
             report.tenants += 1
             store = self.database.store(tenant_id)
@@ -438,15 +480,93 @@ class AxentraFiles:
                 report.found += 1
                 if blob not in mapped:
                     report.pending += 1
-            ax_tenant = self.link.tenant(tenant_id)
-            if ax_tenant is not None:
-                known = {item.axentra_file for item in mapped.values()}
-                for info in self._axentra_files(ax_tenant):
-                    if info.id not in known:
-                        report.orphans.append(
-                            {"tenant": tenant_id, "file": info.id, "blob": str(info.metadata.get(BLOB_KEY, ""))}
-                        )
+            self._leftovers(tenant_id, mapped, report, now or _now())
         logger.info("Input file verification: %s", report.as_dict())
+        return report
+
+    def _leftovers(self, tenant_id: str, mapped: dict[str, FileObject], report: FilesReport, moment: datetime) -> None:
+        """Add the tenant's orphans and unreferenced mappings older than :data:`LEFTOVER_GRACE` to ``report``."""
+        cutoff = moment - LEFTOVER_GRACE
+        used = self._referenced(tenant_id)
+        for blob, item in mapped.items():
+            if blob in used:
+                continue
+            if max(item.created_at, item.used_at or item.created_at) > cutoff:
+                report.recent += 1
+                continue
+            report.unreferenced.append({"tenant": tenant_id, "blob": blob, "file": item.axentra_file or ""})
+        ax_tenant = self.link.tenant(tenant_id)
+        if ax_tenant is None:
+            return
+        known = {item.axentra_file for item in mapped.values()}
+        for info in self._axentra_files(ax_tenant):
+            if info.id in known:
+                continue
+            if info.created_at > cutoff:
+                report.recent += 1
+                continue
+            report.orphans.append({"tenant": tenant_id, "file": info.id, "blob": str(info.metadata.get(BLOB_KEY, ""))})
+
+    def _referenced(self, tenant_id: str) -> set[str]:
+        """The blobs the tenant's input files use (their content and their cached extraction)."""
+        used: set[str] = set()
+        for _, item in self.database.store(tenant_id).items(INPUT_FILES, InputFile):
+            used.add(item.blob)
+            if item.extract_blob:
+                used.add(item.extract_blob)
+        return used
+
+    def cleanup(self, *, tenant: str | None = None, dry_run: bool = False, now: datetime | None = None) -> FilesReport:
+        """Remove what :meth:`verify` reports as leftovers (older than :data:`LEFTOVER_GRACE`): every Axentra object
+        without a mapping, and every mapping no input file uses together with its object (a file deleted while the
+        backend was ``volume`` is then deleted in Axentra too). Each one is checked again under the blob's lock
+        right before it is removed; volume files are never touched."""
+        moment = now or _now()
+        cutoff = moment - LEFTOVER_GRACE
+        report = FilesReport(dry_run=dry_run)
+        for tenant_id in self._tenants(tenant):
+            report.tenants += 1
+            store = self.database.store(tenant_id)
+            found = FilesReport()
+            self._leftovers(tenant_id, dict(store.items(COLLECTION, FileObject)), found, moment)
+            report.recent += found.recent
+            for entry in found.unreferenced:
+                report.found += 1
+                blob = entry["blob"]
+                if dry_run:
+                    report.unreferenced.append(entry)
+                    continue
+                with store.transaction():
+                    store.lock(COLLECTION, blob)
+                    current = store.get(COLLECTION, blob, FileObject)
+                    stale = (
+                        current is not None
+                        and max(current.created_at, current.used_at or current.created_at) <= cutoff
+                        and blob not in self._referenced(tenant_id)
+                    )
+                    if stale:
+                        store.delete(COLLECTION, blob)
+                if not stale or current is None:
+                    report.kept += 1
+                    continue
+                self.discard(current.axentra_tenant, current.axentra_file)
+                report.removed += 1
+            for entry in found.orphans:
+                report.found += 1
+                if dry_run:
+                    report.orphans.append(entry)
+                    continue
+                blob = entry["blob"]
+                with store.transaction():
+                    if _BLOB.match(blob):
+                        store.lock(COLLECTION, blob)
+                    current = store.get(COLLECTION, blob, FileObject) if _BLOB.match(blob) else None
+                if current is not None and current.axentra_file == entry["file"]:
+                    report.kept += 1  # recorded meanwhile
+                    continue
+                self.discard(self.axentra_tenant(tenant_id), entry["file"])
+                report.removed += 1
+        logger.info("Input file cleanup%s: %s", " (dry run)" if dry_run else "", report.as_dict())
         return report
 
     def _axentra_files(self, ax_tenant: str) -> Iterator[Any]:
@@ -569,7 +689,7 @@ class AxentraBlobs:
     def put(self, data: bytes, *, name: str, media_type: str) -> str:
         digest = _sha256(data)
         blob = digest[:16]
-        existing = self.files.lookup(self.tenant_id, blob)
+        existing = self.files.reuse(self.tenant_id, blob)
         if existing is not None:
             if existing.sha256 != digest:
                 raise NodestroError("input.integrity", "Two contents share one blob id", blob=blob)

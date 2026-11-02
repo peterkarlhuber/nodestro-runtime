@@ -183,7 +183,11 @@ class AxentraNotifications:
         if found is not None:
             return found
         rows = self.link.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
-        return self.link.ensure_tenant(tenant_id, str(rows[0][0])) if rows else None
+        if not rows:
+            return None
+        from .axentra_platform import axentra_tenant_name
+
+        return self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, str(rows[0][0])))
 
     # -- sending -------------------------------------------------------------------------------------------------
 

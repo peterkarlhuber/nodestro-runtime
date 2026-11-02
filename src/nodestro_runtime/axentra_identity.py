@@ -52,7 +52,8 @@ from datetime import timedelta
 import logging
 from typing import Any, Literal, cast
 
-from .axentra_platform import LINK_LOCK_CLASS, AxentraConfig, AxentraLink, AxentraServices
+from .axentra_platform import LINK_LOCK_CLASS, AxentraConfig, AxentraLink, AxentraServices, axentra_tenant_name
+from .axentra_platform import NAME_LIMIT as _NAME_LIMIT
 from .identity_store import (
     ROLE_GRANTS,
     ROLES,
@@ -112,7 +113,6 @@ ACCESS_REVISION = 1
 #: ``auth_method`` and ``user_agent`` of the Axentra sessions Nodestro starts (it keeps its own OIDC flow).
 SESSION_METHOD = "oidc"
 SESSION_AGENT = "nodestro"
-_NAME_LIMIT = 200  # axentra_users.name / axentra_tenants.name
 
 
 def access_definitions() -> Any:
@@ -145,10 +145,6 @@ def axentra_name(name: str | None) -> str:
     return (name or "").strip()[:_NAME_LIMIT]
 
 
-def axentra_tenant_name(tenant_id: str, name: str) -> str:
-    return name.strip()[:_NAME_LIMIT] or tenant_id
-
-
 def _platform_scope() -> Any:
     from axentra.data.database import DbScope
 
@@ -159,6 +155,22 @@ def _system() -> Any:
     from axentra.core.context import Principal
 
     return Principal.system("nodestro-identity")
+
+
+def _linked(kind: str) -> str:
+    """SQL for the Axentra id linked to a Nodestro id (one ``%s`` parameter), in the collation of Axentra's columns.
+
+    ``nodestro_axentra_ids`` keeps ids in collation ``"C"`` like every Nodestro id; Axentra's id columns use the
+    database default. Compared across that difference, PostgreSQL cannot use Axentra's indexes, and filtering on a
+    joined link row made it read every membership of the product (``/api/auth/me`` grew with the number of
+    memberships of all tenants, measured with ``nodestro-api/tests/bench_api.py``). As a scalar subquery the id
+    is looked up once (an InitPlan) and then used as an index condition."""
+    if kind not in ("tenant", "user"):
+        raise ValueError(f"unknown link kind {kind!r}")
+    return (
+        f'(SELECT x.axentra_id COLLATE "default" FROM nodestro_axentra_ids x'
+        f" WHERE x.kind = '{kind}' AND x.nodestro_id = %s)"
+    )
 
 
 class AxentraIdentityStore(IdentityStore):
@@ -432,7 +444,8 @@ class AxentraIdentityStore(IdentityStore):
         """Axentra's tenants of product ``nodestro`` under their Nodestro ids (name from Axentra; the creation time
         is Nodestro's, the tenant's data and files are filed under it). A tenant is suspended when either side says
         so (fail closed: a suspension made directly in Axentra counts, and resuming needs Nodestro's command)."""
-        where = " AND l.nodestro_id = %s" if tenant_id is not None else ""
+        # One tenant: its Axentra id first (an InitPlan), so the lookup is an index scan, not a join of all tenants.
+        where = f" AND t.id = {_linked('tenant')}" if tenant_id is not None else ""
         params: tuple[Any, ...] = (self.product_id,) + ((tenant_id,) if tenant_id is not None else ())
         with self._ax(read_only=True) as tx:
             rows = tx.all(
@@ -516,12 +529,15 @@ class AxentraIdentityStore(IdentityStore):
     def _memberships(self, *, tenant_id: str | None = None, user_id: str | None = None) -> list[Membership]:
         """Axentra's memberships in product ``nodestro`` under Nodestro's ids and role names (an Axentra role
         without a Nodestro meaning grants nothing and is left out)."""
+        # Filter on Axentra's own ids (InitPlans over the link table) so that axentra_memberships is read through its
+        # tenant/user indexes; filtering on the joined link rows made PostgreSQL read every membership (see
+        # _linked).
         where, params = ["m.product_id = %s"], [self.product_id]
         if tenant_id is not None:
-            where.append("lt.nodestro_id = %s")
+            where.append(f"m.tenant_id = {_linked('tenant')}")
             params.append(tenant_id)
         if user_id is not None:
-            where.append("lu.nodestro_id = %s")
+            where.append(f"m.user_id = {_linked('user')}")
             params.append(user_id)
         with self._ax(read_only=True) as tx:
             rows = tx.all(
@@ -593,12 +609,14 @@ class AxentraIdentityStore(IdentityStore):
                 " FROM nodestro_sessions s"
                 " JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.nodestro_id = s.user_id"
                 " JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.nodestro_id = s.tenant_id"
-                " JOIN axentra_memberships m ON m.tenant_id = lt.axentra_id AND m.user_id = lu.axentra_id"
-                " JOIN axentra_tenants t ON t.id = lt.axentra_id"
+                # Axentra's ids are compared in their own collation (the link table's are "C"), so that the
+                # membership and tenant are found through their indexes (see _linked).
+                ' JOIN axentra_memberships m ON m.tenant_id = lt.axentra_id COLLATE "default" AND m.user_id = %s'
+                ' JOIN axentra_tenants t ON t.id = lt.axentra_id COLLATE "default"'
                 " JOIN nodestro_tenants n ON n.id = s.tenant_id"
                 " LEFT JOIN axentra_roles r ON r.product_id = m.product_id AND r.key = m.role"
                 " WHERE s.token_hash = %s AND lu.axentra_id = %s AND m.product_id = %s",
-                (token_hash, info.user.id, self.product_id),
+                (info.user.id, token_hash, info.user.id, self.product_id),
             )
             if row is None or row["role"] not in ROLE_FROM_AXENTRA:
                 return None

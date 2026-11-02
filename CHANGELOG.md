@@ -2,9 +2,28 @@
 
 ## Unreleased
 
+<<<<<<< HEAD
+Security review fixes (SR-01, SR-03, SR-04, SR-05, SR-07, SR-08, SR-09):
+
+- `tests/test_tenant_filters.py` parses every SQL statement of the runtime and the API with PostgreSQL's grammar
+  (`pglast`, a dev dependency) and requires a tenant binding for each tenant table, which it reads from the
+  migrations; statements it cannot build or parse fail, exceptions are listed one by one with their reason in
+  `tenant_sql_allowlist.py` (new `tenant_sql_check.py`).
+- `RunWorker` takes `tenant_active`: `owns()` is false for a suspended tenant's run, so it makes no further call.
+- The start checks that each keyring key and `NODESTRO_SECRET_KEY` decrypts sample stored values, and counts the key
+  ids of Axentra's own encrypted columns; `AxentraServices.reencrypt_columns` / `kids_in_use`.
+- Run usage settlement: a run id that does not fit an idempotency key is settled under its SHA-256; a run that fails
+  is quarantined and retried while the watermark moves on.
+- The volume catalog of input files is rewritten under an exclusive `flock` on `catalog.lock`.
+- `AxentraFiles.verify` fails on leftovers (`orphans`, new `unreferenced`), new `AxentraFiles.cleanup` removes them;
+  `FileObject.used_at`; `AxentraFiles.check` creates the local storage directory.
+- Every path that creates an Axentra tenant cuts its name to 200 characters (`axentra_platform.axentra_tenant_name`,
+  `NAME_LIMIT`).
+=======
 - Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
   probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty
   `noexec` tmpfs mounts on `/run` and `/var/tmp`, which the sandbox gateway now allows too.
+>>>>>>> origin/master
 
 Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 
@@ -24,9 +43,33 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
   `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
 - New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
 
-Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
+Axentra pin: `a8ea5d535feb63fda3a2ea66701c232c093849ee` (webhook backoff settings and the setup_already_completed/email_taken codes; security review fixes SR-02/SR-04/SR-05/SR-06 with migration
+0011, session resolution in one transaction, P1 fixes for suspended tenants and invitation links; replaces `f6ae01d`).
+
+Previous Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+<<<<<<< HEAD
+Performance (Axentra migration, requirement 15, 2026-11-02; numbers in `docs/AXENTRA.md`, "Performance"):
+
+- Fix: the identity reads of `NODESTRO_IDENTITY_BACKEND=axentra` compared `nodestro_axentra_ids` (collation `"C"`)
+  with Axentra's id columns, so PostgreSQL could not use Axentra's indexes and read every membership of the product
+  on each session resolution and `/api/auth/me` (22 ms at 3,500 memberships, growing). They now filter on Axentra's
+  ids (`/api/auth/me` 4.2 ms). Test: `tests/test_axentra_identity_indexes.py`.
+- Fix: the worker's periodic run usage pass (`NODESTRO_AXENTRA_RUN_USAGE=1`) read the mirrored events of every run
+  ever settled; it now reads only its candidate runs' events by key (0.04 s instead of 0.7 s at 10,000 runs, flat).
+  Test: `tests/test_axentra_run_usage_reads.py`.
+- Measured with Axentra `69c06a5` (session resolution in one transaction; needs a pin bump to take effect).
+Legacy cleanup (Axentra migration M12, 2026-11-02):
+
+- `AxentraServices.start` refuses to run without the process's database pool (`axentra.unavailable`): Axentra never
+  opens a second pool in a Nodestro process. The metrics show that one pool once (`pool="nodestro"`); the duplicate
+  `pool="axentra"` series of the shared pool is gone.
+- Removed dead code: `AxentraServices.secret_box` (use `keyring_secret_box`), `AxentraLink.backfill_tenants`
+  (`nodestro-server axentra backfill-identity` links tenants) and `AxentraLink.reverse`.
+- `docs/AXENTRA.md` lists every legacy path that stays, why, and its removal precondition; RT-036 tracks the
+  contract step.
+=======
 Security: containers that run package code (security review DS-1, DS-5, DS-7, DS-9; RT-038):
 
 - DS-1: the module check after an image build (`ContainerImages.missing_modules`) ran the image by tag with a plain
@@ -88,6 +131,7 @@ Docker-first sandbox selection and library environments (security review DS-2, D
   `status`, `plan`, `install`, `ensure`, `sandbox` and `ToolEnvironment` take an optional `trust` (additive); tool
   jobs plan as `untrusted`. `PythonEnvironments` takes `docker_state`.
 - New `tests/test_docker_first.py`; selection, routing and built-in sandbox tests adjusted to the new policy.
+>>>>>>> origin/master
 
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 

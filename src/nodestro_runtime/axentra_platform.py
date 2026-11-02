@@ -51,6 +51,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
+import hashlib
 import json
 import logging
 import os
@@ -360,9 +361,10 @@ class AxentraServices:
     ``database``: the process's :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Axentra then borrows its
     pool (``axentra.data.Database.on_pool``): one connection budget per process (``NODESTRO_DATABASE_POOL_SIZE``),
     the same role, ``search_path`` and time limits; Axentra's scope settings are transaction-local, so nothing of
-    them stays on a connection Nodestro gets back. Without it (``migrate`` and other commands that only need the
-    migration runner), Axentra builds its own pool, opened by :meth:`start` only. ``migration_url``: the owner role's
-    connection for Axentra's migrations (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
+    them stays on a connection Nodestro gets back. :meth:`start` needs it: Axentra never opens a pool of its own in a
+    Nodestro process. Without it only what needs no pool works (``migrate``: Axentra's migration runner opens its own
+    connections; the settings). ``migration_url``: the owner role's connection for Axentra's migrations
+    (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
     """
 
     def __init__(
@@ -398,6 +400,12 @@ class AxentraServices:
     def start(self) -> None:
         from axentra.core.errors import AxentraError
 
+        if self.database is None:
+            # A second pool would break the process's connection budget (one pool per process, M10).
+            raise NodestroError(
+                "axentra.unavailable",
+                "Axentra starts only on the process's database pool (AxentraServices(database=...))",
+            )
         try:
             # Stricter than Axentra's own check (production only), and before anything is written: row-level security
             # must apply to the runtime role in every environment, unless the operator allowed a privileged role.
@@ -465,8 +473,19 @@ class AxentraServices:
 
     # ---- secrets -------------------------------------------------------------------------------------
 
-    def secret_box(self, legacy: SecretBox | None) -> KeyringSecretBox:
-        return KeyringSecretBox(legacy, self.platform.secrets, write=self.config.secrets_format)
+    def reencrypt_columns(self, *, dry_run: bool) -> dict[str, Any]:
+        """Re-encrypt Axentra's own keyring columns (login states, webhook secrets, notification messages and the
+        inbox; security review SR-05) under the active key: ``axentra secrets reencrypt`` for this server. The
+        report counts values per key id before the run (``by_kid``; ``?``: not a keyring value)."""
+        self.platform.db.open()
+        report = self.platform.reencrypt_secrets(dry_run=dry_run)
+        return dict(report.as_dict())
+
+    def kids_in_use(self) -> dict[str, int]:
+        """Values per key id in Axentra's own keyring columns (a dry run of :meth:`reencrypt_columns`), for the start
+        check: a keyring that lacks one of them would make those values unreadable."""
+        found = self.reencrypt_columns(dry_run=True).get("by_kid", {})
+        return {str(kid): int(n) for kid, n in found.items() if kid != "?"}
 
 
 def keyring_secret_box(config: AxentraConfig, legacy: SecretBox | None) -> KeyringSecretBox:
@@ -740,14 +759,19 @@ def stored_secret_formats(database: PostgresDatabase) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def secrets_rollback_problems(config: AxentraConfig, formats: Mapping[str, int]) -> list[dict[str, str]]:
+def secrets_rollback_problems(
+    config: AxentraConfig, formats: Mapping[str, int], axentra_kids: Mapping[str, int] | None = None
+) -> list[dict[str, str]]:
     """Why this configuration cannot read every stored tenant secret (empty: it can), as ``profile.invalid`` problems.
 
     The start refuses (instead of reading values as ``secrets.unreadable`` and inviting people to enter them again):
     ``NODESTRO_AXENTRA=off`` while ``axs1`` values exist (the keyring is only read with ``on``), and a keyring that
     lacks a key id still in use (a key removed before ``secrets reencrypt`` reported ``pending: 0``). v1 values are
-    always readable: ``NODESTRO_SECRET_KEY`` is required in every configuration."""
+    always readable: ``NODESTRO_SECRET_KEY`` is required in every configuration. ``axentra_kids``: the key ids of
+    Axentra's own keyring columns (:meth:`AxentraServices.kids_in_use`, SR-05), counted like Nodestro's values."""
     in_use = {kind.split(":", 1)[1]: count for kind, count in formats.items() if kind.startswith("axs1:")}
+    for kid, count in (axentra_kids or {}).items():
+        in_use[kid] = in_use.get(kid, 0) + count
     if not in_use:
         return []
     total = sum(in_use.values())
@@ -782,10 +806,92 @@ def secrets_rollback_problems(config: AxentraConfig, formats: Mapping[str, int])
     ]
 
 
-def require_readable_secrets(database: PostgresDatabase, config: AxentraConfig) -> None:
+#: How many stored values per key are tried at start (:func:`secret_key_problems`).
+KEY_CHECK_SAMPLES = 5
+
+
+def secret_key_problems(
+    database: PostgresDatabase, box: Any, *, samples: int = KEY_CHECK_SAMPLES
+) -> list[dict[str, str]]:
+    """Whether the configured keys are the keys the stored tenant secrets were encrypted with (security review
+    SR-04): comparing key ids is not enough, new bytes under an old id would make every value under it unreadable.
+
+    For each key in use (every ``axs1`` key id, and the v1 key) up to ``samples`` stored values are decrypted with
+    ``box`` (:class:`KeyringSecretBox` or v1's ``SecretBox``). AES-GCM authenticates each value under its key, so a
+    value that decrypts proves the key bytes; when none does, the key differs (or every value tried was damaged) and
+    the start is refused. Key ids the keyring lacks are :func:`secrets_rollback_problems`'; with the v1 format
+    retired (``box.legacy is None``) v1 values are not tried. Read-only; nothing is decrypted beyond the samples, and
+    problems name locations, never values."""
+    from .server_settings import ENCRYPTED_PREFIX
+
+    keyring_kids: set[str] | None = None
+    if isinstance(box, KeyringSecretBox):
+        keyring_kids = set(box.box.keyring.kids)
+    by_collection = {item.collection: item for item in SECRET_FIELDS}
+    rows = database._query(
+        "SELECT tenant_id, collection, id, coalesce(raw, data::text) FROM nodestro_documents"
+        " WHERE collection = ANY(%s) AND (strpos(data::text, %s) > 0 OR strpos(data::text, %s) > 0)"
+        " ORDER BY tenant_id, collection, id",
+        ([item.collection for item in SECRET_FIELDS], '"' + AXS1_PREFIX, '"' + ENCRYPTED_PREFIX),
+    )
+    tried: dict[str, list[str]] = {}
+    proven: set[str] = set()
+    for tenant_id, collection, key, text in rows:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            continue
+        for path, name in by_collection[collection].fields(str(key), data):
+            token = _get(data, path)
+            if not isinstance(token, str) or not token:
+                continue
+            kind = _format_of(token)
+            if kind == "plain" or kind in proven or len(tried.get(kind, [])) >= samples:
+                continue
+            if kind == "v1" and isinstance(box, KeyringSecretBox) and box.legacy is None:
+                continue
+            if kind.startswith("axs1:") and (keyring_kids is None or kind.split(":", 1)[1] not in keyring_kids):
+                continue  # Axentra off or a key id the keyring lacks: reported by secrets_rollback_problems
+            try:
+                box.decrypt(str(tenant_id), name, token)
+            except NodestroError:
+                tried.setdefault(kind, []).append(f"{tenant_id}/{collection}/{key}:{name}")
+            else:
+                proven.add(kind)
+    problems = []
+    for kind, where in sorted(tried.items()):
+        if kind in proven:
+            continue
+        field, label = (
+            ("NODESTRO_SECRET_KEY", "NODESTRO_SECRET_KEY")
+            if kind == "v1"
+            else ("NODESTRO_AXENTRA_KEYRING", f"key {kind.split(':', 1)[1]} of NODESTRO_AXENTRA_KEYRING")
+        )
+        problems.append(
+            {
+                "field": field,
+                "value": kind.split(":", 1)[1] if kind != "v1" else "v1",
+                "reason": f"{label} does not decrypt any of the {len(where)} stored tenant secrets tried under it "
+                f"(for example {where[0]}): its bytes differ from the key that encrypted them; configure the "
+                "original key again (a new key needs a new key id, behind which the old one stays until "
+                "'secrets reencrypt' reports pending: 0)",
+            }
+        )
+    return problems
+
+
+def require_readable_secrets(
+    database: PostgresDatabase,
+    config: AxentraConfig,
+    box: Any | None = None,
+    axentra_kids: Mapping[str, int] | None = None,
+) -> None:
     """Refuse to serve (``profile.invalid``) when the configuration cannot read every stored tenant secret
-    (:func:`secrets_rollback_problems`); ``check``, ``api`` and ``worker`` call it after the schema check."""
-    problems = secrets_rollback_problems(config, stored_secret_formats(database))
+    (:func:`secrets_rollback_problems`) or, given the secret ``box``, when a configured key is not the one the stored
+    values were encrypted with (:func:`secret_key_problems`); ``check``, ``api`` and ``worker`` call it after the
+    schema check."""
+    problems = secrets_rollback_problems(config, stored_secret_formats(database), axentra_kids)
+    if not problems and box is not None:
+        problems = secret_key_problems(database, box)
     if problems:
         raise NodestroError(
             "profile.invalid",
@@ -797,6 +903,16 @@ def require_readable_secrets(database: PostgresDatabase, config: AxentraConfig) 
 # ---- links between Nodestro and Axentra records ----------------------------------------------------------------
 
 _SLUG_BODY = re.compile(r"[^a-z0-9-]")
+#: The longest name Axentra stores (``axentra_users.name`` / ``axentra_tenants.name``).
+NAME_LIMIT = 200
+
+
+def axentra_tenant_name(tenant_id: str, name: str) -> str:
+    """The name Axentra stores for a Nodestro tenant: trimmed, at most :data:`NAME_LIMIT` characters, the id when
+    empty. Every :meth:`AxentraLink.ensure_tenant` call passes its name through this."""
+    return name.strip()[:NAME_LIMIT] or tenant_id
+
+
 #: Advisory lock class of :meth:`AxentraLink.ensure_tenant` (two-key form; ``Axen`` in ASCII).
 LINK_LOCK_CLASS = 0x4178656E
 
@@ -832,12 +948,6 @@ class AxentraLink:
     def lookup(self, kind: str, nodestro_id: str) -> str | None:
         rows = self.database._query(
             "SELECT axentra_id FROM nodestro_axentra_ids WHERE kind = %s AND nodestro_id = %s", (kind, nodestro_id)
-        )
-        return str(rows[0][0]) if rows else None
-
-    def reverse(self, kind: str, axentra_id: str) -> str | None:
-        rows = self.database._query(
-            "SELECT nodestro_id FROM nodestro_axentra_ids WHERE kind = %s AND axentra_id = %s", (kind, axentra_id)
         )
         return str(rows[0][0]) if rows else None
 
@@ -909,18 +1019,6 @@ class AxentraLink:
             self._tenants[nodestro_id] = axentra_id
         return axentra_id
 
-    def backfill_tenants(self) -> dict[str, Any]:
-        """Link every Nodestro tenant (``nodestro_tenants``) to an Axentra tenant; idempotent and resumable."""
-        rows = self.database._query("SELECT id, name FROM nodestro_tenants ORDER BY id")
-        created, linked = 0, 0
-        for tenant_id, name in rows:
-            if self.tenant(str(tenant_id)) is not None:
-                linked += 1
-                continue
-            self.ensure_tenant(str(tenant_id), str(name))
-            created += 1
-        return {"tenants": len(rows), "already_linked": linked, "created": created}
-
 
 # ---- audit and usage mirrors (M3) ---------------------------------------------------------------
 
@@ -972,8 +1070,28 @@ def run_usage_key(run_id: str, meter: str) -> str:
     A run's usage is final once it is finished (:data:`SETTLED_RUN_STATES`; continuing a run creates a new run whose
     reused steps count no cost), so a retry, a crash after the write, a second worker or a second reconcile replays
     the same key with the same quantity (Axentra returns the stored event and adds nothing). A finished run whose
-    usage changed anyway is refused by Axentra (same key, other request) and reported, never counted again."""
-    return f"nodestro:run:{run_id}:{meter}"
+    usage changed anyway is refused by Axentra (same key, other request) and reported, never counted again.
+
+    Axentra accepts keys of 1 to 200 printable ASCII characters. A run id that does not fit (an imported run with a
+    long or non-ASCII id; security review SR-07) is replaced by ``h.`` and the SHA-256 of its UTF-8 bytes: still one
+    deterministic key per run and meter. Such a run could never be settled under its raw id, so no event exists under
+    that key and the change counts nothing twice."""
+    raw = f"nodestro:run:{run_id}:{meter}"
+    if _IDEMPOTENCY_KEY.fullmatch(raw):
+        return raw
+    return f"nodestro:run:h.{hashlib.sha256(run_id.encode('utf-8', 'surrogatepass')).hexdigest()}:{meter}"
+
+
+#: The idempotency keys Axentra accepts (``axentra.usage.service``): 1 to 200 printable ASCII characters.
+#: More runs in the settlement quarantine than this hold the watermark (a failing Axentra, not one bad run).
+QUARANTINE_LIMIT = 1000
+_IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,200}")
+#: The same rule and the same fallback in SQL, for the reconciliation backlog (``d`` is the run's document).
+_RUN_KEY_SQL = (
+    "CASE WHEN ('nodestro:run:' || d.id || ':nodestro.ai.requests') ~ '^[!-~]{1,200}$'"
+    " THEN 'nodestro:run:' || d.id || ':nodestro.ai.requests'"
+    " ELSE 'nodestro:run:h.' || encode(sha256(convert_to(d.id, 'UTF8')), 'hex') || ':nodestro.ai.requests' END"
+)
 
 
 @dataclass(frozen=True)
@@ -1066,6 +1184,9 @@ class AxentraEvents:
         self._meters_ready = False
         #: Where the periodic run settlement continues (``updated_at`` of the runs; ``None``: the lookback).
         self._settled_until: Any = None
+        #: Runs whose settlement failed (SR-07), retried at every pass: ``(tenant, run id) -> (run, failed passes)``.
+        #: One run that cannot be settled no longer holds the watermark (and with it every tenant) back.
+        self.quarantine: dict[tuple[str, str], tuple[SettledRun, int]] = {}
 
     # -- set-up ------------------------------------------------------------------------------------
 
@@ -1139,7 +1260,7 @@ class AxentraEvents:
         rows = self.link.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
         if not rows:
             return None
-        return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
+        return self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, str(rows[0][0])))
 
     def _guarded(self, what: str, record_id: str, write: Callable[[Any, str], None], tenant_id: str) -> str:
         """Run ``write`` in a savepoint; the outcome: ``ok``, ``skipped`` (no tenant), ``changed`` (Axentra refused a
@@ -1274,7 +1395,16 @@ class AxentraEvents:
         already mirrored runs are skipped, and a replay is a no-op (:func:`run_usage_key`)."""
         from datetime import datetime, timedelta, timezone
 
-        report = {"runs": 0, "missing": 0, "written": 0, "changed": 0, "too_old": 0, "failed": 0, "skipped": 0}
+        report = {
+            "runs": 0,
+            "missing": 0,
+            "written": 0,
+            "changed": 0,
+            "too_old": 0,
+            "failed": 0,
+            "skipped": 0,
+            "quarantined": 0,
+        }
         if not self.run_usage_enabled:
             return report
         if not dry_run and not self._meters_ready:
@@ -1290,10 +1420,24 @@ class AxentraEvents:
         if tenant is not None:
             query += " WHERE id = %s"
             params = (tenant,)
+        periodic = not full and tenant is None and not dry_run
+        retry: dict[str, list[SettledRun]] = {}
+        if periodic:
+            for (tenant_id, _run_id), (run, _failures) in self.quarantine.items():
+                retry.setdefault(tenant_id, []).append(run)
         for (tenant_id,) in self.link.database._query(query + " ORDER BY id", params):
             tenant_id = str(tenant_id)
-            recorded = self._mirrored_runs(tenant_id)
-            for run in settled_runs(self.link.database, tenant_id, since=since):
+            candidates = settled_runs(self.link.database, tenant_id, since=since)
+            seen = {run.id for run in candidates}
+            candidates += [run for run in retry.pop(tenant_id, []) if run.id not in seen]
+            if not candidates:
+                continue
+            # A periodic pass reads the mirrored events of its candidate runs only (by key, through the unique
+            # index): reading every run event of the tenant made each pass grow with all runs ever settled.
+            recorded = self._mirrored_runs(
+                tenant_id, None if full else [run.id for run in candidates], known=[run.id for run in candidates]
+            )
+            for run in candidates:
                 report["runs"] += 1
                 wanted = usage_quantities(run.usage)
                 if not wanted:
@@ -1315,29 +1459,80 @@ class AxentraEvents:
                 outcome = self.settle_run(tenant_id, run)
                 key = {"ok": "written", "changed": "changed", "skipped": "skipped"}.get(outcome, "failed")
                 report[key] += 1
-        if not full and tenant is None and not dry_run and report["failed"] == 0:
+                if periodic:
+                    self._note_settlement(tenant_id, run, outcome)
+        for tenant_id, runs in retry.items():  # quarantined runs of tenants that are gone: forgotten
+            for run in runs:
+                self.quarantine.pop((tenant_id, run.id), None)
+        if periodic:
+            report["quarantined"] = len(self.quarantine)
             # The next pass starts a little before this one did: a run committed while this pass read is not missed.
-            self._settled_until = started - timedelta(minutes=5)
+            # A run that failed does not hold it back (SR-07): it stays in the quarantine and is retried every pass.
+            # Many failures mean Axentra itself fails: the watermark then stays, as before (the quarantine is kept
+            # in memory only; a restart looks back RUN_SETTLE_LOOKBACK_DAYS anyway).
+            if len(self.quarantine) <= QUARANTINE_LIMIT:
+                self._settled_until = started - timedelta(minutes=5)
         return report
 
-    def _mirrored_runs(self, tenant_id: str) -> dict[str, dict[str, Decimal]]:
+    def _note_settlement(self, tenant_id: str, run: SettledRun, outcome: str) -> None:
+        """Keep a run whose settlement failed in the quarantine (counted as ``mirror_write`` ``quarantined``) until a
+        pass settles it."""
+        key = (tenant_id, run.id)
+        if outcome != "failed":
+            self.quarantine.pop(key, None)
+            return
+        failures = self.quarantine.get(key, (run, 0))[1] + 1
+        self.quarantine[key] = (run, failures)
+        count_operation("mirror_write", "quarantined", kind="run_usage")
+        if failures in (1, 10, 100):
+            logger.error("The settled usage of run %s of tenant %s failed %d times", run.id, tenant_id, failures)
+
+    def _mirrored_runs(
+        self, tenant_id: str, run_ids: list[str] | None = None, known: list[str] | None = None
+    ) -> dict[str, dict[str, Decimal]]:
+        """The mirrored quantities per run and meter of the tenant: every run's, or (``run_ids``) only those runs'.
+        ``known``: run ids whose hashed keys (:func:`run_usage_key`) are mapped back in the every-run read."""
         ax_tenant = self.link.tenant(tenant_id)
         if ax_tenant is None:
             return {}
         from axentra.data.database import DbScope, join
 
+        product = self.link.services.product_id
+        hashed = {
+            run_usage_key(run_id, meter): (run_id, meter)
+            for run_id in known or run_ids or []
+            for meter, _unit, _text in USAGE_METERS
+            if run_usage_key(run_id, meter).startswith("nodestro:run:h.")
+        }
+        rows: list[Any] = []
         with (
             self.link.joined() as connection,
-            join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx,
+            join(connection, DbScope.tenant(product, ax_tenant)) as tx,
         ):
-            rows = tx.all(
-                "SELECT idempotency_key, quantity FROM axentra_usage_events"
-                " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:run:%%'",
-                (self.link.services.product_id, ax_tenant),
-            )
+            if run_ids is None:
+                rows = tx.all(
+                    "SELECT idempotency_key, quantity FROM axentra_usage_events"
+                    " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:run:%%'",
+                    (product, ax_tenant),
+                )
+            else:
+                keys = [run_usage_key(run_id, meter) for run_id in run_ids for meter, _unit, _text in USAGE_METERS]
+                for start in range(0, len(keys), 2000):
+                    rows += tx.all(
+                        "SELECT idempotency_key, quantity FROM axentra_usage_events"
+                        " WHERE product_id = %s AND tenant_id = %s AND idempotency_key = ANY(%s)",
+                        (product, ax_tenant, keys[start : start + 2000]),
+                    )
         found: dict[str, dict[str, Decimal]] = {}
         for row in rows:
-            _, _, run_id, meter = str(row["idempotency_key"]).split(":", 3)
+            key = str(row["idempotency_key"])
+            if key.startswith("nodestro:run:h."):
+                owner = hashed.get(key)  # a run whose id needed the hashed key (SR-07)
+                if owner is None:
+                    continue
+                run_id, meter = owner
+            else:
+                _, _, run_id, meter = key.split(":", 3)
             found.setdefault(run_id, {})[meter] = Decimal(row["quantity"])
         return found
 
@@ -1533,7 +1728,9 @@ _BACKLOG_SQL = {
           AND d.updated_at >= now() - make_interval(days => %(days)s)
           AND NOT EXISTS (SELECT 1 FROM axentra_usage_events e WHERE e.product_id = %(product)s
                 AND e.tenant_id = l.axentra_id
-                AND e.idempotency_key = 'nodestro:run:' || d.id || ':nodestro.ai.requests')""",
+                AND e.idempotency_key = """
+    + _RUN_KEY_SQL
+    + ")",
     # Approval audit events and MCP events without a mirrored audit event.
     "audit": """
         SELECT count(*) FROM nodestro_documents d
@@ -1589,6 +1786,7 @@ __all__ = [
     "AXS1_PREFIX",
     "IDENTITY_BACKENDS",
     "MODULES",
+    "NAME_LIMIT",
     "PRODUCT_SLUG",
     "SECRET_FIELDS",
     "USAGE_METERS",
@@ -1602,6 +1800,7 @@ __all__ = [
     "SettledRun",
     "attach_platform_events",
     "available",
+    "axentra_tenant_name",
     "axentra_version",
     "build_settings",
     "from_environment",
@@ -1612,6 +1811,7 @@ __all__ = [
     "require_readable_secrets",
     "run_usage_key",
     "secret_context",
+    "secret_key_problems",
     "secrets_rollback_problems",
     "settled_runs",
     "stored_secret_formats",

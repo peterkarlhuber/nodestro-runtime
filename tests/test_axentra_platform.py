@@ -366,10 +366,10 @@ def test_tenants_are_linked_once_with_unique_slugs(linked: Any) -> None:
     from identity_support import create_tenants
 
     create_tenants(linked.database, [("acme_eu", "Acme EU"), ("acme-eu", "Acme (dash)"), ("a", "A")])
-    report = linked.backfill_tenants()
-    assert report == {"tenants": 3, "already_linked": 0, "created": 3}
-    assert linked.backfill_tenants() == {"tenants": 3, "already_linked": 3, "created": 0}
-    ids = {tenant: linked.tenant(tenant) for tenant in ("acme_eu", "acme-eu", "a")}
+    names = {"acme_eu": "Acme EU", "acme-eu": "Acme (dash)", "a": "A"}
+    ids = {tenant: linked.ensure_tenant(tenant, name) for tenant, name in names.items()}
+    assert {tenant: linked.ensure_tenant(tenant, name) for tenant, name in names.items()} == ids  # idempotent
+    assert {tenant: linked.tenant(tenant) for tenant in names} == ids
     assert len(set(ids.values())) == 3 and all(value.startswith("ten_") for value in ids.values())
     rows = postgres_support.owner_of(linked.database)._query(
         "SELECT slug, settings->>'nodestro_tenant', name FROM axentra_tenants ORDER BY settings->>'nodestro_tenant'"
@@ -377,7 +377,8 @@ def test_tenants_are_linked_once_with_unique_slugs(linked: Any) -> None:
     assert sorted(row[0] for row in rows) == ["a-0", "acme-eu", "acme-eu-2"]
     assert {row[1]: row[2] for row in rows} == {"a": "A", "acme-eu": "Acme (dash)", "acme_eu": "Acme EU"}
     assert linked.ensure_tenant("acme_eu", "ignored") == ids["acme_eu"]
-    assert linked.reverse("tenant", ids["a"]) == "a"
+    links = linked.database._query("SELECT nodestro_id, axentra_id FROM nodestro_axentra_ids WHERE kind = 'tenant'")
+    assert {str(row[0]): str(row[1]) for row in links} == ids  # one link per tenant, unique in both directions
 
 
 def test_a_rolled_back_nodestro_transaction_leaves_no_axentra_tenant(linked: Any) -> None:

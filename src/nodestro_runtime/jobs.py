@@ -325,6 +325,10 @@ class QueuedRuns:
 WorkspaceOf = Callable[[str], Any]
 
 
+#: How long a worker reuses a tenant's "active" answer before it asks again (seconds, see :class:`RunWorker`).
+TENANT_CHECK_SECONDS = 2.0
+
+
 class RunWorker:
     """Claims run jobs and executes them in this process, renewing their leases (a worker process).
 
@@ -342,8 +346,17 @@ class RunWorker:
         flush: float = 0.25,
         max_runs: int = DEFAULT_MAX_RUNS,
         max_waiting: int = DEFAULT_MAX_WAITING,
+        tenant_active: Callable[[str], bool] | None = None,
+        tenant_check: float = TENANT_CHECK_SECONDS,
     ) -> None:
         check_capacity(max_runs, max_waiting)
+        #: Whether a tenant may still execute runs (the identity backend's answer; ``None``: not asked). :meth:`owns`
+        #: asks it before every model request and tool call, so a suspended tenant's run stops at its next step
+        #: (security review SR-03), not only at the worker's periodic sweep.
+        self.tenant_active = tenant_active
+        #: An "active" answer is reused for this long (seconds); "suspended" is never cached.
+        self.tenant_check = tenant_check
+        self._tenant_seen: dict[str, float] = {}
         self.max_runs = max_runs
         #: The waiting capacity of this worker, shared by the tool gates of all tenants it executes runs of.
         self.slots = WaitingSlots(max_waiting)
@@ -388,7 +401,24 @@ class RunWorker:
         before every model request and tool call (M11), so a worker that lost its lease stops before it pays for
         or does anything more, not only at its next heartbeat."""
         job_id = self._jobs.get((tenant_id, run_id))
-        return job_id is not None and self.queue.heartbeat(job_id, self.name) is not None
+        if job_id is None or not self._tenant_allows(tenant_id):
+            return False
+        return self.queue.heartbeat(job_id, self.name) is not None
+
+    def _tenant_allows(self, tenant_id: str) -> bool:
+        """Whether ``tenant_id`` is active (:attr:`tenant_active`), with an "active" answer reused for
+        :attr:`tenant_check` seconds. A failing check raises: the run manager counts that as lost."""
+        if self.tenant_active is None:
+            return True
+        seen = self._tenant_seen.get(tenant_id)
+        if seen is not None and time.monotonic() - seen < self.tenant_check:
+            return True
+        if not self.tenant_active(tenant_id):
+            self._tenant_seen.pop(tenant_id, None)
+            logger.warning("Tenant %s is suspended: its runs stop at their next step", tenant_id)
+            return False
+        self._tenant_seen[tenant_id] = time.monotonic()
+        return True
 
     async def run_once(self) -> Job | None:
         """Claim one job and execute it to its end (or pause); ``None`` when the queue was empty."""
@@ -627,6 +657,7 @@ class ScheduleFirings:
 __all__ = [
     "RUN_JOB",
     "SCHEDULER_LOCK",
+    "TENANT_CHECK_SECONDS",
     "Job",
     "JobQueue",
     "JobStatus",
