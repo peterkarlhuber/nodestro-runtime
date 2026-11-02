@@ -470,11 +470,6 @@ class AxentraServices:
                 problems=problems,
             )
 
-    # ---- secrets -------------------------------------------------------------------------------------
-
-    def secret_box(self, legacy: SecretBox | None) -> KeyringSecretBox:
-        return KeyringSecretBox(legacy, self.platform.secrets, write=self.config.secrets_format)
-
 
 def keyring_secret_box(config: AxentraConfig, legacy: SecretBox | None) -> KeyringSecretBox:
     """The tenant secret box for ``config`` without opening the database (only the keyring is needed)."""
@@ -842,12 +837,6 @@ class AxentraLink:
         )
         return str(rows[0][0]) if rows else None
 
-    def reverse(self, kind: str, axentra_id: str) -> str | None:
-        rows = self.database._query(
-            "SELECT nodestro_id FROM nodestro_axentra_ids WHERE kind = %s AND axentra_id = %s", (kind, axentra_id)
-        )
-        return str(rows[0][0]) if rows else None
-
     def link(self, connection: Any, kind: str, nodestro_id: str, axentra_id: str) -> None:
         connection.execute(
             "INSERT INTO nodestro_axentra_ids (kind, nodestro_id, axentra_id) VALUES (%s, %s, %s)",
@@ -915,18 +904,6 @@ class AxentraLink:
         if outermost:
             self._tenants[nodestro_id] = axentra_id
         return axentra_id
-
-    def backfill_tenants(self) -> dict[str, Any]:
-        """Link every Nodestro tenant (``nodestro_tenants``) to an Axentra tenant; idempotent and resumable."""
-        rows = self.database._query("SELECT id, name FROM nodestro_tenants ORDER BY id")
-        created, linked = 0, 0
-        for tenant_id, name in rows:
-            if self.tenant(str(tenant_id)) is not None:
-                linked += 1
-                continue
-            self.ensure_tenant(str(tenant_id), str(name))
-            created += 1
-        return {"tenants": len(rows), "already_linked": linked, "created": created}
 
 
 # ---- audit and usage mirrors (M3) ---------------------------------------------------------------
