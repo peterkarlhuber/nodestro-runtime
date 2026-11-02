@@ -16,8 +16,8 @@ AxentraConfig`) chooses where the identity records live. A change is a restart o
     :meth:`axentra.identity.service.IdentityService.resolve_session`), roles and the permissions they grant
     (:attr:`Session.permissions`, from Axentra's role definitions), memberships, member lists, the tenant list and
     tenant status (suspended when either side says so). The API lets Axentra run the OIDC login too
-    (``nodestro_api.identity.AxentraLoginFlow``). Writes still go to both sides in one transaction, so Nodestro's tables stay current and switching
-    back to ``mirror`` or ``nodestro`` is a restart (the rollback).
+    (``nodestro_api.identity.AxentraLoginFlow``). Writes still go to both sides in one transaction, so Nodestro's
+    tables stay current and switching back to ``mirror`` or ``nodestro`` is a restart (the rollback).
 
 What stays Nodestro-only in every mode: bootstrap tokens (setup links; plan gap G-5 decided: one store for every
 mode and the rollback), Nodestro's ids (``u_…``, tenant ids) in every contract, the e-mail column (Axentra keeps an
