@@ -8,7 +8,7 @@ client's region), so a price has to list the regions it covers.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -41,7 +41,7 @@ from nodestro_runtime.reconciliation import (
 )
 from nodestro_runtime.storage import SQLiteStore
 
-T0 = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 CLAUDE = "anthropic.claude-sonnet-5-5"
 EU_PROFILE = "eu.anthropic.claude-sonnet-5-5"
 ARN = "arn:aws:bedrock:eu-central-1:123456789012:application-inference-profile/abc123"
@@ -456,9 +456,7 @@ class _Anthropic:
 
     def fetch(self, start: date, end: date) -> ProviderReport:
         line = BilledLine(day=DAY, provider="anthropic", amount_usd=Decimal("2"), model="claude-sonnet-5-5")
-        return ProviderReport(
-            provider="anthropic", lines=[line], complete_until=datetime(2026, 10, 30, tzinfo=timezone.utc)
-        )
+        return ProviderReport(provider="anthropic", lines=[line], complete_until=datetime(2026, 10, 30, tzinfo=UTC))
 
 
 def test_bedrock_is_reported_as_not_reconciled_never_as_complete() -> None:
@@ -467,7 +465,7 @@ def test_bedrock_is_reported_as_not_reconciled_never_as_complete() -> None:
         (DAY, "bedrock", EU_PROFILE): Estimate(known_usd=Decimal("1.5"), requests=4, unpriced_requests=1),
         (DAY, "bedrock", ARN): Estimate(known_usd=Decimal("0.5"), requests=1),
     }
-    later = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    later = datetime(2026, 11, 1, tzinfo=UTC)
     report = CostReconciliationService([_Anthropic()], lambda _s, _e: estimates, clock=lambda: later).reconcile(
         DAY, date(2026, 10, 21)
     )

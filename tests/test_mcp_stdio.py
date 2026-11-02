@@ -21,8 +21,6 @@ from orkexa.dynamic import SandboxError, SandboxProbe
 from pydantic import ValidationError
 import pytest
 
-pytest.importorskip("mcp")
-
 from nodestro_runtime.container_images import MCP_OWNER, StreamedSandbox, sandbox_run_args
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import McpServerIn, StdioCommand

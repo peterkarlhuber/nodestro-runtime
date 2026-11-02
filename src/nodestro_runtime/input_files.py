@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 import contextlib
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import os
@@ -210,7 +210,7 @@ class _Blobs(LocalFileStore):
                         media_type=media_type,
                         size=len(data),
                         sha256=digest,
-                        created_at=datetime.now(timezone.utc),
+                        created_at=datetime.now(UTC),
                     ),
                     data,
                 )
@@ -277,7 +277,7 @@ class InputFiles:
             media_type=spec.media_type if spec.key != "code" else (media_type or "text/plain"),
             size=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             origin=origin,
             uploaded_by=uploaded_by,
             info=extracted.info,
@@ -423,7 +423,7 @@ class InputFiles:
     def cleanup(self, *, older_than_days: int | None = None, at: datetime | None = None) -> CleanupResult:
         """Remove files nobody uses (after :data:`GRACE`) and, with ``older_than_days``, the files of
         finished runs created before then. Files of active runs, test cases and schedules stay."""
-        moment = at or datetime.now(timezone.utc)
+        moment = at or datetime.now(UTC)
         references = self.references()
         cutoff = moment - timedelta(days=older_than_days) if older_than_days is not None else None
         result = CleanupResult()

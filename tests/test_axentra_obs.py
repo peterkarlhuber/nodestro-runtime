@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, timedelta
 from decimal import Decimal
 import secrets
 import threading
@@ -468,7 +468,7 @@ def test_the_start_refuses_a_key_with_other_bytes_under_a_known_key_id(database:
 
 def _seed_axentra_login_state(services: Any) -> None:
     """A row of one of Axentra's own keyring columns (an OIDC login start), under the services' active key."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from axentra.data.database import DbScope
 
@@ -484,7 +484,7 @@ def _seed_axentra_login_state(services: Any) -> None:
                 box.encrypt("n", f"axentra_login_states:{state}:nonce"),
                 box.encrypt("v", f"axentra_login_states:{state}:code_verifier"),
                 "/",
-                datetime.now(timezone.utc) + timedelta(hours=1),
+                datetime.now(UTC) + timedelta(hours=1),
             ),
         )
 

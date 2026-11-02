@@ -15,11 +15,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp_support import LoopbackServer, serve
+import pytest
 
 from nodestro_runtime.mcp.models import McpServerIn
 from nodestro_runtime.mcp.vault import VAULT_KEY_ENV

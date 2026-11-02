@@ -28,7 +28,7 @@ notifications. This module imports Axentra only inside its methods (server profi
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -237,7 +237,7 @@ class AxentraNotifications:
         """Notify about failed runs and pending approvals changed since the last pass (first pass: :attr:`lookback`).
 
         Safe to run in several workers at once and to repeat: every message is keyed per event and recipient."""
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         since = since or self._since or started - self.lookback
         report = NotifyReport()
         database = self.link.database

@@ -25,8 +25,6 @@ def test_limits_come_from_the_environment() -> None:
         assert caught.value.code == "mcp.limits_invalid"
 
 
-pytest.importorskip("mcp")
-
 from mcp_support import LoopbackServer, serve  # noqa: E402
 
 from nodestro_runtime.mcp.models import McpServerIn  # noqa: E402

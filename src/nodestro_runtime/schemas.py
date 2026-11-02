@@ -8,7 +8,7 @@ plain data: :mod:`nodestro_runtime.agent_builder` turns an :class:`AgentConfig` 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 import uuid
@@ -59,7 +59,7 @@ LANGUAGES: tuple[str, ...] = ("de", "en", "es", "fr", "pt-BR", "it")
 
 
 def now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def new_id(prefix: str) -> str:

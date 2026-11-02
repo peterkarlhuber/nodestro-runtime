@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC
 import socket
 import threading
 import time
@@ -128,7 +129,7 @@ def serve(
 
 def self_signed(directory: Any, name: str) -> tuple[str, str, str]:
     """A self-signed certificate for ``name``: (cert path, key path, cert path as CA)."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -137,7 +138,7 @@ def self_signed(directory: Any, name: str) -> tuple[str, str, str]:
 
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)

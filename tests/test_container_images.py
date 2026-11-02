@@ -1050,7 +1050,6 @@ def test_a_local_mcp_server_gets_its_packages_through_the_same_approval(
 ) -> None:
     """WP-8: a stdio server's packages are planned, approved and built into a sandbox image like a tool's; the
     server starts only in that image, and removing the server removes its environment."""
-    pytest.importorskip("mcp")
     from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
 
     mcp = workspace.mcp
@@ -1091,7 +1090,6 @@ def test_a_local_mcp_server_gets_its_packages_through_the_same_approval(
 
 
 def test_without_docker_a_local_mcp_server_is_refused(tmp_path: Path) -> None:
-    pytest.importorskip("mcp")
     from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
 
     opened = Workspace(tmp_path / "data", python_runner=FakeUv(INDEX), integrations=[])

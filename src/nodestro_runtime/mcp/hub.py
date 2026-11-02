@@ -130,7 +130,7 @@ def require_sdk() -> None:
     if not sdk_available():
         raise NodestroError(
             "mcp.unavailable",
-            "MCP is not available in this installation (it needs Python 3.11 or later and the 'mcp' package)",
+            "MCP is not available in this installation (the 'mcp' package is not installed)",
         )
 
 
@@ -434,7 +434,7 @@ class McpHub:
         slots = self._tenant_slots
         try:
             await asyncio.wait_for(slots.acquire(), timeout=self.limits.queue_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise NodestroError(
                 "mcp.overloaded",
                 f"All {self.limits.max_parallel} MCP call slots stayed busy for {self.limits.queue_seconds:g} seconds",

@@ -1025,7 +1025,7 @@ class Gateway:
         # The route is decided on the head; the body limit depends on it (an image build sends its context).
         try:
             request = await asyncio.wait_for(read_head(reader), timeout=self.config.head_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise Refused("The request head took too long", 408) from None
         if request is None:
             return
@@ -1038,7 +1038,7 @@ class Gateway:
                 read_body(reader, request, limit=_BUILD_LIMIT if kind == "build" else _JSON_LIMIT),
                 timeout=self.config.body_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise Refused("The request body took too long", 408) from None
         # Every target sent to the daemon is rebuilt from what was checked, never passed through as written.
         target, body = f"{prefix}{bare}", request.body

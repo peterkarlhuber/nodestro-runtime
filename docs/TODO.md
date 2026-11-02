@@ -235,7 +235,8 @@ None known.
   nodestro-server SRV-019
 - **What:** Every Axentra integration of the server profile is merged and off by default; none is active in
   production. Open:
-  - the independent security review (running; identity mirror and Axentra login first);
+  - an organizationally independent security review: the separate agent's review was accepted on 2026-11-02 (condition
+    SR-01 met, its Lows fixed and re-reviewed); an external sign-off is still outstanding;
   - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
     `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
     against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);
@@ -251,10 +252,10 @@ None known.
   transaction, so there is nothing to compare or trigger); moving knowledge files (already in PostgreSQL with their
   search index); running jobs on Axentra (M11, variant A), Nodestro's migrations on Axentra's runner (M9) and
   row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
-- **Next step:** Finish the independent review, then the staging rehearsal. No switch is activated in production by
+- **Next step:** The external security sign-off, then the staging rehearsal. No switch is activated in production by
   this work.
 
-### RT-036 · Axentra contract step (M12): remove the legacy paths
+### RT-039 · Axentra contract step (M12): remove the legacy paths
 
 - **Priority:** P3 Low · **Status:** Blocked (on production evidence per switch, RT-030) · **Refs:** `docs/AXENTRA.md`
   ("Legacy paths and their removal preconditions")
@@ -405,25 +406,14 @@ None known.
 
 ## Technical debt
 
-### RT-022 · Python 3.10 support after its end of life
+### RT-022 · Python 3.14 untested
 
-- **Priority:** P3 Low · **Status:** Needs decision · **Refs:** `pyproject.toml`, CI matrix
-- **What:** Python 3.10 reached end of life in October 2026, but the package and CI still target it, and MCP already
-  needs 3.11 (`mcp.unavailable` on 3.10).
-- **Next step:** Decide on 3.11 as the minimum together with the dependent repositories (this entry holds the
-  platform decision; orkexa ORK-007, nodestro-api API-025 and nodestro-sdk SDK-013 follow it), then update the
-  classifiers, ruff/mypy targets and CI matrix.
-- **Interim decision (2026-11-02, Axentra migration):** Axentra (3.11+) is installed only through the `postgres` and
-  `dev` extras with the marker `python_version >= '3.11'`; the server image runs 3.13. On 3.10 the package, the
-  desktop and Local Docker keep working and `NODESTRO_AXENTRA=on` is refused. 3.10 is not dropped by this change.
-- **Review (2026-11-02):** no shipped artifact runs 3.10: the desktop bundles python-build-standalone 3.13
-  (nodestro-desktop `scripts/build_backend.sh`), the server and Local Docker images use `python:3.13-slim`
-  (nodestro-server `image/Dockerfile`). Raising the minimum affects only pip installs of the libraries and the CI
-  legs. Recommendation: 3.11 in all Python repositories at once (orkexa first, then runtime, examples,
-  integrations, api, sdk, studio), then drop the 3.10 workarounds: the `mcp` and `axentra` markers, the
-  `tomllib` fallback in `python_deps.py` and studio `scripts/check_versions.py`, the `sys.version_info` guards in
-  `axentra_platform.py`, the MCP test skips, the 3.10 sandbox base image in `container_images.py`, and orkexa's
-  `pymdown-extensions` split (the `mcp.unavailable` error code stays: it is part of the API contract).
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `pyproject.toml`, CI matrix 3.11/3.13
+- **What:** Python 3.11 is the minimum of all Nodestro repositories and orkexa since 2026-11-02 (3.10 reached end of
+  life in October 2026). 3.14 is not in the CI matrices or classifiers: every dependency installs on 3.14 (checked
+  2026-11-02), but orkexa's sandbox policy test fails there (ORK-007).
+- **Next step:** After ORK-007, add 3.14 to the matrices and classifiers of all Python repositories at once.
+- **Depends on:** orkexa ORK-007
 
 ### RT-023 · Reproducible Python dependencies
 
@@ -503,7 +493,7 @@ None known.
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
-| RT-022 | orkexa, nodestro-api, nodestro-sdk | ORK-007, API-025, SDK-013 | One platform decision, held here |
+| RT-022 | orkexa | ORK-007 | Orkexa's sandbox review for 3.14 comes first |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |

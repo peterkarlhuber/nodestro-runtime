@@ -7,7 +7,7 @@ processes): a person deciding in an API process while the worker that holds the 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import multiprocessing
 from pathlib import Path
 import threading
@@ -90,7 +90,7 @@ def postgres(tmp_path: Path) -> Iterator[Opened]:
 
 class Clock:
     def __init__(self) -> None:
-        self.at = datetime.now(timezone.utc)
+        self.at = datetime.now(UTC)
 
     def __call__(self) -> datetime:
         return self.at
@@ -140,7 +140,7 @@ def test_a_decision_after_the_deadline_is_refused_by_the_store(opened: Opened) -
     approvals = ToolApprovals(opened.store, clock=clock)
     found = ask(approvals)
     # The stored deadline is in the past by the store's own clock, the deciding process's clock is behind.
-    opened.store.put(COLLECTION, found.key, found.model_copy(update={"deadline": datetime.now(timezone.utc)}))
+    opened.store.put(COLLECTION, found.key, found.model_copy(update={"deadline": datetime.now(UTC)}))
     clock.at -= timedelta(minutes=30)
     with pytest.raises(NodestroError) as error:
         approvals.decide("run_1", found.id, approved=True, by="usr_1", arguments=found.arguments_hash)

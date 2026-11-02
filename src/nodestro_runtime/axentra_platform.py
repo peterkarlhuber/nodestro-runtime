@@ -10,7 +10,7 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
 
 ==========================================  ================================================================
 ``NODESTRO_AXENTRA``                        ``off`` (default) or ``on``: open Axentra next to Nodestro
-                                            (needs Python 3.11+ and ``nodestro-runtime[postgres]``)
+                                            (needs ``nodestro-runtime[postgres]``)
 ``NODESTRO_AXENTRA_KEYRING`` (or ``_FILE``) Axentra keyring ``kid:base64key[,kid2:base64key]`` (first key
                                             encrypts); required with ``NODESTRO_AXENTRA=on``
 ``NODESTRO_AXENTRA_CONFIG``                 optional Axentra TOML file for Axentra's own knobs; Nodestro's
@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC
 from decimal import Decimal
 import hashlib
 import json
@@ -57,7 +58,7 @@ import logging
 import os
 from pathlib import Path
 import re
-import sys
+import tomllib
 from typing import TYPE_CHECKING, Any, Literal
 
 from .axentra_metrics import count_operation
@@ -99,9 +100,7 @@ def modules(config: AxentraConfig) -> tuple[str, ...]:
 
 
 def available() -> bool:
-    """Whether the ``axentra`` package can be imported (Python 3.11+ and ``nodestro-runtime[postgres]``)."""
-    if sys.version_info < (3, 11):
-        return False
+    """Whether the ``axentra`` package can be imported (``nodestro-runtime[postgres]``)."""
     try:
         import axentra  # noqa: F401
     except ImportError:
@@ -341,15 +340,10 @@ def _merge_file(path: str | None, overrides: dict[str, Any]) -> dict[str, Any]:
 
 
 def _read_toml(path: str) -> dict[str, Any]:
-    if sys.version_info < (3, 11):  # pragma: no cover - Axentra needs 3.11+
-        raise NodestroError("profile.invalid", "NODESTRO_AXENTRA_CONFIG needs Python 3.11+")
-    else:
-        import tomllib
-
-        try:
-            return tomllib.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise NodestroError("profile.invalid", f"NODESTRO_AXENTRA_CONFIG cannot be read: {exc}") from None
+    try:
+        return tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise NodestroError("profile.invalid", f"NODESTRO_AXENTRA_CONFIG cannot be read: {exc}") from None
 
 
 class AxentraServices:
@@ -1380,7 +1374,7 @@ class AxentraEvents:
         outcome: str,
         details: dict[str, Any],
     ) -> None:
-        audit_log: Any = self.link.services.platform.audit  # typed loosely: Axentra is optional (3.10)
+        audit_log: Any = self.link.services.platform.audit  # typed loosely: Axentra is optional
         audit_log.record(
             tx,
             None,
@@ -1453,7 +1447,7 @@ class AxentraEvents:
         still accepts, :data:`USAGE_RECONCILE_DAYS`). Same filter as the usage dashboard: top-level runs only (a
         sub-workflow's cost is counted in its parent run) and never imported runs. Nothing is written twice:
         already mirrored runs are skipped, and a replay is a no-op (:func:`run_usage_key`)."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         report = {
             "runs": 0,
@@ -1469,7 +1463,7 @@ class AxentraEvents:
             return report
         if not dry_run and not self._meters_ready:
             self.ensure_meters()
-        started = datetime.now(timezone.utc)
+        started = datetime.now(UTC)
         oldest = started - timedelta(days=USAGE_RECONCILE_DAYS)
         if full:
             since = None
@@ -1604,7 +1598,7 @@ class AxentraEvents:
         Idempotent and resumable: usage replays its idempotency keys (nothing is counted twice; entries older than
         :data:`USAGE_RECONCILE_DAYS` are reported, not written, because Axentra refuses them); an audit event is
         written only when no Axentra event carries its ``nodestro_event`` id. Nodestro's records are only read."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         from .tool_approvals import AUDIT, ToolApprovalEvent, audit_details
         from .usage_log import UsageLog
@@ -1622,7 +1616,7 @@ class AxentraEvents:
         }
         if self.usage_enabled and not dry_run and not self._meters_ready:
             self.ensure_meters()
-        oldest = datetime.now(timezone.utc) - timedelta(days=USAGE_RECONCILE_DAYS)
+        oldest = datetime.now(UTC) - timedelta(days=USAGE_RECONCILE_DAYS)
         params: tuple[Any, ...] = ()
         query = "SELECT id FROM nodestro_tenants"
         if tenant is not None:

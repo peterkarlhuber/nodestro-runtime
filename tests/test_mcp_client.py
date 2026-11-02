@@ -7,15 +7,13 @@ import base64
 from collections.abc import Iterator
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp_support import LoopbackServer, build_server, serve
+import pytest
 
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import EVENTS, SERVERS, McpEvent, McpServerIn
@@ -350,3 +348,15 @@ def test_audit_events_hold_no_secrets(service: McpService, server: LoopbackServe
     raw = str([service.store.get_raw(EVENTS, key) for key, _ in service.store.items(EVENTS, McpEvent)])
     assert "tok-123" not in raw and "tok-456" not in raw
     assert {event.kind for event in service.events()} >= {"server_added", "token_changed", "server_changed"}
+
+
+def test_an_installation_without_the_sdk_answers_mcp_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SDK is a dependency, but the error code is part of the API contract: an installation without it still
+    # keeps the configuration and refuses connections with mcp.unavailable.
+    from nodestro_runtime.mcp import hub
+
+    monkeypatch.setitem(sys.modules, "mcp", None)  # import mcp raises ImportError
+    assert not hub.sdk_available()
+    with pytest.raises(NodestroError) as caught:
+        hub.require_sdk()
+    assert caught.value.code == "mcp.unavailable"

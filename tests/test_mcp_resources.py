@@ -7,12 +7,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-pytest.importorskip("mcp")
-
 from mcp.server.mcpserver import Context
 from mcp_support import LoopbackServer, serve
+import pytest
 
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import RESOURCE_TOOL, McpServerIn, clean_definition, resource_definition

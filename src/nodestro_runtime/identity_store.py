@@ -22,7 +22,7 @@ tables and Axentra's in step (migration step M5).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import hashlib
 import secrets
 from typing import Any, Literal, cast
@@ -52,7 +52,7 @@ def _hash(token: str) -> bytes:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Tenant(BaseModel):

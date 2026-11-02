@@ -21,7 +21,7 @@ so running and saved workflows see exactly what they saw before.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import hashlib
 from pathlib import PurePosixPath
 import re
@@ -443,7 +443,7 @@ def adopt(ctx: Workspace, request: AdoptConfirm) -> AdoptOutcome:
             )
         prepared.append((source, item))
     outcome = AdoptOutcome()
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = datetime.now(UTC).isoformat()
     for source, item in prepared:
         existing = _duplicate(ctx, item)
         if existing is not None:

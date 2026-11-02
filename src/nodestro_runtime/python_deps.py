@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
-import importlib
 import re
 import sys
+import tomllib
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -317,15 +317,7 @@ def script_dependencies(code: str) -> tuple[list[str], list[DependencyIssue]]:
     )
     line_number = code[: blocks[0].start()].count("\n") + 1
     try:
-        try:
-            tomllib = importlib.import_module("tomllib")  # Python 3.11+
-            data = tomllib.loads(content)
-            dependencies = data.get("dependencies", [])
-        except ModuleNotFoundError:  # Python 3.10: the block is simple TOML; read the one key we need
-            match = re.search(r"(?ms)^dependencies\s*=\s*(\[.*?\])\s*$", content)
-            if match is None and re.search(r"(?m)^dependencies\s*=", content):
-                raise ValueError("'dependencies' is not a closed list") from None
-            dependencies = ast.literal_eval(match.group(1)) if match else []
+        dependencies = tomllib.loads(content).get("dependencies", [])
     except Exception as exc:  # any syntax error in the block
         issues.append(
             DependencyIssue(
@@ -363,7 +355,7 @@ class _Imports(ast.NodeVisitor):
         self.dynamic: list[int] = []
         self._optional = 0
 
-    def visit_Try(self, node: ast.Try) -> None:
+    def visit_Try(self, node: ast.Try | ast.TryStar) -> None:
         optional = any(_handles_import_error(handler) for handler in node.handlers)
         self._optional += optional
         for statement in node.body:

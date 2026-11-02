@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.13"]
+        python: ["3.11", "3.13"]
     # PostgreSQL storage (ADR-0002) runs the storage contract against a real server; a missing database fails.
     services:
       postgres:

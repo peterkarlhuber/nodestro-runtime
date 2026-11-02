@@ -9,40 +9,40 @@ description = "Nodestro Runtime – the multi-agent workflow engine of Nodestro,
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Peter Karlhuber" }]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@3364fb8eadb0942cd35cf9e9678f15b0121cfbbb",
+    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@dec66eba837e473385f94d26e9ca8e7ad3d5c59e",
     "pydantic>=2.6,<3",
     # Builds the Python environments of tools with third-party libraries (see python_envs.py).
     "uv>=0.5",
     "packaging>=23",
-    # The MCP client (ADR-0007): the official SDK with its own protocol version negotiation. It needs Python 3.11+;
-    # on 3.10 MCP servers cannot be reached (mcp.unavailable), everything else works.
-    "mcp>=2.3,<3; python_version >= '3.11'",
+    # The MCP client (ADR-0007): the official SDK with its own protocol version negotiation.
+    "mcp>=2.3,<3",
     "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
 # The server profile: PostgreSQL, encryption of tenant secrets (server_settings.SecretBox) and the Axentra platform
-# services (axentra_platform, off unless NODESTRO_AXENTRA=on). Axentra needs Python 3.11+: on 3.10 the server
-# profile works without it, and switching it on is refused. The desktop and Local Docker never install this extra.
+# services (axentra_platform, off unless NODESTRO_AXENTRA=on). The desktop and Local Docker never install this extra:
+# Axentra is not a base dependency, and without it the server profile works and switching it on is refused.
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5 ; python_version >= '3.11'",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5 ; python_version >= '3.11'",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5",
     "mypy>=1.13",
     # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
     "pglast>=7,<9",
@@ -69,7 +69,7 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
@@ -85,15 +85,10 @@ force-sort-within-sections = true
 known-first-party = ["nodestro_runtime"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 packages = ["nodestro_runtime"]
 mypy_path = "src"
-
-[[tool.mypy.overrides]]
-# The MCP SDK needs Python 3.11+ (dependency with an environment marker); on 3.10 it is not installed.
-module = ["mcp", "mcp.*", "mcp_types", "mcp_types.*"]
-ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # boto3/botocore (Amazon Bedrock, through orkexa[bedrock]) ship no type information.
@@ -101,7 +96,7 @@ module = ["boto3", "boto3.*", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# Axentra (optional, server profile) needs Python 3.11+; mypy checks against 3.10, where it is not installed.
+# Axentra is optional (the postgres extra, server profile only): mypy also runs where it is not installed.
 module = ["axentra", "axentra.*"]
 ignore_missing_imports = true
 

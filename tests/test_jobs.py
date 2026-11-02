@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import threading
 import time
@@ -451,7 +451,7 @@ def test_only_one_process_leads_the_scheduler(connect: Callable[[], PostgresData
 
 
 def test_every_schedule_slot_fires_once(connect: Callable[[], PostgresDatabase]) -> None:
-    slot = datetime(2026, 10, 31, 9, 0, tzinfo=timezone.utc)
+    slot = datetime(2026, 10, 31, 9, 0, tzinfo=UTC)
     results: list[bool] = []
     barrier = threading.Barrier(5)
 

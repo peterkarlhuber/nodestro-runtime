@@ -18,7 +18,7 @@ ZIP timestamps; the document date is the run's end).
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 import html
 import io
 import json
@@ -50,7 +50,7 @@ def _package(parts: dict[str, str]) -> bytes:
 
 
 def _stamp(moment: datetime | None) -> str:
-    return (moment or datetime(2000, 1, 1, tzinfo=timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (moment or datetime(2000, 1, 1, tzinfo=UTC)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _core(title: str, moment: datetime | None) -> str:
