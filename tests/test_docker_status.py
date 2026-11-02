@@ -220,6 +220,7 @@ def test_the_reaper_removes_all_own_containers_at_start_then_expired_ones(monkey
         return 1
 
     monkeypatch.setattr(docker_status, "reap", reap)
+    monkeypatch.setattr(DockerMonitor, "reap_mcp_once", lambda self, started_before=None: 0)
     checked = monitor(FakeSandbox())
     checked.reap_interval = 0.05
     checked.start_reaper(remove_all_first=True)
@@ -237,6 +238,144 @@ def test_a_reaper_failure_is_not_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(docker_status, "reap", refuse)
     assert monitor(FakeSandbox()).reap_once(remove_all=True) == 0
+
+
+class FakeContainers:
+    """Stands in for ``list_sandbox_containers`` and ``docker rm -f`` of the MCP reaper."""
+
+    def __init__(self, containers: list[Any]) -> None:
+        self.containers = {container.id: container for container in containers}
+        self.listed: list[str] = []
+        self.removed: list[str] = []
+
+    def list(self, docker: str, owner: str, *, env: Any = None) -> list[Any]:
+        self.listed.append(owner)
+        return [container for container in self.containers.values() if container.owner == owner]
+
+    def remove(self, _monitor: DockerMonitor, container_id: str) -> bool:
+        self.removed.append(container_id)
+        self.containers.pop(container_id, None)
+        return True
+
+
+def _mcp_containers(now: float) -> list[Any]:
+    from orkexa.dynamic.docker import SandboxContainer
+
+    lifetime = docker_status.MCP_LIFETIME
+    mine = "nodestro-mcp-0123456789ab"
+    return [
+        # Started a day before this process (its connection's process is gone): left behind.
+        SandboxContainer("left", "nodestro-sandbox-mcp-left", mine, now - 86400 + lifetime, True),
+        # Past its deadline.
+        SandboxContainer("expired", "nodestro-sandbox-mcp-expired", mine, now - 10, True),
+        # Without a valid deadline.
+        SandboxContainer("broken", "nodestro-sandbox-mcp-broken", mine, None, False),
+        # Started by this process after its reaper began.
+        SandboxContainer("fresh", "nodestro-sandbox-mcp-fresh", mine, now + 5 + lifetime, True),
+        # Another installation's on the same daemon (another owner): never even listed.
+        SandboxContainer("other", "nodestro-sandbox-mcp-other", "nodestro-mcp-ba9876543210", now - 10, True),
+    ]
+
+
+def test_left_behind_mcp_containers_are_reaped_at_the_start_then_expired_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = time.time()
+    fake = FakeContainers(_mcp_containers(now))
+    monkeypatch.setattr(docker_status, "list_sandbox_containers", fake.list)
+    monkeypatch.setattr(DockerMonitor, "_remove", lambda self, container_id: fake.remove(self, container_id))
+    monkeypatch.setattr(docker_status, "reap", lambda *args, **kwargs: 0)
+    checked = monitor(FakeSandbox())
+    checked.owner = "nodestro-0123456789ab"
+    assert checked.reap_mcp_once(started_before=now) == 3
+    assert sorted(fake.removed) == ["broken", "expired", "left"]
+    assert set(fake.listed) == {"nodestro-mcp-0123456789ab"}  # only the installation's own MCP owner
+    assert set(fake.containers) == {"fresh", "other"}
+    # Later runs remove only containers past their deadline: a running connection's container stays.
+    assert checked.reap_mcp_once() == 0 and set(fake.containers) == {"fresh", "other"}
+    fake.containers["fresh"] = replace(fake.containers["fresh"], deadline=time.time() - 1)
+    assert checked.reap_mcp_once() == 1 and set(fake.containers) == {"other"}
+
+
+def test_the_reaper_thread_reaps_mcp_containers_at_start_and_periodically(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[float | None] = []
+    done = threading.Event()
+
+    def reap_mcp_once(self: DockerMonitor, *, started_before: float | None = None) -> int:
+        calls.append(started_before)
+        if len(calls) >= 3:
+            done.set()
+        return 0
+
+    monkeypatch.setattr(docker_status, "reap", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(DockerMonitor, "reap_mcp_once", reap_mcp_once)
+    began = time.time()
+    checked = monitor(FakeSandbox())
+    checked.reap_interval = 0.05
+    checked.start_reaper(remove_all_first=True)
+    assert done.wait(10)
+    checked.close()
+    assert calls[0] is not None and began <= calls[0] <= time.time()
+    assert all(call is None for call in calls[1:])
+    # A server's processes (which share the daemon and owner) reap only expired MCP containers, also at the start.
+    calls.clear()
+    done.clear()
+    shared = monitor(FakeSandbox())
+    shared.reap_interval = 0.05
+    shared.start_reaper(remove_all_first=False)
+    assert done.wait(10)
+    shared.close()
+    assert all(call is None for call in calls)
+
+
+def test_a_server_s_processes_reap_only_expired_mcp_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orkexa.dynamic.docker import SandboxContainer
+
+    now = time.time()
+    shared = "nodestro-mcp"
+    fake = FakeContainers(
+        [
+            SandboxContainer("running", "a", shared, now - 86400 + docker_status.MCP_LIFETIME, True),
+            SandboxContainer("expired", "b", shared, now - 1, True),
+        ]
+    )
+    monkeypatch.setattr(docker_status, "list_sandbox_containers", fake.list)
+    monkeypatch.setattr(DockerMonitor, "_remove", lambda self, container_id: fake.remove(self, container_id))
+    assert monitor(FakeSandbox()).reap_mcp_once() == 1
+    assert fake.removed == ["expired"] and fake.listed == [shared]
+
+
+def test_the_mcp_reaper_is_quiet_without_docker_or_an_mcp_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orkexa.dynamic import SandboxError
+
+    def refuse(*args: Any, **kwargs: Any) -> list[Any]:
+        raise SandboxError("GET /containers/json is not available through the gateway")
+
+    monkeypatch.setattr(docker_status, "list_sandbox_containers", refuse)
+    assert monitor(FakeSandbox()).reap_mcp_once(started_before=time.time()) == 0
+    foreign = monitor(FakeSandbox())
+    foreign.owner = "orkexa"  # not one of Nodestro's owners: it has no MCP owner
+    assert foreign.mcp_container_owner() is None and foreign.reap_mcp_once() == 0
+
+
+def test_an_mcp_container_is_removed_with_the_daemon_s_cli_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    seen: list[tuple[list[str], Any]] = []
+
+    def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        seen.append((args, kwargs.get("env")))
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(docker_status.subprocess, "run", run)
+    assert monitor(FakeSandbox())._remove("abc") is True
+    assert seen == [([DOCKER, "rm", "-f", "abc"], {"PATH": "/usr/bin"})]
+
+
+def test_stdio_containers_carry_the_deadline_the_mcp_reaper_assumes() -> None:
+    from nodestro_runtime.mcp import stdio
+
+    assert stdio.LIFETIME == docker_status.MCP_LIFETIME
 
 
 @pytest.mark.real_docker_status

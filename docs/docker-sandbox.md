@@ -62,5 +62,8 @@ Nodestro Local Docker containers with their own `/data`) never touch each other'
 removes all of its own containers at the start (left behind by a crash; no other owner is touched), then the expired
 ones every 60 seconds. A server's API and worker processes share the owner `nodestro` and the daemon, so they only
 remove expired containers. Local MCP servers run with the owner `nodestro-mcp-<id>` (`nodestro-mcp` on a server) and a
-deadline a week ahead, and are never reaped while their connection lives. Through the sandbox gateway containers
-cannot be listed; the gateway removes its own containers.
+deadline a week ahead; the tool reaper never touches them. They are reaped separately: at the start of an installation
+that owns its containers every one started before that start (the process holds the data directory lock, so no
+connection of it is running), and every 60 seconds those past their deadline (on a server only those). Each MCP
+container starts only after the preflight and the self-test of its image in its exact shape passed, and runs the
+image by its id. Through the sandbox gateway containers cannot be listed; the gateway removes its own containers.
