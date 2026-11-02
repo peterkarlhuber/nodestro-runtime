@@ -5,6 +5,29 @@
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+Docker-first sandbox selection and library environments (security review DS-2, DS-3, 2026-11-02):
+
+- DS-3: in the desktop's `auto` mode untrusted (AI-generated) code runs only in Docker once its preflight and
+  self-test passed; otherwise it is refused with Docker's reason (`SandboxSelection.reason` is now e.g.
+  `docker-unreachable` or `docker-checking` instead of `no-isolation`). The built-in Linux sandbox is no longer chosen
+  automatically, not even when Docker is missing. New sandbox mode `linux` (`SettingsIn.sandbox`, `Settings.sandbox`,
+  `SandboxSelection.mode`; additive): the only mode that uses the built-in Linux sandbox. `subprocess` never runs
+  untrusted code (refused with reason `subprocess-mode` at call time, `no-isolation` in the selection); a stored
+  `subprocess` choice is kept, so an installation that relied on it for the built-in sandbox has to choose `linux`.
+  New `ToolLibrary.sandbox_mode` and `ToolLibrary.docker_status` (set by the workspace).
+- DS-2: untrusted code's Python libraries never become a host virtual environment: no `uv pip sync` and no
+  `verify_imports` on the host (whose interpreter runs the packages' `.pth` files as the user). New
+  `PythonEnvironments.backend()`/`scope_trust()`: in `auto` mode such scopes are container images, built and
+  import-checked in containers and refused with `sandbox.isolation_required` (Docker's `reason`) while Docker is not
+  proven; in `subprocess` and `linux` mode they are refused with `sandbox.libraries_need_isolation` (status
+  `unsupported`). Scopes whose code is a person's own keep host environments. A host environment built for a person's
+  code is no longer handed out once AI-generated code needs it. The built-in Linux sandbox always starts Nodestro's
+  own interpreter, never an environment's (whose `.pth` files would run before confinement), so untrusted code gets no
+  third-party libraries in `linux` mode. The `auto` container fallback also replaces a host environment's interpreter.
+  `status`, `plan`, `install`, `ensure`, `sandbox` and `ToolEnvironment` take an optional `trust` (additive); tool
+  jobs plan as `untrusted`. `PythonEnvironments` takes `docker_state`.
+- New `tests/test_docker_first.py`; selection, routing and built-in sandbox tests adjusted to the new policy.
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence

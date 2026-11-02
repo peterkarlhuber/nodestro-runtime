@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import textwrap
 import threading
@@ -266,22 +267,31 @@ def test_isolating_only_where_the_checks_passed(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_untrusted_code_is_routed_to_the_builtin_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Only after the built-in sandbox was chosen (``linux`` mode, Docker-first DS-3)."""
     monkeypatch.setattr(LinuxSandbox, "status", staticmethod(lambda refresh=False: _UP))
     library = ToolLibrary(tmp_path / "tools", policy=SandboxPolicy("desktop"))
     host = library.registry.sandbox
     assert isinstance(host, SubprocessSandbox)
+    for mode in (None, "auto", "subprocess"):
+        library.sandbox_mode = mode
+        with pytest.raises(NodestroError):
+            library._require("untrusted", host, "x")
+    library.sandbox_mode = "linux"
     routed = library._require("untrusted", host, "x")
     assert isinstance(routed, LinuxSandbox) and routed.python == host.python
     assert str(tmp_path) in routed.protected
     assert library._require("user-authored", host, "x") is host  # a person's own code keeps the configured sandbox
+    # A host environment's interpreter would run its packages' .pth files before the sandbox confines it (DS-2):
+    # the built-in sandbox always starts Nodestro's own interpreter.
     environment = SubprocessSandbox(python="/opt/env/bin/python", timeout=60.0, memory_mb=2048, acknowledge_unsafe=True)
     routed = library._require("untrusted", environment, "x")
-    assert isinstance(routed, LinuxSandbox) and routed.python == "/opt/env/bin/python" and routed.memory_mb == 2048
+    assert isinstance(routed, LinuxSandbox) and routed.python == sys.executable and routed.memory_mb == 2048
 
 
 def test_without_the_builtin_sandbox_untrusted_code_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(LinuxSandbox, "status", staticmethod(lambda refresh=False: _DOWN))
     library = ToolLibrary(tmp_path / "tools", policy=SandboxPolicy("desktop"))
+    library.sandbox_mode = "linux"
     with pytest.raises(NodestroError) as caught:
         library._require("untrusted", library.registry.sandbox, "x")
     assert caught.value.code == "sandbox.isolation_required"
@@ -306,9 +316,12 @@ def test_generated_tools_run_in_the_builtin_sandbox_and_never_on_the_host(
     def host(*_args: object) -> str:
         raise AssertionError("untrusted code reached the host subprocess")
 
+    from nodestro_runtime.schemas import SettingsIn
+
     workspace = Workspace(tmp_path / "data", integrations=[])
     try:
         assert workspace.sandbox_policy.profile == "desktop"
+        workspace.update_settings(SettingsIn(sandbox="linux"))  # chosen explicitly (Docker-first)
         (tmp_path / "data" / "secret.txt").write_text("secret", encoding="utf-8")
         monkeypatch.setattr(SubprocessSandbox, "_execute", host)
         saved, info = workspace.tools.save_custom(

@@ -407,6 +407,7 @@ class Workspace:
             self.tools,
             runner=python_runner,
             sandbox_kind=self._sandbox_kind,
+            docker_state=self._docker_state,
             workflow_exists=lambda workflow_id: self.store.get_raw("workflows", workflow_id) is not None,
             mcp_exists=lambda server_id: self.store.get_raw(MCP_SERVERS, server_id) is not None,
             # One Docker daemon serves every tenant of a server: a tenant's action never removes a shared image.
@@ -567,16 +568,23 @@ class Workspace:
     def _sandbox_kind(self) -> SandboxMode:
         """The sandbox setting in effect (:mod:`.sandbox_selection`): ``docker`` wherever only containers may run
         code; on the desktop the stored choice, and ``auto`` when none was made (also for installations of earlier
-        releases that never chose: an explicitly stored ``subprocess`` stays ``subprocess``)."""
+        releases that never chose: an explicitly stored ``subprocess`` stays ``subprocess``, which since Docker-first
+        runs no AI-generated code at all; the built-in Linux sandbox is used only after ``linux`` was chosen)."""
         stored = self._stored("sandbox")
         if self.sandbox_policy.profile != "desktop" or stored == "docker":
             return "docker"
-        return "subprocess" if stored == "subprocess" else "auto"
+        if stored == "subprocess":
+            return "subprocess"
+        return "linux" if stored == "linux" else "auto"
 
     def _apply_sandbox_mode(self) -> None:
-        """Give the tool library the ``auto`` mode's container fallback (and take it away in other modes)."""
-        auto = self.sandbox_policy.profile == "desktop" and self._sandbox_kind() == "auto"
+        """Tell the tool library the sandbox mode: the ``auto`` mode's container fallback (taken away in other modes),
+        and whether the built-in Linux sandbox was chosen (``linux``)."""
+        mode = self._sandbox_kind()
+        auto = self.sandbox_policy.profile == "desktop" and mode == "auto"
         self.tools.container_fallback = self._auto_container if auto else None
+        self.tools.sandbox_mode = mode
+        self.tools.docker_status = self._docker_state
 
     def _auto_container(self) -> Sandbox | None:
         """In ``auto`` mode: a container for untrusted code without libraries, while Docker passed its preflight and

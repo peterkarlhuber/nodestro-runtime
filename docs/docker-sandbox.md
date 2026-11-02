@@ -1,8 +1,12 @@
 # The Docker sandbox: status, reasons and the reaper
 
-Docker is the sandbox for AI-generated and other untrusted tool code wherever the built-in Linux sandbox is not
-released (macOS, Windows, servers, Nodestro Local Docker, Linux systems outside the tested list). Nodestro starts
-without Docker; only the secure execution is blocked, and the settings say why.
+Docker is the default sandbox for AI-generated and other untrusted tool code on every system (Docker-first): the
+desktop's `auto` mode runs such code only in Docker, also on Linux systems where the built-in Linux sandbox passed its
+checks, and refuses it with Docker's reason (`SandboxSelection.reason`, e.g. `docker-unreachable`, `docker-checking`)
+while Docker has not passed its preflight and self-test. The built-in Linux sandbox is used only after the `linux`
+mode was chosen explicitly; the `subprocess` mode never runs untrusted code. Untrusted code's Python libraries are
+container images only (built and import-checked in containers), never host environments. Nodestro starts without
+Docker; only the secure execution is blocked, and the settings say why.
 
 ## When Docker counts
 
