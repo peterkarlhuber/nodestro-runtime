@@ -104,7 +104,7 @@ are written exactly as before, and the usage dashboard reads them. The mirrors a
 |---|---|---|
 | `nodestro` (default) | Nodestro's tables (`IdentityStore`, unchanged) | Nodestro only |
 | `mirror` | Nodestro's tables | both, **one PostgreSQL transaction** (Nodestro's connection, Axentra joined to it) |
-| `axentra` | Axentra: session validity (absolute/idle expiry, revocation, disabled user; database clock), roles, memberships, member lists, tenant list | both, one transaction (Nodestro's tables stay current for the rollback) |
+| `axentra` | Axentra: session validity (absolute/idle expiry, revocation, disabled user; database clock), roles **and their permissions**, memberships, member lists, tenant list and status; Axentra also runs the OIDC login | both, one transaction (Nodestro's tables stay current for the rollback) |
 
 `AxentraIdentityStore` has `IdentityStore`'s interface; `nodestro-server` builds the store for `api`, `worker` and the
 member commands in one place. A failure on either side rolls back both; there is no dual write across connections.
@@ -120,16 +120,74 @@ member commands in one place. A failure on either side rolls back both; there is
   address. No Axentra OIDC provider entry is needed: Axentra does not run the login (Nodestro's OIDC flow and routes
   are unchanged), and `create_external_user` takes the issuer string as the provider.
 - Roles: `owner` -> `tenant_owner` (Axentra's last-owner guard applies too), `admin` -> `tenant_admin`, `viewer` ->
-  `viewer`, `editor`/`operator` -> custom tenant roles of the same key in product `nodestro` with generic tenant
-  permissions only (no `members:manage`, no tenant settings), created idempotently at start. Nodestro's
-  `read/edit/run/admin` still come from `ROLE_PERMISSIONS` by Nodestro role name; `/api/auth/me` is unchanged.
+  `viewer`, `editor`/`operator` -> custom tenant roles of the same key in product `nodestro` (generic tenant
+  permissions, no `members:manage`, no tenant settings, plus Nodestro's own, see below). `/api/auth/me` is unchanged.
 - Sessions: the same token. Axentra's `token_hash` is the hex form of Nodestro's `bytea` SHA-256, so the hash joins
   both rows (no mapping row). New sessions are started by Axentra (`start_session` makes the token, Nodestro stores
   its hash); both rows get Nodestro's expiry. The active tenant stays `nodestro_sessions.tenant_id`. `last_seen_at`
   touches, logout, "log out everywhere", removal of a member (ends their sessions in that tenant at once) and
   housekeeping are mirrored. A tenant switch still issues a new session and ends the old one.
-- Stays Nodestro-only: login states (10 minutes; a login started during the switch fails once with
-  `identity.login_expired`) and bootstrap tokens (setup links; using one writes the owner membership on both sides).
+- Bootstrap tokens (setup links) stay Nodestro's in every mode (decision on plan gap G-5: they must work in every mode
+  and after a rollback, so there is one store); using one writes the owner membership on both sides. Login states:
+  Nodestro's table in `nodestro`/`mirror`, Axentra's in `axentra` (10 minutes either way; a login started across a
+  restart into another mode fails once with `identity.login_expired`).
+
+**Permissions and roles (report risk 10, decided).** Nodestro's permissions are product permissions of product
+`nodestro`, tenant scope: `nodestro.workspace:read`, `:edit`, `:run`, `:admin` (`install` is never a tenant
+permission). `tenant_owner` and `tenant_admin` hold all four by Axentra's rules, `viewer` holds `read`
+(`default_roles`), and the custom roles list theirs (`editor`: read, edit, run; `operator`: read, run): the same table
+as `ROLE_GRANTS` / the API's `ROLE_PERMISSIONS` (an import-time assertion and a test keep them equal). They are
+registered as **versioned access definitions** (`access_definitions()`, `ACCESS_REVISION`; Axentra's
+`ax.access_definitions.apply`) at every start of `api`, `worker` and the identity commands in `mirror`/`axentra`:
+
+- the same revision is a no-op; a newer one is applied once, under an advisory lock, audited
+  (`access.definitions.apply`); an older process (rolling deployment) never downgrades it (`stale`, logged); the same
+  revision with other content stops the start (`identity.access_conflict`). A test pins the content hash of every
+  revision, so a change without a new revision fails CI. "Last start wins" is gone.
+- The managed roles `editor`/`operator` cannot be changed over Axentra's API (`409`); a later revision changes them.
+- **Source of permission checks.** In `axentra` mode the session carries the permissions Axentra's role definitions
+  grant (read in the same request as the session: a role change, a removal or a newer revision applies to the next
+  request in every process). In `nodestro` and `mirror` mode `ROLE_PERMISSIONS` decides. Route checks are unchanged
+  (`read/edit/run/admin`). Reason: one identity service answers in `axentra` mode, and the permissions come from the
+  registered definitions, so every process agrees even during a rolling deployment.
+
+**Suspended tenants (report risk 7, decided).** Nodestro tenants have a status (`active`/`suspended`, migration
+`0008_tenant_status`); `nodestro-server suspend-tenant ID` / `resume-tenant ID` set it (on both sides with Axentra
+identity). A suspended tenant is closed, not deleted:
+
+- its sessions are refused with `403 identity.tenant_suspended` (every route, event streams end at their next
+  check); a login to it, a tenant switch to it and its setup links are refused with the same code (the links stay
+  unused); `/api/auth/me` lists only active tenants; a login without a tenant goes to an active one;
+- workers fail a claimed job of it with `identity.tenant_suspended` before its run starts or continues (no model
+  call; the orphan sweep later marks the run interrupted, so it can be continued after resuming), stop runs they
+  execute for it within `reap_every` without storing more (as after a lost lease), and fire no schedules and no
+  tool-wait sweeps for it. The check is `IdentityStore.tenant_active`, answered by the identity backend.
+- In `axentra` mode a tenant counts as suspended when **either** side says so: a suspension made directly in Axentra
+  closes it at once (fail closed), and resuming it needs Nodestro's command when Nodestro's side is suspended. In
+  `nodestro`/`mirror` mode Nodestro's status decides (`mirror` writes it to Axentra too). The backfill copies a
+  suspension to Axentra and never resumes an Axentra-side one (it reports `suspended_in_axentra_only`); the
+  reconciliation reports a status that differs.
+
+**Login (M5 OIDC, decided: Axentra in `axentra` mode).** Axentra's `OidcService` meets Nodestro's requirements:
+authorization code flow with PKCE `S256`, random `state` consumed exactly once before any check (stored hashed),
+`nonce`, the browser binding (login cookie = state, no login CSRF), exact issuer, audience/`azp`, asymmetric
+algorithms only, key rotation with a rate-limited refresh, response size limit, and it never links by e-mail with
+`link_by_verified_email=false`. Generic additions made for this (Axentra `0009`): the host's callback URL
+(`redirect_uri=`), host context carried through the login (the requested tenant and the bootstrap token's hash,
+encrypted), and `finish(start_session=False)` with the verified identity. So in `axentra` mode `/api/auth/login` and
+`/api/auth/callback` run on Axentra (`nodestro_api.identity.AxentraLoginFlow`): Axentra keeps the login state,
+verifies the provider, finds or creates the user of `(issuer, subject)`, refuses a disabled account
+(`identity.account_disabled`), rate-limits starts per client address (`identity.rate_limited`, 429; behind a proxy
+set `FORWARDED_ALLOW_IPS` so uvicorn sees client addresses, or raise `security.login_rate_per_minute`) and audits
+refused logins; Nodestro then writes its user row, checks that Nodestro's link names the same Axentra user, applies a
+setup link and starts the session in the chosen tenant (both sides). Routes, cookies, error codes and redirects are
+unchanged; Axentra's codes map to Nodestro's (`login_expired` -> `identity.login_expired`, `provider_unavailable` ->
+`identity.provider`, everything else -> `identity.login_failed`). In `nodestro`/`mirror` mode Nodestro's own client
+runs the login (it must work without Axentra). Session rotation in every mode: a login ends the session the browser
+held before, and a tenant switch issues a new session and ends the old one. Logout, "log out everywhere"
+(`revoke-sessions`) and removal end sessions on both sides; ended sessions stay ended across every mode switch.
+One provider per server (`NODESTRO_OIDC_*`); a person is an identity `(issuer, subject)`, so changing the provider or
+a second issuer with the same verified address gives a new person without access (never merged by e-mail).
 
 **Procedure (maintenance window).** Stop `api` and `worker`; back up (`migrate --backup-dir`); set `NODESTRO_AXENTRA=on`
 and `migrate`; `nodestro-server axentra backfill-identity --dry-run`, then without `--dry-run` (idempotent, resumable:
@@ -145,9 +203,10 @@ Writes made in `nodestro` mode after a switch back are not mirrored: run the bac
 
 **Limits.** Session resolution in `axentra` mode costs three short reads instead of one; when Axentra notes a use on
 its own (`resolve_session`, at most once a minute) Nodestro's `last_seen_at` may lag up to about two minutes (it only
-matters for idle expiry after a rollback). In `axentra` mode the tenant list, roles and members come from Axentra,
-the user profile (`/api/auth/me` name and address) from Nodestro's row. A suspended Axentra tenant is not yet treated
-as closed. Axentra's own HTTP API and admin functions are not exposed through Nodestro.
+matters for idle expiry after a rollback); the permissions of `axentra` mode add one short read (the product's
+permission catalog). In `axentra` mode the tenant list, roles, permissions and members come from Axentra, the user
+profile (`/api/auth/me` name and address) from Nodestro's row. Axentra's own HTTP API and admin functions are not
+exposed through Nodestro.
 
 ## What stays Nodestro's
 
