@@ -21,6 +21,18 @@ SKIP_MODULES: dict[str, str] = {
 ALLOWLIST: dict[tuple[str, str], str] = {
     (
         "nodestro_runtime/axentra_identity.py",
+        "(SELECT x.axentra_id COLLATE \"default\" FROM nodestro_axentra_ids x WHERE x.kind = '{kind}' AND x.nodestro_id = %s)",
+    ): (
+        "_linked() fragment: the Axentra id linked to one Nodestro id (kind is the literal 'tenant' or 'user', checked by _linked); names no tenant table"
+    ),
+    (
+        "nodestro_runtime/axentra_identity.py",
+        "SELECT l.nodestro_id, t.name, n.created_at, CASE WHEN t.status = 'active' AND n.status = 'active' THEN 'active' ELSE 'suspended' END AS status FROM axentra_tenants t JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.axentra_id = t.id JOIN nodestro_tenants n ON n.id = l.nodestro_id WHERE t.product_id = %s AND t.id = {_linked('tenant')} ORDER BY l.nodestro_id",
+    ): (
+        "names no tenant table: Axentra's tenant joined to its link and nodestro_tenants; {_linked('tenant')} is the scalar subquery of _linked() with the tenant id as a parameter"
+    ),
+    (
+        "nodestro_runtime/axentra_identity.py",
         "SELECT lt.nodestro_id AS tenant_id, lu.nodestro_id AS user_id, m.role, CASE WHEN t.status = 'active' AND n.status = 'active' THEN 'active' ELSE 'suspended' END AS status FROM axentra_memberships m JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.axentra_id = m.tenant_id JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.axentra_id = m.user_id JOIN axentra_users u ON u.id = m.user_id AND u.status = 'active' JOIN axentra_tenants t ON t.id = m.tenant_id JOIN nodestro_tenants n ON n.id = lt.nodestro_id WHERE {where} ORDER BY lt.nodestro_id, lu.nodestro_id",
     ): (
         "names no tenant table: Axentra's memberships joined to the id links and nodestro_tenants; {where} is "
@@ -29,7 +41,7 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ),
     (
         "nodestro_runtime/axentra_identity.py",
-        "SELECT s.user_id, s.tenant_id, m.role, r.permissions AS custom, t.status = 'active' AND n.status = 'active' AS active, s.last_seen_at < clock_timestamp() - interval '1 minute' AS stale FROM nodestro_sessions s JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.nodestro_id = s.user_id JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.nodestro_id = s.tenant_id JOIN axentra_memberships m ON m.tenant_id = lt.axentra_id AND m.user_id = lu.axentra_id JOIN axentra_tenants t ON t.id = lt.axentra_id JOIN nodestro_tenants n ON n.id = s.tenant_id LEFT JOIN axentra_roles r ON r.product_id = m.product_id AND r.key = m.role WHERE s.token_hash = %s AND lu.axentra_id = %s AND m.product_id = %s",
+        "SELECT s.user_id, s.tenant_id, m.role, r.permissions AS custom, t.status = 'active' AND n.status = 'active' AS active, s.last_seen_at < clock_timestamp() - interval '1 minute' AS stale FROM nodestro_sessions s JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.nodestro_id = s.user_id JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.nodestro_id = s.tenant_id JOIN axentra_memberships m ON m.tenant_id = lt.axentra_id COLLATE \"default\" AND m.user_id = %s JOIN axentra_tenants t ON t.id = lt.axentra_id COLLATE \"default\" JOIN nodestro_tenants n ON n.id = s.tenant_id LEFT JOIN axentra_roles r ON r.product_id = m.product_id AND r.key = m.role WHERE s.token_hash = %s AND lu.axentra_id = %s AND m.product_id = %s",
     ): (
         "session lookup (NODESTRO_IDENTITY_BACKEND=axentra) by the SHA-256 of the session token, before any "
         "tenant is known: the token picks the one session and its tenant; the user and product are bound as "
