@@ -60,7 +60,11 @@ are `clone` 220, `execve` 221, `ptrace` 117, `socket` 198, `process_vm_readv` 27
   `NODESTRO_REQUIRE_SANDBOX=1`) is unchanged.
 - The confinement code (`sandbox_confine.py`) and x86-64 behavior are unchanged.
 
-Test runs: see the CI runs of branch `claude/project-thread-qz41p9` (commit message and pull request). Locally
+Test runs: CI run 41430951901 (commit f50be03, all jobs green). `builtin-sandbox-arm64` on `ubuntu-24.04-arm`
+(aarch64, kernel 7.0.0-1017-azure, normal user uid 1001): 67 passed, 20 skipped (the x86-64 header test and the
+tests that need an available sandbox); `test_the_real_machine_fails_closed` passed; the probe command exited 2 with
+reason `platform`. `builtin-sandbox` on `ubuntu-24.04` (x86-64, Landlock ABI 8): 32 of 32 probe checks passed. The
+`test` job (x86-64) ran `tests/test_sandbox_arch.py` including the header comparison. Locally
 (x86-64 container, kernel 6.18, Landlock ABI 7, normal user): the probe command passed 31 of 31 checks;
 `tests/test_builtin_sandbox.py`, `tests/test_sandbox_arch.py` and `tests/test_sandbox_policy.py` with
 `NODESTRO_REQUIRE_SANDBOX=1` passed.
