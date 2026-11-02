@@ -23,6 +23,16 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+Legacy cleanup (Axentra migration M12, 2026-11-02):
+
+- `AxentraServices.start` refuses to run without the process's database pool (`axentra.unavailable`): Axentra never
+  opens a second pool in a Nodestro process. The metrics show that one pool once (`pool="nodestro"`); the duplicate
+  `pool="axentra"` series of the shared pool is gone.
+- Removed dead code: `AxentraServices.secret_box` (use `keyring_secret_box`), `AxentraLink.backfill_tenants`
+  (`nodestro-server axentra backfill-identity` links tenants) and `AxentraLink.reverse`.
+- `docs/AXENTRA.md` lists every legacy path that stays, why, and its removal precondition; RT-036 tracks the
+  contract step.
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence

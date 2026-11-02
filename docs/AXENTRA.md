@@ -52,7 +52,8 @@ mapping between Nodestro ids and Axentra ids (`tenant`, `user`, `session`, `api_
 Nodestro ids never change.
 
 One connection pool per process: Axentra borrows the pool of Nodestro's `PostgresDatabase`
-(`axentra.data.Database.on_pool`, see [One connection pool](#one-connection-pool-m10)).
+(`axentra.data.Database.on_pool`, see [One connection pool](#one-connection-pool-m10)); `AxentraServices.start`
+refuses to run on a pool of its own.
 
 ## Database roles
 
@@ -80,7 +81,7 @@ table). A server therefore uses two roles:
   owner and everything else as such a runtime role (`tests/postgres_support.py`).
 - Found that way: Axentra's audit/usage mirror did not work under a non-superuser role (an Axentra transaction inside
   `Database.joined` emptied the scope of the enclosing `join`, so the meter was invisible); fixed in Axentra, see its
-  CHANGELOG. **The runtime pin must include that fix before any mirror runs under a runtime role.**
+  CHANGELOG (included in the current pin `f6ae01d`).
 
 ## One connection pool (M10)
 
@@ -180,7 +181,7 @@ re-encrypted, `NODESTRO_SECRET_KEY` must stay set.
 
 `AxentraLink.ensure_tenant` creates the Axentra tenant of a Nodestro tenant (slug derived from the id, `-2`, `-3` on a
 collision, `settings.nodestro_tenant` = the Nodestro id) in the caller's Nodestro transaction, serialized by an
-advisory lock; `backfill_tenants` links every existing tenant (idempotent, resumable). Pseudo tenants without a
+advisory lock; `nodestro-server axentra backfill-identity` links every existing tenant (idempotent, resumable). Pseudo tenants without a
 `nodestro_tenants` row (the price reference) are never linked.
 
 ## Audit and usage mirrors (M3)
@@ -400,7 +401,7 @@ only the package). Labels come from small fixed sets: never a tenant, user, run 
 
 | Metric | Meaning |
 |---|---|
-| `nodestro_db_pool_{size,idle,in_use,max,requests_waiting,requests,requests_errors,connection_errors}{pool}` | Nodestro's and Axentra's pools (`pool="nodestro"`, `"axentra"`); a shared pool appears once |
+| `nodestro_db_pool_{size,idle,in_use,max,requests_waiting,requests,requests_errors,connection_errors}{pool}` | The process's pool (`pool="nodestro"`); Axentra borrows it, so it has no series of its own |
 | `nodestro_integration_operations_total{operation,outcome,detail}` | This process: `mirror_write` (`audit`/`usage`/`run_usage`; `ok`, `failed`, `skipped`, `changed`), `identity_resolve` (`valid`, `none`, `error`), `secret_decrypt` (`v1`/`axs1`; `ok`, `unreadable`), `notification` |
 | `nodestro_jobs{kind,status}`, `nodestro_jobs_expired_leases`, `nodestro_workers_active`, `nodestro_jobs_oldest_queued_seconds` | The job queue |
 | `nodestro_runs_finished_24h{status}`, `nodestro_run_cost_usd_24h{status}` | Top-level runs finished in the last 24 h and their known cost, all tenants |
@@ -598,3 +599,35 @@ keeps a provider key that cannot be decrypted byte for byte (it is shown as miss
 enters a new key); billing admin keys and MCP tokens are only replaced by explicit new values. There is no switch to
 start with unreadable secrets: restore the key, or the backup. A full rollback restores the backup taken by
 `migrate`.
+
+## Legacy paths and their removal preconditions (M12)
+
+M12 is the contract step of the migration: an old implementation goes only when (1) the new one is fully tested,
+(2) existing data has been migrated and checked, (3) the fallback period has passed, (4) no supported installation or
+integration depends on it, (5) a valid backup and restore path exists and (6) the required security review has
+passed. As of 2026-11-02 no switch is active in any production environment, no fallback period has started and the
+independent security review is still running, so conditions 2, 3 and 6 hold for no path. What M12 could remove now
+was dead or superseded code with no data or rollback dependency: Axentra starting on a pool of its own (now refused by
+`AxentraServices.start`, and with it the duplicate `pool="axentra"` metric series), `AxentraServices.secret_box`
+(superseded by `keyring_secret_box`), `AxentraLink.backfill_tenants` (superseded by `backfill-identity`, which also
+copies names and suspensions) and `AxentraLink.reverse` (never called).
+
+Common precondition for every row below, called **production evidence** here: the switch has been on in production
+for at least two releases and at least 30 days without a rollback; the independent security review of that switch
+has passed; and a restore drill of the pre-switch backup on a production copy has passed.
+
+| Path (files, symbols) | Switch, default | Why it stays | Removal precondition |
+|---|---|---|---|
+| `identity_store.IdentityStore` reads of sessions, memberships, roles and tenants; tables `nodestro_memberships`, `nodestro_login_states` | `NODESTRO_IDENTITY_BACKEND`, default `nodestro` (this path) | Default path and the rollback target of `axentra` mode; `mirror` and `axentra` write both sides so that a rollback is a restart | Production evidence for `axentra` mode; `axentra reconcile-identity` prints `"ok": true` with no difference at the end of the window; the decision that `nodestro` and `mirror` mode are no longer supported (they are also the only modes of a server without the package). Then a migration drops the two tables and `AxentraIdentityStore` stops writing them |
+| Tables `nodestro_tenants`, `nodestro_users`, `nodestro_sessions`, `nodestro_bootstrap_tokens`, `nodestro_axentra_ids` | none | Not duplicates: they hold Nodestro's ids, tenant status, the profile of `/api/auth/me`, the active tenant of a session, the setup links (G-5) and the id mapping, in every mode | Not planned. Only the columns that duplicate Axentra (session expiry and revocation, user identity) may go with the row above |
+| Nodestro's OIDC client: `nodestro_api.identity.OidcClient`, `NodestroLoginFlow`, PKCE helpers, `ALGORITHMS`, `secure_url` | `NODESTRO_IDENTITY_BACKEND` `nodestro`/`mirror` (default) | The login of every server without Axentra identity, including a server without the package. `safe_return_path` and the routes are used in every mode and stay | Same as the first row: `axentra` mode the only supported identity mode |
+| Identity mirror writes and `backfill-identity` / `reconcile-identity` (`axentra_identity`) | `mirror`/`axentra` | The mirror is application code in one transaction, not database triggers; backfill and reconciliation are the evidence for condition 2 | Removed together with the first row; database mirror triggers were never built, so there is nothing else to remove |
+| Shadow modes (plan 4.6 `shadow`, `primary`, `only`) | – | Never implemented: `mirror` and `axentra` replace them | Nothing to remove |
+| `server_settings.SecretBox` v1 (`nodestro:enc:v1:`), the v1 branch of `KeyringSecretBox`, `NODESTRO_SECRET_KEY` | `NODESTRO_SECRETS_FORMAT`, default `v1` | Default format and the only one of a server without Axentra; the desktop's MCP token vault (`mcp.vault`, `NODESTRO_VAULT_KEY`) uses the same class, so the class itself stays | For the server's values: the decision that new servers write `axs1` (RT-010); on every installation `secrets reencrypt --dry-run` reports `pending: 0` and `failed: []` and `nodestro_secrets_stored{format="v1"}` is 0; zero `nodestro_integration_operations_total{operation="secret_decrypt",detail="v1"}` on every API process for 30 days (workers have no metrics listener, hence also the stored count); review passed. Then `KeyringSecretBox(legacy=None)` retires v1 (already tested: such values read as `secrets.unreadable`, never deleted) and `NODESTRO_SECRET_KEY` becomes optional |
+| Volume blobs of input files (`input_files._Blobs` on the data volume) | `NODESTRO_FILES_BACKEND`, default `volume` | Default path, the fallback read for files from before the switch and the rollback target (`files export-volume`); the desktop and Local Docker always use it | Per server: `files migrate` and `files verify` with `"ok": true`, then `files remove-source` after `NODESTRO_FILES_SOURCE_RETENTION_DAYS` (that mechanism exists). The code stays for the desktop |
+| Audit and usage mirrors (`AxentraEvents`, `axentra reconcile`) | `NODESTRO_AXENTRA_AUDIT`, `_USAGE`, `_RUN_USAGE`, default off | Not a legacy path: Nodestro's records stay the source of truth (decided, see [Usage](#usage-end-state-and-run-usage)); the mirror is the integration | Not planned |
+| Nodestro's migration runner (`storage_postgres.PostgresDatabase.migrate`) | none | Not a legacy path (M9 decided, see [Migrations](#migrations-m9-decided-nodestro-keeps-its-runner)) | Not planned |
+| `NODESTRO_AXENTRA_ALLOW_SUPERUSER` | default `0` | Not made obsolete by the runtime role: it is the explicit development opt-in that keeps the role check strict by default; a single-role database (the owner serves) cannot start Axentra without it, and the env-based tests of nodestro-api run that way | Every development setup and test harness uses the owner/runtime roles (for example `NODESTRO_TEST_RUNTIME_ROLE=1` as the default) |
+| `ndk_` API keys (`nodestro_api.serving`, `api_keys`) | – | The server serves no published APIs (M6); the desktop and Local Docker do | Not on the desktop. On a server: when publication comes, `axk_` keys plus the legacy verifier (see [API keys](#api-keys-m6-decision)), and the legacy verifier only after zero `ndk_` logins for an announced period |
+
+The contract step itself is tracked as RT-036 in `docs/TODO.md`.
