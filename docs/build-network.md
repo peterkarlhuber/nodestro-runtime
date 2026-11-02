@@ -9,8 +9,9 @@
 A Python package that ships only a source distribution must run its build script to report its dependencies, so
 `uv pip compile` for such a package cannot be split into "download on the host" and "build without network": the next
 download is known only after the build ran. Nodestro therefore resolves these packages in one container
-(`ContainerImages.compile_in_container`) that has network. Everything else about that container is locked down
-like a sandbox container (`orkexa.dynamic.docker.run_args`); the network is the one open door.
+(`ContainerImages.compile_in_container`) that has network. Everything else about that container is the proven
+sandbox shape (`orkexa.dynamic.docker.run_args`, enforced by `container_images.check_shape` up to an executable
+`/tmp` and the proxy variables); the network is the one open door.
 
 Today that network is Docker's default bridge (or `NODESTRO_DOCKER_BUILD_NETWORK`). From there a build script can
 reach:

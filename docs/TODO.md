@@ -105,6 +105,17 @@ None known.
   network is not proof that it is filtered. Source builds come back outside the desktop only with a build network
   the runtime proves filtered (RT-040). The sandbox gateway never offered a resolve container (it refuses network,
   pulls and other images), so Local Docker could not build sources before either; the refusal now says why.
+- **Proven shape (done 2026-11-02, review R-5):** The resolve and module-check containers are no longer written
+  by hand. Both are built from Orkexa's `run_args` and checked against it right before they start
+  (`container_images.check_shape`, `sandbox.shape_mismatch` otherwise, nothing started): the module check must be
+  exactly the self-tested shape; the resolve container may differ only in `RESOLVE_ALLOWANCES` (`--network none`
+  replaced by Docker's default or one named network, never `host` or another namespace mode; `noexec` dropped from
+  `/tmp`; `--env` for proxy variables without credentials). The resolve container thereby gained the noexec `/work`
+  and the sealed `/run` and `/var/tmp` of the proven shape, and its sandbox runs Orkexa's self-test with exactly its
+  own limits (`_RESOLVE_LIMITS`: memory, CPU, processes, open files, file size, tmpfs and `/dev/shm` sizes), so those
+  values are proven in the resolver image too. What the self-test cannot prove is the allowed differences themselves:
+  the network (by design) and the executable `/tmp`. An in-container probe of the resolve shape was not added: it
+  would need its own image-specific checks and would prove only what the allowlist already states.
 - **Residual risk (desktop):** The resolve container still has network (Docker's default bridge, or
   `NODESTRO_DOCKER_BUILD_NETWORK`) while untrusted build scripts run in it: they can reach the package index, the
   internet, hosts on the LAN, ports the host publishes on the bridge and, on cloud VMs, the instance metadata service.
@@ -114,8 +125,9 @@ None known.
   into code that can read them). `/tmp` in the resolve container is executable (compilers and build tools run there).
   The resolver is used only for plans a person explicitly accepted (library dialog), never for generated tools.
 - **Next step:** RT-040 (a proven filtered build network, or iterative resolving without network). Add a real-Docker
-  test of `missing_modules` and the resolve container in the CI `docker` job. Studio needs a text for
-  `deps.source_build_disabled`.
+  test of `missing_modules` and the resolve container in the CI `docker` job (it would also show that uv runs with
+  the sealed `/run` and `/var/tmp` and the `/tmp` mode Docker gives a tmpfs without `mode=`). Studio needs texts for
+  `deps.source_build_disabled` and `sandbox.shape_mismatch`.
 
 ### RT-040 · A filtered build network, so servers can build Python packages from source again
 

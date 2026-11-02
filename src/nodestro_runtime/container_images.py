@@ -21,6 +21,9 @@ id, code and Orkexa's runner on stdin, and only after the daemon passed Orkexa's
 If Docker or the image is missing, or the daemon does not prove the sandbox's limits, the call fails; there is never a
 fallback to a host subprocess.
 The module check after a build (:meth:`ContainerImages.missing_modules`) runs package code, so it runs the same way.
+Both it and the resolve container are checked against Orkexa's proven shape right before they start
+(:func:`check_shape`): the module check must be exactly that shape, the resolve container may differ only in
+:data:`RESOLVE_ALLOWANCES`.
 Source builds that a person accepted (:meth:`ContainerImages.compile_in_container`) run in a container with network;
 they are off unless the desktop profile turns them on (``deps.source_build_disabled``, RT-038).
 Every docker CLI call reads bounded output (:func:`bounded_run`), and an image is only built on a base image pinned by
@@ -52,7 +55,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
@@ -60,7 +63,6 @@ from orkexa.dynamic import BoundedOutput, DockerSandbox, SandboxError, SandboxPr
 from orkexa.dynamic.docker import (
     BOOTSTRAP,
     DEADLINE_LABEL,
-    OWNER_LABEL,
     ContainerLimits,
     copy_runner,
     run_args,
@@ -158,6 +160,125 @@ _RESOLVE_GRACE = 60.0
 #: much of the end of its stderr it keeps.
 MAX_CLI_STDOUT = 16 * 1024 * 1024
 MAX_CLI_STDERR = 256 * 1024
+#: The limits of the resolve container (:meth:`ContainerImages.compile_in_container`). Its sandbox runs Orkexa's
+#: self-test with exactly these limits in the resolver image, so they are proven on the daemon before a build runs.
+_RESOLVE_LIMITS = ContainerLimits(
+    memory_mb=2048,
+    cpus=2.0,
+    pids=256,
+    nofile=4096,
+    fsize_mb=1024,
+    tmp_mb=1024,
+    shm_mb=64,
+    lifetime_s=_RESOLVE_TIMEOUT + _RESOLVE_GRACE,
+)
+
+#: A difference from Orkexa's proven container shape (:func:`orkexa.dynamic.docker.run_args`) that
+#: :func:`check_shape` may allow, and nothing else:
+#:
+#: - ``network``: ``--network none`` replaced by Docker's default network (no ``--network``) or one named network
+#:   (never ``host``, ``container:<id>``, ``ns:<path>`` or another namespace mode);
+#: - ``exec_tmp``: ``noexec`` dropped from the ``/tmp`` tmpfs, every other option of it kept;
+#: - ``proxy_env``: ``--env`` for the proxy variables only, without credentials.
+ShapeAllowance = Literal["network", "exec_tmp", "proxy_env"]
+#: What the resolve container may differ in (it is started only on the desktop profile, RT-038).
+RESOLVE_ALLOWANCES: frozenset[ShapeAllowance] = frozenset({"network", "exec_tmp", "proxy_env"})
+#: ``docker run`` flags of the proven shape that take no value.
+_VALUE_FREE_FLAGS = frozenset({"--rm", "-i", "--read-only"})
+#: A network a resolve container may be attached to: a plain network name (no ``mode:argument`` forms).
+_NETWORK_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_NAMESPACE_NETWORKS = frozenset({"host"})
+
+
+def _run_options(args: list[str], docker: str) -> tuple[list[tuple[str, str | None]], str]:
+    """The options of ``docker run ... <image>`` (``args`` ends with the image) as ``(flag, value)`` pairs in order,
+    and the image. Raises :class:`ValueError` for anything else: another command, a positional argument before the
+    image, ``--flag=value`` forms or a flag without its value."""
+    if len(args) < 3 or args[0] != docker or args[1] != "run":
+        raise ValueError("not a docker run command")
+    body, image = args[2:-1], args[-1]
+    if not image or image.startswith("-"):
+        raise ValueError(f"invalid image {image!r}")
+    options: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(body):
+        flag = body[index]
+        if not flag.startswith("-") or "=" in flag:
+            raise ValueError(f"unexpected argument {flag!r}")
+        if flag in _VALUE_FREE_FLAGS:
+            options.append((flag, None))
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            raise ValueError(f"{flag} has no value")
+        options.append((flag, body[index + 1]))
+        index += 2
+    return options, image
+
+
+def _allowed_network(value: str) -> bool:
+    return bool(_NETWORK_NAME.fullmatch(value)) and value.lower() not in _NAMESPACE_NETWORKS
+
+
+def _allowed_proxy_env(value: str) -> bool:
+    name, separator, setting = value.partition("=")
+    return (
+        bool(separator)
+        and name in _PROXY_VARIABLES
+        and "\n" not in setting
+        and "\x00" not in setting
+        and strip_credentials(setting) == setting
+    )
+
+
+def _normalized(
+    options: list[tuple[str, str | None]], allow: frozenset[ShapeAllowance], *, candidate: bool
+) -> list[tuple[str, str | None]]:
+    """``options`` with the allowed differences taken out (raises :class:`ValueError` for a difference that is not
+    allowed in the form it has)."""
+    kept: list[tuple[str, str | None]] = []
+    networks = 0
+    for flag, value in options:
+        if flag == "--network" and "network" in allow:
+            networks += 1
+            if candidate and not (value is not None and _allowed_network(value)):
+                raise ValueError(f"the network {value!r} is not allowed")
+            continue
+        if flag == "--tmpfs" and value is not None and value.startswith("/tmp:") and "exec_tmp" in allow:
+            kept.append((flag, "/tmp:" + ",".join(item for item in value[5:].split(",") if item != "noexec")))
+            continue
+        if flag == "--env" and candidate and "proxy_env" in allow:
+            if value is None or not _allowed_proxy_env(value):
+                raise ValueError("only proxy settings without credentials may be passed")
+            continue
+        kept.append((flag, value))
+    if networks > 1:
+        raise ValueError("more than one --network")
+    return kept
+
+
+def check_shape(candidate: list[str], proven: list[str], *, allow: frozenset[ShapeAllowance] = frozenset()) -> None:
+    """Refuse ``candidate`` (``docker run`` up to the image) unless it is ``proven`` (the same call of Orkexa's
+    :func:`~orkexa.dynamic.docker.run_args`, the shape the in-container self-test proves) with at most the
+    differences in ``allow`` (:data:`ShapeAllowance`): the same options with the same values in the same order, the
+    same docker CLI and the same image. Raises :class:`NodestroError` ``sandbox.shape_mismatch`` otherwise.
+
+    Every container Nodestro starts outside a :class:`StreamedSandbox` tool call (the module check, the resolve
+    container) is checked this way right before it starts, so a later change of either side cannot quietly move it
+    away from the proven shape."""
+    docker = proven[0] if proven else ""
+    try:
+        theirs, their_image = _run_options(candidate, docker)
+        ours, our_image = _run_options(proven, docker)
+        if their_image != our_image:
+            raise ValueError("another image")
+        if _normalized(theirs, allow, candidate=True) != _normalized(ours, allow, candidate=False):
+            raise ValueError("options that differ from the proven shape")
+    except ValueError as exc:
+        raise NodestroError(
+            "sandbox.shape_mismatch",
+            f"A container was refused before it started: it differs from the sandbox's proven shape ({exc})",
+        ) from None
 
 
 def default_base(python_version: str) -> str:
@@ -641,25 +762,29 @@ class ContainerImages:
         """Resolve ``requirements`` like :meth:`~nodestro_runtime.python_envs.UvRunner.compile`, but in a container,
         so the build scripts of packages without a wheel never run on the host. Returns the lock (with hashes).
 
-        The build scripts are untrusted code, so the container is as close to the sandbox's shape
-        (:func:`orkexa.dynamic.docker.run_args`) as a build allows: no bind mount, no capabilities, no new
-        privileges, user ``nobody``, a read-only root file system with a ``tmpfs`` ``/tmp`` (executable: compilers
-        and build tools run there), private IPC, memory (without swap), CPU, process, open-file, file-size and core
-        limits, no logging, never pulled (the image is pulled by its digest first and run by its id), and the labels
-        ``org.orkexa.sandbox=<owner>`` and ``org.orkexa.deadline``, so the reaper removes a container a crashed
-        process left behind. The host reads at most :data:`_RESOLVE_STDOUT` bytes of the lock and the end of
-        stderr; a timeout, too much output or a cancelled call kills and removes the container.
+        The build scripts are untrusted code, so the container is Orkexa's proven sandbox shape
+        (:func:`orkexa.dynamic.docker.run_args` with :data:`_RESOLVE_LIMITS`, the shape the self-test checked on
+        this daemon in this image) with exactly three differences (:data:`RESOLVE_ALLOWANCES`, enforced by
+        :func:`check_shape` right before the container starts): network, an executable ``/tmp`` (compilers and build
+        tools run there) and the proxy variables. So: no bind mount, no capabilities, no new privileges, user
+        ``nobody``, a read-only root file system, ``noexec`` ``/work``, sealed ``/run`` and ``/var/tmp``, private IPC,
+        memory (without swap), CPU, process, open-file, file-size and core limits, no logging, never pulled (the image
+        is pulled by its digest first and run by its id), and the labels ``org.orkexa.sandbox=<owner>`` and
+        ``org.orkexa.deadline``, so the reaper removes a container a crashed process left behind. The host reads at
+        most :data:`_RESOLVE_STDOUT` bytes of the lock and the end of stderr; a timeout, too much output or a
+        cancelled call kills and removes the container.
 
         It is the only container with network: the resolver needs the package index, and a package's metadata is
         only known after its build script ran. The network is Docker's default one (or
-        ``NODESTRO_DOCKER_BUILD_NETWORK``), and it is not filtered (RT-038). No host variable
-        reaches it but the proxy settings, **without** a user name or password (:func:`strip_credentials`): the build
-        code could read them. The requirements, the previous lock and a certificate authority
-        (``NODESTRO_BUILD_CA_FILE`` or ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout.
+        ``NODESTRO_DOCKER_BUILD_NETWORK``, a network name; ``host`` and other namespace modes are refused), and it is
+        not filtered (RT-038). No host variable reaches it but the proxy settings, **without** a user name or password
+        (:func:`strip_credentials`): the build code could read them. The requirements, the previous lock and a
+        certificate authority (``NODESTRO_BUILD_CA_FILE`` or ``SSL_CERT_FILE``) travel on stdin; the lock comes back
+        on stdout.
 
         It runs only after the daemon passed Orkexa's preflight and the in-container self-test for the resolver image
-        (``sandbox.unavailable`` otherwise). The image is uv's, pinned by digest (:data:`UV_IMAGE`); an image that is
-        not pinned by a real digest is refused (``deps.build_unavailable``).
+        with the resolve container's limits (``sandbox.unavailable`` otherwise). The image is uv's, pinned by digest
+        (:data:`UV_IMAGE`); an image that is not pinned by a real digest is refused (``deps.build_unavailable``).
 
         Source builds are off unless :attr:`source_builds` is set (only the desktop profile sets it): the network of
         this container is not filtered, so on a server or in Nodestro Local Docker build scripts could reach the LAN,
@@ -668,8 +793,8 @@ class ContainerImages:
 
         Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when source builds
         are off (``deps.source_build_disabled``), Docker is missing or not proven (``sandbox.unavailable``), the image
-        is not pinned or cannot be pulled (``deps.build_unavailable``) or the container was stopped
-        (``deps.image_failed``)."""
+        is not pinned or cannot be pulled (``deps.build_unavailable``), the container left the proven shape
+        (``sandbox.shape_mismatch``, nothing started) or the container was stopped (``deps.image_failed``)."""
         if not self.source_builds:
             # Before any docker call: no pull, no self-test, no container.
             raise NodestroError(
@@ -684,19 +809,20 @@ class ContainerImages:
                 "Building packages from source in a container is not set up in this version (the resolver image is "
                 "not pinned), and Nodestro never runs build scripts on this computer",
             )
+        network = self._build_network()
         environ = self._cli_environment()
         image_id = self._pinned_image(image, log)
         sandbox = self.sandbox_class(
             image=image_id,
             timeout=_RESOLVE_TIMEOUT,
-            memory_mb=2048,
-            cpus=2.0,
-            pids_limit=256,
+            container_limits=_RESOLVE_LIMITS,
             docker=self.docker,
             environ=environ,
             owner=self.owner,
         )
-        probe = sandbox.self_test()  # preflight and self-test on this daemon, for this image: or nothing runs
+        # Preflight and self-test on this daemon, for this image and with exactly the resolve container's limits:
+        # or nothing runs.
+        probe = sandbox.self_test()
         if not probe.available:
             raise NodestroError(
                 "sandbox.unavailable",
@@ -720,8 +846,12 @@ class ContainerImages:
             if cleaned:
                 proxies[variable] = cleaned
         name = f"nodestro-resolve-{uuid.uuid4().hex[:12]}"
+        deadline = math.ceil(time.time() + _RESOLVE_LIMITS.lifetime_s)
+        shaped = self._resolve_args(name, image_id, proxies, network=network, deadline=deadline)
+        proven = run_args(self.docker, name, image_id, _RESOLVE_LIMITS, owner=self.owner, deadline=deadline)
+        check_shape(shaped, proven, allow=RESOLVE_ALLOWANCES)  # sandbox.shape_mismatch: nothing starts
         args = [
-            *self._resolve_args(name, image_id, proxies),
+            *shaped,
             "python",
             "-I",
             "-B",
@@ -745,25 +875,42 @@ class ContainerImages:
             raise ResolveError(redact(explanation))
         return stdout
 
-    def _resolve_args(self, name: str, image_id: str, proxies: Mapping[str, str]) -> list[str]:
-        """``docker run`` up to the image for the resolve container (see :meth:`compile_in_container`)."""
-        network = self.environ.get("NODESTRO_DOCKER_BUILD_NETWORK")
-        deadline = math.ceil(time.time() + _RESOLVE_TIMEOUT + _RESOLVE_GRACE)
-        fsize = 1024 * 1024 * 1024
-        return [
-            self.docker,
-            *("run", "--rm", "-i", "--pull", "never", "--name", name),
-            *(("--network", network) if network else ()),
-            *("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534"),
-            *("--ipc", "private", "--shm-size", "64m"),
-            *("--ulimit", "nofile=4096:4096", "--ulimit", f"fsize={fsize}:{fsize}", "--ulimit", "core=0:0"),
-            *("--log-driver", "none"),
-            *("--pids-limit", "256", "--memory", "2048m", "--memory-swap", "2048m", "--cpus", "2"),
-            *("--tmpfs", "/tmp:rw,nosuid,nodev,size=1024m,uid=65534,gid=65534,mode=0700"),
-            *("--label", f"{OWNER_LABEL}={self.owner}", "--label", f"{DEADLINE_LABEL}={deadline}"),
-            *(item for variable, value in proxies.items() for item in ("--env", f"{variable}={value}")),
-            image_id,
-        ]
+    def _build_network(self) -> str | None:
+        """The network of the resolve container: ``NODESTRO_DOCKER_BUILD_NETWORK`` or Docker's default (``None``).
+        A namespace mode (``host``, ``container:<id>``, ...) is refused (``deps.build_unavailable``)."""
+        network = self.environ.get("NODESTRO_DOCKER_BUILD_NETWORK", "").strip()
+        if not network:
+            return None
+        if not _allowed_network(network):
+            raise NodestroError(
+                "deps.build_unavailable",
+                f"NODESTRO_DOCKER_BUILD_NETWORK={network!r} is not allowed for building packages from source: it must "
+                "name a Docker network (not host or another namespace mode)",
+            )
+        return network
+
+    def _resolve_args(
+        self, name: str, image_id: str, proxies: Mapping[str, str], *, network: str | None, deadline: int
+    ) -> list[str]:
+        """``docker run`` up to the image for the resolve container (see :meth:`compile_in_container`).
+
+        Orkexa's proven shape (:func:`orkexa.dynamic.docker.run_args` with :data:`_RESOLVE_LIMITS`) with exactly
+        :data:`RESOLVE_ALLOWANCES`: the network (``network``, or Docker's default), an executable ``/tmp`` (compilers
+        and build tools run there) and the proxy variables in ``proxies``. :func:`check_shape` enforces that."""
+        proven = run_args(self.docker, name, image_id, _RESOLVE_LIMITS, owner=self.owner, deadline=deadline)
+        options, image = _run_options(proven, self.docker)
+        args = [self.docker, "run"]
+        for flag, value in options:
+            if flag == "--network":
+                if network:
+                    args += [flag, network]
+                continue
+            if flag == "--tmpfs" and value is not None and value.startswith("/tmp:"):
+                value = "/tmp:" + ",".join(item for item in value[5:].split(",") if item != "noexec")
+            args += [flag] if value is None else [flag, value]
+        for variable, setting in proxies.items():
+            args += ["--env", f"{variable}={setting}"]
+        return [*args, image]
 
     def _pinned_image(self, image: str, log: Callable[[str], None]) -> str:
         """The id of the local image ``image`` (``repository[:tag]@sha256:<digest>``), pulled by its digest when it is
@@ -817,7 +964,8 @@ class ContainerImages:
         (:func:`orkexa.dynamic.docker.run_args`: no network, read-only, no capabilities, ``nobody``, limits, the
         owner and deadline labels), the image by its id, only after the daemon passed Orkexa's preflight and the
         self-test for this image (``sandbox.unavailable`` otherwise), with bounded output, and stopped and removed
-        after :data:`_VERIFY_TIMEOUT` seconds (``deps.image_failed``)."""
+        after :data:`_VERIFY_TIMEOUT` seconds (``deps.image_failed``). Its arguments must be exactly that shape
+        (:func:`check_shape` without allowances; ``sandbox.shape_mismatch`` otherwise, nothing started)."""
         names = sorted({name for name in modules if name})
         script = (
             "import importlib.util, json, sys; "
@@ -830,10 +978,14 @@ class ContainerImages:
             raise NodestroError("sandbox.unavailable", f"The image {tag} cannot be checked: {exc}") from None
         name = f"nodestro-sandbox-verify-{uuid.uuid4().hex[:12]}"
         command = ["python", "-I", "-B", "-c", script, json.dumps(names)]
+        shaped = sandbox.shaped_run(name, image_id)
+        deadline = next(value for value in shaped if value.startswith(DEADLINE_LABEL + "="))
+        proven = run_args(
+            self.docker, name, image_id, sandbox.limits(), owner=self.owner, deadline=float(deadline.partition("=")[2])
+        )
+        check_shape(shaped, proven)  # exactly the self-tested shape, no allowance
         try:
-            code, output = sandbox.run_container(
-                [*sandbox.shaped_run(name, image_id), *command], name, max_stdout=_VERIFY_STDOUT
-            )
+            code, output = sandbox.run_container([*shaped, *command], name, max_stdout=_VERIFY_STDOUT)
         except SandboxError as exc:
             raise NodestroError("deps.image_failed", f"Checking the modules of {tag} stopped: {exc}") from None
         stdout = output.stdout.decode("utf-8", "replace")
@@ -917,9 +1069,28 @@ class StreamedSandbox(DockerSandbox):
     container.
     """
 
-    def __init__(self, *, environ: Mapping[str, str] | None = None, owner: str = OWNER, **options: Any) -> None:
+    def __init__(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+        owner: str = OWNER,
+        container_limits: ContainerLimits | None = None,
+        **options: Any,
+    ) -> None:
+        """``container_limits`` replaces the limits Orkexa derives from ``memory_mb``, ``cpus``, ``pids_limit`` and
+        ``timeout`` (the resolve container's larger file, tmpfs and open-file limits); the self-test then proves
+        exactly these."""
         options.pop("transport", None)  # always stdin: a mount needs the daemon to see this computer's files
+        if container_limits is not None:
+            options.update(
+                memory_mb=container_limits.memory_mb, cpus=container_limits.cpus, pids_limit=container_limits.pids
+            )
+        self._container_limits = container_limits  # before Orkexa's __init__, which validates limits()
         super().__init__(transport="stdin", owner=owner, environ=environ, **options)
+
+    def limits(self) -> ContainerLimits:
+        """The limits of this sandbox's containers (and of its self-test)."""
+        return self._container_limits if self._container_limits is not None else super().limits()
 
     def self_test(self, *, image: str | None = None) -> SandboxProbe:
         """Orkexa's self-test; a pass also proves the daemon for the sandbox policy
@@ -1102,6 +1273,7 @@ __all__ = [
     "RuntimeImageSandbox",
     "StreamedSandbox",
     "bounded_run",
+    "check_shape",
     "default_base",
     "lock_has_hashes",
     "orkexa_fingerprint",
