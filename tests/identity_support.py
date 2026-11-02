@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import postgres_support
+
 
 def create_tenants(database: Any, tenants: list[tuple[str, str]]) -> None:
     from nodestro_runtime.identity_store import IdentityStore
@@ -18,8 +20,6 @@ def axentra_services(database: Any) -> Any:
     import base64
     import secrets
 
-    import postgres_support
-
     from nodestro_runtime.axentra_platform import AxentraConfig, AxentraServices
 
     ring = "k1:" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
@@ -28,6 +28,8 @@ def axentra_services(database: Any) -> Any:
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        migration_url=postgres_support.DSN,
+        database=database,  # one pool: Axentra borrows the Nodestro database's connections (as on a server)
     )
     services.migrate()
     services.start()
@@ -37,6 +39,6 @@ def axentra_services(database: Any) -> Any:
 def age_sessions(database: Any, by: Any) -> None:
     """Move the last use of every session back by ``by`` (a ``timedelta``) on both sides."""
     database._write("UPDATE nodestro_sessions SET last_seen_at = clock_timestamp() - %s", (by,))
-    exists = database._query("SELECT to_regclass('axentra_sessions') IS NOT NULL")[0][0]
+    exists = postgres_support.owner_of(database)._query("SELECT to_regclass('axentra_sessions') IS NOT NULL")[0][0]
     if exists:
-        database._write("UPDATE axentra_sessions SET last_seen_at = now() - %s", (by,))
+        postgres_support.owner_of(database)._write("UPDATE axentra_sessions SET last_seen_at = now() - %s", (by,))

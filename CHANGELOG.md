@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
+shared pool, runtime roles; replaces `f114920`).
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence
@@ -12,6 +15,38 @@ Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
   (`RunManager.owns`, set by `RunWorker`; a failing check counts as lost).
 - New `tests/test_job_delivery.py` (real PostgreSQL): SIGKILL during a model call, stalled worker, external write
   before a lost lease, parallel workers, cancel and resume, nested sub-workflows.
+
+Identity completion (Axentra migration M5, risks 7 and 10; off by default):
+
+- Suspended tenants: migration `0008_tenant_status` (`nodestro_tenants.status`), `IdentityStore.set_tenant_status`,
+  `tenant_active`, `Tenant.status`, `Membership.tenant_status`. A suspended tenant's sessions, new sessions and setup
+  links are refused with `identity.tenant_suspended`; with Axentra identity both sides are written, and in `axentra`
+  mode a suspension on either side closes the tenant. Backfill copies suspensions (never resumes one), reconcile
+  reports status differences.
+- Versioned access definitions: Nodestro's permissions `nodestro.workspace:read|edit|run|admin` and the roles
+  `editor`/`operator` are applied with Axentra's `ax.access_definitions` (`ACCESS_REVISION`, content hash pinned by a
+  test) instead of creating roles at every start; a conflicting revision stops the start (`identity.access_conflict`).
+  In `axentra` mode `Session.permissions` comes from Axentra's role definitions. Needs Axentra with migration `0009`.
+
+Database roles, one connection pool, migration checksums (Axentra migration, work package dbinfra):
+
+- `grant_runtime_role(owner_database, role)` and `inspect_role` in `storage_postgres`: a runtime role gets data
+  privileges only (tables, sequences, functions, default privileges for later migrations; schema versions
+  read-only); refused for the owner itself, superusers, `BYPASSRLS` and table-owning roles.
+  `PostgresDatabase.role_info()`. `ServerSettings` reads `NODESTRO_DATABASE_MIGRATION_URL[_FILE]` (the owner role;
+  default: `NODESTRO_DATABASE_URL`).
+- `AxentraServices(database=..., migration_url=...)`: Axentra borrows the `PostgresDatabase` pool
+  (`PostgresDatabase.shared_pool()`, Axentra `Database.on_pool`) and migrates with the owner's connection; its serving
+  gate reads through the runtime pool. `start()` refuses a superuser, `BYPASSRLS` or table-owning role in every
+  environment unless `NODESTRO_AXENTRA_ALLOW_SUPERUSER=1`, before writing anything.
+- Migrations record a SHA-256 checksum per file (`nodestro_schema_migrations.checksum`, added by the runner); a changed
+  applied migration is refused (`storage.migration_changed`) by `migrate` and `require_current_schema`; rows of
+  earlier releases are adopted once. `migrate` no longer needs the CREATE privilege on the database when its schema
+  exists.
+- Tests: `tests/test_database_roles.py`, `tests/test_tenant_filters.py`, checksum cases in
+  `tests/test_storage_postgres.py`; `NODESTRO_TEST_RUNTIME_ROLE=1` runs every PostgreSQL test as a runtime role
+  (migrations as the owner). Measurements: `tests/bench_shared_pool.py`, `tests/bench_nodestro_rls.py`
+  (`docs/AXENTRA.md`). Needs Axentra with `Database.on_pool` and the `joined`/`join` scope fix.
 
 One container owner per installation (Docker-first plan R2 follow-up, 2026-11-02):
 
@@ -110,6 +145,15 @@ Environment image caps and collection (Docker-first plan R3, 2026-11-02):
 
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 
+- Observability, notifications, run usage and secrets rollback (all off by default, needs Axentra with the inbox
+  channel, migration `0010_notify_inbox`): `axentra_metrics.ServerMetrics` on Axentra's metrics registry (pools,
+  jobs, leases, schema state, reconcile backlog, run cost of 24 h, operations by outcome; no tenant labels);
+  `NODESTRO_AXENTRA_RUN_USAGE` settles finished runs once per run and meter (`nodestro:run:<run>:<meter>`);
+  `NODESTRO_AXENTRA_NOTIFY` puts failed runs, pending approvals and budget decisions into the members' Axentra inbox
+  (`axentra_notify`, idempotent per event and recipient, never e-mail); `require_readable_secrets` refuses to start
+  `NODESTRO_AXENTRA=off` while `axs1` values exist or with a keyring missing a key id in use, and
+  `NODESTRO_SECRETS_FORMAT=v1` re-encryption moves `axs1` values back to v1. See `docs/AXENTRA.md`.
+
 - New `nodestro_runtime.axentra_platform` and `docs/AXENTRA.md`. `NODESTRO_AXENTRA=on` opens Axentra in the server's
   PostgreSQL database (product `nodestro`, single-product mode, keyring from `NODESTRO_AXENTRA_KEYRING[_FILE]`).
   `nodestro-runtime[postgres]` and `[dev]` install `axentra[oidc]` from a pinned commit on Python 3.11+ only; 3.10
@@ -128,6 +172,14 @@ Axentra platform services in the server profile (Axentra migration, 2026-11-02; 
   answers, both written), `backfill_identity`, `reconcile_identity` and `identity_readiness`. Same session tokens on
   both sides, never a merge by e-mail, Nodestro ids and contracts unchanged. `AxentraLink.ensure_tenant` reads slugs
   in Axentra's platform scope (row-level security); `AxentraLink.tenant` caches only committed links.
+- Input files in Axentra's storage (M8, `NODESTRO_FILES_BACKEND`, default `volume`): new
+  `nodestro_runtime.axentra_storage` (`AxentraFiles`, `AxentraBlobs`) stores input file bytes through Axentra's
+  `StorageService` (local or S3) with tenant isolation, quotas, the size limit, the G-7 content-type policy
+  (`store_inert` for product `nodestro` unless it has its own), and a SHA-256 check on every read; ids and references
+  unchanged, the volume is the read fallback. Resumable `migrate`, `verify`, guarded `remove_sources`
+  (`NODESTRO_FILES_SOURCE_REMOVAL`, `NODESTRO_FILES_SOURCE_RETENTION_DAYS`) and `export_to_volume` (rollback).
+  `InputFiles(blobs=...)`, `InputFiles.download_type`, `WorkspaceStorage.input_blobs`, `AxentraConfig.modules`.
+  Tests: `tests/test_axentra_storage.py` (also against moto's S3 server when installed).
 - New `tests/test_axentra_platform.py`, `tests/test_axentra_mirror.py` and `tests/test_axentra_identity.py`;
   `tests/test_identity_store.py` runs against all three identity backends.
 
@@ -826,6 +878,7 @@ Nodestro Local Docker (the `local-container` profile and the sandbox gateway):
   29 really sends and on hostile ones, the protocol (including attach with half-close) against a stand-in daemon,
   and with `NODESTRO_DOCKER_TESTS=1` a real image build, a tool call without network or writable files, and refused
   escape attempts through the docker CLI.
+
 Request options cannot add tools or a provider-hosted MCP server (security fix, MCP-0 finding F-1):
 
 - An agent's `request_options` could switch on a provider's own MCP connector and add tools past the tool library:
