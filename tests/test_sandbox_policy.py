@@ -255,7 +255,11 @@ def test_the_workspace_keeps_provenance_and_forgets_it_after_a_restore(tmp_path:
         reopened.close()
 
 
-def test_the_agent_check_reports_an_untrusted_tool_without_isolation(tmp_path: Path) -> None:
+def test_the_agent_check_reports_an_untrusted_tool_without_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without Docker: where it runs, the automatic mode would use it (tests/test_sandbox_selection.py).
+    monkeypatch.setattr(DockerSandbox, "available", staticmethod(lambda *a, **k: False))
     workspace = Workspace(tmp_path / "data", integrations=[])
     try:
         save_generated(workspace.tools, ContainerDouble())
