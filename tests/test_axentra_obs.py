@@ -177,8 +177,14 @@ def _run(database: Any, tenant: str, run_id: str, status: str, usage: dict[str, 
     database.store(tenant).put_raw("runs", run_id, document)
 
 
+def _owner(database: Any) -> Any:
+    """The table owner's view: Axentra's tables have forced row-level security, so a check that reads them across
+    tenants (no Axentra scope) runs as the owner (``NODESTRO_TEST_RUNTIME_ROLE=1``; otherwise ``database`` itself)."""
+    return postgres_support.owner_of(database)
+
+
 def _totals(database: Any, prefix: str = "nodestro:run:") -> dict[str, Decimal]:
-    rows = database._query(
+    rows = _owner(database)._query(
         "SELECT m.key, sum(e.quantity) FROM axentra_usage_events e JOIN axentra_usage_meters m ON m.id = e.meter_id"
         " WHERE e.idempotency_key LIKE %s GROUP BY m.key",
         (prefix + "%",),
@@ -218,10 +224,10 @@ def test_finished_runs_are_settled_once_per_run_and_meter(runs: tuple[Any, Axent
     first, second = events.reconcile(), events.reconcile()
     assert (first["runs_missing"], second["runs_missing"], second["written"]) == (0, 0, 0)
     assert _totals(database) == totals
-    keys = {row[0] for row in database._query("SELECT idempotency_key FROM axentra_usage_events")}
+    keys = {row[0] for row in _owner(database)._query("SELECT idempotency_key FROM axentra_usage_events")}
     assert run_usage_key("run_ok", "nodestro.ai.requests") in keys
     assert not any("run_child" in key or "run_import" in key or "run_busy" in key for key in keys)
-    props = database._query(
+    props = _owner(database)._query(
         "SELECT properties FROM axentra_usage_events WHERE idempotency_key = %s",
         (run_usage_key("run_api", "nodestro.ai.requests"),),
     )
@@ -530,7 +536,7 @@ def test_failed_runs_and_pending_approvals_go_to_the_inbox_once(notifying: tuple
     assert notify.list_inbox(viewer, product, tenant).items == []
     # Nothing was handed to a delivery provider.
     assert notify.dispatcher().run_once(10).claimed == 0
-    rows = database._query("SELECT DISTINCT channel, status, provider FROM axentra_notify_messages")
+    rows = _owner(database)._query("SELECT DISTINCT channel, status, provider FROM axentra_notify_messages")
     assert rows == [("inbox", "sent", "inbox")]
 
 
