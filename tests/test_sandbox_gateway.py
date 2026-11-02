@@ -271,6 +271,13 @@ def test_foreign_and_malformed_labels_are_dropped() -> None:
     assert json.loads(raw)["Labels"] == {LABEL: "test"}
 
 
+@pytest.mark.parametrize("owner", ["nodestro-0123456789ab", "nodestro-mcp-0123456789ab", "nodestro"])
+def test_an_installation_s_own_owner_label_is_kept(owner: str) -> None:
+    labels = {"org.orkexa.sandbox": owner, "org.orkexa.deadline": "1798761600"}
+    _, raw = plan_create({}, body(Labels=labels), CONFIG)
+    assert json.loads(raw)["Labels"] == {**labels, LABEL: "test"}  # the gateway's own label is always its own
+
+
 @pytest.mark.parametrize(
     ("host", "reason"),
     [

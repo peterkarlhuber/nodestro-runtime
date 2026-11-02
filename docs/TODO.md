@@ -98,16 +98,20 @@ None known.
 
 ### RT-034 · Container reaper: follow-ups
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.DockerMonitor.start_reaper`
-- **What:** Tool containers carry `org.orkexa.sandbox=nodestro` and a deadline label. A desktop and Nodestro Local
-  Docker remove all of them at the start (`reap(owner, remove_all=True)`, only that owner), every process then
-  removes the expired ones every 60 s. Local MCP servers use the owner `nodestro-mcp` and are never reaped (they live
-  as long as their connection). Open: a server's API and worker processes share a daemon, so they reap only expired
-  containers and never all at start; through the sandbox gateway containers cannot be listed, so there the gateway's
-  own reconcile does the work; two installations on one daemon share the owner `nodestro` (a desktop start would
-  remove a second installation's running containers).
-- **Next step:** An installation id in the owner label (e.g. `nodestro-<id>`), and a real-daemon test of the reaper in
-  the CI `docker` job.
+- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.DockerMonitor.start_reaper`,
+  `docker_status.installation_owner`
+- **What:** Tool containers carry `org.orkexa.sandbox=<owner>` and a deadline label. The owner of a desktop or
+  Nodestro Local Docker is its own (`nodestro-<12 hex digits of SHA-256 of the resolved data directory and the
+  installation id>`, done 2026-11-02): such an installation removes all of its own containers at the start
+  (`reap(owner, remove_all=True)`), then the expired ones every 60 s, and never touches another installation's
+  containers on the same daemon. Local MCP servers use `nodestro-mcp-<id>` and are never reaped (they live as long as
+  their connection). A server's API and worker processes share the owner `nodestro` and reap only expired
+  containers. Open: through the sandbox gateway containers cannot be listed, so there the gateway's own reconcile does
+  the work; containers an earlier release left with the owner `nodestro` on a desktop are no longer removed at the
+  start (they have a deadline; a server on the same daemon removes them once expired, otherwise `docker rm`); a copy of
+  a data directory (with its `python/installation-id`) at the same path on the same daemon, e.g. a second Nodestro
+  Local Docker container on a copied volume, shares the owner.
+- **Next step:** A real-daemon test of the reaper (two owners on one daemon) in the CI `docker` job.
 
 ## Bugs and reliability
 

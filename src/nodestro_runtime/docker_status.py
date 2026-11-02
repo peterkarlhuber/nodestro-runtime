@@ -20,8 +20,11 @@ still checks again itself before it starts (Orkexa). The Studio starts without D
 blocked, with the reason.
 
 The monitor also removes containers this installation left behind (:func:`orkexa.dynamic.docker.reap`, only those
-labelled ``org.orkexa.sandbox=nodestro``): at the start all of them (a desktop or Nodestro Local Docker, which own the
-daemon's Nodestro containers), then every :data:`REAP_INTERVAL` seconds those past their deadline.
+labelled ``org.orkexa.sandbox=<owner>``): at the start all of them (a desktop or Nodestro Local Docker, which own
+their containers), then every :data:`REAP_INTERVAL` seconds those past their deadline. The owner names one
+installation (:func:`installation_owner`: ``nodestro-<id>``), so two installations on one daemon (two desktop users,
+a desktop and Nodestro Local Docker) never remove each other's containers. A server's API and worker processes share
+the owner :data:`OWNER` and only ever remove expired containers.
 """
 
 from __future__ import annotations
@@ -30,8 +33,11 @@ from collections.abc import Callable, Mapping
 import contextlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import logging
 import os
+from pathlib import Path
+import re
 import shutil
 import sys
 import threading
@@ -46,8 +52,11 @@ if TYPE_CHECKING:  # the schemas import the sandbox policy, which imports this m
 
 logger = logging.getLogger(__name__)
 
-#: The owner label (``org.orkexa.sandbox``) of Nodestro's tool containers; the reaper removes only these.
+#: The owner label (``org.orkexa.sandbox``) of a server's tool containers (shared by its API and worker processes,
+#: which only ever reap expired ones) and the prefix of an installation's own owner (:func:`installation_owner`).
 OWNER = "nodestro"
+#: Orkexa's rule for an owner (:func:`orkexa.dynamic.docker.run_args` refuses any other).
+_OWNER_RULE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 #: Seconds a preflight result is reused before ``docker info`` runs again.
 PREFLIGHT_TTL = 5.0
 #: Seconds before a failed self-test is tried again by itself (a passed one is kept per daemon fingerprint).
@@ -79,6 +88,37 @@ ROOTFUL_NOTE = (
     "This Docker daemon runs as root: membership in the docker group (or access to its socket) is equivalent to root "
     "access on this computer. Rootless Docker or Podman limit what a container escape could reach."
 )
+
+
+def installation_owner(data_dir: str | Path, installation: str = "") -> str:
+    """The owner label of one installation's sandbox containers: ``nodestro-<12 hex digits>``.
+
+    The digits are the start of the SHA-256 of the resolved data directory and the installation's random id
+    (:attr:`nodestro_runtime.python_envs.PythonEnvironments.installation`), so two installations on one Docker daemon
+    get different owners even when their data directories have the same path (two Nodestro Local Docker containers,
+    each with its own ``/data`` volume). The reaper of one installation never sees the other's containers."""
+    resolved = str(Path(data_dir).expanduser().resolve())
+    digest = hashlib.sha256(f"{resolved}\0{installation}".encode()).hexdigest()[:12]
+    return _checked_owner(f"{OWNER}-{digest}")
+
+
+def mcp_owner(owner: str = OWNER) -> str:
+    """The owner label of the local MCP servers' containers of the installation whose tool containers carry ``owner``
+    (``nodestro-mcp`` for :data:`OWNER`, ``nodestro-mcp-<id>`` for ``nodestro-<id>``). It differs from every tool
+    owner, so the tool containers' reaper never removes a running MCP server (they live as long as their
+    connection)."""
+    if owner == OWNER:
+        return f"{OWNER}-mcp"
+    prefix = f"{OWNER}-"
+    if not owner.startswith(prefix) or owner.startswith(f"{OWNER}-mcp"):
+        raise ValueError(f"Not a tool container owner: {owner!r}")
+    return _checked_owner(f"{OWNER}-mcp-{owner[len(prefix) :]}")
+
+
+def _checked_owner(owner: str) -> str:
+    if not _OWNER_RULE.fullmatch(owner):
+        raise ValueError(f"Invalid sandbox owner {owner!r}")
+    return owner
 
 
 def reason_of(code: str) -> str:
@@ -200,7 +240,8 @@ def daemon_proven(docker: str, environ: Mapping[str, str] | None) -> bool:
     key = daemon_key(docker, environ)
     with _PROOFS_LOCK:
         proven = key in _PROOFS and time.monotonic() - _PROOFS[key] < PROOF_TTL
-        monitor = _MONITORS.get(key)
+        # Any monitor of this daemon (one per owner, i.e. per installation of the process) can check it again.
+        monitor = next((found for (daemon, _owner), found in _MONITORS.items() if daemon == key), None)
     if not proven and monitor is not None:
         monitor.status()  # starts a check in the background if one is due
     return proven
@@ -427,19 +468,24 @@ class DockerMonitorLike(Protocol):
     def close(self) -> None: ...
 
 
-_MONITORS: dict[_DaemonKey, DockerMonitor] = {}
+_MONITORS: dict[tuple[_DaemonKey, str], DockerMonitor] = {}
 
 
 def monitor_for(
-    sandbox: Callable[[], DockerSandbox], *, docker: str = "docker", environ: Mapping[str, str] | None = None
+    sandbox: Callable[[], DockerSandbox],
+    *,
+    docker: str = "docker",
+    environ: Mapping[str, str] | None = None,
+    owner: str = OWNER,
 ) -> DockerMonitorLike:
-    """The process's monitor of the daemon ``docker`` with ``environ`` reaches (one per daemon, shared by every
-    workspace of the process, e.g. a server's tenants); created with ``sandbox`` on first use."""
-    key = daemon_key(docker, environ)
+    """The process's monitor of the daemon ``docker`` with ``environ`` reaches, for the containers of ``owner`` (one
+    per daemon and owner, shared by every workspace of the process, e.g. a server's tenants); created with
+    ``sandbox`` (whose containers carry ``owner``) on first use."""
+    key = (daemon_key(docker, environ), owner)
     with _PROOFS_LOCK:
         monitor = _MONITORS.get(key)
         if monitor is None or monitor._stop.is_set():
-            monitor = DockerMonitor(sandbox, docker=docker, environ=environ)
+            monitor = DockerMonitor(sandbox, docker=docker, environ=environ, owner=owner)
             _MONITORS[key] = monitor
         return monitor
 
@@ -469,7 +515,9 @@ __all__ = [
     "approved_status",
     "clear_proofs",
     "daemon_proven",
+    "installation_owner",
     "last_reason",
+    "mcp_owner",
     "monitor_for",
     "reason_of",
     "record_proof",

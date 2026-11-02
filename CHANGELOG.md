@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+One container owner per installation (Docker-first plan R2 follow-up, 2026-11-02):
+
+- A desktop and Nodestro Local Docker label their sandbox containers with their own owner,
+  `docker_status.installation_owner(data_dir, installation)` = `nodestro-<12 hex digits of SHA-256 of the resolved
+  data directory and the random installation id>` (`Workspace.sandbox_owner`); the self-test, the runtime-image
+  sandbox, the environments' sandboxes (`ContainerImages(owner=...)`, `ContainerImages.owner`) and the reaper use it.
+  The start-up reaper (`remove_all`) therefore removes only this installation's containers: two installations on one
+  Docker daemon no longer remove each other's running containers. A server's tenants keep the shared owner
+  `nodestro` (`OWNER`) and reap only expired containers.
+- Local MCP servers: `docker_status.mcp_owner(owner)` = `nodestro-mcp-<id>` (`nodestro-mcp` for `OWNER`, still
+  `MCP_OWNER`), with the week-long deadline; `mcp.stdio.launch(owner=...)` (new optional parameter).
+- `monitor_for(..., owner=...)` (new optional parameter): one monitor per daemon and owner;
+  `python_envs.installation_id(root)` is the installation id behind `PythonEnvironments.installation`.
+- The sandbox gateway already passes on any well-formed owner label (tests added for the new owners).
+- Orkexa pin moved to `f5cd7ea146485b1de43de55acec58c45f0a503fc` (Orkexa PR #31 merged: container shape, stdin
+  transport, preflight, self-test, reaper).
+
 Docker-first sandbox status (Docker-first plan R2, 2026-11-02):
 
 - New `nodestro_runtime.docker_status`: `DockerMonitor` checks Docker in a background thread, Orkexa's preflight at

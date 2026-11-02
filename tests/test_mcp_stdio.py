@@ -39,6 +39,9 @@ IMAGE = "nodestro-env:" + "0" * 32
 
 
 class FakeImages:
+    #: An installation's own owner (``docker_status.installation_owner``).
+    owner = "nodestro-0123456789ab"
+
     def __init__(self, docker: str, log: Path) -> None:
         self.docker = docker
         self.log = log
@@ -299,6 +302,8 @@ def test_discovery_approval_and_calls_run_in_the_container(service: McpService, 
     for call in runs:
         assert call[call.index("--network") + 1] == "none"
         assert call[-3:] == ["mcp_stdio_server", "--name", "x"]
+        # The installation's MCP owner: never the tool containers' owner, so their reaper leaves it alone.
+        assert "org.orkexa.sandbox=nodestro-mcp-0123456789ab" in call
         name = call[call.index("--name") + 1]
         assert ["rm", "-f", name] in calls  # removed after the connection
     # Changing a write tool stays blocked without the per-call approval gate (as for HTTP servers).

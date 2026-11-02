@@ -54,8 +54,13 @@ Docker Desktop, OrbStack and Colima keep the daemon in a virtual machine and get
 
 ## The reaper
 
-Every tool container carries the labels `org.orkexa.sandbox=nodestro` and `org.orkexa.deadline=<epoch seconds>`. A
-desktop and Nodestro Local Docker remove all `nodestro` containers at the start (left behind by a crash; no other
-owner is touched), then every process removes the expired ones every 60 seconds. A server's processes share the
-daemon, so they only remove expired containers. Local MCP servers run with the owner `nodestro-mcp` and are never
-reaped. Through the sandbox gateway containers cannot be listed; the gateway removes its own containers.
+Every tool container carries the labels `org.orkexa.sandbox=<owner>` and `org.orkexa.deadline=<epoch seconds>`. On a
+desktop and in Nodestro Local Docker the owner is the installation's own, `nodestro-<id>`: the first 12 hexadecimal
+digits of the SHA-256 of the resolved data directory and the installation's random id (`python/installation-id` in
+the data directory), so two installations on one daemon (two desktop users, a desktop and Nodestro Local Docker, two
+Nodestro Local Docker containers with their own `/data`) never touch each other's containers. Such an installation
+removes all of its own containers at the start (left behind by a crash; no other owner is touched), then the expired
+ones every 60 seconds. A server's API and worker processes share the owner `nodestro` and the daemon, so they only
+remove expired containers. Local MCP servers run with the owner `nodestro-mcp-<id>` (`nodestro-mcp` on a server) and a
+deadline a week ahead, and are never reaped while their connection lives. Through the sandbox gateway containers
+cannot be listed; the gateway removes its own containers.

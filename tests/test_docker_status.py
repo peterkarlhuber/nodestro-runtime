@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -244,8 +245,32 @@ def test_one_monitor_per_daemon_is_shared() -> None:
     first = docker_status.monitor_for(make, environ={"DOCKER_HOST": "unix:///a.sock"})
     assert docker_status.monitor_for(make, environ={"DOCKER_HOST": "unix:///a.sock"}) is first
     assert docker_status.monitor_for(make, environ={"DOCKER_HOST": "unix:///b.sock"}) is not first
+    # One per installation on a daemon: its reaper removes only its own containers.
+    other = docker_status.monitor_for(make, environ={"DOCKER_HOST": "unix:///a.sock"}, owner="nodestro-0123456789ab")
+    assert other is not first and other.owner == "nodestro-0123456789ab"  # type: ignore[attr-defined]
     docker_status.reset_monitors()
     assert docker_status.monitor_for(make, environ={"DOCKER_HOST": "unix:///a.sock"}) is not first
+
+
+def test_each_installation_has_its_own_container_owner(tmp_path: Path) -> None:
+    from orkexa.dynamic.docker import ContainerLimits, run_args
+
+    first = docker_status.installation_owner(tmp_path / "a", "id-1")
+    assert re.fullmatch(r"nodestro-[0-9a-f]{12}", first)
+    assert docker_status.installation_owner(tmp_path / "a", "id-1") == first  # stable across starts
+    assert docker_status.installation_owner(tmp_path / "x" / ".." / "a", "id-1") == first  # the resolved path
+    assert docker_status.installation_owner(tmp_path / "b", "id-1") != first
+    # Two Nodestro Local Docker containers both keep their data in /data: their installation ids tell them apart.
+    assert docker_status.installation_owner("/data", "id-1") != docker_status.installation_owner("/data", "id-2")
+    limits = ContainerLimits(memory_mb=256, cpus=1.0, pids=64)
+    run_args("docker", "nodestro-sandbox-x", "img", limits, owner=first)  # Orkexa accepts it
+    mcp = docker_status.mcp_owner(first)
+    assert mcp == f"nodestro-mcp-{first.removeprefix('nodestro-')}" and mcp != first
+    assert docker_status.mcp_owner(docker_status.OWNER) == "nodestro-mcp"
+    with pytest.raises(ValueError):
+        docker_status.mcp_owner(mcp)
+    with pytest.raises(ValueError):
+        docker_status.mcp_owner("orkexa")
 
 
 def test_a_missing_proof_asks_the_daemon_s_monitor_to_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -257,7 +282,7 @@ def test_a_missing_proof_asks_the_daemon_s_monitor_to_check(monkeypatch: pytest.
             return docker_status.CHECKING
 
     key = docker_status.daemon_key("docker", {"DOCKER_HOST": "unix:///c.sock"})
-    docker_status._MONITORS[key] = Recording(lambda: FakeSandbox())  # type: ignore[arg-type,return-value]
+    docker_status._MONITORS[(key, docker_status.OWNER)] = Recording(lambda: FakeSandbox())  # type: ignore[arg-type,return-value]
     assert not docker_status.daemon_proven("docker", {"DOCKER_HOST": "unix:///c.sock"}) and asked == [False]
 
 
@@ -302,6 +327,35 @@ def test_the_settings_never_wait_for_docker_info(tmp_path: Path, monkeypatch: py
         workspace.close()
 
 
+@pytest.mark.real_docker_status
+def test_two_installations_on_one_daemon_never_reap_each_other(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        DockerMonitor, "start_reaper", lambda self, remove_all_first: started.append((self.owner, remove_all_first))
+    )
+    monkeypatch.setattr(DockerMonitor, "status", lambda self, refresh=False, wait=0.0: docker_status.CHECKING)
+    first = Workspace(tmp_path / "one", integrations=[])
+    second = Workspace(tmp_path / "two", integrations=[])
+    try:
+        owners = (first.sandbox_owner, second.sandbox_owner)
+        assert owners[0] != owners[1] and all(re.fullmatch(r"nodestro-[0-9a-f]{12}", item) for item in owners)
+        # Each removes all of its own containers at the start, and only its own.
+        assert started == [(owners[0], True), (owners[1], True)]
+        assert first.docker_monitor is not second.docker_monitor
+        # The self-test, the tool calls and the environments' containers all carry the installation's owner.
+        assert first._runtime_sandbox().owner == owners[0]
+        assert first.python.runtime_sandbox().owner == owners[0]
+        assert first.python.images.sandbox("nodestro-env:x").owner == owners[0]
+    finally:
+        first.close()
+        second.close()
+    again = Workspace(tmp_path / "one", integrations=[])
+    try:
+        assert again.sandbox_owner == owners[0]  # the same installation keeps its owner
+    finally:
+        again.close()
+
+
 def test_the_workspace_starts_the_reaper_only_where_it_owns_the_containers(tmp_path: Path) -> None:
     workspace = Workspace(tmp_path / "data", integrations=[])
     try:
@@ -309,5 +363,18 @@ def test_the_workspace_starts_the_reaper_only_where_it_owns_the_containers(tmp_p
         assert workspace.docker_status().reason == "docker-missing"
         selection = sandbox_selection.select(SandboxPolicy("desktop"), "docker", workspace.docker_monitor.status())
         assert selection.blocked and selection.reason == "docker-missing"
+    finally:
+        workspace.close()
+
+
+def test_a_server_tenant_shares_the_server_s_owner_and_reaps_only_expired_containers(tmp_path: Path) -> None:
+    from bedrock_support import tenant_storage
+
+    workspace = Workspace(tmp_path / "tenant", integrations=[], storage=tenant_storage(tmp_path / "db", "alpha"))
+    try:
+        # A server's API and worker processes share the daemon: never all containers at the start.
+        assert workspace.sandbox_owner == docker_status.OWNER
+        assert workspace.docker_monitor.reaps == [False]  # type: ignore[attr-defined]
+        assert workspace.python.runtime_sandbox().owner == docker_status.OWNER
     finally:
         workspace.close()

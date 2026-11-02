@@ -61,7 +61,7 @@ from orkexa.dynamic.docker import (
 from orkexa.providers.base import redact
 
 from . import docker_status
-from .docker_status import OWNER
+from .docker_status import OWNER, mcp_owner
 from .image_limits import (
     GC_MAX_GB,
     GC_MAX_IMAGES,
@@ -201,11 +201,14 @@ class ContainerImages:
         usage_file: Path | None = None,
         keep: Callable[[], Iterable[str]] | None = None,
         collect: bool = True,
+        owner: str = OWNER,
     ) -> None:
         """``usage_file`` keeps when each image was last used (for :meth:`gc`); ``keep`` names images that are
         never collected (those of installed environments); ``collect=False`` turns the collection after a build
-        off (a server, whose daemon serves every tenant)."""
+        off (a server, whose daemon serves every tenant). ``owner`` labels the sandbox containers of
+        :meth:`sandbox` (an installation's own, :func:`~nodestro_runtime.docker_status.installation_owner`)."""
         self.docker = docker
+        self.owner = owner
         self.base = base
         self.environ = os.environ if environ is None else environ
         self._run = run
@@ -587,13 +590,19 @@ class ContainerImages:
         """A sandbox whose calls run in the image ``tag`` (Orkexa's container flags, no network, never pulled)."""
         self.note_use(tag)
         return StreamedSandbox(
-            image=tag, timeout=timeout, memory_mb=memory_mb, docker=self.docker, environ=self._cli_environment()
+            image=tag,
+            timeout=timeout,
+            memory_mb=memory_mb,
+            docker=self.docker,
+            environ=self._cli_environment(),
+            owner=self.owner,
         )
 
 
-#: The owner label of local MCP servers' containers: they live as long as their connection, so the tool containers'
+#: The owner label of a server's local MCP servers' containers (an installation's own:
+#: :func:`~nodestro_runtime.docker_status.mcp_owner`): they live as long as their connection, so the tool containers'
 #: reaper never touches them.
-MCP_OWNER = "nodestro-mcp"
+MCP_OWNER = mcp_owner(OWNER)
 #: Seconds a container made by :func:`sandbox_run_args` may exist by default (its deadline label).
 DEFAULT_LIFETIME = 600.0
 
@@ -633,9 +642,11 @@ class StreamedSandbox(DockerSandbox):
     mounted (the tool's files and Orkexa's runner travel on stdin into a ``tmpfs`` work directory), so the daemon may
     run on another host or in another container (a server's workers, the sandbox gateway); each call runs the image
     by its id in Orkexa's one container shape, and only after the daemon passed the preflight and the in-container
-    self-test. Its containers carry the owner label :data:`OWNER`. The docker CLI gets only ``environ`` (the variables
-    it needs to reach its daemon, :meth:`ContainerImages._cli_environment`), never the process's. Cancelling a run
-    (:mod:`nodestro_runtime.sandbox_cancel`) or :meth:`cancel` removes the call's container.
+    self-test. Its containers carry the owner label ``owner`` (the installation's,
+    :func:`~nodestro_runtime.docker_status.installation_owner`; :data:`OWNER` on a server). The docker CLI gets only
+    ``environ`` (the variables it needs to reach its daemon, :meth:`ContainerImages._cli_environment`), never the
+    process's. Cancelling a run (:mod:`nodestro_runtime.sandbox_cancel`) or :meth:`cancel` removes the call's
+    container.
     """
 
     def __init__(self, *, environ: Mapping[str, str] | None = None, owner: str = OWNER, **options: Any) -> None:

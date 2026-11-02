@@ -36,7 +36,7 @@ CPUS = 1.0
 #: The container name prefix; the sandbox gateway accepts only names of the sandbox's pattern.
 NAME_PREFIX = "nodestro-sandbox-mcp-"
 #: The deadline label of a stdio server's container (it lives as long as its connection; the tool containers' reaper
-#: never removes containers of :data:`~nodestro_runtime.container_images.MCP_OWNER`).
+#: never removes containers of an MCP owner, :func:`~nodestro_runtime.docker_status.mcp_owner`).
 LIFETIME = 7 * 24 * 3600.0
 
 
@@ -74,6 +74,7 @@ def launch(
     docker: str = "docker",
     docker_env: Mapping[str, str] | None = None,
     python: str = sys.executable,
+    owner: str = MCP_OWNER,
 ) -> StdioLaunch:
     """The relay command that runs ``python -m module args`` in a sandbox container of ``image``."""
     name = container_name()
@@ -85,7 +86,7 @@ def launch(
             memory_mb=memory_mb,
             cpus=CPUS,
             pids_limit=PIDS_LIMIT,
-            owner=MCP_OWNER,
+            owner=owner,
             lifetime_s=LIFETIME,
         ),
         "python",

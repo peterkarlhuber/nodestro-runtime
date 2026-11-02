@@ -576,6 +576,22 @@ def _add_via(package: LockedPackage, source: str) -> None:
 # ---- the manager ----------------------------------------------------------------------
 
 
+def installation_id(root: Path) -> str:
+    """The random id of the installation whose Python environments live in ``root`` (created on first use, kept in
+    ``root/installation-id``, outside the database: backups do not carry it)."""
+    path = root / "installation-id"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    value = uuid.uuid4().hex
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+    return value
+
+
 class PythonEnvironments:
     """Requirements, plans, approvals and the environments of all scopes."""
 
@@ -635,17 +651,7 @@ class PythonEnvironments:
     @property
     def installation(self) -> str:
         """A random id of this data directory, kept outside the database (backups do not carry it)."""
-        path = self.root / "installation-id"
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-        except OSError:
-            pass
-        value = uuid.uuid4().hex
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
-        return value
+        return installation_id(self.root)
 
     def env_dir(self, scope: str) -> Path:
         slug = re.sub(r"[^A-Za-z0-9_-]+", "-", scope)[:80]
@@ -1313,7 +1319,11 @@ class PythonEnvironments:
         It needs no image an operator built by hand and no bind mount, so it also works with a Docker daemon on
         another host (``DOCKER_HOST``)."""
         return RuntimeImageSandbox(
-            self.runtime_image, timeout=timeout, docker=self.images.docker, environ=self.images._cli_environment()
+            self.runtime_image,
+            timeout=timeout,
+            docker=self.images.docker,
+            environ=self.images._cli_environment(),
+            owner=self.images.owner,
         )
 
     def runtime_image(self) -> str:

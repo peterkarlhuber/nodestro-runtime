@@ -86,7 +86,7 @@ from .providers import (
     qualify,
     verification_key,
 )
-from .python_envs import PythonEnvironments
+from .python_envs import PythonEnvironments, installation_id
 from .python_tools import EnvironmentGate
 from .reports import ResultFiles
 from .resume import PublishedRuns
@@ -328,6 +328,10 @@ class Workspace:
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
         self.sandbox_policy = SandboxPolicy("server" if storage is not None else self.profile.kind)
+        # The owner label of this installation's sandbox containers: its own on a desktop and in Nodestro Local Docker
+        # (two installations on one daemon never reap each other's containers), the shared one of a server's
+        # processes, which reap only expired containers.
+        self.sandbox_owner = docker_status.OWNER if storage is not None else self._installation_owner()
         sandbox = make_sandbox(self._sandbox_kind(), self.sandbox_policy, self._container_sandbox())
         self.tools = ToolLibrary(
             data_dir / "tools",
@@ -407,11 +411,13 @@ class Workspace:
         )
         # Local MCP servers (WP-8) run in a container of their approved packages' image, never on the host.
         self.mcp.python = self.python
+        if isinstance(self.python.images, ContainerImages):
+            self.python.images.owner = self.sandbox_owner
         # Docker's preflight and self-test run in the background (never in a settings read), shared by every workspace
-        # of the process; the reaper removes Nodestro's left-over containers: all of them at the start where this
-        # process owns them (desktop, Nodestro Local Docker), and expired ones every minute.
+        # of the process; the reaper removes this installation's left-over containers: all of them at the start where
+        # this process owns them (desktop, Nodestro Local Docker), and expired ones every minute.
         self.docker_monitor: DockerMonitorLike = docker_status.monitor_for(
-            self._runtime_sandbox, environ=ContainerImages()._cli_environment()
+            self._runtime_sandbox, environ=ContainerImages()._cli_environment(), owner=self.sandbox_owner
         )
         self.docker_monitor.start_reaper(remove_all_first=storage is None)
         self.docker_monitor.status()
@@ -538,8 +544,20 @@ class Workspace:
         """The container sandbox for tool code without libraries: Nodestro's runtime image (built on first use, no
         image to build by hand, no bind mounts). Its self-test also proves the daemon (:attr:`docker_monitor`)."""
         return RuntimeImageSandbox(
-            lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
+            lambda: self.python.runtime_image(),
+            timeout=15.0,
+            environ=ContainerImages()._cli_environment(),
+            owner=self.sandbox_owner,
         )
+
+    def _installation_owner(self) -> str:
+        """This installation's container owner (:func:`~nodestro_runtime.docker_status.installation_owner`) from its
+        data directory and random installation id; a data directory whose id cannot be written uses its path only."""
+        try:
+            installation = installation_id(self.data_dir / "python")
+        except OSError:
+            installation = ""
+        return docker_status.installation_owner(self.data_dir, installation)
 
     def _sandbox_kind(self) -> SandboxMode:
         """The sandbox setting in effect (:mod:`.sandbox_selection`): ``docker`` wherever only containers may run
