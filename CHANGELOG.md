@@ -23,7 +23,7 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
-Security: containers that run package code (security review DS-1, DS-5, DS-7, DS-9; RT-035):
+Security: containers that run package code (security review DS-1, DS-5, DS-7, DS-9; RT-038):
 
 - DS-1: the module check after an image build (`ContainerImages.missing_modules`) ran the image by tag with a plain
   `docker run` (no limits, no labels, unbounded output; after 120 s only the CLI was killed and the container kept
@@ -37,7 +37,7 @@ Security: containers that run package code (security review DS-1, DS-5, DS-7, DS
   image; it adds private IPC, ulimits (nofile, fsize, core), no logging, the owner and deadline labels (the reaper
   removes orphans), bounded output and removal on timeout or cancel. Proxy URLs reach it without user name or
   password (`strip_credentials`; a proxy that needs credentials no longer works for the resolver). It keeps network
-  for the package index; the residual risk is documented in `docs/TODO.md` (RT-035).
+  for the package index; the residual risk is documented in `docs/TODO.md` (RT-038).
 - DS-7: every docker CLI call of `ContainerImages` reads at most 16 MiB of stdout and the last 256 KiB of stderr
   (`bounded_run`, the new default `run`; more kills the CLI and fails with `deps.image_failed`).
 - DS-9: a Python version without a pinned base image is refused with the new code `deps.python_unsupported` instead
@@ -61,6 +61,29 @@ Local MCP servers and the sandbox gateway (security review DS-4, DS-11, 2026-11-
   now. A `nodestro-env:<key>` tag is accepted for a container only when the image carries the lock label, and the
   container is created by the checked image id. The daemon's limits and seccomp profile are confirmed again after
   `LIMITS_TTL` (5 s, the runtime's preflight interval) instead of once per gateway process.
+
+Docker-first sandbox selection and library environments (security review DS-2, DS-3, 2026-11-02):
+
+- DS-3: in the desktop's `auto` mode untrusted (AI-generated) code runs only in Docker once its preflight and
+  self-test passed; otherwise it is refused with Docker's reason (`SandboxSelection.reason` is now e.g.
+  `docker-unreachable` or `docker-checking` instead of `no-isolation`). The built-in Linux sandbox is no longer chosen
+  automatically, not even when Docker is missing. New sandbox mode `linux` (`SettingsIn.sandbox`, `Settings.sandbox`,
+  `SandboxSelection.mode`; additive): the only mode that uses the built-in Linux sandbox. `subprocess` never runs
+  untrusted code (refused with reason `subprocess-mode` at call time, `no-isolation` in the selection); a stored
+  `subprocess` choice is kept, so an installation that relied on it for the built-in sandbox has to choose `linux`.
+  New `ToolLibrary.sandbox_mode` and `ToolLibrary.docker_status` (set by the workspace).
+- DS-2: untrusted code's Python libraries never become a host virtual environment: no `uv pip sync` and no
+  `verify_imports` on the host (whose interpreter runs the packages' `.pth` files as the user). New
+  `PythonEnvironments.backend()`/`scope_trust()`: in `auto` mode such scopes are container images, built and
+  import-checked in containers and refused with `sandbox.isolation_required` (Docker's `reason`) while Docker is not
+  proven; in `subprocess` and `linux` mode they are refused with `sandbox.libraries_need_isolation` (status
+  `unsupported`). Scopes whose code is a person's own keep host environments. A host environment built for a person's
+  code is no longer handed out once AI-generated code needs it. The built-in Linux sandbox always starts Nodestro's
+  own interpreter, never an environment's (whose `.pth` files would run before confinement), so untrusted code gets no
+  third-party libraries in `linux` mode. The `auto` container fallback also replaces a host environment's interpreter.
+  `status`, `plan`, `install`, `ensure`, `sandbox` and `ToolEnvironment` take an optional `trust` (additive); tool
+  jobs plan as `untrusted`. `PythonEnvironments` takes `docker_state`.
+- New `tests/test_docker_first.py`; selection, routing and built-in sandbox tests adjusted to the new policy.
 
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 

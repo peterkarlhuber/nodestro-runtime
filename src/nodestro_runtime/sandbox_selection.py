@@ -1,13 +1,15 @@
 """Which sandbox runs which code on this computer, and why (ADR-0006, ADR-0009).
 
-The ``sandbox`` setting has three modes:
+The ``sandbox`` setting has four modes (Docker-first, ADR-0006):
 
-* ``auto`` (the default when nothing was chosen): untrusted code runs in the built-in Linux sandbox where this
-  computer passed its checks, otherwise in a Docker container if Docker passed its preflight and self-test,
-  otherwise it is refused.
-  Code a person wrote runs in a host subprocess, as before.
-* ``subprocess`` (chosen explicitly, kept from earlier releases): like ``auto``, but never Docker: untrusted
-  code runs only in the built-in Linux sandbox, otherwise it is refused.
+* ``auto`` (the default when nothing was chosen): untrusted (AI-generated) code runs in a Docker container once Docker
+  passed its preflight and self-test, otherwise it is refused with Docker's reason. The built-in Linux sandbox is never
+  chosen automatically, also not when Docker is missing. Code a person wrote runs in a host subprocess, as before.
+* ``linux`` (chosen explicitly, Linux only): untrusted code runs in the built-in Linux sandbox where this computer
+  passed its checks, otherwise it is refused; never in Docker. Third-party libraries are not available to untrusted
+  code in this mode (:meth:`nodestro_runtime.python_envs.PythonEnvironments.backend`).
+* ``subprocess`` (chosen explicitly, for trusted use only): untrusted code is always refused; only code a person
+  wrote runs, in a host subprocess. It is never a fallback for AI-generated code.
 * ``docker``: every tool runs in a container.
 
 Server and Nodestro Local Docker always run tool code in containers; the setting does not apply there.
@@ -37,8 +39,8 @@ from .sandbox_policy import SandboxPolicy
 from .schemas import SandboxBackendStatus, SandboxSelection
 
 BackendState = Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable", "checking"]
-SandboxMode = Literal["auto", "subprocess", "docker"]
-MODES: tuple[SandboxMode, ...] = ("auto", "subprocess", "docker")
+SandboxMode = Literal["auto", "subprocess", "linux", "docker"]
+MODES: tuple[SandboxMode, ...] = ("auto", "subprocess", "linux", "docker")
 
 
 def runtime_platform() -> tuple[str, str]:
@@ -166,23 +168,47 @@ def select(
         else:
             detail = f"{where} but the sandbox is not available ({status.detail}); no tool code runs until it passes"
         return result("", "", status.reason or "docker-unreachable", detail)
-    if policy.builtin_available():
-        return result("linux-builtin", "subprocess")
-    if mode == "auto" and status.approved:
-        return result("docker", "subprocess")
-    native = _native(policy)
-    detail = (
-        f"The built-in sandbox is not available here ({native.reason}: {native.detail})"
-        if system == "linux"
-        else f"Nodestro has no native sandbox for {system}"
+    if mode == "auto":
+        # Docker-first: no automatic fallback to the built-in Linux sandbox or to the host.
+        if status.approved:
+            return result("docker", "subprocess")
+        if status.state == "checking":
+            detail = (
+                "Automatic mode runs AI-generated code in Docker; its preflight and self-test are still running, so "
+                "AI-generated code is refused until they passed."
+            )
+        else:
+            detail = (
+                f"Automatic mode runs AI-generated code only in Docker, which is not available ({status.detail}); "
+                "AI-generated code is refused. To run it, start Docker."
+            )
+        return result("", "subprocess", status.reason or "docker-unreachable", detail)
+    if mode == "linux":
+        if policy.builtin_available():
+            return result(
+                "linux-builtin",
+                "subprocess",
+                detail="The built-in Linux sandbox was chosen; AI-generated code gets no third-party libraries here.",
+            )
+        native = _native(policy)
+        detail = (
+            f"The built-in sandbox is not available here ({native.reason}: {native.detail})"
+            if system == "linux"
+            else f"Nodestro has no native sandbox for {system}"
+        )
+        return result(
+            "",
+            "subprocess",
+            "no-isolation",
+            f"{detail}; AI-generated code is refused. To run it, choose Automatic and start Docker.",
+        )
+    return result(
+        "",
+        "subprocess",
+        "no-isolation",
+        "The Subprocess mode runs only code a person wrote; AI-generated code is refused. To run it, choose Automatic "
+        "and start Docker.",
     )
-    if mode == "auto" and status.state == "checking":
-        hint = "wait until Docker's check finished"
-    elif mode == "auto":
-        hint = f"start Docker (now: {status.reason})"
-    else:
-        hint = "choose Automatic or Docker and start Docker"
-    return result("", "subprocess", "no-isolation", f"{detail}; AI-generated code is refused. To run it, {hint}.")
 
 
 __all__ = ["MODES", "SandboxMode", "backends", "docker_status_of", "runtime_platform", "select"]

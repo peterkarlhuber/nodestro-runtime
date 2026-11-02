@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 6 |
-| P3 Low | 21 |
+| P2 Medium | 7 |
+| P3 Low | 22 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -72,14 +72,14 @@ None known.
 - **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
   for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
   bind mounts, proxy variables only and without credentials, no capabilities, `nobody`, read-only with a tmpfs,
-  limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-035). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
+  limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-038). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
   (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
   (which refuses containers with network and foreign images). Studio has no text for the `reason` parameter yet.
 - **Next step:** Add a real-Docker test of the resolve
   container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
 
-### RT-035 · Containers that run package code: hardened shape, residual network risk of the resolver
+### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
 
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** security review DS-1, DS-5, DS-7, DS-9 (2026-11-02),
   `ContainerImages.missing_modules`, `ContainerImages.compile_in_container`, `container_images.bounded_run`,
@@ -124,6 +124,27 @@ None known.
   stand-ins only (no daemon in the development container).
 - **Next step:** A1/S1/ST1 in nodestro-api, nodestro-sdk and nodestro-studio; a real-daemon test of the background
   check in the CI `docker` job; decide whether a tool call should wait (bounded) for a running first check.
+
+### RT-036 · Docker-first for untrusted code and its libraries (DS-2, DS-3): follow-ups
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** security review DS-2, DS-3; product decision 2026-11-02
+  (Docker-first); `sandbox_selection.py`, `tool_library.ToolLibrary._require`, `python_envs.PythonEnvironments.backend`
+- **What:** Done 2026-11-02: the desktop's `auto` mode runs untrusted code only in Docker (refused with Docker's reason
+  otherwise, never the built-in Linux sandbox automatically); the new `linux` mode is the only one that uses the
+  built-in Linux sandbox, always with Nodestro's own interpreter; `subprocess` never runs untrusted code (reason
+  `subprocess-mode`). Untrusted code's libraries are never a host venv (no `uv pip sync`, no host `verify_imports`):
+  container images in `auto`/`docker`, refused in `subprocess`/`linux` (`sandbox.libraries_need_isolation`, param
+  `mode`). Open: Studio and the API need texts for the `linux` mode, the reason `subprocess-mode`, the `auto` refusal
+  now carrying Docker's reason instead of `no-isolation`, and the status `unsupported` with
+  `sandbox.isolation_required` / `sandbox.libraries_need_isolation`; installations that chose `subprocess` to use the
+  built-in sandbox must choose `linux` (no automatic migration); host venvs that earlier releases built for untrusted
+  scopes stay on disk unused until `cleanup`/removal; local MCP servers still need Docker mode (`containers()`), also
+  in `auto` with Docker approved; a scope's trust for an unsaved tool comes from the code digest the caller passes
+  (`Needed.digests`), so an API plan without code (reinstall) falls back to the stored tools (unknown counts as
+  untrusted).
+- **Next step:** API/SDK/Studio texts and the `linux` choice in the settings; decide whether `auto` should also allow
+  local MCP servers once Docker is approved; optionally run the built-in sandbox with an environment's packages by
+  starting the interpreter with `-S` and adding site-packages after confinement.
 
 ### RT-034 · Container reaper: follow-ups
 

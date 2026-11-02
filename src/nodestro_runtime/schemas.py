@@ -919,8 +919,9 @@ class SettingsIn(_Model):
     default_model: str | None = None
     assistant_model: str | None = None
     default_budget_usd: float | None = Field(default=None, ge=0)
-    #: ``auto`` (built-in sandbox, else Docker, else refused), ``subprocess`` (never Docker) or ``docker``.
-    sandbox: Literal["auto", "subprocess", "docker"] | None = None
+    #: ``auto`` (Docker, else AI-generated code is refused), ``linux`` (the built-in Linux sandbox, chosen explicitly),
+    #: ``subprocess`` (only code a person wrote, AI-generated code is refused) or ``docker`` (everything in Docker).
+    sandbox: Literal["auto", "subprocess", "linux", "docker"] | None = None
     #: The interface language the user chose; ``None`` follows the browser.
     language: Language | None = None
     #: Cost limit of one Workflow Architect job in USD (``None``: no limit).
@@ -1006,7 +1007,7 @@ class SandboxBackendStatus(_Model):
 class SandboxSelection(_Model):
     """Where tool code runs now on the computer the runtime runs on (not the browser's)."""
 
-    mode: Literal["auto", "subprocess", "docker"] = "auto"
+    mode: Literal["auto", "subprocess", "linux", "docker"] = "auto"
     profile: str = "desktop"
     #: ``linux``, ``macos`` or ``windows``, and the CPU (``x86_64``, ``arm64``).
     os: str = ""
@@ -1015,8 +1016,9 @@ class SandboxSelection(_Model):
     untrusted: str = ""
     #: The backend that runs code a person wrote in the tool editor.
     user_authored: str = ""
-    #: Whether untrusted code is refused here, with ``reason``: ``no-isolation``, or (Docker mode, server, local
-    #: container) the Docker backend's reason, e.g. ``docker-unreachable``, ``docker-selftest``, ``docker-checking``.
+    #: Whether untrusted code is refused here, with ``reason``: ``no-isolation`` (``subprocess`` and ``linux`` modes),
+    #: or (``auto`` and Docker mode, server, local container) the Docker backend's reason, e.g.
+    #: ``docker-unreachable``, ``docker-selftest``, ``docker-checking``.
     blocked: bool = False
     reason: str = ""
     detail: str = ""
@@ -1030,7 +1032,7 @@ class Settings(_Model):
     default_model: str = DEFAULT_AGENT_MODEL
     assistant_model: str = DEFAULT_ASSISTANT_MODEL
     default_budget_usd: float | None = 2.0
-    sandbox: Literal["auto", "subprocess", "docker"] = "auto"
+    sandbox: Literal["auto", "subprocess", "linux", "docker"] = "auto"
     docker_available: bool = False
     #: Where tool code runs now and why untrusted code may be refused (cross-platform sandbox architecture).
     sandbox_selection: SandboxSelection = Field(default_factory=SandboxSelection)
