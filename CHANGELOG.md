@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
+
+- An attended run whose next model request does not fit its budget pauses before the request is sent instead of
+  failing: run `paused` with `run.budget.pending_request_id`, node status `awaiting_budget`
+  (`WAITING_NODE_STATUSES`). Agents, quality judges (a resumable refine loop), orchestrator decisions, sub-workflows
+  and teams suspend through orkexa's `RequestSuspended` into a request-stage checkpoint (`AgentCheckpoint.kind
+  "budget"`); no thread or worker waits. Attended runs refuse oversized requests before the call
+  (`on_oversized="reject"`).
+- New `nodestro_runtime.run_budget` (`BudgetRequest`, `BudgetRequests`, `RunBudgetGate`, audit trail
+  `budget_audit`) and `RunManager.decide_budget`, `budget_requests`, `sweep_budget_waits`. One open request per run,
+  parallel agents join it; a raise changes only the blocking limit (`run`, `subworkflow`, `team`) of this run and is
+  recorded in `run.budget.raises`; compare-and-set decisions with idempotency keys; deadline
+  (`budget_decision_hours`, default 24) and caps (tenant `max_run_budget_usd`, operator
+  `NODESTRO_MAX_RUN_BUDGET_USD`).
+- `Run.started_by`, `Run.budget` and `RunSummary.budget`; new error codes `run.budget_ended`,
+  `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
+- New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
+
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 

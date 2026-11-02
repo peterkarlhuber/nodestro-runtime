@@ -893,6 +893,8 @@ class RunSummary(_Model):
     workflow_version: int | None = None
     release_id: str | None = None
     release_number: int | None = None
+    #: The run budget (BUDGET-1): a set ``pending_request_id`` means the paused run waits for a budget decision.
+    budget: RunBudget | None = None
 
 
 class RunEvent(_Model):

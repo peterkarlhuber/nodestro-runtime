@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 4 |
-| P3 Low | 19 |
+| P3 Low | 20 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -127,6 +127,14 @@ None known.
   the reasons and measurements are in the doc.
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
+
+### RT-031 · Run budget decisions: remaining gaps
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `docs/BUDGET.md`, orkexa ORK-022
+- **What:** Requests inside orkexa batches and `run_agent` sub-agents cannot suspend and fail with
+  `run.budget_exceeded` as before. A request whose real cost exceeds its bound (a price change) is kept and the next
+  request asks. Only simulated tests (no paid calls) cover the feature.
+- **Next step:** Suspendable batches in orkexa (ORK-022), then let those requests ask too.
 
 ## Performance
 
