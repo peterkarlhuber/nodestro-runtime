@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
+
+- Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence
+  in `docs/AXENTRA.md`, "What stays Nodestro's").
+- Fix: a worker whose heartbeat stalled could still call the model or make a tool call with outside effects after
+  the reaper had interrupted its run (the loss was noticed only at the next heartbeat or write). A queue execution
+  now asks whether its worker still holds the run's job before every model request and every tool call
+  (`RunManager.owns`, set by `RunWorker`; a failing check counts as lost).
+- New `tests/test_job_delivery.py` (real PostgreSQL): SIGKILL during a model call, stalled worker, external write
+  before a lost lease, parallel workers, cancel and resume, nested sub-workflows.
+
 One container owner per installation (Docker-first plan R2 follow-up, 2026-11-02):
 
 - A desktop and Nodestro Local Docker label their sandbox containers with their own owner,
