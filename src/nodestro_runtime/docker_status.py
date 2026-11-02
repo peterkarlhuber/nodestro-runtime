@@ -82,8 +82,10 @@ RETRY_FAILED = 300.0
 REAP_INTERVAL = 60.0
 #: Seconds a passed check counts for :func:`daemon_proven` without being confirmed again.
 PROOF_TTL = 600.0
-#: Seconds a local MCP server's container may exist (its deadline label; it lives as long as its connection).
-MCP_LIFETIME = 7 * 24 * 3600.0
+#: Seconds a local MCP server's container may exist (its deadline label). Connections are per operation
+#: (``McpHub._stdio_session``), capped at ``2 * timeout_seconds`` with ``McpServer.timeout_seconds <= 300``, plus
+#: container start and removal. The label only bounds a container whose relay and hub both crashed.
+MCP_LIFETIME = 15 * 60.0
 
 DockerState = Literal["approved", "unavailable", "checking"]
 

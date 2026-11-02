@@ -264,8 +264,8 @@ def _mcp_containers(now: float) -> list[Any]:
     lifetime = docker_status.MCP_LIFETIME
     mine = "nodestro-mcp-0123456789ab"
     return [
-        # Started a day before this process (its connection's process is gone): left behind.
-        SandboxContainer("left", "nodestro-sandbox-mcp-left", mine, now - 86400 + lifetime, True),
+        # Started a minute before this process (its connection's process is gone): left behind.
+        SandboxContainer("left", "nodestro-sandbox-mcp-left", mine, now - 60 + lifetime, True),
         # Past its deadline.
         SandboxContainer("expired", "nodestro-sandbox-mcp-expired", mine, now - 10, True),
         # Without a valid deadline.
@@ -335,7 +335,7 @@ def test_a_server_s_processes_reap_only_expired_mcp_containers(monkeypatch: pyte
     shared = "nodestro-mcp"
     fake = FakeContainers(
         [
-            SandboxContainer("running", "a", shared, now - 86400 + docker_status.MCP_LIFETIME, True),
+            SandboxContainer("running", "a", shared, now - 60 + docker_status.MCP_LIFETIME, True),
             SandboxContainer("expired", "b", shared, now - 1, True),
         ]
     )
@@ -517,3 +517,12 @@ def test_a_server_tenant_shares_the_server_s_owner_and_reaps_only_expired_contai
         assert workspace.python.runtime_sandbox().owner == docker_status.OWNER
     finally:
         workspace.close()
+
+
+def test_the_mcp_lifetime_covers_the_longest_connection() -> None:
+    from nodestro_runtime.mcp.models import McpServer
+
+    longest = McpServer.model_fields["timeout_seconds"].metadata
+    maximum = next(m.le for m in longest if getattr(m, "le", None) is not None)
+    # A connection is capped at twice the server's timeout; a minute covers container start and removal.
+    assert 2 * maximum + 60 <= docker_status.MCP_LIFETIME
