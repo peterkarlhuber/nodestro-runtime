@@ -697,6 +697,28 @@ def test_a_resolve_container_that_left_the_proven_shape_never_starts(
     assert docker.resolves == [] and docker.containers == []
 
 
+def test_a_resolve_container_whose_limits_were_not_the_proven_ones_never_starts(docker: FakeDocker) -> None:
+    """The shape a resolve container is checked against is the one its self-test ran with (the sandbox's limits):
+    a sandbox that proved other limits than the resolve container would get is refused before it starts."""
+    from dataclasses import replace
+
+    from nodestro_runtime import container_images
+
+    proving = docker.sandbox_class()
+
+    class OtherLimits(proving):  # type: ignore[misc, valid-type]
+        def limits(self) -> ContainerLimits:
+            return replace(container_images._RESOLVE_LIMITS, memory_mb=4096)
+
+    built = images(docker)
+    built.sandbox_class = OtherLimits
+    with pytest.raises(NodestroError) as caught:
+        built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "sandbox.shape_mismatch"
+    assert docker.gate_limits == [replace(container_images._RESOLVE_LIMITS, memory_mb=4096)]
+    assert docker.resolves == [] and docker.containers == []
+
+
 @pytest.mark.parametrize("network", ["host", "HOST", "container:abc", "ns:/proc/1/ns/net", "-x"])
 def test_a_build_network_in_a_namespace_mode_is_refused_before_docker(docker: FakeDocker, network: str) -> None:
     with pytest.raises(NodestroError) as caught:

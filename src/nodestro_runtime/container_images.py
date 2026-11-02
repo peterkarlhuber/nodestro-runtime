@@ -848,7 +848,9 @@ class ContainerImages:
         name = f"nodestro-resolve-{uuid.uuid4().hex[:12]}"
         deadline = math.ceil(time.time() + _RESOLVE_LIMITS.lifetime_s)
         shaped = self._resolve_args(name, image_id, proxies, network=network, deadline=deadline)
-        proven = run_args(self.docker, name, image_id, _RESOLVE_LIMITS, owner=self.owner, deadline=deadline)
+        # The proven shape is the one the self-test above ran: this sandbox's limits, not the constant, so a sandbox
+        # that proved other limits than the resolve container would get is refused here.
+        proven = run_args(self.docker, name, image_id, sandbox.limits(), owner=self.owner, deadline=deadline)
         check_shape(shaped, proven, allow=RESOLVE_ALLOWANCES)  # sandbox.shape_mismatch: nothing starts
         args = [
             *shaped,
