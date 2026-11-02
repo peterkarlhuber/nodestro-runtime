@@ -13,7 +13,7 @@
 | P1 High | 1 |
 | P2 Medium | 8 |
 | P3 Low | 25 |
-| P4 Optional | 6 |
+| P4 Optional | 7 |
 
 **Release blockers:** None for this repository.
 
@@ -328,6 +328,16 @@ None known.
 - **Next step:** A store-level time filter (or SQL aggregation) for usage entries and run costs; the API uses it.
 
 ## Features and enhancements
+
+### RT-041 · Similarity hint for pasted code that resembles AI-generated code (R-4)
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** ADR-0006 (R-4 amendment), `tool_library.editor_trust`,
+  `tool_provenance.code_digest`
+- **What:** Code pasted into the tool editor counts as `user-authored` (decision R-4, default 2); only an exact copy
+  of stored AI-generated code (normalized digest) is recognized. Slightly edited AI code is not detected.
+- **Next step:** Decide whether a fuzzy match (for example token shingles against stored untrusted tools, drafts and
+  job attempts) should show a *hint* in the editor. It must stay a hint: it never changes the trust class and is
+  never a security boundary.
 
 ### RT-010 · Rotation of the server secret key
 

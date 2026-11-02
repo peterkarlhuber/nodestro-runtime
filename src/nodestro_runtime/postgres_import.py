@@ -6,8 +6,9 @@ is opened read-only; use a closed desktop's database or a backup copy of it.
 
 What is not copied:
 
-- ``tool_provenance``: a server cannot verify where the desktop's records came from, so every imported tool is
-  untrusted (like after restoring a backup) and runs only in an isolating sandbox.
+- ``tool_provenance`` and ``tool_adoptions``: a server cannot verify where the desktop's records came from, so every
+  imported tool is untrusted (like after restoring a backup) and runs only in an isolating sandbox. An adoption of
+  AI-generated code (ADR-0006, R-4) is a desktop-only decision and never carries over to a server.
 - Provider API keys in the settings: a server keeps keys only encrypted with its own key, so they are entered again
   in the server's settings; :attr:`ImportReport.not_imported` names the providers.
 - Files beside the database (``tools``, ``python``, ``inputs`` in the data directory): the server keeps them
@@ -31,7 +32,7 @@ from .storage import SCHEMA_VERSION
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
 
 #: Document collections that are never imported (see the module documentation).
-SKIPPED_COLLECTIONS = frozenset({"tool_provenance"})
+SKIPPED_COLLECTIONS = frozenset({"tool_provenance", "tool_adoptions"})
 #: Directories of a desktop data directory whose files stay behind.
 DATA_DIRECTORIES = ("tools", "python", "inputs")
 _TENANT_TABLES = ("nodestro_documents", "nodestro_files", "nodestro_chunks", "nodestro_memory_files")
@@ -119,6 +120,8 @@ def import_desktop_database(source: str | Path, database: PostgresDatabase, tena
             report.not_imported.append(f"{name}/: files beside the database are not part of the import")
     if report.skipped.get("tool_provenance"):
         report.not_imported.append("tool_provenance: imported tools are untrusted and need an isolating sandbox")
+    if report.skipped.get("tool_adoptions"):
+        report.not_imported.append("tool_adoptions: adoptions of AI-generated tools are valid on the desktop only")
     return report
 
 

@@ -60,7 +60,7 @@ from .providers import Connection, qualify
 from .sandbox_policy import HOST_AWS_ENV, Isolation, SandboxPolicy, TrustClass, isolation_of
 from .schemas import new_id, now
 from .tool_policy import UNKNOWN, ToolCapability, capability_of
-from .tool_provenance import MemoryProvenance, ToolProvenance, code_digest
+from .tool_provenance import MemoryProvenance, ToolAdoption, ToolProvenance, code_digest, content_hash
 
 if TYPE_CHECKING:
     from .docker_status import DockerStatus
@@ -137,6 +137,11 @@ class ToolInfo(BaseModel):
     code: str | None = None
     tests: str | None = None
     requirement: str | None = None
+    #: :func:`~nodestro_runtime.tool_provenance.content_hash` of ``code`` and ``tests``: what an adoption of this
+    #: version must name (``POST /api/tools/{name}/adopt``, ADR-0006 R-4); ``None`` for tools without code.
+    content_hash: str | None = None
+    #: The adoption that makes this AI-generated tool ``user-authored`` (who, when, which version); ``None`` otherwise.
+    adoption: ToolAdoption | None = None
     #: MCP tools (``kind == "mcp"``): the server, the server's own tool name and the approved definition's hash.
     server_id: str | None = None
     server_name: str | None = None
@@ -333,9 +338,22 @@ class _LinkedProvenance:
     def record_authored(self, name: str, version: int) -> None:
         raise NodestroError("tool.frozen", "Tools of a published release cannot be changed")
 
+    def adoption(self, name: str) -> ToolAdoption | None:
+        """The source's adoption while it still counts there (a frozen copy of the adopted content counts too)."""
+        return self.source.adoption(name)
+
+    def record_adoption(self, adoption: ToolAdoption) -> None:
+        raise NodestroError("tool.frozen", "Tools of a published release cannot be changed")
+
+    def drop_adoption(self, name: str) -> None:
+        raise NodestroError("tool.frozen", "Tools of a published release cannot be changed")
+
     def clear(self) -> None:
         """Nothing to forget: the records belong to the source library."""
 
+
+#: Who may adopt AI-generated code (ADR-0006, R-4): the desktop's local owner or an administrator.
+ADOPTER_ROLES = frozenset({"owner", "admin"})
 
 _Fingerprint = tuple[tuple[str, str, int, int, int, int], ...]
 
@@ -464,6 +482,9 @@ class ToolLibrary:
         self.sandbox_mode: str | None = None
         #: The Docker sandbox's status (set by the workspace), for the reason of a refusal in ``auto`` mode.
         self.docker_status: Callable[[], DockerStatus] | None = None
+        #: Called with the adoption and the new version when a change that is not a person's own (an AI-written
+        #: version) ends an adoption (ADR-0006, R-4); the workspace writes it to the audit trail.
+        self.on_adoption_revoked: Callable[[ToolAdoption, int], None] | None = None
 
     def _load(self, path: Path | None, sandbox: Sandbox) -> ToolRegistry:
         seen = _fingerprint(path)
@@ -524,6 +545,8 @@ class ToolLibrary:
             code=record.code,
             tests=record.tests,
             requirement=record.requirement,
+            content_hash=content_hash(record.code, record.tests or "") if record.code is not None else None,
+            adoption=self.adoption(name) if trust == "user-authored" else None,
             capability=capability_of(name=record.name, kind=kind, isolation=self.isolation(trust, name)),
         )
 
@@ -554,7 +577,94 @@ class ToolLibrary:
         authored = self.provenance.authored(name)
         if all(record.version in authored and not record.requirement for record in versions):
             return "user-authored"
+        if self._valid_adoption(name, versions, authored) is not None:
+            return "user-authored"
         return "untrusted"
+
+    def adoption(self, name: str) -> ToolAdoption | None:
+        """The adoption of ``name`` while it still counts (ADR-0006, R-4); ``None`` otherwise.
+
+        It counts only while the adopted version is stored with exactly the content that was shown
+        (:func:`~nodestro_runtime.tool_provenance.content_hash`) and every later version was written by a person in
+        the tool editor. A later version without that record (AI-written, a draft, a generation job) ends it."""
+        try:
+            versions = self.registry.versions(name)
+        except RegistryError:
+            return None
+        if any(record.kind == "trusted" for record in versions):
+            return None
+        return self._valid_adoption(name, versions, self.provenance.authored(name))
+
+    def _valid_adoption(self, name: str, versions: Sequence[Any], authored: set[int]) -> ToolAdoption | None:
+        found = self.provenance.adoption(name)
+        if found is None:
+            return None
+        adopted = [record for record in versions if record.version == found.version]
+        if len(adopted) != 1 or adopted[0].code is None:
+            return None
+        if content_hash(adopted[0].code, adopted[0].tests or "") != found.content_hash:
+            return None
+        later = [record for record in versions if record.version > found.version]
+        if any(record.version not in authored or record.requirement for record in later):
+            return None
+        return found
+
+    def adopt(self, name: str, *, actor: str, role: str, expected_hash: str) -> ToolAdoption:
+        """Adopt the current version of an AI-generated tool as the person's own code (ADR-0006, R-4).
+
+        Only on the desktop (``tool.adoption_desktop_only`` elsewhere: a server's, and Nodestro Local Docker's,
+        trust policy never changes), only by the local owner or an administrator (``role`` ``owner`` or ``admin``,
+        ``tool.adoption_forbidden`` otherwise), and only for the content the person saw: ``expected_hash`` is the
+        :attr:`ToolInfo.content_hash` that was shown with the code and tests (``tool.adoption_stale`` when the tool
+        changed since). A tool that is not ``untrusted`` needs no adoption (``tool.adoption_not_needed``); built-in,
+        MCP and code-less tools cannot be adopted (``tool.adoption_not_applicable``). Raises :class:`KeyError` for
+        an unknown tool. The caller writes the audit record (:func:`nodestro_runtime.tool_adoption.adopt_tool`)."""
+        if self.policy.profile != "desktop":
+            raise NodestroError(
+                "tool.adoption_desktop_only",
+                f"AI-generated code can be adopted as your own only in the desktop app; in the {self.policy.profile} "
+                "profile it always runs in an isolating sandbox",
+                name=name,
+                profile=self.policy.profile,
+            )
+        if role not in ADOPTER_ROLES:
+            raise NodestroError(
+                "tool.adoption_forbidden",
+                "Only the owner of this computer or an administrator may adopt AI-generated code",
+                name=name,
+            )
+        if name in self.builtin:
+            raise NodestroError(
+                "tool.adoption_not_applicable", f"{name!r} is a built-in tool and needs no adoption", name=name
+            )
+        with self._lock:
+            try:
+                record = self.registry.record(name)
+            except RegistryError:
+                raise KeyError(name) from None
+            if record.kind == "trusted" or record.code is None:
+                raise NodestroError(
+                    "tool.adoption_not_applicable", f"{name!r} has no code that could be adopted", name=name
+                )
+            if self.trust(name) != "untrusted":
+                raise NodestroError(
+                    "tool.adoption_not_needed",
+                    f"{name!r} is {self.trust(name)} already and needs no adoption",
+                    name=name,
+                    trust=self.trust(name),
+                )
+            current = content_hash(record.code, record.tests or "")
+            if expected_hash != current:
+                raise NodestroError(
+                    "tool.adoption_stale",
+                    f"{name!r} changed after it was shown (now version {record.version}); look at it again before "
+                    "adopting it",
+                    name=name,
+                    version=record.version,
+                )
+            adoption = ToolAdoption(name=name, version=record.version, content_hash=current, actor=actor, role=role)
+            self.provenance.record_adoption(adoption)
+        return adoption
 
     def editor_trust(self, function_name: str, code: str) -> TrustClass:
         """The class of code a person submits in the tool editor.
@@ -568,6 +678,13 @@ class ToolLibrary:
             existing = ()
         if existing and self.trust(function_name) != "user-authored":
             return "untrusted"
+        adoption = self.adoption(function_name) if existing else None
+        if adoption is not None:
+            # The adopted code itself (also the job attempt it came from) is the person's own now; a copy of it
+            # under another name is not.
+            adopted = next(record for record in existing if record.version == adoption.version)
+            if adopted.code is not None and code_digest(adopted.code) == code_digest(code):
+                return "user-authored"
         return self.digest_trust(code_digest(code))
 
     def digest_trust(self, digest: str) -> TrustClass:
@@ -881,11 +998,23 @@ class ToolLibrary:
             )
             if trust == "user-authored":
                 self.provenance.record_authored(record.name, record.version)
+            else:
+                self._revoke_adoption(record.name, record.version)
             for older in existing:
                 if older.status == "approved":
                     registry.set_status(older.name, older.version, "revoked")
             registry.approve(record.name, record.version)
         return result, self._info(record.name)
+
+    def _revoke_adoption(self, name: str, version: int) -> None:
+        """A version that is not a person's own ends the tool's adoption (R-4); it would not count any more anyway
+        (:meth:`adoption`), the record is dropped so that a later edit cannot bring it back."""
+        found = self.provenance.adoption(name)
+        if found is None:
+            return
+        self.provenance.drop_adoption(name)
+        if self.on_adoption_revoked is not None:
+            self.on_adoption_revoked(found, version)
 
     def delete(self, name: str) -> None:
         if name in self.builtin:
