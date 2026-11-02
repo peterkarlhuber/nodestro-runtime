@@ -585,11 +585,13 @@ def compat_checks(env_python: str | None = None) -> list[Result]:
 
 
 def _workspace_check() -> list[str]:
-    """A desktop workspace: an AI-generated tool is tested and runs in the built-in sandbox; the host subprocess
-    is never used for it (it would fail here), and without the built-in sandbox it is refused."""
+    """A desktop workspace with the built-in sandbox chosen explicitly (`linux` mode; `auto` is Docker-only): an
+    AI-generated tool is tested and runs in the built-in sandbox; the host subprocess is never used for it (it would
+    fail here), and without the built-in sandbox it is refused."""
     from orkexa.dynamic import SubprocessSandbox
 
     from .problems import NodestroError
+    from .schemas import SettingsIn
     from .tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
     from .workspace import Workspace
 
@@ -602,6 +604,7 @@ def _workspace_check() -> list[str]:
         with tempfile.TemporaryDirectory(prefix="nodestro-workspace-") as directory:
             workspace = Workspace(Path(directory) / "data", integrations=[])
             try:
+                workspace.update_settings(SettingsIn(sandbox="linux"))
                 tools = workspace.tools
                 saved, info = tools.save_custom(
                     CUSTOM_TOOL_TEMPLATE, CUSTOM_TESTS_TEMPLATE, "celsius_to_fahrenheit", requirement="Convert"

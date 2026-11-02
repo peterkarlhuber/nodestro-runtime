@@ -6,6 +6,12 @@ network, read-only root file system, no capabilities, user ``nobody``, memory/CP
 registry. There is no host fallback: without the Docker sandbox a stdio server is refused with
 ``sandbox.isolation_required``.
 
+Before every container start the daemon must prove the sandbox for that image and exactly this container shape, as
+for a tool call (:func:`prove`): Orkexa's preflight (``docker info``: limits, seccomp, cgroups) and its in-container
+self-test of the image (:meth:`orkexa.dynamic.DockerSandbox.self_test`, remembered per daemon, image id and shape).
+The container then runs the image by the id the self-test checked, never by its tag, so a tag moved afterwards is not
+run unchecked. A daemon that fails either check (cgroup v1, limits it does not apply) starts nothing.
+
 Between the MCP SDK's stdio transport and ``docker run`` sits a small relay (``python -m
 nodestro_runtime.mcp.stdio``, Nodestro's own code). The SDK buffers a line without limit; the relay ends the
 connection when the server writes a line longer than :data:`MAX_LINE_BYTES`, so an untrusted server cannot exhaust
@@ -19,6 +25,7 @@ from collections.abc import Callable, Mapping
 import contextlib
 from dataclasses import dataclass, field
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -26,7 +33,11 @@ import threading
 from typing import Any
 import uuid
 
-from ..container_images import MCP_OWNER, sandbox_run_args
+from orkexa.dynamic import SandboxError, SandboxProbe
+
+from ..container_images import MCP_OWNER, StreamedSandbox, sandbox_run_args
+from ..docker_status import MCP_LIFETIME, reason_of
+from ..problems import NodestroError
 
 #: The longest JSON-RPC line a stdio server may write (a tool result is cut to ``max_output_chars`` later anyway).
 MAX_LINE_BYTES = 8 * 1024 * 1024
@@ -36,8 +47,12 @@ CPUS = 1.0
 #: The container name prefix; the sandbox gateway accepts only names of the sandbox's pattern.
 NAME_PREFIX = "nodestro-sandbox-mcp-"
 #: The deadline label of a stdio server's container (it lives as long as its connection; the tool containers' reaper
-#: never removes containers of an MCP owner, :func:`~nodestro_runtime.docker_status.mcp_owner`).
-LIFETIME = 7 * 24 * 3600.0
+#: never removes containers of an MCP owner, :func:`~nodestro_runtime.docker_status.mcp_owner`, the MCP reaper
+#: :meth:`~nodestro_runtime.docker_status.DockerMonitor.reap_mcp_once` those past it or left behind).
+LIFETIME = MCP_LIFETIME
+#: Seconds the self-test container of :func:`prove` may take (Orkexa gives it at least 60).
+SELF_TEST_TIMEOUT = 60.0
+_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,61 @@ def container_name() -> str:
     return f"{NAME_PREFIX}{uuid.uuid4().hex[:12]}"
 
 
+def proof_sandbox(
+    image: str,
+    *,
+    memory_mb: int,
+    docker: str = "docker",
+    docker_env: Mapping[str, str] | None = None,
+    owner: str = MCP_OWNER,
+) -> StreamedSandbox:
+    """The sandbox whose self-test proves the daemon for a stdio server's container: the same docker CLI and
+    environment, owner and limits (memory, :data:`CPUS`, :data:`PIDS_LIMIT`) as :func:`launch`, hence the same
+    container shape (the deadline aside)."""
+    return StreamedSandbox(
+        image=image,
+        timeout=SELF_TEST_TIMEOUT,
+        memory_mb=memory_mb,
+        cpus=CPUS,
+        pids_limit=PIDS_LIMIT,
+        docker=docker,
+        environ=dict(docker_env) if docker_env is not None else None,
+        owner=owner,
+    )
+
+
+def prove(
+    image: str,
+    *,
+    memory_mb: int,
+    docker: str = "docker",
+    docker_env: Mapping[str, str] | None = None,
+    owner: str = MCP_OWNER,
+    sandbox: Callable[..., Any] = proof_sandbox,
+) -> str:
+    """The id of ``image`` once the daemon passed Orkexa's preflight and the self-test of this image in the stdio
+    container's shape; raises ``sandbox.isolation_required`` (with the Docker backend's ``reason``) otherwise.
+
+    The preflight runs on every call (``docker info``); a passed self-test is remembered per daemon fingerprint,
+    image id and shape (Orkexa), so a changed daemon or image is tested again."""
+    checker = sandbox(image, memory_mb=memory_mb, docker=docker, docker_env=docker_env, owner=owner)
+    try:
+        probe: SandboxProbe = checker.self_test(image=image)
+    except SandboxError as exc:
+        probe = SandboxProbe("docker", False, "self-test", str(exc))
+    image_id = str(dict(probe.facts).get("image_id", ""))
+    if not probe.available or not _IMAGE_ID.fullmatch(image_id):
+        reason = reason_of(probe.reason) if not probe.available else "docker-image"
+        detail = probe.detail or "the self-test reported no image id"
+        raise NodestroError(
+            "sandbox.isolation_required",
+            "A local MCP server runs only in a container on a Docker daemon that passed the sandbox's preflight and "
+            f"self-test; this one did not ({reason}): {detail[:500]}",
+            reason=reason,
+        )
+    return image_id
+
+
 def launch(
     *,
     image: str,
@@ -76,7 +146,15 @@ def launch(
     python: str = sys.executable,
     owner: str = MCP_OWNER,
 ) -> StdioLaunch:
-    """The relay command that runs ``python -m module args`` in a sandbox container of ``image``."""
+    """The relay command that runs ``python -m module args`` in a sandbox container of ``image``.
+
+    ``image`` is the id :func:`prove` returned (a tag is refused: only a checked image is run)."""
+    if not _IMAGE_ID.fullmatch(image):
+        raise NodestroError(
+            "sandbox.isolation_required",
+            "A local MCP server's container runs only a proven image by its id",
+            reason="docker-image",
+        )
     name = container_name()
     run = [
         *sandbox_run_args(

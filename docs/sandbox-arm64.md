@@ -13,7 +13,7 @@ on AArch64 today?
 
 No, the x86-64 evidence does not carry over, and the sandbox is not usable on AArch64 today. Nothing fails open:
 on AArch64 the sandbox is refused by three independent checks before any tool code runs. Untrusted code on Linux
-ARM64 therefore needs Docker (the `auto` mode picks it when it runs), exactly as on any other untested system.
+ARM64 therefore needs Docker (the `auto` mode uses it when it runs), exactly as on every other system (Docker-first).
 
 ## What differs between x86-64 and AArch64
 

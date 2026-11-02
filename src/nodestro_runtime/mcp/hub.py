@@ -554,7 +554,8 @@ class McpHub:
 
         from .. import __version__
 
-        launch = self._launch(server)
+        # The launch proves the daemon first (preflight, and the self-test of a new image: up to a minute).
+        launch = await asyncio.to_thread(self._launch, server)
         try:
             async with self._semaphore(server):
                 parameters = StdioServerParameters(command=launch.command, args=launch.args, env=launch.env)

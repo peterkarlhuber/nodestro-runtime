@@ -15,9 +15,11 @@ form:
   devices, ports, host namespaces, privileged mode or other runtimes; private IPC, a small ``/dev/shm``, open-file,
   file-size and core limits, no logging. A request that asks for any of these is refused (HTTP 403 with the reason),
   so a misconfigured or compromised client cannot quietly get them. Orkexa's container shape
-  (:func:`orkexa.dynamic.docker.run_args`) is accepted as it is, with its ``org.orkexa.*`` labels. The image must be
-  one Nodestro builds: ``nodestro-env:<key>``, or the id (``sha256:...``) of an image that carries such a tag and the
-  lock label; nothing is ever pulled for a container.
+  (:func:`orkexa.dynamic.docker.run_args`) is accepted as it is, with its ``org.orkexa.*`` labels. No environment
+  variable of the request reaches the container. The image must be one Nodestro builds: a ``nodestro-env:<key>`` tag
+  or the id (``sha256:...``) of an image that carries such a tag and the lock label (a tag is checked the same way
+  and replaced by the image's id); nothing is ever pulled for a container. The daemon's limits and seccomp profile
+  are confirmed (``/info``) at most :data:`LIMITS_TTL` seconds before a container or build is started.
 - **Containers can only be used by name or ID if the gateway created them** (attach, start, wait, kill, remove,
   inspect). They carry the gateway's label; at start and every few seconds the gateway removes its containers that
   outlived :attr:`GatewayConfig.max_lifetime` (cleanup after crashes), and it refuses new ones beyond
@@ -93,6 +95,10 @@ TMPFS = {
     "/tmp": "rw,noexec,nosuid,nodev,size=16m",
     # mode=1777, not uid=/gid= (Podman 4 rejects those): every process in the container runs as 65534 anyway.
     "/work": "rw,noexec,nosuid,nodev,size=16m,mode=1777",
+    # Empty, root-owned and noexec: they replace the writable, executable tmpfs Podman mounts on /run and /var/tmp
+    # of a read-only container (Orkexa's self-test refuses any mount it does not expect).
+    "/run": "rw,noexec,nosuid,nodev,size=1m,mode=755",
+    "/var/tmp": "rw,noexec,nosuid,nodev,size=1m,mode=755",
 }
 #: Orkexa's labels on a sandbox container (owner and deadline), passed on when they are well-formed; every other label
 #: of a request is dropped.
@@ -284,6 +290,11 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
     env = body.get("Env") or []
     if not isinstance(env, list) or not all(isinstance(item, str) for item in env) or len(env) > 64:
         raise Refused("The environment must be a short list of KEY=value strings")
+    # No variable of the request reaches the container: Nodestro's sandboxes pass none (Orkexa's shape has no -e), and
+    # what a docker CLI adds by itself (the proxies of its config.json) is useless without network and could carry a
+    # secret. Orkexa's self-test refuses a container with variables the image does not define.
+    if env:
+        logger.debug("The environment of a container request is dropped (%d variables)", len(env))
 
     host = body.get("HostConfig") or {}
     if not isinstance(host, dict):
@@ -355,7 +366,7 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
         "Image": image,
         "Cmd": command,
         "WorkingDir": "/work",
-        "Env": env,
+        "Env": [],
         "User": "65534:65534",
         "AttachStdin": bool(body.get("AttachStdin")),
         "AttachStdout": bool(body.get("AttachStdout")),
@@ -825,6 +836,10 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 #: What ``/info`` must report as ``true`` before a sandbox container or image build is started.
 _LIMIT_FEATURES = ("MemoryLimit", "PidsLimit", "CpuCfsQuota", "CpuCfsPeriod")
+#: Seconds a confirmation of the daemon's limits and seccomp profile is reused before ``/info`` is asked again (the
+#: runtime's preflight interval, :data:`nodestro_runtime.docker_status.PREFLIGHT_TTL`): a daemon reconfigured later
+#: (``seccomp-profile=unconfined``, limits lost) is noticed within that time.
+LIMITS_TTL = 5.0
 
 
 class Gateway:
@@ -836,7 +851,9 @@ class Gateway:
         self.containers: dict[str, str] = {}
         self._builds = asyncio.Semaphore(config.max_builds)
         self._creating = asyncio.Lock()
-        self._limits_enforced = False
+        #: When the daemon last confirmed its limits and seccomp profile (monotonic clock), ``None``: not yet.
+        self._limits_enforced: float | None = None
+        self._clock = time.monotonic
         self._connections = 0
 
     # -- daemon access --
@@ -866,9 +883,12 @@ class Gateway:
 
         Docker discards memory, CPU and process limits it cannot apply and only warns about it, for example rootless
         Docker without cgroup v2 delegation. Tool code would then run without limits, so nothing is started (503).
-        Once the daemon has confirmed its limits, they are not asked for again."""
-        if self._limits_enforced:
+        A confirmation counts for :data:`LIMITS_TTL` seconds; then the daemon is asked again, and a refusal forgets
+        it at once."""
+        confirmed = self._limits_enforced
+        if confirmed is not None and self._clock() - confirmed < LIMITS_TTL:
             return
+        self._limits_enforced = None
         status, info = await self.call("GET", "/info")
         missing = [name for name in _LIMIT_FEATURES if not (isinstance(info, dict) and info.get(name) is True)]
         options = info.get("SecurityOptions") if isinstance(info, dict) else None
@@ -887,7 +907,7 @@ class Gateway:
                 "Rootless Docker needs cgroup v2 with delegated controllers (see Docker's rootless documentation)",
                 503,
             )
-        self._limits_enforced = True
+        self._limits_enforced = self._clock()
 
     async def require_image_space(self, *, tag: str) -> None:
         """Refuse a build (507) when the environment images already reach :attr:`GatewayConfig.max_images` or
@@ -908,20 +928,26 @@ class Gateway:
                 507,
             )
 
-    async def require_nodestro_image(self, image_id: str) -> None:
-        """Refuse an image id (404) unless the image carries a ``nodestro-env:<key>`` tag and the lock label, i.e. it
-        is an environment image Nodestro built (through this gateway's build checks or on this daemon before)."""
-        status, found = await self.call("GET", f"/images/{quote(image_id, safe=':')}/json")
+    async def require_nodestro_image(self, ref: str) -> str:
+        """The id of the image ``ref`` (an id or a ``nodestro-env:<key>`` tag); refused (404) unless the image carries
+        a ``nodestro-env:<key>`` tag (``ref`` itself when it is a tag) and the lock label, i.e. it is an environment
+        image Nodestro built (through this gateway's build checks or on this daemon before), not another image
+        that was given such a tag."""
+        status, found = await self.call("GET", f"/images/{quote(ref, safe=':')}/json")
         labels = ((found or {}).get("Config") or {}).get("Labels") if isinstance(found, dict) else None
         tags = found.get("RepoTags") if isinstance(found, dict) else None
+        image_id = str(found.get("Id", "")) if isinstance(found, dict) else ""
+        tagged = [tag for tag in tags or [] if isinstance(tag, str) and IMAGE.fullmatch(tag)]
         if (
             status != 200
             or not isinstance(labels, dict)
             or not re.fullmatch(r"[0-9a-f]{64}", str(labels.get(_LOCK_LABEL) or ""))
-            or not any(isinstance(tag, str) and IMAGE.fullmatch(tag) for tag in tags or [])
-            or str(found.get("Id", "")) != image_id
+            or not tagged
+            or not IMAGE_ID.fullmatch(image_id)
+            or (image_id != ref if IMAGE_ID.fullmatch(ref) else ref not in tagged)
         ):
-            raise Refused(f"The image {image_id!r} is not one of Nodestro's sandbox images", 404)
+            raise Refused(f"The image {ref!r} is not one of Nodestro's sandbox images", 404)
+        return image_id
 
     # -- bookkeeping --
 
@@ -1029,9 +1055,13 @@ class Gateway:
             query, body = plan_create(request.query, parsed, self.config)
             target = f"{prefix}/containers/create?{urlencode(query)}"
             await self.require_limits()
-            image = str(parsed.get("Image", ""))
-            if IMAGE_ID.fullmatch(image):
-                await self.require_nodestro_image(image)
+            # By id or by tag, the image must be one Nodestro built (lock label); a tag is replaced by the id that was
+            # checked, so moving the tag before the daemon creates the container changes nothing.
+            image_id = await self.require_nodestro_image(str(parsed.get("Image", "")))
+            created = json.loads(body)
+            if created["Image"] != image_id:
+                created["Image"] = image_id
+                body = json.dumps(created).encode("utf-8")
             async with self._creating:
                 if len(self.containers) >= self.config.max_containers:
                     await self.reconcile()

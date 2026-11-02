@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import Any
 
+from orkexa.dynamic import SandboxError, SandboxProbe
 from pydantic import ValidationError
 import pytest
 
@@ -27,7 +28,7 @@ from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
 from nodestro_runtime.mcp.netguard import EgressPolicy
 from nodestro_runtime.mcp.service import McpService
-from nodestro_runtime.mcp.stdio import LIFETIME, MAX_LINE_BYTES, launch, relay
+from nodestro_runtime.mcp.stdio import LIFETIME, MAX_LINE_BYTES, launch, proof_sandbox, prove, relay
 from nodestro_runtime.mcp.vault import TokenVault
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import needed_for_requirements
@@ -36,6 +37,22 @@ from nodestro_runtime.storage import SQLiteStore
 
 TESTS = Path(__file__).resolve().parent
 IMAGE = "nodestro-env:" + "0" * 32
+#: The id the (stand-in) self-test resolves IMAGE to; containers run it, never the tag.
+IMAGE_ID = "sha256:" + "ab" * 32
+
+
+class FakeProof:
+    """Stands in for ``stdio.prove`` (preflight and in-container self-test): records the calls, returns the id."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.refuse: str | None = None
+
+    def __call__(self, image: str, **options: Any) -> str:
+        self.calls.append({"image": image, **options})
+        if self.refuse is not None:
+            raise NodestroError("sandbox.isolation_required", "refused", reason=self.refuse)
+        return IMAGE_ID
 
 
 class FakeImages:
@@ -100,6 +117,7 @@ def service(tmp_path: Path, docker: tuple[str, Path]) -> Iterator[McpService]:
     hub = McpHub(EgressPolicy())
     svc = McpService(store, hub, TokenVault(None, "local"))
     svc.python = FakePython(FakeImages(*docker))
+    svc.stdio_proof = FakeProof()
     yield svc
     hub.close()
     store.close()
@@ -203,13 +221,14 @@ def test_without_approved_packages_nothing_starts(service: McpService, docker: t
 
 
 def test_the_container_has_the_sandbox_shape() -> None:
-    started = launch(image=IMAGE, module="pkg.server", args=["--tz", "UTC"], memory_mb=256, docker="docker")
+    started = launch(image=IMAGE_ID, module="pkg.server", args=["--tz", "UTC"], memory_mb=256, docker="docker")
     run = started.args[started.args.index("--") + 1 :]
-    image = run.index(IMAGE)
+    image = run.index(IMAGE_ID)
+    assert IMAGE not in run
     expected = sandbox_run_args(
         docker="docker",
         container_name=started.container,
-        image=IMAGE,
+        image=IMAGE_ID,
         memory_mb=256,
         cpus=1.0,
         pids_limit=64,
@@ -339,6 +358,172 @@ def test_a_changed_command_needs_new_approvals(service: McpService) -> None:
     assert service.tool(server.id, "search").status == "changed"
     service.remove(server.id)
     assert service.python.forgotten == [f"mcp:{server.id}"]
+
+
+# ---- the proof before every start (DS-4) ----------------------------------------------------------------
+
+
+def test_every_start_is_proven_and_runs_the_image_by_its_id(service: McpService, docker: tuple[str, Path]) -> None:
+    server = service.add(stdio_input(cmd={"memory_mb": 384}))
+    service.discover(server.id)
+    service.discover(server.id)
+    runs = [call for call in docker_calls(docker[1]) if call[0] == "run"]
+    proofs = service.stdio_proof.calls  # type: ignore[attr-defined]
+    assert len(runs) == len(proofs) == 2  # one proof per container start
+    for proof in proofs:
+        # The approved image's tag is checked in exactly the container's shape and owner.
+        assert proof["image"] == IMAGE and proof["memory_mb"] == 384
+        assert proof["owner"] == "nodestro-mcp-0123456789ab" and proof["docker"] == docker[0]
+    for call in runs:
+        assert IMAGE_ID in call and IMAGE not in call  # the checked id, never the tag
+
+
+@pytest.mark.parametrize("reason", ["docker-selftest", "docker-limits", "docker-seccomp", "docker-unreachable"])
+def test_a_daemon_that_fails_the_proof_starts_no_container(
+    service: McpService, docker: tuple[str, Path], reason: str
+) -> None:
+    server = service.add(stdio_input())
+    service.stdio_proof.refuse = reason  # type: ignore[attr-defined]
+    with pytest.raises(NodestroError) as caught:
+        service.discover(server.id)
+    assert caught.value.code == "sandbox.isolation_required" and caught.value.params["reason"] == reason
+    assert docker_calls(docker[1]) == []
+
+
+def test_a_tag_is_never_launched() -> None:
+    assert code(lambda: launch(image=IMAGE, module="pkg.server", args=[], memory_mb=256)) == (
+        "sandbox.isolation_required"
+    )
+
+
+class ProofSandbox:
+    """Stands in for the self-test sandbox of ``stdio.prove``."""
+
+    def __init__(self, probe: SandboxProbe | Exception) -> None:
+        self.probe = probe
+        self.made: list[tuple[str, dict[str, Any]]] = []
+        self.tested: list[str | None] = []
+
+    def __call__(self, image: str, **options: Any) -> ProofSandbox:
+        self.made.append((image, options))
+        return self
+
+    def self_test(self, *, image: str | None = None) -> SandboxProbe:
+        self.tested.append(image)
+        if isinstance(self.probe, Exception):
+            raise self.probe
+        return self.probe
+
+
+@pytest.mark.parametrize(
+    ("probe", "reason"),
+    [
+        (SandboxProbe("docker", False, "limits", "the daemon does not enforce memory limits"), "docker-limits"),
+        (SandboxProbe("docker", False, "seccomp", "seccomp unconfined"), "docker-seccomp"),
+        (SandboxProbe("docker", False, "unreachable", "no daemon"), "docker-unreachable"),
+        (SandboxProbe("docker", False, "self-test", "the container is not on cgroup v2"), "docker-selftest"),
+        (SandboxProbe("docker", False, "image", "not built"), "docker-image"),
+        (SandboxError("the self-test container did not run"), "docker-selftest"),
+        (SandboxProbe("docker", True), "docker-image"),  # passed, but without the id it checked
+    ],
+)
+def test_prove_refuses_without_preflight_and_self_test(probe: SandboxProbe | Exception, reason: str) -> None:
+    fake = ProofSandbox(probe)
+    with pytest.raises(NodestroError) as caught:
+        prove(IMAGE, memory_mb=256, docker="docker", docker_env={"PATH": "/usr/bin"}, sandbox=fake)
+    assert caught.value.code == "sandbox.isolation_required" and caught.value.params["reason"] == reason
+    assert fake.tested == [IMAGE]
+
+
+def test_prove_returns_the_id_the_self_test_checked() -> None:
+    fake = ProofSandbox(SandboxProbe("docker", True, facts=(("image_id", IMAGE_ID),)))
+    assert (
+        prove(IMAGE, memory_mb=300, docker="dk", docker_env={"PATH": "/p"}, owner="nodestro-mcp-x", sandbox=fake)
+        == IMAGE_ID
+    )
+    assert fake.made == [
+        (IMAGE, {"memory_mb": 300, "docker": "dk", "docker_env": {"PATH": "/p"}, "owner": "nodestro-mcp-x"})
+    ]
+
+
+def test_the_self_test_checks_the_shape_the_container_gets() -> None:
+    from orkexa.dynamic.docker import run_args
+
+    checker = proof_sandbox(IMAGE_ID, memory_mb=256, docker="docker", docker_env={"PATH": "/p"}, owner=MCP_OWNER)
+    assert checker.owner == MCP_OWNER and checker.environ == {"PATH": "/p"}
+    started = launch(image=IMAGE_ID, module="pkg.server", args=[], memory_mb=256, docker="docker")
+    run = started.args[started.args.index("--") + 1 :]
+    run = run[: run.index(IMAGE_ID) + 1]
+
+    def stable(args: list[str]) -> list[str]:
+        return [item for item in args if not item.startswith("org.orkexa.deadline=")]
+
+    # The self-test's container shape (Orkexa keys its result by it) is the stdio container's, the deadline aside.
+    shape = run_args("docker", started.container, IMAGE_ID, checker.limits(), owner=checker.owner)
+    assert stable(shape) == stable(run)
+
+
+def test_prove_runs_orkexa_s_preflight_and_self_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real gate: a daemon without enforced limits (preflight) or on cgroup v1 (self-test) is refused, and no
+    MCP container is ever started; only the self-test container runs."""
+    from dataclasses import replace
+
+    from orkexa.dynamic.docker import DockerHost, ImageInfo
+    import orkexa.dynamic.sandbox as orkexa_sandbox
+
+    from nodestro_runtime import docker_status
+
+    host = DockerHost(
+        engine="docker",
+        os_type="linux",
+        arch="x86_64",
+        rootless=False,
+        cgroup_version="1",
+        cgroup_driver="cgroupfs",
+        memory_limit=True,
+        pids_limit=True,
+        cpu_cfs_quota=True,
+        cpu_cfs_period=True,
+        seccomp_profile="builtin",
+        apparmor=True,
+        selinux=False,
+        daemon_id="daemon-mcp",
+        server_version="27.4.0",
+    )
+    current = {"host": replace(host, memory_limit=False)}
+    started: list[list[str]] = []
+
+    def run_bounded(args: list[str], data: bytes, **_: Any) -> tuple[int, Any]:
+        started.append(args)
+        report = json.dumps({"version": 1, "cgroup": {"version": "1"}}).encode()
+
+        class Output:
+            stdout = report + b"\n"
+            stderr = b""
+
+        return 0, Output()
+
+    monkeypatch.setattr(orkexa_sandbox, "inspect_host", lambda docker, env=None: current["host"])
+    monkeypatch.setattr(
+        orkexa_sandbox,
+        "inspect_image",
+        lambda docker, ref, env=None: ImageInfo(id=IMAGE_ID, repo_digests=(), env_names=()),
+    )
+    monkeypatch.setattr(orkexa_sandbox, "run_bounded", run_bounded)
+    StreamedSandbox.clear_self_test_cache()
+    try:
+        with pytest.raises(NodestroError) as caught:
+            prove(IMAGE, memory_mb=256, docker=sys.executable, docker_env={"PATH": os.environ.get("PATH", "")})
+        assert caught.value.params["reason"] == "docker-limits" and started == []  # refused before any container
+        current["host"] = host  # limits reported, but cgroup v1: the self-test shows they are not verifiable
+        with pytest.raises(NodestroError) as caught:
+            prove(IMAGE, memory_mb=256, docker=sys.executable, docker_env={"PATH": os.environ.get("PATH", "")})
+        assert caught.value.params["reason"] == "docker-selftest"
+        assert len(started) == 1 and any(item.startswith("orkexa-selftest-") for item in started[0])
+        assert f"org.orkexa.sandbox={MCP_OWNER}" in started[0] and "256m" in started[0]
+    finally:
+        StreamedSandbox.clear_self_test_cache()
+        docker_status.clear_proofs()
 
 
 def test_without_a_launcher_the_hub_refuses(tmp_path: Path) -> None:

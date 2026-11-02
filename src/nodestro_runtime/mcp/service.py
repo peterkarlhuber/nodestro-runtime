@@ -53,7 +53,7 @@ from .models import (
 )
 from .netguard import is_loopback_url, redact_url, url_secret_problem
 from .oauth import OAuthCredentials, PendingAuthorization
-from .stdio import StdioLaunch, launch
+from .stdio import StdioLaunch, launch, prove
 from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,9 @@ class McpService:
         #: approved packages and the container image of a local stdio server (WP-8). ``None``: stdio is refused.
         self.python: Any = None
         self._lock = threading.RLock()
+        #: Proves the daemon for a stdio server's image before each container start and returns the image's id
+        #: (:func:`~nodestro_runtime.mcp.stdio.prove`: preflight and in-container self-test); tests replace it.
+        self.stdio_proof: Callable[..., str] = prove
         hub.stdio_launcher = self.stdio_launch
         self._scrub_url_secrets()
 
@@ -336,7 +339,11 @@ class McpService:
         return self.python.plan("mcp", server.id, self._needed(server), label=server.name)
 
     def stdio_launch(self, server: McpServer) -> StdioLaunch:
-        """How the hub starts a connection: the server's command in a container of its approved image."""
+        """How the hub starts a connection: the server's command in a container of its approved image.
+
+        The setting alone is not enough: before each start the daemon must pass the preflight and the self-test of
+        this image in the container's shape (:attr:`stdio_proof`), and the container runs the image by the id that
+        was checked. Otherwise nothing starts (``sandbox.isolation_required`` with the reason)."""
         self.require_isolation()
         if server.transport != "stdio" or server.stdio is None:
             raise NodestroError("mcp.stdio_invalid", "Only a stdio server is started locally")
@@ -348,14 +355,19 @@ class McpService:
                 server=server.name,
             )
         images = self.python.images
+        docker_env = images._cli_environment()
+        owner = mcp_owner(images.owner)
+        image_id = self.stdio_proof(
+            image, memory_mb=server.stdio.memory_mb, docker=images.docker, docker_env=docker_env, owner=owner
+        )
         return launch(
-            image=image,
+            image=image_id,
             module=server.stdio.module,
             args=list(server.stdio.args),
             memory_mb=server.stdio.memory_mb,
             docker=images.docker,
-            docker_env=images._cli_environment(),
-            owner=mcp_owner(images.owner),
+            docker_env=docker_env,
+            owner=owner,
         )
 
     # ---- discovery -------------------------------------------------------------------------
