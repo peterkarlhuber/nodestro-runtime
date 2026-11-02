@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-11-02):
+
+- `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so
+  the label only bounds a container whose relay and hub both crashed. A test ties it to the model's maximum timeout.
+
 Resolve and module-check containers checked against the proven shape (R-5, RT-038; 2026-11-02):
 
 - `container_images.check_shape` refuses a `docker run` that is not Orkexa's `run_args` (the shape the in-container
