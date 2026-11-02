@@ -47,6 +47,7 @@ from typing import Any
 import uuid
 
 from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
+from orkexa.providers.base import redact
 
 from . import sandbox_cancel
 from .image_limits import (
@@ -80,6 +81,43 @@ BASE_IMAGES: dict[str, str] = {
     "3.14": "python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8",
 }
 _BUILD_TIMEOUT = 1800.0
+#: The image that resolves requirements in a container when a package has to be built from source to read its
+#: dependencies (:meth:`ContainerImages.compile_in_container`): uv's official image with Python, pinned by digest.
+#: The digest is a placeholder until it is pinned on purpose (RT-032); with it, building from source is refused.
+#: Pin with ``docker buildx imagetools inspect ghcr.io/astral-sh/uv:<version>-python3.13-bookworm-slim``.
+UV_IMAGE = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:" + "0" * 64
+_UV_IMAGE_PLACEHOLDER = "@sha256:" + "0" * 64
+_PINNED = re.compile(r"^[a-z0-9./:_-]+@sha256:[0-9a-f]{64}$")
+_RESOLVE_TIMEOUT = 900.0
+#: Runs in the resolve container: writes the requirements (and the previous lock, and a certificate authority) from
+#: stdin into the tmpfs ``/tmp``, runs ``uv pip compile`` there and prints only the lock on stdout.
+_RESOLVE = (
+    "import json, os, subprocess, sys\n"
+    "envelope = json.loads(sys.stdin.read())\n"
+    "work = '/tmp/resolve'\n"
+    "os.makedirs(work, mode=0o700)\n"
+    "env = {'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'), 'HOME': '/tmp',\n"
+    "       'UV_CACHE_DIR': '/tmp/uv-cache', 'UV_NO_PROGRESS': '1', 'NO_COLOR': '1', 'UV_PYTHON_DOWNLOADS': 'never'}\n"
+    "for name in json.loads(sys.argv[1]):\n"
+    "    if os.environ.get(name):\n"
+    "        env[name] = os.environ[name]\n"
+    "if envelope.get('ca'):\n"
+    "    with open('/tmp/ca.pem', 'w', encoding='utf-8') as handle:\n"
+    "        handle.write(envelope['ca'])\n"
+    "    env['SSL_CERT_FILE'] = '/tmp/ca.pem'\n"
+    "with open(os.path.join(work, 'requirements.in'), 'w', encoding='utf-8') as handle:\n"
+    "    handle.write(envelope['requirements'])\n"
+    "if envelope.get('previous'):\n"
+    "    with open(os.path.join(work, 'requirements.txt'), 'w', encoding='utf-8') as handle:\n"
+    "        handle.write(envelope['previous'])\n"
+    "command = ['uv', 'pip', 'compile', 'requirements.in', '-o', 'requirements.txt', '--universal',\n"
+    "           '--python-version', envelope['python'], '--no-header', '--quiet', '--generate-hashes']\n"
+    "code = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL, stdout=sys.stderr).returncode\n"
+    "if code:\n"
+    "    sys.exit(code)\n"
+    "with open(os.path.join(work, 'requirements.txt'), encoding='utf-8') as handle:\n"
+    "    sys.stdout.write(handle.read())\n"
+)
 
 
 def default_base(python_version: str) -> str:
@@ -172,7 +210,14 @@ class ContainerImages:
     def available(self) -> bool:
         return DockerSandbox.available(self.docker)
 
-    def _docker(self, args: list[str], *, timeout: float = 60.0, log: Callable[[str], None] | None = None) -> str:
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 60.0,
+        log: Callable[[str], None] | None = None,
+        stdin: str | None = None,
+    ) -> str:
         if shutil.which(self.docker) is None and not os.path.isabs(self.docker):
             raise NodestroError("sandbox.unavailable", "Docker is not installed; tools with libraries need it")
         try:
@@ -183,6 +228,7 @@ class ContainerImages:
                 timeout=timeout,
                 check=False,
                 env=self._cli_environment(),
+                **({} if stdin is None else {"input": stdin}),
             )
         except subprocess.TimeoutExpired as exc:
             raise NodestroError("deps.image_failed", f"docker {args[0]} timed out") from exc
@@ -422,6 +468,81 @@ class ContainerImages:
             if value and Path(value).is_file():
                 return Path(value)
         return None
+
+    # ---- resolving with source builds, in a container -----------------------------------------
+
+    def compile_in_container(
+        self,
+        requirements: list[str],
+        *,
+        python: str,
+        previous: str,
+        log: Callable[[str], None],
+        image: str | None = None,
+    ) -> str:
+        """Resolve ``requirements`` like :meth:`~nodestro_runtime.python_envs.UvRunner.compile`, but in a container,
+        so the build scripts of packages without a wheel never run on the host. Returns the lock (with hashes).
+
+        The container has network (the only thing it is for: the package index), no bind mount, no host variable
+        but the proxy settings (passed by name, their values never on a command line), no capabilities, no new
+        privileges, user ``nobody``, a read-only root file system with a ``tmpfs`` ``/tmp``, memory/CPU/process
+        limits. The requirements, the previous lock and a certificate authority (``NODESTRO_BUILD_CA_FILE`` or
+        ``SSL_CERT_FILE``) travel on stdin; the lock comes back on stdout. The image is uv's, pinned by digest
+        (:data:`UV_IMAGE`); while the digest is a placeholder, this is refused (``deps.build_unavailable``).
+
+        Raises :class:`ResolveError` with uv's output when resolving fails, :class:`NodestroError` when Docker is
+        missing (``sandbox.unavailable``) or the image is not pinned."""
+        image = image or UV_IMAGE
+        if image.endswith(_UV_IMAGE_PLACEHOLDER) or not _PINNED.fullmatch(image):
+            raise NodestroError(
+                "deps.build_unavailable",
+                "Building packages from source in a container is not set up in this version (the resolver image is "
+                "not pinned), and Nodestro never runs build scripts on this computer",
+            )
+        ca = self._certificate_authority()
+        envelope = json.dumps(
+            {
+                "requirements": "\n".join(requirements) + "\n",
+                "previous": previous,
+                "python": python,
+                "ca": ca.read_text(encoding="utf-8", errors="replace") if ca is not None else "",
+            }
+        )
+        name = f"nodestro-resolve-{uuid.uuid4().hex[:12]}"
+        environ = self._cli_environment()
+        proxies = [variable for variable in _PROXY_VARIABLES if environ.get(variable)]
+        # Network only for this step: Docker's default network, or the one image builds use.
+        network = self.environ.get("NODESTRO_DOCKER_BUILD_NETWORK")
+        args = [
+            *("run", "--rm", "-i", "--pull", "missing", "--name", name),
+            *(("--network", network) if network else ()),
+            *("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65534:65534"),
+            *("--pids-limit", "256", "--memory", "2048m", "--memory-swap", "2048m", "--cpus", "2"),
+            *("--tmpfs", "/tmp:rw,nosuid,size=1024m,uid=65534,gid=65534,mode=0700"),
+            *(item for variable in proxies for item in ("--env", variable)),
+            image,
+            *("python", "-I", "-B", "-c", _RESOLVE, json.dumps(proxies)),
+        ]
+        log(f"$ uv pip compile (in a container of {image.split('@', 1)[0]})")
+        try:
+            return self._docker(args, timeout=_RESOLVE_TIMEOUT, log=lambda line: log(redact(line)), stdin=envelope)
+        except _DockerFailed as exc:
+            lowered = exc.output.lower()
+            if "cannot connect to the docker daemon" in lowered or "is the docker daemon running" in lowered:
+                raise NodestroError("sandbox.unavailable", "Docker is not running") from None
+            raise ResolveError(redact(exc.output)) from None
+        except NodestroError:
+            # A timed-out docker client leaves its container running.
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                self._run(
+                    [self.docker, "rm", "-f", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    env=environ,
+                )
+            raise
 
     def missing_modules(self, tag: str, modules: Iterable[str]) -> list[str]:
         """The modules that cannot be found in the image (checked without network, as ``nobody``)."""
@@ -663,6 +784,14 @@ def _copy_orkexa(target: Path) -> None:
         shutil.copyfile(path, destination)
 
 
+class ResolveError(Exception):
+    """Resolving in a container failed; ``output`` is uv's explanation (see ``python_envs.explain_uv_error``)."""
+
+    def __init__(self, output: str) -> None:
+        super().__init__(output)
+        self.output = output
+
+
 class _DockerFailed(Exception):
     def __init__(self, output: str) -> None:
         super().__init__(output)
@@ -692,8 +821,10 @@ __all__ = [
     "IMAGE_REPOSITORY",
     "LOCK_LABEL",
     "MAX_IMAGE_GB",
+    "UV_IMAGE",
     "ContainerImages",
     "LocalImageSandbox",
+    "ResolveError",
     "RuntimeImageSandbox",
     "StreamedSandbox",
     "lock_has_hashes",

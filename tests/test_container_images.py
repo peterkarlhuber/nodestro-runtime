@@ -53,6 +53,10 @@ class FakeDocker:
         self.build_size = 100 * 1024**2
         self.in_use: set[str] = set()
         self.list_fails = False
+        #: Runs of the resolve container: (arguments, stdin); what it answers.
+        self.resolves: list[tuple[list[str], str]] = []
+        self.resolve_lock = HASHED
+        self.resolve_error = ""
 
     def __call__(self, args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
@@ -91,6 +95,11 @@ class FakeDocker:
             self.images[built] = hashlib.sha256(lock.encode()).hexdigest()
             self.sizes[built] = self.build_size
             return subprocess.CompletedProcess(args, 0, "built\n", "")
+        if command[0] == "run" and any(item.startswith("nodestro-resolve-") for item in command):
+            self.resolves.append((args, str(options.get("input"))))
+            if self.resolve_error:
+                return subprocess.CompletedProcess(args, 2, "", self.resolve_error)
+            return subprocess.CompletedProcess(args, 0, self.resolve_lock, "resolved\n")
         if command[0] == "run":
             return subprocess.CompletedProcess(args, 0, json.dumps(self.missing) + "\n", "")
         if command[:2] == ["image", "rm"]:
@@ -328,6 +337,126 @@ def test_environments_keep_their_images_when_unused_ones_are_collected(
     removed = python.images.gc(max_images=0)
     assert len(removed) == 30 and tag not in removed
     assert list(docker.images) == [tag]
+
+
+# ---- resolving with source builds in a container (no build scripts on the host) -----------------
+
+PINNED_UV = "ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:" + "ab" * 32
+
+
+def test_resolving_in_a_container_is_refused_while_the_image_is_a_placeholder(docker: FakeDocker) -> None:
+    from nodestro_runtime.container_images import UV_IMAGE
+
+    for image in (None, UV_IMAGE, "ghcr.io/astral-sh/uv:latest"):
+        with pytest.raises(NodestroError) as caught:
+            images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=image)
+        assert caught.value.code == "deps.build_unavailable"
+    assert docker.calls == []
+
+
+def test_resolving_in_a_container_is_locked_down_and_uses_only_stdin_and_stdout(
+    docker: FakeDocker, tmp_path: Path
+) -> None:
+    ca = tmp_path / "ca.pem"
+    ca.write_text("CERT")
+    built = images(
+        docker,
+        HTTPS_PROXY="http://user:secret@proxy:3128",
+        NODESTRO_BUILD_CA_FILE=str(ca),
+        ANTHROPIC_API_KEY="sk-secret",
+        AWS_SECRET_ACCESS_KEY="aws-secret",
+    )
+    lines: list[str] = []
+    lock = built.compile_in_container(
+        ["six==1.17.0"], python="3.12", previous="six==1.16.0\n", log=lines.append, image=PINNED_UV
+    )
+    assert lock == HASHED
+    ((args, stdin),) = docker.resolves
+    run = args[1:]
+    image = run.index(PINNED_UV)
+    flags, command = run[:image], run[image + 1 :]
+    for flag in ("--read-only", "--rm", "-i"):
+        assert flag in flags
+    pairs = [(flags[index], flags[index + 1]) for index in range(len(flags) - 1)]
+    expected = [
+        ("--cap-drop", "ALL"),
+        ("--security-opt", "no-new-privileges"),
+        ("--user", "65534:65534"),
+        ("--pull", "missing"),
+        ("--env", "HTTPS_PROXY"),
+    ]
+    for pair in expected:
+        assert pair in pairs, pair
+    assert [flag for flag in flags if flag in ("-v", "--volume", "--mount", "--privileged", "--env-file")] == []
+    # Network only for this step (Docker's default), but nothing of the host: the only variable is a proxy, by name.
+    assert "--network" not in flags
+    assert [flags[index + 1] for index, flag in enumerate(flags) if flag in ("--env", "-e")] == ["HTTPS_PROXY"]
+    assert not any("secret" in item for item in args)
+    tmpfs = [flags[index + 1] for index, flag in enumerate(flags) if flag == "--tmpfs"]
+    assert len(tmpfs) == 1 and tmpfs[0].startswith("/tmp:")
+    assert command[:4] == ["python", "-I", "-B", "-c"]
+    envelope = json.loads(stdin)
+    assert envelope == {"requirements": "six==1.17.0\n", "previous": "six==1.16.0\n", "python": "3.12", "ca": "CERT"}
+    # The docker CLI gets the proxy (to pass it on) but no provider or cloud keys.
+    environment = docker.environments[-1]
+    assert environment["HTTPS_PROXY"] and "ANTHROPIC_API_KEY" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    compile(command[4], "<resolve>", "exec")  # the script that runs in the container is valid Python
+
+
+def test_a_failed_resolve_in_a_container_carries_uv_s_explanation(docker: FakeDocker) -> None:
+    from nodestro_runtime.container_images import ResolveError
+    from nodestro_runtime.python_envs import explain_uv_error
+
+    docker.resolve_error = "No solution found: Because nothere was not found in the package registry"
+    with pytest.raises(ResolveError) as caught:
+        images(docker).compile_in_container(["nothere"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert explain_uv_error(caught.value.output).code == "deps.not_found"
+    docker.resolve_error = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+    with pytest.raises(NodestroError) as down:
+        images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert down.value.code == "sandbox.unavailable"
+
+
+def test_an_accepted_source_build_is_resolved_in_a_container(
+    workspace: Workspace, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodestro_runtime import container_images
+
+    monkeypatch.setattr(container_images, "UV_IMAGE", PINNED_UV)
+    python = workspace.python
+    runner = python.runner
+    assert isinstance(runner, FakeUv)
+    runner.source_only = {"tablib"}
+    needed = python.needed_for_sources([("show", TOOL, "")])
+    # A generated tool's plan (nobody accepted a build) stops at deps.build_required; nothing runs in a container.
+    unbuilt = python.plan("tool", "show", needed, builds=False)
+    assert unbuilt.error is not None and unbuilt.error.code == "deps.build_required" and docker.resolves == []
+    docker.resolve_lock = (
+        "tablib==1.0 \\\n    --hash=sha256:" + "1" * 64 + "\n    # via -r requirements.in\n"
+        "pydantic==2.0.0 \\\n    --hash=sha256:" + "2" * 64 + "\n    # via -r requirements.in\n"
+    )
+    plan = python.plan("tool", "show", needed)
+    assert runner.builds == [False, False]  # uv on the host never builds
+    assert plan.error is None and plan.lock == docker.resolve_lock and len(docker.resolves) == 1
+    assert {item.name for item in plan.packages} >= {"tablib"}
+    envelope = json.loads(docker.resolves[0][1])
+    assert "tablib" in envelope["requirements"]
+
+
+def test_without_docker_an_accepted_source_build_stays_refused(
+    workspace: Workspace, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodestro_runtime import container_images
+
+    monkeypatch.setattr(container_images, "UV_IMAGE", PINNED_UV)
+    python = workspace.python
+    assert isinstance(python.runner, FakeUv)
+    python.runner.source_only = {"tablib"}
+    docker.resolve_error = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+    plan = python.plan("tool", "show", python.needed_for_sources([("show", TOOL, "")]))
+    assert plan.error is not None and plan.error.code == "deps.build_required"
+    assert plan.error.params == {"name": "tablib", "reason": "sandbox.unavailable"} and not plan.lock
 
 
 # ---- environments in the Docker sandbox -------------------------------------------------------

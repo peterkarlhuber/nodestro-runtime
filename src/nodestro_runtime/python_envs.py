@@ -47,7 +47,13 @@ from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, Field
 
 from .builtin_sandbox import LinuxSandbox
-from .container_images import ContainerImages, RuntimeImageSandbox, lock_has_hashes, orkexa_fingerprint
+from .container_images import (
+    ContainerImages,
+    ResolveError,
+    RuntimeImageSandbox,
+    lock_has_hashes,
+    orkexa_fingerprint,
+)
 from .problems import NodestroError, Problem, problem
 from .python_deps import RUNTIME_PACKAGES, ToolDependencies, analyze, blocking, normalize
 from .sandbox_policy import HOST_AWS_ENV, Isolation
@@ -411,8 +417,8 @@ class UvRunner:
         environment = uv_environment()
         environment.update({"UV_CACHE_DIR": str(self.cache_dir), "NO_COLOR": "1", "UV_NO_PROGRESS": "1"})
         # No AWS_* variable reaches uv (allowlist). Its shared AWS files are deliberately not hidden: private package
-        # indexes that authenticate through AWS (CodeArtifact keyring backends) keep working. Residual risk: a source
-        # build runs third-party code on the host with HOME and can read ~/.aws, as before (approval-gated builds).
+        # indexes that authenticate through AWS (CodeArtifact keyring backends) keep working. uv never builds a
+        # package on the host (--no-build for compile and sync); accepted source builds run in a container.
         return environment
 
     def _run(self, args: list[str], log: Callable[[str], None], *, timeout: float = 900, cwd: str | None = None) -> str:
@@ -450,13 +456,16 @@ class UvRunner:
         python: str,
         previous: str,
         log: Callable[[str], None],
-        builds: bool = True,
+        builds: bool = False,
     ) -> str:
         """Resolve exact versions of all packages; ``previous`` pins are kept where possible.
 
-        Resolving a package that has no wheel builds its source distribution, which runs that
-        package's build script. ``builds=False`` (``--no-build``) forbids that: such a package
-        then fails with :data:`_WHEELS_REQUIRED` instead.
+        Resolving a package that has no wheel would build its source distribution, which runs that
+        package's build script on this computer. By default (``builds=False``, ``--no-build``) that is
+        forbidden: such a package fails with :data:`_WHEELS_REQUIRED` instead, and
+        :meth:`PythonEnvironments.plan` resolves it in a container
+        (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`) once a person
+        accepted that. ``builds=True`` remains for callers that run uv in an isolated place themselves.
         """
         with tempfile.TemporaryDirectory(prefix="nodestro-resolve-") as directory:
             source = Path(directory) / "requirements.in"
@@ -494,7 +503,8 @@ class UvRunner:
         with tempfile.TemporaryDirectory(prefix="nodestro-sync-") as directory:
             requirements = Path(directory) / "requirements.txt"
             requirements.write_text(lock, encoding="utf-8")
-            self._run(["pip", "sync", "--python", str(interpreter), str(requirements)], log)
+            # --no-build: a package without a wheel is never built (its build script never runs) on the host.
+            self._run(["pip", "sync", "--no-build", "--python", str(interpreter), str(requirements)], log)
 
     def prune_cache(self, *, log: Callable[[str], None]) -> None:
         self._run(["cache", "prune"], log, timeout=300)
@@ -824,9 +834,11 @@ class PythonEnvironments:
     def plan(self, kind: ScopeKind, ref: str, needed: Needed, *, label: str = "", builds: bool = True) -> Plan:
         """Resolve all versions for the approval overview; nothing is installed.
 
-        A package without a wheel is built from source to read its dependencies, which runs its
-        build script. Plans a person asked for allow that (``builds``); plans made without one
-        (a generated tool's libraries) do not, and report ``deps.build_required`` instead.
+        Resolving never runs a package's build script on this computer (``--no-build``). A package
+        without a wheel reports ``deps.build_required``. Plans a person asked for (``builds``, the
+        library dialog where ``deps.build_required`` sends them) are then resolved again in a container
+        (:meth:`~nodestro_runtime.container_images.ContainerImages.compile_in_container`); plans made
+        without one (a generated tool's libraries, ``builds=False``) are not.
         """
         scope = scope_of(kind, ref)
         plan = Plan(
@@ -847,11 +859,17 @@ class PythonEnvironments:
         log: list[str] = []
         try:
             plan.lock = self.runner.compile(
-                lines, python=current_python_version(), previous=previous, log=log.append, builds=builds
+                lines, python=current_python_version(), previous=previous, log=log.append, builds=False
             )
         except UvError as exc:
             plan.error = explain_uv_error(exc.output)
-            return plan
+            if not (builds and plan.error.code == "deps.build_required"):
+                return plan
+            found = self._compile_in_container(lines, previous, plan.error, log.append)
+            if isinstance(found, Problem):
+                plan.error = found
+                return plan
+            plan.error, plan.lock = None, found
         plan.packages = self._plan_packages(env, parse_lock(plan.lock), needed)
         plan.needs_approval = any(item.status in ("new", "changed") for item in plan.packages) or bool(status.reasons)
         with self._lock:
@@ -860,6 +878,27 @@ class PythonEnvironments:
                 del self._plans[key]
             self._plans[plan.id] = (plan, needed)
         return plan
+
+    def _compile_in_container(
+        self, lines: list[str], previous: str, required: Problem, log: Callable[[str], None]
+    ) -> str | Problem:
+        """The lock of ``lines`` resolved in a container (a person accepted the source build); a problem if not."""
+        try:
+            return self.images.compile_in_container(lines, python=current_python_version(), previous=previous, log=log)
+        except ResolveError as exc:
+            return explain_uv_error(exc.output)
+        except NodestroError as exc:
+            if exc.code not in ("sandbox.unavailable", "deps.build_unavailable"):
+                return exc.problem
+            # Still the package's problem (the UI explains it by its name), with the reason it was not built.
+            name = required.params.get("name", "A package")
+            return problem(
+                "deps.build_required",
+                f"{name} is only available as source code. Its build script runs only in a container, which is not "
+                f"possible here: {exc}",
+                name=name,
+                reason=exc.code,
+            )
 
     def _plan_packages(
         self, env: PythonEnvironment | None, locked: list[LockedPackage], needed: Needed

@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 4 |
+| P2 Medium | 5 |
 | P3 Low | 20 |
 | P4 Optional | 6 |
 
@@ -64,6 +64,21 @@ None known.
   named as the next hardening step. Neither is a known bypass.
 - **Next step:** Inspect each created container's limits and remove it on mismatch (`sandbox_gateway.py`); evaluate
   `runsc` support with a CI job that has it installed.
+
+### RT-032 · Source builds of Python packages only in a container: pin the resolver image
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** Docker-first plan R4, `container_images.UV_IMAGE`,
+  `ContainerImages.compile_in_container`
+- **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
+  for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
+  bind mounts, proxy variables only, no capabilities, `nobody`, read-only with a tmpfs, input on stdin, lock on
+  stdout). The uv image's digest in `UV_IMAGE` is still a placeholder, so this is refused for now and such packages
+  report `deps.build_required` (reason `deps.build_unavailable`). It also cannot run through the sandbox gateway
+  (which refuses containers with network and foreign images), and without Docker there is no source build at all.
+  Studio has no text for the `reason` parameter yet.
+- **Next step:** Pin `UV_IMAGE` on purpose (`docker buildx imagetools inspect
+  ghcr.io/astral-sh/uv:<version>-python3.13-bookworm-slim`, amd64 and arm64), add a real-Docker test of the resolve
+  container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
 
 ## Bugs and reliability
 

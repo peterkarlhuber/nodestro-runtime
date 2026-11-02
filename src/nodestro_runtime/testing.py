@@ -245,7 +245,7 @@ class FakeUv:
         python: str,
         previous: str,
         log: Callable[[str], None],
-        builds: bool = True,
+        builds: bool = False,
     ) -> str:
         import re
 

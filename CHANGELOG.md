@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+No package build scripts on the host (Docker-first plan R4, 2026-11-02):
+
+- `UvRunner.compile` resolves with `--no-build` by default and `UvRunner.sync` installs host virtual environments
+  with `--no-build`, so no package's build script runs on the host. `PythonEnvironments.plan` always resolves with
+  `--no-build` on the host; `builds` now means that a person accepted a source build (`deps.build_required`).
+- New `ContainerImages.compile_in_container`: for such an accepted plan, `uv pip compile --generate-hashes` runs in a
+  container of uv's image, pinned by digest (`UV_IMAGE`), with network only for that step, no bind mounts, only the
+  proxy variables (by name), `--cap-drop ALL`, `no-new-privileges`, user `65534`, a read-only root and a tmpfs `/tmp`;
+  requirements, the previous lock and the build CA travel on stdin, the lock comes back on stdout. While the digest
+  is a placeholder it is refused (`deps.build_unavailable`), and the plan reports `deps.build_required` with the
+  parameter `reason` (also `sandbox.unavailable` without Docker). Container image builds keep `--only-binary=:all:`.
+  Tracked follow-ups: RT-032.
+
 Environment image caps and collection (Docker-first plan R3, 2026-11-02):
 
 - `ContainerImages.build` removes a freshly built image larger than `NODESTRO_MAX_IMAGE_GB` (default 8 GiB) and fails
