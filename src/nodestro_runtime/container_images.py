@@ -353,12 +353,13 @@ class StreamedSandbox(DockerSandbox):
         super().__init__(**options)
         self.environ = dict(environ) if environ is not None else None
 
-    def command(self, workdir: Path, container_name: str) -> list[str]:
+    def command(self, workdir: Path, container_name: str, *, image: str | None = None) -> list[str]:
+        # ``image`` as in Orkexa's ``DockerSandbox.command`` (orkexa e220f70): defaults to :attr:`image`.
         return [
             *sandbox_run_args(
                 self.docker,
                 container_name,
-                self.image,
+                image or self.image,
                 memory_mb=self.memory_mb,
                 cpus=self.cpus,
                 pids_limit=self.pids_limit,
