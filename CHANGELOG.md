@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Environment image caps and collection (Docker-first plan R3, 2026-11-02):
+
+- `ContainerImages.build` removes a freshly built image larger than `NODESTRO_MAX_IMAGE_GB` (default 8 GiB) and fails
+  with the new code `deps.image_too_large`; an invalid value fails the build before Docker runs (`deps.image_failed`).
+- New `ContainerImages.gc(max_images=20, max_bytes=20 GiB, keep=...)`: removes the least recently used environment
+  images beyond either limit. Only `nodestro-env:<key>` images that carry `org.nodestro.lock-sha256` are counted or
+  removed (never a foreign image), never a kept one, never one a container still uses. Last uses are recorded in
+  `<data>/python/image-usage.json`; where images cannot be listed (the sandbox gateway) the record alone is used.
+  `build` collects after each new image; a failed collection never fails the build.
+- `PythonEnvironments` keeps the images of every environment of its store and the runtime image; with
+  `remove_images=False` (a server, shared daemon) nothing is collected.
+- New `nodestro_runtime.image_limits` holds the image names and limits shared with the sandbox gateway (its limits are
+  unchanged: 32 images, 20 GB). Tracked follow-ups: RT-031.
+
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 
 - New `nodestro_runtime.axentra_platform` and `docs/AXENTRA.md`. `NODESTRO_AXENTRA=on` opens Axentra in the server's

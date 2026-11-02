@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 4 |
-| P3 Low | 19 |
+| P3 Low | 20 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -66,6 +66,18 @@ None known.
   `runsc` support with a CI job that has it installed.
 
 ## Bugs and reliability
+
+### RT-031 · Environment image caps and collection: follow-ups
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R3, `container_images.py`, `image_limits.py`
+- **What:** A built environment image above `NODESTRO_MAX_IMAGE_GB` (default 8) is removed and refused
+  (`deps.image_too_large`), and every build collects the least recently used `nodestro-env` images (with the lock
+  label) beyond 20 images or 20 GiB, never one an environment of the store names. Open: a server (shared daemon,
+  `remove_images=False`) does not collect, so its operator still prunes; through the sandbox gateway images cannot be
+  listed, so collection there sees only images in the data directory's usage record (`python/image-usage.json`);
+  the size cap and collection were tested only with the fake docker CLI; Studio has no translated text for
+  `deps.image_too_large` yet.
+- **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job, and the Studio error text.
 
 ### RT-004 · Internal agents set a fixed reasoning effort
 

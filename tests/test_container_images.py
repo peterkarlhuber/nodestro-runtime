@@ -47,6 +47,12 @@ class FakeDocker:
         self.contexts: list[dict[str, str]] = []
         self.missing: list[str] = []
         self.orkexa_files: list[str] = []
+        #: Image sizes in bytes (default 100 MB); tags in ``in_use`` cannot be removed; ``list_fails`` refuses
+        #: ``image ls`` like the sandbox gateway does.
+        self.sizes: dict[str, int] = {}
+        self.build_size = 100 * 1024**2
+        self.in_use: set[str] = set()
+        self.list_fails = False
 
     def __call__(self, args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(args)
@@ -56,7 +62,16 @@ class FakeDocker:
             tag = command[-1]
             if tag not in self.images:
                 return subprocess.CompletedProcess(args, 1, "", "No such image")
+            if "{{.Size}}" in command[command.index("--format") + 1]:
+                label = self.images[tag] or "<no value>"
+                return subprocess.CompletedProcess(args, 0, f"{self.sizes.get(tag, 0)}|{label}\n", "")
             return subprocess.CompletedProcess(args, 0, self.images[tag] + "\n", "")
+        if command[:2] == ["image", "ls"]:
+            if self.list_fails:
+                return subprocess.CompletedProcess(args, 1, "", "GET /images/json is not available")
+            assert f"label={LOCK_LABEL}" in command
+            listed = [tag for tag, label in self.images.items() if label]
+            return subprocess.CompletedProcess(args, 0, "".join(f"{tag}\n" for tag in listed), "")
         if command[0] == "build":
             context = Path(command[-1])
             self.contexts.append(
@@ -72,11 +87,15 @@ class FakeDocker:
             lock = (context / "requirements.txt").read_text()
             import hashlib
 
-            self.images[command[command.index("-t") + 1]] = hashlib.sha256(lock.encode()).hexdigest()
+            built = command[command.index("-t") + 1]
+            self.images[built] = hashlib.sha256(lock.encode()).hexdigest()
+            self.sizes[built] = self.build_size
             return subprocess.CompletedProcess(args, 0, "built\n", "")
         if command[0] == "run":
             return subprocess.CompletedProcess(args, 0, json.dumps(self.missing) + "\n", "")
         if command[:2] == ["image", "rm"]:
+            if command[-1] in self.in_use:
+                return subprocess.CompletedProcess(args, 1, "", "image is being used by running container")
             self.images.pop(command[-1], None)
             return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(args)
@@ -192,6 +211,123 @@ def test_the_image_key_names_the_orkexa_package(docker: FakeDocker) -> None:
         assert built.tag(HASHED, "3.13") != tag  # another Orkexa means another image
     finally:
         container_images._FINGERPRINT = original
+
+
+# ---- size caps and collection of unused images ---------------------------------------------------
+
+GIB = 1024**3
+
+
+def _tag(number: int) -> str:
+    return f"nodestro-env:{number:032x}"
+
+
+def _collected(docker: FakeDocker, tmp_path: Path, **environ: str) -> ContainerImages:
+    built = images(docker, **environ)
+    built.usage_file = tmp_path / "image-usage.json"
+    return built
+
+
+def test_an_image_larger_than_the_limit_is_removed_and_refused(docker: FakeDocker, tmp_path: Path) -> None:
+    docker.build_size = 9 * GIB
+    built = _collected(docker, tmp_path)
+    with pytest.raises(NodestroError) as caught:
+        built.build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_too_large" and caught.value.params["limit_gb"] == "8"
+    assert docker.images == {}  # never left behind for a sandbox
+    # The limit is configurable; an image below it is kept.
+    assert _collected(docker, tmp_path, NODESTRO_MAX_IMAGE_GB="10").build(HASHED, "3.13") in docker.images
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "lots", "inf", "nan"])
+def test_an_invalid_image_limit_fails_before_building(docker: FakeDocker, tmp_path: Path, value: str) -> None:
+    with pytest.raises(NodestroError) as caught:
+        _collected(docker, tmp_path, NODESTRO_MAX_IMAGE_GB=value).build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_failed"
+    assert not [call for call in docker.calls if call[1] == "build"]
+
+
+def test_gc_removes_the_least_recently_used_images_and_never_foreign_ones(docker: FakeDocker, tmp_path: Path) -> None:
+    built = _collected(docker, tmp_path)
+    for number in range(5):
+        docker.images[_tag(number)] = "a" * 64
+        docker.sizes[_tag(number)] = GIB
+    docker.images[_tag(99)] = ""  # a foreign image in Nodestro's repository, without the lock label
+    docker.sizes[_tag(99)] = 50 * GIB
+    built.usage_file.write_text(json.dumps({_tag(number): 1000.0 + number for number in range(5)}))
+    built.note_use(_tag(0), force=True)  # used just now: the most recent one
+    assert built.gc(max_images=3, keep={_tag(1)}) == [_tag(2), _tag(3)]
+    assert set(docker.images) == {_tag(0), _tag(1), _tag(4), _tag(99)}
+    usage = json.loads(built.usage_file.read_text())
+    assert set(usage) == {_tag(0), _tag(1), _tag(4)}
+    # The size cap alone also collects (oldest first), and never below what is kept.
+    assert built.gc(max_bytes=GIB, keep={_tag(1)}) == [_tag(4), _tag(0)]
+    assert set(docker.images) == {_tag(1), _tag(99)}
+    assert not [call for call in docker.calls if call[1:3] == ["image", "rm"] and call[-1] == _tag(99)]
+
+
+def test_gc_works_from_the_usage_record_where_images_cannot_be_listed(docker: FakeDocker, tmp_path: Path) -> None:
+    # Through the sandbox gateway only nodestro-env images can be inspected and removed, not listed.
+    docker.list_fails = True
+    built = _collected(docker, tmp_path)
+    for number in range(3):
+        docker.images[_tag(number)] = "a" * 64
+    docker.in_use.add(_tag(0))  # a running container still uses it: the daemon refuses, gc goes on
+    built.usage_file.write_text(json.dumps({_tag(number): float(number) for number in range(3)} | {"evil:1": 0}))
+    assert built.gc(max_images=1) == [_tag(1), _tag(2)]
+    assert set(docker.images) == {_tag(0)}
+    assert not [call for call in docker.calls if call[1:3] == ["image", "inspect"] and call[-1] == "evil:1"]
+
+
+def test_a_build_collects_unused_images_but_keeps_what_environments_name(docker: FakeDocker, tmp_path: Path) -> None:
+    built = _collected(docker, tmp_path)
+    for number in range(25):
+        docker.images[_tag(number)] = "a" * 64
+    built.keep = lambda: {_tag(0)}
+    tag = built.build(HASHED, "3.13")
+    assert tag in docker.images and _tag(0) in docker.images
+    assert len([item for item, label in docker.images.items() if label]) == 20
+    # Collection off (a server): nothing is removed.
+    docker.images[_tag(30)] = "a" * 64
+    server = _collected(docker, tmp_path)
+    server.collect = False
+    server.build(HASHED + "\n", "3.13")
+    assert _tag(30) in docker.images
+
+
+def test_a_failing_collection_never_fails_the_build(docker: FakeDocker, tmp_path: Path) -> None:
+    built = _collected(docker, tmp_path)
+
+    def broken() -> set[str]:
+        raise NodestroError("sandbox.unavailable", "gone")
+
+    built.keep = broken
+    assert built.build(HASHED, "3.13") in docker.images
+
+
+def test_the_gateway_shares_the_image_names_and_limits() -> None:
+    from nodestro_runtime import image_limits, sandbox_gateway
+
+    config = sandbox_gateway.GatewayConfig()
+    assert (config.max_images, config.max_images_gb) == (32, 20.0)  # unchanged
+    assert sandbox_gateway._LOCK_LABEL == LOCK_LABEL == image_limits.LOCK_LABEL
+    assert config.max_images > image_limits.GC_MAX_IMAGES and config.max_images_gb >= image_limits.GC_MAX_GB
+
+
+def test_environments_keep_their_images_when_unused_ones_are_collected(
+    workspace: Workspace, docker: FakeDocker
+) -> None:
+    scope = _approve(workspace)
+    python = workspace.python
+    env = python.get(scope)
+    assert env is not None
+    tag = python.images.tag(env.lock, env.python_version)
+    assert python.images.usage_file == python.root / "image-usage.json"
+    for number in range(30):
+        docker.images[_tag(number)] = "a" * 64
+    removed = python.images.gc(max_images=0)
+    assert len(removed) == 30 and tag not in removed
+    assert list(docker.images) == [tag]
 
 
 # ---- environments in the Docker sandbox -------------------------------------------------------

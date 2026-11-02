@@ -21,6 +21,11 @@ call fails (``sandbox.unavailable``); there is never a fallback to a host subpro
 Proxies and an extra certificate authority for the download stage come from the host: ``HTTP(S)_PROXY`` /
 ``NO_PROXY`` are passed as build arguments, and the file in ``NODESTRO_BUILD_CA_FILE`` (or ``SSL_CERT_FILE``) is
 copied into the download stage only. ``NODESTRO_DOCKER_BUILD_NETWORK`` chooses the build network (default: Docker's).
+
+Images are capped: a built image larger than ``NODESTRO_MAX_IMAGE_GB`` (default 8 GiB) is removed again and the build
+fails (``deps.image_too_large``), and after every build :meth:`ContainerImages.gc` removes the least recently used
+environment images beyond 20 images or 20 GiB (:mod:`nodestro_runtime.image_limits`). Only images that carry
+:data:`LOCK_LABEL` are ever removed, never an image Nodestro did not build, nor one a caller keeps.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from collections.abc import Callable, Iterable, Mapping
 import contextlib
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -36,18 +42,31 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any
 import uuid
 
 from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
 
 from . import sandbox_cancel
+from .image_limits import (
+    GC_MAX_GB,
+    GC_MAX_IMAGES,
+    GIB,
+    IMAGE_REPOSITORY,
+    LOCK_LABEL,
+    MAX_IMAGE_GB,
+    MAX_IMAGE_GB_VARIABLE,
+)
 from .problems import NodestroError
 
-#: The repository of environment images (the tag is the image key).
-IMAGE_REPOSITORY = "nodestro-env"
-#: The label that names the lock an image was built from.
-LOCK_LABEL = "org.nodestro.lock-sha256"
+logger = logging.getLogger(__name__)
+
+#: The tags of environment images (``IMAGE_REPOSITORY`` and a 32-digit key); the only tags :meth:`ContainerImages.gc`
+#: looks at.
+_TAG = re.compile(rf"^{re.escape(IMAGE_REPOSITORY)}:[0-9a-f]{{32}}$")
+#: A use is written to the usage record at most this often (seconds) per image.
+_USE_INTERVAL = 60.0
 _PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 #: Base images of environment images, pinned by the digest of their multi-platform index (amd64 and arm64), so a
@@ -125,11 +144,22 @@ class ContainerImages:
         base: Callable[[str], str] = default_base,
         environ: Mapping[str, str] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        usage_file: Path | None = None,
+        keep: Callable[[], Iterable[str]] | None = None,
+        collect: bool = True,
     ) -> None:
+        """``usage_file`` keeps when each image was last used (for :meth:`gc`); ``keep`` names images that are
+        never collected (those of installed environments); ``collect=False`` turns the collection after a build
+        off (a server, whose daemon serves every tenant)."""
         self.docker = docker
         self.base = base
         self.environ = os.environ if environ is None else environ
         self._run = run
+        self.usage_file = usage_file
+        self.keep = keep
+        self.collect = collect
+        self._usage_lock = threading.Lock()
+        self._noted: dict[str, float] = {}
 
     # ---- names --------------------------------------------------------------------------------
 
@@ -206,7 +236,9 @@ class ContainerImages:
             )
         tag = self.tag(lock, python_version)
         if self.lock_of(tag) == _sha(lock):
+            self.note_use(tag)
             return tag
+        limit = self._max_image_bytes()
         with tempfile.TemporaryDirectory(prefix="nodestro-image-") as directory:
             context = Path(directory)
             (context / "requirements.txt").write_text(lock, encoding="utf-8")
@@ -234,7 +266,155 @@ class ContainerImages:
                 self._docker([*args, str(context)], timeout=_BUILD_TIMEOUT, log=log)
             except _DockerFailed as exc:
                 raise NodestroError(*_explain(exc.output)) from None
+        found = self._inspect(tag)
+        size = found[0] if found is not None else 0
+        if size > limit:
+            self.remove(tag)
+            raise NodestroError(
+                "deps.image_too_large",
+                f"The container image of these libraries is {size / GIB:.1f} GB, more than the limit of "
+                f"{limit / GIB:g} GB ({MAX_IMAGE_GB_VARIABLE}); it was removed again",
+                size_gb=f"{size / GIB:.1f}",
+                limit_gb=f"{limit / GIB:g}",
+            )
+        self.note_use(tag, force=True)
+        if self.collect:
+            try:
+                self.gc(keep={tag})
+            except (NodestroError, _DockerFailed, OSError) as exc:  # a failed collection never fails the build
+                logger.warning("Removing unused environment images failed: %s", exc)
         return tag
+
+    def _max_image_bytes(self) -> int:
+        value = self.environ.get(MAX_IMAGE_GB_VARIABLE, "").strip()
+        if not value:
+            return int(MAX_IMAGE_GB * GIB)
+        try:
+            limit = float(value)
+        except ValueError:
+            limit = 0.0
+        if not limit > 0 or limit == float("inf"):
+            raise NodestroError("deps.image_failed", f"{MAX_IMAGE_GB_VARIABLE} must be a positive number of GB")
+        return int(limit * GIB)
+
+    # ---- size and collection ------------------------------------------------------------------
+
+    def _inspect(self, tag: str) -> tuple[int, str] | None:
+        """Size (bytes) and lock label of an image (``None``: no such image); an empty label: not Nodestro's."""
+        try:
+            output = self._docker(
+                ["image", "inspect", "--format", f'{{{{.Size}}}}|{{{{index .Config.Labels "{LOCK_LABEL}"}}}}', tag]
+            )
+        except _DockerFailed:
+            return None
+        size, _, label = output.strip().partition("|")
+        label = label.strip()
+        try:
+            return int(size), "" if label == "<no value>" else label
+        except ValueError:
+            return 0, "" if label == "<no value>" else label
+
+    def note_use(self, tag: str, *, force: bool = False) -> None:
+        """Record that ``tag`` was used now (at most once a minute per image unless ``force``)."""
+        if self.usage_file is None:
+            return
+        moment = time.time()
+        if not force and moment - self._noted.get(tag, 0.0) < _USE_INTERVAL:
+            return
+        self._noted[tag] = moment
+        with self._usage_lock:
+            usage = self._read_usage()
+            usage[tag] = moment
+            self._write_usage(usage)
+
+    def _read_usage(self) -> dict[str, float]:
+        if self.usage_file is None:
+            return {}
+        try:
+            raw: Any = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(tag): float(when)
+            for tag, when in raw.items()
+            if _TAG.fullmatch(str(tag)) and isinstance(when, (int, float))
+        }
+
+    def _write_usage(self, usage: Mapping[str, float]) -> None:
+        if self.usage_file is None:
+            return
+        try:
+            self.usage_file.parent.mkdir(parents=True, exist_ok=True)
+            partial = self.usage_file.with_name(self.usage_file.name + f".{uuid.uuid4().hex[:8]}.tmp")
+            partial.write_text(json.dumps(dict(sorted(usage.items()))), encoding="utf-8")
+            partial.replace(self.usage_file)
+        except OSError as exc:
+            logger.warning("Cannot write the image usage record %s: %s", self.usage_file, exc)
+
+    def _listed(self) -> set[str]:
+        """The environment images the daemon lists (empty where listing is refused, e.g. by the sandbox gateway)."""
+        try:
+            output = self._docker(
+                [
+                    *("image", "ls", "--filter", f"label={LOCK_LABEL}"),
+                    *("--filter", f"reference={IMAGE_REPOSITORY}:*", "--format", "{{.Repository}}:{{.Tag}}"),
+                ]
+            )
+        except _DockerFailed:
+            return set()
+        return {line.strip() for line in output.splitlines() if _TAG.fullmatch(line.strip())}
+
+    def gc(
+        self,
+        max_images: int = GC_MAX_IMAGES,
+        max_bytes: int = int(GC_MAX_GB * GIB),
+        keep: Iterable[str] = (),
+    ) -> list[str]:
+        """Remove the least recently used environment images until at most ``max_images`` images of at most
+        ``max_bytes`` remain; returns the removed tags.
+
+        Only ``nodestro-env:<key>`` images that carry :data:`LOCK_LABEL` are counted and removed; ``keep`` (and what
+        the ``keep`` callback of the constructor names) is never removed, nor an image a container still uses (the
+        daemon refuses that). Images missing from the usage record count as the least recently used."""
+        kept = set(keep) | (set(self.keep()) if self.keep is not None else set())
+        with self._usage_lock:
+            usage = self._read_usage()
+        images: list[tuple[float, str, int]] = []
+        gone: set[str] = set()
+        for tag in sorted(set(usage) | self._listed()):
+            found = self._inspect(tag)
+            if found is None:
+                gone.add(tag)
+                continue
+            size, label = found
+            if not label:  # not built by Nodestro: never counted, never removed
+                continue
+            images.append((usage.get(tag, 0.0), tag, size))
+        images.sort()
+        count, total = len(images), sum(size for _, _, size in images)
+        removed: list[str] = []
+        for _, tag, size in images:
+            if count <= max_images and total <= max_bytes:
+                break
+            if tag in kept:
+                continue
+            try:
+                self._docker(["image", "rm", tag])
+            except _DockerFailed as exc:
+                logger.info("Keeping the environment image %s: %s", tag, exc.output[-200:])
+                continue
+            removed.append(tag)
+            count, total = count - 1, total - size
+        if removed or gone:
+            with self._usage_lock:
+                usage = self._read_usage()
+                for tag in [*removed, *gone]:
+                    usage.pop(tag, None)
+                    self._noted.pop(tag, None)
+                self._write_usage(usage)
+        return removed
 
     def _certificate_authority(self) -> Path | None:
         for name in ("NODESTRO_BUILD_CA_FILE", "SSL_CERT_FILE"):
@@ -269,6 +449,7 @@ class ContainerImages:
 
     def sandbox(self, tag: str, *, timeout: float = 60.0, memory_mb: int = 2048) -> StreamedSandbox:
         """A sandbox whose calls run in the image ``tag`` (Orkexa's container flags, no network, never pulled)."""
+        self.note_use(tag)
         return StreamedSandbox(
             image=tag, timeout=timeout, memory_mb=memory_mb, docker=self.docker, environ=self._cli_environment()
         )
@@ -506,8 +687,11 @@ def _explain(output: str) -> tuple[str, str]:
 
 
 __all__ = [
+    "GC_MAX_GB",
+    "GC_MAX_IMAGES",
     "IMAGE_REPOSITORY",
     "LOCK_LABEL",
+    "MAX_IMAGE_GB",
     "ContainerImages",
     "LocalImageSandbox",
     "RuntimeImageSandbox",

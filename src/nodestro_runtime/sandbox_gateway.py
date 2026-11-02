@@ -64,14 +64,16 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import uuid
 
+from .image_limits import GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGES_GB, GIB, IMAGE_REPOSITORY, LOCK_LABEL
+
 logger = logging.getLogger("nodestro.sandbox_gateway")
 
 #: Label of every container the gateway creates; its value is the gateway's instance.
 LABEL = "dev.nodestro.sandbox"
 #: The images a client may use, inspect, build and remove (see container_images.IMAGE_REPOSITORY).
 IMAGE = re.compile(r"^nodestro-env:[0-9a-f]{32}$")
-_IMAGE_REPOSITORY = "nodestro-env"
-_LOCK_LABEL = "org.nodestro.lock-sha256"  # container_images.LOCK_LABEL
+_IMAGE_REPOSITORY = IMAGE_REPOSITORY
+_LOCK_LABEL = LOCK_LABEL
 #: Container names a client may choose (orkexa/nodestro sandboxes use these prefixes).
 NAME = re.compile(r"^(?:nodestro|orkexa)-sandbox-[0-9a-z-]{1,64}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -116,8 +118,8 @@ class GatewayConfig:
     max_builds: int = 1
     #: Environment images (``nodestro-env:*``) kept on the daemon, and their total size; a build beyond either is
     #: refused (507) until images are removed (``docker image prune --filter label=org.nodestro.lock-sha256``).
-    max_images: int = 32
-    max_images_gb: float = 20.0
+    max_images: int = GATEWAY_MAX_IMAGES
+    max_images_gb: float = GATEWAY_MAX_IMAGES_GB
     #: Client connections at once; more are refused (503).
     max_connections: int = 32
     #: Seconds a client may take to send a request head, and its body.
@@ -817,9 +819,9 @@ class Gateway:
         if tag in tags:
             return
         size = sum(int(item.get("Size") or 0) for item in listed if isinstance(item, dict))
-        if len(listed) >= self.config.max_images or size >= self.config.max_images_gb * 1024**3:
+        if len(listed) >= self.config.max_images or size >= self.config.max_images_gb * GIB:
             raise Refused(
-                f"There are already {len(listed)} environment images ({size / 1024**3:.1f} GB; limits: "
+                f"There are already {len(listed)} environment images ({size / GIB:.1f} GB; limits: "
                 f"{self.config.max_images} images, {self.config.max_images_gb:g} GB). Remove unused ones: "
                 f"docker image prune -a --filter label={_LOCK_LABEL}",
                 507,

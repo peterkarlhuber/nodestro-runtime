@@ -589,10 +589,10 @@ class PythonEnvironments:
         same lock may use the image; unused images are the operator's to remove (``docker image prune``)."""
         self.store = store
         self.remove_images = remove_images
+        self.root = root
         self.images = images if images is not None else ContainerImages()
         #: Image tag -> the lock hash it was found with (images are immutable, so a hit stays valid).
         self._images_ready: dict[str, str] = {}
-        self.root = root
         self.tools = tools
         self.runner = runner if runner is not None else UvRunner(root / "cache")
         self.sandbox_kind = sandbox_kind
@@ -602,6 +602,23 @@ class PythonEnvironments:
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
         self._analysis: dict[str, ToolDependencies] = {}
+
+    @property
+    def images(self) -> ContainerImages:
+        return self._images
+
+    @images.setter
+    def images(self, images: ContainerImages) -> None:
+        """Unused images are collected after each build (least recently used first), never one an environment of
+        this store names. On a server (``remove_images=False``) every tenant shares the daemon: no collection."""
+        self._images = images
+        if isinstance(images, ContainerImages):
+            if images.usage_file is None:
+                images.usage_file = self.root / "image-usage.json"
+            if images.keep is None:
+                images.keep = self._image_tags
+            if not self.remove_images:
+                images.collect = False
 
     # ---- identity and paths ----------------------------------------------------------
 
@@ -1233,6 +1250,13 @@ class PythonEnvironments:
             env=SANDBOX_ENV,
             acknowledge_unsafe=True,
         )
+
+    def _image_tags(self) -> set[str]:
+        """The images :meth:`ContainerImages.gc` keeps: those of every environment of this store and the runtime's."""
+        tags = {self.images.tag(env.lock, env.python_version) for env in self.all() if env.lock}
+        # No lock: runtime_image() holds it while it builds (and the build collects). A copy is enough.
+        tags.update(list(_RUNTIME_IMAGES.values()))
+        return tags
 
     def image(self, scope: str) -> str | None:
         """The container image of the scope's approved and installed lock; ``None`` without the Docker sandbox or
