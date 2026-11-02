@@ -19,6 +19,7 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 - `Run.started_by`, `Run.budget` and `RunSummary.budget`; new error codes `run.budget_ended`,
   `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
 - New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
+- Orkexa pin `e220f70` (orkexa #32: `RequestSuspended`, request-stage turn checkpoints, `BudgetTracker.set_limit`).
 
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).

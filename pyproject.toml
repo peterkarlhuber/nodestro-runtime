@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@544ef92aa2c49ce2af37d475c66c03c8e703fc47",
+    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@e220f706611dc8f2cc7cb4c87e44306a25f93fbf",
     "pydantic>=2.6,<3",
     # Builds the Python environments of tools with third-party libraries (see python_envs.py).
     "uv>=0.5",
