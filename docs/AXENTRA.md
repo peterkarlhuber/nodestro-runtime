@@ -151,10 +151,33 @@ milliseconds over a network; a pipeline saves the round trips but not the commit
 - it would change the store's connection model (autocommit reads with retry on a lost connection) in every module
   that writes SQL (storage, knowledge, jobs, identity), which other work packages change at the same time.
 
-Instead, `tests/test_tenant_filters.py` fails when a PostgreSQL statement on a tenant-data table (`nodestro_documents`,
-`_files`, `_chunks`, `_memory_files`, `_run_events`) does not mention `tenant_id`; the only exception is the run-event
-housekeeping (by age, every tenant). The runtime role cannot alter the tables either. Revisit when Nodestro's store
-runs inside per-request transactions anyway.
+Instead, a static check keeps every statement bound to one tenant (security review SR-01 found the first version
+unsound: a substring test for `tenant_id` on five tables of the runtime only). `nodestro_runtime/tenant_sql_check.py`,
+run by `tests/test_tenant_filters.py` of the runtime and of the API:
+
+- tenant tables are every `nodestro_*` table with a `tenant_id` column in the migrations (read at test time, so a new
+  table is covered at once): documents, files, chunks, memory files, jobs, run events, schedule firings, sessions,
+  memberships, login states, bootstrap tokens (runs, schedules and secrets are collections of the documents table);
+- every string expression of `nodestro_runtime` and `nodestro_api` is rebuilt as Python would build it (constants,
+  `+` and implicit concatenation, f-strings, `str.format`, `join`, psycopg `sql.SQL`/`Identifier`/`Placeholder`/
+  `Composed`; names resolved to module constants, local assignments with each conditional `+=` taken and not taken,
+  and loops over constant tuples), and every variant that names a tenant table is parsed with PostgreSQL's own
+  grammar (`pglast`, a dev dependency);
+- each reference to a tenant table (`FROM`, joins, `USING`, `UPDATE`/`DELETE` targets, subqueries, CTEs, set
+  operations) must be bound by a top-level `AND` conjunct `tenant_id = <param>` or `tenant_id = ANY(<param>)` (or
+  equal to the `tenant_id` of a bound or enclosing reference); `INSERT` must list `tenant_id`; `TRUNCATE`, `COPY`,
+  `MERGE` are refused;
+- a statement with a part that cannot be resolved is reported as dynamic, one the parser rejects as unparsed; neither
+  passes silently;
+- the exceptions are in `tenant_sql_allowlist.py` of each package: the module and the whole normalized statement,
+  each with its reason (worker claim, heartbeat and finish by job id, the reaper, housekeeping, session lookup by
+  token hash, operator commands, metrics aggregates). Matching is exact, and an entry that matches nothing fails.
+  The desktop's SQLite modules are skipped by name, and the check fails if one of them uses PostgreSQL.
+
+What it cannot see: SQL text that comes from outside the source (none exists), and a statement whose table name and
+leading keyword both arrive at run time from a value the check cannot resolve (it would be reported only if it starts
+with a data keyword or completes a `nodestro_` name). The runtime role cannot alter the tables either. Revisit RLS when
+Nodestro's store runs inside per-request transactions anyway.
 
 ## Tenant secrets and key rotation
 

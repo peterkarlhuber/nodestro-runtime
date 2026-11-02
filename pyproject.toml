@@ -44,6 +44,8 @@ dev = [
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@f6ae01d4fe5945d56b322673202860f93e2213a9 ; python_version >= '3.11'",
     "mypy>=1.13",
+    # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
+    "pglast>=7,<9",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5",
@@ -75,6 +77,8 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 # Office Open XML parts with their long namespace and relationship URIs.
 "src/nodestro_runtime/office.py" = ["E501"]
+# Whole SQL statements as allowlist keys (matched exactly, so they are not split).
+"src/nodestro_runtime/tenant_sql_allowlist.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
