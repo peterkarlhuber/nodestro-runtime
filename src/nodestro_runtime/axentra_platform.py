@@ -51,6 +51,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
+import hashlib
 import json
 import logging
 import os
@@ -1073,8 +1074,28 @@ def run_usage_key(run_id: str, meter: str) -> str:
     A run's usage is final once it is finished (:data:`SETTLED_RUN_STATES`; continuing a run creates a new run whose
     reused steps count no cost), so a retry, a crash after the write, a second worker or a second reconcile replays
     the same key with the same quantity (Axentra returns the stored event and adds nothing). A finished run whose
-    usage changed anyway is refused by Axentra (same key, other request) and reported, never counted again."""
-    return f"nodestro:run:{run_id}:{meter}"
+    usage changed anyway is refused by Axentra (same key, other request) and reported, never counted again.
+
+    Axentra accepts keys of 1 to 200 printable ASCII characters. A run id that does not fit (an imported run with a
+    long or non-ASCII id; security review SR-07) is replaced by ``h.`` and the SHA-256 of its UTF-8 bytes: still one
+    deterministic key per run and meter. Such a run could never be settled under its raw id, so no event exists under
+    that key and the change counts nothing twice."""
+    raw = f"nodestro:run:{run_id}:{meter}"
+    if _IDEMPOTENCY_KEY.fullmatch(raw):
+        return raw
+    return f"nodestro:run:h.{hashlib.sha256(run_id.encode('utf-8', 'surrogatepass')).hexdigest()}:{meter}"
+
+
+#: The idempotency keys Axentra accepts (``axentra.usage.service``): 1 to 200 printable ASCII characters.
+#: More runs in the settlement quarantine than this hold the watermark (a failing Axentra, not one bad run).
+QUARANTINE_LIMIT = 1000
+_IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,200}")
+#: The same rule and the same fallback in SQL, for the reconciliation backlog (``d`` is the run's document).
+_RUN_KEY_SQL = (
+    "CASE WHEN ('nodestro:run:' || d.id || ':nodestro.ai.requests') ~ '^[!-~]{1,200}$'"
+    " THEN 'nodestro:run:' || d.id || ':nodestro.ai.requests'"
+    " ELSE 'nodestro:run:h.' || encode(sha256(convert_to(d.id, 'UTF8')), 'hex') || ':nodestro.ai.requests' END"
+)
 
 
 @dataclass(frozen=True)
@@ -1167,6 +1188,9 @@ class AxentraEvents:
         self._meters_ready = False
         #: Where the periodic run settlement continues (``updated_at`` of the runs; ``None``: the lookback).
         self._settled_until: Any = None
+        #: Runs whose settlement failed (SR-07), retried at every pass: ``(tenant, run id) -> (run, failed passes)``.
+        #: One run that cannot be settled no longer holds the watermark (and with it every tenant) back.
+        self.quarantine: dict[tuple[str, str], tuple[SettledRun, int]] = {}
 
     # -- set-up ------------------------------------------------------------------------------------
 
@@ -1375,7 +1399,16 @@ class AxentraEvents:
         already mirrored runs are skipped, and a replay is a no-op (:func:`run_usage_key`)."""
         from datetime import datetime, timedelta, timezone
 
-        report = {"runs": 0, "missing": 0, "written": 0, "changed": 0, "too_old": 0, "failed": 0, "skipped": 0}
+        report = {
+            "runs": 0,
+            "missing": 0,
+            "written": 0,
+            "changed": 0,
+            "too_old": 0,
+            "failed": 0,
+            "skipped": 0,
+            "quarantined": 0,
+        }
         if not self.run_usage_enabled:
             return report
         if not dry_run and not self._meters_ready:
@@ -1391,14 +1424,23 @@ class AxentraEvents:
         if tenant is not None:
             query += " WHERE id = %s"
             params = (tenant,)
+        periodic = not full and tenant is None and not dry_run
+        retry: dict[str, list[SettledRun]] = {}
+        if periodic:
+            for (tenant_id, _run_id), (run, _failures) in self.quarantine.items():
+                retry.setdefault(tenant_id, []).append(run)
         for (tenant_id,) in self.link.database._query(query + " ORDER BY id", params):
             tenant_id = str(tenant_id)
             candidates = settled_runs(self.link.database, tenant_id, since=since)
+            seen = {run.id for run in candidates}
+            candidates += [run for run in retry.pop(tenant_id, []) if run.id not in seen]
             if not candidates:
                 continue
             # A periodic pass reads the mirrored events of its candidate runs only (by key, through the unique
             # index): reading every run event of the tenant made each pass grow with all runs ever settled.
-            recorded = self._mirrored_runs(tenant_id, None if full else [run.id for run in candidates])
+            recorded = self._mirrored_runs(
+                tenant_id, None if full else [run.id for run in candidates], known=[run.id for run in candidates]
+            )
             for run in candidates:
                 report["runs"] += 1
                 wanted = usage_quantities(run.usage)
@@ -1421,19 +1463,51 @@ class AxentraEvents:
                 outcome = self.settle_run(tenant_id, run)
                 key = {"ok": "written", "changed": "changed", "skipped": "skipped"}.get(outcome, "failed")
                 report[key] += 1
-        if not full and tenant is None and not dry_run and report["failed"] == 0:
+                if periodic:
+                    self._note_settlement(tenant_id, run, outcome)
+        for tenant_id, runs in retry.items():  # quarantined runs of tenants that are gone: forgotten
+            for run in runs:
+                self.quarantine.pop((tenant_id, run.id), None)
+        if periodic:
+            report["quarantined"] = len(self.quarantine)
             # The next pass starts a little before this one did: a run committed while this pass read is not missed.
-            self._settled_until = started - timedelta(minutes=5)
+            # A run that failed does not hold it back (SR-07): it stays in the quarantine and is retried every pass.
+            # Many failures mean Axentra itself fails: the watermark then stays, as before (the quarantine is kept
+            # in memory only; a restart looks back RUN_SETTLE_LOOKBACK_DAYS anyway).
+            if len(self.quarantine) <= QUARANTINE_LIMIT:
+                self._settled_until = started - timedelta(minutes=5)
         return report
 
-    def _mirrored_runs(self, tenant_id: str, run_ids: list[str] | None = None) -> dict[str, dict[str, Decimal]]:
-        """The mirrored quantities per run and meter of the tenant: every run's, or (``run_ids``) only those runs'."""
+    def _note_settlement(self, tenant_id: str, run: SettledRun, outcome: str) -> None:
+        """Keep a run whose settlement failed in the quarantine (counted as ``mirror_write`` ``quarantined``) until a
+        pass settles it."""
+        key = (tenant_id, run.id)
+        if outcome != "failed":
+            self.quarantine.pop(key, None)
+            return
+        failures = self.quarantine.get(key, (run, 0))[1] + 1
+        self.quarantine[key] = (run, failures)
+        count_operation("mirror_write", "quarantined", kind="run_usage")
+        if failures in (1, 10, 100):
+            logger.error("The settled usage of run %s of tenant %s failed %d times", run.id, tenant_id, failures)
+
+    def _mirrored_runs(
+        self, tenant_id: str, run_ids: list[str] | None = None, known: list[str] | None = None
+    ) -> dict[str, dict[str, Decimal]]:
+        """The mirrored quantities per run and meter of the tenant: every run's, or (``run_ids``) only those runs'.
+        ``known``: run ids whose hashed keys (:func:`run_usage_key`) are mapped back in the every-run read."""
         ax_tenant = self.link.tenant(tenant_id)
         if ax_tenant is None:
             return {}
         from axentra.data.database import DbScope, join
 
         product = self.link.services.product_id
+        hashed = {
+            run_usage_key(run_id, meter): (run_id, meter)
+            for run_id in known or run_ids or []
+            for meter, _unit, _text in USAGE_METERS
+            if run_usage_key(run_id, meter).startswith("nodestro:run:h.")
+        }
         rows: list[Any] = []
         with (
             self.link.joined() as connection,
@@ -1455,7 +1529,14 @@ class AxentraEvents:
                     )
         found: dict[str, dict[str, Decimal]] = {}
         for row in rows:
-            _, _, run_id, meter = str(row["idempotency_key"]).split(":", 3)
+            key = str(row["idempotency_key"])
+            if key.startswith("nodestro:run:h."):
+                owner = hashed.get(key)  # a run whose id needed the hashed key (SR-07)
+                if owner is None:
+                    continue
+                run_id, meter = owner
+            else:
+                _, _, run_id, meter = key.split(":", 3)
             found.setdefault(run_id, {})[meter] = Decimal(row["quantity"])
         return found
 
@@ -1651,7 +1732,9 @@ _BACKLOG_SQL = {
           AND d.updated_at >= now() - make_interval(days => %(days)s)
           AND NOT EXISTS (SELECT 1 FROM axentra_usage_events e WHERE e.product_id = %(product)s
                 AND e.tenant_id = l.axentra_id
-                AND e.idempotency_key = 'nodestro:run:' || d.id || ':nodestro.ai.requests')""",
+                AND e.idempotency_key = """
+    + _RUN_KEY_SQL
+    + ")",
     # Approval audit events and MCP events without a mirrored audit event.
     "audit": """
         SELECT count(*) FROM nodestro_documents d

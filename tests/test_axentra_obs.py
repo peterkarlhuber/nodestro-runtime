@@ -234,6 +234,59 @@ def test_finished_runs_are_settled_once_per_run_and_meter(runs: tuple[Any, Axent
     assert props == [({"source": "api_run", "status": "succeeded", "workflow_id": "wf_1"},)]
 
 
+def test_a_run_id_that_does_not_fit_a_key_is_settled_under_its_hash(runs: tuple[Any, AxentraEvents]) -> None:
+    """SR-07: a run id of more than 170 characters or with non-ASCII characters made an idempotency key Axentra
+    refuses; such a run was never settled and held the watermark for every tenant."""
+    database, events = runs
+    long_id, umlaut = "run_" + "x" * 300, "run_über"
+    _run(database, "alpha", long_id, "succeeded", _usage(2, 0.02))
+    _run(database, "alpha", umlaut, "succeeded", _usage(3, 0.03))
+    _run(database, "beta", "run_ok", "succeeded", _usage(1, 0.01))
+    assert run_usage_key("run_ok", "nodestro.ai.requests") == "nodestro:run:run_ok:nodestro.ai.requests"
+    hashed = run_usage_key(umlaut, "nodestro.ai.requests")
+    assert hashed.startswith("nodestro:run:h.") and hashed == run_usage_key(umlaut, "nodestro.ai.requests")
+    assert len(run_usage_key(long_id, "nodestro.ai.cost_usd")) <= 200
+    assert reconciliation_backlog(events.link.services)["runs"] == 3
+    report = events.settle_runs()
+    assert (report["missing"], report["written"], report["failed"], report["quarantined"]) == (3, 3, 0, 0)
+    assert _totals(database)["nodestro.ai.requests"] == 6
+    # Mapped back: nothing is missing, nothing is counted again, and the backlog query uses the same key rule.
+    assert events.settle_runs(since=now().replace(year=2000))["missing"] == 0
+    assert events.settle_runs(full=True)["missing"] == 0
+    assert reconciliation_backlog(events.link.services)["runs"] == 0
+    assert _totals(database)["nodestro.ai.requests"] == 6
+
+
+def test_a_run_that_cannot_be_settled_is_quarantined_and_the_watermark_moves(
+    runs: tuple[Any, AxentraEvents], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, events = runs
+    _run(database, "alpha", "run_bad", "succeeded", _usage(2, 0.02))
+    _run(database, "beta", "run_good", "succeeded", _usage(1, 0.01))
+    real = events.settle_run
+
+    def failing(tenant_id: str, run: Any) -> str:
+        return "failed" if run.id == "run_bad" else real(tenant_id, run)
+
+    monkeypatch.setattr(events, "settle_run", failing)
+    first = events.settle_runs()
+    assert (first["written"], first["failed"], first["quarantined"]) == (1, 1, 1)
+    watermark = events._settled_until
+    assert watermark is not None  # one bad run no longer holds every tenant back
+    # Later passes start at the watermark and still retry the quarantined run (here outside every later window).
+    from datetime import timedelta
+
+    events._settled_until = now() + timedelta(hours=1)
+    second = events.settle_runs()
+    assert (second["runs"], second["failed"], second["quarantined"]) == (1, 1, 1)
+    assert events.quarantine[("alpha", "run_bad")][1] == 2
+    monkeypatch.setattr(events, "settle_run", real)
+    third = events.settle_runs()
+    assert (third["written"], third["quarantined"]) == (1, 0) and events.quarantine == {}
+    assert _totals(database)["nodestro.ai.requests"] == 3  # each run once
+    assert events.settle_runs(full=True)["missing"] == 0
+
+
 def test_a_crash_after_the_write_and_a_replay_count_nothing_twice(runs: tuple[Any, AxentraEvents]) -> None:
     database, events = runs
     _run(database, "alpha", "run_ok", "succeeded", _usage(2, 0.02))
