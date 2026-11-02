@@ -144,11 +144,11 @@ None known.
   inspect output, the container's environment, its output, the installation log), and only credential-free proxy
   variables reach it. Locally (cgroup v1) the approved-path tests skip with the self-test's refusal.
 - **Real-engine findings (2026-11-02):**
-  - Fixed in Orkexa (pin bump pending): the resolve self-test refused every daemon, cgroup v2 included. The pinned
+  - Fixed in Orkexa #38 (pinned `0861c1b`): the resolve self-test refused every daemon, cgroup v2 included. The pinned
     `UV_IMAGE` sets no `LANG`, so Python's C-locale coercion (PEP 538) put `LC_CTYPE=C.UTF-8` into the self-test's
     `os.environ`, and `evaluate_self_test` refused it ("unexpected environment variables: LC_CTYPE"). Orkexa's
     self-test now reports `/proc/self/environ`, the environment the container was started with; its allowlist is
-    unchanged. Until Nodestro pins that Orkexa commit, desktop source builds end with `deps.build_required` (reason
+    unchanged. Before that pin, desktop source builds ended with `deps.build_required` (reason
     `sandbox.unavailable`), fail-closed. The environment images on `python:<v>-slim` set `LANG` and were not affected.
   - Fixed: `/tmp` of the resolve container was not executable. Docker mounts a `--tmpfs` `noexec` unless its options
     say `exec`, so only dropping `noexec` had no effect. The `exec_tmp` allowance now replaces `noexec` with `exec`

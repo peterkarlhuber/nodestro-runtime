@@ -16,8 +16,9 @@ The resolve path on a real Docker engine (RT-038; 2026-11-02):
 - Fix: the resolve container's `/tmp` is really executable. Docker mounts a tmpfs `noexec` unless its options say
   `exec`, so dropping `noexec` had no effect; the `exec_tmp` allowance now replaces `noexec` with `exec` in
   `_resolve_args` and in `check_shape`. `/work` stays `noexec`.
-- Found: the self-test refused the pinned resolver image on every daemon (Python's C-locale coercion sets
-  `LC_CTYPE`, which Orkexa refused). Fixed in Orkexa's self-test; it takes effect with the next Orkexa pin.
+- Orkexa pin `0861c1b2b79209c388a5e996035e5676a96f6d75` (orkexa #38): the self-test reports the container's own
+  environment (`/proc/self/environ`), so the coerced `LC_CTYPE` of uv's resolver image (no `LANG`) no longer refuses
+  every daemon. Only that file changed since `dec66eb` (plus CI and docs in #37).
 
 Axentra pin: `f3ed8d22a8bd45faff84204786e01da32ece4034` (axentra #28, #27: secret-free OIDC `return_to`, `POST`
 OIDC start, encoded-token redaction; 2026-11-02).
