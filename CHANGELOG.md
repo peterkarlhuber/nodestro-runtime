@@ -17,7 +17,13 @@ Axentra platform services in the server profile (Axentra migration, 2026-11-02; 
   and usage ledger entries are mirrored into Axentra in the same transaction as Nodestro's record, in a savepoint
   that never fails Nodestro's write; `AxentraEvents.reconcile` writes what is missing, idempotently. New
   `nodestro_runtime.platform_events` (the sink protocol; never imports Axentra), `PostgresDatabase.platform_events`.
-- New `tests/test_axentra_platform.py` and `tests/test_axentra_mirror.py`.
+- Identity on Axentra (M5, `NODESTRO_IDENTITY_BACKEND`, default `nodestro`): new `nodestro_runtime.axentra_identity`
+  with `AxentraIdentityStore` (`mirror`: Nodestro answers, Axentra written in the same transaction; `axentra`: Axentra
+  answers, both written), `backfill_identity`, `reconcile_identity` and `identity_readiness`. Same session tokens on
+  both sides, never a merge by e-mail, Nodestro ids and contracts unchanged. `AxentraLink.ensure_tenant` reads slugs
+  in Axentra's platform scope (row-level security); `AxentraLink.tenant` caches only committed links.
+- New `tests/test_axentra_platform.py`, `tests/test_axentra_mirror.py` and `tests/test_axentra_identity.py`;
+  `tests/test_identity_store.py` runs against all three identity backends.
 
 Automatic sandbox selection (sandbox architecture Phase E, 2026-11-02):
 

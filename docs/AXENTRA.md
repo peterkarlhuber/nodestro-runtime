@@ -29,6 +29,7 @@ to 3.11 is tracked as RT-022.
 | `NODESTRO_SECRETS_FORMAT` | `v1` | `axs1`: new tenant secrets are written with the Axentra keyring (rotation). Needs `on` |
 | `NODESTRO_AXENTRA_AUDIT` | `0` | `1`: mirror the approval audit trail and MCP events into Axentra's audit log. Needs `on` |
 | `NODESTRO_AXENTRA_USAGE` | `0` | `1`: mirror the AI usage ledger into Axentra meters `nodestro.ai.*`. Needs `on` |
+| `NODESTRO_IDENTITY_BACKEND` | `nodestro` | `mirror`: Nodestro answers, every identity write also goes to Axentra in the same transaction; `axentra`: Axentra answers, both are written. Needs `on`; see [Identity](#identity-and-tenancy-m5) |
 
 Every invalid combination stops the server with `profile.invalid` and names every problem.
 
@@ -94,6 +95,60 @@ are written exactly as before, and the usage dashboard reads them. The mirrors a
   it would need a per-run idempotency key and a decision on billing; until then Axentra's meters cover only usage
   outside runs. No limit is enforced from Axentra (`enforce=False`).
 
+## Identity and tenancy (M5)
+
+`NODESTRO_IDENTITY_BACKEND` chooses where users, tenants, memberships and sessions live
+(`nodestro_runtime.axentra_identity`). A change is a restart of `api` and `worker`.
+
+| Value | Reads from | Writes to |
+|---|---|---|
+| `nodestro` (default) | Nodestro's tables (`IdentityStore`, unchanged) | Nodestro only |
+| `mirror` | Nodestro's tables | both, **one PostgreSQL transaction** (Nodestro's connection, Axentra joined to it) |
+| `axentra` | Axentra: session validity (absolute/idle expiry, revocation, disabled user; database clock), roles, memberships, member lists, tenant list | both, one transaction (Nodestro's tables stay current for the rollback) |
+
+`AxentraIdentityStore` has `IdentityStore`'s interface; `nodestro-server` builds the store for `api`, `worker` and the
+member commands in one place. A failure on either side rolls back both; there is no dual write across connections.
+
+**Mapping.**
+
+- Tenant: Axentra tenant of product `nodestro`, linked in `nodestro_axentra_ids` (kind `tenant`); the slug is only a
+  label (`acme_eu` -> `acme-eu`, `a` -> `a-0`, collisions `-2`, ...). Names longer than 200 characters are cut.
+- User: Axentra user created with `create_external_user`, identity `(provider = OIDC issuer, subject)` exactly as
+  Nodestro keys users; linked as kind `user`. **Never merged by e-mail**: Axentra stores the (verified) address only
+  when no other Axentra user has it (and Axentra accepts its form); otherwise the user has no address in Axentra and
+  the identity row keeps it for reference. Nodestro keeps its own `email` column. The oldest account keeps a shared
+  address. No Axentra OIDC provider entry is needed: Axentra does not run the login (Nodestro's OIDC flow and routes
+  are unchanged), and `create_external_user` takes the issuer string as the provider.
+- Roles: `owner` -> `tenant_owner` (Axentra's last-owner guard applies too), `admin` -> `tenant_admin`, `viewer` ->
+  `viewer`, `editor`/`operator` -> custom tenant roles of the same key in product `nodestro` with generic tenant
+  permissions only (no `members:manage`, no tenant settings), created idempotently at start. Nodestro's
+  `read/edit/run/admin` still come from `ROLE_PERMISSIONS` by Nodestro role name; `/api/auth/me` is unchanged.
+- Sessions: the same token. Axentra's `token_hash` is the hex form of Nodestro's `bytea` SHA-256, so the hash joins
+  both rows (no mapping row). New sessions are started by Axentra (`start_session` makes the token, Nodestro stores
+  its hash); both rows get Nodestro's expiry. The active tenant stays `nodestro_sessions.tenant_id`. `last_seen_at`
+  touches, logout, "log out everywhere", removal of a member (ends their sessions in that tenant at once) and
+  housekeeping are mirrored. A tenant switch still issues a new session and ends the old one.
+- Stays Nodestro-only: login states (10 minutes; a login started during the switch fails once with
+  `identity.login_expired`) and bootstrap tokens (setup links; using one writes the owner membership on both sides).
+
+**Procedure (maintenance window).** Stop `api` and `worker`; back up (`migrate --backup-dir`); set `NODESTRO_AXENTRA=on`
+and `migrate`; `nodestro-server axentra backfill-identity --dry-run`, then without `--dry-run` (idempotent, resumable:
+one transaction per tenant, user, tenant's memberships, batch of sessions; reports created records, slug changes and
+users stored without an address); `nodestro-server axentra reconcile-identity` must print `"ok": true` (exit code 1
+otherwise; ids and counts only, never tokens or hashes); set `NODESTRO_IDENTITY_BACKEND=mirror`, start. Later
+`axentra` (restart). `api`, `worker` and `check` refuse `axentra` with `identity.backfill_required` while a quick count
+finds records missing on one side, and refuse an Axentra session idle limit that differs from Nodestro's 2 hours.
+Nobody has to log in again: sessions are copied with their hash.
+
+**Rollback.** `axentra` -> `mirror` -> `nodestro` is a restart each; Nodestro's tables are current in both modes.
+Writes made in `nodestro` mode after a switch back are not mirrored: run the backfill again before switching forward.
+
+**Limits.** Session resolution in `axentra` mode costs three short reads instead of one; when Axentra notes a use on
+its own (`resolve_session`, at most once a minute) Nodestro's `last_seen_at` may lag up to about two minutes (it only
+matters for idle expiry after a rollback). In `axentra` mode the tenant list, roles and members come from Axentra,
+the user profile (`/api/auth/me` name and address) from Nodestro's row. A suspended Axentra tenant is not yet treated
+as closed. Axentra's own HTTP API and admin functions are not exposed through Nodestro.
+
 ## What stays Nodestro's
 
 - **Jobs.** Nodestro's job queue keeps its guarantees: one active job per `(tenant, kind, ref)`, the run fence
@@ -104,6 +159,6 @@ are written exactly as before, and the usage dashboard reads them. The mirrors a
 ## Rollback
 
 Every switch can be turned off again without data changes: `NODESTRO_AXENTRA_AUDIT=0`, `..._USAGE=0`,
-`NODESTRO_AXENTRA=off`. `NODESTRO_SECRETS_FORMAT=axs1` can go back to `v1` only while the Axentra keyring is still
+`NODESTRO_IDENTITY_BACKEND=mirror` or `nodestro` (see above), `NODESTRO_AXENTRA=off`. `NODESTRO_SECRETS_FORMAT=axs1` can go back to `v1` only while the Axentra keyring is still
 configured (the `axs1` values written meanwhile need it to be read); keep `NODESTRO_AXENTRA=on` until they are moved
 back, or restore the pre-switch backup. A full rollback restores the backup taken by `migrate`.

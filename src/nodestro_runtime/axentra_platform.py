@@ -23,6 +23,9 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
                                             audit log (same transaction; needs NODESTRO_AXENTRA=on)
 ``NODESTRO_AXENTRA_USAGE``                  ``1``: mirror the AI usage ledger into Axentra meters (``nodestro.ai.*``;
                                             same transaction, idempotent; needs NODESTRO_AXENTRA=on)
+``NODESTRO_IDENTITY_BACKEND``               ``nodestro`` (default), ``mirror`` or ``axentra``: where users,
+                                            tenants, memberships and sessions live (``mirror``/``axentra`` need
+                                            NODESTRO_AXENTRA=on; see :mod:`nodestro_runtime.axentra_identity`)
 ==========================================  ================================================================
 
 :class:`KeyringSecretBox` reads both secret formats (``nodestro:enc:v1:`` and Axentra's ``axs1.<kid>.…``) and writes
@@ -61,6 +64,8 @@ MODULES = ("identity", "tenancy", "access", "audit", "usage")
 #: Prefix of Axentra ciphertexts (``axs1.<kid>.<nonce>.<ciphertext>``).
 AXS1_PREFIX = "axs1."
 SecretsFormat = Literal["v1", "axs1"]
+IdentityBackend = Literal["nodestro", "mirror", "axentra"]
+IDENTITY_BACKENDS: tuple[IdentityBackend, ...] = ("nodestro", "mirror", "axentra")
 _ON = frozenset({"1", "on", "true", "yes"})
 _OFF = frozenset({"", "0", "off", "false", "no"})
 
@@ -101,6 +106,8 @@ class AxentraConfig:
     audit: bool = False
     #: Mirror the AI usage ledger into Axentra's usage meters.
     usage: bool = False
+    #: Where identity records live (``NODESTRO_IDENTITY_BACKEND``, see :mod:`nodestro_runtime.axentra_identity`).
+    identity_backend: IdentityBackend = "nodestro"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str], problems: list[dict[str, str]]) -> AxentraConfig:
@@ -117,6 +124,12 @@ class AxentraConfig:
         if fmt not in ("v1", "axs1"):
             problem("NODESTRO_SECRETS_FORMAT", fmt, "NODESTRO_SECRETS_FORMAT must be v1 or axs1")
             fmt = "v1"
+        backend = environ.get("NODESTRO_IDENTITY_BACKEND", "").strip().lower() or "nodestro"
+        if backend not in IDENTITY_BACKENDS:
+            problem(
+                "NODESTRO_IDENTITY_BACKEND", backend, "NODESTRO_IDENTITY_BACKEND must be nodestro, mirror or axentra"
+            )
+            backend = "nodestro"
         superuser = environ.get("NODESTRO_AXENTRA_ALLOW_SUPERUSER", "").strip().lower()
         if superuser not in _ON | _OFF:
             problem("NODESTRO_AXENTRA_ALLOW_SUPERUSER", superuser, "NODESTRO_AXENTRA_ALLOW_SUPERUSER must be 1 or 0")
@@ -146,6 +159,12 @@ class AxentraConfig:
         if not enabled:
             if fmt == "axs1":
                 problem("NODESTRO_SECRETS_FORMAT", fmt, "NODESTRO_SECRETS_FORMAT=axs1 needs NODESTRO_AXENTRA=on")
+            if backend != "nodestro":
+                problem(
+                    "NODESTRO_IDENTITY_BACKEND",
+                    backend,
+                    f"NODESTRO_IDENTITY_BACKEND={backend} needs NODESTRO_AXENTRA=on",
+                )
             return cls(secrets_format=fmt)  # type: ignore[arg-type]
         if not available():
             problem(
@@ -175,6 +194,7 @@ class AxentraConfig:
             secrets_format=fmt,  # type: ignore[arg-type]
             audit=mirrors["audit"],
             usage=mirrors["usage"],
+            identity_backend=backend,  # type: ignore[arg-type]
         )
 
 
@@ -612,7 +632,8 @@ class AxentraLink:
         found = self._tenants.get(nodestro_id)
         if found is None:
             found = self.lookup("tenant", nodestro_id)
-            if found is not None:
+            # Only committed links are cached: inside a transaction the link may still roll back.
+            if found is not None and not self.database.in_transaction:
                 self._tenants[nodestro_id] = found
         return found
 
@@ -639,14 +660,19 @@ class AxentraLink:
             if row is not None:
                 axentra_id = str(row[0])
             else:
+                from axentra.data.database import DbScope
+
                 base = tenant_slug(nodestro_id)
-                taken = {
-                    str(item[0])
-                    for item in connection.execute(
-                        "SELECT slug FROM axentra_tenants WHERE product_id = %s AND (slug = %s OR slug LIKE %s)",
-                        (product_id, base, base[:60] + "-%"),
-                    ).fetchall()
-                }
+                # axentra_tenants has forced row-level security: read it in Axentra's platform scope (a bare
+                # connection without a scope sees no rows unless its role bypasses RLS).
+                with self.services.platform.db.transaction(DbScope.platform()) as tx:
+                    taken = {
+                        str(item["slug"])
+                        for item in tx.all(
+                            "SELECT slug FROM axentra_tenants WHERE product_id = %s AND (slug = %s OR slug LIKE %s)",
+                            (product_id, base, base[:60] + "-%"),
+                        )
+                    }
                 slug, counter = base, 2
                 while slug in taken:
                     slug, counter = f"{base[:60]}-{counter}", counter + 1
@@ -1076,6 +1102,7 @@ def from_environment(environ: Mapping[str, str] | None = None) -> AxentraConfig:
 
 __all__ = [
     "AXS1_PREFIX",
+    "IDENTITY_BACKENDS",
     "MODULES",
     "PRODUCT_SLUG",
     "SECRET_FIELDS",
@@ -1084,6 +1111,7 @@ __all__ = [
     "AxentraEvents",
     "AxentraLink",
     "AxentraServices",
+    "IdentityBackend",
     "KeyringSecretBox",
     "ReencryptReport",
     "attach_platform_events",

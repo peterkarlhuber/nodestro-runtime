@@ -11,6 +11,10 @@ tokens are random 256-bit values, and only their SHA-256 hashes are stored.
   and it is worth nothing once the membership is gone.
 - A **bootstrap token** (made by an operator command) makes the first user who logs in with it the owner of an
   empty tenant; it works once, and only before the tenant has an owner.
+
+With ``NODESTRO_IDENTITY_BACKEND=mirror`` or ``axentra`` the server uses
+:class:`~nodestro_runtime.axentra_identity.AxentraIdentityStore` instead, which has this interface and keeps these
+tables and Axentra's in step (migration step M5).
 """
 
 from __future__ import annotations
@@ -218,10 +222,14 @@ class IdentityStore:
             return None
         user_id, tenant_id, role, expires_at, last_seen = rows[0]
         if _now() - last_seen > timedelta(minutes=1):
-            self.database._write(
-                "UPDATE nodestro_sessions SET last_seen_at = clock_timestamp() WHERE token_hash = %s", (_hash(token),)
-            )
+            self._touch(_hash(token))
         return Session(user_id=user_id, tenant_id=tenant_id, role=role, expires_at=expires_at)
+
+    def _touch(self, token_hash: bytes) -> None:
+        """Note that the session of ``token_hash`` was used now (at most once a minute)."""
+        self.database._write(
+            "UPDATE nodestro_sessions SET last_seen_at = clock_timestamp() WHERE token_hash = %s", (token_hash,)
+        )
 
     def end_session(self, token: str) -> None:
         self.database._write("DELETE FROM nodestro_sessions WHERE token_hash = %s", (_hash(token),))
