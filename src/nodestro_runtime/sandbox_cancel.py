@@ -9,44 +9,38 @@ threads that run tool calls), and a sandbox that supports it polls :func:`reques
 - the container sandboxes Nodestro builds (:class:`nodestro_runtime.container_images.StreamedSandbox`) remove the
   call's container (``docker rm -f``), which also ends the docker client.
 
-Orkexa's own ``SubprocessSandbox`` and ``DockerSandbox`` do not poll it: their calls still end at the sandbox
-timeout, and the agent stops at its next check after the call.
+Orkexa's ``SubprocessSandbox`` and ``DockerSandbox`` poll the same check (the context variable is Orkexa's own,
+:mod:`orkexa.dynamic.lifecycle`, ORK-001): they kill the call's process group, or remove its container.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextvars import ContextVar, Token
+from contextvars import Token
 
-Check = Callable[[], bool]
+from orkexa.dynamic.lifecycle import CancelCheck, bind_cancel, cancel_requested, current_cancel, reset_cancel
 
-_CHECK: ContextVar[Check | None] = ContextVar("nodestro_sandbox_cancel", default=None)
+Check = CancelCheck
 
 
 def bind(check: Check | None) -> Token[Check | None]:
     """Bind the cancel check of the run whose tools the current thread (and the threads it starts) runs."""
-    return _CHECK.set(check)
+    return bind_cancel(check)
 
 
 def reset(token: Token[Check | None]) -> None:
-    _CHECK.reset(token)
+    reset_cancel(token)
 
 
 def current() -> Check | None:
     """The bound check, for a thread that watches a call on behalf of the caller (context variables are not
     inherited by new threads)."""
-    return _CHECK.get()
+    return current_cancel()
 
 
 def requested(check: Check | None = None) -> bool:
-    """Whether the run of the current call was cancelled (``False`` outside a run)."""
-    found = check if check is not None else _CHECK.get()
-    if found is None:
-        return False
-    try:
-        return bool(found())
-    except Exception:  # a broken check must never stop a call by itself
-        return False
+    """Whether the run of the current call was cancelled (``False`` outside a run; a broken check never
+    cancels)."""
+    return cancel_requested(check)
 
 
 __all__ = ["Check", "bind", "current", "requested", "reset"]

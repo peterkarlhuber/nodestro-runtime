@@ -45,6 +45,7 @@ from orkexa.dynamic import DockerSandbox, Sandbox
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
+from . import sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -90,6 +91,7 @@ from .reports import ResultFiles
 from .resume import PublishedRuns
 from .resume import resume as resume_run
 from .sandbox_policy import SandboxPolicy
+from .sandbox_selection import SandboxMode
 from .schemas import (
     DEFAULT_AGENT_MODEL,
     DEFAULT_ASSISTANT_MODEL,
@@ -332,6 +334,7 @@ class Workspace:
             policy=self.sandbox_policy,
             provenance=StoredProvenance(self.store),
         )
+        self._apply_sandbox_mode()
         # MCP (ADR-0007): the egress policy is the operator's (process environment), tokens are sealed with the
         # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.
         self.mcp = McpService(
@@ -526,11 +529,28 @@ class Workspace:
             lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
         )
 
-    def _sandbox_kind(self) -> Literal["subprocess", "docker"]:
-        """The sandbox setting in effect: the stored one, or ``docker`` wherever only containers may run code."""
-        if self.sandbox_policy.profile != "desktop" or self._stored("sandbox") == "docker":
+    def _sandbox_kind(self) -> SandboxMode:
+        """The sandbox setting in effect (:mod:`.sandbox_selection`): ``docker`` wherever only containers may run
+        code; on the desktop the stored choice, and ``auto`` when none was made (also for installations of earlier
+        releases that never chose: an explicitly stored ``subprocess`` stays ``subprocess``)."""
+        stored = self._stored("sandbox")
+        if self.sandbox_policy.profile != "desktop" or stored == "docker":
             return "docker"
-        return "subprocess"
+        return "subprocess" if stored == "subprocess" else "auto"
+
+    def _apply_sandbox_mode(self) -> None:
+        """Give the tool library the ``auto`` mode's container fallback (and take it away in other modes)."""
+        auto = self.sandbox_policy.profile == "desktop" and self._sandbox_kind() == "auto"
+        self.tools.container_fallback = self._auto_container if auto else None
+
+    def _auto_container(self) -> Sandbox | None:
+        """In ``auto`` mode: a container for untrusted code without libraries, while Docker is running. Nodestro's
+        runtime image (built on first use, no image to build by hand, no bind mounts)."""
+        if not self._docker_available():
+            return None
+        return RuntimeImageSandbox(
+            lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()
+        )
 
     def _providers(self, values: dict[str, Any] | None = None, *, sealed: bool = False) -> dict[str, dict[str, Any]]:
         """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key.
@@ -573,6 +593,10 @@ class Workspace:
             sandbox=self._sandbox_kind(),
             docker_available=self._docker_available(),
             builtin_sandbox=self._builtin_sandbox(),
+            sandbox_selection=sandbox_selection.select(
+                self.sandbox_policy, self._sandbox_kind(), self._docker_available()
+            ),
+            sandbox_backends=sandbox_selection.backends(self.sandbox_policy, self._docker_available()),
             language=values.get("language") if values.get("language") in LANGUAGES else None,
             architect_budget_usd=values.get("architect_budget_usd", 2.0),
             architect_max_repairs=int(values.get("architect_max_repairs") or 0)
@@ -664,6 +688,7 @@ class Workspace:
         self.store.put_raw("settings", "app", values)
         if changes.get("sandbox"):
             self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy, self._container_sandbox()))
+            self._apply_sandbox_mode()
         return self.settings()
 
     # ---- Amazon Bedrock ------------------------------------------------------------
@@ -895,6 +920,7 @@ class Workspace:
         becomes ``untrusted`` (ADR-0006)."""
         self.tools.provenance.clear()
         self.tools.reload(make_sandbox(self._sandbox_kind(), self.sandbox_policy, self._container_sandbox()))
+        self._apply_sandbox_mode()
         self.inputs.forget()
 
     # ---- workflows ------------------------------------------------------------------

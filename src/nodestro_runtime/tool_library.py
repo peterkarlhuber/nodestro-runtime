@@ -21,7 +21,9 @@ from datetime import datetime
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -306,7 +308,8 @@ class DependencyGate:
 def make_sandbox(
     kind: str, policy: SandboxPolicy | None = None, container: Callable[[], Sandbox] | None = None
 ) -> Sandbox:
-    """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess.
+    """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess (``subprocess`` and
+    ``auto``; in ``auto`` the workspace also sets :attr:`ToolLibrary.container_fallback`).
 
     ``container`` builds the container sandbox where Orkexa's default (``orkexa-sandbox`` image, bind mounts) does
     not fit, as on a server. The subprocess sandbox runs only trusted and user-authored code; the policy refuses
@@ -451,6 +454,9 @@ class ToolLibrary:
         self.untrusted_sources: Callable[[], Iterable[str]] = lambda: ()
         #: Tools of connected MCP servers (:mod:`nodestro_runtime.mcp`); ``None`` when MCP is not set up.
         self.mcp: McpService | None = None
+        #: The ``auto`` sandbox mode on the desktop: a container sandbox for code that needs isolation when the
+        #: built-in Linux sandbox is not available (``None`` while Docker is not running or in other modes).
+        self.container_fallback: Callable[[], Sandbox | None] | None = None
 
     def _load(self, path: Path | None, sandbox: Sandbox) -> ToolRegistry:
         seen = _fingerprint(path)
@@ -591,8 +597,20 @@ class ToolLibrary:
         isolated = self._isolated(sandbox)
         if isolated is not None and self.policy.allows(trust, isolated):
             return isolated
+        fallback = self._fallback(sandbox)
+        if fallback is not None and self.policy.allows(trust, fallback):
+            return fallback
         self.policy.require(trust, sandbox, name=name)
         return sandbox  # pragma: no cover - require() raised
+
+    def _fallback(self, sandbox: Sandbox) -> Sandbox | None:
+        """The ``auto`` mode's container for code without third-party libraries (a Python environment's
+        interpreter has packages the container image lacks, so its code is not moved)."""
+        if self.container_fallback is None or not isinstance(sandbox, SubprocessSandbox):
+            return None
+        if os.path.realpath(sandbox.python) != os.path.realpath(sys.executable):
+            return None
+        return self.container_fallback()
 
     def _isolated(self, sandbox: Sandbox) -> Sandbox | None:
         if not isinstance(sandbox, SubprocessSandbox) or not self.policy.builtin_available():

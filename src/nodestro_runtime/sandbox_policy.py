@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import sys
 from typing import Literal, get_args
 
 from orkexa.dynamic import DockerSandbox, Sandbox
@@ -61,7 +62,9 @@ def isolation_of(sandbox: Sandbox) -> Isolation:
     Orkexa's ``DockerSandbox`` isolates with a container (no network, read-only, no capabilities, unprivileged user,
     limits); a subclass keeps those flags. The built-in ``LinuxSandbox`` isolates with the kernel (``kernel``) when
     this computer passed its checks (:meth:`LinuxSandbox.status`). Every other sandbox, including a subprocess with a
-    custom interpreter, runs on the host as the user."""
+    custom interpreter, runs on the host as the user, and so does Orkexa's experimental ``MacOSSandbox``: it is
+    implemented and self-tested, but not reviewed or released, so it never counts as isolating here, whatever its
+    capability report says."""
     if isinstance(sandbox, DockerSandbox):
         return "container"
     if isinstance(sandbox, LinuxSandbox) and LinuxSandbox.status().available:
@@ -106,7 +109,14 @@ class SandboxPolicy:
         if self.profile == "desktop":
             status = LinuxSandbox.status()
             reason, detail = status.reason, status.detail
-        why = f" The built-in Linux sandbox is not available here: {detail}." if detail else ""
+        if self.profile == "desktop" and not sys.platform.startswith("linux"):
+            system = {"darwin": "macOS", "win32": "Windows"}.get(sys.platform, sys.platform)
+            why = (
+                f" Nodestro has no released native sandbox for {system} yet: start Docker and choose Automatic or "
+                "Docker under Settings, Sandbox."
+            )
+        else:
+            why = f" The built-in Linux sandbox is not available here: {detail}." if detail else ""
         raise NodestroError(
             "sandbox.isolation_required",
             f"The tool code {label}is {trust} and runs only in an isolating sandbox (the built-in Linux sandbox or "
