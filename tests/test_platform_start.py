@@ -68,7 +68,11 @@ def test_workspace_starts_and_reports_the_sandbox(tmp_path: Path) -> None:
             # The built-in sandbox is Linux-only: it is reported as missing, never as available.
             assert status.available is False
             assert status.reason == "platform"
-        assert settings.sandbox in {"subprocess", "docker"}
+        assert settings.sandbox == "auto"  # nothing chosen yet
+        assert settings.sandbox_selection.os in {"linux", "macos", "windows"}
+        if not sys.platform.startswith("linux") and not settings.docker_available:
+            assert settings.sandbox_selection.blocked
+            assert settings.sandbox_selection.reason == "no-isolation"
 
 
 def test_untrusted_code_is_refused_without_isolation() -> None:

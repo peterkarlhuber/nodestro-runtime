@@ -42,7 +42,14 @@ import time
 from typing import ClassVar
 
 import orkexa
-from orkexa.dynamic import BoundedOutput, Sandbox, communicate_bounded, response_limit
+from orkexa.dynamic import (
+    BoundedOutput,
+    Sandbox,
+    SandboxCapabilities,
+    SandboxProbe,
+    communicate_bounded,
+    response_limit,
+)
 from orkexa.dynamic.errors import SandboxError
 
 from . import sandbox_cancel, sandbox_confine
@@ -140,6 +147,36 @@ class LinuxSandbox(Sandbox):
         self._min_landlock_abi = 0
 
     # --- availability --------------------------------------------------------------------------------------------
+
+    def capabilities(self) -> SandboxCapabilities:
+        """What the sandbox enforces (Orkexa's capability model); the policy decides where that is enough."""
+        return SandboxCapabilities(
+            backend="linux-builtin",
+            isolation="os",
+            filesystem="restricted",
+            network="none",
+            processes="blocked",
+            clean_environment=True,
+            limits=frozenset(
+                {"wall_clock", "cpu", "memory", "file_size", "open_files", "processes", "output", "temp_size"}
+            ),
+            memory="kernel",
+            cancellable=True,
+            maturity="stable",
+            platforms=("linux",),
+            architectures=("x86_64",),
+            notes=(
+                "Landlock ABI 4+ and seccomp; validated on Ubuntu 24.04 and Debian 13 (x86-64) only.",
+                "Shares the kernel with the computer; file metadata outside the allowed paths stays visible.",
+            ),
+        )
+
+    @classmethod
+    def probe(cls) -> SandboxProbe:
+        """:meth:`status` in Orkexa's probe format."""
+        found = cls.status()
+        facts = (("system", found.system), ("landlock_abi", str(found.landlock_abi)))
+        return SandboxProbe("linux-builtin", found.available, found.reason, found.detail, facts)
 
     @staticmethod
     def status(*, refresh: bool = False) -> SandboxStatus:

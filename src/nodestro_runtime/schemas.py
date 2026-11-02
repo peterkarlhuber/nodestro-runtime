@@ -867,7 +867,8 @@ class SettingsIn(_Model):
     default_model: str | None = None
     assistant_model: str | None = None
     default_budget_usd: float | None = Field(default=None, ge=0)
-    sandbox: Literal["subprocess", "docker"] | None = None
+    #: ``auto`` (built-in sandbox, else Docker, else refused), ``subprocess`` (never Docker) or ``docker``.
+    sandbox: Literal["auto", "subprocess", "docker"] | None = None
     #: The interface language the user chose; ``None`` follows the browser.
     language: Language | None = None
     #: Cost limit of one Workflow Architect job in USD (``None``: no limit).
@@ -894,6 +895,47 @@ class BuiltinSandboxStatus(_Model):
     system: str = ""
 
 
+class SandboxBackendStatus(_Model):
+    """One sandbox backend of the computer the runtime runs on, as the policy sees it."""
+
+    #: ``linux-builtin``, ``macos-seatbelt``, ``windows-native``, ``docker`` or ``subprocess``.
+    name: str
+    #: Whether it can run on this computer now (its probe passed).
+    available: bool = False
+    #: ``approved`` (released for AI-generated code here), ``experimental`` (works, but not reviewed or released:
+    #: never used), ``unavailable``, ``not-isolating`` (runs only code a person wrote) or ``not-applicable``.
+    state: Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable"] = "unavailable"
+    #: Why it is not approved, e.g. ``platform``, ``not-released``, ``not-implemented``, ``unreachable``, ``server``.
+    reason: str = ""
+    #: The technical detail in English.
+    detail: str = ""
+    #: ``none``, ``container`` or ``os`` (Orkexa's capability model).
+    isolation: str = "none"
+    maturity: str = "stable"
+    #: How memory is limited: ``kernel``, ``watchdog`` or ``none``.
+    memory: str = "none"
+    #: Known limitations in English.
+    notes: list[str] = Field(default_factory=list)
+
+
+class SandboxSelection(_Model):
+    """Where tool code runs now on the computer the runtime runs on (not the browser's)."""
+
+    mode: Literal["auto", "subprocess", "docker"] = "auto"
+    profile: str = "desktop"
+    #: ``linux``, ``macos`` or ``windows``, and the CPU (``x86_64``, ``arm64``).
+    os: str = ""
+    arch: str = ""
+    #: The backend that runs AI-generated and other untrusted code; empty when such code is refused.
+    untrusted: str = ""
+    #: The backend that runs code a person wrote in the tool editor.
+    user_authored: str = ""
+    #: Whether untrusted code is refused here, with ``reason`` (``no-isolation``, ``docker-unreachable``).
+    blocked: bool = False
+    reason: str = ""
+    detail: str = ""
+
+
 class Settings(_Model):
     #: Every AI provider with its configuration state (never the keys themselves).
     providers: list[ProviderStatus] = Field(default_factory=list)
@@ -902,8 +944,12 @@ class Settings(_Model):
     default_model: str = DEFAULT_AGENT_MODEL
     assistant_model: str = DEFAULT_ASSISTANT_MODEL
     default_budget_usd: float | None = 2.0
-    sandbox: Literal["subprocess", "docker"] = "subprocess"
+    sandbox: Literal["auto", "subprocess", "docker"] = "auto"
     docker_available: bool = False
+    #: Where tool code runs now and why untrusted code may be refused (cross-platform sandbox architecture).
+    sandbox_selection: SandboxSelection = Field(default_factory=SandboxSelection)
+    #: The sandbox backends of this computer with their state.
+    sandbox_backends: list[SandboxBackendStatus] = Field(default_factory=list)
     #: The built-in Linux sandbox: with it, AI-generated code runs isolated without Docker.
     builtin_sandbox: BuiltinSandboxStatus = Field(default_factory=BuiltinSandboxStatus)
     language: Language | None = None

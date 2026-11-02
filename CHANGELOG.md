@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Automatic sandbox selection (sandbox architecture Phase E, 2026-11-02):
+
+- The desktop `sandbox` setting has a new mode `auto`, the default when nothing was chosen. Untrusted (AI-generated)
+  code runs in the built-in Linux sandbox where this computer passed its checks, otherwise in a container of
+  Nodestro's runtime image while Docker is running, otherwise it is refused. It never falls back to the host
+  subprocess. Code a person wrote keeps running in the host subprocess. A stored `subprocess` (chosen explicitly)
+  stays `subprocess` and never uses Docker; a stored `docker` stays `docker`. Server and Nodestro Local Docker
+  always use containers, as before. Code of a Python environment (its own interpreter) is never moved into the
+  container, whose image lacks its packages.
+- New `nodestro_runtime.sandbox_selection` and settings fields `sandbox_selection` (mode, profile, the runtime's
+  operating system and CPU, where untrusted and user-authored code runs, or why it is blocked) and
+  `sandbox_backends` (native sandbox of this OS, Docker, subprocess: available, state `approved` / `experimental` /
+  `unavailable` / `not-isolating` / `not-applicable`, reason, isolation, maturity, memory limit). The operating system
+  is the runtime's, never the browser's.
+- Orkexa's experimental macOS sandbox (Seatbelt) is reported as `experimental` / `not-released` and never used:
+  `isolation_of` keeps returning `none` for it. Windows reports `windows-native: unavailable / not-implemented`.
+- `sandbox_cancel` now uses Orkexa's cancel context (`orkexa.dynamic.lifecycle`, ORK-001), so Orkexa's subprocess and
+  Docker sandboxes stop a cancelled run's call too. `LinuxSandbox` reports `capabilities()` and `probe()`.
+- Orkexa pin `544ef92` (capabilities, probes, cancellation, experimental macOS sandbox; orkexa #28).
+- New `tests/test_sandbox_selection.py`.
+
 macOS and Windows start (sandbox architecture Phase A, 2026-11-02):
 
 - The runtime imports and starts on macOS and Windows again. `sandbox_confine.py` looked up `prctl` with ctypes at

@@ -198,7 +198,11 @@ None known.
 - **What:** The built-in sandbox is Linux-only. On macOS and Windows untrusted (AI-generated) tools need Docker.
   Since 2026-11-02 the runtime imports and starts on macOS (arm64, x86-64) and Windows (x64, ARM64), tested by the
   `Platforms` workflow; before that, the import of `sandbox_confine.py` failed on both.
-- **Next step:** Native isolation for macOS and Windows (cross-platform sandbox architecture, in progress).
+  Since Phase E the `auto` mode (default) uses Docker automatically when it is running and reports why code is
+  blocked otherwise; Orkexa's macOS sandbox is implemented and self-tested on macOS 26 arm64 but experimental and
+  not used (no independent review); Windows has no native sandbox (ADR-0009 in the studio repo).
+- **Next step:** Independent security review of the macOS sandbox before it may be released; a Windows backend
+  (AppContainer + Job Object, or MXC) as a separate decision.
 
 ### RT-020 · Real providers and PostgreSQL at scale
 
