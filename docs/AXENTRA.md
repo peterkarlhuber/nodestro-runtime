@@ -525,8 +525,11 @@ on the data volume.
    them (resumable, idempotent; each copy is read back and its SHA-256 compared before the mapping is recorded; a
    damaged volume file is reported, not copied; the volume file is **never** deleted). Exit code 2 when a file failed.
 3. `nodestro-server files verify` reads every object back, compares the SHA-256 and records `verified_at`; it reports
-   failures, volume blobs not migrated yet (`pending`) and Axentra objects without a mapping (`orphans`, e.g. from an
-   interrupted upload; they are reported, never deleted automatically).
+   failures, volume blobs not migrated yet (`pending`) and leftovers older than an hour: Axentra objects without a
+   mapping (`orphans`, e.g. from an interrupted upload or copy) and mappings no input file uses (`unreferenced`, e.g.
+   a file deleted while the backend was `volume`). A leftover makes the report `"ok": false` (exit code 2);
+   `nodestro-server files cleanup --dry-run [--tenant ID]` lists them, `files cleanup` deletes them in Axentra
+   (volume files are never touched; younger leftovers are only counted as `recent`).
 4. Later, after the fallback period: `NODESTRO_FILES_SOURCE_REMOVAL=1 nodestro-server files remove-source --dry-run`,
    then without `--dry-run`. A volume file is deleted only when its object was migrated, verified by `files verify`,
    the fallback period (`NODESTRO_FILES_SOURCE_RETENTION_DAYS`, default 30) since its migration has passed and a fresh
@@ -548,7 +551,9 @@ delete removes them. Restore the dump and the archive (or bucket) of the same ti
 
 **Rollback.** `nodestro-server files export-volume [--dry-run]` copies every file that exists only in Axentra back to
 the volume (idempotent); then `NODESTRO_FILES_BACKEND=volume` and restart. Mappings and objects stay; switching
-forward again later reuses them (`files migrate` copies only what is new).
+forward again later reuses them (`files migrate` copies only what is new). Deletes made while the backend was
+`volume` reach only the volume: after switching forward again run `files verify` and `files cleanup`, which delete
+the Axentra objects of those files.
 
 **Cost (measured, one machine, PostgreSQL 16 local, medians).** Per blob operation (put / get / delete, ms):
 
@@ -616,7 +621,7 @@ role. 50 tenants, 2,000 users, 3,537 memberships, 10,000 sessions unless noted.
   `secrets reencrypt` 5,000 documents 6.3 s, `files migrate` 4,000 blobs (16 MB) 44 s, `files verify` 13 s,
   `axentra reconcile` 2,000 audit events + 2,000 usage entries + 2,000 runs 60 s. Peak RSS growth of each command
   under 4 MiB (they stream). A `files migrate` killed mid-copy leaves at most one Axentra object without a mapping,
-  which `files verify` reports as an orphan (never deleted automatically).
+  which `files verify` reports as an orphan (`"ok": false`) and `files cleanup` deletes.
 - Axentra adds about 10 MiB to a process after start (its import and services) and a transient start peak (about
   +60 MiB RSS high-water mark while the services start); nothing grows under load.
 

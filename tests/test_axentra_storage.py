@@ -395,9 +395,81 @@ def test_verify_reports_missing_objects_and_orphans(files: Any, tmp_path: Path) 
         name="stray.txt",
         metadata={"nodestro_blob": "0" * 16},
     )
-    report = files.verify(data_root)
+    from nodestro_runtime.schemas import now
+
+    report = files.verify(data_root, now=now() + timedelta(hours=2))
     assert [(entry["blob"], entry["reason"]) for entry in report.failed] == [(item.blob, "input.content_missing")]
     assert [entry["file"] for entry in report.orphans] == [stray.id]
+
+
+def _later() -> Any:
+    from nodestro_runtime.schemas import now
+
+    return now() + timedelta(hours=2)
+
+
+def test_an_object_of_a_cut_off_copy_fails_verify_and_cleanup_removes_it(files: Any, tmp_path: Path) -> None:
+    """``files migrate`` killed between the upload and the mapping leaves an Axentra object nothing uses."""
+    data_root = tmp_path / "data"
+    item = _volume_inputs(files.database, data_root, "alpha").add(b"copied when killed", name="a.txt")
+    cut_off = files.upload(
+        "alpha", b"copied when killed", blob=item.blob, name="a.txt", media_type="text/plain", origin="migration"
+    )
+    fresh = files.verify(data_root).as_dict()  # may still be a copy in flight
+    assert fresh["ok"] and fresh["orphans"] == [] and fresh["recent"] == 1
+    assert files.cleanup().removed == 0
+    late = files.verify(data_root, now=_later()).as_dict()
+    assert not late["ok"] and [entry["file"] for entry in late["orphans"]] == [cut_off.axentra_file]
+    planned = files.cleanup(dry_run=True, now=_later())
+    assert planned.removed == 0 and [entry["file"] for entry in planned.orphans] == [cut_off.axentra_file]
+    assert files.cleanup(now=_later()).removed == 1
+    assert {row[0]: row[2] for row in _axentra_rows(files.database)}[cut_off.axentra_file] == "deleted"
+    assert files.verify(data_root, now=_later()).as_dict()["ok"]
+    assert files.migrate(data_root).copied == 2  # the copy itself is simply made again
+    assert files.cleanup(now=_later()).removed == 0
+
+
+def test_a_delete_made_while_the_backend_was_volume_is_removed_from_axentra(files: Any, tmp_path: Path) -> None:
+    """Security review SR-09: export, switch back to ``volume``, a user deletes a file, switch forward again."""
+    data_root = tmp_path / "data"
+    kept = _inputs(files, data_root, "alpha").add(b"stays", name="keep.txt")
+    gone = _inputs(files, data_root, "alpha").add(b"personal data the user deleted", name="gone.txt")
+    files.export_to_volume(data_root)
+    rolled_back = _volume_inputs(files.database, data_root, "alpha")
+    rolled_back.delete(gone.id, force=True)  # the volume backend knows nothing about Axentra
+    objects = {files.lookup("alpha", blob).axentra_file for blob in (gone.blob, gone.extract_blob)}
+    assert None not in objects
+    report = files.verify(data_root, now=_later()).as_dict()
+    assert not report["ok"] and report["failed"] == [] and report["orphans"] == []
+    assert sorted(entry["blob"] for entry in report["unreferenced"]) == sorted([gone.blob, gone.extract_blob])
+    planned = files.cleanup(dry_run=True, now=_later())
+    assert planned.removed == 0 and len(planned.unreferenced) == 2
+    assert files.lookup("alpha", gone.blob) is not None
+    done = files.cleanup(now=_later())
+    assert (done.removed, done.kept, done.failed) == (2, 0, [])
+    states = {row[0]: row[2] for row in _axentra_rows(files.database)}
+    assert {states[file] for file in objects} == {"deleted"}
+    assert files.lookup("alpha", gone.blob) is None and files.lookup("alpha", kept.blob) is not None
+    assert files.verify(data_root, now=_later()).as_dict()["ok"]
+    assert _inputs(files, data_root, "alpha").data(kept.id) == b"stays"
+
+
+def test_cleanup_keeps_a_mapping_that_an_upload_just_reused(files: Any, tmp_path: Path) -> None:
+    from nodestro_runtime.axentra_storage import COLLECTION
+
+    data_root = tmp_path / "data"
+    gone = _inputs(files, data_root, "alpha").add(b"uploaded again", name="a.txt")
+    files.export_to_volume(data_root)
+    _volume_inputs(files.database, data_root, "alpha").delete(gone.id, force=True)
+    store = files.database.store("alpha")
+    for blob in (gone.blob, gone.extract_blob):  # the leftovers are old by now
+        old = files.lookup("alpha", blob)
+        store.put(COLLECTION, blob, old.model_copy(update={"created_at": old.created_at - timedelta(hours=2)}))
+    # The same content is uploaded again: its blob store reuses the mapping, the input file is written after that.
+    assert _inputs(files, data_root, "alpha").blobs.put(b"uploaded again", name="a.txt", media_type="text/plain")
+    report = files.cleanup()
+    assert report.removed == 1 and report.recent == 1  # only the unused extraction goes
+    assert files.lookup("alpha", gone.blob) is not None
 
 
 def test_export_to_the_volume_makes_a_rollback_possible(files: Any, tmp_path: Path) -> None:
