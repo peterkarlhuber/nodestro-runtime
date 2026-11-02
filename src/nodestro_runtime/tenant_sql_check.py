@@ -10,14 +10,21 @@ How it works:
 - :func:`tenant_tables` reads the migrations and returns every ``nodestro_*`` table with a ``tenant_id`` column, so a
   new table is covered as soon as its migration exists.
 - :func:`scan_package` reads every ``.py`` file of a package with :mod:`ast` and rebuilds the text of each string
-  expression the way Python would build it: string constants, implicit and ``+`` concatenation, f-strings,
-  ``str.format``, ``str.join`` and psycopg's ``sql.SQL(...).format(...)`` / ``sql.Identifier`` / ``sql.Placeholder``
-  / ``sql.Composed``. A name inside it is resolved to the string values it can hold (module constants, local
-  assignments and ``+=`` in the same function, each conditional ``+=`` taken and not taken, ``for`` loops over a tuple
-  of strings). Every combination is one variant, and every variant is checked.
-- Each variant that names a tenant table (or that starts like a data statement and contains a part that cannot be
-  resolved) is a candidate. A candidate with an unresolved part is reported as ``dynamic``; one that the PostgreSQL
-  parser rejects is reported as ``unparsed``. Neither passes silently.
+  expression the way Python would build it: string and bytes constants, implicit and ``+`` concatenation,
+  f-strings, ``str.format``, ``str.join`` (of a literal list, or of a name holding one) and psycopg's
+  ``sql.SQL(...).format(...)`` / ``sql.Identifier`` / ``sql.Placeholder`` / ``sql.Composed``; a string method that
+  changes the text (``.replace``, ``.lower`` ...) adds an unknown part.
+- A name is resolved to every value it can hold where it is read -- inside a string expression and also on its own,
+  as in ``q += " OR ..."; db._query(q)`` or ``q = q + ...``: module constants (and assignments of functions that
+  declare it ``global``), the assignments and ``+=`` of the same function before the read (and after it, in a loop
+  around it), each conditional assignment or ``+=`` taken and not taken, ``for`` loops over a tuple of strings. A
+  ``+=`` that a loop repeats, or ``q = q + ...`` in a loop, is an unknown part. Every combination is one variant,
+  and every variant is checked; more than :data:`MAX_VARIANTS` is reported as ``dynamic``.
+- Each variant whose known parts name a tenant table, that starts like a data statement and contains a part that
+  cannot be resolved, or that starts with a part that cannot be resolved (an imported fragment, ``self.BASE``, a
+  function's result, a parameter) followed by SQL words, is a candidate. A candidate with an unresolved part is
+  reported as ``dynamic``; one that the PostgreSQL parser rejects is reported as ``unparsed``. Neither passes
+  silently: such a text passes only through an allowlist entry with its reason.
 - A parsed candidate passes when every reference to a tenant table -- in ``FROM``, joins, ``USING``, the target of
   ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level ``AND`` conjunct of its
   statement's ``WHERE`` (or of an inner join's ``ON``) of the form ``<ref>.tenant_id = <param>`` or
@@ -29,17 +36,20 @@ How it works:
   longer matches anything is reported as stale.
 
 What it cannot see: SQL built from values that are not in the source (a query read from a file or a database), and
-SQL that names no tenant table and starts with no data keyword but becomes one at run time. Both would be unusual in
-this code base; the first does not exist, the second is reported when its pieces are rebuilt (``dynamic``).
+SQL that names no tenant table, starts with no data keyword and has no known SQL words after an unknown start, but
+becomes one at run time (a text made only of unknown parts, such as ``QS[0] + QS[1]``; the strings it is made of are
+checked where they are written). Both would be unusual in this code base; the first does not exist.
 """
 
 from __future__ import annotations
 
 import ast
 from collections.abc import Iterable, Iterator, Mapping
+import dataclasses
 from dataclasses import dataclass, field
 import itertools
 from pathlib import Path
+import re
 import string
 from typing import Any
 
@@ -156,172 +166,369 @@ def _is_sql_attr(node: ast.expr, name: str) -> bool:
     return isinstance(node, ast.Name) and node.id == name
 
 
+Position = tuple[int, int]
+
+#: String methods whose result is the text of the receiver (for the strip methods: without arguments).
+_SAME_TEXT = frozenset({"encode", "decode", "strip", "lstrip", "rstrip"})
+#: String methods that change the text of the receiver: the result is the receiver followed by an unknown part.
+_CHANGED_TEXT = frozenset(
+    {
+        "replace",
+        "translate",
+        "format_map",
+        "removeprefix",
+        "removesuffix",
+        "lower",
+        "upper",
+        "casefold",
+        "swapcase",
+        "title",
+        "capitalize",
+        "expandtabs",
+        "zfill",
+        "center",
+        "ljust",
+        "rjust",
+    }
+)
+_LOOPS = (ast.For, ast.AsyncFor, ast.While)
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _start(node: ast.AST) -> Position:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+def _end(node: ast.AST) -> Position:
+    end_line = getattr(node, "end_lineno", None)
+    end_col = getattr(node, "end_col_offset", None)
+    if end_line is None or end_col is None:
+        return _start(node)
+    return (end_line, end_col)
+
+
+def _inside(position: Position, node: ast.AST) -> bool:
+    return _start(node) <= position <= _end(node)
+
+
+@dataclass(frozen=True, eq=False)
+class _Event:
+    """An assignment to a name in one scope."""
+
+    position: Position  # where the new value takes effect: the end of the statement (of the iterable for ``for``)
+    kind: str  # set | add (``+=``) | for (a loop target) | unknown
+    value: ast.AST
+    conditional: bool  # it may not happen before the use (a branch, a loop body, a handler)
+    loops: tuple[ast.AST, ...]  # the loops of the scope around it (for a ``global``: the function)
+    node: ast.AST
+
+
+def _body(owner: ast.AST) -> list[ast.stmt]:
+    body = getattr(owner, "body", [])
+    return body if isinstance(body, list) else []
+
+
+def _walruses(node: ast.AST) -> Iterator[ast.NamedExpr]:
+    """``name := ...`` in the expressions of statement ``node`` (not in nested statements or functions)."""
+    for _field, value in ast.iter_fields(node):
+        for item in value if isinstance(value, list) else [value]:
+            if not isinstance(item, ast.expr):
+                continue
+            stack: list[ast.AST] = [item]
+            while stack:
+                current = stack.pop()
+                if isinstance(current, ast.Lambda):
+                    continue
+                if isinstance(current, ast.NamedExpr):
+                    yield current
+                stack.extend(ast.iter_child_nodes(current))
+
+
+def _stored(target: ast.AST) -> Iterator[str]:
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name):
+            yield node.id
+
+
+def _collect_events(owner: ast.AST, module: bool) -> dict[str, list[_Event]]:
+    """The assignments of every name directly in ``owner`` (not in nested functions or classes), in source order.
+    For the module, the assignments of functions that declare a name ``global`` count too (as conditional, at any
+    time)."""
+    events: dict[str, list[_Event]] = {}
+    only: set[str] | None = None
+
+    def add(
+        name: str,
+        node: ast.AST,
+        position: Position,
+        kind: str,
+        value: ast.AST,
+        conditional: bool,
+        loops: tuple[ast.AST, ...],
+    ) -> None:
+        if only is None or name in only:
+            events.setdefault(name, []).append(_Event(position, kind, value, conditional, loops, node))
+
+    def visit(nodes: Iterable[ast.AST], conditional: bool, loops: tuple[ast.AST, ...]) -> None:
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            for walrus in _walruses(node):
+                add(walrus.target.id, walrus, _end(walrus), "unknown", walrus.value, conditional, loops)
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        add(target.id, node, _end(node), "set", node.value, conditional, loops)
+                    elif isinstance(target, (ast.Tuple, ast.List, ast.Starred)):
+                        for name in _stored(target):
+                            add(name, node, _end(node), "unknown", node.value, conditional, loops)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is not None:
+                    add(node.target.id, node, _end(node), "set", node.value, conditional, loops)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                kind = "add" if isinstance(node.op, ast.Add) else "unknown"
+                add(node.target.id, node, _end(node), kind, node.value, conditional, loops)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                if isinstance(node.target, ast.Name):
+                    add(node.target.id, node, _end(node.iter), "for", node.iter, conditional, loops)
+                else:
+                    for name in _stored(node.target):
+                        add(name, node, _end(node.iter), "unknown", node.iter, conditional, loops)
+                visit(node.body, True, (*loops, node))
+                visit(node.orelse, True, loops)
+            elif isinstance(node, ast.While):
+                visit(node.body, True, (*loops, node))
+                visit(node.orelse, True, loops)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for name in _stored(item.optional_vars):
+                            add(name, node, _end(item.context_expr), "unknown", item.context_expr, conditional, loops)
+                visit(node.body, conditional, loops)
+            elif isinstance(node, (ast.If, ast.Try, ast.Match)) or type(node).__name__ == "TryStar":
+                for child_field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    for child in getattr(node, child_field, None) or []:
+                        if isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                            if isinstance(child, ast.ExceptHandler) and child.name:
+                                add(child.name, child, _start(child), "unknown", child, True, loops)
+                            if isinstance(child, ast.match_case):
+                                for name in _stored(child.pattern):
+                                    add(name, child, _start(child), "unknown", child, True, loops)
+                            visit(child.body, True, loops)
+                        else:
+                            visit([child], True, loops)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    add(alias.asname or alias.name.split(".")[0], node, _end(node), "unknown", node, conditional, loops)
+
+    visit(_body(owner), False, ())
+    if module:
+        for function in ast.walk(owner):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            declared = {name for n in ast.walk(function) if isinstance(n, ast.Global) for name in n.names}
+            if declared:
+                only = declared
+                visit(function.body, True, (function,))
+                only = None
+    return events
+
+
+def _loops_of(owner: ast.AST) -> list[ast.AST]:
+    """The loops directly in ``owner`` (not in nested functions)."""
+    found: list[ast.AST] = []
+    stack: list[ast.AST] = list(_body(owner))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, _LOOPS):
+            found.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return found
+
+
 class _Scope:
     """Where names are resolved: the enclosing function (if any) and the module."""
 
-    def __init__(self, module: ast.Module, function: ast.AST | None, consumed: set[int], names: set[int]) -> None:
+    def __init__(
+        self,
+        module: ast.Module,
+        function: ast.AST | None,
+        consumed: set[int],
+        names: set[int],
+        cache: dict[tuple[int, str], Any] | None = None,
+    ) -> None:
         self.module = module
         self.function = function
         self.consumed = consumed
         #: The ``Name`` nodes read while rebuilding a string (their value became part of it).
         self.names = names
+        self.cache: dict[tuple[int, str], Any] = {} if cache is None else cache
 
-    def _events(self, body_owner: ast.AST, name: str) -> list[tuple[int, str, ast.AST, bool, bool]]:
-        """Assignments to ``name`` directly in ``body_owner`` (not in nested functions or classes):
-        ``(line, kind, value, conditional, in_loop)``."""
-        events: list[tuple[int, str, ast.AST, bool, bool]] = []
-
-        def visit(nodes: Iterable[ast.AST], conditional: bool, loop: bool) -> None:
-            for node in nodes:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                    continue
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id == name:
-                            events.append((node.lineno, "set", node.value, conditional, loop))
-                        elif isinstance(target, (ast.Tuple, ast.List)) and any(
-                            isinstance(t, ast.Name) and t.id == name for t in target.elts
-                        ):
-                            events.append((node.lineno, "unknown", node.value, conditional, loop))
-                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
-                    if node.value is not None:
-                        events.append((node.lineno, "set", node.value, conditional, loop))
-                elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
-                    kind = "add" if isinstance(node.op, ast.Add) else "unknown"
-                    events.append((node.lineno, kind, node.value, conditional, loop))
-                elif isinstance(node, (ast.For, ast.AsyncFor)):
-                    if isinstance(node.target, ast.Name) and node.target.id == name:
-                        events.append((node.lineno, "for", node.iter, conditional, loop))
-                    elif _binds(node.target, name):
-                        events.append((node.lineno, "unknown", node.iter, conditional, loop))
-                    visit(node.body, True, True)
-                    visit(node.orelse, True, loop)
-                    continue
-                elif isinstance(node, ast.NamedExpr) and node.target.id == name:
-                    events.append((node.lineno, "unknown", node.value, conditional, loop))
-                elif isinstance(node, (ast.With, ast.AsyncWith)):
-                    for item in node.items:
-                        if item.optional_vars is not None and _binds(item.optional_vars, name):
-                            events.append((node.lineno, "unknown", item.context_expr, conditional, loop))
-                    visit(node.body, conditional, loop)
-                    continue
-                elif isinstance(node, ast.While):
-                    visit(node.body, True, True)
-                    visit(node.orelse, True, loop)
-                    continue
-                elif isinstance(node, (ast.If, ast.Try, ast.Match)) or type(node).__name__ == "TryStar":
-                    for child_field in ("body", "orelse", "finalbody", "handlers", "cases"):
-                        children = getattr(node, child_field, None) or []
-                        for child in children:
-                            if isinstance(child, (ast.ExceptHandler, ast.match_case)):
-                                if isinstance(child, ast.ExceptHandler) and child.name == name:
-                                    events.append((child.lineno, "unknown", child, True, loop))
-                                visit(child.body, True, loop)
-                            else:
-                                visit([child], True, loop)
-                    continue
-                elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                    for alias in node.names:
-                        if (alias.asname or alias.name.split(".")[0]) == name:
-                            events.append((node.lineno, "unknown", node, conditional, loop))
-                # Expressions inside statements may hold walrus targets or comprehensions; not relevant for strings.
-
-        visit(getattr(body_owner, "body", []), False, False)
+    def _events(self, owner: ast.AST, name: str) -> list[_Event]:
+        key = (id(owner), "\0events")
+        if key not in self.cache:
+            self.cache[key] = _collect_events(owner, owner is self.module)
+        events: list[_Event] = self.cache[key].get(name, [])
         return events
 
-    def resolve(self, name: str, line: int, depth: int) -> list[list[Any]]:
-        owners: list[ast.AST] = []
-        if self.function is not None:
-            owners.append(self.function)
-        owners.append(self.module)
-        for owner in owners:
-            if owner is self.function and isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                args = owner.args
-                params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-                if args.vararg:
-                    params.append(args.vararg)
-                if args.kwarg:
-                    params.append(args.kwarg)
-                if any(p.arg == name for p in params):
-                    return [[Hole(name)]]
-            events = self._events(owner, name)
-            if owner is self.function:
-                events = [e for e in events if e[0] <= line]
-            if not events:
-                continue
-            return self._variants(events, name, line, depth, owner is self.module)
+    def _loops(self, owner: ast.AST) -> list[ast.AST]:
+        key = (id(owner), "\0loops")
+        if key not in self.cache:
+            self.cache[key] = _loops_of(owner)
+        loops: list[ast.AST] = self.cache[key]
+        return loops
+
+    def _is_parameter(self, name: str) -> bool:
+        if not isinstance(self.function, _FUNCTIONS):
+            return False
+        args = self.function.args
+        params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+        if args.vararg:
+            params.append(args.vararg)
+        if args.kwarg:
+            params.append(args.kwarg)
+        return any(p.arg == name for p in params)
+
+    def _local_events(self, name: str, position: Position) -> tuple[list[_Event], list[_Event], list[ast.AST]] | None:
+        """The assignments of the enclosing function that can reach ``position``: those before it, and those after
+        it in a loop around it (the next pass reads them); with the loops around ``position``. ``None``: the name is
+        not assigned in the function."""
+        if self.function is None:
+            return None
+        events = self._events(self.function, name)
+        around = [loop for loop in self._loops(self.function) if _inside(position, loop)]
+        before = [e for e in events if e.position <= position]
+        after = [
+            dataclasses.replace(e, conditional=True)
+            for e in events
+            if e.position > position and any(loop in around for loop in e.loops)
+        ]
+        if not before and not after:
+            return None
+        return before, after, around
+
+    def resolve(self, name: str, position: Position, depth: int) -> list[list[Any]] | None:
+        if self._is_parameter(name):
+            return [[Hole(name)]]
+        local = self._local_events(name, position)
+        if local is not None:
+            before, after, around = local
+            return self._variants(before, after, around, name, depth)
+        events = self._events(self.module, name)
+        if events:
+            return self._variants(events, [], [], name, depth)
         return [[Hole(name)]]
 
     def _variants(
-        self, events: list[tuple[int, str, ast.AST, bool, bool]], name: str, line: int, depth: int, module: bool
-    ) -> list[list[Any]]:
+        self, before: list[_Event], after: list[_Event], around: list[ast.AST], name: str, depth: int
+    ) -> list[list[Any]] | None:
+        """Every value ``name`` can hold: each assignment that may be the last one, followed by each combination of
+        the ``+=`` after it (a conditional one taken and not taken). ``None``: more than :data:`MAX_VARIANTS`."""
         # The last unconditional assignment before the use starts the chain; earlier ones are overwritten.
         start = 0
-        for index, (_line, kind, _value, conditional, _loop) in enumerate(events):
-            if kind in ("set", "for", "unknown") and not conditional:
+        for index, event in enumerate(before):
+            if event.kind != "add" and not event.conditional:
                 start = index
+        before = before[start:]
+        if not any(e.kind != "add" for e in (*before, *after)):
+            return [[Hole(name)]]
         variants: list[list[Any]] = []
-        bases = [e for e in events[start:] if e[1] in ("set", "for", "unknown")]
-        for base_index, base in enumerate(events[start:], start):
-            _line, kind, value, _conditional, loop = base
-            if kind == "add":
+        for index, base in enumerate(before):
+            if base.kind == "add":
                 continue
-            if kind == "unknown" or (loop and kind == "set" and not module):
-                heads: list[list[Any]] | None = [[Hole(name)]]
-            elif kind == "for":
-                heads = self._iterate(value, line, depth)
-            else:
-                assert isinstance(value, ast.expr)
-                heads = self.render(value, line, depth + 1)
-            if heads is None:
-                return [[Hole(name)]]
-            # Following += until the next assignment: unconditional ones always apply, conditional ones may.
-            chains = heads
-            for later in events[base_index + 1 :]:
-                if later[1] != "add":
-                    if later[3]:
-                        continue  # a conditional assignment may not happen: the chain goes on (its own chain too)
-                    break
-                assert isinstance(later[2], ast.expr)
-                added = self.render(later[2], line, depth + 1)
-                if added is None or later[4]:
-                    added = [[Hole(f"{name} += ...")]]
-                options = added if not later[3] else [*added, []]
-                combined = _product([chains, options])
-                if combined is None:
-                    return [[Hole(name)]]
-                chains = combined
+            chains = self._chain(base, [*before[index + 1 :], *after], name, depth)
+            if chains is None:
+                return None
             variants.extend(chains)
             if len(variants) > MAX_VARIANTS:
-                return [[Hole(name)]]
-        if not bases:
-            return [[Hole(name)]]
+                return None
+        for index, base in enumerate(after):
+            if base.kind == "add":
+                continue
+            # Assigned after the use in a loop around it: the next pass runs the rest of this one, then the part of
+            # the loop before the use.
+            shared = [loop for loop in around if loop in base.loops]
+            again = [e for e in before if any(loop in shared for loop in e.loops)]
+            chains = self._chain(base, [*after[index + 1 :], *again], name, depth)
+            if chains is None:
+                return None
+            variants.extend(chains)
+            if len(variants) > MAX_VARIANTS:
+                return None
         return variants
 
-    def _iterate(self, iterable: ast.AST, line: int, depth: int) -> list[list[Any]] | None:
+    def _chain(self, base: _Event, following: list[_Event], name: str, depth: int) -> list[list[Any]] | None:
+        """The values of ``name`` from ``base`` on, through the ``+=`` that follow it until the next unconditional
+        assignment."""
+        heads = self._head(base, name, depth)
+        if heads is None:
+            return None
+        base_loops = (*base.loops, base.node) if base.kind == "for" else base.loops
+        chains = heads
+        for event in following:
+            if event.kind != "add":
+                if event.conditional:
+                    continue  # a conditional assignment may not happen: the chain goes on (its own chain too)
+                break
+            added: list[list[Any]] | None
+            if not all(any(loop is outer for outer in base_loops) for loop in event.loops):
+                added = [[Hole(f"{name} += ...")]]  # repeated by a loop the base is not in: any number of times
+            else:
+                assert isinstance(event.value, ast.expr)
+                added = self.render(event.value, _start(event.value), depth + 1)
+                if added is None:
+                    return None
+            options = [*added, []] if event.conditional else added
+            combined = _product([chains, options])
+            if combined is None:
+                return None
+            chains = combined
+        return chains
+
+    def _head(self, base: _Event, name: str, depth: int) -> list[list[Any]] | None:
+        if base.kind == "unknown":
+            return [[Hole(name)]]
+        if base.kind == "for":
+            return self._iterate(base.value, _start(base.value), depth)
+        if base.loops and _binds(base.value, name):
+            return [[Hole(name)]]  # `q = q + ...` in a loop (or in a function, for a global): grows every time
+        assert isinstance(base.value, ast.expr)
+        return self.render(base.value, _start(base.value), depth + 1)
+
+    def _iterate(self, iterable: ast.AST, position: Position, depth: int) -> list[list[Any]] | None:
         if isinstance(iterable, ast.Name):
             self.names.add(id(iterable))
             events = self._events(self.module, iterable.id)
-            if len(events) == 1 and events[0][1] == "set":
-                iterable = events[0][2]
+            if len(events) == 1 and events[0].kind == "set":
+                iterable = events[0].value
         if isinstance(iterable, (ast.Tuple, ast.List)):
             options: list[list[Any]] = []
             for element in iterable.elts:
-                rendered = self.render(element, line, depth + 1)
+                rendered = self.render(element, position, depth + 1)
                 if rendered is None:
                     return None
                 options.extend(rendered)
             return options
         return [[Hole(ast.unparse(iterable))]] if isinstance(iterable, ast.expr) else None
 
-    def render(self, node: ast.expr, line: int, depth: int = 0) -> list[list[Any]] | None:
-        """The possible texts of ``node`` as lists of pieces (str or :class:`Hole`); ``None``: too many variants."""
+    def render(self, node: ast.expr, position: Position | int, depth: int = 0) -> list[list[Any]] | None:
+        """The possible texts of ``node`` as lists of pieces (str or :class:`Hole`), with names resolved as they are at
+        ``position`` (a line alone counts as its end); ``None``: too many variants."""
+        if isinstance(position, int):
+            position = (position, 1 << 30)
         self.consumed.add(id(node))
         if depth > 12:
             return [[Hole(ast.unparse(node))]]
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
                 return [[node.value]]
+            if isinstance(node.value, bytes):
+                try:
+                    return [[node.value.decode("utf-8")]]
+                except UnicodeDecodeError:
+                    return [[Hole(ast.unparse(node))]]
             return [[Hole(ast.unparse(node))]]
         if isinstance(node, ast.JoinedStr):
             parts: list[list[list[Any]]] = []
@@ -332,7 +539,7 @@ class _Scope:
                     if value.conversion != -1 or value.format_spec is not None:
                         parts.append([[Hole(ast.unparse(value.value))]])
                     else:
-                        rendered = self.render(value.value, line, depth + 1)
+                        rendered = self.render(value.value, position, depth + 1)
                         if rendered is None:
                             return None
                         parts.append(rendered)
@@ -340,38 +547,38 @@ class _Scope:
                     parts.append([[Hole(ast.unparse(value))]])
             return _product(parts)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left = self.render(node.left, line, depth + 1)
-            right = self.render(node.right, line, depth + 1)
+            left = self.render(node.left, position, depth + 1)
+            right = self.render(node.right, position, depth + 1)
             if left is None or right is None:
                 return None
             return _product([left, right])
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-            left = self.render(node.left, line, depth + 1)
+            left = self.render(node.left, position, depth + 1)
             if left is None:
                 return None
             return [[*variant, Hole(f"% {ast.unparse(node.right)}")] for variant in left]
         if isinstance(node, ast.IfExp):
-            body = self.render(node.body, line, depth + 1)
-            orelse = self.render(node.orelse, line, depth + 1)
+            body = self.render(node.body, position, depth + 1)
+            orelse = self.render(node.orelse, position, depth + 1)
             if body is None or orelse is None:
                 return None
             return [*body, *orelse]
         if isinstance(node, ast.Name):
             self.names.add(id(node))
-            return self.resolve(node.id, line, depth + 1)
+            return self.resolve(node.id, position, depth + 1)
         if isinstance(node, ast.Call):
-            return self._render_call(node, line, depth)
+            return self._render_call(node, position, depth)
         return [[Hole(ast.unparse(node))]]
 
-    def _render_call(self, node: ast.Call, line: int, depth: int) -> list[list[Any]] | None:
+    def _render_call(self, node: ast.Call, position: Position, depth: int) -> list[list[Any]] | None:
         func = node.func
         # sql.SQL("..."), sql.Identifier("a", "b"), sql.Placeholder(), sql.Literal(x), sql.Composed([...])
         if _is_sql_attr(func, "SQL") and len(node.args) == 1 and not node.keywords:
-            return self.render(node.args[0], line, depth + 1)
+            return self.render(node.args[0], position, depth + 1)
         if _is_sql_attr(func, "Identifier") and node.args and not node.keywords:
             parts: list[list[list[Any]]] = []
             for index, arg in enumerate(node.args):
-                rendered = self.render(arg, line, depth + 1)
+                rendered = self.render(arg, position, depth + 1)
                 if rendered is None:
                     return None
                 quoted = [
@@ -385,38 +592,82 @@ class _Scope:
                 return [[f"%({node.args[0].value})s"]]
             return [["%s"]] if not node.args else [[Hole(ast.unparse(node))]]
         if _is_sql_attr(func, "Composed") and len(node.args) == 1:
-            return self._render_sequence(node.args[0], [[""]], line, depth)
+            return self._render_sequence(node.args[0], [[""]], position, depth)
         if isinstance(func, ast.Attribute) and func.attr == "join" and len(node.args) == 1 and not node.keywords:
-            separator = self.render(func.value, line, depth + 1)
+            separator = self.render(func.value, position, depth + 1)
             if separator is None:
                 return None
-            return self._render_sequence(node.args[0], separator, line, depth)
+            return self._render_sequence(node.args[0], separator, position, depth)
         if isinstance(func, ast.Attribute) and func.attr == "format":
-            template = self.render(func.value, line, depth + 1)
+            template = self.render(func.value, position, depth + 1)
             if template is None:
                 return None
-            return self._render_format(template, node, line, depth)
+            return self._render_format(template, node, position, depth)
         if isinstance(func, ast.Attribute) and func.attr == "as_string":
-            return self.render(func.value, line, depth + 1)
+            return self.render(func.value, position, depth + 1)
+        if isinstance(func, ast.Attribute) and func.attr in _SAME_TEXT | _CHANGED_TEXT:
+            receiver = self.render(func.value, position, depth + 1)
+            if receiver is None:
+                return None
+            if func.attr in ("encode", "decode") or (func.attr in _SAME_TEXT and not node.args and not node.keywords):
+                return receiver
+            return [[*variant, Hole(f".{func.attr}(...)")] for variant in receiver]
         return [[Hole(ast.unparse(node))]]
 
     def _render_sequence(
-        self, sequence: ast.expr, separator: list[list[Any]], line: int, depth: int
+        self, sequence: ast.expr, separator: list[list[Any]], position: Position, depth: int
     ) -> list[list[Any]] | None:
+        if isinstance(sequence, ast.Name):
+            return self._render_named_sequence(sequence, separator, position, depth)
         if not isinstance(sequence, (ast.List, ast.Tuple)) or any(isinstance(e, ast.Starred) for e in sequence.elts):
             return [[Hole(ast.unparse(sequence))]]
         parts: list[list[list[Any]]] = []
         for index, element in enumerate(sequence.elts):
             if index:
                 parts.append(separator)
-            rendered = self.render(element, line, depth + 1)
+            rendered = self.render(element, position, depth + 1)
             if rendered is None:
                 return None
             parts.append(rendered)
         return _product(parts) if parts else [[]]
 
+    def _render_named_sequence(
+        self, sequence: ast.Name, separator: list[list[Any]], position: Position, depth: int
+    ) -> list[list[Any]] | None:
+        """A list or tuple held by a name: each list it is assigned, followed by an unknown part when it is changed
+        (``append``, ``+=``, an item assigned, passed to a call ...); unknown when it is assigned anything else."""
+        self.names.add(id(sequence))
+        name = sequence.id
+        owner: ast.AST = self.module
+        if self._is_parameter(name):
+            return [[Hole(name)]]
+        if self.function is not None and self._events(self.function, name):
+            owner = self.function
+        events = self._events(owner, name)
+        if not events or any(e.kind not in ("set", "add") for e in events):
+            return [[Hole(name)]]
+        bases = [e for e in events if e.kind == "set"]
+        if not bases or not all(isinstance(e.value, (ast.List, ast.Tuple)) for e in bases):
+            return [[Hole(name)]]
+        changed = len(bases) != len(events) or _changed_elsewhere(owner, name, sequence)
+        variants: list[list[Any]] = []
+        for base in bases:
+            assert isinstance(base.value, ast.expr)
+            rendered = self._render_sequence(base.value, separator, _start(base.value), depth + 1)
+            if rendered is None:
+                return None
+            if changed:
+                tail = _product([rendered, separator, [[Hole(f"{name} (changed)")]]])
+                if tail is None:
+                    return None
+                rendered = tail
+            variants.extend(rendered)
+            if len(variants) > MAX_VARIANTS:
+                return None
+        return variants
+
     def _render_format(
-        self, template: list[list[Any]], call: ast.Call, line: int, depth: int
+        self, template: list[list[Any]], call: ast.Call, position: Position, depth: int
     ) -> list[list[Any]] | None:
         if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
             return [[*variant, Hole(ast.unparse(call))] for variant in template]
@@ -444,14 +695,14 @@ class _Scope:
                         argument = call.args[auto] if auto < len(call.args) else None
                         auto += 1
                     elif field_name.isdigit():
-                        position = int(field_name)
-                        argument = call.args[position] if position < len(call.args) else None
+                        index = int(field_name)
+                        argument = call.args[index] if index < len(call.args) else None
                     else:
                         argument = keywords.get(field_name)
                     if argument is None or spec or conversion:
                         parts.append([[Hole(field_name or "{}")]])
                         continue
-                    rendered = self.render(argument, line, depth + 1)
+                    rendered = self.render(argument, position, depth + 1)
                     if rendered is None:
                         return None
                     parts.append(rendered)
@@ -464,21 +715,39 @@ class _Scope:
         return results
 
 
+def _changed_elsewhere(owner: ast.AST, name: str, use: ast.Name) -> bool:
+    """Whether the list held by ``name`` may be changed in ``owner``: any other read of the name (a method call, an
+    item assigned or deleted, an argument of a call ...) or a ``global`` declaration counts."""
+    for node in ast.walk(owner):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load) and node is not use:
+            return True
+        if isinstance(node, ast.Global) and name in node.names:
+            return True
+    return False
+
+
 def _binds(target: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(target))
 
 
 def _is_string_root(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant):
-        return isinstance(node.value, str)
+        return isinstance(node.value, (str, bytes))
     if isinstance(node, ast.JoinedStr):
         return True
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
         return _is_string_root(node.left) or _is_string_root(node.right)
     if isinstance(node, ast.Call):
         func = node.func
-        if isinstance(func, ast.Attribute) and func.attr in ("format", "join", "as_string"):
-            return _is_string_root(func.value)
+        if isinstance(func, ast.Attribute) and func.attr in (
+            "format",
+            "join",
+            "as_string",
+            *_SAME_TEXT,
+            *_CHANGED_TEXT,
+        ):
+            # On a name too: ``QUERY.replace(...)`` or ``template.format(...)`` is a new text, checked as such.
+            return isinstance(func.value, ast.Name) or _is_string_root(func.value)
         return any(_is_sql_attr(func, name) for name in ("SQL", "Composed"))
     return False
 
@@ -556,72 +825,77 @@ def _builds_table_name(pieces: list[Any]) -> bool:
     return False
 
 
-def _values_used_alone(tree: ast.Module, rendered_names: set[int]) -> set[int]:
-    """The ids of assigned string values (and of the elements of assigned tuples and lists) whose name is also read
-    somewhere other than while rebuilding a string, in the same scope (the function that assigns it, else the
-    module)."""
-    assigned: dict[tuple[int, str], list[ast.AST]] = {}
-    loads: dict[tuple[int, str], list[ast.Name]] = {}
+def _name_uses(tree: ast.Module) -> Iterator[tuple[ast.Name, ast.AST | None]]:
+    """Every read of a name with its enclosing function."""
 
-    def values(node: ast.AST) -> list[ast.AST]:
-        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-            return [node, *node.elts]
-        return [node]
-
-    def visit(node: ast.AST, scope: ast.AST, local: set[str]) -> None:
+    def visit(node: ast.AST, function: ast.AST | None) -> Iterator[tuple[ast.Name, ast.AST | None]]:
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                inner = {n.id for n in ast.walk(child) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-                visit(child, child, inner)
-                continue
-            if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and child.value is not None:
-                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        owner = scope if target.id in local else tree
-                        assigned.setdefault((id(owner), target.id), []).extend(values(child.value))
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                owner = scope if child.id in local else tree
-                loads.setdefault((id(owner), child.id), []).append(child)
-            visit(child, scope, local)
+                yield child, function
+            inner = child if isinstance(child, _FUNCTIONS) else function
+            yield from visit(child, inner)
 
-    visit(tree, tree, set())
-    alone: set[int] = set()
-    for key, nodes in assigned.items():
-        if any(id(n) not in rendered_names for n in loads.get(key, [])):
-            alone.update(id(n) for n in nodes)
-    return alone
+    yield from visit(tree, None)
+
+
+#: SQL words in the known part of a text that starts with an unknown part (``f"{BASE} OR true"``).
+_SQL_WORDS = re.compile(
+    r"\b(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|AND|OR|NOT|LIMIT|OFFSET|ORDER BY|GROUP BY|HAVING|UNION"
+    r"|RETURNING|VALUES|SET|ON CONFLICT|tenant_id)\b"
+)
+
+
+def _hole_led_sql(pieces: list[Any]) -> bool:
+    """Whether a text starts with an unknown part (an imported fragment, ``self.BASE``, a function's result, a
+    parameter) and its known parts hold SQL: its statement is not known, so it is reported."""
+    for piece in pieces:
+        if isinstance(piece, str) and not piece.strip(" (\n\t"):
+            continue
+        if not isinstance(piece, Hole):
+            return False
+        break
+    else:
+        return False
+    return bool(_SQL_WORDS.search(" ".join(p for p in pieces if isinstance(p, str))))
 
 
 def statements_of(source: str, module: str, tables: frozenset[str]) -> list[Statement]:
-    """Every variant of every string expression in ``source`` that must be checked as SQL."""
+    """Every variant of every string expression in ``source`` that must be checked as SQL, and every value a name
+    can hold where the name is read (``db._query(query)`` after ``query += ...``)."""
     tree = ast.parse(source)
     consumed: set[int] = set()
     names: set[int] = set()
-    rendered: list[tuple[ast.expr, list[list[Any]] | None]] = []
+    cache: dict[tuple[int, str], Any] = {}
+    rendered: list[tuple[ast.expr, list[list[Any]] | None, bool]] = []
     for root, function in _roots(tree):
-        scope = _Scope(tree, function, consumed, names)
+        scope = _Scope(tree, function, consumed, names, cache)
         before = set(consumed)
-        result = scope.render(root, getattr(root, "lineno", 0))
+        result = scope.render(root, _start(root))
         consumed.discard(id(root))
         consumed |= before
-        rendered.append((root, result))
-    # A value that went into another string is checked there, unless its name is also used on its own.
-    used_alone = _values_used_alone(tree, names)
+        rendered.append((root, result, False))
+    # A name read outside a string (a bare argument, a return value ...) is resolved where it is read: every value it
+    # can hold there is checked, with every `+=` and reassignment before it (and after it in a loop around it).
+    assigned = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    uses = [(use, function) for use, function in _name_uses(tree) if id(use) not in names and use.id in assigned]
+    for use, function in uses:
+        scope = _Scope(tree, function, consumed, names, cache)
+        rendered.append((use, scope.render(use, _start(use)), True))
     found: list[Statement] = []
-    for root, variants in rendered:
-        if id(root) in consumed and id(root) not in used_alone:
-            continue  # part of another expression (a module constant or a local fragment): checked there
-        line = getattr(root, "lineno", 0)
+    for node, variants, is_use in rendered:
+        if not is_use and id(node) in consumed:
+            continue  # part of another expression or the value of a name read elsewhere: checked there
+        line = getattr(node, "lineno", 0)
         if variants is None:
-            found.append(Statement(module, line, " ".join(ast.unparse(root).split()), True))
+            found.append(Statement(module, line, " ".join(ast.unparse(node).split()), True))
             continue
         for pieces in variants:
             text, dynamic = _text(pieces)
-            words = _words(text)
-            names_table = bool(words & tables)
+            # Only the known parts count: an unknown part's source text (``{db._query('SELECT ...')}``) holds strings
+            # that are checked on their own.
+            names_table = bool(_words(" ".join(p for p in pieces if isinstance(p, str))) & tables)
             if dynamic:
-                if not (names_table or _builds_table_name(pieces) or _starts_like_data(text)):
+                if not (names_table or _builds_table_name(pieces) or _starts_like_data(text) or _hole_led_sql(pieces)):
                     continue
             elif not names_table:
                 continue
@@ -940,9 +1214,12 @@ def scan_package(
                 continue
             report.checked.append(statement)
             if statement.dynamic:
-                report.findings.append(
-                    Finding(module, statement.line, "dynamic", statement.text, "SQL with a part that is not known")
+                detail = (
+                    "SQL that starts with a part that is not known"
+                    if statement.text.lstrip(" (").startswith("{")
+                    else "SQL with a part that is not known"
                 )
+                report.findings.append(Finding(module, statement.line, "dynamic", statement.text, detail))
                 continue
             try:
                 problems = check_sql(statement.text, tables)

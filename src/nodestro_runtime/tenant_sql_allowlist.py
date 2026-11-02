@@ -247,4 +247,25 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "JSON key literal and cannot change the statement; the tenant is bound by tenant_id = %s (kept as a "
         "literal so the expression indexes of migrations 0001/0006 apply)"
     ),
+    (
+        "nodestro_runtime/axentra_platform.py",
+        "SELECT {[sql.Identifier(name) for name in names]} FROM (SELECT {[sql.Identifier(name) for name in names]}, row_number() OVER (PARTITION BY split_part({column.column}, '.', 2) ORDER BY {column.key_column}::text) AS sample FROM {column.table} WHERE {column.column} LIKE %s) AS sampled WHERE sample <= %s",
+    ): (
+        "start check (AxentraServices.key_samples, SR-04a): reads up to five values per key id of each of "
+        "Axentra's own keyring columns (platform.encrypted_columns: login states, webhook secrets, notification "
+        "messages and mailbox) to prove the key bytes; the identifiers come from that list, names no Nodestro "
+        "tenant table, returns nothing of a value"
+    ),
+    (
+        "nodestro_runtime/tenant_sql_check.py",
+        "{node.relation.relname}: INSERT without tenant_id in the column list",
+    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
+    (
+        "nodestro_runtime/tenant_sql_check.py",
+        "{ref.table} (as {ref.name}) is not bound to one tenant by a top-level `tenant_id = <param>` conjunct",
+    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
+    (
+        "nodestro_runtime/tenant_sql_check.py",
+        "{ref.table} is not bound to one tenant by a top-level `tenant_id = <param>` conjunct",
+    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
 }

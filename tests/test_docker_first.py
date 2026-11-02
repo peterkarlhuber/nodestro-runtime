@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from pathlib import Path
 import sys
+import threading
 from typing import Any
 
 from orkexa.dynamic import SubprocessSandbox
@@ -459,3 +460,47 @@ def test_the_workspace_follows_the_stored_mode(make: Make, monkeypatch: pytest.M
     with pytest.raises(NodestroError) as caught:
         workspace.tools.run("celsius_to_fahrenheit", {"celsius": 100})
     assert caught.value.params["reason"] == "subprocess-mode"
+
+
+# ---- SR-03a: a suspended tenant's installation stops ------------------------------------------------------------
+
+
+class _BlockingImages(_Images):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def build(self, lock: str, python_version: str, *, log: Callable[[str], None] | None = None) -> str:
+        self.entered.set()
+        self.release.wait(10)
+        return super().build(lock, python_version, log=log)
+
+
+def test_a_cancelled_installation_stops_before_its_next_step(make: Make) -> None:
+    workspace, _uv, _images = make(docker=True)
+    python = workspace.python
+    images = _BlockingImages()
+    python.images = images  # type: ignore[assignment]
+    needed = python.needed_for_sources([("show", CODE, TESTS)])
+    plan = python.plan("tool", "show", needed, trust="untrusted")
+    assert plan.error is None and plan.lock
+    python.approve(plan.id)  # in a background thread, as the API does
+    assert images.entered.wait(10), "the image build never started"
+    try:
+        assert python.cancel_installs("identity.tenant_suspended") == [plan.scope]
+        assert python.cancel_installs("identity.tenant_suspended") == []  # idempotent
+    finally:
+        images.release.set()
+    for _ in range(500):
+        env = python.get(plan.scope)
+        if env is not None and env.install.status != "installing":
+            break
+        threading.Event().wait(0.02)
+    assert env is not None and env.install.status == "failed"
+    assert env.install.error is not None and env.install.error.code == "identity.tenant_suspended"
+    # The build that already ran finished, but no later step ran: its image was never checked.
+    assert images.checked == []
+    assert python.cancel_installs("identity.tenant_suspended") == []  # nothing runs any more
+    # Once resumed, the environment installs again (the stop applied to that one installation only).
+    again = python.install(plan.scope, needed.all_modules(), trust="untrusted")
+    assert again.install.status == "installed" and images.checked

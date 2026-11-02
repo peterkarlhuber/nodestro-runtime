@@ -436,3 +436,227 @@ def test_a_conditional_reassignment_does_not_hide_a_later_fragment(tmp_path: Pat
     assert [f.text for f in report.findings] == [
         "SELECT id FROM nodestro_documents WHERE id = %s AND collection = 'runs'"
     ]
+
+
+# --- names read on their own (security re-review SR-01a) -----------------------------------------------------------
+
+BARE_NAME_LEAKS = {
+    "unconditional += OR": """
+        def f(db):
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            q += " OR true"
+            db._query(q)
+        """,
+    "q = q + OR": """
+        def f(db):
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            q = q + " OR true"
+            db._query(q)
+        """,
+    "conditional += OR": """
+        def f(db, alt):
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            if alt:
+                q += " OR id = %s"
+            db._query(q, ())
+        """,
+    "elif reassignment": """
+        def f(db, a):
+            if a == 1:
+                w = "tenant_id = %s"
+            elif a == 2:
+                w = "true"
+            else:
+                w = "tenant_id = %s AND id = %s"
+            q = "SELECT data FROM nodestro_documents WHERE " + w
+            db._query(q)
+        """,
+    "assigned after the read in a loop": """
+        def f(db, xs):
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            for x in xs:
+                db._query(q)
+                q = "SELECT data FROM nodestro_documents WHERE true"
+        """,
+    "set by a function that declares it global": """
+        Q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+
+        def widen():
+            global Q
+            Q = "SELECT data FROM nodestro_documents"
+
+        def f(db):
+            db._query(Q)
+        """,
+    "returned": """
+        def f():
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            q += " OR true"
+            return q
+        """,
+    "the value assigned before a later string reads the name": """
+        def f(db):
+            w = "tenant_id = %s OR true"
+            q = f"SELECT data FROM nodestro_documents WHERE {w}"
+            w = "tenant_id = %s"
+            db._query(q)
+        """,
+}
+
+
+@pytest.mark.parametrize("name", sorted(BARE_NAME_LEAKS))
+def test_a_name_read_on_its_own_is_checked_with_every_value(name: str, tmp_path: Path) -> None:
+    report = _scan(BARE_NAME_LEAKS[name], tmp_path)
+    assert [f.kind for f in report.findings if f.kind == "leak"], name
+
+
+def test_every_branch_of_a_bare_name_is_checked(tmp_path: Path) -> None:
+    report = _scan(
+        """
+        def f(db, limit=None, live=None):
+            q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"
+            if live is not None:
+                q += " OR live"
+            if limit is not None:
+                q += " LIMIT %s"
+            db._query(q)
+        """,
+        tmp_path,
+    )
+    assert sorted(s.text.removeprefix("SELECT data FROM nodestro_documents WHERE ") for s in report.checked) == [
+        "tenant_id = %s",
+        "tenant_id = %s LIMIT %s",
+        "tenant_id = %s OR live",
+        "tenant_id = %s OR live LIMIT %s",
+    ]
+    assert sorted(f.text.split("WHERE ")[1] for f in report.findings) == [
+        "tenant_id = %s OR live",
+        "tenant_id = %s OR live LIMIT %s",
+    ]
+
+
+def test_a_bound_statement_completed_by_plus_equals_passes(tmp_path: Path) -> None:
+    # Only the whole value is read: the base alone (no tenant filter yet) is not a statement of its own.
+    report = _scan(
+        """
+        def f(db, tenant):
+            q = "SELECT data FROM nodestro_documents"
+            q += " WHERE tenant_id = %s"
+            return db._query(q, (tenant,))
+        """,
+        tmp_path,
+    )
+    _assert_clean(report)
+    assert [s.text for s in report.checked] == ["SELECT data FROM nodestro_documents WHERE tenant_id = %s"]
+
+
+def test_a_bare_name_that_a_loop_extends_or_with_too_many_variants_is_dynamic(tmp_path: Path) -> None:
+    branches = "".join(f"    if a{i}:\n        q += ' AND c{i} = 1'\n" for i in range(10))
+    report = _scan(
+        "def loop(db, ids):\n"
+        "    q = 'SELECT data FROM nodestro_documents WHERE tenant_id = %s'\n"
+        "    for i in ids:\n"
+        "        q += ' OR id = %s'\n"
+        "    db._query(q)\n"
+        "\n"
+        f"def many(db, {', '.join(f'a{i}' for i in range(10))}):\n"
+        "    q = 'SELECT data FROM nodestro_documents WHERE tenant_id = %s'\n" + branches + "    db._query(q)\n",
+        tmp_path,
+    )
+    assert sorted((f.line, f.kind) for f in report.findings) == [(5, "dynamic"), (29, "dynamic")]
+
+
+def test_the_real_shapes_of_storage_postgres_are_checked_at_the_bare_sink(tmp_path: Path) -> None:
+    # replace_if(): `query += " AND ..."` then `self.database._write(query, params)`. Turned into an OR, it leaks.
+    source = (RUNTIME / "storage_postgres.py").read_text(encoding="utf-8")
+    line = '            query += " AND (data->>%s)::timestamptz > clock_timestamp()"\n'
+    assert source.count(line) == 1
+    allow = {k: v for k, v in tenant_sql_allowlist.ALLOWLIST.items() if k[0] == "nodestro_runtime/storage_postgres.py"}
+    clean = _scan(source, tmp_path / "a", package="nodestro_runtime", module="storage_postgres.py", allowlist=allow)
+    _assert_clean(clean)
+    assert any(s.text.endswith("(data->>%s)::timestamptz > clock_timestamp()") for s in clean.checked)
+    mutated = _scan(
+        source.replace(line, line.replace(" AND ", " OR ")),
+        tmp_path / "b",
+        package="nodestro_runtime",
+        module="storage_postgres.py",
+        allowlist=allow,
+    )
+    leaks = [f for f in mutated.findings if f.kind == "leak"]
+    assert len(leaks) == 1 and leaks[0].text.endswith("OR (data->>%s)::timestamptz > clock_timestamp()")
+
+
+# --- texts that start with an unknown part (security re-review SR-01b) ---------------------------------------------
+
+HOLE_LED = {
+    "imported fragment + OR": ("from .frag import BASE\n\ndef f(db):\n    db._query(f'{BASE} OR true')\n", "dynamic"),
+    "imported fragment + WHERE": (
+        "from .frag import BASE\n\ndef f(db):\n    db._query(BASE + ' WHERE id = %s')\n",
+        "dynamic",
+    ),
+    "class attribute via self": (
+        "class S:\n    BASE = 'SELECT data FROM nodestro_documents WHERE tenant_id = %s'\n\n"
+        "    def f(self, db):\n        db._query(self.BASE + ' OR true')\n",
+        "dynamic",
+    ),
+    "function result": (
+        "def base():\n    return 'SELECT data FROM nodestro_documents WHERE tenant_id = %s'\n\n"
+        "def f(db):\n    db._query(base() + ' OR true')\n",
+        "dynamic",
+    ),
+    "parameter": ("def f(db, base):\n    db._query(base + ' AND id = %s')\n", "dynamic"),
+    "join of a list that is appended to": (
+        "def f(db):\n    parts = ['SELECT data FROM nodestro_documents WHERE tenant_id = %s']\n"
+        "    parts.append('OR true')\n    db._query(' '.join(parts))\n",
+        "dynamic",
+    ),
+    "str.replace": (
+        "Q = 'SELECT data FROM nodestro_documents WHERE tenant_id = %s AND id = %s'\n\n"
+        "def f(db):\n    db._query(Q.replace('tenant_id = %s AND ', ''))\n",
+        "dynamic",
+    ),
+    "bytes SQL": ("def f(db):\n    db._query(b'SELECT data FROM nodestro_documents')\n", "leak"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOLE_LED))
+def test_a_text_led_by_an_unknown_part_is_reported(name: str, tmp_path: Path) -> None:
+    source, kind = HOLE_LED[name]
+    root = tmp_path / "sample"
+    root.mkdir()
+    (root / "frag.py").write_text("BASE = 'SELECT data FROM nodestro_documents WHERE tenant_id = %s'\n")
+    report = _scan(source, tmp_path)
+    assert kind in [f.kind for f in report.findings], name
+
+
+def test_a_text_led_by_an_unknown_part_passes_only_when_allowlisted(tmp_path: Path) -> None:
+    source = "from .frag import BASE\n\ndef f(db):\n    db._query(f'{BASE} OR true')\n"
+    report = _scan(source, tmp_path)
+    assert [(f.kind, f.text, f.detail) for f in report.findings] == [
+        ("dynamic", "{BASE} OR true", "SQL that starts with a part that is not known")
+    ]
+    report = _scan(source, tmp_path, allowlist={("sample/sample.py", "{BASE} OR true"): "a reason for the test"})
+    assert report.findings == [] and [s.text for s in report.allowed] == ["{BASE} OR true"]
+
+
+def test_a_text_led_by_an_unknown_part_without_sql_words_is_not_a_statement(tmp_path: Path) -> None:
+    report = _scan(
+        "def f(name, parts):\n    print(f'{name} has no price for the model')\n    return ', '.join(parts)\n",
+        tmp_path,
+    )
+    assert report.findings == [] and report.checked == []
+
+
+def test_a_join_of_a_constant_list_is_resolved(tmp_path: Path) -> None:
+    report = _scan(
+        """
+        def f(db):
+            where = ["tenant_id = %s", "collection = %s"]
+            return db._query("SELECT data FROM nodestro_documents WHERE " + " AND ".join(where))
+        """,
+        tmp_path,
+    )
+    _assert_clean(report)
+    assert [s.text for s in report.checked] == [
+        "SELECT data FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+    ]

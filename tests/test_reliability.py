@@ -672,3 +672,32 @@ def test_run_warnings_name_failed_and_refused_tool_calls() -> None:
         ("tool.failed", "a", "calc", 1),
         ("tool.not_granted", "a", "send", 1),
     ]
+
+
+def test_a_cancelled_host_installation_never_becomes_the_environment(make: Make) -> None:
+    # SR-03a: the host (uv) path of an installation stopped because its tenant was suspended.
+    uv = _SlowUv()
+    workspace = make(python_runner=uv)
+    code = '# /// script\n# dependencies = ["wcwidth"]\n# ///\nimport wcwidth\n'
+    needed = workspace.python.needed_for_sources([("measure", code, "")])
+    plan = workspace.python.plan("tool", "measure", needed, trust="user-authored")
+    assert plan.error is None and plan.lock
+    workspace.python.approve(plan.id)
+    try:
+        for _ in range(500):
+            env = workspace.python.get(plan.scope)
+            if env is not None and env.install.step == "deps.step.install":
+                break
+            threading.Event().wait(0.02)
+        assert workspace.python.cancel_installs("identity.tenant_suspended") == [plan.scope]
+    finally:
+        uv.release.set()
+    for _ in range(500):
+        env = workspace.python.get(plan.scope)
+        if env is not None and env.install.status != "installing":
+            break
+        threading.Event().wait(0.02)
+    assert env is not None and env.install.status == "failed"
+    assert env.install.error is not None and env.install.error.code == "identity.tenant_suspended"
+    assert uv.syncs == 1  # the sync that already ran finished; nothing after it ran
+    assert not workspace.python.env_dir(plan.scope).exists()  # the staging environment was never moved in
