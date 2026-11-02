@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
+  probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty
+  `noexec` tmpfs mounts on `/run` and `/var/tmp`, which the sandbox gateway now allows too.
+
 Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 
 - An attended run whose next model request does not fit its budget pauses before the request is sent instead of

@@ -95,6 +95,10 @@ TMPFS = {
     "/tmp": "rw,noexec,nosuid,nodev,size=16m",
     # mode=1777, not uid=/gid= (Podman 4 rejects those): every process in the container runs as 65534 anyway.
     "/work": "rw,noexec,nosuid,nodev,size=16m,mode=1777",
+    # Empty, root-owned and noexec: they replace the writable, executable tmpfs Podman mounts on /run and /var/tmp
+    # of a read-only container (Orkexa's self-test refuses any mount it does not expect).
+    "/run": "rw,noexec,nosuid,nodev,size=1m,mode=755",
+    "/var/tmp": "rw,noexec,nosuid,nodev,size=1m,mode=755",
 }
 #: Orkexa's labels on a sandbox container (owner and deadline), passed on when they are well-formed; every other label
 #: of a request is dropped.
