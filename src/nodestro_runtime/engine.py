@@ -4616,3 +4616,8 @@ def _in_loop(loop: asyncio.AbstractEventLoop) -> bool:
         return asyncio.get_running_loop() is loop
     except RuntimeError:
         return False
+
+
+#: What a run already spent (known costs) and whether some of its cost is unknown (for the API's budget view).
+run_spent_usd = _known_decimal
+run_has_unknown_cost = _unknown_cost
