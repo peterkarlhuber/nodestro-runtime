@@ -15,17 +15,28 @@ with the other server settings (:class:`~nodestro_runtime.server_settings.Server
                                             encrypts); required with ``NODESTRO_AXENTRA=on``
 ``NODESTRO_AXENTRA_CONFIG``                 optional Axentra TOML file for Axentra's own knobs; Nodestro's
                                             values (database, product, mode, keyring) always win
-``NODESTRO_AXENTRA_ALLOW_SUPERUSER``        ``1`` lets Axentra run on a superuser / ``BYPASSRLS`` role (its
-                                            row-level security is then no defense in depth); default refused
+``NODESTRO_AXENTRA_ALLOW_SUPERUSER``        ``1`` lets Axentra run on a superuser / ``BYPASSRLS`` role or one that
+                                            owns the tables (its row-level security is then no defense in
+                                            depth); default refused in every environment: run ``api`` and
+                                            ``worker`` as a runtime role (``nodestro-server db
+                                            grant-runtime-role``) and ``migrate`` as the owner
+                                            (``NODESTRO_DATABASE_MIGRATION_URL``)
 ``NODESTRO_SECRETS_FORMAT``                 ``v1`` (default) or ``axs1``: format of newly written tenant secrets
                                             (``axs1`` = Axentra keyring with rotation; needs NODESTRO_AXENTRA=on)
 ``NODESTRO_AXENTRA_AUDIT``                  ``1``: mirror the approval audit trail and MCP events into Axentra's
                                             audit log (same transaction; needs NODESTRO_AXENTRA=on)
 ``NODESTRO_AXENTRA_USAGE``                  ``1``: mirror the AI usage ledger into Axentra meters (``nodestro.ai.*``;
                                             same transaction, idempotent; needs NODESTRO_AXENTRA=on)
+``NODESTRO_AXENTRA_RUN_USAGE``              ``1``: also mirror the settled usage of finished workflow runs (one event
+                                            per run and meter, deterministic key; needs NODESTRO_AXENTRA_USAGE=1)
+``NODESTRO_AXENTRA_NOTIFY``                 ``1``: in-app inbox notifications through Axentra's notify module
+                                            (failed runs, pending tool approvals; never e-mail; needs ``on``)
 ``NODESTRO_IDENTITY_BACKEND``               ``nodestro`` (default), ``mirror`` or ``axentra``: where users,
                                             tenants, memberships and sessions live (``mirror``/``axentra`` need
                                             NODESTRO_AXENTRA=on; see :mod:`nodestro_runtime.axentra_identity`)
+``NODESTRO_FILES_BACKEND``                  ``volume`` (default) or ``axentra``: where the bytes of input files
+                                            live (``axentra`` needs NODESTRO_AXENTRA=on; see
+                                            :mod:`nodestro_runtime.axentra_storage`)
 ==========================================  ================================================================
 
 :class:`KeyringSecretBox` reads both secret formats (``nodestro:enc:v1:`` and Axentra's ``axs1.<kid>.…``) and writes
@@ -39,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
 import json
 import logging
 import os
@@ -47,6 +59,7 @@ import re
 import sys
 from typing import TYPE_CHECKING, Any, Literal
 
+from .axentra_metrics import count_operation
 from .problems import NodestroError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -58,16 +71,30 @@ logger = logging.getLogger(__name__)
 #: The Axentra product Nodestro's tenants belong to (single-product mode).
 PRODUCT_SLUG = "nodestro"
 PRODUCT_NAME = "Nodestro"
-#: Axentra modules Nodestro uses; the others (billing, notify, storage, search, data, events) stay off until a
-#: migration step needs them, so Axentra does not start background behaviour nobody asked for.
+#: Axentra modules Nodestro uses; the others (billing, notify, search, data, events) stay off until a migration step
+#: needs them, so Axentra does not start background behaviour nobody asked for. ``storage`` is added only with
+#: ``NODESTRO_FILES_BACKEND=axentra`` (:attr:`AxentraConfig.modules`).
 MODULES = ("identity", "tenancy", "access", "audit", "usage")
 #: Prefix of Axentra ciphertexts (``axs1.<kid>.<nonce>.<ciphertext>``).
 AXS1_PREFIX = "axs1."
 SecretsFormat = Literal["v1", "axs1"]
 IdentityBackend = Literal["nodestro", "mirror", "axentra"]
 IDENTITY_BACKENDS: tuple[IdentityBackend, ...] = ("nodestro", "mirror", "axentra")
+FilesBackend = Literal["volume", "axentra"]
+FILES_BACKENDS: tuple[FilesBackend, ...] = ("volume", "axentra")
+#: Days a migrated volume file is kept as the fallback before ``files remove-source`` may delete it.
+DEFAULT_SOURCE_RETENTION_DAYS = 30
 _ON = frozenset({"1", "on", "true", "yes"})
 _OFF = frozenset({"", "0", "off", "false", "no"})
+
+
+def modules(config: AxentraConfig) -> tuple[str, ...]:
+    """The Axentra modules this server switches on: :attr:`AxentraConfig.modules` (``storage`` with the Axentra
+    file backend), plus ``notify`` with ``NODESTRO_AXENTRA_NOTIFY``
+    (Nodestro uses only its in-app inbox channel; Axentra's provider stays ``local`` unless its own config file says
+    otherwise, and Nodestro creates no e-mail templates)."""
+    base = config.modules
+    return (*base, "notify") if config.notify else base
 
 
 def available() -> bool:
@@ -106,8 +133,23 @@ class AxentraConfig:
     audit: bool = False
     #: Mirror the AI usage ledger into Axentra's usage meters.
     usage: bool = False
+    #: Also mirror the settled usage of finished workflow runs (needs ``usage``).
+    run_usage: bool = False
+    #: In-app inbox notifications through Axentra's notify module (``NODESTRO_AXENTRA_NOTIFY``).
+    notify: bool = False
     #: Where identity records live (``NODESTRO_IDENTITY_BACKEND``, see :mod:`nodestro_runtime.axentra_identity`).
     identity_backend: IdentityBackend = "nodestro"
+    #: Where input file bytes live (``NODESTRO_FILES_BACKEND``, see :mod:`nodestro_runtime.axentra_storage`).
+    files_backend: FilesBackend = "volume"
+    #: ``NODESTRO_FILES_SOURCE_REMOVAL=1``: ``files remove-source`` may delete migrated volume files (default off).
+    files_source_removal: bool = False
+    #: ``NODESTRO_FILES_SOURCE_RETENTION_DAYS``: the fallback period before a migrated volume file may be removed.
+    files_source_retention_days: int = DEFAULT_SOURCE_RETENTION_DAYS
+
+    @property
+    def modules(self) -> tuple[str, ...]:
+        """The Axentra modules this configuration uses (``storage`` only for ``NODESTRO_FILES_BACKEND=axentra``)."""
+        return MODULES + (("storage",) if self.files_backend == "axentra" else ())
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str], problems: list[dict[str, str]]) -> AxentraConfig:
@@ -130,11 +172,32 @@ class AxentraConfig:
                 "NODESTRO_IDENTITY_BACKEND", backend, "NODESTRO_IDENTITY_BACKEND must be nodestro, mirror or axentra"
             )
             backend = "nodestro"
+        files = environ.get("NODESTRO_FILES_BACKEND", "").strip().lower() or "volume"
+        if files not in FILES_BACKENDS:
+            problem("NODESTRO_FILES_BACKEND", files, "NODESTRO_FILES_BACKEND must be volume or axentra")
+            files = "volume"
+        removal = environ.get("NODESTRO_FILES_SOURCE_REMOVAL", "").strip().lower()
+        if removal not in _ON | _OFF:
+            problem("NODESTRO_FILES_SOURCE_REMOVAL", removal, "NODESTRO_FILES_SOURCE_REMOVAL must be 1 or 0")
+        retention_text = environ.get("NODESTRO_FILES_SOURCE_RETENTION_DAYS", "").strip()
+        retention = DEFAULT_SOURCE_RETENTION_DAYS
+        if retention_text:
+            try:
+                retention = int(retention_text)
+                if retention < 0:
+                    raise ValueError
+            except ValueError:
+                problem(
+                    "NODESTRO_FILES_SOURCE_RETENTION_DAYS",
+                    retention_text,
+                    "NODESTRO_FILES_SOURCE_RETENTION_DAYS must be a whole number of days (0 or more)",
+                )
+                retention = DEFAULT_SOURCE_RETENTION_DAYS
         superuser = environ.get("NODESTRO_AXENTRA_ALLOW_SUPERUSER", "").strip().lower()
         if superuser not in _ON | _OFF:
             problem("NODESTRO_AXENTRA_ALLOW_SUPERUSER", superuser, "NODESTRO_AXENTRA_ALLOW_SUPERUSER must be 1 or 0")
         mirrors: dict[str, bool] = {}
-        for name in ("audit", "usage"):
+        for name in ("audit", "usage", "run_usage", "notify"):
             variable = f"NODESTRO_AXENTRA_{name.upper()}"
             value = environ.get(variable, "").strip().lower()
             if value not in _ON | _OFF:
@@ -142,6 +205,8 @@ class AxentraConfig:
             elif value in _ON and not enabled:
                 problem(variable, value, f"{variable}=1 needs NODESTRO_AXENTRA=on")
             mirrors[name] = value in _ON
+        if mirrors["run_usage"] and not mirrors["usage"]:
+            problem("NODESTRO_AXENTRA_RUN_USAGE", "1", "NODESTRO_AXENTRA_RUN_USAGE=1 needs NODESTRO_AXENTRA_USAGE=1")
         config_file = environ.get("NODESTRO_AXENTRA_CONFIG", "").strip() or None
         keyring, ref = "", ""
         direct = environ.get("NODESTRO_AXENTRA_KEYRING", "").strip()
@@ -165,6 +230,8 @@ class AxentraConfig:
                     backend,
                     f"NODESTRO_IDENTITY_BACKEND={backend} needs NODESTRO_AXENTRA=on",
                 )
+            if files != "volume":
+                problem("NODESTRO_FILES_BACKEND", files, f"NODESTRO_FILES_BACKEND={files} needs NODESTRO_AXENTRA=on")
             return cls(secrets_format=fmt)  # type: ignore[arg-type]
         if not available():
             problem(
@@ -194,7 +261,12 @@ class AxentraConfig:
             secrets_format=fmt,  # type: ignore[arg-type]
             audit=mirrors["audit"],
             usage=mirrors["usage"],
+            run_usage=mirrors["run_usage"],
+            notify=mirrors["notify"],
             identity_backend=backend,  # type: ignore[arg-type]
+            files_backend=files,  # type: ignore[arg-type]
+            files_source_removal=removal in _ON,
+            files_source_retention_days=retention,
         )
 
 
@@ -210,12 +282,22 @@ def _with_search_path(conninfo: str, schema: str | None) -> str:
     return make_conninfo("", **parts)
 
 
-def build_settings(config: AxentraConfig, *, database_url: str, public_origin: str, schema: str | None = None) -> Any:
+def build_settings(
+    config: AxentraConfig,
+    *,
+    database_url: str,
+    public_origin: str,
+    schema: str | None = None,
+    migration_url: str | None = None,
+) -> Any:
     """Axentra's :class:`~axentra.config.settings.Settings` for Nodestro's server (``config.enabled`` only).
 
     The operator's ``NODESTRO_AXENTRA_CONFIG`` file is read first; Nodestro then fixes what must agree with it:
-    the database (the server's own, same schema), single-product mode with product ``nodestro``, the modules and the
-    environment (production for an https origin). The keyring is passed to Axentra directly, never as a setting."""
+    the database (the server's own, same schema; migrations with ``migration_url``, the owner role, when given),
+    single-product mode with product ``nodestro``, the modules and the environment (production for an https origin).
+    A role that bypasses row-level security or owns the tables is allowed only with ``NODESTRO_AXENTRA_ALLOW_SUPERUSER``
+    (checked by :meth:`AxentraServices.start` in every environment). The keyring is passed to Axentra directly, never
+    as a setting."""
     from axentra.config.settings import load_settings
 
     production = public_origin.startswith("https://")
@@ -223,12 +305,22 @@ def build_settings(config: AxentraConfig, *, database_url: str, public_origin: s
     overrides: dict[str, Any] = {
         "environment": "production" if production else "development",
         "mode": "single",
-        "modules": list(MODULES),
+        "modules": list(modules(config)),
         "product": {"slug": PRODUCT_SLUG, "name": PRODUCT_NAME},
-        "database": {"url": url, "allow_superuser": config.allow_superuser},
+        "database": {
+            "url": url,
+            "migration_url": _with_search_path(migration_url, schema) if migration_url else None,
+            "migration_url_ref": None,
+            "url_ref": None,
+            "allow_superuser": config.allow_superuser,
+            "allow_table_owner": config.allow_superuser,
+        },
         # The keyring is not a setting here: Nodestro validated it and hands it to Axentra (AxentraServices).
         "security": {"public_url": public_origin, "master_keys_ref": None, "master_keys": None},
         "observability": {"otel_service_name": "nodestro"},
+        # Nodestro sends only in-app inbox notifications: no delivery provider that leaves the process (an e-mail
+        # channel would be a separate, explicit switch; see docs/AXENTRA.md, "Notifications").
+        "notify": {"provider": "local"},
     }
     # Only the given file and Nodestro's values: AXENTRA__* variables of the process are ignored on purpose, so the
     # server's behaviour depends on documented NODESTRO_* settings and one optional file.
@@ -263,18 +355,42 @@ class AxentraServices:
     """Axentra opened for one Nodestro server process (API, worker or an operator command).
 
     ``platform`` is the :class:`axentra.platform.Axentra` facade (services as attributes). Construction opens
-    nothing; :meth:`start` opens the pool, checks the database role and creates/confirms the product ``nodestro``.
+    nothing; :meth:`start` checks the database role and creates/confirms the product ``nodestro``.
+
+    ``database``: the process's :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Axentra then borrows its
+    pool (``axentra.data.Database.on_pool``): one connection budget per process (``NODESTRO_DATABASE_POOL_SIZE``),
+    the same role, ``search_path`` and time limits; Axentra's scope settings are transaction-local, so nothing of
+    them stays on a connection Nodestro gets back. Without it (``migrate`` and other commands that only need the
+    migration runner), Axentra builds its own pool, opened by :meth:`start` only. ``migration_url``: the owner role's
+    connection for Axentra's migrations (``NODESTRO_DATABASE_MIGRATION_URL``; default: ``database_url``).
     """
 
-    def __init__(self, config: AxentraConfig, *, database_url: str, public_origin: str, schema: str | None = None):
+    def __init__(
+        self,
+        config: AxentraConfig,
+        *,
+        database_url: str,
+        public_origin: str,
+        schema: str | None = None,
+        migration_url: str | None = None,
+        database: PostgresDatabase | None = None,
+    ):
         if not config.enabled:
             raise NodestroError("axentra.disabled", "Axentra is not switched on (NODESTRO_AXENTRA)")
         from axentra.config.secrets import Keyring
+        from axentra.data.database import Database
         from axentra.platform import Axentra
 
         self.config = config
-        self.settings = build_settings(config, database_url=database_url, public_origin=public_origin, schema=schema)
-        self.platform = Axentra(self.settings, keyring=Keyring.parse(config.keyring))
+        self.settings = build_settings(
+            config, database_url=database_url, public_origin=public_origin, schema=schema, migration_url=migration_url
+        )
+        self.database = database
+        shared = None
+        if database is not None:
+            pool = database.shared_pool()
+            shared = Database.on_pool(pool, url=_with_search_path(pool.conninfo, schema))
+        self.platform = Axentra(self.settings, keyring=Keyring.parse(config.keyring), database=shared)
         self._product_id: str | None = None
 
     # ---- lifecycle ---------------------------------------------------------------------------------
@@ -283,8 +399,15 @@ class AxentraServices:
         from axentra.core.errors import AxentraError
 
         try:
+            # Stricter than Axentra's own check (production only), and before anything is written: row-level security
+            # must apply to the runtime role in every environment, unless the operator allowed a privileged role.
+            self.platform.db.open()
+            self.platform.db.check_role(
+                allow_superuser=self.config.allow_superuser, allow_table_owner=self.config.allow_superuser
+            )
             self.platform.start()
         except AxentraError as exc:
+            self.platform.close()
             raise NodestroError("axentra.unavailable", f"Axentra cannot start: {exc}") from None
         product = self.platform.single_product()
         if product is None:  # pragma: no cover - start() creates it in single mode
@@ -312,7 +435,10 @@ class AxentraServices:
         from axentra.core.errors import AxentraError
 
         try:
-            self.platform.migration_runner().require_current()
+            if self.database is not None:  # through the runtime role's pool: serving processes need no owner URL
+                self.platform.require_current_schema()
+            else:
+                self.platform.migration_runner().require_current()
         except AxentraError as exc:
             return [str(exc)]
         return []
@@ -388,22 +514,35 @@ class KeyringSecretBox:
     def decrypt(self, tenant_id: str, name: str, token: str) -> str:
         if isinstance(token, str) and token.startswith(AXS1_PREFIX):
             try:
-                return str(self.box.decrypt(token, secret_context(tenant_id, name)))
+                plaintext = str(self.box.decrypt(token, secret_context(tenant_id, name)))
             except Exception:  # unknown key id, tampered value, other tenant or field
+                count_operation("secret_decrypt", "unreadable", format="axs1")
                 raise NodestroError(
                     "secrets.unreadable",
                     "A stored secret cannot be decrypted with this server's keyring; enter it again",
                 ) from None
+            count_operation("secret_decrypt", "ok", format="axs1")
+            return plaintext
         if self.legacy is None:
+            count_operation("secret_decrypt", "unreadable", format="v1")
             raise NodestroError(
                 "secrets.unreadable", "A stored secret uses the retired v1 format; this server no longer reads it"
             )
-        return self.legacy.decrypt(tenant_id, name, token)
+        try:
+            plaintext = self.legacy.decrypt(tenant_id, name, token)
+        except NodestroError:
+            count_operation("secret_decrypt", "unreadable", format="v1")
+            raise
+        count_operation("secret_decrypt", "ok", format="v1")
+        return plaintext
 
     def needs_rewrite(self, token: str) -> bool:
-        """Whether ``token`` is not in the format and key this box writes."""
+        """Whether ``token`` is not in the format and key this box writes.
+
+        Writing ``v1`` (the rollback of ``NODESTRO_SECRETS_FORMAT=axs1``): every ``axs1`` value needs a rewrite, so
+        ``secrets reencrypt`` moves them back to v1 before the keyring may go."""
         if self.write == "v1":
-            return False
+            return isinstance(token, str) and token.startswith(AXS1_PREFIX)
         parts = token.split(".")
         return not (token.startswith(AXS1_PREFIX) and len(parts) == 4 and parts[1] == self.active_kid)
 
@@ -504,7 +643,8 @@ def reencrypt_tenant_secrets(
     dry_run: bool = False,
     tenant: str | None = None,
 ) -> ReencryptReport:
-    """Move every stored tenant secret to the active Axentra key (``nodestro-server secrets reencrypt``).
+    """Move every stored tenant secret to the format and key ``box`` writes (``nodestro-server secrets reencrypt``):
+    the active Axentra key with ``NODESTRO_SECRETS_FORMAT=axs1``, or back to v1 with ``v1`` (the rollback).
 
     Guarantees: each document is re-encrypted in its own transaction with the row locked (``FOR UPDATE``), so a
     crash loses nothing and a rerun continues; only values not under the active key are touched (idempotent);
@@ -513,7 +653,7 @@ def reencrypt_tenant_secrets(
     """
     from .storage_postgres import _encode
 
-    report = ReencryptReport(dry_run=dry_run, active_kid=box.active_kid)
+    report = ReencryptReport(dry_run=dry_run, active_kid=box.active_kid if box.write == "axs1" else "v1")
     collections = [item.collection for item in SECRET_FIELDS]
     by_collection = {item.collection: item for item in SECRET_FIELDS}
     params: tuple[Any, ...] = (collections,)
@@ -572,6 +712,86 @@ def reencrypt_tenant_secrets(
                     (text, raw, tenant_id, collection, key),
                 )
     return report
+
+
+def stored_secret_formats(database: PostgresDatabase) -> dict[str, int]:
+    """How many stored tenant secrets use which format: ``v1``, ``axs1:<kid>`` and ``plain`` (read-only).
+
+    Cheap enough for every start: only the few documents of :data:`SECRET_FIELDS` that contain an encrypted value
+    are read (one per tenant for the settings, one per MCP server or billing key), nothing is decrypted."""
+    from .server_settings import ENCRYPTED_PREFIX
+
+    counts: dict[str, int] = {}
+    by_collection = {item.collection: item for item in SECRET_FIELDS}
+    rows = database._query(
+        "SELECT collection, id, coalesce(raw, data::text) FROM nodestro_documents WHERE collection = ANY(%s)"
+        " AND (strpos(data::text, %s) > 0 OR strpos(data::text, %s) > 0)",
+        ([item.collection for item in SECRET_FIELDS], '"' + AXS1_PREFIX, '"' + ENCRYPTED_PREFIX),
+    )
+    for collection, key, text in rows:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            continue
+        for path, _name in by_collection[collection].fields(str(key), data):
+            token = _get(data, path)
+            if isinstance(token, str) and token:
+                kind = _format_of(token)
+                counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def secrets_rollback_problems(config: AxentraConfig, formats: Mapping[str, int]) -> list[dict[str, str]]:
+    """Why this configuration cannot read every stored tenant secret (empty: it can), as ``profile.invalid`` problems.
+
+    The start refuses (instead of reading values as ``secrets.unreadable`` and inviting people to enter them again):
+    ``NODESTRO_AXENTRA=off`` while ``axs1`` values exist (the keyring is only read with ``on``), and a keyring that
+    lacks a key id still in use (a key removed before ``secrets reencrypt`` reported ``pending: 0``). v1 values are
+    always readable: ``NODESTRO_SECRET_KEY`` is required in every configuration."""
+    in_use = {kind.split(":", 1)[1]: count for kind, count in formats.items() if kind.startswith("axs1:")}
+    if not in_use:
+        return []
+    total = sum(in_use.values())
+    if not config.enabled:
+        return [
+            {
+                "field": "NODESTRO_AXENTRA",
+                "value": "off",
+                "reason": f"{total} stored tenant secrets use Axentra's keyring (axs1) and cannot be read with "
+                "NODESTRO_AXENTRA=off; keep NODESTRO_AXENTRA=on with the keyring, or set NODESTRO_SECRETS_FORMAT=v1 "
+                "and run 'nodestro-server secrets reencrypt' first (it moves them back to v1)",
+            }
+        ]
+    from axentra.config.secrets import Keyring
+
+    try:
+        kids = set(Keyring.parse(config.keyring).kids)
+    except Exception:  # already reported by AxentraConfig.from_env
+        return []
+    missing = sorted(set(in_use) - kids)
+    if not missing:
+        return []
+    return [
+        {
+            "field": "NODESTRO_AXENTRA_KEYRING",
+            "value": ",".join(missing),
+            "reason": "NODESTRO_AXENTRA_KEYRING lacks key ids still used by stored tenant secrets: "
+            + ", ".join(f"{kid} ({in_use[kid]} values)" for kid in missing)
+            + "; add the old key again (behind the active one) and remove it only after 'secrets reencrypt' "
+            "reports pending: 0",
+        }
+    ]
+
+
+def require_readable_secrets(database: PostgresDatabase, config: AxentraConfig) -> None:
+    """Refuse to serve (``profile.invalid``) when the configuration cannot read every stored tenant secret
+    (:func:`secrets_rollback_problems`); ``check``, ``api`` and ``worker`` call it after the schema check."""
+    problems = secrets_rollback_problems(config, stored_secret_formats(database))
+    if problems:
+        raise NodestroError(
+            "profile.invalid",
+            "The server cannot start: " + "; ".join(item["reason"] for item in problems),
+            problems=problems,
+        )
 
 
 # ---- links between Nodestro and Axentra records ----------------------------------------------------------------
@@ -706,11 +926,15 @@ class AxentraLink:
 
 #: The Axentra meters the usage mirror writes (key, unit, what a quantity of the meter is).
 USAGE_METERS: tuple[tuple[str, str, str], ...] = (
-    ("nodestro.ai.requests", "requests", "AI requests made outside workflow runs"),
-    ("nodestro.ai.input_tokens", "tokens", "Input tokens of AI requests made outside workflow runs"),
-    ("nodestro.ai.output_tokens", "tokens", "Output tokens of AI requests made outside workflow runs"),
-    ("nodestro.ai.cost_usd", "USD", "Fully priced cost of AI requests made outside workflow runs"),
+    ("nodestro.ai.requests", "requests", "AI requests (usage ledger; workflow runs when run usage is mirrored)"),
+    ("nodestro.ai.input_tokens", "tokens", "Input tokens of AI requests"),
+    ("nodestro.ai.output_tokens", "tokens", "Output tokens of AI requests"),
+    ("nodestro.ai.cost_usd", "USD", "Fully priced cost of AI requests (an incomplete cost is never mirrored)"),
 )
+#: Run states whose usage is final: a continued run is a new run (``resumed_from``), so a finished run never changes.
+SETTLED_RUN_STATES = ("succeeded", "failed", "cancelled")
+#: How far back the worker's periodic settlement looks after a start (older runs: ``axentra reconcile``).
+RUN_SETTLE_LOOKBACK_DAYS = 7
 #: How far back Axentra accepts usage (``axentra.usage.service.MAX_BACKDATE`` is 400 days), with a margin.
 USAGE_RECONCILE_DAYS = 395
 _MICRO = 10**6
@@ -742,14 +966,86 @@ def usage_key(entry_id: str, meter: str) -> str:
     return f"nodestro:usage:{entry_id}:{meter}"
 
 
+def run_usage_key(run_id: str, meter: str) -> str:
+    """The idempotency key of a finished run's settled usage of one meter: one event per run and meter, ever.
+
+    A run's usage is final once it is finished (:data:`SETTLED_RUN_STATES`; continuing a run creates a new run whose
+    reused steps count no cost), so a retry, a crash after the write, a second worker or a second reconcile replays
+    the same key with the same quantity (Axentra returns the stored event and adds nothing). A finished run whose
+    usage changed anyway is refused by Axentra (same key, other request) and reported, never counted again."""
+    return f"nodestro:run:{run_id}:{meter}"
+
+
+@dataclass(frozen=True)
+class SettledRun:
+    """What the run usage mirror reads of a finished run (the stored run document stays the source of truth)."""
+
+    id: str
+    status: str
+    trigger: str
+    workflow_id: str
+    finished_at: Any
+    usage: Any
+
+    def properties(self) -> dict[str, Any]:
+        """Deterministic properties of the run's usage events (part of the replayed request: never time-dependent)."""
+        return {
+            "source": "api_run" if self.trigger == "api" else "workflow_run",
+            "status": self.status,
+            "workflow_id": self.workflow_id,
+        }
+
+
+def settled_runs(database: PostgresDatabase, tenant_id: str, *, since: Any = None) -> list[SettledRun]:
+    """The finished, top-level, not imported runs of a tenant (``since``: changed at or after it), oldest first.
+
+    Reads only the run's status, trigger, workflow, end and usage (``jsonb`` fields, not the whole document), through
+    the ``(tenant, collection, updated_at)`` index when ``since`` is given."""
+    from datetime import datetime
+
+    from .schemas import Usage
+
+    where = (
+        "tenant_id = %s AND collection = 'runs' AND data ->> 'status' = ANY(%s)"
+        " AND data ->> 'parent_run_id' IS NULL AND data ->> 'imported_at' IS NULL"
+    )
+    params: tuple[Any, ...] = (tenant_id, list(SETTLED_RUN_STATES))
+    if since is not None:
+        where += " AND updated_at >= %s"
+        params += (since,)
+    rows = database._query(
+        "SELECT id, data ->> 'status', coalesce(data ->> 'trigger', 'manual'), coalesce(data ->> 'workflow_id', ''),"
+        " data ->> 'finished_at', updated_at, data -> 'usage' FROM nodestro_documents"
+        f" WHERE {where} ORDER BY updated_at, id",
+        params,
+    )
+    found = []
+    for run_id, status, trigger, workflow_id, finished, updated, usage in rows:
+        at = datetime.fromisoformat(finished.replace("Z", "+00:00")) if finished else updated
+        found.append(
+            SettledRun(
+                id=str(run_id),
+                status=str(status),
+                trigger=str(trigger),
+                workflow_id=str(workflow_id),
+                finished_at=at,
+                usage=Usage.model_validate(usage or {}),
+            )
+        )
+    return found
+
+
 @dataclass
 class MirrorStats:
     """What the mirror did since the process started (``failed``: kept in Nodestro, written by reconcile)."""
 
     audit: int = 0
     usage: int = 0
+    runs: int = 0
     skipped: int = 0
     failed: int = 0
+    #: Finished runs whose stored usage differs from what was mirrored (never counted twice; see run_usage_key).
+    changed: int = 0
 
 
 class AxentraEvents:
@@ -761,12 +1057,15 @@ class AxentraEvents:
     and :meth:`reconcile` writes what is missing later. Tenants without a ``nodestro_tenants`` row (the price
     reference pseudo tenant, ...) are not mirrored."""
 
-    def __init__(self, link: AxentraLink, *, audit: bool, usage: bool) -> None:
+    def __init__(self, link: AxentraLink, *, audit: bool, usage: bool, run_usage: bool = False) -> None:
         self.link = link
         self.audit_enabled = audit
         self.usage_enabled = usage
+        self.run_usage_enabled = usage and run_usage
         self.stats = MirrorStats()
         self._meters_ready = False
+        #: Where the periodic run settlement continues (``updated_at`` of the runs; ``None``: the lookback).
+        self._settled_until: Any = None
 
     # -- set-up ------------------------------------------------------------------------------------
 
@@ -842,7 +1141,10 @@ class AxentraEvents:
             return None
         return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
 
-    def _guarded(self, what: str, record_id: str, write: Callable[[Any, str], None], tenant_id: str) -> None:
+    def _guarded(self, what: str, record_id: str, write: Callable[[Any, str], None], tenant_id: str) -> str:
+        """Run ``write`` in a savepoint; the outcome: ``ok``, ``skipped`` (no tenant), ``changed`` (Axentra refused a
+        replayed key with another quantity) or ``failed`` (logged; reconcile writes it later)."""
+        from axentra.core.errors import Conflict
         from axentra.data.database import DbScope, join
 
         try:
@@ -851,17 +1153,33 @@ class AxentraEvents:
                 ax_tenant = self._tenant(tenant_id) if tenant_id else None
                 if ax_tenant is None:
                     self.stats.skipped += 1
-                    return
+                    count_operation("mirror_write", "skipped", kind=what)
+                    return "skipped"
                 with join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx:
                     write(tx, ax_tenant)
+        except Conflict:
+            self.stats.changed += 1
+            count_operation("mirror_write", "changed", kind=what)
+            logger.warning(
+                "The %s record %s of tenant %s changed after it was mirrored; it is not counted again",
+                what,
+                record_id,
+                tenant_id,
+            )
+            return "changed"
         except Exception:
             self.stats.failed += 1
+            count_operation("mirror_write", "failed", kind=what)
             logger.exception("Could not mirror %s record %s of tenant %s into Axentra", what, record_id, tenant_id)
-            return
+            return "failed"
+        count_operation("mirror_write", "ok", kind=what)
         if what == "audit":
             self.stats.audit += 1
+        elif what == "run_usage":
+            self.stats.runs += 1
         else:
             self.stats.usage += 1
+        return "ok"
 
     def _actor(self, actor: str | None) -> tuple[str, str, str]:
         if actor:
@@ -915,6 +1233,114 @@ class AxentraEvents:
                 properties=properties,
             )
 
+    # -- settled usage of finished workflow runs ---------------------------------------------------------
+
+    def _run_usage(self, tx: Any, ax_tenant: str, run: SettledRun) -> None:
+        from axentra.core.context import Principal
+
+        if not self._meters_ready:
+            raise RuntimeError("the nodestro.ai.* meters are not set up (ensure_meters)")
+        platform = self.link.services.platform
+        for meter, quantity in usage_quantities(run.usage).items():
+            platform.usage.record_in(
+                tx,
+                Principal.system("nodestro"),
+                self.link.services.product_id,
+                ax_tenant,
+                meter,
+                quantity,
+                run_usage_key(run.id, meter),
+                occurred_at=run.finished_at,
+                properties=run.properties(),
+            )
+
+    def settle_run(self, tenant_id: str, run: SettledRun) -> str:
+        """Mirror the settled usage of one finished run (idempotent; see :func:`run_usage_key`); the outcome."""
+        store = self.link.database.store(tenant_id)
+        with store.transaction():
+            return self._guarded(
+                "run_usage", run.id, lambda tx, ax_tenant: self._run_usage(tx, ax_tenant, run), tenant_id
+            )
+
+    def settle_runs(
+        self, *, tenant: str | None = None, since: Any = None, dry_run: bool = False, full: bool = False
+    ) -> dict[str, Any]:
+        """Mirror the settled usage of every finished top-level run that is not mirrored yet.
+
+        The worker calls it periodically (``since`` = where the last pass stopped; the first pass looks
+        :data:`RUN_SETTLE_LOOKBACK_DAYS` back); ``axentra reconcile`` calls it with ``full=True`` (every run Axentra
+        still accepts, :data:`USAGE_RECONCILE_DAYS`). Same filter as the usage dashboard: top-level runs only (a
+        sub-workflow's cost is counted in its parent run) and never imported runs. Nothing is written twice:
+        already mirrored runs are skipped, and a replay is a no-op (:func:`run_usage_key`)."""
+        from datetime import datetime, timedelta, timezone
+
+        report = {"runs": 0, "missing": 0, "written": 0, "changed": 0, "too_old": 0, "failed": 0, "skipped": 0}
+        if not self.run_usage_enabled:
+            return report
+        if not dry_run and not self._meters_ready:
+            self.ensure_meters()
+        started = datetime.now(timezone.utc)
+        oldest = started - timedelta(days=USAGE_RECONCILE_DAYS)
+        if full:
+            since = None
+        elif since is None:
+            since = self._settled_until or started - timedelta(days=RUN_SETTLE_LOOKBACK_DAYS)
+        params: tuple[Any, ...] = ()
+        query = "SELECT id FROM nodestro_tenants"
+        if tenant is not None:
+            query += " WHERE id = %s"
+            params = (tenant,)
+        for (tenant_id,) in self.link.database._query(query + " ORDER BY id", params):
+            tenant_id = str(tenant_id)
+            recorded = self._mirrored_runs(tenant_id)
+            for run in settled_runs(self.link.database, tenant_id, since=since):
+                report["runs"] += 1
+                wanted = usage_quantities(run.usage)
+                if not wanted:
+                    continue
+                mirrored = recorded.get(run.id, {})
+                if set(wanted) <= set(mirrored):
+                    if any(Decimal(str(wanted[meter])) != mirrored[meter] for meter in wanted):
+                        # Settled with other quantities: reported, never counted again (see run_usage_key).
+                        report["changed"] += 1
+                        self.stats.changed += 1
+                        count_operation("mirror_write", "changed", kind="run_usage")
+                    continue
+                if run.finished_at < oldest:
+                    report["too_old"] += 1
+                    continue
+                report["missing"] += 1
+                if dry_run:
+                    continue
+                outcome = self.settle_run(tenant_id, run)
+                key = {"ok": "written", "changed": "changed", "skipped": "skipped"}.get(outcome, "failed")
+                report[key] += 1
+        if not full and tenant is None and not dry_run and report["failed"] == 0:
+            # The next pass starts a little before this one did: a run committed while this pass read is not missed.
+            self._settled_until = started - timedelta(minutes=5)
+        return report
+
+    def _mirrored_runs(self, tenant_id: str) -> dict[str, dict[str, Decimal]]:
+        ax_tenant = self.link.tenant(tenant_id)
+        if ax_tenant is None:
+            return {}
+        from axentra.data.database import DbScope, join
+
+        with (
+            self.link.joined() as connection,
+            join(connection, DbScope.tenant(self.link.services.product_id, ax_tenant)) as tx,
+        ):
+            rows = tx.all(
+                "SELECT idempotency_key, quantity FROM axentra_usage_events"
+                " WHERE product_id = %s AND tenant_id = %s AND idempotency_key LIKE 'nodestro:run:%%'",
+                (self.link.services.product_id, ax_tenant),
+            )
+        found: dict[str, dict[str, Decimal]] = {}
+        for row in rows:
+            _, _, run_id, meter = str(row["idempotency_key"]).split(":", 3)
+            found.setdefault(run_id, {})[meter] = Decimal(row["quantity"])
+        return found
+
     # -- reconciliation ------------------------------------------------------------------------------
 
     def reconcile(self, *, dry_run: bool = False, tenant: str | None = None) -> dict[str, Any]:
@@ -934,6 +1360,8 @@ class AxentraEvents:
             "audit_missing": 0,
             "usage_missing": 0,
             "usage_too_old": 0,
+            "runs_missing": 0,
+            "runs_changed": 0,
             "written": 0,
             "failed": 0,
         }
@@ -1002,9 +1430,16 @@ class AxentraEvents:
                     if not dry_run:
                         with store.transaction():
                             self.usage(tenant_id, entry)
-            written = report["audit_missing"] + report["usage_missing"]
             report["failed"] += self.stats.failed - failed_before
-            report["written"] = 0 if dry_run else written - report["failed"]
+        written = report["audit_missing"] + report["usage_missing"]
+        report["written"] = 0 if dry_run else written - report["failed"]
+        if self.run_usage_enabled:
+            runs = self.settle_runs(tenant=tenant, dry_run=dry_run, full=True)
+            report["runs_missing"] = runs["missing"]
+            report["runs_changed"] = runs["changed"]
+            report["usage_too_old"] += runs["too_old"]
+            report["failed"] += runs["failed"]
+            report["written"] += runs["written"]
         return report
 
     def _documents(self, tenant_id: str, collection: str) -> list[dict[str, Any]]:
@@ -1076,12 +1511,61 @@ def _stored_mcp_details(data: dict[str, Any]) -> dict[str, Any]:
     return details
 
 
+_BACKLOG_SQL = {
+    # Ledger entries without their mirrored request count (every entry with requests has that meter).
+    "usage": """
+        SELECT count(*) FROM nodestro_documents d
+        JOIN nodestro_tenants t ON t.id = d.tenant_id
+        LEFT JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.nodestro_id = d.tenant_id
+        WHERE d.collection = 'usage_log' AND coalesce((d.data -> 'usage' ->> 'requests')::bigint, 0) > 0
+          AND (d.data ->> 'at')::timestamptz >= now() - make_interval(days => %(days)s)
+          AND NOT EXISTS (SELECT 1 FROM axentra_usage_events e WHERE e.product_id = %(product)s
+                AND e.tenant_id = l.axentra_id
+                AND e.idempotency_key = 'nodestro:usage:' || d.id || ':nodestro.ai.requests')""",
+    # Finished top-level runs with AI requests whose settled usage is not mirrored.
+    "runs": """
+        SELECT count(*) FROM nodestro_documents d
+        JOIN nodestro_tenants t ON t.id = d.tenant_id
+        LEFT JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.nodestro_id = d.tenant_id
+        WHERE d.collection = 'runs' AND d.data ->> 'status' IN ('succeeded', 'failed', 'cancelled')
+          AND d.data ->> 'parent_run_id' IS NULL AND d.data ->> 'imported_at' IS NULL
+          AND coalesce((d.data -> 'usage' ->> 'requests')::bigint, 0) > 0
+          AND d.updated_at >= now() - make_interval(days => %(days)s)
+          AND NOT EXISTS (SELECT 1 FROM axentra_usage_events e WHERE e.product_id = %(product)s
+                AND e.tenant_id = l.axentra_id
+                AND e.idempotency_key = 'nodestro:run:' || d.id || ':nodestro.ai.requests')""",
+    # Approval audit events and MCP events without a mirrored audit event.
+    "audit": """
+        SELECT count(*) FROM nodestro_documents d
+        JOIN nodestro_tenants t ON t.id = d.tenant_id
+        LEFT JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.nodestro_id = d.tenant_id
+        WHERE d.collection IN ('tool_approval_audit', 'mcp_events')
+          AND NOT EXISTS (SELECT 1 FROM axentra_audit_events a WHERE a.product_id = %(product)s
+                AND a.tenant_id = l.axentra_id AND a.details ->> 'nodestro_event' = d.data ->> 'id')""",
+}
+
+
+def reconciliation_backlog(services: AxentraServices) -> dict[str, int]:
+    """How many Nodestro records ``axentra reconcile`` would mirror right now, by kind (``usage``, ``runs``,
+    ``audit``; read-only, all tenants, counts only).
+
+    Approximate on purpose (cheap enough for ``axentra status`` and a cached metrics gauge): usage and runs are
+    matched by their request-count key, audit events by ``details.nodestro_event``; records older than
+    :data:`USAGE_RECONCILE_DAYS` are not counted (Axentra refuses them). Every kind is counted whether its mirror is
+    switched on or not, so the numbers also tell what switching it on would have to catch up."""
+    from axentra.data.database import DbScope
+
+    params = {"product": services.product_id, "days": USAGE_RECONCILE_DAYS}
+    with services.platform.db.transaction(DbScope.platform(), read_only=True) as tx:
+        return {kind: int(tx.scalar(sql, params) or 0) for kind, sql in _BACKLOG_SQL.items()}
+
+
 def attach_platform_events(database: PostgresDatabase, link: AxentraLink) -> AxentraEvents | None:
     """Attach the audit/usage mirror to ``database`` when ``NODESTRO_AXENTRA_AUDIT`` or ``..._USAGE`` is on."""
     config = link.services.config
     if not (config.audit or config.usage):
         return None
-    events = AxentraEvents(link, audit=config.audit, usage=config.usage)
+    events = AxentraEvents(link, audit=config.audit, usage=config.usage, run_usage=config.run_usage)
     if config.usage:
         events.ensure_meters()
     database.platform_events = events
@@ -1115,14 +1599,22 @@ __all__ = [
     "IdentityBackend",
     "KeyringSecretBox",
     "ReencryptReport",
+    "SettledRun",
     "attach_platform_events",
     "available",
     "axentra_version",
     "build_settings",
     "from_environment",
     "keyring_secret_box",
+    "modules",
+    "reconciliation_backlog",
     "reencrypt_tenant_secrets",
+    "require_readable_secrets",
+    "run_usage_key",
     "secret_context",
+    "secrets_rollback_problems",
+    "settled_runs",
+    "stored_secret_formats",
     "tenant_slug",
     "usage_key",
     "usage_quantities",

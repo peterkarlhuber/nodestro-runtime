@@ -226,6 +226,9 @@ class WorkspaceStorage:
     #: regions; :meth:`nodestro_runtime.bedrock.BedrockOperatorConfig.for_tenant`). ``None`` or a policy without a
     #: role: Bedrock is not available to the tenant. The server's own AWS credentials are never used for a tenant.
     bedrock: bedrock_auth.BedrockServerPolicy | None = None
+    #: Where the bytes of uploaded input files live: ``input_blobs(<data_dir>/inputs)`` returns the blob store
+    #: (:mod:`nodestro_runtime.axentra_storage`, ``NODESTRO_FILES_BACKEND=axentra``). ``None``: the volume below it.
+    input_blobs: Callable[[Path], Any] | None = None
 
 
 class Workspace:
@@ -413,7 +416,9 @@ class Workspace:
         self.runs.resolve_workflow = self.resolve_workflow
         self.runs.tool_marker = self.tool_marker
         # Files uploaded as run inputs: own storage, never knowledge by themselves (see input_files.py).
-        self.inputs = InputFiles(self.store, data_dir / "inputs", ocr=self._input_ocr)
+        inputs = data_dir / "inputs"
+        blobs = storage.input_blobs(inputs) if storage is not None and storage.input_blobs is not None else None
+        self.inputs = InputFiles(self.store, inputs, ocr=self._input_ocr, blobs=blobs)
         self.runs.inputs = self.inputs
         self.runs.file_names = self.file_catalog
         self.files = ResultFiles(self.store)

@@ -289,7 +289,12 @@ def test_axentra_migrates_into_nodestros_schema_and_creates_the_product(database
     schema = database.test_schema
     config = AxentraConfig(enabled=True, keyring=f"k1:{_key()}", allow_superuser=True)
     services = axentra_platform.AxentraServices(
-        config, database_url=postgres_support.DSN, public_origin="http://localhost:8000", schema=schema
+        config,
+        database_url=postgres_support.DSN,
+        public_origin="http://localhost:8000",
+        schema=schema,
+        migration_url=postgres_support.DSN,
+        database=database,
     )
     try:
         with pytest.raises(NodestroError) as caught:
@@ -340,6 +345,8 @@ def linked(database: Any) -> Iterator[Any]:
         database_url=postgres_support.DSN,
         public_origin="http://localhost:8000",
         schema=database.test_schema,
+        migration_url=postgres_support.DSN,
+        database=database,
     )
     services.migrate()
     services.start()
@@ -364,7 +371,7 @@ def test_tenants_are_linked_once_with_unique_slugs(linked: Any) -> None:
     assert linked.backfill_tenants() == {"tenants": 3, "already_linked": 3, "created": 0}
     ids = {tenant: linked.tenant(tenant) for tenant in ("acme_eu", "acme-eu", "a")}
     assert len(set(ids.values())) == 3 and all(value.startswith("ten_") for value in ids.values())
-    rows = linked.database._query(
+    rows = postgres_support.owner_of(linked.database)._query(
         "SELECT slug, settings->>'nodestro_tenant', name FROM axentra_tenants ORDER BY settings->>'nodestro_tenant'"
     )
     assert sorted(row[0] for row in rows) == ["a-0", "acme-eu", "acme-eu-2"]
@@ -381,5 +388,10 @@ def test_a_rolled_back_nodestro_transaction_leaves_no_axentra_tenant(linked: Any
         linked.ensure_tenant("ghost", "Ghost")
         raise Stop
     assert linked.lookup("tenant", "ghost") is None and linked.tenant("ghost") is None  # nothing cached either
-    assert linked.database._query("SELECT count(*) FROM axentra_tenants WHERE slug = 'ghost'")[0][0] == 0
+    assert (
+        postgres_support.owner_of(linked.database)._query("SELECT count(*) FROM axentra_tenants WHERE slug = 'ghost'")[
+            0
+        ][0]
+        == 0
+    )
     assert linked.ensure_tenant("ghost", "Ghost").startswith("ten_")

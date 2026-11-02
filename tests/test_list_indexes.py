@@ -167,7 +167,9 @@ def test_find_uses_the_expression_indexes_on_postgresql(postgres: object) -> Non
         cursor.executemany(
             "INSERT INTO nodestro_documents (tenant_id, collection, id, data) VALUES (%s, %s, %s, %s::jsonb)", rows
         )
-    with postgres._transaction() as db:
+    import postgres_support
+
+    with postgres_support.owner_of(postgres)._transaction() as db:  # ANALYZE is the owner's (a runtime role skips it)
         db.execute("ANALYZE nodestro_documents")
     captured: list[str] = []
     original = postgres._query

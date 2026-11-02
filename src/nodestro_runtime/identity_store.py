@@ -11,6 +11,9 @@ tokens are random 256-bit values, and only their SHA-256 hashes are stored.
   and it is worth nothing once the membership is gone.
 - A **bootstrap token** (made by an operator command) makes the first user who logs in with it the owner of an
   empty tenant; it works once, and only before the tenant has an owner.
+- A tenant is ``active`` or ``suspended`` (an operator command). A suspended tenant is closed: its sessions are
+  refused at once (``identity.tenant_suspended``), no session starts in it, its setup links do not work and workers
+  neither start nor continue its runs. Nothing is deleted; resuming restores access.
 
 With ``NODESTRO_IDENTITY_BACKEND=mirror`` or ``axentra`` the server uses
 :class:`~nodestro_runtime.axentra_identity.AxentraIdentityStore` instead, which has this interface and keeps these
@@ -31,6 +34,17 @@ from .storage_postgres import TENANT_ID, PostgresDatabase
 
 Role = Literal["owner", "admin", "editor", "operator", "viewer"]
 ROLES: tuple[Role, ...] = ("owner", "admin", "editor", "operator", "viewer")
+TenantStatus = Literal["active", "suspended"]
+TENANT_STATUSES: tuple[TenantStatus, ...] = ("active", "suspended")
+#: What each role may do in its tenant, by Nodestro permission name (``nodestro_api.permissions.Permission``); the
+#: API's ``ROLE_PERMISSIONS`` is this table, and the Axentra definitions are registered from it.
+ROLE_GRANTS: dict[Role, tuple[str, ...]] = {
+    "owner": ("read", "edit", "run", "admin"),
+    "admin": ("read", "edit", "run", "admin"),
+    "editor": ("read", "edit", "run"),
+    "operator": ("read", "run"),
+    "viewer": ("read",),
+}
 
 
 def _hash(token: str) -> bytes:
@@ -45,6 +59,7 @@ class Tenant(BaseModel):
     id: str
     name: str
     created_at: datetime
+    status: TenantStatus = "active"
 
 
 class User(BaseModel):
@@ -59,6 +74,8 @@ class Membership(BaseModel):
     tenant_id: str
     user_id: str
     role: Role
+    #: The status of the tenant (a membership of a suspended tenant grants nothing while it is suspended).
+    tenant_status: TenantStatus = "active"
 
 
 class Session(BaseModel):
@@ -68,6 +85,13 @@ class Session(BaseModel):
     tenant_id: str
     role: Role
     expires_at: datetime
+    #: The Nodestro permissions of the role (``read``, ``edit``, ``run``, ``admin``) when the identity backend
+    #: decides them (``axentra`` mode: Axentra's role definitions); ``None``: :data:`ROLE_GRANTS` applies.
+    permissions: tuple[str, ...] | None = None
+
+
+def tenant_suspended(tenant_id: str) -> NodestroError:
+    return NodestroError("identity.tenant_suspended", "This tenant is suspended", tenant=tenant_id)
 
 
 class LoginState(BaseModel):
@@ -105,20 +129,42 @@ class IdentityStore:
             raise NodestroError("identity.tenant_id", f"Invalid tenant id {tenant_id!r}", tenant=tenant_id)
         rows = self.database._query(
             "INSERT INTO nodestro_tenants (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING"
-            " RETURNING id, name, created_at",
+            " RETURNING id, name, created_at, status",
             (tenant_id, name.strip() or tenant_id),
         )
         if not rows:
             raise NodestroError("identity.tenant_exists", f"Tenant {tenant_id} exists already", tenant=tenant_id)
-        return Tenant(id=rows[0][0], name=rows[0][1], created_at=rows[0][2])
+        return Tenant(id=rows[0][0], name=rows[0][1], created_at=rows[0][2], status=rows[0][3])
 
     def tenant(self, tenant_id: str) -> Tenant | None:
-        rows = self.database._query("SELECT id, name, created_at FROM nodestro_tenants WHERE id = %s", (tenant_id,))
-        return Tenant(id=rows[0][0], name=rows[0][1], created_at=rows[0][2]) if rows else None
+        """The tenant, active or suspended (``None``: unknown)."""
+        rows = self.database._query(
+            "SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s", (tenant_id,)
+        )
+        return Tenant(id=rows[0][0], name=rows[0][1], created_at=rows[0][2], status=rows[0][3]) if rows else None
 
     def tenants(self) -> list[Tenant]:
-        rows = self.database._query("SELECT id, name, created_at FROM nodestro_tenants ORDER BY id")
-        return [Tenant(id=row[0], name=row[1], created_at=row[2]) for row in rows]
+        """Every tenant, active or suspended (``status`` says which)."""
+        rows = self.database._query("SELECT id, name, created_at, status FROM nodestro_tenants ORDER BY id")
+        return [Tenant(id=row[0], name=row[1], created_at=row[2], status=row[3]) for row in rows]
+
+    def tenant_active(self, tenant_id: str) -> bool:
+        """Whether the tenant exists and is not suspended (the check of every worker before it executes a run)."""
+        found = self.tenant(tenant_id)
+        return found is not None and found.status == "active"
+
+    def set_tenant_status(self, tenant_id: str, status: TenantStatus) -> Tenant:
+        """Suspend or resume a tenant. Suspending ends nothing in the database (sessions are refused while it is
+        suspended, so resuming restores them unless they expired); ``identity.tenant_unknown`` for an unknown tenant."""
+        if status not in TENANT_STATUSES:
+            raise NodestroError("identity.tenant_status", f"Unknown tenant status {status!r}", status=status)
+        rows = self.database._query(
+            "UPDATE nodestro_tenants SET status = %s WHERE id = %s RETURNING id, name, created_at, status",
+            (status, tenant_id),
+        )
+        if not rows:
+            raise NodestroError("identity.tenant_unknown", f"No tenant {tenant_id}", tenant=tenant_id)
+        return Tenant(id=rows[0][0], name=rows[0][1], created_at=rows[0][2], status=rows[0][3])
 
     # ---- users and roles -----------------------------------------------------------------------
 
@@ -182,10 +228,13 @@ class IdentityStore:
         return cast(Role, rows[0][0]) if rows else None
 
     def memberships(self, user_id: str) -> list[Membership]:
+        """Every membership of the user, with the status of its tenant."""
         rows = self.database._query(
-            "SELECT tenant_id, role FROM nodestro_memberships WHERE user_id = %s ORDER BY tenant_id", (user_id,)
+            "SELECT m.tenant_id, m.role, t.status FROM nodestro_memberships m"
+            " JOIN nodestro_tenants t ON t.id = m.tenant_id WHERE m.user_id = %s ORDER BY m.tenant_id",
+            (user_id,),
         )
-        return [Membership(tenant_id=row[0], user_id=user_id, role=row[1]) for row in rows]
+        return [Membership(tenant_id=row[0], user_id=user_id, role=row[1], tenant_status=row[2]) for row in rows]
 
     def members(self, tenant_id: str) -> list[Membership]:
         rows = self.database._query(
@@ -196,9 +245,12 @@ class IdentityStore:
     # ---- sessions ------------------------------------------------------------------------------
 
     def create_session(self, user_id: str, tenant_id: str) -> str:
-        """A new session token for a member of the tenant (``identity.not_a_member`` otherwise)."""
+        """A new session token for a member of the tenant (``identity.not_a_member`` otherwise;
+        ``identity.tenant_suspended`` for a suspended tenant)."""
         if self.role(tenant_id, user_id) is None:
             raise NodestroError("identity.not_a_member", "This account has no role in the tenant", tenant=tenant_id)
+        if not self.tenant_active(tenant_id):
+            raise tenant_suspended(tenant_id)
         token = secrets.token_urlsafe(32)
         self.database._write(
             "INSERT INTO nodestro_sessions (token_hash, user_id, tenant_id, expires_at) VALUES (%s, %s, %s, %s)",
@@ -208,19 +260,22 @@ class IdentityStore:
 
     def session(self, token: str) -> Session | None:
         """The session of ``token`` with the user's current role; ``None`` when unknown, expired, idle too long
-        or when the membership is gone."""
+        or when the membership is gone. Raises ``identity.tenant_suspended`` while its tenant is suspended."""
         if not token or len(token) > 256:
             return None
         rows = self.database._query(
-            "SELECT s.user_id, s.tenant_id, m.role, s.expires_at, s.last_seen_at FROM nodestro_sessions s"
+            "SELECT s.user_id, s.tenant_id, m.role, s.expires_at, s.last_seen_at, t.status FROM nodestro_sessions s"
             " JOIN nodestro_memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id"
+            " JOIN nodestro_tenants t ON t.id = s.tenant_id"
             " WHERE s.token_hash = %s AND s.expires_at > clock_timestamp()"
             " AND s.last_seen_at > clock_timestamp() - %s",
             (_hash(token), self.idle_timeout),
         )
         if not rows:
             return None
-        user_id, tenant_id, role, expires_at, last_seen = rows[0]
+        user_id, tenant_id, role, expires_at, last_seen, status = rows[0]
+        if status != "active":
+            raise tenant_suspended(tenant_id)
         if _now() - last_seen > timedelta(minutes=1):
             self._touch(_hash(token))
         return Session(user_id=user_id, tenant_id=tenant_id, role=role, expires_at=expires_at)
@@ -315,7 +370,9 @@ class IdentityStore:
             if row is None:
                 raise NodestroError("identity.bootstrap_invalid", "This setup link is invalid, used or expired")
             tenant_id = str(row[0])
-            db.execute("SELECT 1 FROM nodestro_tenants WHERE id = %s FOR UPDATE", (tenant_id,))
+            status = db.execute("SELECT status FROM nodestro_tenants WHERE id = %s FOR UPDATE", (tenant_id,)).fetchone()
+            if status is not None and status[0] != "active":
+                raise tenant_suspended(tenant_id)  # rolled back: the link stays usable once the tenant is resumed
             owner = db.execute(
                 "SELECT 1 FROM nodestro_memberships WHERE tenant_id = %s AND role = 'owner'", (tenant_id,)
             ).fetchone()
@@ -340,4 +397,17 @@ class IdentityStore:
         )
 
 
-__all__ = ["ROLES", "IdentityStore", "LoginState", "Membership", "Role", "Session", "Tenant", "User"]
+__all__ = [
+    "ROLES",
+    "ROLE_GRANTS",
+    "TENANT_STATUSES",
+    "IdentityStore",
+    "LoginState",
+    "Membership",
+    "Role",
+    "Session",
+    "Tenant",
+    "TenantStatus",
+    "User",
+    "tenant_suspended",
+]
