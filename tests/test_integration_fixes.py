@@ -240,7 +240,7 @@ async def test_event_numbering_continues_after_a_restart(tmp_path: Path) -> None
 # ---- Python libraries of generated tools -----------------------------------------------------
 
 
-def test_generated_tools_never_build_a_package_while_resolving(make: Make) -> None:
+def test_generated_tools_never_build_a_package_while_resolving(make: Make, tmp_path: Path) -> None:
     from nodestro_runtime.testing import FakeUv
 
     uv = FakeUv({"onlysource": [("1.0", [], "onlysource\nX = 1\n")]})
@@ -258,9 +258,33 @@ def test_generated_tools_never_build_a_package_while_resolving(make: Make) -> No
     assert uv.builds == [False]
     assert unbuilt.error is not None and unbuilt.error.code == "deps.build_required"
     assert unbuilt.error.params == {"name": "onlysource"}
-    # A person who asks for the plan may still resolve it (and then approve the installation).
+    # A person who asks for the plan accepts the source build, but it never runs on the host: uv still resolves with
+    # --no-build, and the build would run in a container, which needs Docker (missing here, whatever the host has).
+    workspace.python.images.docker = str(tmp_path / "no-docker")
     plan = workspace.python.plan("tool", "measure", needed)
-    assert uv.builds[-1] is True and plan.error is None and plan.lock
+    assert uv.builds == [False, False] and not plan.lock
+    assert plan.error is not None and plan.error.code == "deps.build_required"
+    assert plan.error.params == {"name": "onlysource", "reason": "sandbox.unavailable"}
+
+
+def test_uv_never_builds_on_the_host_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nodestro_runtime.python_envs import UvRunner
+
+    calls: list[list[str]] = []
+
+    def record(self: UvRunner, args: list[str], log: object, **options: object) -> str:
+        calls.append(args)
+        if args[:2] == ["pip", "compile"]:
+            (Path(str(options["cwd"])) / "requirements.txt").write_text("six==1.17.0\n")
+        return ""
+
+    monkeypatch.setattr(UvRunner, "_run", record)
+    runner = UvRunner(tmp_path / "cache", "uv")
+    assert runner.compile(["six"], python="3.12", previous="", log=lambda _line: None) == "six==1.17.0\n"
+    runner.sync(tmp_path / "venv" / "bin" / "python", "six==1.17.0\n", log=lambda _line: None)
+    compile_args, sync_args = calls
+    assert "--no-build" in compile_args and "--generate-hashes" in compile_args
+    assert sync_args[:3] == ["pip", "sync", "--no-build"]
 
 
 def test_uv_no_build_keeps_build_scripts_from_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

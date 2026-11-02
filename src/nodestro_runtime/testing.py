@@ -26,6 +26,8 @@ from anthropic.types import Message
 from orkexa.dynamic import DockerSandbox, SubprocessSandbox, ValidationResult
 from pydantic import BaseModel
 
+from .docker_status import DockerStatus, unavailable_status
+
 
 def message(
     content: list[dict[str, Any]],
@@ -245,7 +247,7 @@ class FakeUv:
         python: str,
         previous: str,
         log: Callable[[str], None],
-        builds: bool = True,
+        builds: bool = False,
     ) -> str:
         import re
 
@@ -348,6 +350,31 @@ class ContainerDouble(DockerSandbox):
         self.calls.append(("validate", function_name))
         return self.host.validate(code, tests, function_name)
 
+    def self_test_passed(self) -> bool:
+        """Counts as a container whose daemon passed its self-test (it runs nothing in Docker)."""
+        return True
+
     def call(self, code: str, function_name: str, payload: dict[str, Any]) -> str:
         self.calls.append(("call", function_name))
         return self.host.call(code, function_name, payload)
+
+
+class StaticDockerMonitor:
+    """**Tests only.** Stands in for :class:`nodestro_runtime.docker_status.DockerMonitor` with a fixed status: no
+    thread, no docker CLI, no reaper. ``refreshes`` counts ``status(refresh=True)`` calls."""
+
+    def __init__(self, status: DockerStatus | None = None) -> None:
+        self.current = status if status is not None else unavailable_status()
+        self.refreshes = 0
+        self.reaps: list[bool] = []
+
+    def status(self, *, refresh: bool = False, wait: float = 0.0) -> DockerStatus:
+        if refresh:
+            self.refreshes += 1
+        return self.current
+
+    def start_reaper(self, *, remove_all_first: bool) -> None:
+        self.reaps.append(remove_all_first)
+
+    def close(self) -> None:
+        """Nothing runs."""

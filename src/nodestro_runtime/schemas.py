@@ -895,17 +895,36 @@ class BuiltinSandboxStatus(_Model):
     system: str = ""
 
 
+class SandboxCheck(_Model):
+    """One check behind a backend's state, e.g. ``preflight`` or ``self-test`` of the Docker sandbox."""
+
+    #: ``cli``, ``daemon``, ``preflight``, ``image`` or ``self-test`` (Docker).
+    name: str
+    ok: bool = False
+    #: The technical detail in English (why it failed, or what passed).
+    detail: str = ""
+
+
 class SandboxBackendStatus(_Model):
     """One sandbox backend of the computer the runtime runs on, as the policy sees it."""
 
     #: ``linux-builtin``, ``macos-seatbelt``, ``windows-native``, ``docker`` or ``subprocess``.
     name: str
-    #: Whether it can run on this computer now (its probe passed).
+    #: Whether it can run on this computer now (its probe passed; for Docker: preflight and self-test passed).
     available: bool = False
     #: ``approved`` (released for AI-generated code here), ``experimental`` (works, but not reviewed or released:
-    #: never used), ``unavailable``, ``not-isolating`` (runs only code a person wrote) or ``not-applicable``.
-    state: Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable"] = "unavailable"
-    #: Why it is not approved, e.g. ``platform``, ``not-released``, ``not-implemented``, ``unreachable``, ``server``.
+    #: never used; no backend reports it since the macOS sandbox was removed, kept for older clients),
+    #: ``unavailable``, ``not-isolating`` (runs only code a person wrote), ``not-applicable``, or ``checking``
+    #: (Docker: the first check after the start has not finished yet; nothing runs in it until then).
+    state: Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable", "checking"] = (
+        "unavailable"
+    )
+    #: Why it is not approved, e.g. ``platform``, ``not-released``, ``not-implemented``, ``removed`` (macOS: the
+    #: Seatbelt sandbox was removed), ``server``, and for Docker: ``docker-missing`` (no CLI), ``docker-unreachable``
+    #: (no daemon), ``docker-limits`` (memory, process or CPU limits not enforced), ``docker-seccomp`` (no seccomp
+    #: filter), ``docker-rootless-cgroup`` (rootless on cgroup v1), ``docker-os-type`` (no Linux containers),
+    #: ``docker-image`` (the sandbox image cannot be found or built), ``docker-selftest`` (a container of the sandbox's
+    #: shape showed a missing restriction) or ``docker-checking`` (with state ``checking``).
     reason: str = ""
     #: The technical detail in English.
     detail: str = ""
@@ -916,6 +935,14 @@ class SandboxBackendStatus(_Model):
     memory: str = "none"
     #: Known limitations in English.
     notes: list[str] = Field(default_factory=list)
+    #: Docker only (empty elsewhere): the engine as far as it can be told (``docker``, ``docker-desktop``, ``podman``,
+    #: ``colima``, ``orbstack``, ``unknown``; informational, never a reason to trust it), whether it runs rootless, its
+    #: cgroup version (``"1"``, ``"2"``), the checks behind the state, and when the self-test last ran.
+    engine: str = ""
+    rootless: bool | None = None
+    cgroup_version: str | None = None
+    checks: list[SandboxCheck] = Field(default_factory=list)
+    tested_at: datetime | None = None
 
 
 class SandboxSelection(_Model):
@@ -930,7 +957,8 @@ class SandboxSelection(_Model):
     untrusted: str = ""
     #: The backend that runs code a person wrote in the tool editor.
     user_authored: str = ""
-    #: Whether untrusted code is refused here, with ``reason`` (``no-isolation``, ``docker-unreachable``).
+    #: Whether untrusted code is refused here, with ``reason``: ``no-isolation``, or (Docker mode, server, local
+    #: container) the Docker backend's reason, e.g. ``docker-unreachable``, ``docker-selftest``, ``docker-checking``.
     blocked: bool = False
     reason: str = ""
     detail: str = ""

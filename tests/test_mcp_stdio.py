@@ -22,12 +22,12 @@ import pytest
 
 pytest.importorskip("mcp")
 
-from nodestro_runtime.container_images import StreamedSandbox, sandbox_run_args
+from nodestro_runtime.container_images import MCP_OWNER, StreamedSandbox, sandbox_run_args
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
 from nodestro_runtime.mcp.netguard import EgressPolicy
 from nodestro_runtime.mcp.service import McpService
-from nodestro_runtime.mcp.stdio import MAX_LINE_BYTES, launch, relay
+from nodestro_runtime.mcp.stdio import LIFETIME, MAX_LINE_BYTES, launch, relay
 from nodestro_runtime.mcp.vault import TokenVault
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import needed_for_requirements
@@ -39,6 +39,9 @@ IMAGE = "nodestro-env:" + "0" * 32
 
 
 class FakeImages:
+    #: An installation's own owner (``docker_status.installation_owner``).
+    owner = "nodestro-0123456789ab"
+
     def __init__(self, docker: str, log: Path) -> None:
         self.docker = docker
         self.log = log
@@ -203,9 +206,22 @@ def test_the_container_has_the_sandbox_shape() -> None:
     started = launch(image=IMAGE, module="pkg.server", args=["--tz", "UTC"], memory_mb=256, docker="docker")
     run = started.args[started.args.index("--") + 1 :]
     image = run.index(IMAGE)
-    assert run[: image + 1] == sandbox_run_args(
-        docker="docker", container_name=started.container, image=IMAGE, memory_mb=256, cpus=1.0, pids_limit=64
+    expected = sandbox_run_args(
+        docker="docker",
+        container_name=started.container,
+        image=IMAGE,
+        memory_mb=256,
+        cpus=1.0,
+        pids_limit=64,
+        owner=MCP_OWNER,
+        lifetime_s=LIFETIME,
     )
+
+    def stable(args: list[str]) -> list[str]:  # the deadline label is the time of the call
+        return [item for item in args if not item.startswith("org.orkexa.deadline=")]
+
+    assert stable(run[: image + 1]) == stable(expected)
+    assert f"org.orkexa.sandbox={MCP_OWNER}" in run  # never removed by the tool containers' reaper
     assert run[image + 1 :] == ["python", "-I", "-B", "-m", "pkg.server", "--tz", "UTC"]
     flags = " ".join(run)
     for flag in (
@@ -225,9 +241,11 @@ def test_the_container_has_the_sandbox_shape() -> None:
     # The tool sandbox uses the same shape.
     sandbox = StreamedSandbox(image=IMAGE, docker="docker", memory_mb=256)
     assert (
-        sandbox.command(Path("/tmp"), "nodestro-sandbox-x")[:-5][1:]
-        == sandbox_run_args(
-            "docker", "nodestro-sandbox-x", IMAGE, memory_mb=256, cpus=sandbox.cpus, pids_limit=sandbox.pids_limit
+        stable(sandbox.command(Path("/tmp"), "nodestro-sandbox-x")[:-5][1:])
+        == stable(
+            sandbox_run_args(
+                "docker", "nodestro-sandbox-x", IMAGE, memory_mb=256, cpus=sandbox.cpus, pids_limit=sandbox.pids_limit
+            )
         )[1:]
     )
 
@@ -284,6 +302,8 @@ def test_discovery_approval_and_calls_run_in_the_container(service: McpService, 
     for call in runs:
         assert call[call.index("--network") + 1] == "none"
         assert call[-3:] == ["mcp_stdio_server", "--name", "x"]
+        # The installation's MCP owner: never the tool containers' owner, so their reaper leaves it alone.
+        assert "org.orkexa.sandbox=nodestro-mcp-0123456789ab" in call
         name = call[call.index("--name") + 1]
         assert ["rm", "-f", name] in calls  # removed after the connection
     # Changing a write tool stays blocked without the per-call approval gate (as for HTTP servers).

@@ -18,7 +18,7 @@ import tempfile
 import textwrap
 import threading
 
-from orkexa.dynamic import DockerSandbox, SubprocessSandbox
+from orkexa.dynamic import SubprocessSandbox
 from orkexa.errors import ToolExecutionError
 import pytest
 
@@ -26,6 +26,7 @@ from nodestro_runtime import builtin_sandbox, sandbox_confine, sandbox_probes
 from nodestro_runtime.builtin_sandbox import TESTED_SYSTEMS, LinuxSandbox, SandboxStatus, measure
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.sandbox_policy import SandboxPolicy, isolation_of
+from nodestro_runtime.testing import ContainerDouble
 from nodestro_runtime.tool_library import ToolLibrary
 
 pytestmark = pytest.mark.real_sandbox_status  # this module checks the computer's real sandbox (see conftest.py)
@@ -261,7 +262,7 @@ def test_isolating_only_where_the_checks_passed(monkeypatch: pytest.MonkeyPatch)
     # A server keeps its tenants' code in containers.
     assert not SandboxPolicy("server").allows("untrusted", sandbox)
     assert not SandboxPolicy("server").allows("user-authored", sandbox)
-    assert SandboxPolicy("server").allows("untrusted", DockerSandbox())
+    assert SandboxPolicy("server").allows("untrusted", ContainerDouble())  # a container whose self-test passed
 
 
 def test_untrusted_code_is_routed_to_the_builtin_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

