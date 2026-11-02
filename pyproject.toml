@@ -37,12 +37,12 @@ dependencies = [
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@f3ed8d22a8bd45faff84204786e01da32ece4034",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@024da57c15b064ea3abcf4119518707fbcc4e7b5",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@f3ed8d22a8bd45faff84204786e01da32ece4034",
     "mypy>=1.13",
     # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
     "pglast>=7,<9",

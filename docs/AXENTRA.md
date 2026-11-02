@@ -160,31 +160,64 @@ run by `tests/test_tenant_filters.py` of the runtime and of the API:
   table is covered at once): documents, files, chunks, memory files, jobs, run events, schedule firings, sessions,
   memberships, login states, bootstrap tokens (runs, schedules and secrets are collections of the documents table);
 - every string expression of `nodestro_runtime` and `nodestro_api` is rebuilt as Python would build it (string and
-  bytes constants, `+` and implicit concatenation, f-strings, `str.format`, `join` of a literal list or of a name
-  holding one, psycopg `sql.SQL`/`Identifier`/`Placeholder`/`Composed`; `.replace` and other methods that change the
-  text add an unknown part), and every variant that names a tenant table is parsed with PostgreSQL's own grammar
+  bytes constants, `+` and implicit concatenation with adjacent constants joined without a gap, so a table name split
+  as `"nodestro_" + "documents"` or completed after a constant prefix is seen (SR-01d), f-strings, `str.format`,
+  `str % values`, `join` of a literal list or of a name holding one, an item of a literal tuple, list or dict that
+  nothing changes, psycopg `sql.SQL`/`Identifier`/`Placeholder`/`Composed`; `.replace` and other methods that change
+  the text add an unknown part), and every variant that names a tenant table is parsed with PostgreSQL's own grammar
   (`pglast`, a dev dependency);
 - a name is resolved to every value it can hold at each place it is read, inside a string expression and on its own
   (`query += " OR ..."; db._query(query)`, `query = query + ...`): module constants, the local assignments and `+=`
   before the read (and after it in a loop around it), each conditional assignment or `+=` taken and not taken, and
-  loops over constant tuples; a `+=` that a loop repeats is an unknown part, and more than 256 variants are reported
-  as dynamic (SR-01a);
+  loops over constant tuples. A parameter starts as an unknown part and its `+=` follow it; a closure or lambda reads
+  an outer name with every value it can hold in the enclosing function; `nonlocal` and `global` assignments of other
+  functions count. A `+=` that a loop or a nested function repeats is an unknown part, and more than 256 variants are
+  reported as dynamic. `+=` on an attribute, an item or a class attribute (`self.q`, `Q["a"]`) is checked as an
+  unknown part followed by its value (SR-01a);
 - each reference to a tenant table (`FROM`, joins, `USING`, `UPDATE`/`DELETE` targets, subqueries, CTEs, set
   operations) must be bound by a top-level `AND` conjunct `tenant_id = <param>` or `tenant_id = ANY(<param>)` (or
-  equal to the `tenant_id` of a bound or enclosing reference); `INSERT` must list `tenant_id`; `TRUNCATE`, `COPY`,
-  `MERGE` are refused;
+  equal to the `tenant_id` of a bound or enclosing reference, where an inner alias hides an outer one of the same
+  name); `INSERT` must list `tenant_id` with a parameter (or a bound `tenant_id` of its `SELECT`) as the value; an
+  upsert that updates must have `tenant_id` in its conflict target; no `UPDATE` may set `tenant_id`; SQL inside a
+  string (`DO $$ ... $$`, `query_to_xml('...')`), `TRUNCATE`, `COPY`, `MERGE` are refused;
 - a statement with a part that cannot be resolved is reported as dynamic, one the parser rejects as unparsed; neither
   passes silently. A text that starts with an unknown part (an imported fragment, `self.BASE + "..."`, a function's
-  result) followed by SQL words is reported as dynamic too, not dropped (SR-01b);
+  result, a parameter) followed by SQL is reported as dynamic too. SQL is a keyword in capitals, a comment (`--`,
+  `/*`), or a keyword in lower case in a SQL shape (`or true`, `and id = %s`); a text outside any known statement
+  that continues one (`" OR true"` as a class attribute, a tuple item or a call argument) is reported the same way
+  (SR-01b). A developer fixes such a finding or allowlists it with a reason;
 - the exceptions are in `tenant_sql_allowlist.py` of each package: the module and the whole normalized statement,
   each with its reason (worker claim, heartbeat and finish by job id, the reaper, housekeeping, session lookup by
   token hash, operator commands, metrics aggregates). Matching is exact, and an entry that matches nothing fails.
   The desktop's SQLite modules are skipped by name, and the check fails if one of them uses PostgreSQL.
 
-What it cannot see: SQL text that comes from outside the source (none exists), and a statement whose table name and
-leading keyword both arrive at run time from a value the check cannot resolve (it would be reported only if it starts
-with a data keyword or completes a `nodestro_` name). The runtime role cannot alter the tables either. Revisit RLS when
-Nodestro's store runs inside per-request transactions anyway.
+What the check guarantees: every text in `nodestro_runtime` and `nodestro_api` that is, or may become, a statement on
+a tenant table, as far as its parts are written in that source, is proven bound to one tenant, reported, or
+allowlisted with a reason. Each bypass found by the security review (rounds 1 to 3) is a regression test in
+`tests/test_tenant_filters.py`. What it does not guarantee: that the bound parameter is the caller's tenant (the store
+object bound to one tenant passes it), and the cases below.
+
+**Remaining isolation risk.** Without row-level security, PostgreSQL itself does not stop a statement that reads or
+changes another tenant's rows in `nodestro_*` tables; the check is a test-time review of source code. What can still
+slip through it:
+
+- SQL from outside the scanned packages: statements in other packages, operator scripts or tests, and SQL read at
+  run time from a file, a setting or the database. Today no other package (Axentra, orkexa, nodestro-server, the SDK)
+  names a `nodestro_*` tenant table, and Nodestro reads no SQL from data apart from its migrations (schema only, run by
+  the owner role);
+- SQL that run-time data puts together without a known part that shows it: an argument of a helper that runs whatever
+  it is given (checked only at the callers that pass a literal text), a text made only of unknown parts whose SQL
+  fragments live in another package, a lower-case keyword without a SQL shape after an unknown part
+  (`f"{BASE} or deleted"`), SQL reached through `getattr`, `eval` or a container the check does not follow;
+- a wrong tenant value in a correctly shaped statement (a store created for the wrong tenant), and the allowlisted
+  cross-tenant statements themselves (each has a reason; a changed statement no longer matches and is reviewed again).
+
+This is acceptable without RLS because every one of these needs code that leaves the store's patterns: all SQL on
+`nodestro_*` tables lives in the runtime's stores and is written as literal text with the tenant as a parameter (the
+check proves this for all of it today: no finding, only the allowlisted cross-tenant statements); the store object
+that supplies the tenant id is the same one RLS would take it from, so RLS would add only a second check of the same
+value, at the measured cost above; and the runtime role cannot alter the tables. Code review keeps new SQL inside the
+stores; revisit RLS when Nodestro's store runs inside per-request transactions anyway.
 
 ## Tenant secrets and key rotation
 
@@ -312,10 +345,12 @@ identity). A suspended tenant is closed, not deleted:
   tool-wait sweeps for it. The check is `IdentityStore.tenant_active`, answered by the identity backend.
 - API processes stop what its context started in the background within `suspension_check` seconds
   (`server_app.stop_tenant_work`, stop code `identity.tenant_suspended`): batches, benchmarks with their judge,
-  assistant answers, architect drafts, live run chat answers (`RunChat.cancel_answers`: the question fails at once and
+  assistant answers, architect drafts, tool generation jobs (`ToolLibrary.cancel_jobs`: the job is `failed` at once
+  with `message_code` `identity.tenant_suspended`; no further model request, a running sandbox test is killed and its
+  container removed, a wait for a decision ends, the tool is never registered; security review NF-1), live run chat answers (`RunChat.cancel_answers`: the question fails at once and
   a late answer is not stored) and Python environment installations (`PythonEnvironments.cancel_installs`: stopped
   before their next step; a `uv` or `docker build` command already running finishes, bounded by its timeout, but its
-  result is never checked or used). Security review SR-03, SR-03a.
+  result is never checked or used). Security review SR-03, SR-03a, NF-1.
 - In `axentra` mode a tenant counts as suspended when **either** side says so: a suspension made directly in Axentra
   closes it at once (fail closed), and resuming it needs Nodestro's command when Nodestro's side is suspended. In
   `nodestro`/`mirror` mode Nodestro's status decides (`mirror` writes it to Axentra too). The backfill copies a
