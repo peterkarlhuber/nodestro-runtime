@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal
 import uuid
 
@@ -21,14 +22,28 @@ Effort = Literal["low", "medium", "high", "xhigh", "max"]
 ThinkingMode = Literal["adaptive", "between_tools", "disabled"]
 ThinkingDisplay = Literal["summarized", "omitted", "updates"]
 NodeType = Literal["start", "agent", "output", "condition", "approval", "subworkflow", "orchestrator"]
-#: ``paused``: the run waits for a human decision at an approval node.
+#: ``paused``: the run waits for a human decision: at an approval node, at a tool call (M6b), or about its budget
+#: (BUDGET-1; then ``Run.budget.pending_request_id`` is set and nodes wait as ``awaiting_budget``).
 RunStatus = Literal["queued", "running", "paused", "succeeded", "failed", "cancelled"]
 #: ``skipped``: deliberately not run, because its branch was not chosen (no error);
 #: ``blocked``: not run, because a predecessor failed or was cancelled;
-#: ``awaiting_approval``: an approval node waiting for a person.
+#: ``awaiting_approval``: an approval node waiting for a person;
+#: ``awaiting_budget``: stopped before a model request until a person raises the run's budget or ends the run
+#: (:mod:`nodestro_runtime.run_budget`).
 NodeStatus = Literal[
-    "idle", "waiting", "running", "succeeded", "failed", "skipped", "blocked", "awaiting_approval", "cancelled"
+    "idle",
+    "waiting",
+    "running",
+    "succeeded",
+    "failed",
+    "skipped",
+    "blocked",
+    "awaiting_approval",
+    "awaiting_budget",
+    "cancelled",
 ]
+#: Node statuses that wait for a person: the node is suspended and continues after the decision.
+WAITING_NODE_STATUSES: frozenset[str] = frozenset({"awaiting_approval", "awaiting_budget"})
 #: What started a run.
 #: ``api``: a published workflow API (:mod:`nodestro_api.serving`); ``trigger_ref`` is the publication.
 RunTrigger = Literal["manual", "schedule", "batch", "benchmark", "subworkflow", "resume", "api"]
@@ -757,6 +772,35 @@ class SanitizeReport(_Model):
     replaced: dict[str, int] = Field(default_factory=dict)
 
 
+class BudgetRaise(_Model):
+    """One approved raise of a run's budget (BUDGET-1); the request in ``budget_requests`` holds the full record."""
+
+    request_id: str
+    previous_limit_usd: Decimal
+    new_limit_usd: Decimal
+    decided_by: str
+    decided_at: datetime = Field(default_factory=now)
+
+
+class RunBudget(_Model):
+    """The budget of one run, apart from every configuration it came from (BUDGET-1).
+
+    ``initial_limit_usd`` is the effective limit the run started with (the workflow's budget, else the workspace's
+    default budget, or a published release's run limit); ``limit_usd`` is the limit that applies now: the initial one
+    or the last approved raise. A raise changes only this run: never the workflow, its saved versions or the
+    settings, and never another run. ``None`` limits mean: no limit.
+    """
+
+    #: Where the initial limit came from: ``workflow``, ``default`` (workspace setting), ``release`` (a published
+    #: API's run limit), ``team`` / ``subworkflow`` (a child run's own workflow budget) or ``none``.
+    source: Literal["workflow", "default", "release", "subworkflow", "team", "none"] = "none"
+    initial_limit_usd: Decimal | None = None
+    limit_usd: Decimal | None = None
+    raises: list[BudgetRaise] = Field(default_factory=list)
+    #: The budget request that waits for a decision (top-level runs only), ``None`` otherwise.
+    pending_request_id: str | None = None
+
+
 class RunIn(_Model):
     input: str = ""
     file_ids: list[str] = Field(default_factory=list)
@@ -818,6 +862,12 @@ class Run(_Model):
     release_number: int | None = None
     #: The API key that started it (its id, never the key itself).
     api_key_id: str | None = None
+    #: The principal that started it (``local`` on a desktop; a user id on a server), when known. A budget raise
+    #: needs this principal or an administrator (BUDGET-1).
+    started_by: str | None = None
+    #: The run's own budget: initial limit, approved raises, pending decision (``None`` before the first start or
+    #: for runs of earlier versions).
+    budget: RunBudget | None = None
 
 
 class RunSummary(_Model):
@@ -843,6 +893,8 @@ class RunSummary(_Model):
     workflow_version: int | None = None
     release_id: str | None = None
     release_number: int | None = None
+    #: The run budget (BUDGET-1): a set ``pending_request_id`` means the paused run waits for a budget decision.
+    budget: RunBudget | None = None
 
 
 class RunEvent(_Model):
@@ -879,6 +931,12 @@ class SettingsIn(_Model):
     ocr_enabled: bool | None = None
     #: ``standard`` or ``strict``: whether requests without a known (or with a long unchecked) price are refused.
     price_mode: Literal["standard", "strict"] | None = None
+    #: The highest limit a person may raise a run's budget to (BUDGET-1); ``None`` keeps the current value. Send
+    #: ``clear_max_run_budget`` to remove it.
+    max_run_budget_usd: Decimal | None = Field(default=None, ge=0, le=1_000_000, decimal_places=2)
+    clear_max_run_budget: bool | None = None
+    #: How long a budget decision of an attended run waits before the run ends (hours).
+    budget_decision_hours: int | None = Field(default=None, ge=1, le=720)
 
 
 class BuiltinSandboxStatus(_Model):
@@ -988,3 +1046,10 @@ class Settings(_Model):
     ocr_available: bool = False
     #: How unknown and stale prices are treated (PRICING-1): ``standard`` warns, ``strict`` refuses.
     price_mode: Literal["standard", "strict"] = "standard"
+    #: The highest limit a budget decision may raise a run's budget to (BUDGET-1; ``None``: no maximum). The limits
+    #: workflows start with are not affected.
+    max_run_budget_usd: Decimal | None = None
+    #: The operator's maximum on a server (``NODESTRO_MAX_RUN_BUDGET_USD``): a tenant cannot lift it.
+    operator_max_run_budget_usd: Decimal | None = None
+    #: How long a budget decision of an attended run waits before the run ends (hours).
+    budget_decision_hours: int = 24
