@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
+`return_to` tokens are never adopted; 2026-11-02).
+
 The resolve path on a real Docker engine (RT-038; 2026-11-02):
 
 - `tests/test_resolve_real_engine.py` runs `ContainerImages.compile_in_container` against a real daemon
