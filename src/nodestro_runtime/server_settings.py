@@ -15,13 +15,20 @@ unsafe one with ``profile.invalid``, listing every problem at once. Nothing has 
 ``NODESTRO_SECRET_KEY`` (or ``_FILE``)    at least 32 random bytes, base64: encrypts tenant secrets at rest
 ========================================  ==================================================================
 
+Optional Axentra platform services (``NODESTRO_AXENTRA``, ``NODESTRO_AXENTRA_KEYRING``, ``NODESTRO_SECRETS_FORMAT``,
+...) are read by :class:`~nodestro_runtime.axentra_platform.AxentraConfig` in the same pass; all of them are off by
+default.
+
 A ``…_FILE`` variable names a file holding the value (container secrets); giving both forms is refused. Secret
 values never appear in ``repr``, errors or logs.
 
 :class:`SecretBox` encrypts tenant secrets (provider API keys) with AES-256-GCM. Each tenant gets its own key,
 derived from the server's secret key with HKDF-SHA256; the tenant and the field are bound as associated data, so
-a value copied to another tenant or another field does not decrypt. Rotation of the server key is not supported
-yet: changing it makes the stored secrets unreadable (they must be entered again).
+a value copied to another tenant or another field does not decrypt. This v1 format has no key id and cannot rotate;
+with ``NODESTRO_AXENTRA=on`` and ``NODESTRO_SECRETS_FORMAT=axs1`` new secrets are written with Axentra's rotatable
+keyring instead and ``nodestro-server secrets reencrypt`` moves the stored ones
+(:class:`~nodestro_runtime.axentra_platform.KeyringSecretBox`); v1 values stay readable as long as
+``NODESTRO_SECRET_KEY`` is configured.
 """
 
 from __future__ import annotations
@@ -32,8 +39,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlsplit
 
+from .axentra_platform import AxentraConfig, KeyringSecretBox
 from .problems import NodestroError
 
 #: Prefix of an encrypted value; anything else is not a secret this module wrote.
@@ -41,6 +50,15 @@ ENCRYPTED_PREFIX = "nodestro:enc:v1:"
 _KEY_BYTES = 32
 _NONCE_BYTES = 12
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class TenantSecrets(Protocol):
+    """What stores need from a secret box: encrypt and decrypt one tenant's field (:class:`SecretBox` and
+    :class:`~nodestro_runtime.axentra_platform.KeyringSecretBox`)."""
+
+    def encrypt(self, tenant_id: str, name: str, plaintext: str) -> str: ...
+
+    def decrypt(self, tenant_id: str, name: str, token: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -53,6 +71,8 @@ class ServerSettings:
     oidc_client_id: str
     oidc_client_secret: str = field(repr=False)
     secret_key: bytes = field(repr=False)
+    #: Optional Axentra platform services (off by default).
+    axentra: AxentraConfig = field(default_factory=AxentraConfig)
 
     @property
     def redirect_uri(self) -> str:
@@ -64,8 +84,14 @@ class ServerSettings:
         """Whether session cookies carry ``Secure`` (always, except for a loopback development origin)."""
         return urlsplit(self.public_origin).scheme == "https"
 
-    def secret_box(self) -> SecretBox:
-        return SecretBox(self.secret_key)
+    def secret_box(self) -> SecretBox | KeyringSecretBox:
+        """The tenant secret box: v1, or Axentra's keyring (reading v1 too) when Axentra is switched on."""
+        legacy = SecretBox(self.secret_key)
+        if not self.axentra.enabled:
+            return legacy
+        from .axentra_platform import keyring_secret_box
+
+        return keyring_secret_box(self.axentra, legacy)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerSettings:
@@ -118,6 +144,7 @@ class ServerSettings:
                         "(for example: openssl rand -base64 32)",
                     )
                 )
+        axentra = AxentraConfig.from_env(environ, problems)
         if problems:
             raise NodestroError(
                 "profile.invalid",
@@ -131,6 +158,7 @@ class ServerSettings:
             oidc_client_id=client_id,
             oidc_client_secret=client_secret,
             secret_key=key,
+            axentra=axentra,
         )
 
 
@@ -218,7 +246,10 @@ class SecretBox:
 
 
 def is_encrypted(value: object) -> bool:
-    return isinstance(value, str) and value.startswith(ENCRYPTED_PREFIX)
+    """Whether ``value`` is an encrypted secret: v1 (``nodestro:enc:v1:``) or Axentra's ``axs1.<kid>.…``."""
+    return isinstance(value, str) and (
+        value.startswith(ENCRYPTED_PREFIX) or (value.startswith("axs1.") and value.count(".") == 3)
+    )
 
 
-__all__ = ["ENCRYPTED_PREFIX", "SecretBox", "ServerSettings", "is_encrypted"]
+__all__ = ["ENCRYPTED_PREFIX", "SecretBox", "ServerSettings", "TenantSecrets", "is_encrypted"]

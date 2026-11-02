@@ -31,11 +31,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The server profile: PostgreSQL, and encryption of tenant secrets (server_settings.SecretBox).
-postgres = ["psycopg[binary,pool]>=3.2", "cryptography>=42"]
+# The server profile: PostgreSQL, encryption of tenant secrets (server_settings.SecretBox) and the Axentra platform
+# services (axentra_platform, off unless NODESTRO_AXENTRA=on). Axentra needs Python 3.11+: on 3.10 the server
+# profile works without it, and switching it on is refused. The desktop and Local Docker never install this extra.
+postgres = [
+    "psycopg[binary,pool]>=3.2",
+    "cryptography>=42",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@d6aab1e70040653b0230200adf707db5379eb1e3; python_version >= '3.11'",
+]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@d6aab1e70040653b0230200adf707db5379eb1e3; python_version >= '3.11'",
     "mypy>=1.13",
     "pytest>=8",
     "pytest-asyncio>=0.24",
@@ -88,3 +95,9 @@ ignore_missing_imports = true
 # boto3/botocore (Amazon Bedrock, through orkexa[bedrock]) ship no type information.
 module = ["boto3", "boto3.*", "botocore", "botocore.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Axentra (optional, server profile) needs Python 3.11+; mypy checks against 3.10, where it is not installed.
+module = ["axentra", "axentra.*"]
+ignore_missing_imports = true
+
