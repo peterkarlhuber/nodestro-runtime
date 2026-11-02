@@ -1,11 +1,17 @@
-"""Tenants, users, roles, sessions and bootstrap tokens in PostgreSQL (needs ``NODESTRO_TEST_POSTGRES``)."""
+"""Tenants, users, roles, sessions and bootstrap tokens in PostgreSQL (needs ``NODESTRO_TEST_POSTGRES``).
+
+Contract tests: every case runs against each identity backend (``NODESTRO_IDENTITY_BACKEND``): ``nodestro`` (the
+store alone), ``mirror`` (Nodestro's tables answer, Axentra is written in the same transaction) and ``axentra``
+(Axentra answers). The Axentra cases need the ``axentra`` package (Python 3.11+).
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import timedelta
 import hashlib
 import threading
+from typing import Any
 
 import postgres_support
 import pytest
@@ -20,20 +26,55 @@ from nodestro_runtime.storage_postgres import PostgresDatabase
 ISSUER = "https://login.example"
 
 
+BACKENDS = ("nodestro", "mirror", "axentra")
+
+
 @pytest.fixture
 def database() -> Iterator[PostgresDatabase]:
     dsn = postgres_support.require_postgres()
     schema = postgres_support.new_schema()
     opened = PostgresDatabase(dsn, schema=schema)
     opened.migrate()
+    opened.test_schema = schema  # type: ignore[attr-defined]
     yield opened
     opened.close()
     postgres_support.drop_schema(schema)
 
 
+@pytest.fixture(params=BACKENDS)
+def backend(request: pytest.FixtureRequest) -> str:
+    if request.param != "nodestro":
+        pytest.importorskip("axentra", reason="Axentra needs Python 3.11+")
+    return str(request.param)
+
+
 @pytest.fixture
-def identity(database: PostgresDatabase) -> IdentityStore:
-    return IdentityStore(database)
+def make(database: PostgresDatabase, backend: str) -> Iterator[Callable[..., IdentityStore]]:
+    """Builds the identity store of ``backend`` (keyword arguments: the lifetimes)."""
+    services: Any = None
+    if backend != "nodestro":
+        from identity_support import axentra_services
+
+        services = axentra_services(database)
+
+    def build(**lifetimes: Any) -> IdentityStore:
+        if services is None:
+            return IdentityStore(database, **lifetimes)
+        from nodestro_runtime.axentra_identity import AxentraIdentityStore
+        from nodestro_runtime.axentra_platform import AxentraLink
+
+        store = AxentraIdentityStore(database, AxentraLink(services, database), mode=backend, **lifetimes)
+        store.ensure_roles()
+        return store
+
+    yield build
+    if services is not None:
+        services.close()
+
+
+@pytest.fixture
+def identity(make: Callable[..., IdentityStore]) -> IdentityStore:
+    return make()
 
 
 def _hash(token: str) -> bytes:
@@ -108,14 +149,22 @@ def test_sessions_end(identity: IdentityStore) -> None:
     assert identity.session(second) is None and identity.session(third) is None
 
 
-def test_sessions_expire_and_time_out(database: PostgresDatabase) -> None:
-    identity = IdentityStore(database, session_lifetime=timedelta(seconds=-1))
+def test_sessions_expire_and_time_out(make: Callable[..., IdentityStore], database: PostgresDatabase) -> None:
+    identity = make(session_lifetime=timedelta(seconds=-1))
     identity.create_tenant("acme", "ACME")
     user = identity.login(ISSUER, "sub-1")
     identity.set_role("acme", user.id, "owner")
     assert identity.session(identity.create_session(user.id, "acme")) is None
-    idle = IdentityStore(database, idle_timeout=timedelta(seconds=-1))
-    assert idle.session(idle.create_session(user.id, "acme")) is None
+    idle = make()
+    token = idle.create_session(user.id, "acme")
+    assert idle.session(token) is not None
+    # Idle for 1 h 59 min: still valid; for 2 h 1 min: ended (on both sides, measured on the database clock).
+    from identity_support import age_sessions
+
+    age_sessions(database, timedelta(hours=1, minutes=59))
+    assert idle.session(token) is not None
+    age_sessions(database, timedelta(hours=2, minutes=1))
+    assert idle.session(token) is None
     assert idle.cleanup() >= 2
 
 
@@ -148,8 +197,8 @@ def test_login_states_are_taken_once(identity: IdentityStore) -> None:
     assert identity.take_login_state("unknown") is None
 
 
-def test_expired_login_states_are_refused(database: PostgresDatabase) -> None:
-    identity = IdentityStore(database, login_lifetime=timedelta(seconds=-1))
+def test_expired_login_states_are_refused(make: Callable[..., IdentityStore]) -> None:
+    identity = make(login_lifetime=timedelta(seconds=-1))
     state = identity.create_login_state(nonce="n", code_verifier="v", return_to="/")
     assert identity.take_login_state(state) is None
 

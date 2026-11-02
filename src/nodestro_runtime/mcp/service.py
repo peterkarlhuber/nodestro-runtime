@@ -22,6 +22,7 @@ from typing import Any
 
 from orkexa import Tool
 
+from ..platform_events import platform_events
 from ..problems import NodestroError
 from ..release import McpToolRef
 from ..schemas import now
@@ -926,7 +927,23 @@ class McpService:
     ) -> McpEvent:
         record = McpEvent(kind=kind, actor=actor, server_id=server_id, tool=tool, details=details)
         try:
-            self.store.put(EVENTS, f"{record.at.isoformat()}_{record.id}", record)
+            sink = platform_events(self.store)
+            if sink is None:
+                self.store.put(EVENTS, f"{record.at.isoformat()}_{record.id}", record)
+            else:  # the mirror commits with the event (see nodestro_runtime.platform_events)
+                with self.store.transaction():
+                    self.store.put(EVENTS, f"{record.at.isoformat()}_{record.id}", record)
+                    sink.audit(
+                        str(getattr(self.store, "tenant_id", "")),
+                        event_id=record.id,
+                        at=record.at,
+                        action=f"nodestro.mcp.{kind}",
+                        actor=actor,
+                        target_type="mcp_server" if server_id else "",
+                        target_id=server_id or "",
+                        outcome="success",
+                        details=mcp_event_details(record),
+                    )
         except Exception:
             logger.exception("Could not store MCP event %s", kind)
         return record
@@ -938,3 +955,14 @@ class McpService:
             for key, _ in items[MAX_EVENTS:]:
                 self.store.delete(EVENTS, key)
         return [event for _, event in items[:limit]]
+
+
+def mcp_event_details(event: McpEvent) -> dict[str, Any]:
+    """What the platform mirror of ``event`` keeps: its ids and details, with every address redacted (an address
+    with a secret in it is never mirrored as it is)."""
+    details: dict[str, Any] = {"nodestro_event": event.id, "nodestro_actor": event.actor}
+    if event.tool is not None:
+        details["tool"] = event.tool
+    for key, value in event.details.items():
+        details[key] = redact_url(value) if key == "url" and isinstance(value, str) else value
+    return details
