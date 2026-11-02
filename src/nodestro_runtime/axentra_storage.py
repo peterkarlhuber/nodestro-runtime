@@ -131,6 +131,8 @@ class FilesReport:
     unreferenced: list[dict[str, str]] = field(default_factory=list)
     #: Leftovers younger than :data:`LEFTOVER_GRACE` (not listed, not removed).
     recent: int = 0
+    #: A listed leftover makes the report not ``ok`` (``verify``; a ``cleanup --dry-run`` only lists them).
+    leftovers_fail: bool = False
 
     def fail(self, tenant: str, blob: str, reason: str) -> None:
         self.failed.append({"tenant": tenant, "blob": blob, "reason": reason})
@@ -151,7 +153,7 @@ class FilesReport:
             "orphans": list(self.orphans),
             "unreferenced": list(self.unreferenced),
             "recent": self.recent,
-            "ok": not self.failed and not self.orphans and not self.unreferenced,
+            "ok": not self.failed and not (self.leftovers_fail and (self.orphans or self.unreferenced)),
         }
 
 
@@ -455,7 +457,7 @@ class AxentraFiles:
         """Read every mapped object back and compare its SHA-256 (records ``verified_at``); report volume blobs not
         migrated yet (``pending``) and the leftovers :meth:`cleanup` removes: Axentra objects without a mapping
         (``orphans``) and mappings no input file uses (``unreferenced``). Either makes the report not ``ok``."""
-        report = FilesReport()
+        report = FilesReport(leftovers_fail=True)
         for tenant_id in self._tenants(tenant):
             report.tenants += 1
             store = self.database.store(tenant_id)

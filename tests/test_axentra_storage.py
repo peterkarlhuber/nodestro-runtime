@@ -422,6 +422,7 @@ def test_an_object_of_a_cut_off_copy_fails_verify_and_cleanup_removes_it(files: 
     assert not late["ok"] and [entry["file"] for entry in late["orphans"]] == [cut_off.axentra_file]
     planned = files.cleanup(dry_run=True, now=_later())
     assert planned.removed == 0 and [entry["file"] for entry in planned.orphans] == [cut_off.axentra_file]
+    assert planned.as_dict()["ok"]  # a dry run lists them; only verify fails on them
     assert files.cleanup(now=_later()).removed == 1
     assert {row[0]: row[2] for row in _axentra_rows(files.database)}[cut_off.axentra_file] == "deleted"
     assert files.verify(data_root, now=_later()).as_dict()["ok"]
