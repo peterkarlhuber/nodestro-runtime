@@ -27,8 +27,8 @@ One container owner per installation (Docker-first plan R2 follow-up, 2026-11-02
 - `monitor_for(..., owner=...)` (new optional parameter): one monitor per daemon and owner;
   `python_envs.installation_id(root)` is the installation id behind `PythonEnvironments.installation`.
 - The sandbox gateway already passes on any well-formed owner label (tests added for the new owners).
-- Orkexa pin moved to `f5cd7ea146485b1de43de55acec58c45f0a503fc` (Orkexa PR #31 merged: container shape, stdin
-  transport, preflight, self-test, reaper).
+- Orkexa pin moved to `e220f706611dc8f2cc7cb4c87e44306a25f93fbf` (Orkexa PR #31: container shape, stdin
+  transport, preflight, self-test, reaper; and PR #32: backward-compatible budget primitives).
 
 Docker-first sandbox status (Docker-first plan R2, 2026-11-02):
 
