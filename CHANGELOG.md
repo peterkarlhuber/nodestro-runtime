@@ -26,6 +26,15 @@ Identity completion (Axentra migration M5, risks 7 and 10; off by default):
 
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 
+- Observability, notifications, run usage and secrets rollback (all off by default, needs Axentra with the inbox
+  channel, migration `0010_notify_inbox`): `axentra_metrics.ServerMetrics` on Axentra's metrics registry (pools,
+  jobs, leases, schema state, reconcile backlog, run cost of 24 h, operations by outcome; no tenant labels);
+  `NODESTRO_AXENTRA_RUN_USAGE` settles finished runs once per run and meter (`nodestro:run:<run>:<meter>`);
+  `NODESTRO_AXENTRA_NOTIFY` puts failed runs, pending approvals and budget decisions into the members' Axentra inbox
+  (`axentra_notify`, idempotent per event and recipient, never e-mail); `require_readable_secrets` refuses to start
+  `NODESTRO_AXENTRA=off` while `axs1` values exist or with a keyring missing a key id in use, and
+  `NODESTRO_SECRETS_FORMAT=v1` re-encryption moves `axs1` values back to v1. See `docs/AXENTRA.md`.
+
 - New `nodestro_runtime.axentra_platform` and `docs/AXENTRA.md`. `NODESTRO_AXENTRA=on` opens Axentra in the server's
   PostgreSQL database (product `nodestro`, single-product mode, keyring from `NODESTRO_AXENTRA_KEYRING[_FILE]`).
   `nodestro-runtime[postgres]` and `[dev]` install `axentra[oidc]` from a pinned commit on Python 3.11+ only; 3.10
