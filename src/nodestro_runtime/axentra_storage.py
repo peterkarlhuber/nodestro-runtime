@@ -192,7 +192,8 @@ class AxentraFiles:
 
     def check(self) -> None:
         """Refuse a configuration that would lose files: a relative local directory depends on the working
-        directory of each process (``profile.invalid``)."""
+        directory of each process (``profile.invalid``). The local directory is created when it is missing (owner
+        only), so a fresh installation can be backed up before its first upload."""
         cfg = self.storage.cfg
         if cfg.backend == "local" and not Path(cfg.local_path).is_absolute():
             raise NodestroError(
@@ -200,6 +201,8 @@ class AxentraFiles:
                 "Axentra's storage.local_path must be an absolute directory shared by the API and the workers "
                 f"(set it in NODESTRO_AXENTRA_CONFIG; found {cfg.local_path!r})",
             )
+        if cfg.backend == "local":
+            Path(cfg.local_path).mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def ensure_policy(self) -> str:
         """Product ``nodestro`` keeps blocked types (executables, HTML, SVG, scripts) as inert attachments unless

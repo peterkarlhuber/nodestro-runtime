@@ -552,3 +552,10 @@ def test_a_tenant_with_a_long_name_gets_its_axentra_tenant_for_files(files: Any,
         "SELECT name FROM axentra_tenants WHERE id = %s", (files.link.tenant("long"),)
     )
     assert len(rows[0][0]) == NAME_LIMIT
+
+
+def test_the_local_directory_exists_after_the_start_before_any_upload(files: Any, tmp_path: Path) -> None:
+    """A fresh installation is backed up before its first upload: the backup archives the directory."""
+    directory = tmp_path / "objects"
+    assert directory.is_dir() and (directory.stat().st_mode & 0o777) == 0o700
+    assert list(directory.iterdir()) == []
