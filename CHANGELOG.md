@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Axentra pin: `f3ed8d22a8bd45faff84204786e01da32ece4034` (axentra #28, #27: secret-free OIDC `return_to`, `POST`
+OIDC start, encoded-token redaction; 2026-11-02).
+
 Static tenant SQL check: the gaps of security review round 3 closed (#89; 2026-11-02):
 
 - `tenant_sql_check` fails closed on the remaining bypasses: adjacent constants are joined without a gap (a table
