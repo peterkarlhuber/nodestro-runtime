@@ -13,16 +13,24 @@ alter them.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from decimal import Decimal
 import threading
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from orkexa import UsageRecord
-from orkexa.dynamic import BudgetTracker, UnpricedModelError
+from orkexa import Reservation, UsageRecord
+from orkexa.dynamic import BudgetExceededError, BudgetTracker, UnpricedModelError
 from orkexa.pricing import ModelPrice, PriceLookup
 
 from .pricing import REGIONAL_PROVIDERS, PricingService, missing_conditions
 from .problems import NodestroError
+
+if TYPE_CHECKING:
+    from .run_budget import RunBudgetGate, TrackerScope
+
+#: Set while the outermost tracker of a request admits it: the parents it passes the reservation on to do not hold
+#: the request again (BUDGET-1).
+_ADMITTING: ContextVar[bool] = ContextVar("nodestro_budget_admitting", default=False)
 
 #: ``standard``: unknown prices and stale prices only warn (the default). ``strict``: a request without a known
 #: price, or with a price not checked for longer than ``critical_after``, is not sent; a request whose cost
@@ -34,7 +42,20 @@ PRICE_MODES: tuple[str, ...] = ("standard", "strict")
 
 
 class PricedTracker(BudgetTracker):
-    """A budget tracker priced with the workspace's catalog."""
+    """A budget tracker priced with the workspace's catalog.
+
+    **Budget decisions (BUDGET-1).** The trackers of an attended run carry the run's
+    :class:`~nodestro_runtime.run_budget.RunBudgetGate` (``budget_gate``) and the run whose limit they hold
+    (``budget_scope``). For them a refused request is not an error of the run: the gate opens one budget request for
+    the run and stops the requesting turn before anything is sent (:class:`orkexa.RequestSuspended`); while it is
+    pending every further request of the run waits too. The limit check before a request therefore happens where
+    the request's most expensive outcome is known (:meth:`try_reserve`), and such trackers never raise after a
+    request was recorded: the paid response is used, and the next request waits for the decision.
+    """
+
+    #: The run's budget decisions (attended runs only) and the run whose limit this tracker holds.
+    budget_gate: RunBudgetGate | None = None
+    budget_scope: TrackerScope | None = None
 
     def __init__(
         self,
@@ -107,6 +128,46 @@ class PricedTracker(BudgetTracker):
                     "the request was not sent (strict price mode)",
                     model=f"{provider}:{model}",
                 )
+
+    # ---- budget decisions (BUDGET-1) ------------------------------------------------------------------------------
+
+    def before_request(self, *, agent: str, provider: str, model: str, priced: bool) -> None:
+        if self.budget_gate is None:
+            super().before_request(agent=agent, provider=provider, model=model, priced=priced)
+            return
+        # The limit is checked by try_reserve, which also knows the request's cost bound; the other checks stay.
+        if not priced and self.on_unpriced == "reject":
+            raise UnpricedModelError(
+                f"No price known for {provider}:{model} (agent {agent!r}); the budget cannot be enforced"
+            )
+        if self.parent is not None:
+            upstream = f"{self.prefix}/{agent}" if self.prefix else agent
+            self.parent.before_request(agent=upstream, provider=provider, model=model, priced=priced)
+
+    def try_reserve(self, *, agent: str, provider: str, model: str, amount: Decimal | None) -> Reservation | None:
+        gate = self.budget_gate
+        if gate is None or _ADMITTING.get():
+            return super().try_reserve(agent=agent, provider=provider, model=model, amount=amount)
+        token = _ADMITTING.set(True)
+        try:
+            gate.hold(self, agent=agent, provider=provider, model=model, amount=amount)
+            try:
+                return super().try_reserve(agent=agent, provider=provider, model=model, amount=amount)
+            except UnpricedModelError:
+                raise  # a price problem: a higher budget cannot fix it
+            except BudgetExceededError as exc:
+                blocking = getattr(exc, "tracker", None)
+                if not isinstance(blocking, PricedTracker) or blocking.budget_scope is None:
+                    raise
+                gate.block(blocking, exc, agent=agent, provider=provider, model=model, amount=amount, requester=self)
+                raise  # not reached: block() stops the turn or raises exc
+        finally:
+            _ADMITTING.reset(token)
+
+    def check(self) -> None:
+        if self.budget_gate is not None:
+            return  # recorded costs never end an attended run: its next request waits for a decision instead
+        super().check()
 
     def note(self, record: UsageRecord) -> None:
         """Remember whether ``record`` was priced with a stale price."""

@@ -73,7 +73,7 @@ def _invocation(node: Node, state: NodeRun) -> flow.Invocation | None:
             error=state.error_code,
             dispatches=1,
         )
-    if state.status == "awaiting_approval":
+    if state.status in ("awaiting_approval", "awaiting_budget"):
         return flow.Invocation(id=ident, node=node.id, status="suspended", dispatches=1)
     # waiting, idle, or running (a run that stopped mid-node runs it again, as before)
     return None
@@ -112,7 +112,7 @@ def result_of(node: Node, state: NodeRun) -> flow.Result:
             return flow.Result(status="succeeded")
         known = set(ports(node))
         return flow.Result(status="succeeded", ports=tuple(port for port in opened if port in known))
-    if state.status == "awaiting_approval":
+    if state.status in ("awaiting_approval", "awaiting_budget"):
         return flow.Result(status="suspended")
     if state.status == "cancelled":
         return flow.Result(status="cancelled", error=state.error_code)

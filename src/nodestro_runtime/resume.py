@@ -280,8 +280,16 @@ def _request(source: Run) -> RunIn:
     return RunIn(input=text or "", values=source.values, file_ids=[] if source.values else source.file_ids)
 
 
-async def resume(ctx: Workspace, run_id: str, *, mode: Literal["continue", "restart"], confirm: bool) -> Run:
-    """Start the continued run (or, with ``restart``, a complete new run linked to the old one)."""
+async def resume(
+    ctx: Workspace,
+    run_id: str,
+    *,
+    mode: Literal["continue", "restart"],
+    confirm: bool,
+    started_by: str | None = None,
+) -> Run:
+    """Start the continued run (or, with ``restart``, a complete new run linked to the old one). The new run starts
+    with the regular budget again (BUDGET-1): raises of the earlier run were for that run only."""
     source = _source(ctx, run_id)
     found = plan(ctx, run_id)
     if source.trigger == "api" and source.release_id:
@@ -294,7 +302,15 @@ async def resume(ctx: Workspace, run_id: str, *, mode: Literal["continue", "rest
     if source.values:
         request.file_ids = [item for item in source.file_ids if item not in _form_files(source)]
     if mode == "restart":
-        return await launch(ctx, current, request, trigger="resume", trigger_ref=source.id, resumed_from=source.id)
+        return await launch(
+            ctx,
+            current,
+            request,
+            trigger="resume",
+            trigger_ref=source.id,
+            resumed_from=source.id,
+            started_by=started_by,
+        )
     if not found.possible:
         blocking = next(item for item in found.issues if item.level == "error")
         raise NodestroError(blocking.code, blocking.message, **blocking.params)
@@ -313,7 +329,14 @@ async def resume(ctx: Workspace, run_id: str, *, mode: Literal["continue", "rest
             state.approval.reused_from = source.id
         preset[entry.node_id] = state
     return await launch(
-        ctx, current, request, trigger="resume", trigger_ref=source.id, resumed_from=source.id, preset=preset
+        ctx,
+        current,
+        request,
+        trigger="resume",
+        trigger_ref=source.id,
+        resumed_from=source.id,
+        preset=preset,
+        started_by=started_by,
     )
 
 

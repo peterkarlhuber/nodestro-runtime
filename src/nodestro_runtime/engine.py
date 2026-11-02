@@ -27,12 +27,15 @@ import concurrent.futures
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 import functools
 import json
 import logging
 import os
+from pathlib import Path
 import re
+import tempfile
 import threading
 import time
 from typing import Any, Literal, TypeVar
@@ -60,13 +63,14 @@ from orkexa import (
     flow,
     orchestration,
     refine,
+    tool_results_of_last_turn,
 )
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
 from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
+from . import contracts, flow_driver, graph, run_budget, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
@@ -91,6 +95,7 @@ from .providers import Connection, check_model, model_id, provider_of
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
+    WAITING_NODE_STATUSES,
     AgentConfig,
     ApprovalConfig,
     ApprovalRecord,
@@ -101,8 +106,10 @@ from .schemas import (
     KnowledgeProposal,
     Node,
     NodeRun,
+    NodeStatus,
     OutputConfig,
     Run,
+    RunBudget,
     RunEvent,
     RunIn,
     RunTrigger,
@@ -752,7 +759,7 @@ class _ChildTracker(PricedTracker):
     parent's budget can hold its most expensive outcome, and neither side can spend past the other's limit.
     """
 
-    def __init__(self, parent: BudgetTracker, prefix: str, limit_usd: float | None = None) -> None:
+    def __init__(self, parent: BudgetTracker, prefix: str, limit_usd: float | Decimal | None = None) -> None:
         if isinstance(parent, PricedTracker):
             # The parent warns about unpriced usage once; the child only rejects it in strict mode.
             super().__init__(
@@ -762,16 +769,21 @@ class _ChildTracker(PricedTracker):
                 parent=parent,
                 prefix=prefix,
                 on_unpriced="reject" if parent.mode == "strict" else "ignore",
+                on_oversized=parent.on_oversized,
             )
         else:
             super().__init__(limit_usd, parent=parent, prefix=prefix, on_unpriced="ignore")
             self.price_resolver = parent.price_resolver
 
     def before_request(self, *, agent: str, provider: str, model: str, priced: bool) -> None:
-        if self.limit_usd is not None and self.spent_usd >= self.limit_usd:
+        if self.budget_gate is None and self.limit_usd is not None and self.spent_usd >= self.limit_usd:
             raise BudgetExceededError(
                 f"Budget of the sub-workflow used up: spent ${self.spent_usd:.4f} of ${self.limit_usd:.4f}; "
-                f"request of agent {agent!r} to {provider}:{model} not sent"
+                f"request of agent {agent!r} to {provider}:{model} not sent",
+                limit_usd=self.limit_usd,
+                spent_usd=self.spent_usd,
+                tracker=self,
+                reason="used_up",
             )
         super().before_request(agent=agent, provider=provider, model=model, priced=priced)
 
@@ -837,6 +849,8 @@ class _RunContext:
         #: nothing of it is stored or announced any more, and it is cancelled.
         self.fenced_out = False
         self.fence_lock = threading.Lock()
+        #: The budget decisions of this execution (attended top-level runs; shared with its child runs, BUDGET-1).
+        self.budget_gate: run_budget.RunBudgetGate | None = root.budget_gate if root is not None else None
 
     def check(self) -> None:
         if self.cancelled.is_set():
@@ -921,6 +935,12 @@ class RunManager:
         self.remote_poll = 0.25
         #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
         self.tool_gate: ToolGate | None = None
+        #: The budget policy (BUDGET-1): the highest limit a decision may raise a run to (``None``: none) and how many
+        #: hours an attended run waits for a decision.
+        self.budget_policy: Callable[[], tuple[Decimal | None, int]] = lambda: (
+            run_budget.operator_cap(),
+            run_budget.DEFAULT_DECISION_HOURS,
+        )
         #: The live chat of runs (LRC-1): instructions of people reach orchestrators at their next decision.
         self.chat = RunChat(store)
         #: How many agents (and orchestrator decisions) of this manager's runs execute at the same time, each in a
@@ -978,8 +998,12 @@ class RunManager:
         release_id: str | None = None,
         release_number: int | None = None,
         api_key_id: str | None = None,
+        started_by: str | None = None,
     ) -> Run:
         """Start a new run; ``preset`` node states are taken over and never executed again.
+
+        ``started_by`` names the principal that started it (BUDGET-1: who may raise its budget besides
+        administrators).
 
         ``release_id`` marks a run of a published API: it executes with its release's
         environment (see :attr:`environments`).
@@ -996,6 +1020,7 @@ class RunManager:
                 release_id=release_id,
                 release_number=release_number,
                 api_key_id=api_key_id,
+                started_by=started_by,
             )
         )
         if elsewhere is not None:
@@ -1031,15 +1056,20 @@ class RunManager:
             release_id=release_id,
             release_number=release_number,
             api_key_id=api_key_id,
+            started_by=started_by,
         )
         if preset:
             run.nodes.update({node_id: state for node_id, state in preset.items() if node_id in run.nodes})
         return self._launch(run)
 
-    def tracker(self, budget: float | None) -> PricedTracker:
-        """The tracker of one run: the budget in USD (``None``: none), priced with the workspace's catalog."""
+    def tracker(self, budget: float | Decimal | None, *, attended: bool = False) -> PricedTracker:
+        """The tracker of one run: the budget in USD (``None``: none), priced with the workspace's catalog.
+
+        ``attended`` (BUDGET-1): a request whose most expensive outcome does not fit the rest of the budget is
+        refused before it is sent (and becomes a budget decision) instead of being admitted alone."""
+        kwargs: dict[str, Any] = {"on_oversized": "reject"} if attended else {}
         return PricedTracker(
-            Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode()
+            Decimal(str(budget)) if budget is not None else None, pricing=self.pricing, mode=self.price_mode(), **kwargs
         )
 
     def environment(self, run: Run) -> RunEnvironment:
@@ -1100,6 +1130,8 @@ class RunManager:
             # compare-and-set from ``paused`` wins queues it, so there is one job and no stale run document
             # written over a run that already goes on.
             was = run.status
+            if run.parent_run_id is None:
+                self._apply_decided(run)  # a raise is part of the stored run before any worker continues it
             run.status = "queued"
             if was == "paused":
                 if not self.store.replace_if("runs", run.id, run, field="status", expected="paused"):
@@ -1110,10 +1142,25 @@ class RunManager:
             return run
         loop = _require_loop()
         workflow = run.workflow
-        limit = workflow.budget_usd if workflow.budget_usd is not None else self.default_budget()
-        run.budget_usd = limit
-        budget = _remaining(limit, run)
-        context = _RunContext(run, self.tracker(budget), self.environment(run))
+        if run.budget is None:
+            # The run's own budget (BUDGET-1), fixed when it first starts: later changes of the workflow or of the
+            # default budget do not change it, and raising it changes nothing else.
+            run.budget = run_budget.initial_budget(
+                run, workflow_budget=workflow.budget_usd, default_budget=self.default_budget()
+            )
+        self._apply_decided(run)
+        limit = run_budget.limit_of(run)
+        run.budget_usd = float(limit) if limit is not None else None
+        attended = run.trigger not in UNATTENDED_TRIGGERS and run.parent_run_id is None
+        offset = _known_decimal(run)
+        tracker = self.tracker(_remaining_decimal(limit, offset), attended=attended)
+        context = _RunContext(run, tracker, self.environment(run))
+        if attended:
+            context.budget_gate = self._budget_gate(context)
+            tracker.budget_gate = context.budget_gate
+            tracker.budget_scope = run_budget.TrackerScope(
+                run_id=run.id, limit=limit, offset=offset, unknown_before=_unknown_cost(run)
+            )
         context.loop = loop
         context.fence = fence
         self._contexts[run.id] = context
@@ -1335,16 +1382,24 @@ class RunManager:
         # a queue entry that never arrived): it ends here as cancelled.
         return self._cancel_stored(root.id, ("queued", "running", "paused"))
 
-    def _cancel_stored(self, run_id: str, statuses: tuple[str, ...] = ("paused",)) -> bool:
+    def _cancel_stored(
+        self,
+        run_id: str,
+        statuses: tuple[str, ...] = ("paused",),
+        *,
+        because: Problem | None = None,
+        status: Literal["cancelled", "failed"] = "cancelled",
+    ) -> bool:
         """Cancel a stored run in one of ``statuses`` that is not executing (its pending approvals end undecided,
         nodes stored as running end cancelled); ``False`` when it is in none of them. The write is conditional: a
-        run another process changed meanwhile is looked at again."""
+        run another process changed meanwhile is looked at again. ``because`` and ``status`` end it otherwise: a
+        person ended it at a budget decision, or the decision's deadline passed (BUDGET-1)."""
         for _attempt in range(_CAS_ATTEMPTS):
             stored = self.store.get("runs", run_id, _FencedRun)
             if stored is None or stored.status not in statuses:
                 return False
             run, fence = _split(stored)
-            status = run.status
+            read = run.status
             children: list[str] = []
             for node in run.workflow.nodes:
                 state = run.nodes.get(node.id)
@@ -1355,21 +1410,25 @@ class RunManager:
                     state.finished_at = now()
                     _fail(state, problem("run.node_cancelled", "Cancelled"))
                     children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
-                if state.status == "awaiting_approval":
+                if state.status in WAITING_NODE_STATUSES:
                     state.status = "cancelled"
                     state.finished_at = now()
                     _fail(state, problem("run.node_cancelled", "Cancelled"))
                     children += [child_id for child_id in [state.child_run_id, *state.child_run_ids] if child_id]
                     if state.orchestration is not None:
                         state.orchestration = _cancelled_orchestration(state.orchestration)
-            run.status = "cancelled"
+            run.status = status
             run.finished_at = now()
-            _fail(run, problem("run.cancelled", "The run was cancelled"))
-            if self._replace_run(run, fence=fence, status=status) is None:
+            _fail(run, because or problem("run.cancelled", "The run was cancelled"))
+            if run.budget is not None:
+                run.budget.pending_request_id = None
+            if self._replace_run(run, fence=fence, status=read) is None:
                 continue
             for child_id in children:
                 self._cancel_stored(child_id, statuses)
             self.discard_tool_waits(run.id, because="cancelled")
+            if run.parent_run_id is None:
+                self._close_budget_requests(run.id, because=because.code if because is not None else "run.cancelled")
             self._forget_events(run.id)
             self._notify(run)
             return True
@@ -1429,6 +1488,10 @@ class RunManager:
         root = self.root_of(run)
         if root.status != "paused" or root.id in self._contexts:
             return False
+        if root.budget is not None and root.budget.pending_request_id:
+            pending = run_budget.BudgetRequests(self.store).get(root.id, root.budget.pending_request_id)
+            if pending is not None and pending.status == "pending":
+                return False  # it also waits for a budget decision: that decision continues it
         # What this continue answers, read before the run goes on (a worker may reach the calls at once).
         answered = [item for item in approvals.of_run(run_id) if item.checkpointed and item.use == "open"]
         try:
@@ -1462,7 +1525,7 @@ class RunManager:
         approvals = ToolApprovals(self.store)
         gate = self.tool_gate
         enabled = gate is not None and gate.checkpoints and checkpoints_enabled()
-        holding = tool_checkpoints.runs_with_checkpoints(self.store)
+        holding = tool_checkpoints.runs_with_checkpoints(self.store, "tool")
         if not enabled:
             for run_id in holding:
                 for item in approvals.of_run(run_id):
@@ -1483,6 +1546,354 @@ class RunManager:
             if run.status == "paused" and resume and self._continue_paused(run_id):
                 continued.append(run_id)
         return continued
+
+    # ---- budget decisions (BUDGET-1) -------------------------------------------------------------------------------
+
+    def _budget_gate(self, context: _RunContext) -> run_budget.RunBudgetGate:
+        """The budget decisions of an execution of an attended top-level run; a request that is still pending holds
+        every model request from the start."""
+        run = context.run
+        _cap, hours = self.budget_policy()
+        requests = run_budget.BudgetRequests(self.store)
+        gate = run_budget.RunBudgetGate(
+            run_id=run.id,
+            workflow_id=run.workflow_id,
+            workflow_name=run.workflow_name,
+            requests=requests,
+            deadline_hours=hours,
+            on_request=lambda found, created: self._budget_requested(context, found, created),
+        )
+        pending = run.budget.pending_request_id if run.budget is not None else None
+        if pending:
+            found = requests.get(run.id, pending)
+            if found is not None and found.status == "pending":
+                gate.pending = found
+        return gate
+
+    def _budget_requested(self, context: _RunContext, found: run_budget.BudgetRequest, created: bool) -> None:
+        """A budget request was opened (``created``) or another request joined it: store it, record it in the run
+        and announce it. Runs in the requesting thread, under the gate's lock."""
+        requests = run_budget.BudgetRequests(self.store)
+        if created:
+            stored = requests.put(found)
+            run_budget.record_audit(
+                self.store,
+                run_budget.BudgetAuditEvent(
+                    kind="requested",
+                    actor="nodestro",
+                    run_id=found.run_id,
+                    request_id=found.id,
+                    previous_limit_usd=found.limit_usd,
+                    scope=found.block.scope,
+                ),
+            )
+        else:
+            # A decision may have arrived meanwhile: only a request that is still pending is changed.
+            stored = requests.update(found) or found
+        root = context.root
+        with root.lock:
+            if root.run.budget is None:
+                root.run.budget = RunBudget()
+            root.run.budget.pending_request_id = stored.id
+        if created:
+            self._emit(root, "budget_required", request=stored.model_dump(mode="json"))
+
+    def _apply_decided(self, run: Run, root_id: str | None = None) -> None:
+        """Record the approved raises of ``run``'s own limit that it does not hold yet (the requests are the record:
+        a raise stored by a process that stopped before it changed the run is applied here), and forget a pending
+        request that was decided."""
+        top = root_id or run.id
+        requests = run_budget.BudgetRequests(self.store)
+        for decided in requests.of_run(top):
+            if decided.status == "raised" and decided.block.run_id == run.id:
+                run_budget.apply_raise(run, decided)
+        if run.parent_run_id is None and run.budget is not None and run.budget.pending_request_id:
+            found = requests.get(run.id, run.budget.pending_request_id)
+            if found is None or found.status != "pending":
+                run.budget.pending_request_id = None
+
+    def _budget_continues(self, context: _RunContext) -> bool:
+        """After the graph stopped with a pending budget request: whether it was decided meanwhile (by a person, in
+        this or another process) so that the execution goes on at once. A raise applies to the live tracker of the
+        top-level run; a child run's own limit is applied when the child continues."""
+        gate = context.budget_gate
+        if gate is None or context.root is not context or gate.pending is None or context.cancelled.is_set():
+            return False
+        found = gate.resolved()
+        if found is None:
+            return False
+        gate.pending = None
+        run = context.run
+        with context.lock:
+            if run.budget is not None:
+                run.budget.pending_request_id = None
+        self._emit(context, "budget_decided", request=found.model_dump(mode="json"))
+        if found.status == "raised":
+            if found.block.run_id == run.id:
+                with context.lock:
+                    run_budget.apply_raise(run, found)
+                scope = context.tracker.budget_scope if isinstance(context.tracker, PricedTracker) else None
+                if scope is not None and found.new_limit_usd is not None:
+                    scope.limit = found.new_limit_usd
+                    context.tracker.set_limit(max(found.new_limit_usd - scope.offset, Decimal(0)))
+            return True
+        if found.status == "ended":
+            context.stop = problem("run.budget_ended", "The run was ended at a budget decision")
+        else:
+            context.stop = _budget_closed_problem(found)
+        context.cancelled.set()
+        return True
+
+    def _waiting_status(self, state: NodeRun) -> NodeStatus:
+        """What a sub-workflow or orchestrator node waits for while its child runs are paused: ``awaiting_budget``
+        when they wait only for a budget decision, ``awaiting_approval`` otherwise."""
+        budget = False
+        for child_id in [state.child_run_id, *state.child_run_ids]:
+            child = self.get(child_id) if child_id else None
+            if child is None or child.status != "paused":
+                continue
+            statuses = {item.status for item in child.nodes.values()}
+            if "awaiting_approval" in statuses:
+                return "awaiting_approval"
+            budget = budget or "awaiting_budget" in statuses
+        return "awaiting_budget" if budget else "awaiting_approval"
+
+    def budget_requests(self, run_id: str) -> list[run_budget.BudgetRequest]:
+        """The budget requests of a run's top-level run, oldest first."""
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        return run_budget.BudgetRequests(self.store).of_run(self.root_of(run).id)
+
+    def decide_budget(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        action: Literal["raise", "end"],
+        by: str,
+        limit_usd: Decimal | str | float | None = None,
+        idempotency_key: str | None = None,
+        max_limit_usd: Decimal | None = None,
+    ) -> run_budget.BudgetRequest:
+        """Decide a pending budget request (BUDGET-1): raise exactly the limit that refused the request and let the
+        run continue, or end the run. Raising and continuing are one operation.
+
+        The decision is a compare-and-set on the request: exactly one decision wins; a repeated or stale one is
+        refused with ``budget.not_pending`` unless it is the same decision sent again with the same
+        ``idempotency_key`` by the same person, which answers the stored result. A new limit must be higher than the
+        current one and at most ``max_limit_usd`` (the tenant's and the operator's maximum). Every attempt, also a
+        refused one, is in the audit trail. Who may decide is the caller's check (the API)."""
+        elsewhere = self._on_loop(
+            lambda: self.decide_budget(
+                run_id,
+                request_id,
+                action=action,
+                by=by,
+                limit_usd=limit_usd,
+                idempotency_key=idempotency_key,
+                max_limit_usd=max_limit_usd,
+            )
+        )
+        if elsewhere is not None:
+            return elsewhere
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        root = self.root_of(run)
+        requests = run_budget.BudgetRequests(self.store)
+        found = requests.get(root.id, request_id)
+        if found is None:
+            raise NodestroError("budget.request_not_found", "There is no such budget request", status=404)
+        new_limit: Decimal | None = None
+
+        def refuse(code: str, message: str, **params: Any) -> NodestroError:
+            run_budget.record_audit(
+                self.store,
+                run_budget.BudgetAuditEvent(
+                    kind="refused",
+                    actor=by,
+                    run_id=root.id,
+                    request_id=found.id,
+                    previous_limit_usd=found.limit_usd,
+                    new_limit_usd=new_limit,
+                    result=code,
+                    scope=found.block.scope,
+                ),
+            )
+            return NodestroError(code, message, **params)
+
+        if action not in ("raise", "end"):
+            raise refuse("budget.action_invalid", "Decide with raise or end")
+        if action == "raise":
+            if limit_usd is None:
+                raise refuse("budget.limit_invalid", "Enter the new limit of this run")
+            try:
+                new_limit = run_budget.amount(limit_usd)
+            except NodestroError as exc:
+                raise refuse(exc.code, str(exc), **exc.params) from None
+        if found.status != "pending":
+            same = (
+                idempotency_key is not None
+                and found.idempotency_key == idempotency_key
+                and found.decided_by == by
+                and found.status == ("raised" if action == "raise" else "ended")
+                and (action == "end" or found.new_limit_usd == new_limit)
+            )
+            if same:
+                return found
+            raise refuse(
+                "budget.not_pending",
+                "This budget decision was already made or closed",
+                request_status=found.status,
+                decided_by=found.decided_by,
+            )
+        target = root if found.block.run_id == root.id else self.get(found.block.run_id)
+        current = run_budget.limit_of(target) if target is not None else found.limit_usd
+        current = found.limit_usd if current is None else max(current, found.limit_usd)
+        if action == "raise":
+            assert new_limit is not None
+            if new_limit <= current:
+                raise refuse(
+                    "budget.limit_not_higher",
+                    "The new limit must be higher than the current one",
+                    current_limit_usd=str(current),
+                )
+            if max_limit_usd is not None and new_limit > max_limit_usd:
+                raise refuse(
+                    "budget.over_policy",
+                    "The new limit is above the highest run budget allowed here",
+                    max_limit_usd=str(max_limit_usd),
+                )
+        decided = requests.transition(
+            found,
+            "raised" if action == "raise" else "ended",
+            decided_by=by,
+            decided_at=now(),
+            new_limit_usd=new_limit,
+            idempotency_key=idempotency_key,
+            outcome="continued" if action == "raise" else "ended",
+        )
+        if decided is None:
+            again = requests.get(root.id, request_id)
+            raise refuse(
+                "budget.not_pending",
+                "This budget decision was made meanwhile",
+                request_status=again.status if again is not None else None,
+                decided_by=again.decided_by if again is not None else None,
+            )
+        context = self._contexts.get(root.id)
+        stored = self.store.get("runs", root.id, Run)
+        executing = context is not None or (stored is not None and stored.status in ("queued", "running"))
+        run_budget.record_audit(
+            self.store,
+            run_budget.BudgetAuditEvent(
+                kind="raised" if action == "raise" else "ended",
+                actor=by,
+                run_id=root.id,
+                request_id=decided.id,
+                previous_limit_usd=current,
+                new_limit_usd=new_limit,
+                outcome=("waiting" if executing else decided.outcome),
+                scope=decided.block.scope,
+            ),
+        )
+        if not executing:
+            self._after_budget_decision(root.id, decided)
+        # An execution (here or in a worker) reads the decision when its graph stops (``_budget_continues``).
+        return decided
+
+    def _after_budget_decision(self, root_id: str, decided: run_budget.BudgetRequest) -> bool:
+        """Carry out a decision for a paused run that nothing executes: continue it, or end it."""
+        if decided.status == "raised":
+            try:
+                self.resume(root_id)
+            except (NodestroError, KeyError):
+                # Another process continued it first, or no event loop here: the sweep continues it.
+                return False
+            return True
+        if decided.status == "ended":
+            return self._cancel_stored(
+                root_id,
+                ("paused",),
+                because=problem("run.budget_ended", "The run was ended at a budget decision"),
+            )
+        return self._cancel_stored(root_id, ("paused",), because=_budget_closed_problem(decided), status="failed")
+
+    def _close_budget_requests(self, run_id: str, *, because: str) -> None:
+        """A run ends while a budget request waits: it closes without a decision."""
+        requests = run_budget.BudgetRequests(self.store)
+        for closed in requests.close_run(run_id, "cancelled", because=because):
+            run_budget.record_audit(
+                self.store,
+                run_budget.BudgetAuditEvent(
+                    kind="cancelled",
+                    actor="nodestro",
+                    run_id=run_id,
+                    request_id=closed.id,
+                    previous_limit_usd=closed.limit_usd,
+                    result=because,
+                    scope=closed.block.scope,
+                ),
+            )
+
+    def sweep_budget_waits(self, *, resume: bool = True) -> list[str]:
+        """The sweep of budget decisions (BUDGET-1; at start and then periodically, next to the tool-wait sweep).
+        Returns the runs it continued or ended.
+
+        - A pending request past its deadline expires; its paused run fails with ``run.budget_exceeded``
+          (``expired``). A run that still executes reads the expiry itself.
+        - A pending request whose run ended or is gone is closed; budget checkpoints of such runs are deleted.
+        - A paused run whose request was decided (the process that decided stopped before it continued the run)
+          continues, or ends.
+        """
+        requests = run_budget.BudgetRequests(self.store)
+        handled: list[str] = []
+        for item in requests.overdue():
+            done = requests.transition(item, "expired", closed_because="deadline", decided_at=now())
+            if done is None:
+                continue
+            run_budget.record_audit(
+                self.store,
+                run_budget.BudgetAuditEvent(
+                    kind="expired",
+                    actor="nodestro",
+                    run_id=done.run_id,
+                    request_id=done.id,
+                    previous_limit_usd=done.limit_usd,
+                    result="deadline",
+                    scope=done.block.scope,
+                ),
+            )
+        for item in requests.pending():
+            stored = self.store.get("runs", item.run_id, Run)
+            if stored is None or stored.status in ("succeeded", "failed", "cancelled"):
+                self._close_budget_requests(item.run_id, because="run.gone")
+        for run_id in tool_checkpoints.runs_with_checkpoints(self.store, "budget"):
+            stored = self.store.get("runs", run_id, Run)
+            if stored is None or stored.status in ("succeeded", "failed", "cancelled"):
+                tool_checkpoints.delete_run(self.store, run_id)
+        if not resume:
+            return handled
+        for stored in self._budget_paused():
+            if stored.id in self._contexts or stored.budget is None or not stored.budget.pending_request_id:
+                continue
+            found = requests.get(stored.id, stored.budget.pending_request_id)
+            if found is None or found.status == "pending":
+                continue
+            if self._after_budget_decision(stored.id, found):
+                handled.append(stored.id)
+        return handled
+
+    def _budget_paused(self) -> list[Run]:
+        """Paused top-level runs that wait for a budget decision."""
+        ids = {item.run_id for item in run_budget.BudgetRequests(self.store).recent()}
+        found = []
+        for run_id in ids:
+            stored = self.store.get("runs", run_id, Run)
+            if stored is not None and stored.status == "paused" and stored.parent_run_id is None:
+                found.append(stored)
+        return found
 
     def _notify(self, run: Run) -> None:
         for listener in list(self.listeners):
@@ -1735,6 +2146,8 @@ class RunManager:
                 if context.resume_requested and not context.cancelled.is_set():
                     context.resume_requested = False
                     continue
+                if self._budget_continues(context):
+                    continue  # decided while other work still ran: the waiting steps continue now
                 break
             self._conclude(context)
         except asyncio.CancelledError:
@@ -1763,6 +2176,7 @@ class RunManager:
             paused = _is_paused(run)
             if not paused:
                 run.finished_at = now()
+            self._budget_settled(context, paused)
             self._save(context)
             if context.root.fenced_out:
                 # The run is no longer this process's (C-06): its end is not stored, announced or delivered here.
@@ -1771,6 +2185,51 @@ class RunManager:
                 self._subscribers.pop(run.id, None)
             else:
                 self._finished(context, paused)
+                if paused and context.budget_gate is not None and context.root is context:
+                    self._budget_after_pause(context)
+
+    def _budget_settled(self, context: _RunContext, paused: bool) -> None:
+        """When an execution of a top-level run stops: a paused run's pending budget request gets the final numbers
+        (requests in flight finished and are counted); a run that ended closes it (BUDGET-1)."""
+        gate = context.budget_gate
+        if gate is None or context.root is not context or gate.pending is None:
+            return
+        run = context.run
+        requests = run_budget.BudgetRequests(self.store)
+        found = gate.pending
+        if not paused:
+            gate.pending = None
+            if run.budget is not None:
+                run.budget.pending_request_id = None
+            if not context.root.fenced_out:
+                self._close_budget_requests(run.id, because=run.error_code or f"run.{run.status}")
+            return
+        if found.block.run_id == run.id:
+            spent = _known_decimal(run)
+            unknown = _unknown_cost(run)
+        else:
+            child = self.get(found.block.run_id)
+            spent = _known_decimal(child) if child is not None else found.spent_usd
+            unknown = _unknown_cost(child) if child is not None else found.unknown_cost
+        refused = found.refused
+        bound = refused.max_cost_usd if refused is not None else None
+        updated = requests.update(
+            found,
+            spent_usd=spent,
+            reserved_usd=Decimal(0),
+            unknown_cost=unknown or found.unknown_cost,
+            suggested_limit_usd=run_budget.suggested_limit(found.limit_usd, spent, Decimal(0), bound),
+            reason="request_too_large" if spent < found.limit_usd else "used_up",
+        )
+        if updated is not None:
+            gate.pending = updated
+
+    def _budget_after_pause(self, context: _RunContext) -> None:
+        """A decision that arrived while the paused run was being stored continues (or ends) it now."""
+        gate = context.budget_gate
+        found = gate.resolved() if gate is not None else None
+        if found is not None:
+            self._after_budget_decision(context.run.id, found)
 
     def _finished(self, context: _RunContext, paused: bool) -> None:
         """What follows a stored end (or pause) of an execution: result files, listeners, the last event."""
@@ -1861,7 +2320,7 @@ class RunManager:
         elif context.cancelled.is_set():
             run.status = "cancelled"
             _fail(run, problem("run.cancelled", "The run was cancelled"))
-        elif "awaiting_approval" in statuses:
+        elif statuses & WAITING_NODE_STATUSES:
             run.status = "paused"
         elif statuses & {"failed", "blocked", "cancelled"}:
             run.status = "failed"
@@ -2239,7 +2698,7 @@ class RunManager:
         state = run.nodes[node.id]
         inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
         # A step that continues after a decision (paused at an approval) keeps when it began (X-02).
-        if state.status != "awaiting_approval" or state.started_at is None:
+        if state.status not in WAITING_NODE_STATUSES or state.started_at is None:
             state.started_at = now()
         if node.type == "start":
             state.status = "succeeded"
@@ -2289,8 +2748,10 @@ class RunManager:
             await self._orchestrate(context, node, inputs, absent)
             return
         assert node.agent is not None
-        # Paused at a tool call (M6b): the turn continues from its checkpoint, the model is not asked again.
-        resuming = state.status == "awaiting_approval"
+        # Paused at a tool call (M6b) or before a request for a budget decision (BUDGET-1): the turn continues from
+        # its checkpoint, nothing that already happened is asked or sent again.
+        resuming = state.status in WAITING_NODE_STATUSES
+        budget_wait = state.status == "awaiting_budget"
         state.status = "running"
         config = node.agent
         prompt = render_task(
@@ -2308,7 +2769,7 @@ class RunManager:
         # running, instead of a step that looks as if it was never reached.
         self._save(context)
         await self._in_run_thread(
-            self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming
+            self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming, budget_wait
         )
         self._save(context)
         if state.tool_calls and not context.root.fenced_out:
@@ -2324,11 +2785,34 @@ class RunManager:
         return prompt_values(start_fields(run.workflow), run.values, names, mark_empty=mark_empty)
 
     async def _execute_child(self, context: _RunContext, node: Node, child: Run) -> _RunContext:
-        """Run a child run to its end (or pause): its own budget inside the parent's, cost counted at ``node``."""
-        child.budget_usd = child.workflow.budget_usd
+        """Run a child run to its end (or pause): its own budget inside the parent's, cost counted at ``node``.
+
+        The child's own limit is part of the child run (BUDGET-1): a budget decision about it raises exactly that
+        limit, and the parent's limits still apply to every request."""
+        kind: run_budget.BudgetScope = "team" if node.type == "orchestrator" else "subworkflow"
+        if child.budget is None:
+            child.budget = run_budget.initial_budget(
+                child, workflow_budget=child.workflow.budget_usd, default_budget=None, child=kind
+            )
+        self._apply_decided(child, context.root.run.id)
+        limit = run_budget.limit_of(child)
+        child.budget_usd = float(limit) if limit is not None else None
+        offset = _known_decimal(child)
+        tracker = _ChildTracker(context.tracker, node.id, _remaining_decimal(limit, offset))
+        if context.budget_gate is not None:
+            tracker.budget_gate = context.budget_gate
+            tracker.budget_scope = run_budget.TrackerScope(
+                run_id=child.id,
+                scope=kind,
+                node_id=node.id,
+                label=child.workflow_name,
+                limit=limit,
+                offset=offset,
+                unknown_before=_unknown_cost(child),
+            )
         child_context = _RunContext(
             child,
-            _ChildTracker(context.tracker, node.id, _remaining(child.workflow.budget_usd, child)),
+            tracker,
             context.env,
             cancelled=CancelFlag(context.cancelled),
             stack=(*context.stack, context.run.workflow_id),
@@ -2428,7 +2912,7 @@ class RunManager:
             state.status = "succeeded"
             state.output = child.output
         elif child.status == "paused":
-            state.status = "awaiting_approval"
+            state.status = self._waiting_status(state)
             state.finished_at = None
         elif child.status == "cancelled":
             state.status = "cancelled"
@@ -2632,7 +3116,7 @@ class RunManager:
     ) -> str | None:
         """Ask about a call by pausing the run at it (M6b): store the request, then stop the turn."""
         run_id = context.run.id
-        paused = tool_checkpoints.runs_with_checkpoints(self.store) - {run_id}
+        paused = tool_checkpoints.runs_with_checkpoints(self.store, "tool") - {run_id}
         if len(paused) >= gate.max_paused:
             return self._deny_call(
                 context,
@@ -2855,8 +3339,57 @@ class RunManager:
         )
         state.status = "awaiting_approval"
 
-    def _checkpoint_lost(self, context: _RunContext, node: Node, state: NodeRun, prior: Usage | None) -> None:
-        """A paused agent whose checkpoint is gone, expired or switched off: the waiting calls never run."""
+    def _suspend_for_budget(
+        self, context: _RunContext, node_id: str, state: NodeRun, iteration: list[int], stop: AgentSuspended
+    ) -> None:
+        """Store where the turn stopped before its request (BUDGET-1) and let the node wait for the decision."""
+        gate = context.budget_gate
+        deadline = gate.pending.deadline if gate is not None and gate.pending is not None else None
+        tool_checkpoints.save(
+            self.store,
+            tool_checkpoints.AgentCheckpoint(
+                kind="budget",
+                run_id=context.run.id,
+                node_id=node_id,
+                iteration=iteration,
+                turn=stop.checkpoint.model_dump(mode="json") if stop.checkpoint is not None else None,
+                memory=stop.memory,
+                refinement=stop.refinement,
+                request_ids=[stop.ref] if stop.ref else [],
+                expires_at=(deadline or now() + timedelta(hours=run_budget.MAX_DECISION_HOURS)) + EXECUTION_WINDOW,
+            ),
+        )
+        state.status = "awaiting_budget"
+
+    def _checkpoint_lost(
+        self, context: _RunContext, node: Node, state: NodeRun, prior: Usage | None, *, budget: bool = False
+    ) -> None:
+        """A paused agent whose checkpoint is gone, expired or switched off: the waiting calls never run. A budget
+        wait whose checkpoint is gone fails explicitly (BUDGET-1): the turn is never started again silently; the
+        continue plan of the failed run decides what is reused and asks before tools run again."""
+        if budget:
+            state.status = "failed"
+            if prior is not None:
+                state.usage = prior
+            state.finished_at = now()
+            _fail(
+                state,
+                problem(
+                    "run.budget_checkpoint_lost",
+                    "The step waited for a budget decision, but where it stopped is no longer stored",
+                ),
+            )
+            self._emit(
+                context,
+                "node_finished",
+                node.id,
+                status=state.status,
+                error=state.error,
+                error_code=state.error_code,
+                error_params=state.error_params,
+                usage=state.usage.model_dump(mode="json"),
+            )
+            return
         gate = self.tool_gate
         if gate is not None:
             self._close_node_waits(context.run.id, node.id, list(state.iteration), gate.approvals, because=SWITCH_OFF)
@@ -2983,7 +3516,7 @@ class RunManager:
         config = node.orchestrator
         assert config is not None
         label = node_label(node)
-        prior = state.usage.model_copy() if state.status == "awaiting_approval" else None
+        prior = state.usage.model_copy() if state.status in WAITING_NODE_STATUSES else None
         pool, teams = self._orchestration_pool(context, node)
         limits = orchestration.OrchestrationLimits(
             max_decisions=config.max_decisions,
@@ -2997,7 +3530,7 @@ class RunManager:
         next_step = [0]
         #: The team run of each assignment started here, by (step, slot): the record's outcomes name it (X-02).
         team_runs: dict[tuple[int, int], str] = {}
-        if state.status == "awaiting_approval" and state.orchestration is not None:
+        if state.status in WAITING_NODE_STATUSES and state.orchestration is not None:
             recorded = orchestration.OrchestrationState.model_validate(state.orchestration)
             task = recorded.task
             next_step[0] = len(recorded.steps)
@@ -3112,7 +3645,7 @@ class RunManager:
                 stop_on=(RunCancelled,),
             )
             if result.paused:
-                state.status = "awaiting_approval"
+                state.status = self._waiting_status(state)
             elif result.outcome == "finished":
                 state.status = "succeeded"
                 state.output = result.answer
@@ -3127,6 +3660,11 @@ class RunManager:
                         max_decisions=config.max_decisions,
                     ),
                 )
+        except AgentSuspended as stop:
+            if not stop.budget:
+                raise
+            # The next decision waits for a budget decision (BUDGET-1); the steps so far are recorded.
+            state.status = "awaiting_budget"
         except _TeamStopped as stop:
             # A team's rejection ended its run: this run ends too (like a sub-workflow), nobody gets around it.
             state.status = "cancelled"
@@ -3149,12 +3687,14 @@ class RunManager:
                 if prior is not None and state.decision_usage is not None
                 else decisions
             )
-            state.finished_at = None if state.status == "awaiting_approval" else now()
+            state.finished_at = None if state.status in WAITING_NODE_STATUSES else now()
             state.current_decision = None
-        if state.status != "awaiting_approval":
+        if state.status not in WAITING_NODE_STATUSES:
             self._guidance_expired(context, node)
         if state.status == "awaiting_approval":
             self._emit(context, "approval_requested", node.id, status=state.status)
+        elif state.status == "awaiting_budget":
+            self._emit(context, "budget_waiting", node.id, status=state.status)
         else:
             self._emit(
                 context,
@@ -3302,11 +3842,20 @@ class RunManager:
             hooks={"on_request": on_request},
             cancelled=context.cancelled.is_set,
             attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
+            # A decision the budget cannot admit stops before it is sent (BUDGET-1): the orchestrator waits and asks
+            # this decision again when the run continues (every earlier step is recorded).
+            suspendable=context.budget_gate is not None,
         )
         return decision_of(outcome.output)
 
     def _run_agent_sync(
-        self, context: _RunContext, node: Node, prompt: str, with_run_files: bool, resuming: bool = False
+        self,
+        context: _RunContext,
+        node: Node,
+        prompt: str,
+        with_run_files: bool,
+        resuming: bool = False,
+        budget_wait: bool = False,
     ) -> None:
         """Runs in a worker thread: build the agent, ask (or refine), record the result.
 
@@ -3329,9 +3878,12 @@ class RunManager:
         checkpoint: tool_checkpoints.AgentCheckpoint | None = None
         if resuming:
             checkpoint = tool_checkpoints.load(self.store, context.run.id, node_id, iteration)
-            if checkpoint is None or gate is None or not checkpointing:
-                self._checkpoint_lost(context, node, state, prior)
+            if checkpoint is not None and checkpoint.kind == "budget":
+                pass  # a budget wait needs no tool gate: the turn stopped before a request (BUDGET-1)
+            elif checkpoint is None or gate is None or not checkpointing:
+                self._checkpoint_lost(context, node, state, prior, budget=budget_wait)
                 return
+        budget_checkpoint = checkpoint if checkpoint is not None and checkpoint.kind == "budget" else None
 
         def on_text(delta: str) -> None:
             context.check()
@@ -3448,6 +4000,8 @@ class RunManager:
                 resume=checkpoint.turn if checkpoint is not None else None,
                 # before_tool asks the tool gate for every call except the run's own tools (S-2).
                 gated=gate is not None,
+                refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
+                suspendable=context.budget_gate is not None,
             )
             state.output = outcome.output
             state.memory = outcome.memory
@@ -3466,8 +4020,11 @@ class RunManager:
             state.status = "succeeded"
         except AgentSuspended as stop:
             suspended = True
-            assert gate is not None
-            self._suspend_agent(context, node_id, state, iteration, stop, gate)
+            if stop.budget:
+                self._suspend_for_budget(context, node_id, state, iteration, stop)
+            else:
+                assert gate is not None
+                self._suspend_agent(context, node_id, state, iteration, stop, gate)
         except RunCancelled:
             state.status = "cancelled"
             _fail(state, problem("run.node_cancelled", "Cancelled"))
@@ -3480,6 +4037,8 @@ class RunManager:
             _fail(state, node_problem(exc))
         finally:
             sandbox_cancel.reset(cancel_token)
+            if budget_checkpoint is not None and not suspended:
+                tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)
             if checkpointing and not suspended:
                 # The turn ended (or failed): what it waited for is over, nothing of it may run later.
                 if gate is not None and (resuming or checkpoint is not None):
@@ -3588,11 +4147,17 @@ def execute_agent(
     attended: bool = True,
     resume: Mapping[str, Any] | None = None,
     gated: bool = False,
+    refinement: Mapping[str, Any] | None = None,
+    suspendable: bool = False,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
     ``resume`` continues a turn from its orkexa checkpoint instead of asking (M6b); a turn that stops at a waiting
     call raises :class:`AgentSuspended` with the checkpoint and the run memory.
+
+    ``suspendable`` (BUDGET-1, attended runs): a request the run's budget cannot admit stops the turn before it is
+    sent (:class:`AgentSuspended` with ``budget``); with a judge the refinement loop's progress travels with it
+    (``refinement``) and continues from there.
 
     Used by workflow runs and by the agent test in the inspector, so both behave the same.
     Agent and judge each use the connection of their own provider. ``gated`` must be true only when the
@@ -3635,30 +4200,169 @@ def execute_agent(
             evaluator.agent.on_request = hooks["on_request"]
         if on_evaluation_start is not None:
             on_evaluation_start()
-        refinement = refine(agent, prompt, evaluator, max_revisions=config.quality.max_revisions)
-        result = refinement.output
-        evaluation = EvaluationRecord(
-            passed=refinement.passed,
-            attempts=refinement.attempts,
-            feedback=refinement.evaluation.feedback(),
-        )
+        if suspendable:
+            with run_budget.suspendable():
+                try:
+                    output, verdict, attempts = _refine_resumable(
+                        agent,
+                        prompt,
+                        evaluator,
+                        max_revisions=config.quality.max_revisions,
+                        state=refinement,
+                        resume=resume,
+                    )
+                except _RefinementSuspended as stop:
+                    files = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
+                    raise AgentSuspended(
+                        stop.checkpoint, files, budget=True, ref=stop.ref, refinement=stop.state
+                    ) from None
+            result = output
+            evaluation = EvaluationRecord(passed=verdict.passed, attempts=attempts, feedback=verdict.feedback())
+        else:
+            refined = refine(agent, prompt, evaluator, max_revisions=config.quality.max_revisions)
+            result = refined.output
+            evaluation = EvaluationRecord(
+                passed=refined.passed,
+                attempts=refined.attempts,
+                feedback=refined.evaluation.feedback(),
+            )
     else:
         try:
-            result = agent.resume(resume) if resume is not None else agent.ask(prompt)
+            if suspendable:
+                with run_budget.suspendable():
+                    result = agent.resume(resume) if resume is not None else agent.ask(prompt)
+            else:
+                result = agent.resume(resume) if resume is not None else agent.ask(prompt)
         except TurnSuspended as stop:
             files = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
-            raise AgentSuspended(stop.checkpoint, files) from None
+            raise AgentSuspended(
+                stop.checkpoint,
+                files,
+                budget=_budget_stop(stop.checkpoint),
+                ref=getattr(stop.checkpoint, "ref", None),
+            ) from None
     memory = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
     return AgentOutcome(output=_jsonable(result), evaluation=evaluation, memory=memory)
 
 
 class AgentSuspended(Exception):
-    """An agent's turn stopped at a tool call that waits (M6b): its checkpoint and its run memory."""
+    """An agent's turn stopped: at a tool call that waits (M6b), or before a model request until a budget decision
+    (``budget``, BUDGET-1). Its checkpoint and its run memory; ``refinement`` holds a judge loop's progress."""
 
-    def __init__(self, checkpoint: Any, memory: dict[str, str] | None) -> None:
-        super().__init__("the agent waits for a tool approval")
+    def __init__(
+        self,
+        checkpoint: Any,
+        memory: dict[str, str] | None,
+        *,
+        budget: bool = False,
+        ref: str | None = None,
+        refinement: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__("the agent waits for a budget decision" if budget else "the agent waits for a tool approval")
         self.checkpoint = checkpoint
         self.memory = memory
+        self.budget = budget
+        self.ref = ref
+        self.refinement = refinement
+
+
+def _budget_stop(checkpoint: Any) -> bool:
+    """Whether a turn checkpoint stopped before a request for a budget decision (BUDGET-1)."""
+    return getattr(checkpoint, "stage", "tools") == "request" and getattr(checkpoint, "reason", "") == (
+        run_budget.SUSPEND_REASON
+    )
+
+
+#: The revision prompt of orkexa's ``refine`` (kept identical, so both loops ask the same).
+_REVISE = (
+    "A reviewer checked your answer and found problems:\n{feedback}\n\n"
+    "Revise your answer so that it satisfies every criterion. Return the complete answer."
+)
+
+
+class _RefinementSuspended(Exception):
+    def __init__(self, checkpoint: Any, ref: str | None, state: dict[str, Any]) -> None:
+        super().__init__("the refinement waits for a budget decision")
+        self.checkpoint = checkpoint
+        self.ref = ref
+        self.state = state
+
+
+def _history_text(agent: Any) -> str:
+    with tempfile.TemporaryDirectory(prefix="nodestro-refine-") as folder:
+        path = Path(folder) / "history.json"
+        agent.save_history(path)
+        return path.read_text(encoding="utf-8")
+
+
+def _load_history_text(agent: Any, text: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="nodestro-refine-") as folder:
+        path = Path(folder) / "history.json"
+        path.write_text(text, encoding="utf-8")
+        agent.load_history(path)
+
+
+def _refine_resumable(
+    agent: Any,
+    prompt: str,
+    evaluator: Evaluator,
+    *,
+    max_revisions: int,
+    state: Mapping[str, Any] | None,
+    resume: Mapping[str, Any] | None,
+) -> tuple[Any, Any, int]:
+    """orkexa's ``refine`` (ask, evaluate, revise), resumable at every model request (BUDGET-1).
+
+    It uses only public orkexa parts (``ask``/``resume``, ``Evaluator.evaluate``, ``tool_results_of_last_turn``,
+    history files). A request the run's budget does not admit stops the loop with :class:`_RefinementSuspended`:
+    in an answer turn its turn checkpoint continues it later; in an evaluation (a judge turn without tools that
+    stopped before its only request, so nothing was sent) the evaluation is asked again. The state holds the
+    attempt, the phase, the answer to evaluate, the judge's material and the agent's committed conversation.
+    """
+    current = dict(state or {})
+    attempt = int(current.get("attempt", 0))
+    gathered: list[str] = list(current.get("gathered", []))
+    message = str(current.get("message", prompt))
+    phase = str(current.get("phase", "answer"))
+    output: Any = current.get("output")
+    if current.get("history"):
+        _load_history_text(agent, str(current["history"]))
+    pending_turn = resume if phase == "answer" else None
+    while True:
+        if phase == "answer":
+            if pending_turn is None:
+                attempt += 1
+            try:
+                output = agent.resume(pending_turn) if pending_turn is not None else agent.ask(message)
+            except TurnSuspended as stop:
+                if not _budget_stop(stop.checkpoint):
+                    raise
+                saved = {"attempt": attempt, "gathered": gathered, "message": message, "phase": "answer"}
+                raise _RefinementSuspended(stop.checkpoint, stop.checkpoint.ref, saved) from None
+            pending_turn = None
+            turn = tool_results_of_last_turn(agent)
+            if turn:
+                gathered.append(turn)
+            phase = "evaluate"
+        material = "\n\n".join(gathered) or None
+        try:
+            verdict = evaluator.evaluate(prompt, output, context=material)
+        except TurnSuspended as stop:
+            if not _budget_stop(stop.checkpoint) or stop.checkpoint.round != 0:
+                raise
+            saved = {
+                "attempt": attempt,
+                "gathered": gathered,
+                "message": message,
+                "phase": "evaluate",
+                "output": _jsonable(output),
+                "history": _history_text(agent),
+            }
+            raise _RefinementSuspended(None, stop.checkpoint.ref, saved) from None
+        if verdict.passed or attempt > max_revisions:
+            return output, verdict, attempt
+        message = _REVISE.format(feedback=verdict.feedback())
+        phase = "answer"
 
 
 def _decision_code(final: ToolApprovalRequest) -> str | None:
@@ -3854,6 +4558,31 @@ def _abandon(run: Run) -> None:
             _fail(state, problem("run.node_cancelled", "Cancelled"))
     run.status = "cancelled"
     _fail(run, problem("run.cancelled", "The run was cancelled"))
+
+
+def _known_decimal(run: Run) -> Decimal:
+    """What a run already spent (known costs), exactly (BUDGET-1)."""
+    if run.usage.requests and run.usage.known_cost_usd is not None:
+        return Decimal(str(run.usage.known_cost_usd))
+    return Decimal(str(_known_cost(run)))
+
+
+def _unknown_cost(run: Run) -> bool:
+    return run.usage.unpriced_requests > 0 or any(state.usage.unpriced_requests > 0 for state in run.nodes.values())
+
+
+def _remaining_decimal(limit: Decimal | None, spent: Decimal) -> Decimal | None:
+    return None if limit is None else max(limit - spent, Decimal(0))
+
+
+def _budget_closed_problem(found: run_budget.BudgetRequest) -> Problem:
+    """Why a run ends whose budget request closed without a raise (deadline, cancelled)."""
+    return problem(
+        "run.budget_exceeded",
+        "Nobody raised the run's budget in time" if found.status == "expired" else "The budget decision was closed",
+        expired=found.status == "expired",
+        limit_usd=str(found.limit_usd),
+    )
 
 
 def _remaining(budget: float | None, run: Run) -> float | None:

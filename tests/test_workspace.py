@@ -60,9 +60,9 @@ def workflow(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], **extra: 
     return WorkflowIn.model_validate({"name": "Test", "nodes": nodes, "edges": edges, **extra})
 
 
-async def run(workspace: Workspace, flow: WorkflowIn, value: str = "Eingabe") -> Any:
+async def run(workspace: Workspace, flow: WorkflowIn, value: str = "Eingabe", *, trigger: Any = "manual") -> Any:
     saved = workspace.save_workflow(flow)
-    started = await workspace.run(saved, RunIn(input=value))
+    started = await workspace.run(saved, RunIn(input=value), trigger=trigger)
     return await workspace.wait(started.id, timeout=20)
 
 
@@ -136,12 +136,13 @@ async def test_a_failed_step_blocks_its_successors(make: Make) -> None:
 
 
 async def test_budget_limits_stop_the_run(make: Make) -> None:
+    # Unattended (scheduled) runs keep failing at their limit; attended runs wait for a decision (test_run_budget).
     huge = {"input_tokens": 1_000_000, "output_tokens": 0}
     workspace = make({"EXPENSIVE": [text("a", usage=huge)], "NEXT": [text("b")]})
     flow = workflow(
         [agent("expensive", "EXPENSIVE"), agent("next", "NEXT")], [edge("expensive", "next")], budget_usd=0.5
     )
-    done = await run(workspace, flow)
+    done = await run(workspace, flow, trigger="schedule")
     assert done.status == "failed"
     assert done.nodes["expensive"].error_code == "run.budget_exceeded"
 
@@ -165,7 +166,7 @@ async def test_the_budget_of_a_sub_workflow_is_enforced(make: Make) -> None:
     parent = workflow(
         [{"id": "start", "type": "start"}, subflow("child", child.id)], [edge("start", "child")], budget_usd=1000.0
     )
-    done = await run(workspace, parent)
+    done = await run(workspace, parent, trigger="schedule")
     assert done.status == "failed"
     # The child stopped at its own limit, although the parent still had money left.
     inner = workspace.runs.get(done.nodes["child"].child_run_id)
@@ -184,7 +185,7 @@ async def test_the_parent_budget_still_covers_the_sub_workflow(make: Make) -> No
     parent = workflow(
         [{"id": "start", "type": "start"}, subflow("child", child.id)], [edge("start", "child")], budget_usd=0.5
     )
-    done = await run(workspace, parent)
+    done = await run(workspace, parent, trigger="schedule")
     assert done.status == "failed"
     inner = workspace.runs.get(done.nodes["child"].child_run_id)
     assert inner.nodes["expensive"].error_code == "run.budget_exceeded"

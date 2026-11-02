@@ -102,7 +102,7 @@ ANSWER_TIMEOUT = timedelta(minutes=3)
 #: The statuses of a run that can still take messages.
 ACTIVE_RUN = frozenset({"queued", "running", "paused"})
 #: The statuses of an orchestrator node that can still take instructions.
-ACTIVE_NODE = frozenset({"waiting", "running", "awaiting_approval"})
+ACTIVE_NODE = frozenset({"waiting", "running", "awaiting_approval", "awaiting_budget"})
 OPEN_INSTRUCTION = frozenset({"queued", "delivered"})
 
 #: Environment variables for the limits (see :func:`chat_limits`).
@@ -706,7 +706,7 @@ def _team_activities(get_run: Callable[[str], Run | None], run: Run, node: Node,
             for item in child.workflow.nodes
             if item.type in ("agent", "orchestrator", "subworkflow")
             and child.nodes.get(item.id) is not None
-            and child.nodes[item.id].status in ("running", "awaiting_approval")
+            and child.nodes[item.id].status in ("running", "awaiting_approval", "awaiting_budget")
         ]
         step, slot = places.get(child.id, (deciding, -1))
         found.append(

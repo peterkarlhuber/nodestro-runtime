@@ -45,7 +45,7 @@ from orkexa.dynamic import DockerSandbox, Sandbox
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
-from . import sandbox_selection
+from . import run_budget, sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -360,6 +360,7 @@ class Workspace:
             default_budget=lambda: self.settings().default_budget_usd,
             assistant_model=lambda: self.settings().assistant_model,
         )
+        self.runs.budget_policy = self._budget_policy
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
             self.runs.tool_gate = ToolGate(
@@ -610,6 +611,18 @@ class Workspace:
             ocr_enabled=bool(values.get("ocr_enabled")),
             ocr_available=self.knowledge.ocr_available(),
             price_mode="strict" if values.get("price_mode") == "strict" else "standard",
+            max_run_budget_usd=run_budget.stored_amount(values.get("max_run_budget_usd")),
+            operator_max_run_budget_usd=run_budget.operator_cap(server=self._server_tenant),
+            budget_decision_hours=run_budget.decision_hours(values.get("budget_decision_hours")),
+        )
+
+    def _budget_policy(self) -> tuple[Decimal | None, int]:
+        """The highest limit a budget decision may set (the tenant's and the operator's maximum) and the hours an
+        attended run waits for a decision (BUDGET-1)."""
+        current = self.settings()
+        return (
+            run_budget.effective_cap(current.max_run_budget_usd, current.operator_max_run_budget_usd),
+            current.budget_decision_hours,
         )
 
     def price_mode(self) -> PriceMode:
@@ -689,6 +702,11 @@ class Workspace:
         for key in ("default_model", "assistant_model"):
             if changes.get(key):
                 changes[key] = check_model(changes[key])
+        if changes.pop("clear_max_run_budget", None):
+            values.pop("max_run_budget_usd", None)
+            changes.pop("max_run_budget_usd", None)
+        if changes.get("max_run_budget_usd") is not None:
+            changes["max_run_budget_usd"] = str(changes["max_run_budget_usd"])
         values.update(changes)
         self.store.put_raw("settings", "app", values)
         if changes.get("sandbox"):
@@ -1071,12 +1089,14 @@ class Workspace:
 
     # ---- running ----------------------------------------------------------------------
 
-    async def run(self, workflow: Workflow, request: RunIn, *, trigger: RunTrigger = "manual") -> Run:
+    async def run(
+        self, workflow: Workflow, request: RunIn, *, trigger: RunTrigger = "manual", started_by: str | None = None
+    ) -> Run:
         """Start a run the way the studio does (pre-check, providers, approved libraries).
 
         Returns the queued run at once; :meth:`wait` waits for it to stop.
         """
-        return await launch(self, workflow, request, trigger=trigger)
+        return await launch(self, workflow, request, trigger=trigger, started_by=started_by)
 
     async def wait(self, run_id: str, *, timeout: float | None = None) -> Run:
         """The run once it finished or paused (waiting for a person); raises :class:`KeyError` for an unknown id."""

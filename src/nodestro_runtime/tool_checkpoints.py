@@ -4,7 +4,8 @@ The orkexa turn checkpoint (:class:`orkexa.TurnCheckpoint`) holds the conversati
 message with the calls, the results of the calls that already ran and the calls that wait. This module stores it,
 together with the agent's run memory, as a document of its own in the tenant's store (collection
 ``agent_checkpoints``, key ``<run id>:<node id>:<iteration>``), never in the run document and never with tool
-definitions or keys.
+definitions or keys. The same documents hold turns that stopped before a model request until a person decides about
+the run's budget (``kind="budget"``, BUDGET-1); they expire with the budget request's deadline.
 
 - **Tenant-bound:** it lives in the tenant's own store and records the tenant; another tenant's checkpoint is never
   read (:func:`load` treats it as missing).
@@ -34,13 +35,19 @@ VERSION = 1
 class AgentCheckpoint(BaseModel):
     format: Literal["nodestro.agent-checkpoint"] = "nodestro.agent-checkpoint"
     version: int = VERSION
+    #: ``tool``: the turn waits for tool approvals (M6b); ``budget``: it stopped before a model request until a budget
+    #: decision (BUDGET-1, :mod:`nodestro_runtime.run_budget`).
+    kind: Literal["tool", "budget"] = "tool"
     #: The store's tenant (``None`` on a desktop): a checkpoint of another tenant is never used.
     tenant_id: str | None = None
     run_id: str
     node_id: str
     iteration: list[int] = Field(default_factory=list)
-    #: The orkexa turn checkpoint (``TurnCheckpoint.model_dump(mode="json")``).
-    turn: dict[str, Any]
+    #: The orkexa turn checkpoint (``TurnCheckpoint.model_dump(mode="json")``); ``None`` for a budget wait of a
+    #: quality judge's evaluation (it is asked again from ``refinement``).
+    turn: dict[str, Any] | None = None
+    #: A budget wait inside a quality judge's refinement loop: attempt, phase, answer and conversation so far.
+    refinement: dict[str, Any] | None = None
     #: The agent's run memory files when the turn stopped (``None``: the agent has no run memory).
     memory: dict[str, str] | None = None
     #: The approval requests the waiting calls belong to.
@@ -98,9 +105,14 @@ def delete_run(store: DocumentStore, run_id: str) -> int:
     return store.delete_prefix(COLLECTION, f"{run_id}:")
 
 
-def runs_with_checkpoints(store: DocumentStore) -> set[str]:
-    """The runs of the tenant that have a stored checkpoint (paused at a tool call)."""
-    return {raw_key.split(":", 1)[0] for raw_key, _ in store.items(COLLECTION, _Any)}
+def runs_with_checkpoints(store: DocumentStore, kind: Literal["tool", "budget"] | None = None) -> set[str]:
+    """The runs of the tenant that have a stored checkpoint (paused at a tool call, or for a budget decision);
+    ``kind`` keeps only checkpoints of that kind."""
+    return {
+        raw_key.split(":", 1)[0]
+        for raw_key, found in store.items(COLLECTION, _Any)
+        if kind is None or (getattr(found, "kind", None) or "tool") == kind
+    }
 
 
 class _Any(BaseModel):

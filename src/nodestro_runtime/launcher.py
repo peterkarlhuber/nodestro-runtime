@@ -57,6 +57,7 @@ async def launch(
     version: int | None = None,
     resumed_from: str | None = None,
     preset: dict[str, NodeRun] | None = None,
+    started_by: str | None = None,
 ) -> Run:
     blocking_problems(ctx, workflow)
     ctx.require_providers(agent_models(workflow))  # fail fast: every provider the agents use is configured
@@ -76,6 +77,7 @@ async def launch(
         version=version if version is not None else ctx.current_version(workflow),
         resumed_from=resumed_from,
         preset=preset,
+        started_by=started_by,
     )
 
 
