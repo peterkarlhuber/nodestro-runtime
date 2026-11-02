@@ -14,6 +14,9 @@ Python 3.11 minimum (2026-11-02):
   `ruff --select UP` for 3.11 (`datetime.UTC`, `TimeoutError`).
 - Pin orkexa dec66eb (orkexa #36): orkexa also requires Python 3.11.
 - Python 3.14 is not added yet: RT-022.
+- Docs: the M12 contract step is RT-039 (RT-036 was taken twice; RT-036 stays the Docker-first follow-ups); stale
+  pin and review statements in `docs/AXENTRA.md` and RT-030 are current again (the agent security review is accepted, an
+  external sign-off is still outstanding).
 
 - Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
   probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty

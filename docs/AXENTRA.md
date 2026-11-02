@@ -81,7 +81,7 @@ table). A server therefore uses two roles:
   owner and everything else as such a runtime role (`tests/postgres_support.py`).
 - Found that way: Axentra's audit/usage mirror did not work under a non-superuser role (an Axentra transaction inside
   `Database.joined` emptied the scope of the enclosing `join`, so the meter was invisible); fixed in Axentra, see its
-  CHANGELOG (included in the current pin `f6ae01d`).
+  CHANGELOG (included since pin `f6ae01d`).
 
 ## One connection pool (M10)
 
@@ -613,7 +613,7 @@ role. 50 tenants, 2,000 users, 3,537 memberships, 10,000 sessions unless noted.
   filter on Axentra's ids, `tests/test_axentra_identity_indexes.py`). (2) The worker's periodic run usage pass read
   the mirrored events of every run ever settled (0.25 s at 2,000 runs, 0.70 s at 10,000, growing); now it reads only
   its candidates (0.04 s, flat; `tests/test_axentra_run_usage_reads.py`). (3) Axentra resolves a session in one
-  transaction instead of two (Axentra commit `69c06a5`, needs a pin bump): with (1), sequential resolution 2.8 -> 1.9
+  transaction instead of two (Axentra commit `69c06a5`, in the pin since `a8ea5d5`): with (1), sequential resolution 2.8 -> 1.9
   ms and 270 -> 390 resolutions/s.
 - **Accepted: the cost of `axentra` mode per request (~1.5-2 ms CPU).** Axentra answers (validity, revocation,
   disabled users, roles, permissions from the versioned definitions) through its own service API, one transaction
@@ -711,7 +711,8 @@ M12 is the contract step of the migration: an old implementation goes only when 
 (2) existing data has been migrated and checked, (3) the fallback period has passed, (4) no supported installation or
 integration depends on it, (5) a valid backup and restore path exists and (6) the required security review has
 passed. As of 2026-11-02 no switch is active in any production environment, no fallback period has started and the
-independent security review is still running, so conditions 2, 3 and 6 hold for no path. What M12 could remove now
+security review so far is a separate agent's (accepted on 2026-11-02, with its fixes re-reviewed), not yet an
+organizationally independent sign-off, so conditions 2, 3 and 6 hold for no path. What M12 could remove now
 was dead or superseded code with no data or rollback dependency: Axentra starting on a pool of its own (now refused by
 `AxentraServices.start`, and with it the duplicate `pool="axentra"` metric series), `AxentraServices.secret_box`
 (superseded by `keyring_secret_box`), `AxentraLink.backfill_tenants` (superseded by `backfill-identity`, which also
@@ -735,4 +736,4 @@ has passed; and a restore drill of the pre-switch backup on a production copy ha
 | `NODESTRO_AXENTRA_ALLOW_SUPERUSER` | default `0` | Not made obsolete by the runtime role: it is the explicit development opt-in that keeps the role check strict by default; a single-role database (the owner serves) cannot start Axentra without it, and the env-based tests of nodestro-api run that way | Every development setup and test harness uses the owner/runtime roles (for example `NODESTRO_TEST_RUNTIME_ROLE=1` as the default) |
 | `ndk_` API keys (`nodestro_api.serving`, `api_keys`) | – | The server serves no published APIs (M6); the desktop and Local Docker do | Not on the desktop. On a server: when publication comes, `axk_` keys plus the legacy verifier (see [API keys](#api-keys-m6-decision)), and the legacy verifier only after zero `ndk_` logins for an announced period |
 
-The contract step itself is tracked as RT-036 in `docs/TODO.md`.
+The contract step itself is tracked as RT-039 in `docs/TODO.md`.

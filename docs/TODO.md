@@ -235,7 +235,8 @@ None known.
   nodestro-server SRV-019
 - **What:** Every Axentra integration of the server profile is merged and off by default; none is active in
   production. Open:
-  - the independent security review (running; identity mirror and Axentra login first);
+  - an organizationally independent security review: the separate agent's review was accepted on 2026-11-02 (condition
+    SR-01 met, its Lows fixed and re-reviewed); an external sign-off is still outstanding;
   - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
     `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
     against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);
@@ -251,10 +252,10 @@ None known.
   transaction, so there is nothing to compare or trigger); moving knowledge files (already in PostgreSQL with their
   search index); running jobs on Axentra (M11, variant A), Nodestro's migrations on Axentra's runner (M9) and
   row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
-- **Next step:** Finish the independent review, then the staging rehearsal. No switch is activated in production by
+- **Next step:** The external security sign-off, then the staging rehearsal. No switch is activated in production by
   this work.
 
-### RT-036 · Axentra contract step (M12): remove the legacy paths
+### RT-039 · Axentra contract step (M12): remove the legacy paths
 
 - **Priority:** P3 Low · **Status:** Blocked (on production evidence per switch, RT-030) · **Refs:** `docs/AXENTRA.md`
   ("Legacy paths and their removal preconditions")
