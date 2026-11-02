@@ -413,6 +413,9 @@ class Workspace:
             mcp_exists=lambda server_id: self.store.get_raw(MCP_SERVERS, server_id) is not None,
             # One Docker daemon serves every tenant of a server: a tenant's action never removes a shared image.
             remove_images=storage is None,
+            # Accepted source builds run in a container with unfiltered network: desktop only, until a filtered build
+            # network exists (RT-038, RT-040). A server tenant and Nodestro Local Docker refuse them.
+            source_builds=self.sandbox_policy.profile == "desktop",
         )
         # Local MCP servers (WP-8) run in a container of their approved packages' image, never on the host.
         self.mcp.python = self.python

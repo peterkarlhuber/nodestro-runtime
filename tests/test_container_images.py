@@ -73,6 +73,7 @@ class FakeDocker:
         #: containers run through the sandbox: (arguments, name, timeout, the docker CLI's environment).
         self.pulled: set[str] = set()
         self.gates: list[str] = []
+        self.gate_limits: list[ContainerLimits] = []
         self.not_proven = False
         self.check_exit = 0
         self.containers: list[tuple[list[str], str, float, dict[str, str]]] = []
@@ -85,6 +86,7 @@ class FakeDocker:
         class FakeSandbox(StreamedSandbox):
             def self_test(self, *, image: str | None = None) -> SandboxProbe:
                 fake.gates.append(image or self.image)
+                fake.gate_limits.append(self.limits())
                 if fake.not_proven:
                     return SandboxProbe("docker", False, "self-test", "the container showed no seccomp filter")
                 return SandboxProbe("docker", True, facts=(("image_id", IMAGE_ID),))
@@ -170,12 +172,14 @@ def docker() -> FakeDocker:
     return FakeDocker()
 
 
-def images(docker: FakeDocker, **environ: str) -> ContainerImages:
+def images(docker: FakeDocker, *, source_builds: bool = True, **environ: str) -> ContainerImages:
+    """Container images on the stand-in; source builds on, as on the desktop (the default is off)."""
     return ContainerImages(
         docker="/usr/bin/docker",
         environ={"PATH": "/usr/bin", **environ},
         run=docker,
         sandbox_class=docker.sandbox_class(),
+        source_builds=source_builds,
     )
 
 
@@ -506,8 +510,22 @@ def test_resolving_in_a_container_is_locked_down_and_uses_only_stdin_and_stdout(
     ]
     assert not any("secret" in item for item in args)
     assert any("credentials in HTTPS_PROXY" in line for line in lines)
-    tmpfs = [flags[index + 1] for index, flag in enumerate(flags) if flag == "--tmpfs"]
-    assert len(tmpfs) == 1 and tmpfs[0].startswith("/tmp:")
+    # R-5: Orkexa's proven shape with the resolve limits (the self-test ran with exactly those), and only the
+    # allowed differences: Docker's default network instead of none, an executable /tmp, the proxy variables.
+    from nodestro_runtime import container_images
+
+    assert docker.gate_limits == [container_images._RESOLVE_LIMITS]
+    expires = int(deadline[0].split("=")[1])
+    proven = run_args("/usr/bin/docker", name, IMAGE_ID, container_images._RESOLVE_LIMITS, deadline=expires)
+    proven[proven.index(f"{OWNER_LABEL}=orkexa")] = f"{OWNER_LABEL}=nodestro"
+    network = proven.index("--network")
+    allowed = proven[:network] + proven[network + 2 :]
+    tmp = next(item for item in allowed if item.startswith("/tmp:"))
+    allowed[allowed.index(tmp)] = tmp.replace("noexec,", "")
+    allowed[-1:-1] = ["--env", "HTTPS_PROXY=http://proxy:3128", "--env", "NO_PROXY=localhost,.internal"]
+    assert args[: image + 2] == allowed
+    assert "/tmp:rw,nosuid,nodev,size=1024m" in flags
+    assert "/work:rw,noexec,nosuid,nodev,size=1024m,mode=1777" in flags
     assert command[:4] == ["python", "-I", "-B", "-c"]
     assert json.loads(command[5]) == ["HTTPS_PROXY", "NO_PROXY"]
     envelope = json.loads(stdin)
@@ -547,6 +565,171 @@ def test_a_resolver_image_without_its_digest_is_refused(docker: FakeDocker) -> N
     assert caught.value.code == "deps.build_unavailable" and docker.resolves == []
 
 
+# ---- the resolve and module-check containers are the proven shape (R-5) ---------------------------------
+
+_SHAPE_LIMITS = ContainerLimits(
+    memory_mb=2048, cpus=2.0, pids=256, nofile=4096, fsize_mb=1024, tmp_mb=1024, lifetime_s=960
+)
+
+
+def _proven(name: str = "nodestro-resolve-abc") -> list[str]:
+    return run_args("/usr/bin/docker", name, IMAGE_ID, _SHAPE_LIMITS, owner="nodestro", deadline=2_000_000_000)
+
+
+def _resolve_shape(*, network: str | None = None, env: tuple[str, ...] = ()) -> list[str]:
+    built = ContainerImages(docker="/usr/bin/docker", environ={"PATH": "/usr/bin"}, owner="nodestro")
+    from nodestro_runtime import container_images
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(container_images, "_RESOLVE_LIMITS", _SHAPE_LIMITS)
+        proxies = dict(item.split("=", 1) for item in env)
+        return built._resolve_args("nodestro-resolve-abc", IMAGE_ID, proxies, network=network, deadline=2_000_000_000)
+
+
+def _with(args: list[str], *extra: str) -> list[str]:
+    """``args`` with ``extra`` inserted before the image."""
+    return [*args[:-1], *extra, args[-1]]
+
+
+def _replace(args: list[str], old: str, new: str) -> list[str]:
+    assert old in args
+    return [new if item == old else item for item in args]
+
+
+def _without(args: list[str], *items: str) -> list[str]:
+    start = next(index for index in range(len(args)) if args[index : index + len(items)] == list(items))
+    return args[:start] + args[start + len(items) :]
+
+
+def test_the_resolve_shape_is_the_proven_one_with_only_the_allowed_differences() -> None:
+    from nodestro_runtime.container_images import RESOLVE_ALLOWANCES, check_shape
+
+    proven = _proven()
+    for candidate in (
+        _resolve_shape(),
+        _resolve_shape(network="nodestro-build"),
+        _resolve_shape(env=("HTTPS_PROXY=http://proxy:3128", "NO_PROXY=localhost")),
+    ):
+        check_shape(candidate, proven, allow=RESOLVE_ALLOWANCES)
+    shaped = _resolve_shape()
+    assert "--network" not in shaped and "/tmp:rw,nosuid,nodev,size=1024m" in shaped
+    # Everything else is exactly Orkexa's: drop the two allowed differences and the lists are equal.
+    network = proven.index("--network")
+    assert _replace(shaped, "/tmp:rw,nosuid,nodev,size=1024m", "/tmp:rw,noexec,nosuid,nodev,size=1024m") == (
+        proven[:network] + proven[network + 2 :]
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(lambda a: _with(a, "--privileged"), id="privileged"),
+        pytest.param(lambda a: _with(a, "--network", "host"), id="host-network"),
+        pytest.param(lambda a: _with(a, "--network", "container:abc"), id="container-network"),
+        pytest.param(lambda a: _with(a, "--network=host"), id="network-equals-form"),
+        pytest.param(lambda a: _with(a, "--network", "nodestro-build", "--network", "bridge"), id="two-networks"),
+        pytest.param(lambda a: _with(a, "--cap-add", "NET_RAW"), id="cap-add"),
+        pytest.param(lambda a: _with(a, "-v", "/:/host"), id="bind-mount"),
+        pytest.param(lambda a: _with(a, "--security-opt", "seccomp=unconfined"), id="seccomp-unconfined"),
+        pytest.param(lambda a: _with(a, "--env", "AWS_SECRET_ACCESS_KEY=x"), id="foreign-env"),
+        pytest.param(lambda a: _with(a, "--env", "HTTPS_PROXY=http://user:secret@proxy:3128"), id="proxy-credentials"),
+        pytest.param(lambda a: _with(a, "-e", "HTTPS_PROXY=http://proxy:3128"), id="short-env-flag"),
+        pytest.param(lambda a: _with(a, "--pid", "host"), id="host-pid"),
+        pytest.param(lambda a: _with(a, "extra"), id="positional"),
+        pytest.param(lambda a: _without(a, "--read-only"), id="writable-root"),
+        pytest.param(lambda a: _without(a, "--cap-drop", "ALL"), id="keeps-capabilities"),
+        pytest.param(lambda a: _replace(a, "65534:65534", "0:0"), id="root-user"),
+        pytest.param(lambda a: _replace(a, "2048m", "4096m"), id="more-memory"),
+        pytest.param(
+            lambda a: _replace(a, "/tmp:rw,nosuid,nodev,size=1024m", "/tmp:rw,exec,nosuid,size=1024m"), id="tmp-suid"
+        ),
+        pytest.param(
+            lambda a: _replace(
+                a, "/work:rw,noexec,nosuid,nodev,size=1024m,mode=1777", "/work:rw,nosuid,nodev,size=1024m,mode=1777"
+            ),
+            id="executable-work",
+        ),
+        pytest.param(
+            lambda a: _without(a, "--tmpfs", "/run:rw,noexec,nosuid,nodev,size=1m,mode=755"), id="no-sealed-run"
+        ),
+        pytest.param(lambda a: [*a[:-1], "sha256:" + "ef" * 32], id="other-image"),
+        pytest.param(lambda a: ["/usr/bin/docker", "create", *a[2:]], id="other-command"),
+    ],
+)
+def test_a_resolve_shape_with_any_other_difference_is_refused(tamper: Callable[[list[str]], list[str]]) -> None:
+    from nodestro_runtime.container_images import RESOLVE_ALLOWANCES, check_shape
+
+    with pytest.raises(NodestroError) as caught:
+        check_shape(tamper(_resolve_shape()), _proven(), allow=RESOLVE_ALLOWANCES)
+    assert caught.value.code == "sandbox.shape_mismatch"
+
+
+def test_without_allowances_only_the_exact_proven_shape_passes() -> None:
+    from nodestro_runtime.container_images import check_shape
+
+    proven = _proven("nodestro-sandbox-verify-abc")
+    check_shape(list(proven), proven)
+    for candidate in (
+        _without(proven, "--network", "none"),  # Docker's default network
+        _replace(proven, "/tmp:rw,noexec,nosuid,nodev,size=1024m", "/tmp:rw,nosuid,nodev,size=1024m"),
+        _with(proven, "--env", "HTTPS_PROXY=http://proxy:3128"),
+        [*proven[:2], *reversed(proven[2:-1]), proven[-1]],
+    ):
+        with pytest.raises(NodestroError) as caught:
+            check_shape(candidate, proven)
+        assert caught.value.code == "sandbox.shape_mismatch"
+
+
+def test_a_resolve_container_that_left_the_proven_shape_never_starts(
+    docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs right before the container starts: a resolve shape changed later (here: by a stand-in) is
+    refused and no container runs."""
+    original = ContainerImages._resolve_args
+
+    def privileged(self: ContainerImages, *args: Any, **options: Any) -> list[str]:
+        return _with(original(self, *args, **options), "--privileged")
+
+    monkeypatch.setattr(ContainerImages, "_resolve_args", privileged)
+    with pytest.raises(NodestroError) as caught:
+        images(docker).compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+    assert caught.value.code == "sandbox.shape_mismatch"
+    assert docker.resolves == [] and docker.containers == []
+
+
+@pytest.mark.parametrize("network", ["host", "HOST", "container:abc", "ns:/proc/1/ns/net", "-x"])
+def test_a_build_network_in_a_namespace_mode_is_refused_before_docker(docker: FakeDocker, network: str) -> None:
+    with pytest.raises(NodestroError) as caught:
+        images(docker, NODESTRO_DOCKER_BUILD_NETWORK=network).compile_in_container(
+            ["six"], python="3.13", previous="", log=print, image=PINNED_UV
+        )
+    assert caught.value.code == "deps.build_unavailable" and docker.calls == []
+
+
+def test_a_named_build_network_is_used_on_the_desktop(docker: FakeDocker) -> None:
+    images(docker, NODESTRO_DOCKER_BUILD_NETWORK="nodestro-build").compile_in_container(
+        ["six"], python="3.13", previous="", log=print, image=PINNED_UV
+    )
+    ((args, _),) = docker.resolves
+    assert args[args.index("--network") + 1] == "nodestro-build" and args.count("--network") == 1
+
+
+def test_a_module_check_that_left_the_proven_shape_never_starts(
+    docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = images(docker)
+    tag = built.build(HASHED, "3.13")
+    original = StreamedSandbox.shaped_run
+
+    def networked(self: StreamedSandbox, name: str, image_id: str) -> list[str]:
+        return _without(original(self, name, image_id), "--network", "none")
+
+    monkeypatch.setattr(StreamedSandbox, "shaped_run", networked)
+    with pytest.raises(NodestroError) as caught:
+        built.missing_modules(tag, ["six"])
+    assert caught.value.code == "sandbox.shape_mismatch" and docker.containers == []
+
+
 def test_proxy_credentials_are_stripped() -> None:
     from nodestro_runtime.container_images import strip_credentials
 
@@ -562,7 +745,7 @@ def test_a_stopped_resolve_is_reported_and_its_container_removed(tmp_path: Path)
     :meth:`StreamedSandbox.run_container`, with a docker CLI stand-in that never ends)."""
     log = tmp_path / "docker.log"
     cli = _fake_cli(tmp_path, log, run="import time; time.sleep(30)")
-    built = ContainerImages(docker=str(cli), environ={"PATH": os.environ["PATH"]})
+    built = ContainerImages(docker=str(cli), environ={"PATH": os.environ["PATH"]}, source_builds=True)
     from nodestro_runtime import container_images
 
     with pytest.MonkeyPatch.context() as patch:
@@ -608,6 +791,7 @@ def test_an_accepted_source_build_is_resolved_in_a_container(
         "tablib==1.0 \\\n    --hash=sha256:" + "1" * 64 + "\n    # via -r requirements.in\n"
         "pydantic==2.0.0 \\\n    --hash=sha256:" + "2" * 64 + "\n    # via -r requirements.in\n"
     )
+    assert python.source_builds is True  # the desktop profile (unchanged by R-1)
     plan = python.plan("tool", "show", needed)
     assert runner.builds == [False, False]  # uv on the host never builds
     assert plan.error is None and plan.lock == docker.resolve_lock and len(docker.resolves) == 1
@@ -629,6 +813,84 @@ def test_without_docker_an_accepted_source_build_stays_refused(
     plan = python.plan("tool", "show", python.needed_for_sources([("show", TOOL, "")]))
     assert plan.error is not None and plan.error.code == "deps.build_required"
     assert plan.error.params == {"name": "tablib", "reason": "sandbox.unavailable"} and not plan.lock
+
+
+def test_source_builds_are_off_unless_turned_on_and_refused_before_docker(docker: FakeDocker) -> None:
+    """R-1: the resolve container has unfiltered network, so a :class:`ContainerImages` refuses source builds unless
+    its owner turns them on (only the desktop profile does), before any docker call: no pull, no self-test, no
+    container."""
+    default = ContainerImages(docker="/usr/bin/docker", environ={"PATH": "/usr/bin"}, run=docker)
+    assert default.source_builds is False
+    for built in (default, images(docker, source_builds=False)):
+        with pytest.raises(NodestroError) as caught:
+            built.compile_in_container(["six"], python="3.13", previous="", log=print, image=PINNED_UV)
+        assert caught.value.code == "deps.source_build_disabled"
+    assert docker.calls == [] and docker.gates == [] and docker.containers == [] and docker.resolves == []
+
+
+def _server_workspace(tmp_path: Path) -> Workspace:
+    from bedrock_support import tenant_storage
+
+    return Workspace(
+        tmp_path / "tenant",
+        python_runner=FakeUv(INDEX),
+        integrations=[],
+        storage=tenant_storage(tmp_path / "db", "alpha"),
+    )
+
+
+def _local_container_workspace(tmp_path: Path) -> Workspace:
+    from nodestro_runtime.profile import RuntimeProfile
+
+    profile = RuntimeProfile(kind="local-container", data_dir=tmp_path / "data")
+    return Workspace(profile=profile, python_runner=FakeUv(INDEX), integrations=[])
+
+
+@pytest.mark.parametrize("opened", [_server_workspace, _local_container_workspace], ids=["server", "local-container"])
+def test_accepted_source_builds_are_refused_outside_the_desktop(
+    opened: Callable[[Path], Workspace], tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-1: on a server and in Nodestro Local Docker a plan a person accepted does not build from source (no filtered
+    build network exists yet, RT-038): it reports ``deps.source_build_disabled`` and docker is never asked to pull,
+    test or run anything. Packages with wheels still resolve."""
+    from nodestro_runtime import container_images
+
+    monkeypatch.setattr(container_images, "UV_IMAGE", PINNED_UV)
+    workspace = opened(tmp_path)
+    try:
+        python = workspace.python
+        python.sandbox_kind = lambda: "docker"
+        python.images = images(docker)  # source builds on: the environments turn them off again
+        assert python.source_builds is False and python.images.source_builds is False
+        runner = python.runner
+        assert isinstance(runner, FakeUv)
+        runner.source_only = {"tablib"}
+        needed = python.needed_for_sources([("show", TOOL, "")])
+        plan = python.plan("tool", "show", needed)  # builds=True: the library dialog, a person accepted
+        assert plan.error is not None and plan.error.code == "deps.source_build_disabled"
+        assert plan.error.params == {"name": "tablib"} and not plan.lock
+        # Even a ContainerImages turned on by hand is not reached: the environments refuse first.
+        python.images.source_builds = True
+        again = python.plan("tool", "show", needed)
+        assert again.error is not None and again.error.code == "deps.source_build_disabled"
+        assert runner.builds == [False, False]  # uv on the host never builds either
+        assert docker.resolves == [] and docker.gates == [] and docker.containers == [] and docker.pulled == set()
+        assert not [call for call in docker.calls if call[1] in ("run", "pull", "create", "start")]
+        # Wheels only (no source build needed): unchanged.
+        runner.source_only = set()
+        wheels = python.plan("tool", "show", needed)
+        assert wheels.error is None and "tablib" in wheels.lock and docker.resolves == []
+    finally:
+        workspace.close()
+
+
+def test_the_desktop_keeps_its_accepted_source_builds(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path / "data", python_runner=FakeUv(INDEX), integrations=[])
+    try:
+        assert workspace.sandbox_policy.profile == "desktop"
+        assert workspace.python.source_builds is True and workspace.python.images.source_builds is True
+    finally:
+        workspace.close()
 
 
 def _fake_cli(tmp_path: Path, log: Path, *, run: str) -> Path:

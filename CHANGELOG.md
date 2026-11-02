@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Resolve and module-check containers checked against the proven shape (R-5, RT-038; 2026-11-02):
+
+- `container_images.check_shape` refuses a `docker run` that is not Orkexa's `run_args` (the shape the in-container
+  self-test proves) up to an explicit allowlist, right before the container starts (`sandbox.shape_mismatch`,
+  nothing started). The module check (`missing_modules`) must be exactly that shape. The resolve container
+  (`compile_in_container`) is now built from `run_args` and may differ only in `RESOLVE_ALLOWANCES`: Docker's default
+  or one named network instead of none, `/tmp` without `noexec`, proxy variables without credentials.
+- The resolve container thereby gets the proven shape's noexec `/work`, sealed `/run` and `/var/tmp` and `-w /work`;
+  its `/tmp` no longer sets `uid=`/`gid=`/`mode=0700` (Docker's tmpfs default applies, as for `/tmp` of every
+  sandbox container).
+- `StreamedSandbox(container_limits=...)`: the resolve sandbox runs Orkexa's self-test with exactly the resolve
+  container's limits (open files, file size, tmpfs and `/dev/shm` sizes included), so they are proven in the
+  resolver image.
+- `NODESTRO_DOCKER_BUILD_NETWORK` must name a network: `host` and namespace modes (`container:<id>`, ...) are
+  refused for the resolve container (`deps.build_unavailable`) before any docker call.
+
+Source builds only on the desktop (R-1, RT-038; 2026-11-02):
+
+- Python packages that must be built from source are resolved in a container with unfiltered network. Outside the
+  desktop profile (a server tenant, Nodestro Local Docker) that is now off by default: a plan a person accepted
+  reports `deps.source_build_disabled` (parameter `name`) and no container is pulled, tested or started.
+  `PythonEnvironments(source_builds=...)` and `ContainerImages(source_builds=...)` default to `False`; `Workspace`
+  turns it on for the desktop profile only. Wheels-only plans and image builds are unchanged. There is no switch to
+  turn it on elsewhere; RT-040 and `docs/build-network.md` describe the filtered build network it would need.
+
 Python 3.11 minimum (2026-11-02):
 
 - Python 3.11 is now the minimum (3.10 reached end of life in October 2026): `requires-python`, classifiers, ruff

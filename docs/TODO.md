@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 8 |
-| P3 Low | 24 |
+| P3 Low | 25 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -69,15 +69,16 @@ None known.
 
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** Docker-first plan R4, `container_images.UV_IMAGE`,
   `ContainerImages.compile_in_container`
-- **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). A plan a person asked
-  for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
+- **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). On the desktop, a
+  plan a person asked for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
   bind mounts, proxy variables only and without credentials, no capabilities, `nobody`, read-only with a tmpfs,
   limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-038). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
   (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
-  (which refuses containers with network and foreign images). Studio has no text for the `reason` parameter yet.
-- **Next step:** Add a real-Docker test of the resolve
-  container in the CI `docker` job, and decide whether the gateway should offer a resolve container.
+  (which refuses containers with network and foreign images); outside the desktop source builds are off
+  (`deps.source_build_disabled`, RT-038). Studio has no text for the `reason` parameter yet.
+- **Next step:** Add a real-Docker test of the resolve container in the CI `docker` job. The gateway offers a resolve
+  container only together with a proven filtered build network (RT-040).
 
 ### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
 
@@ -95,7 +96,27 @@ None known.
   `ContainerImages` reads at most 16 MiB of stdout and the last 256 KiB of stderr (`bounded_run`; more kills the CLI).
   A Python version without a pinned base image is refused (`deps.python_unsupported`) instead of building on the
   unpinned `python:<v>-slim` tag.
-- **Residual risk:** The resolve container still has network (Docker's default bridge, or
+- **Source builds are desktop only (done 2026-11-02, owner decision):** Outside the desktop profile (a server
+  tenant, Nodestro Local Docker) source builds are off by default: `PythonEnvironments.source_builds` and
+  `ContainerImages.source_builds` are `False` unless the workspace runs the desktop profile, and a plan a person
+  accepted reports `deps.source_build_disabled` (parameter `name`) before any docker call (no pull, no self-test, no
+  container). Wheels-only plans and image builds (`--only-binary=:all:`, hashed downloads) are unchanged. There is no
+  operator switch that turns source builds on again, and `NODESTRO_DOCKER_BUILD_NETWORK` does not either: a named
+  network is not proof that it is filtered. Source builds come back outside the desktop only with a build network
+  the runtime proves filtered (RT-040). The sandbox gateway never offered a resolve container (it refuses network,
+  pulls and other images), so Local Docker could not build sources before either; the refusal now says why.
+- **Proven shape (done 2026-11-02, review R-5):** The resolve and module-check containers are no longer written
+  by hand. Both are built from Orkexa's `run_args` and checked against it right before they start
+  (`container_images.check_shape`, `sandbox.shape_mismatch` otherwise, nothing started): the module check must be
+  exactly the self-tested shape; the resolve container may differ only in `RESOLVE_ALLOWANCES` (`--network none`
+  replaced by Docker's default or one named network, never `host` or another namespace mode; `noexec` dropped from
+  `/tmp`; `--env` for proxy variables without credentials). The resolve container thereby gained the noexec `/work`
+  and the sealed `/run` and `/var/tmp` of the proven shape, and its sandbox runs Orkexa's self-test with exactly its
+  own limits (`_RESOLVE_LIMITS`: memory, CPU, processes, open files, file size, tmpfs and `/dev/shm` sizes), so those
+  values are proven in the resolver image too. What the self-test cannot prove is the allowed differences themselves:
+  the network (by design) and the executable `/tmp`. An in-container probe of the resolve shape was not added: it
+  would need its own image-specific checks and would prove only what the allowlist already states.
+- **Residual risk (desktop):** The resolve container still has network (Docker's default bridge, or
   `NODESTRO_DOCKER_BUILD_NETWORK`) while untrusted build scripts run in it: they can reach the package index, the
   internet, hosts on the LAN, ports the host publishes on the bridge and, on cloud VMs, the instance metadata service.
   A pre-download on the host with `--network none` for the build is not feasible as is: the dependencies of a package
@@ -103,10 +124,23 @@ None known.
   separated in one step. A proxy that needs credentials no longer works for the resolver (credentials are not passed
   into code that can read them). `/tmp` in the resolve container is executable (compilers and build tools run there).
   The resolver is used only for plans a person explicitly accepted (library dialog), never for generated tools.
-- **Next step:** Offer an egress-filtered build network (only the package index or the proxy reachable; metadata and
-  RFC 1918 ranges blocked) and make it the default where it can be created; or resolve iteratively (download the
-  hashed sdists on the host side, build their metadata in a `--network none` container, repeat until closed). Add a
-  real-Docker test of `missing_modules` and the resolve container in the CI `docker` job.
+- **Next step:** RT-040 (a proven filtered build network, or iterative resolving without network). Add a real-Docker
+  test of `missing_modules` and the resolve container in the CI `docker` job (it would also show that uv runs with
+  the sealed `/run` and `/var/tmp` and the `/tmp` mode Docker gives a tmpfs without `mode=`). Studio needs texts for
+  `deps.source_build_disabled` and `sandbox.shape_mismatch`.
+
+### RT-040 · A filtered build network, so servers can build Python packages from source again
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** RT-038, [docs/build-network.md](build-network.md),
+  `ContainerImages.compile_in_container`
+- **What:** Source builds outside the desktop are refused (`deps.source_build_disabled`) because the resolve
+  container's network is not filtered. They may come back only with a build network that reaches nothing but the
+  package sources (or a package proxy) over IPv4 and IPv6, with no LAN, host or metadata access, and that the runtime
+  proves on its daemon before each first use (a probe in the build shape, like the sandbox self-test). An operator
+  switch is allowed only together with that proof; one that re-enables the unfiltered network is not.
+- **Next step:** Choose between an internal Docker network with an allowlisting egress proxy and iterative resolving
+  without network (both analyzed in docs/build-network.md), with an owner decision and a security review before any
+  implementation.
 
 ### RT-033 · Docker-first sandbox status: follow-ups
 
