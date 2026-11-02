@@ -14,9 +14,12 @@ The image is built in two stages:
    --no-deps`` installs the downloaded wheels into the final image, which keeps no download cache, no certificate and
    no proxy setting, and runs as ``nobody``.
 
-Tool calls then run in that image with the flags of Orkexa's :class:`~orkexa.dynamic.DockerSandbox` (no network,
-read-only file system, no capabilities, ``nobody``, memory/CPU/process limits). If Docker or the image is missing, the
-call fails (``sandbox.unavailable``); there is never a fallback to a host subprocess.
+Tool calls then run in that image as Orkexa's :class:`~orkexa.dynamic.DockerSandbox` runs them
+(:class:`StreamedSandbox`): one container shape (:func:`orkexa.dynamic.docker.run_args`: no network, read-only file
+system, no capabilities, ``nobody``, private IPC, memory/CPU/process/file limits, no logging), the image run by its
+id, code and Orkexa's runner on stdin, and only after the daemon passed Orkexa's preflight and in-container self-test.
+If Docker or the image is missing, or the daemon does not prove the sandbox's limits, the call fails; there is never a
+fallback to a host subprocess.
 
 Proxies and an extra certificate authority for the download stage come from the host: ``HTTP(S)_PROXY`` /
 ``NO_PROXY`` are passed as build arguments, and the file in ``NODESTRO_BUILD_CA_FILE`` (or ``SSL_CERT_FILE``) is
@@ -46,10 +49,17 @@ import time
 from typing import Any
 import uuid
 
-from orkexa.dynamic import DockerSandbox, SandboxError, response_limit, run_bounded
+from orkexa.dynamic import DockerSandbox, SandboxError, SandboxProbe
+from orkexa.dynamic.docker import (
+    BOOTSTRAP,
+    ContainerLimits,
+    copy_runner,
+    run_args,
+    runner_files,
+    runner_fingerprint,
+)
 from orkexa.providers.base import redact
 
-from . import sandbox_cancel
 from .image_limits import (
     GC_MAX_GB,
     GC_MAX_IMAGES,
@@ -295,7 +305,7 @@ class ContainerImages:
             ca = self._certificate_authority()
             if ca is not None:
                 shutil.copyfile(ca, context / "ca.pem")
-            _copy_orkexa(context / "orkexa")
+            copy_runner(context)  # context/orkexa/...: the runner, copied to /opt/orkexa/orkexa
             (context / "Dockerfile").write_text(
                 _DOCKERFILE.format(
                     base=self.base(python_version),
@@ -579,170 +589,93 @@ class ContainerImages:
         )
 
 
+#: The owner label (``org.orkexa.sandbox``) of Nodestro's tool containers; the reaper removes only these.
+OWNER = "nodestro"
+#: The owner label of local MCP servers' containers: they live as long as their connection, so the tool containers'
+#: reaper never touches them.
+MCP_OWNER = "nodestro-mcp"
+#: Seconds a container made by :func:`sandbox_run_args` may exist by default (its deadline label).
+DEFAULT_LIFETIME = 600.0
+
+
 def sandbox_run_args(
-    docker: str, container_name: str, image: str, *, memory_mb: int, cpus: float, pids_limit: int
+    docker: str,
+    container_name: str,
+    image: str,
+    *,
+    memory_mb: int,
+    cpus: float,
+    pids_limit: int,
+    owner: str = OWNER,
+    lifetime_s: float = DEFAULT_LIFETIME,
 ) -> list[str]:
-    """``docker run`` up to the image for a container of Nodestro's sandbox shape (the command follows).
+    """``docker run`` up to the image for a container of the sandbox shape (the command follows).
 
-    No network, read-only root file system, no capabilities, no new privileges, user ``nobody``, memory/CPU/process
-    limits, small ``noexec`` temporary file systems, stdin attached, removed on exit and never pulled. The sandbox
-    gateway accepts exactly this shape (:func:`~nodestro_runtime.sandbox_gateway.plan_create`)."""
-    return [
-        docker,
-        "run",
-        "--rm",
-        "-i",
-        "--pull",
-        "never",
-        "--name",
-        container_name,
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        "65534:65534",
-        "--pids-limit",
-        str(pids_limit),
-        "--memory",
-        f"{memory_mb}m",
-        "--memory-swap",
-        f"{memory_mb}m",
-        "--cpus",
-        str(cpus),
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=16m",
-        "--tmpfs",
-        "/work:rw,noexec,nosuid,size=16m,uid=65534,gid=65534,mode=0700",
-        "-w",
-        "/work",
-        image,
-    ]
+    Orkexa's one shape (:func:`orkexa.dynamic.docker.run_args`): no network, read-only root file system, no
+    capabilities, no new privileges, user ``nobody``, private IPC, a small ``/dev/shm``, memory (without swap), CPU,
+    process, open-file, file-size and core limits, no logging, small ``noexec`` temporary file systems, stdin attached,
+    removed on exit, never pulled, and the labels ``org.orkexa.sandbox=<owner>`` and ``org.orkexa.deadline`` (now plus
+    ``lifetime_s``). The sandbox gateway accepts exactly this shape
+    (:func:`~nodestro_runtime.sandbox_gateway.plan_create`)."""
+    limits = ContainerLimits(memory_mb=memory_mb, cpus=cpus, pids=pids_limit, lifetime_s=lifetime_s)
+    return run_args(docker, container_name, image, limits, owner=owner)
 
 
-#: Runs first in the container: writes the tool files into the tmpfs ``/work`` and starts Orkexa's runner there.
-_BOOTSTRAP = (
-    "import io, json, os, runpy, sys\n"
-    "envelope = json.loads(sys.stdin.read())\n"
-    "for name, content in envelope['files'].items():\n"
-    "    if not name or '/' in name or name.startswith('.'):\n"
-    "        raise SystemExit('invalid file name')\n"
-    "    with open(os.path.join('/work', name), 'w', encoding='utf-8') as handle:\n"
-    "        handle.write(content)\n"
-    "os.chdir('/work')\n"
-    "runner = '/opt/orkexa/orkexa/dynamic/_sandbox_runner.py'\n"
-    "sys.stdin = io.StringIO(envelope['request'])\n"
-    "sys.argv = [runner]\n"
-    "sys.path.insert(0, os.path.dirname(runner))\n"
-    "runpy.run_path(runner, run_name='__main__')\n"
-)
+#: Runs first in the container (Orkexa's): writes the runner modules and the tool files from stdin into the tmpfs file
+#: systems and starts the runner there.
+_BOOTSTRAP = BOOTSTRAP
 
 
 class StreamedSandbox(DockerSandbox):
-    """Orkexa's Docker sandbox for an image Nodestro built, without bind mounts.
+    """Orkexa's Docker sandbox for an image Nodestro built, as Nodestro runs it.
 
-    Orkexa's :class:`~orkexa.dynamic.DockerSandbox` mounts the call's work directory and its own package from the host
-    into the container. That needs the Docker daemon to see the same file system as Nodestro, which is not the case
-    for a daemon on another host or in another container (a server's workers). Here the image already contains
-    Orkexa (``/opt/orkexa/orkexa``, copied in at build time), and the tool's files travel with the request on stdin
-    into a ``tmpfs`` work directory. The container flags are otherwise Orkexa's: no network, read-only root file
-    system, no capabilities, ``nobody``, memory/CPU/process limits; plus ``--pull never``, so a missing image is
-    never looked for in a registry (and whatever was found there never runs). The docker CLI gets only the variables
-    it needs to reach its daemon.
+    Exactly :class:`~orkexa.dynamic.DockerSandbox` with ``transport="stdin"``: nothing of the host's file system is
+    mounted (the tool's files and Orkexa's runner travel on stdin into a ``tmpfs`` work directory), so the daemon may
+    run on another host or in another container (a server's workers, the sandbox gateway); each call runs the image
+    by its id in Orkexa's one container shape, and only after the daemon passed the preflight and the in-container
+    self-test. Its containers carry the owner label :data:`OWNER`. The docker CLI gets only ``environ`` (the variables
+    it needs to reach its daemon, :meth:`ContainerImages._cli_environment`), never the process's. Cancelling a run
+    (:mod:`nodestro_runtime.sandbox_cancel`) or :meth:`cancel` removes the call's container.
     """
 
-    def __init__(self, *, environ: Mapping[str, str] | None = None, **options: Any) -> None:
-        super().__init__(**options)
-        self.environ = dict(environ) if environ is not None else None
-
-    def command(self, workdir: Path, container_name: str) -> list[str]:
-        return [
-            *sandbox_run_args(
-                self.docker,
-                container_name,
-                self.image,
-                memory_mb=self.memory_mb,
-                cpus=self.cpus,
-                pids_limit=self.pids_limit,
-            ),
-            "python",
-            "-I",
-            "-B",
-            "-c",
-            _BOOTSTRAP,
-        ]
-
-    def _execute(self, workdir: Path, request: str) -> str:
-        files = {path.name: path.read_text(encoding="utf-8") for path in sorted(workdir.iterdir()) if path.is_file()}
-        envelope = json.dumps({"files": files, "request": request})
-        name = f"nodestro-sandbox-{uuid.uuid4().hex[:12]}"
-
-        def remove() -> None:
-            # Killing the docker client does not stop the container.
-            with contextlib.suppress(OSError):
-                subprocess.run([self.docker, "rm", "-f", name], capture_output=True, check=False, env=self.environ)
-
-        # A cancelled run removes this call's container (only this one: the sandbox is shared with other runs);
-        # the docker client then ends and the call fails (:mod:`nodestro_runtime.sandbox_cancel`).
-        check = sandbox_cancel.current()
-        done = threading.Event()
-        stopped = threading.Event()
-
-        def watch() -> None:
-            while not done.wait(0.1):
-                if sandbox_cancel.requested(check):
-                    stopped.set()
-                    remove()
-                    return
-
-        watcher = threading.Thread(target=watch, daemon=True) if check is not None else None
-        if watcher is not None:
-            watcher.start()
-        try:
-            # Bounded: tool code can write to the container's stdout directly, past the runner's limit.
-            code, output = run_bounded(
-                self.command(workdir, name),
-                envelope.encode("utf-8"),
-                timeout=self.timeout,
-                max_stdout=response_limit(self.max_output_chars),
-                env=self.environ,
-                on_abort=remove,
-            )
-        except OSError as exc:
-            raise SandboxError(f"Cannot start docker: {exc}") from exc
-        finally:
-            done.set()
-            if watcher is not None:
-                watcher.join()
-        if stopped.is_set():
-            raise SandboxError("The run was cancelled; the call's container was removed")
-        stdout = output.stdout.decode("utf-8", "replace")
-        if not stdout.strip():
-            stderr = output.stderr.decode("utf-8", "replace")
-            raise SandboxError(f"Container exited with code {code}: {stderr[-1000:]}")
-        return stdout
+    def __init__(self, *, environ: Mapping[str, str] | None = None, owner: str = OWNER, **options: Any) -> None:
+        options.pop("transport", None)  # always stdin: a mount needs the daemon to see this computer's files
+        super().__init__(transport="stdin", owner=owner, environ=environ, **options)
 
 
 class RuntimeImageSandbox(StreamedSandbox):
     """A :class:`StreamedSandbox` whose image is found (or built) on first use by ``resolve``.
 
-    A server's tool code without third-party libraries runs in the image of Nodestro's own runtime requirements
-    (see :meth:`nodestro_runtime.python_envs.PythonEnvironments.runtime_image`). If it cannot be built, the call
-    fails; nothing runs anywhere else."""
+    Tool code without third-party libraries runs in the image of Nodestro's own runtime requirements (see
+    :meth:`nodestro_runtime.python_envs.PythonEnvironments.runtime_image`), on the desktop as on a server. ``resolve``
+    names the image (a tag); every call and the self-test run it by its id, so a tag moved later is never run
+    unchecked. If it cannot be built, the call fails; nothing runs anywhere else."""
 
     def __init__(self, resolve: Callable[[], str], **options: Any) -> None:
         super().__init__(image="", **options)
         self._resolve = resolve
 
-    def _execute(self, workdir: Path, request: str) -> str:
+    def _resolved(self) -> str:
         if not self.image:
             try:
                 self.image = self._resolve()
             except NodestroError as exc:
                 raise SandboxError(f"The sandbox image is not available: {exc}") from exc
+        return self.image
+
+    def self_test(self, *, image: str | None = None) -> SandboxProbe:
+        if image is None:
+            try:
+                self._resolved()
+            except SandboxError as exc:
+                return SandboxProbe("docker", False, "image", str(exc))
+        return super().self_test(image=image)
+
+    def command(self, workdir: Path, container_name: str, *, image: str | None = None) -> list[str]:
+        return super().command(workdir, container_name, image=image or self._resolved())
+
+    def _execute(self, workdir: Path, request: str) -> str:
+        self._resolved()
         return super()._execute(workdir, request)
 
 
@@ -756,35 +689,22 @@ def _orkexa_dir() -> Path:
     return Path(orkexa.__file__).resolve().parent
 
 
-def _orkexa_files() -> list[Path]:
-    root = _orkexa_dir()
-    return sorted(
-        path for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
-    )
-
-
-_FINGERPRINT: str | None = None
+def _orkexa_files() -> dict[str, str]:
+    """What an image carries of Orkexa: the runner and the modules it imports (``{"orkexa/<path>": source}``)."""
+    return runner_files()
 
 
 def orkexa_fingerprint() -> str:
-    """The SHA-256 of the Orkexa package this process runs; part of every image key (the image carries a copy)."""
-    global _FINGERPRINT
-    if _FINGERPRINT is None:
-        root = _orkexa_dir()
-        digest = hashlib.sha256()
-        for path in _orkexa_files():
-            digest.update(str(path.relative_to(root)).encode("utf-8") + b"\0")
-            digest.update(path.read_bytes() + b"\0")
-        _FINGERPRINT = digest.hexdigest()
-    return _FINGERPRINT
+    """The SHA-256 of Orkexa's sandbox runner (:func:`orkexa.dynamic.docker.runner_fingerprint`); part of every image
+    key (the image carries a copy)."""
+    return runner_fingerprint()
 
 
 def _copy_orkexa(target: Path) -> None:
-    root = _orkexa_dir()
-    for path in _orkexa_files():
-        destination = target / path.relative_to(root)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, destination)
+    """Write Orkexa's runner modules into the folder ``target`` (``target/<path>``, as the ``orkexa`` package)."""
+    copy_runner(target.parent)
+    if target.name != "orkexa":  # copy_runner writes <parent>/orkexa/...
+        raise ValueError("The target of the runner copy must be a folder named orkexa")
 
 
 class ResolveError(Exception):
@@ -837,6 +757,8 @@ __all__ = [
     "IMAGE_REPOSITORY",
     "LOCK_LABEL",
     "MAX_IMAGE_GB",
+    "MCP_OWNER",
+    "OWNER",
     "UV_IMAGE",
     "ContainerImages",
     "LocalImageSandbox",
@@ -845,4 +767,5 @@ __all__ = [
     "StreamedSandbox",
     "lock_has_hashes",
     "orkexa_fingerprint",
+    "sandbox_run_args",
 ]

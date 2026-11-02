@@ -519,11 +519,9 @@ class Workspace:
         return values.get(key)
 
     def _container_sandbox(self) -> Callable[[], Sandbox] | None:
-        """On a server and in the local container, tool code without libraries runs in Nodestro's runtime image (no
-        bind mounts, so the Docker daemon may run elsewhere; no image an operator builds by hand); the desktop keeps
-        Orkexa's ``orkexa-sandbox`` image."""
-        if self.sandbox_policy.profile == "desktop":
-            return None
+        """In every profile, tool code without libraries runs in Nodestro's runtime image (no bind mounts, so the Docker
+        daemon may run elsewhere or in a VM; no image anybody builds by hand; Orkexa's ``orkexa-sandbox`` image is not
+        used)."""
         # The Python environments are created after the tool library; the image is resolved on the first call.
         return lambda: RuntimeImageSandbox(
             lambda: self.python.runtime_image(), timeout=15.0, environ=ContainerImages()._cli_environment()

@@ -203,12 +203,13 @@ reach internal services. The desktop import leaves
 provider keys behind. Changing `NODESTRO_SECRET_KEY` makes stored keys unreadable (no rotation yet). Needs the
 `postgres` extra (psycopg, cryptography).
 
-**Containers without bind mounts.** Images built by `container_images` contain Orkexa (`/opt/orkexa/orkexa`, part
-of the image key), and `StreamedSandbox` sends the tool's files on stdin into a `tmpfs` work directory instead of
-mounting host paths, so the Docker daemon may run on another host or in another container (`DOCKER_HOST`). On a
-server, tool code without libraries runs in the runtime image (Nodestro's runtime requirements only), built on first
-use (`RuntimeImageSandbox`); no image has to be built by hand. The desktop keeps Orkexa's `orkexa-sandbox` image for
-tools without libraries.
+**Containers without bind mounts.** `StreamedSandbox` is Orkexa's `DockerSandbox` with the stdin transport: the
+tool's files and Orkexa's sandbox runner travel on stdin into a `tmpfs` work directory instead of mounting host paths,
+so the Docker daemon may run on another host, in a VM or in another container (`DOCKER_HOST`). Every call runs in
+Orkexa's one container shape (`orkexa.dynamic.docker.run_args`), runs the image by its id, and starts only after the
+daemon passed Orkexa's preflight and in-container self-test. Tool code without libraries runs in the runtime image
+(Nodestro's runtime requirements only), built on first use (`RuntimeImageSandbox`), on the desktop as on a server; no
+image has to be built by hand.
 
 **Libraries in the Docker sandbox (ADR-0006 point 6).** With the Docker sandbox, `nodestro_runtime.container_images`
 turns an approved lock file into an image `nodestro-env:<key>`, where the key is the SHA-256 of the lock, the Python

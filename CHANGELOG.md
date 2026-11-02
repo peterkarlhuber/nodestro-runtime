@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+One container shape from Orkexa (Docker-first plan R1, 2026-11-02; needs Orkexa PR #31):
+
+- `sandbox_run_args` (same signature, new optional `owner` and `lifetime_s`) is now Orkexa's
+  `orkexa.dynamic.docker.run_args`: besides the earlier flags `--ipc private`, `--shm-size 16m`,
+  `--ulimit nofile=1024:1024`, `--ulimit fsize=16 MiB`, `--ulimit core=0:0`, `--log-driver none`, `nodev` tmpfs
+  (`/work` with `mode=1777`) and the labels `org.orkexa.sandbox=<owner>` and `org.orkexa.deadline=<epoch>`.
+  Tool containers carry the owner `nodestro` (`container_images.OWNER`), local MCP servers `nodestro-mcp`
+  (`MCP_OWNER`, deadline a week ahead, so the tool reaper never removes a live server).
+- `StreamedSandbox` is a thin `orkexa.dynamic.DockerSandbox` (`transport="stdin"`, owner `nodestro`, `environ` for
+  every docker CLI call): every call runs the image by its id, only after Orkexa's preflight and in-container
+  self-test passed; `Sandbox.cancel()` and a cancelled run (`sandbox_cancel`) kill and remove the call's container
+  (Orkexa's), the runtime-local cancel watcher is gone. Containers are named `orkexa-sandbox-<hex>`.
+- `RuntimeImageSandbox` resolves its tag on first use (also for `command()` and `self_test()`) and runs the image by
+  id. The desktop profile now uses it too (Docker mode and the `auto` fallback); Orkexa's `orkexa-sandbox` image is
+  no longer used by Nodestro.
+- Environment images carry only Orkexa's sandbox runner (`runner_files()`); the image key uses
+  `runner_fingerprint()` (`orkexa_fingerprint()` returns it), so every environment image is rebuilt once. `_BOOTSTRAP`
+  is Orkexa's `BOOTSTRAP`.
+- Sandbox gateway: `plan_create` accepts Orkexa's shape (`IpcMode` private only; `ShmSize` at most 64 MB, default
+  16 MB; `Ulimits` only `nofile` <= 1024, `fsize` <= 64 MB, `core` = 0, soft = hard, defaults filled in; `LogConfig`
+  only `none`; the two `org.orkexa.*` labels when well-formed, other labels dropped as before), container names
+  `orkexa-selftest-*`, and images by id (`sha256:<64 hex>`) only when the daemon reports a `nodestro-env:<key>` tag and
+  the lock label for exactly that id (also for `GET /images/<id>/json`; removal stays by tag). Every earlier refusal
+  stays. The build context must hold exactly Orkexa's runner modules.
+
 No package build scripts on the host (Docker-first plan R4, 2026-11-02):
 
 - `UvRunner.compile` resolves with `--no-build` by default and `UvRunner.sync` installs host virtual environments

@@ -311,9 +311,9 @@ def make_sandbox(
     """The sandbox of the ``sandbox`` setting: ``docker`` (isolating) or a host subprocess (``subprocess`` and
     ``auto``; in ``auto`` the workspace also sets :attr:`ToolLibrary.container_fallback`).
 
-    ``container`` builds the container sandbox where Orkexa's default (``orkexa-sandbox`` image, bind mounts) does
-    not fit, as on a server. The subprocess sandbox runs only trusted and user-authored code; the policy refuses
-    everything else in it (and, in the server profile, refuses to create it at all)."""
+    ``container`` builds the container sandbox (the workspace's: Nodestro's runtime image, every profile); without it
+    Orkexa's default ``DockerSandbox`` is used. The subprocess sandbox runs only trusted and user-authored code; the
+    policy refuses everything else in it (and, in the server profile, refuses to create it at all)."""
     if kind == "docker":
         return container() if container is not None else DockerSandbox()
     (policy or SandboxPolicy()).check_construction("none")

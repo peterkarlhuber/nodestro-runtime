@@ -26,7 +26,7 @@ import threading
 from typing import Any
 import uuid
 
-from ..container_images import sandbox_run_args
+from ..container_images import MCP_OWNER, sandbox_run_args
 
 #: The longest JSON-RPC line a stdio server may write (a tool result is cut to ``max_output_chars`` later anyway).
 MAX_LINE_BYTES = 8 * 1024 * 1024
@@ -35,6 +35,9 @@ PIDS_LIMIT = 64
 CPUS = 1.0
 #: The container name prefix; the sandbox gateway accepts only names of the sandbox's pattern.
 NAME_PREFIX = "nodestro-sandbox-mcp-"
+#: The deadline label of a stdio server's container (it lives as long as its connection; the tool containers' reaper
+#: never removes containers of :data:`~nodestro_runtime.container_images.MCP_OWNER`).
+LIFETIME = 7 * 24 * 3600.0
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,16 @@ def launch(
     """The relay command that runs ``python -m module args`` in a sandbox container of ``image``."""
     name = container_name()
     run = [
-        *sandbox_run_args(docker, name, image, memory_mb=memory_mb, cpus=CPUS, pids_limit=PIDS_LIMIT),
+        *sandbox_run_args(
+            docker,
+            name,
+            image,
+            memory_mb=memory_mb,
+            cpus=CPUS,
+            pids_limit=PIDS_LIMIT,
+            owner=MCP_OWNER,
+            lifetime_s=LIFETIME,
+        ),
         "python",
         "-I",
         "-B",

@@ -14,9 +14,19 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 from orkexa.dynamic import DockerSandbox, SubprocessSandbox
+from orkexa.dynamic.docker import (
+    BOOTSTRAP,
+    DEADLINE_LABEL,
+    OWNER_LABEL,
+    ContainerLimits,
+    run_args,
+    runner_files,
+    runner_fingerprint,
+)
 from orkexa.errors import ToolExecutionError
 import pytest
 
@@ -170,7 +180,7 @@ def test_the_image_downloads_with_hashes_and_installs_offline(docker: FakeDocker
     assert "--require-hashes" in download and "--only-binary=:all:" in download and "ca.pem" in download
     assert "--no-index" in final and "--require-hashes" in final and "ca.pem" not in final
     assert "USER 65534:65534" in final and LOCK_LABEL in final
-    # The image carries the Orkexa package this process runs (no bind mount of it at call time).
+    # The image carries Orkexa's sandbox runner (the calls send it on stdin, too; nothing is mounted).
     assert "COPY orkexa /opt/orkexa/orkexa" in final
     assert "orkexa/dynamic/_sandbox_runner.py" in docker.orkexa_files
     # The docker CLI never gets provider keys.
@@ -213,17 +223,40 @@ def test_the_sandbox_of_an_image_is_a_docker_sandbox(docker: FakeDocker) -> None
     assert any(item.startswith("/work:") for item in command)
 
 
-def test_the_image_key_names_the_orkexa_package(docker: FakeDocker) -> None:
+def test_the_image_key_names_the_orkexa_package(docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
     from nodestro_runtime import container_images
 
     built = images(docker)
     tag = built.tag(HASHED, "3.13")
-    original = container_images._FINGERPRINT
-    container_images._FINGERPRINT = "0" * 64
-    try:
-        assert built.tag(HASHED, "3.13") != tag  # another Orkexa means another image
-    finally:
-        container_images._FINGERPRINT = original
+    assert container_images.orkexa_fingerprint() == runner_fingerprint()
+    monkeypatch.setattr(container_images, "runner_fingerprint", lambda: "0" * 64)
+    assert built.tag(HASHED, "3.13") != tag  # another Orkexa runner means another image
+
+
+def test_the_image_carries_exactly_orkexa_s_runner(docker: FakeDocker) -> None:
+    images(docker).build(HASHED, "3.13")
+    assert docker.orkexa_files == sorted(path for path in runner_files() if path.endswith(".py"))
+
+
+def test_the_sandbox_shape_is_orkexa_s(docker: FakeDocker) -> None:
+    from nodestro_runtime.container_images import _BOOTSTRAP, OWNER, sandbox_run_args
+
+    shim = sandbox_run_args("docker", "nodestro-sandbox-x", "img", memory_mb=256, cpus=0.5, pids_limit=32)
+    limits = ContainerLimits(memory_mb=256, cpus=0.5, pids=32, lifetime_s=600)
+    expected = run_args("docker", "nodestro-sandbox-x", "img", limits, owner=OWNER)
+    deadline = [item for item in shim if item.startswith(DEADLINE_LABEL)]
+    assert [item for item in shim if not item.startswith(DEADLINE_LABEL)] == [
+        item for item in expected if not item.startswith(DEADLINE_LABEL)
+    ]
+    assert len(deadline) == 1 and abs(int(deadline[0].split("=")[1]) - time.time() - 600) < 5
+    for flag in ("--ipc", "--shm-size", "--log-driver"):
+        assert flag in shim
+    assert [shim[i + 1] for i, a in enumerate(shim) if a == "--ulimit"][::2] == ["nofile=1024:1024", "core=0:0"]
+    assert f"{OWNER_LABEL}=nodestro" in shim
+    assert _BOOTSTRAP is BOOTSTRAP
+    sandbox = images(docker).sandbox("nodestro-env:abc")
+    assert sandbox.transport == "stdin" and sandbox.owner == OWNER
+    assert sandbox.environ == {"PATH": "/usr/bin"}
 
 
 # ---- size caps and collection of unused images ---------------------------------------------------
@@ -779,7 +812,10 @@ def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
     # The container's stdout is read with a limit: code that floods it past the runner is stopped and its
     # container removed, so the API or worker process never buffers more than the response limit.
     class Flooding(StreamedSandbox):
-        def command(self, workdir: Path, container_name: str) -> list[str]:
+        def _require_ready(self) -> str:  # preflight and self-test are Orkexa's (tested there)
+            return "sha256:" + "ab" * 32
+
+        def command(self, workdir: Path, container_name: str, *, image: str | None = None) -> list[str]:
             flood = "import os, sys\nsys.stdin.read()\nblock = b'x' * 1048576\nfor _ in range(64): os.write(1, block)\n"
             return [sys.executable, "-c", flood]
 
@@ -789,7 +825,9 @@ def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
     def record(args: list[str], *rest: object, **options: object) -> object:
         if args[1:3] == ["rm", "-f"]:
             removed.append(args)
-            return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+        if args[1:2] in (["kill"], ["ps"]):
+            return subprocess.CompletedProcess(args, 0, b"", b"")
         return real_run(args, *rest, **options)  # type: ignore[call-overload]
 
     sandbox = Flooding(image="nodestro-test", max_output_chars=10, timeout=20)
@@ -797,4 +835,4 @@ def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
         patch.setattr(subprocess, "run", record)
         with pytest.raises(ToolExecutionError, match="more than 1048696 bytes of output"):
             sandbox.call("def f() -> str:\n    return 'x'\n", "f", {})
-    assert len(removed) == 1 and removed[0][3].startswith("nodestro-sandbox-")
+    assert len(removed) == 1 and removed[0][3].startswith("orkexa-sandbox-")

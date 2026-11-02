@@ -12,9 +12,12 @@ form:
   isolation is set by the gateway, whatever the request says: no network, read-only root file system, every
   capability dropped, ``no-new-privileges``, user ``65534:65534`` (``nobody``), memory, CPU and process limits no
   higher than the gateway's maxima, two small ``noexec`` tmpfs (``/tmp``, ``/work``), no bind mounts, volumes,
-  devices, ports, host namespaces, privileged mode or other runtimes. A request that asks for any of these is refused
-  (HTTP 403 with the reason), so a misconfigured or compromised client cannot quietly get them. The image must be one
-  Nodestro builds (``nodestro-env:<key>``), and nothing is ever pulled for a container.
+  devices, ports, host namespaces, privileged mode or other runtimes; private IPC, a small ``/dev/shm``, open-file,
+  file-size and core limits, no logging. A request that asks for any of these is refused (HTTP 403 with the reason),
+  so a misconfigured or compromised client cannot quietly get them. Orkexa's container shape
+  (:func:`orkexa.dynamic.docker.run_args`) is accepted as it is, with its ``org.orkexa.*`` labels. The image must be
+  one Nodestro builds: ``nodestro-env:<key>``, or the id (``sha256:...``) of an image that carries such a tag and the
+  lock label; nothing is ever pulled for a container.
 - **Containers can only be used by name or ID if the gateway created them** (attach, start, wait, kill, remove,
   inspect). They carry the gateway's label; at start and every few seconds the gateway removes its containers that
   outlived :attr:`GatewayConfig.max_lifetime` (cleanup after crashes), and it refuses new ones beyond
@@ -23,7 +26,8 @@ form:
   lock file whose every package is pinned with hashes (no options such as other indexes), with a copy of the very
   Orkexa package the gateway runs, and under exactly the tag the runtime computes for that lock. The build downloads
   wheels (no package code runs: ``--only-binary``), installs them without network access to an index and runs no
-  other command. Only ``nodestro-env:<key>`` images can be inspected or removed.
+  other command. Only ``nodestro-env:<key>`` images can be inspected or removed (and inspected by id when the image is
+  one of them).
 - **Everything else** (other images, volumes, networks, exec, the daemon's events, swarm, plugins, BuildKit sessions,
   registry credentials) is refused.
 
@@ -72,20 +76,38 @@ logger = logging.getLogger("nodestro.sandbox_gateway")
 LABEL = "dev.nodestro.sandbox"
 #: The images a client may use, inspect, build and remove (see container_images.IMAGE_REPOSITORY).
 IMAGE = re.compile(r"^nodestro-env:[0-9a-f]{32}$")
+#: An image id: accepted for a container (and inspected) only when the image carries an :data:`IMAGE` tag and the lock
+#: label (:meth:`Gateway.require_nodestro_image`).
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMAGE_REPOSITORY = IMAGE_REPOSITORY
 _LOCK_LABEL = LOCK_LABEL
-#: Container names a client may choose (orkexa/nodestro sandboxes use these prefixes).
-NAME = re.compile(r"^(?:nodestro|orkexa)-sandbox-[0-9a-z-]{1,64}$")
+#: Container names a client may choose (orkexa/nodestro sandboxes and Orkexa's self-test use these prefixes).
+NAME = re.compile(r"^(?:nodestro|orkexa)-(?:sandbox|selftest)-[0-9a-z-]{1,64}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^/v\d+\.\d+(?=/)")
 _HEAD_LIMIT = 64 * 1024
 _JSON_LIMIT = 1024 * 1024
 _BUILD_LIMIT = 64 * 1024 * 1024
-#: The tmpfs mounts a sandbox container gets (the same as StreamedSandbox asks for).
+#: The tmpfs mounts a sandbox container gets (the same as Orkexa's run_args asks for, StreamedSandbox's shape).
 TMPFS = {
-    "/tmp": "rw,noexec,nosuid,size=16m",
-    "/work": "rw,noexec,nosuid,size=16m,uid=65534,gid=65534,mode=0700",
+    "/tmp": "rw,noexec,nosuid,nodev,size=16m",
+    # mode=1777, not uid=/gid= (Podman 4 rejects those): every process in the container runs as 65534 anyway.
+    "/work": "rw,noexec,nosuid,nodev,size=16m,mode=1777",
 }
+#: Orkexa's labels on a sandbox container (owner and deadline), passed on when they are well-formed; every other label
+#: of a request is dropped.
+OWNER_LABEL = "org.orkexa.sandbox"
+DEADLINE_LABEL = "org.orkexa.deadline"
+_OWNER = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
+_DEADLINE = re.compile(r"^[0-9]{1,12}$")
+MIB = 1024 * 1024
+#: The largest ``/dev/shm``, open-file limit and file size a sandbox container may ask for, and what it gets when it
+#: asks for none (Orkexa's defaults: 16 MB, 1024 files, 16 MB files, no core dumps).
+MAX_SHM = 64 * MIB
+DEFAULT_SHM = 16 * MIB
+MAX_NOFILE = 1024
+MAX_FSIZE = 64 * MIB
+DEFAULT_FSIZE = 16 * MIB
 _PROXY_ARGS = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"})
 _DEFAULTS: tuple[Any, ...] = (None, "", 0, False, [], {})
 
@@ -209,7 +231,7 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
     if not NAME.fullmatch(name):
         raise Refused(f"The container name {name!r} is not allowed")
     image = body.get("Image")
-    if not isinstance(image, str) or not IMAGE.fullmatch(image):
+    if not isinstance(image, str) or not (IMAGE.fullmatch(image) or IMAGE_ID.fullmatch(image)):
         raise Refused(f"Only Nodestro's sandbox images (nodestro-env:<key>) can be run, not {image!r}")
     config_keys = {
         "Image",
@@ -280,6 +302,10 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
         "AutoRemove",
         "ConsoleSize",
         "MemorySwappiness",
+        "IpcMode",
+        "ShmSize",
+        "Ulimits",
+        "LogConfig",
     }
     for key, value in host.items():
         if key not in host_allowed and not _is_default(value):
@@ -289,6 +315,20 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
             raise Refused(f"The host setting {key!r} is not allowed in a sandbox container")
     if host.get("MemorySwappiness") not in (None, -1):
         raise Refused("The host setting 'MemorySwappiness' is not allowed in a sandbox container")
+    if host.get("IpcMode") not in (None, "", "private"):
+        raise Refused("The host setting 'IpcMode' is not allowed in a sandbox container (only private)")
+    log_config = host.get("LogConfig")
+    if log_config is not None and (
+        not isinstance(log_config, dict)
+        or log_config.get("Type") not in (None, "", "none")
+        or log_config.get("Config") not in (None, {})
+        or not set(log_config) <= {"Type", "Config"}
+    ):
+        raise Refused("The host setting 'LogConfig' is not allowed in a sandbox container (only the none driver)")
+    shm = host.get("ShmSize") or DEFAULT_SHM
+    if not isinstance(shm, int) or isinstance(shm, bool) or shm <= 0 or shm > MAX_SHM:
+        raise Refused(f"A sandbox container gets at most {MAX_SHM // MIB} MB of /dev/shm")
+    ulimits = _ulimits(host.get("Ulimits"))
     if host.get("NetworkMode") not in (None, "", "none"):
         raise Refused("A sandbox container has no network (NetworkMode none)")
     if any(not isinstance(item, str) or item != "no-new-privileges" for item in host.get("SecurityOpt") or []):
@@ -324,7 +364,7 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
         "StdinOnce": bool(body.get("StdinOnce")),
         "Tty": False,
         "NetworkDisabled": True,
-        "Labels": {LABEL: config.instance},
+        "Labels": {**_orkexa_labels(body.get("Labels")), LABEL: config.instance},
         "HostConfig": {
             "NetworkMode": "none",
             "ReadonlyRootfs": True,
@@ -333,6 +373,7 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
             "Privileged": False,
             # Stated rather than left to the daemon's defaults, which an administrator can change.
             "IpcMode": "private",
+            "ShmSize": shm,
             "Binds": [],
             "Mounts": [],
             "Devices": [],
@@ -343,12 +384,52 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
             "Tmpfs": dict(TMPFS),
             "AutoRemove": True,
             "Init": False,
-            "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 1024}],
+            "Ulimits": ulimits,
             "LogConfig": {"Type": "none", "Config": {}},
         },
         "NetworkingConfig": {"EndpointsConfig": {}},
     }
     return {"name": name}, json.dumps(created).encode("utf-8")
+
+
+def _ulimits(requested: Any) -> list[dict[str, Any]]:
+    """The ``Ulimits`` of a sandbox container: ``nofile`` (at most :data:`MAX_NOFILE`), ``fsize`` (at most
+    :data:`MAX_FSIZE`) and ``core`` (0) from the request, the defaults for those it leaves out; nothing else."""
+    if requested is not None and not isinstance(requested, list):
+        raise Refused("Ulimits must be a list")
+    found: dict[str, int] = {}
+    for item in requested or []:
+        if not isinstance(item, dict) or set(item) != {"Name", "Soft", "Hard"}:
+            raise Refused("Each ulimit needs exactly Name, Soft and Hard")
+        name, soft, hard = item["Name"], item["Soft"], item["Hard"]
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (soft, hard)):
+            raise Refused("Ulimit values must be numbers")
+        if name in found or soft != hard or soft < 0:
+            raise Refused(f"The ulimit {name!r} must be given once, with equal soft and hard values")
+        if name == "nofile" and not 16 <= soft <= MAX_NOFILE:
+            raise Refused(f"A sandbox container opens at most {MAX_NOFILE} files")
+        elif name == "fsize" and not 0 < soft <= MAX_FSIZE:
+            raise Refused(f"A sandbox container writes files of at most {MAX_FSIZE // MIB} MB")
+        elif name == "core" and soft != 0:
+            raise Refused("A sandbox container writes no core dumps (core=0)")
+        elif name not in ("nofile", "fsize", "core"):
+            raise Refused(f"The ulimit {name!r} is not allowed in a sandbox container")
+        found[name] = soft
+    limits = {"nofile": MAX_NOFILE, "fsize": DEFAULT_FSIZE, "core": 0, **found}
+    return [{"Name": name, "Soft": value, "Hard": value} for name, value in limits.items()]
+
+
+def _orkexa_labels(labels: Any) -> dict[str, str]:
+    """Orkexa's owner and deadline labels of a request, when well-formed (the reaper of the client uses them)."""
+    if not isinstance(labels, dict):
+        return {}
+    kept: dict[str, str] = {}
+    owner, deadline = labels.get(OWNER_LABEL), labels.get(DEADLINE_LABEL)
+    if isinstance(owner, str) and _OWNER.fullmatch(owner):
+        kept[OWNER_LABEL] = owner
+    if isinstance(deadline, str) and _DEADLINE.fullmatch(deadline):
+        kept[DEADLINE_LABEL] = deadline
+    return kept
 
 
 def _lock_entries(lock: str) -> list[str]:
@@ -387,10 +468,10 @@ def check_lock(lock: str) -> None:
 
 
 def _orkexa_files() -> dict[str, bytes]:
-    from .container_images import _orkexa_dir, _orkexa_files
+    """The Orkexa files of a build context: the runner modules of the Orkexa the gateway runs."""
+    from .container_images import _orkexa_files
 
-    root = _orkexa_dir()
-    return {str(PurePosixPath("orkexa", *path.relative_to(root).parts)): path.read_bytes() for path in _orkexa_files()}
+    return {path: content.encode("utf-8") for path, content in _orkexa_files().items()}
 
 
 _PEM_BLOCK = re.compile(rb"-----BEGIN ([A-Z0-9 ]+)-----\r?\n([A-Za-z0-9+/=\r\n]+?)-----END \1-----")
@@ -504,7 +585,7 @@ def plan_build(query: dict[str, str], context: bytes, config: GatewayConfig) -> 
     if ca is not None:
         check_ca_bundle(ca)
     if files != _orkexa_files():
-        raise Refused("The build context must contain exactly the Orkexa package the gateway runs")
+        raise Refused("The build context must contain exactly the Orkexa sandbox runner the gateway runs")
     tag = query.get("t", "")
     for version in config.python_versions:
         base = BASE_IMAGES.get(version)
@@ -562,7 +643,7 @@ def route(method: str, path: str) -> tuple[str, str]:
     if match is not None:
         ref = unquote(match.group(1))
         if (method == "GET" and match.group(2)) or (method == "DELETE" and not match.group(2)):
-            if not IMAGE.fullmatch(ref):
+            if not (IMAGE.fullmatch(ref) or (method == "GET" and IMAGE_ID.fullmatch(ref))):
                 raise Refused(f"Only Nodestro's sandbox images can be inspected or removed, not {ref!r}", 404)
             return f"image:{'inspect' if method == 'GET' else 'delete'}", ref
     raise Refused(f"{method} {bare} is not available through the Nodestro sandbox gateway")
@@ -827,6 +908,21 @@ class Gateway:
                 507,
             )
 
+    async def require_nodestro_image(self, image_id: str) -> None:
+        """Refuse an image id (404) unless the image carries a ``nodestro-env:<key>`` tag and the lock label, i.e. it
+        is an environment image Nodestro built (through this gateway's build checks or on this daemon before)."""
+        status, found = await self.call("GET", f"/images/{quote(image_id, safe=':')}/json")
+        labels = ((found or {}).get("Config") or {}).get("Labels") if isinstance(found, dict) else None
+        tags = found.get("RepoTags") if isinstance(found, dict) else None
+        if (
+            status != 200
+            or not isinstance(labels, dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(labels.get(_LOCK_LABEL) or ""))
+            or not any(isinstance(tag, str) and IMAGE.fullmatch(tag) for tag in tags or [])
+            or str(found.get("Id", "")) != image_id
+        ):
+            raise Refused(f"The image {image_id!r} is not one of Nodestro's sandbox images", 404)
+
     # -- bookkeeping --
 
     def _known(self, ref: str) -> str | None:
@@ -933,6 +1029,9 @@ class Gateway:
             query, body = plan_create(request.query, parsed, self.config)
             target = f"{prefix}/containers/create?{urlencode(query)}"
             await self.require_limits()
+            image = str(parsed.get("Image", ""))
+            if IMAGE_ID.fullmatch(image):
+                await self.require_nodestro_image(image)
             async with self._creating:
                 if len(self.containers) >= self.config.max_containers:
                     await self.reconcile()
@@ -981,6 +1080,8 @@ class Gateway:
             query = request.query
             if query and not set(query) <= {"force", "noprune"}:
                 raise Refused("These parameters are not allowed")
+            if IMAGE_ID.fullmatch(ref):
+                await self.require_nodestro_image(ref)
             path = f"{prefix}/images/{quote(ref, safe=':')}" + ("/json" if kind == "image:inspect" else "")
             target = path + (f"?{urlencode(query)}" if query else "")
             await self._forward(request, target, b"", reader, writer)
@@ -1101,6 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "IMAGE",
+    "IMAGE_ID",
     "LABEL",
     "TMPFS",
     "Gateway",
