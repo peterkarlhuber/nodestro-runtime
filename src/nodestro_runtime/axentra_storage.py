@@ -236,7 +236,9 @@ class AxentraFiles:
         rows = self.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
         if not rows:
             raise NodestroError("identity.tenant_unknown", f"No tenant {tenant_id}", tenant=tenant_id)
-        return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
+        from .axentra_platform import axentra_tenant_name
+
+        return self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, str(rows[0][0])))
 
     def lookup(self, tenant_id: str, blob: str) -> FileObject | None:
         if not _BLOB.match(blob):

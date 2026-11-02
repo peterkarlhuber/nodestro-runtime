@@ -899,6 +899,16 @@ def require_readable_secrets(
 # ---- links between Nodestro and Axentra records ----------------------------------------------------------------
 
 _SLUG_BODY = re.compile(r"[^a-z0-9-]")
+#: The longest name Axentra stores (``axentra_users.name`` / ``axentra_tenants.name``).
+NAME_LIMIT = 200
+
+
+def axentra_tenant_name(tenant_id: str, name: str) -> str:
+    """The name Axentra stores for a Nodestro tenant: trimmed, at most :data:`NAME_LIMIT` characters, the id when
+    empty. Every :meth:`AxentraLink.ensure_tenant` call passes its name through this."""
+    return name.strip()[:NAME_LIMIT] or tenant_id
+
+
 #: Advisory lock class of :meth:`AxentraLink.ensure_tenant` (two-key form; ``Axen`` in ASCII).
 LINK_LOCK_CLASS = 0x4178656E
 
@@ -1264,7 +1274,7 @@ class AxentraEvents:
         rows = self.link.database._query("SELECT name FROM nodestro_tenants WHERE id = %s", (tenant_id,))
         if not rows:
             return None
-        return self.link.ensure_tenant(tenant_id, str(rows[0][0]))
+        return self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, str(rows[0][0])))
 
     def _guarded(self, what: str, record_id: str, write: Callable[[Any, str], None], tenant_id: str) -> str:
         """Run ``write`` in a savepoint; the outcome: ``ok``, ``skipped`` (no tenant), ``changed`` (Axentra refused a
@@ -1790,6 +1800,7 @@ __all__ = [
     "AXS1_PREFIX",
     "IDENTITY_BACKENDS",
     "MODULES",
+    "NAME_LIMIT",
     "PRODUCT_SLUG",
     "SECRET_FIELDS",
     "USAGE_METERS",
@@ -1803,6 +1814,7 @@ __all__ = [
     "SettledRun",
     "attach_platform_events",
     "available",
+    "axentra_tenant_name",
     "axentra_version",
     "build_settings",
     "from_environment",

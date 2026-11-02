@@ -538,3 +538,17 @@ def test_the_s3_backend_stores_migrates_and_deletes(database: Any, tmp_path: Pat
         assert len(keys) == 2
     finally:
         services.close()
+
+
+def test_a_tenant_with_a_long_name_gets_its_axentra_tenant_for_files(files: Any, tmp_path: Path) -> None:
+    from identity_support import create_tenants
+
+    from nodestro_runtime.axentra_platform import NAME_LIMIT
+
+    create_tenants(files.database, [("long", "N" * 300)])
+    item = _inputs(files, tmp_path / "data", "long").add(b"a file of a tenant with a long name", name="a.txt")
+    assert _inputs(files, tmp_path / "data", "long").data(item.id).startswith(b"a file")
+    rows = postgres_support.owner_of(files.database)._query(
+        "SELECT name FROM axentra_tenants WHERE id = %s", (files.link.tenant("long"),)
+    )
+    assert len(rows[0][0]) == NAME_LIMIT

@@ -52,7 +52,8 @@ from datetime import timedelta
 import logging
 from typing import Any, Literal, cast
 
-from .axentra_platform import LINK_LOCK_CLASS, AxentraConfig, AxentraLink, AxentraServices
+from .axentra_platform import LINK_LOCK_CLASS, AxentraConfig, AxentraLink, AxentraServices, axentra_tenant_name
+from .axentra_platform import NAME_LIMIT as _NAME_LIMIT
 from .identity_store import (
     ROLE_GRANTS,
     ROLES,
@@ -112,7 +113,6 @@ ACCESS_REVISION = 1
 #: ``auth_method`` and ``user_agent`` of the Axentra sessions Nodestro starts (it keeps its own OIDC flow).
 SESSION_METHOD = "oidc"
 SESSION_AGENT = "nodestro"
-_NAME_LIMIT = 200  # axentra_users.name / axentra_tenants.name
 
 
 def access_definitions() -> Any:
@@ -143,10 +143,6 @@ def access_definitions() -> Any:
 def axentra_name(name: str | None) -> str:
     """The name Axentra stores for a Nodestro user name (``''`` for none; Axentra trims and caps at 200)."""
     return (name or "").strip()[:_NAME_LIMIT]
-
-
-def axentra_tenant_name(tenant_id: str, name: str) -> str:
-    return name.strip()[:_NAME_LIMIT] or tenant_id
 
 
 def _platform_scope() -> Any:

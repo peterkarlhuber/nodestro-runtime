@@ -689,3 +689,27 @@ def test_identity_resolutions_are_counted(database: Any) -> None:
     before = axentra_metrics.operation_counts().get(("identity_resolve", "none", ""), 0)
     assert store.session("not-a-token") is None
     assert axentra_metrics.operation_counts()[("identity_resolve", "none", "")] == before + 1
+
+
+def test_a_tenant_with_a_long_name_gets_its_axentra_tenant_from_events_and_notifications(database: Any) -> None:
+    """Axentra stores at most 200 characters of a name; every path that creates the Axentra tenant cuts it."""
+    from identity_support import create_tenants
+
+    from nodestro_runtime.axentra_notify import AxentraNotifications
+
+    long_name = "N" * 300
+    create_tenants(database, [("events", long_name), ("notes", long_name)])
+    services = _services(database, notify=True, usage=True)
+    try:
+        link = axentra_platform.AxentraLink(services, database)
+        events = axentra_platform.AxentraEvents(link, audit=True, usage=True)
+        created = {"events": events._tenant("events"), "notes": AxentraNotifications(link)._tenant("notes")}
+        for tenant, axentra_tenant in created.items():
+            assert axentra_tenant is not None and link.tenant(tenant) == axentra_tenant
+        rows = _owner(database)._query(
+            "SELECT name FROM axentra_tenants WHERE id IN (%s, %s)", (created["events"], created["notes"])
+        )
+        assert [row[0] for row in rows] == [axentra_platform.axentra_tenant_name("x", long_name)] * 2
+        assert len(rows[0][0]) == axentra_platform.NAME_LIMIT
+    finally:
+        services.close()
