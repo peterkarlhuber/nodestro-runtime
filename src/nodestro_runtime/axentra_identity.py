@@ -13,19 +13,24 @@ AxentraConfig`) chooses where the identity records live. A change is a restart o
     ``last_seen_at`` touches, logouts, removals and housekeeping.
 ``axentra``
     Axentra answers the reads: session validity (absolute and idle expiry and revocation on the database clock,
-    :meth:`axentra.identity.service.IdentityService.resolve_session`), roles, memberships, member lists and the
-    tenant list. Writes still go to both sides in one transaction, so Nodestro's tables stay current and switching
+    :meth:`axentra.identity.service.IdentityService.resolve_session`), roles and the permissions they grant
+    (:attr:`Session.permissions`, from Axentra's role definitions), memberships, member lists, the tenant list and
+    tenant status (suspended when either side says so). The API lets Axentra run the OIDC login too
+    (``nodestro_api.identity.AxentraLoginFlow``). Writes still go to both sides in one transaction, so Nodestro's tables stay current and switching
     back to ``mirror`` or ``nodestro`` is a restart (the rollback).
 
-What stays Nodestro-only in every mode: login states (10 minutes; plan G-5 drain) and bootstrap tokens (setup links,
-no Axentra counterpart), Nodestro's ids (``u_…``, tenant ids) in every contract, the e-mail column (Axentra keeps an
+What stays Nodestro-only in every mode: bootstrap tokens (setup links; plan gap G-5 decided: one store for every
+mode and the rollback), Nodestro's ids (``u_…``, tenant ids) in every contract, the e-mail column (Axentra keeps an
 address only when it is not another Axentra user's: **identities are never merged by e-mail**), the active tenant of
-a session (``nodestro_sessions.tenant_id``) and the permission semantics (``ROLE_PERMISSIONS`` keyed by Nodestro's
-role names, the last-owner guard, removal ends the member's sessions in the tenant at once).
+a session (``nodestro_sessions.tenant_id``), the last-owner guard and removal ending the member's sessions in the
+tenant at once. Login states are Nodestro's in ``nodestro``/``mirror`` mode and Axentra's in ``axentra`` mode.
 
 Role map (plan 3.4): ``owner`` -> ``tenant_owner`` (Axentra's last-owner guard applies), ``admin`` ->
 ``tenant_admin``, ``viewer`` -> ``viewer`` (built-in), ``editor`` and ``operator`` -> custom tenant roles of the
-same key in product ``nodestro`` with minimal Axentra permissions (:data:`CUSTOM_ROLES`), created idempotently.
+same key in product ``nodestro`` (:data:`CUSTOM_ROLES`). Nodestro's ``read/edit/run/admin`` are product permissions
+``nodestro.workspace:*`` (:data:`PRODUCT_PERMISSIONS`); both are applied as versioned access definitions
+(:func:`access_definitions`, :data:`ACCESS_REVISION`; Axentra's ``ax.access_definitions``): once per revision, never
+downgraded by an older process, a conflicting revision stops the start.
 
 Sessions: Axentra's ``axentra_sessions.token_hash`` is the hex form of Nodestro's ``bytea`` hash of the same token,
 so the hash itself joins the two rows (no mapping row, no third copy of a hash). New sessions are started with
@@ -48,7 +53,21 @@ import logging
 from typing import Any, Literal, cast
 
 from .axentra_platform import LINK_LOCK_CLASS, AxentraConfig, AxentraLink, AxentraServices
-from .identity_store import ROLES, IdentityStore, Membership, Role, Session, Tenant, User, _hash, _now
+from .identity_store import (
+    ROLE_GRANTS,
+    ROLES,
+    TENANT_STATUSES,
+    IdentityStore,
+    Membership,
+    Role,
+    Session,
+    Tenant,
+    TenantStatus,
+    User,
+    _hash,
+    _now,
+    tenant_suspended,
+)
 from .problems import NodestroError
 from .storage_postgres import PostgresDatabase
 
@@ -66,19 +85,59 @@ ROLE_TO_AXENTRA: dict[str, str] = {
 }
 #: Axentra tenant role key -> Nodestro role; any other Axentra role grants nothing in Nodestro.
 ROLE_FROM_AXENTRA: dict[str, Role] = {value: cast(Role, key) for key, value in ROLE_TO_AXENTRA.items()}
-#: Custom tenant roles of product ``nodestro`` (plan 3.4). They carry only generic Axentra tenant permissions;
-#: Nodestro's own ``read/edit/run/admin`` still come from ``ROLE_PERMISSIONS`` keyed by the Nodestro role name.
-CUSTOM_ROLES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "editor": (
-        "Editor",
-        ("tenant:read", "members:read", "files:read", "files:write", "usage:read", "notify:preferences"),
-    ),
-    "operator": ("Operator", ("tenant:read", "members:read", "files:read", "usage:read", "notify:preferences")),
+#: Nodestro's permissions as product permissions of product ``nodestro`` (tenant scope): Nodestro name -> Axentra
+#: name and description. ``tenant_owner``/``tenant_admin`` hold every tenant-scoped product permission by Axentra's
+#: rules; ``viewer`` holds ``read`` through ``default_roles``; the custom roles list theirs.
+PRODUCT_PERMISSIONS: dict[str, tuple[str, str]] = {
+    "read": ("nodestro.workspace:read", "Look at workflows, runs, files, settings and live event streams"),
+    "edit": ("nodestro.workspace:edit", "Create, change and delete workflows, agents, knowledge, memory and files"),
+    "run": ("nodestro.workspace:run", "Execute runs, approvals, batches, schedules, tool code and model requests"),
+    "admin": ("nodestro.workspace:admin", "Tenant settings, provider keys, API keys, publishing, packages"),
 }
+#: Axentra product permission name -> Nodestro permission name.
+PERMISSION_FROM_AXENTRA: dict[str, str] = {name: key for key, (name, _text) in PRODUCT_PERMISSIONS.items()}
+_GENERIC = {
+    "editor": ("tenant:read", "members:read", "files:read", "files:write", "usage:read", "notify:preferences"),
+    "operator": ("tenant:read", "members:read", "files:read", "usage:read", "notify:preferences"),
+}
+#: Custom tenant roles of product ``nodestro`` (plan 3.4): generic Axentra tenant permissions (no
+#: ``members:manage``, no tenant settings) plus Nodestro's permissions of the role (:data:`ROLE_GRANTS`).
+CUSTOM_ROLES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "editor": ("Editor", _GENERIC["editor"] + tuple(PRODUCT_PERMISSIONS[p][0] for p in ROLE_GRANTS["editor"])),
+    "operator": ("Operator", _GENERIC["operator"] + tuple(PRODUCT_PERMISSIONS[p][0] for p in ROLE_GRANTS["operator"])),
+}
+#: The revision of :func:`access_definitions`. Raise it whenever their content changes (a test pins the content
+#: hash of every revision): Axentra applies a newer revision once, and an older process never downgrades it.
+ACCESS_REVISION = 1
 #: ``auth_method`` and ``user_agent`` of the Axentra sessions Nodestro starts (it keeps its own OIDC flow).
 SESSION_METHOD = "oidc"
 SESSION_AGENT = "nodestro"
 _NAME_LIMIT = 200  # axentra_users.name / axentra_tenants.name
+
+
+def access_definitions() -> Any:
+    """Nodestro's permissions and custom roles for Axentra (:class:`axentra.access.definitions.AccessDefinitions`,
+    revision :data:`ACCESS_REVISION`), applied at every start of ``mirror``/``axentra`` (no "last start wins")."""
+    from axentra.access.definitions import AccessDefinitions, RoleDefinition
+    from axentra.access.product_permissions import ProductPermission
+
+    return AccessDefinitions(
+        ACCESS_REVISION,
+        tuple(
+            ProductPermission(
+                name,
+                "tenant",
+                text,
+                default_roles=("viewer",) if key in ROLE_GRANTS["viewer"] else (),
+                read_like=key == "read",
+            )
+            for key, (name, text) in PRODUCT_PERMISSIONS.items()
+        ),
+        tuple(
+            RoleDefinition(key, label, "tenant", permissions, f"Nodestro role {key}")
+            for key, (label, permissions) in CUSTOM_ROLES.items()
+        ),
+    )
 
 
 def axentra_name(name: str | None) -> str:
@@ -144,12 +203,13 @@ class AxentraIdentityStore(IdentityStore):
         return []
 
     def prepare(self) -> None:
-        """Check the settings and create the custom roles (idempotent); ``axentra`` mode also requires the backfill
-        (:func:`identity_readiness`), so a server never answers from an Axentra side that is missing records."""
+        """Check the settings and apply Nodestro's access definitions (versioned, idempotent); ``axentra`` mode also
+        requires the backfill (:func:`identity_readiness`), so a server never answers from an Axentra side that is
+        missing records."""
         problems = self.configuration_problems()
         if problems:
             raise NodestroError("profile.invalid", "The server cannot start: " + "; ".join(problems), problems=problems)
-        self.ensure_roles()
+        self.apply_access()
         missing = identity_readiness(self)
         if missing and self.mode == "axentra":
             raise NodestroError(
@@ -165,30 +225,36 @@ class AxentraIdentityStore(IdentityStore):
                 "Identity mirror: records are not on both sides yet (%s); run the backfill", "; ".join(missing)
             )
 
-    def ensure_roles(self) -> list[str]:
-        """Create the custom roles ``editor`` and ``operator`` in product ``nodestro`` when missing; returns the
-        keys created. A role that exists is left as it is (the reconciliation reports other permissions)."""
+    def apply_access(self) -> Any:
+        """Apply :func:`access_definitions` to product ``nodestro`` (:meth:`axentra.access.definitions.
+        AccessDefinitionService.apply`): applied once per revision, a no-op when equal, never downgraded by an older
+        process (``stale``, logged). The same revision with other content stops the start
+        (``identity.access_conflict``: two builds disagree about one revision)."""
         from axentra.core.errors import Conflict
 
-        created: list[str] = []
-        existing = {role.key for role in self.platform.roles.list_roles(_system(), self.product_id)}
-        for key, (name, permissions) in CUSTOM_ROLES.items():
-            if key in existing:
-                continue
-            try:
-                self.platform.roles.create_role(
-                    _system(),
-                    self.product_id,
-                    key=key,
-                    name=name,
-                    scope="tenant",
-                    permissions=list(permissions),
-                    description=f"Nodestro role {key} (read/edit/run/admin come from Nodestro)",
-                )
-                created.append(key)
-            except Conflict:  # another process created it at the same time
-                pass
-        return created
+        try:
+            result = self.platform.access_definitions.apply(
+                self.product_id, access_definitions(), applied_by=f"nodestro-runtime revision {ACCESS_REVISION}"
+            )
+        except Conflict as exc:
+            raise NodestroError(
+                "identity.access_conflict",
+                f"Axentra holds other access definitions for revision {ACCESS_REVISION}: {exc}",
+                revision=ACCESS_REVISION,
+            ) from None
+        if result.outcome == "applied":
+            logger.info("Access definitions revision %s applied (%s)", ACCESS_REVISION, result.as_dict())
+        elif result.outcome == "stale":
+            logger.warning(
+                "Axentra holds access definitions revision %s, newer than this process's %s; they stay",
+                result.stored_revision,
+                ACCESS_REVISION,
+            )
+        return result
+
+    def ensure_roles(self) -> list[str]:
+        """Apply the access definitions (:meth:`apply_access`); returns the custom role keys created."""
+        return list(self.apply_access().roles["created"])
 
     # ---- helpers ----------------------------------------------------------------------------------------
 
@@ -335,6 +401,22 @@ class AxentraIdentityStore(IdentityStore):
             self.link.ensure_tenant(tenant_id, axentra_tenant_name(tenant_id, tenant.name))
         return tenant
 
+    def set_tenant_status(self, tenant_id: str, status: TenantStatus) -> Tenant:
+        """Suspend or resume the tenant on both sides, in one transaction."""
+        if status not in TENANT_STATUSES:
+            raise NodestroError("identity.tenant_status", f"Unknown tenant status {status!r}", status=status)
+        with self.link.joined():
+            tenant = super().set_tenant_status(tenant_id, status)
+            axentra_tenant = self._tenant_link(tenant_id)
+            self.platform.tenancy.update_tenant(_system(), self.product_id, axentra_tenant, status=status)
+        return tenant if self.mode == "mirror" else (self.tenant(tenant_id) or tenant)
+
+    def tenant_active(self, tenant_id: str) -> bool:
+        if self.mode == "mirror":
+            return super().tenant_active(tenant_id)
+        found = self.tenant(tenant_id)
+        return found is not None and found.status == "active"
+
     def tenant(self, tenant_id: str) -> Tenant | None:
         if self.mode == "mirror":
             return super().tenant(tenant_id)
@@ -348,18 +430,24 @@ class AxentraIdentityStore(IdentityStore):
 
     def _tenants(self, tenant_id: str | None) -> list[Tenant]:
         """Axentra's tenants of product ``nodestro`` under their Nodestro ids (name from Axentra; the creation time
-        is Nodestro's, the tenant's data and files are filed under it)."""
+        is Nodestro's, the tenant's data and files are filed under it). A tenant is suspended when either side says
+        so (fail closed: a suspension made directly in Axentra counts, and resuming needs Nodestro's command)."""
         where = " AND l.nodestro_id = %s" if tenant_id is not None else ""
         params: tuple[Any, ...] = (self.product_id,) + ((tenant_id,) if tenant_id is not None else ())
         with self._ax(read_only=True) as tx:
             rows = tx.all(
-                "SELECT l.nodestro_id, t.name, n.created_at FROM axentra_tenants t"
+                "SELECT l.nodestro_id, t.name, n.created_at,"
+                " CASE WHEN t.status = 'active' AND n.status = 'active' THEN 'active' ELSE 'suspended' END AS status"
+                " FROM axentra_tenants t"
                 " JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.axentra_id = t.id"
                 " JOIN nodestro_tenants n ON n.id = l.nodestro_id"
                 " WHERE t.product_id = %s" + where + " ORDER BY l.nodestro_id",
                 params,
             )
-        return [Tenant(id=row["nodestro_id"], name=row["name"], created_at=row["created_at"]) for row in rows]
+        return [
+            Tenant(id=row["nodestro_id"], name=row["name"], created_at=row["created_at"], status=row["status"])
+            for row in rows
+        ]
 
     # ---- users and roles ------------------------------------------------------------------------------------
 
@@ -437,15 +525,24 @@ class AxentraIdentityStore(IdentityStore):
             params.append(user_id)
         with self._ax(read_only=True) as tx:
             rows = tx.all(
-                "SELECT lt.nodestro_id AS tenant_id, lu.nodestro_id AS user_id, m.role FROM axentra_memberships m"
+                "SELECT lt.nodestro_id AS tenant_id, lu.nodestro_id AS user_id, m.role,"
+                " CASE WHEN t.status = 'active' AND n.status = 'active' THEN 'active' ELSE 'suspended' END AS status"
+                " FROM axentra_memberships m"
                 " JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.axentra_id = m.tenant_id"
                 " JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.axentra_id = m.user_id"
                 " JOIN axentra_users u ON u.id = m.user_id AND u.status = 'active'"
+                " JOIN axentra_tenants t ON t.id = m.tenant_id"
+                " JOIN nodestro_tenants n ON n.id = lt.nodestro_id"
                 " WHERE " + " AND ".join(where) + " ORDER BY lt.nodestro_id, lu.nodestro_id",
                 params,
             )
         return [
-            Membership(tenant_id=row["tenant_id"], user_id=row["user_id"], role=ROLE_FROM_AXENTRA[row["role"]])
+            Membership(
+                tenant_id=row["tenant_id"],
+                user_id=row["user_id"],
+                role=ROLE_FROM_AXENTRA[row["role"]],
+                tenant_status=row["status"],
+            )
             for row in rows
             if row["role"] in ROLE_FROM_AXENTRA
         ]
@@ -455,6 +552,8 @@ class AxentraIdentityStore(IdentityStore):
     def create_session(self, user_id: str, tenant_id: str) -> str:
         if self.role(tenant_id, user_id) is None:
             raise NodestroError("identity.not_a_member", "This account has no role in the tenant", tenant=tenant_id)
+        if not self.tenant_active(tenant_id):
+            raise tenant_suspended(tenant_id)
         with self.link.joined() as connection:
             axentra_user, _how = self._ensure_user(connection, user_id)
             started = self.platform.identity.start_session(
@@ -483,20 +582,33 @@ class AxentraIdentityStore(IdentityStore):
             _principal, info = self.platform.identity.resolve_session(token)
         except AxentraError:
             return None
+        from axentra.access.product_permissions import load_catalog
+
         token_hash = _hash(token)
         with self._ax(read_only=True) as tx:
             row = tx.one(
-                "SELECT s.user_id, s.tenant_id, m.role,"
+                "SELECT s.user_id, s.tenant_id, m.role, r.permissions AS custom,"
+                " t.status = 'active' AND n.status = 'active' AS active,"
                 " s.last_seen_at < clock_timestamp() - interval '1 minute' AS stale"
                 " FROM nodestro_sessions s"
                 " JOIN nodestro_axentra_ids lu ON lu.kind = 'user' AND lu.nodestro_id = s.user_id"
                 " JOIN nodestro_axentra_ids lt ON lt.kind = 'tenant' AND lt.nodestro_id = s.tenant_id"
                 " JOIN axentra_memberships m ON m.tenant_id = lt.axentra_id AND m.user_id = lu.axentra_id"
+                " JOIN axentra_tenants t ON t.id = lt.axentra_id"
+                " JOIN nodestro_tenants n ON n.id = s.tenant_id"
+                " LEFT JOIN axentra_roles r ON r.product_id = m.product_id AND r.key = m.role"
                 " WHERE s.token_hash = %s AND lu.axentra_id = %s AND m.product_id = %s",
                 (token_hash, info.user.id, self.product_id),
             )
-        if row is None or row["role"] not in ROLE_FROM_AXENTRA:
-            return None
+            if row is None or row["role"] not in ROLE_FROM_AXENTRA:
+                return None
+            if not row["active"]:
+                raise tenant_suspended(row["tenant_id"])
+            # Axentra's role definitions decide Nodestro's permissions in this mode (read in this request: a change
+            # to a role or its definitions applies to the next request).
+            catalog = load_catalog(tx, self.product_id)
+            custom = {row["role"]: frozenset(row["custom"])} if row["custom"] is not None else {}
+            granted = catalog.role_permissions(row["role"], custom) & catalog.tenant_mask
         if row["stale"]:
             self._touch(token_hash)
         return Session(
@@ -504,6 +616,9 @@ class AxentraIdentityStore(IdentityStore):
             tenant_id=row["tenant_id"],
             role=ROLE_FROM_AXENTRA[row["role"]],
             expires_at=info.expires_at,
+            permissions=tuple(
+                sorted(PERMISSION_FROM_AXENTRA[name] for name in granted if name in PERMISSION_FROM_AXENTRA)
+            ),
         )
 
     def _touch(self, token_hash: bytes) -> None:
@@ -536,6 +651,8 @@ class AxentraIdentityStore(IdentityStore):
     def use_bootstrap(self, token_hash: bytes, user_id: str) -> str:
         with self.link.joined() as connection:
             tenant_id = super().use_bootstrap(token_hash, user_id)
+            if self.mode == "axentra" and not self.tenant_active(tenant_id):
+                raise tenant_suspended(tenant_id)  # rolled back with the use of the link
             axentra_tenant = self._tenant_link(tenant_id)
             axentra_user, _how = self._ensure_user(connection, user_id)
             try:
@@ -631,7 +748,9 @@ class BackfillReport:
 
     dry_run: bool
     roles_created: list[str] = field(default_factory=list)
-    tenants: dict[str, int] = field(default_factory=lambda: {"total": 0, "created": 0, "renamed": 0})
+    tenants: dict[str, int] = field(default_factory=lambda: {"total": 0, "created": 0, "renamed": 0, "suspended": 0})
+    #: Tenants suspended in Axentra but active in Nodestro: kept suspended (never resumed by a backfill).
+    suspended_in_axentra_only: list[str] = field(default_factory=list)
     #: Nodestro tenant id -> Axentra slug, for every tenant whose slug differs from its id.
     slug_changes: dict[str, str] = field(default_factory=dict)
     users: dict[str, int] = field(default_factory=lambda: {"total": 0, "created": 0, "by_identity": 0})
@@ -648,6 +767,7 @@ class BackfillReport:
             "roles_created": list(self.roles_created),
             "tenants": dict(self.tenants),
             "slug_changes": dict(sorted(self.slug_changes.items())),
+            "suspended_in_axentra_only": sorted(self.suspended_in_axentra_only),
             "users": dict(self.users),
             "users_without_email": sorted(self.users_without_email),
             "memberships": dict(self.memberships),
@@ -692,7 +812,7 @@ def _backfill(store: AxentraIdentityStore, report: BackfillReport, batch: int, *
         report.tenants["total"] += 1
         with unit() as connection:
             row = connection.execute(
-                "SELECT name FROM nodestro_tenants WHERE id = %s FOR SHARE", (tenant_id,)
+                "SELECT name, status FROM nodestro_tenants WHERE id = %s FOR SHARE", (tenant_id,)
             ).fetchone()
             if row is None:
                 continue
@@ -703,7 +823,7 @@ def _backfill(store: AxentraIdentityStore, report: BackfillReport, batch: int, *
             axentra_tenant = store.link.tenant(tenant_id)
             assert axentra_tenant is not None
             with store._ax() as tx:
-                current = tx.one("SELECT slug, name FROM axentra_tenants WHERE id = %s", (axentra_tenant,))
+                current = tx.one("SELECT slug, name, status FROM axentra_tenants WHERE id = %s", (axentra_tenant,))
             if current is None:
                 raise NodestroError(
                     "identity.link_conflict", f"Tenant {tenant_id} is linked to a missing Axentra tenant"
@@ -711,6 +831,12 @@ def _backfill(store: AxentraIdentityStore, report: BackfillReport, batch: int, *
             if current["name"] != name:
                 store.platform.tenancy.update_tenant(_system(), store.product_id, axentra_tenant, name=name)
                 report.tenants["renamed"] += 1
+            # A suspension is copied to Axentra, never undone by a backfill (fail closed).
+            if row[1] == "suspended" and current["status"] != "suspended":
+                store.platform.tenancy.update_tenant(_system(), store.product_id, axentra_tenant, status="suspended")
+                report.tenants["suspended"] += 1
+            elif row[1] == "active" and current["status"] == "suspended":
+                report.suspended_in_axentra_only.append(tenant_id)
             if current["slug"] != tenant_id:
                 report.slug_changes[tenant_id] = str(current["slug"])
     # Users.
@@ -913,7 +1039,8 @@ def reconcile_identity(store: AxentraIdentityStore) -> ReconcileReport:
         connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         with store.platform.db.joined(connection), store._ax(read_only=True) as tx:
             tenants = tx.all(
-                "SELECT n.id, n.name, l.axentra_id, t.id AS found, t.name AS ax_name, t.product_id"
+                "SELECT n.id, n.name, n.status, l.axentra_id, t.id AS found, t.name AS ax_name, t.product_id,"
+                " t.status AS ax_status"
                 " FROM nodestro_tenants n"
                 " LEFT JOIN nodestro_axentra_ids l ON l.kind = 'tenant' AND l.nodestro_id = n.id"
                 " LEFT JOIN axentra_tenants t ON t.id = l.axentra_id ORDER BY n.id"
@@ -968,13 +1095,6 @@ def reconcile_identity(store: AxentraIdentityStore) -> ReconcileReport:
                 " WHERE a.revoked_at IS NULL AND a.expires_at > now() AND NOT EXISTS"
                 " (SELECT 1 FROM nodestro_sessions s WHERE encode(s.token_hash, 'hex') = a.token_hash)"
             )
-            roles = {
-                row["key"]: sorted(row["permissions"])
-                for row in tx.all(
-                    "SELECT key, permissions FROM axentra_roles WHERE product_id = %s AND key = ANY(%s)",
-                    (product, list(CUSTOM_ROLES)),
-                )
-            }
     report.counts = {
         "tenants": len(tenants),
         "users": len(users),
@@ -990,8 +1110,11 @@ def reconcile_identity(store: AxentraIdentityStore) -> ReconcileReport:
             report.add("tenants", f"{row['id']}: linked Axentra tenant missing")
         elif row["product_id"] != product:
             report.add("tenants", f"{row['id']}: Axentra tenant in another product")
-        elif row["ax_name"] != axentra_tenant_name(row["id"], row["name"]):
-            report.add("tenants", f"{row['id']}: name differs")
+        else:
+            if row["ax_name"] != axentra_tenant_name(row["id"], row["name"]):
+                report.add("tenants", f"{row['id']}: name differs")
+            if row["status"] != row["ax_status"]:
+                report.add("tenants", f"{row['id']}: {row['status']} in Nodestro, {row['ax_status']} in Axentra")
     for row in extra_tenants:
         report.add("tenants", f"{row['id']}: Axentra tenant without a Nodestro tenant")
     for row in users:
@@ -1038,21 +1161,22 @@ def reconcile_identity(store: AxentraIdentityStore) -> ReconcileReport:
         report.add("sessions", f"a session of {row['user_id']}: {row['problem']}")
     for row in axentra_only_sessions:
         report.add("sessions", f"a session of {row['user_id']}: only in Axentra")
-    for role_key, (_name, permissions) in CUSTOM_ROLES.items():
-        if role_key not in roles:
-            report.add("roles", f"{role_key}: missing")
-        elif roles[role_key] != sorted(permissions):
-            report.add("roles", f"{role_key}: permissions differ ({', '.join(roles[role_key])})")
+    for problem in store.platform.access_definitions.drift(product, access_definitions()):
+        report.add("roles", problem)
     return report
 
 
 __all__ = [
+    "ACCESS_REVISION",
     "CUSTOM_ROLES",
+    "PERMISSION_FROM_AXENTRA",
+    "PRODUCT_PERMISSIONS",
     "ROLE_FROM_AXENTRA",
     "ROLE_TO_AXENTRA",
     "AxentraIdentityStore",
     "BackfillReport",
     "ReconcileReport",
+    "access_definitions",
     "backfill_identity",
     "identity_readiness",
     "open_identity_store",

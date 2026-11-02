@@ -261,3 +261,63 @@ def test_two_users_racing_for_one_token_get_one_owner(identity: IdentityStore, d
         thread.join(10)
     assert len(wins) == 1
     assert [member.user_id for member in identity.members("acme")] == wins
+
+
+# ---- suspended tenants -----------------------------------------------------------------------------
+
+
+def _member(identity: IdentityStore, tenant: str, subject: str, role: str) -> str:
+    if identity.tenant(tenant) is None:
+        identity.create_tenant(tenant, tenant.upper())
+    user = identity.login(ISSUER, subject)
+    identity.set_role(tenant, user.id, role)  # type: ignore[arg-type]
+    return user.id
+
+
+def test_a_suspended_tenant_is_closed_and_resuming_restores_access(identity: IdentityStore) -> None:
+    alice = _member(identity, "acme", "alice", "owner")
+    _member(identity, "other", "alice", "owner")
+    token = identity.create_session(alice, "acme")
+    assert identity.session(token) is not None and identity.tenant_active("acme")
+    suspended = identity.set_tenant_status("acme", "suspended")
+    assert suspended.status == "suspended" and not identity.tenant_active("acme")
+    with pytest.raises(NodestroError) as refused:
+        identity.session(token)
+    assert refused.value.code == "identity.tenant_suspended"
+    with pytest.raises(NodestroError) as refused:
+        identity.create_session(alice, "acme")
+    assert refused.value.code == "identity.tenant_suspended"
+    # The tenant is still listed (operators manage it) with its status; memberships say so too.
+    assert {t.id: t.status for t in identity.tenants()} == {"acme": "suspended", "other": "active"}
+    assert {m.tenant_id: m.tenant_status for m in identity.memberships(alice)} == {
+        "acme": "suspended",
+        "other": "active",
+    }
+    # Other tenants are unaffected.
+    assert identity.session(identity.create_session(alice, "other")) is not None
+    identity.set_tenant_status("acme", "active")
+    assert identity.session(token) is not None and identity.tenant_active("acme")
+
+
+def test_a_setup_link_of_a_suspended_tenant_stays_unused(identity: IdentityStore) -> None:
+    identity.create_tenant("fresh", "Fresh")
+    token = identity.create_bootstrap_token("fresh")
+    identity.set_tenant_status("fresh", "suspended")
+    user = identity.login(ISSUER, "first")
+    with pytest.raises(NodestroError) as refused:
+        identity.use_bootstrap(_hash(token), user.id)
+    assert refused.value.code == "identity.tenant_suspended"
+    assert identity.members("fresh") == []
+    identity.set_tenant_status("fresh", "active")
+    assert identity.use_bootstrap(_hash(token), user.id) == "fresh"
+
+
+def test_unknown_tenants_and_statuses_are_refused(identity: IdentityStore) -> None:
+    with pytest.raises(NodestroError) as refused:
+        identity.set_tenant_status("nope", "suspended")
+    assert refused.value.code == "identity.tenant_unknown"
+    identity.create_tenant("acme", "ACME")
+    with pytest.raises(NodestroError) as refused:
+        identity.set_tenant_status("acme", "closed")  # type: ignore[arg-type]
+    assert refused.value.code == "identity.tenant_status"
+    assert not identity.tenant_active("nope")

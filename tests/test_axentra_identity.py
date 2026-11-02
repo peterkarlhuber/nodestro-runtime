@@ -21,6 +21,7 @@ pytest.importorskip("axentra", reason="Axentra needs Python 3.11+")
 
 from nodestro_runtime.axentra_identity import (
     CUSTOM_ROLES,
+    PRODUCT_PERMISSIONS,
     ROLE_TO_AXENTRA,
     AxentraIdentityStore,
     backfill_identity,
@@ -318,7 +319,9 @@ def test_every_role_means_the_same_on_both_sides(database: PostgresDatabase, ser
     admin = BUILTIN_ROLES["tenant_admin"].permissions
     for key, (_name, permissions) in CUSTOM_ROLES.items():
         assert not {"members:manage", "tenant:update", "keys:manage"} & set(permissions), key
-        assert set(permissions) < admin
+        # Generic permissions below tenant_admin's; Nodestro's own come from the product permissions.
+        nodestro = {name for name, _text in PRODUCT_PERMISSIONS.values()}
+        assert set(permissions) - nodestro < admin
 
 
 # ---- switching modes: the same sessions ---------------------------------------------------------------------------
@@ -531,3 +534,180 @@ def test_everything_works_under_row_level_security(database: PostgresDatabase) -
         with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
             admin.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
             admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+# ---- suspended tenants (report risk 7) ------------------------------------------------------------------------
+
+
+def _suspend_in_axentra(store: AxentraIdentityStore, tenant_id: str, status: str = "suspended") -> None:
+    from axentra.core.context import Principal
+
+    axentra_tenant = store.link.tenant(tenant_id)
+    assert axentra_tenant is not None
+    store.platform.tenancy.update_tenant(Principal.system("test"), store.product_id, axentra_tenant, status=status)
+
+
+def test_a_tenant_suspended_in_axentra_is_closed_in_axentra_mode(database: PostgresDatabase, services: Any) -> None:
+    plain = IdentityStore(database)
+    seeded = _seed(plain)
+    axentra = _store(database, services, "axentra")
+    backfill_identity(axentra)
+    owner = seeded["people"]["owner"]
+    _suspend_in_axentra(axentra, "acme")
+    for name in ("owner", "admin", "editor", "operator", "viewer"):
+        with pytest.raises(NodestroError) as refused:
+            axentra.session(seeded["tokens"][name])
+        assert refused.value.code == "identity.tenant_suspended", name
+    with pytest.raises(NodestroError) as refused:
+        axentra.create_session(owner.id, "acme")  # login and tenant switch
+    assert refused.value.code == "identity.tenant_suspended"
+    assert not axentra.tenant_active("acme") and axentra.tenant_active("acme_eu")
+    assert {t.id: t.status for t in axentra.tenants()}["acme"] == "suspended"
+    assert {m.tenant_id: m.tenant_status for m in axentra.memberships(owner.id)} == {
+        "acme": "suspended",
+        "acme_eu": "active",
+    }
+    assert axentra.session(seeded["tokens"]["owner-eu"]) is not None  # other tenants keep working
+    # The difference is reported, and a backfill never resumes the tenant.
+    assert (
+        "acme: active in Nodestro, suspended in Axentra"
+        in reconcile_identity(axentra).as_dict()["differences"]["tenants"]
+    )
+    report = backfill_identity(axentra).as_dict()
+    assert report["suspended_in_axentra_only"] == ["acme"]
+    assert not axentra.tenant_active("acme")
+    # Resuming in Axentra alone restores access (Nodestro's side was active all along) ...
+    _suspend_in_axentra(axentra, "acme", "active")
+    assert axentra.session(seeded["tokens"]["owner"]) is not None
+    # ... while a suspension made with Nodestro's command closes the tenant on both sides and in every mode.
+    axentra.set_tenant_status("acme", "suspended")
+    assert plain.tenant("acme").status == "suspended"  # type: ignore[union-attr]
+    with pytest.raises(NodestroError):
+        plain.session(seeded["tokens"]["owner"])
+    _suspend_in_axentra(axentra, "acme", "active")  # an Axentra-side resume does not override Nodestro's suspension
+    with pytest.raises(NodestroError):
+        axentra.session(seeded["tokens"]["owner"])
+    axentra.set_tenant_status("acme", "active")
+    assert axentra.session(seeded["tokens"]["owner"]) is not None
+    assert reconcile_identity(axentra).ok
+
+
+def test_mirror_mode_follows_nodestros_status_and_writes_it_to_axentra(
+    database: PostgresDatabase, mirror: AxentraIdentityStore
+) -> None:
+    seeded = _seed(mirror)
+    mirror.set_tenant_status("acme", "suspended")
+    with mirror._ax(read_only=True) as tx:
+        status = tx.scalar("SELECT status FROM axentra_tenants WHERE id = %s", (mirror.link.tenant("acme"),))
+    assert status == "suspended"
+    with pytest.raises(NodestroError):
+        mirror.session(seeded["tokens"]["owner"])
+    mirror.set_tenant_status("acme", "active")
+    assert mirror.session(seeded["tokens"]["owner"]) is not None
+    assert reconcile_identity(mirror).ok
+
+
+def test_the_backfill_copies_a_suspension(database: PostgresDatabase, services: Any) -> None:
+    plain = IdentityStore(database)
+    seeded = _seed(plain)
+    plain.set_tenant_status("acme", "suspended")
+    axentra = _store(database, services, "axentra")
+    report = backfill_identity(axentra).as_dict()
+    assert report["tenants"]["suspended"] == 1
+    axentra.prepare()
+    with pytest.raises(NodestroError):
+        axentra.session(seeded["tokens"]["viewer"])
+    assert reconcile_identity(axentra).ok
+
+
+# ---- access definitions (report risk 10) and permissions in axentra mode ----------------------------------------
+
+
+def test_the_access_definitions_are_pinned_per_revision() -> None:
+    from nodestro_runtime.axentra_identity import ACCESS_REVISION, access_definitions
+
+    # Changing Nodestro's permissions or roles needs a new revision (and its hash here): Axentra applies a newer
+    # revision once, and an older process never downgrades it.
+    assert max(REVISION_HASHES) == ACCESS_REVISION
+    assert access_definitions().content_hash == REVISION_HASHES[ACCESS_REVISION]
+
+
+REVISION_HASHES = {1: "880e977447ccf6b784b0ec845bd6f56f522fc3e3c53e1c63b1ae32d3239a5441"}
+
+
+def test_every_start_applies_the_definitions_once(database: PostgresDatabase, services: Any) -> None:
+    from nodestro_runtime.axentra_identity import ACCESS_REVISION
+
+    def fresh() -> AxentraIdentityStore:  # a process that starts
+        return AxentraIdentityStore(database, AxentraLink(services, database), mode="mirror")
+
+    first = fresh().apply_access()
+    again = fresh().apply_access()
+    assert (first.outcome, again.outcome) == ("applied", "unchanged")
+    assert first.roles["created"] == ["editor", "operator"]
+    assert sorted(first.permissions["added"]) == sorted(name for name, _text in PRODUCT_PERMISSIONS.values())
+    stored = services.platform.access_definitions.current(services.product_id)
+    assert stored.revision == ACCESS_REVISION and stored.roles == ("editor", "operator")
+
+
+def test_an_older_process_never_downgrades_and_a_conflict_stops_the_start(
+    database: PostgresDatabase, services: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nodestro_runtime.axentra_identity as module
+
+    store = _store(database, services, "mirror")
+    # A newer release applied revision 2 with an extra permission.
+    newer = module.access_definitions()
+    from axentra.access.definitions import AccessDefinitions
+    from axentra.access.product_permissions import ProductPermission
+
+    extra = ProductPermission("nodestro.workspace:audit", "tenant", "Read the audit trail")
+    services.platform.access_definitions.apply(
+        services.product_id, AccessDefinitions(2, (*newer.permissions, extra), newer.roles)
+    )
+    assert store.apply_access().outcome == "stale"  # this (older) process starts: nothing is undone
+    names = {r.permission.name for r in services.platform.permissions.records(services.product_id)}
+    assert "nodestro.workspace:audit" in names
+    # Two builds that disagree about one revision: the start is refused.
+    monkeypatch.setattr(module, "ACCESS_REVISION", 2)
+    with pytest.raises(NodestroError) as refused:
+        store.prepare()
+    assert refused.value.code == "identity.access_conflict"
+
+
+def test_axentra_role_definitions_decide_the_permissions_in_axentra_mode(
+    database: PostgresDatabase, services: Any
+) -> None:
+    from axentra.access.definitions import AccessDefinitions, RoleDefinition
+
+    from nodestro_runtime.axentra_identity import access_definitions
+    from nodestro_runtime.identity_store import ROLE_GRANTS
+
+    plain = IdentityStore(database)
+    seeded = _seed(plain)
+    axentra = _store(database, services, "axentra")
+    mirror = _store(database, services, "mirror")
+    backfill_identity(axentra)
+    for role in ("owner", "admin", "editor", "operator", "viewer"):
+        found = axentra.session(seeded["tokens"][role])
+        assert found is not None and found.permissions == tuple(sorted(ROLE_GRANTS[role])), role  # type: ignore[arg-type]
+        assert mirror.session(seeded["tokens"][role]).permissions is None  # type: ignore[union-attr]
+    # A role change takes effect with the next request.
+    operator = seeded["people"]["operator"]
+    axentra.set_role("acme", operator.id, "editor")
+    assert axentra.session(seeded["tokens"]["operator"]).permissions == ("edit", "read", "run")  # type: ignore[union-attr]
+    axentra.set_role("acme", operator.id, "viewer")
+    assert axentra.session(seeded["tokens"]["operator"]).permissions == ("read",)  # type: ignore[union-attr]
+    # A newer revision of the definitions takes effect at once, in every process.
+    current = access_definitions()
+    roles = tuple(
+        RoleDefinition(r.key, r.name, r.scope, tuple(p for p in r.permissions if p != "nodestro.workspace:run"))
+        if r.key == "editor"
+        else r
+        for r in current.roles
+    )
+    services.platform.access_definitions.apply(services.product_id, AccessDefinitions(2, current.permissions, roles))
+    assert axentra.session(seeded["tokens"]["editor"]).permissions == ("edit", "read")  # type: ignore[union-attr]
+    # Removal ends access at once.
+    axentra.remove_member("acme", seeded["people"]["editor"].id)
+    assert axentra.session(seeded["tokens"]["editor"]) is None

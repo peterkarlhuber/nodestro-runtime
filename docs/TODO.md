@@ -108,7 +108,7 @@ None known.
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`
 - **What:** The server profile can use Axentra (off by default) for keyring secrets, tenant links and the audit and
   usage mirrors, and identity (`NODESTRO_IDENTITY_BACKEND=mirror|axentra`, backfill and reconcile). Open: a staging
-  rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys,
+  rehearsal of the identity switch on a production copy, API keys,
   a dedicated database role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, mirroring run usage (needs a per-run
   idempotency key and a billing decision), Axentra-side enforcement of limits, and a staging run of
   migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).

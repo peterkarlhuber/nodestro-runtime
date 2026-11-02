@@ -12,6 +12,17 @@ Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
   (`RunManager.owns`, set by `RunWorker`; a failing check counts as lost).
 - New `tests/test_job_delivery.py` (real PostgreSQL): SIGKILL during a model call, stalled worker, external write
   before a lost lease, parallel workers, cancel and resume, nested sub-workflows.
+Identity completion (Axentra migration M5, risks 7 and 10; off by default):
+
+- Suspended tenants: migration `0008_tenant_status` (`nodestro_tenants.status`), `IdentityStore.set_tenant_status`,
+  `tenant_active`, `Tenant.status`, `Membership.tenant_status`. A suspended tenant's sessions, new sessions and setup
+  links are refused with `identity.tenant_suspended`; with Axentra identity both sides are written, and in `axentra`
+  mode a suspension on either side closes the tenant. Backfill copies suspensions (never resumes one), reconcile
+  reports status differences.
+- Versioned access definitions: Nodestro's permissions `nodestro.workspace:read|edit|run|admin` and the roles
+  `editor`/`operator` are applied with Axentra's `ax.access_definitions` (`ACCESS_REVISION`, content hash pinned by a
+  test) instead of creating roles at every start; a conflicting revision stops the start (`identity.access_conflict`).
+  In `axentra` mode `Session.permissions` comes from Axentra's role definitions. Needs Axentra with migration `0009`.
 
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 
