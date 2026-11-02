@@ -135,6 +135,10 @@ AuditKind = Literal[
     "stale",
     "result_lost",
     "switch_off",
+    # R-4 (ADR-0006): a person adopted AI-generated code as their own, a refused adoption, an AI change ended one.
+    "tool_adopted",
+    "tool_adoption_refused",
+    "tool_adoption_revoked",
 ]
 
 
@@ -170,12 +174,25 @@ def record_audit(store: DocumentStore, event: ToolApprovalEvent) -> ToolApproval
             at=event.at,
             action=f"nodestro.tool_approval.{event.kind}",
             actor=event.actor,
-            target_type="run" if event.run_id else "tool_pre_grant",
-            target_id=event.run_id or event.pre_grant_id or "",
-            outcome="denied" if event.kind == "decision_refused" else "success",
+            target_type=audit_target(event)[0],
+            target_id=audit_target(event)[1],
+            outcome="denied" if event.kind in REFUSALS else "success",
             details=audit_details(event),
         )
     return event
+
+
+#: Audit kinds of a refused action (mirrored with the outcome ``denied``).
+REFUSALS = frozenset({"decision_refused", "tool_adoption_refused"})
+
+
+def audit_target(event: ToolApprovalEvent) -> tuple[str, str]:
+    """What the platform mirror names as the event's target: the run, the tool of an adoption or the pre-grant."""
+    if event.run_id:
+        return "run", event.run_id
+    if event.kind.startswith("tool_adopt"):
+        return "tool", event.tool or ""
+    return "tool_pre_grant", event.pre_grant_id or ""
 
 
 def audit_details(event: ToolApprovalEvent) -> dict[str, Any]:
@@ -793,6 +810,7 @@ __all__ = [
     "MAX_PAUSED_ENV",
     "MAX_WAIT",
     "PRE_GRANTS",
+    "REFUSALS",
     "SWITCH_OFF",
     "ApprovalStatus",
     "AuditKind",
@@ -806,6 +824,7 @@ __all__ = [
     "approvals_enabled",
     "arguments_hash",
     "audit_events",
+    "audit_target",
     "checkpoints_enabled",
     "max_paused",
     "record_audit",

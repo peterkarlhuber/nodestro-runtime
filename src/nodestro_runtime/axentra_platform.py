@@ -1600,7 +1600,7 @@ class AxentraEvents:
         written only when no Axentra event carries its ``nodestro_event`` id. Nodestro's records are only read."""
         from datetime import datetime, timedelta
 
-        from .tool_approvals import AUDIT, ToolApprovalEvent, audit_details
+        from .tool_approvals import AUDIT, REFUSALS, ToolApprovalEvent, audit_details, audit_target
         from .usage_log import UsageLog
 
         report: dict[str, Any] = {
@@ -1641,9 +1641,9 @@ class AxentraEvents:
                                 at=event.at,
                                 action=f"nodestro.tool_approval.{event.kind}",
                                 actor=event.actor,
-                                target_type="run" if event.run_id else "tool_pre_grant",
-                                target_id=event.run_id or event.pre_grant_id or "",
-                                outcome="denied" if event.kind == "decision_refused" else "success",
+                                target_type=audit_target(event)[0],
+                                target_id=audit_target(event)[1],
+                                outcome="denied" if event.kind in REFUSALS else "success",
                                 details=audit_details(event),
                             )
                 # MCP events are read as stored documents: the core never imports the MCP client (see

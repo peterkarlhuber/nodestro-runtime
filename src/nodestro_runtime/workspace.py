@@ -110,6 +110,7 @@ from .schemas import (
 )
 from .server_settings import TenantSecrets, is_encrypted
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
+from .tool_adoption import audit_revocation
 from .tool_approvals import (
     ToolApprovalEvent,
     ToolApprovals,
@@ -343,6 +344,7 @@ class Workspace:
             policy=self.sandbox_policy,
             provenance=StoredProvenance(self.store),
         )
+        self.tools.on_adoption_revoked = audit_revocation(self.store)
         self._apply_sandbox_mode()
         # MCP (ADR-0007): the egress policy is the operator's (process environment), tokens are sealed with the
         # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.

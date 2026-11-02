@@ -7,6 +7,27 @@ Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-
 - `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so
   the label only bounds a container whose relay and hub both crashed. A test ties it to the model's maximum timeout.
 
+Adopting AI-generated tool code as one's own, desktop only (R-4, ADR-0006 amendment; 2026-11-02):
+
+- `ToolLibrary.adopt(name, actor=, role=, expected_hash=)` makes the current version of an `untrusted` tool
+  `user-authored` after a person confirmed it: only in the desktop policy (`tool.adoption_desktop_only` in the
+  server and `local-container` profiles and for a server tenant's workspace, whose trust policy is unchanged), only
+  for the roles `owner` and `admin` (`tool.adoption_forbidden`), only for the shown content
+  (`tool_provenance.content_hash` of code and tests, `tool.adoption_stale` with `version`), never for a tool that is
+  not `untrusted` (`tool.adoption_not_needed`) or has no code (`tool.adoption_not_applicable`).
+- The adoption (`ToolAdoption`: name, version, content hash, actor, role, time) is stored in `tool_adoptions` and
+  counts only while that version still has that content and every later version was written in the editor. A
+  later AI-written version ends it: the tool is `untrusted` again, the record is dropped and
+  `ToolLibrary.on_adoption_revoked` is called. Editing an adopted tool in the editor keeps it.
+- `tool_adoption.adopt_tool` writes `tool_adopted` and `tool_adoption_refused` to the tool audit trail
+  (`tool_approval_audit`, mirrored to Axentra with target type `tool`); the workspace writes `tool_adoption_revoked`.
+- `ToolInfo.content_hash` and `ToolInfo.adoption` (new optional fields). A restore clears adoptions with the other
+  provenance records; `postgres_import` never imports `tool_adoptions`. Release libraries follow the studio's
+  adoption through `linked_provenance()`.
+- Unchanged: AI code edited by a person stays `untrusted` until adopted, pasted code stays `user-authored`, existing
+  tools keep their class (no migration), the subprocess mode still refuses `untrusted` code, and every profile's
+  `SandboxPolicy` is the same. No similarity detection (see `docs/TODO.md`).
+
 Resolve and module-check containers checked against the proven shape (R-5, RT-038; 2026-11-02):
 
 - `container_images.check_shape` refuses a `docker run` that is not Orkexa's `run_args` (the shape the in-container
