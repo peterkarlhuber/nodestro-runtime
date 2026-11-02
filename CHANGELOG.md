@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
+shared pool, runtime roles; replaces `f114920`).
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence
@@ -12,6 +15,7 @@ Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
   (`RunManager.owns`, set by `RunWorker`; a failing check counts as lost).
 - New `tests/test_job_delivery.py` (real PostgreSQL): SIGKILL during a model call, stalled worker, external write
   before a lost lease, parallel workers, cancel and resume, nested sub-workflows.
+
 Identity completion (Axentra migration M5, risks 7 and 10; off by default):
 
 - Suspended tenants: migration `0008_tenant_status` (`nodestro_tenants.status`), `IdentityStore.set_tenant_status`,
@@ -23,6 +27,7 @@ Identity completion (Axentra migration M5, risks 7 and 10; off by default):
   `editor`/`operator` are applied with Axentra's `ax.access_definitions` (`ACCESS_REVISION`, content hash pinned by a
   test) instead of creating roles at every start; a conflicting revision stops the start (`identity.access_conflict`).
   In `axentra` mode `Session.permissions` comes from Axentra's role definitions. Needs Axentra with migration `0009`.
+
 Database roles, one connection pool, migration checksums (Axentra migration, work package dbinfra):
 
 - `grant_runtime_role(owner_database, role)` and `inspect_role` in `storage_postgres`: a runtime role gets data
@@ -778,6 +783,7 @@ Nodestro Local Docker (the `local-container` profile and the sandbox gateway):
   29 really sends and on hostile ones, the protocol (including attach with half-close) against a stand-in daemon,
   and with `NODESTRO_DOCKER_TESTS=1` a real image build, a tool call without network or writable files, and refused
   escape attempts through the docker CLI.
+
 Request options cannot add tools or a provider-hosted MCP server (security fix, MCP-0 finding F-1):
 
 - An agent's `request_options` could switch on a provider's own MCP connector and add tools past the tool library:
