@@ -7,8 +7,9 @@ on a computer where only one sandbox backend is missing. A missing sandbox backe
 and untrusted code must still be refused.
 
 ``test_import_without_linux_kernel_functions`` also simulates macOS and Windows on Linux: it starts an interpreter in
-which ``prctl`` does not exist, ``resource`` and ``fcntl`` cannot be imported and ``sys.platform`` names the other
-system, and imports every module there.
+which ``prctl`` does not exist and (for Windows) ``resource`` and ``fcntl`` cannot be imported and
+``ctypes.CDLL(None)`` fails, imports every module there, and then checks under the other system's ``sys.platform``
+that the built-in sandbox reports "platform" and untrusted code is refused.
 """
 
 from __future__ import annotations
@@ -31,7 +32,11 @@ from nodestro_runtime.sandbox_policy import SandboxPolicy
 pytestmark = pytest.mark.real_sandbox_status  # the computer's real sandbox status (see conftest.py)
 
 #: Modules that may need an optional dependency that the platform job does not install.
-_OPTIONAL = {"nodestro_runtime.storage_postgres", "nodestro_runtime.postgres_import", "nodestro_runtime.postgres_tables"}
+_OPTIONAL = {
+    "nodestro_runtime.storage_postgres",
+    "nodestro_runtime.postgres_import",
+    "nodestro_runtime.postgres_tables",
+}
 
 
 def _modules() -> list[str]:
@@ -82,9 +87,14 @@ def test_untrusted_code_is_refused_without_isolation() -> None:
 
 def test_user_authored_code_runs_in_the_subprocess_sandbox() -> None:
     """The desktop runs a person's own tool code in a host subprocess on every system (ADR-0006)."""
-    code = "def add(a: int, b: int) -> int:\n    return a + b\n"
+    code = (
+        "def add(a: int, b: int) -> int:\n"
+        '    """Add two numbers.\n\n    Args:\n        a: First.\n        b: Second.\n\n'
+        '    Returns:\n        The sum.\n    """\n'
+        "    return a + b\n"
+    )
     sandbox = SubprocessSandbox(timeout=30.0, acknowledge_unsafe=True)
-    assert sandbox.call(code, "add", {"a": 2, "b": 3}) == 5
+    assert sandbox.call(code, "add", {"a": 2, "b": 3}) == "5"
 
 
 _SIMULATE = textwrap.dedent(
@@ -117,7 +127,6 @@ _SIMULATE = textwrap.dedent(
             return getattr(self._real, name)
 
     ctypes.CDLL = FakeLibc
-    sys.platform = target
     import pkgutil, importlib
     import nodestro_runtime
     failed = {}
@@ -132,9 +141,20 @@ _SIMULATE = textwrap.dedent(
             failed[info.name] = f"{type(exc).__name__}: {exc}"
         except Exception as exc:
             failed[info.name] = f"{type(exc).__name__}: {exc}"
+    # Only now the other system's name: the standard library itself reads sys.platform while it imports.
+    sys.platform = target
     from nodestro_runtime.builtin_sandbox import LinuxSandbox
-    status = LinuxSandbox.status()
-    print(json.dumps({"failed": failed, "available": status.available, "reason": status.reason}))
+    from nodestro_runtime.sandbox_confine import landlock_abi
+    from nodestro_runtime.sandbox_policy import SandboxPolicy
+    from orkexa.dynamic import SubprocessSandbox
+    status = LinuxSandbox.status(refresh=True)
+    try:
+        SandboxPolicy("desktop").require("untrusted", SubprocessSandbox(acknowledge_unsafe=True))
+        refused = ""
+    except Exception as exc:
+        refused = getattr(exc, "code", type(exc).__name__)
+    print(json.dumps({"failed": failed, "available": status.available, "reason": status.reason,
+                      "abi": landlock_abi(), "refused": refused}))
     """
 )
 
@@ -152,3 +172,5 @@ def test_import_without_linux_kernel_functions(target: str, tmp_path: Path) -> N
     assert report["failed"] == {}
     assert report["available"] is False
     assert report["reason"] == "platform"
+    assert report["abi"] == 0
+    assert report["refused"] == "sandbox.isolation_required"

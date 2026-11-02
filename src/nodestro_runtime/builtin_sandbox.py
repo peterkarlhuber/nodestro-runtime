@@ -262,8 +262,11 @@ class LinuxSandbox(Sandbox):
 
 def _kill(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
+        killpg = getattr(os, "killpg", None)  # POSIX only; the sandbox runs only on Linux
         try:
-            os.killpg(process.pid, 9)
+            if killpg is None:
+                raise OSError("no process groups")
+            killpg(process.pid, 9)
         except OSError:
             process.kill()
         process.wait()

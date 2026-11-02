@@ -42,7 +42,9 @@ jobs:
             export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
             export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
           fi
-          pip install -e ".[dev]"
+          # Without the dev extra: psycopg-binary (the server profile) has no Windows ARM64 wheel, and the desktop
+          # does not use PostgreSQL.
+          pip install -e . "pytest>=8" "pytest-asyncio>=0.24"
       - name: System
         run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
       - name: Import the workspace (the path that failed on macOS)

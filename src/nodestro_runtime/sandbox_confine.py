@@ -31,7 +31,6 @@ import errno
 import json
 import os
 import platform
-import resource
 import runpy
 import socket
 import struct
@@ -297,10 +296,34 @@ class Unavailable(Exception):
         self.code = code
 
 
-_libc = ctypes.CDLL(None, use_errno=True)
-_libc.syscall.restype = ctypes.c_long
-_libc.prctl.restype = ctypes.c_int
-_libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+class _Libc:
+    """The C library's ``syscall`` and ``prctl``, looked up on first use and only on Linux.
+
+    The module is imported on every system (the host imports it to find its path and its constants), so nothing
+    Linux-specific may run at import time: macOS has no ``prctl``, and on Windows ``ctypes.CDLL(None)`` fails."""
+
+    def __init__(self) -> None:
+        self._lib: ctypes.CDLL | None = None
+
+    def _load(self) -> ctypes.CDLL:
+        if self._lib is None:
+            if not sys.platform.startswith("linux"):
+                raise Unavailable("platform", f"needs Linux, this is {sys.platform}")
+            lib = ctypes.CDLL(None, use_errno=True)
+            lib.syscall.restype = ctypes.c_long
+            lib.prctl.restype = ctypes.c_int
+            lib.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+            self._lib = lib
+        return self._lib
+
+    def syscall(self, *args: object) -> int:
+        return int(self._load().syscall(*args))
+
+    def prctl(self, *args: int) -> int:
+        return int(self._load().prctl(*args))
+
+
+_libc = _Libc()
 
 _PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
@@ -309,7 +332,9 @@ _SECCOMP_MODE_FILTER = 2
 
 
 def landlock_abi() -> int:
-    """The kernel's Landlock ABI version, or 0 if Landlock is not built in or not enabled."""
+    """The kernel's Landlock ABI version, or 0 if Landlock is not built in or not enabled (and on other systems)."""
+    if not sys.platform.startswith("linux"):
+        return 0
     result = _libc.syscall(_SYS_LANDLOCK_CREATE_RULESET, None, ctypes.c_size_t(0), _LANDLOCK_CREATE_RULESET_VERSION)
     return int(result) if result > 0 else 0
 
@@ -334,6 +359,8 @@ def _check_platform(minimum: int = MIN_LANDLOCK_ABI) -> int:
 
 
 def _set_limits(limits: dict[str, int]) -> None:
+    import resource  # POSIX only; this runs after the platform check
+
     def limit(kind: int, value: int) -> None:
         try:
             resource.setrlimit(kind, (value, value))
