@@ -206,7 +206,7 @@ None known.
   reaped at the start (all started before the reaper, safe because the process holds the data directory lock) and
   once expired (every 60 s). The gateway drops request environment variables, checks a tagged image's lock label and
   creates it by id, and confirms the daemon's limits and seccomp profile again after 5 s. Open: a server's processes
-  share `nodestro-mcp` and reap only expired MCP containers (deadline 7 days); through the sandbox gateway containers
+  share `nodestro-mcp` and reap only expired MCP containers (deadline 15 minutes: per-operation connections of at most 2 × 300 s); through the sandbox gateway containers
   cannot be listed, so its own reconcile (`max_lifetime`, 600 s by default) also ends MCP connections older than that;
   a daemon reconfigured between the preflight and a container start is noticed only at the next start; the gateway
   still inspects and removes `nodestro-env:*` tags without the lock-label check.

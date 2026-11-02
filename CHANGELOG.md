@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Local MCP containers: deadline label 15 minutes instead of 7 days (RT-037; 2026-11-02):
+
+- `MCP_LIFETIME` is 15 minutes. Connections are per operation and capped at `2 * timeout_seconds` (at most 300 s), so
+  the label only bounds a container whose relay and hub both crashed. A test ties it to the model's maximum timeout.
+
 Adopting AI-generated tool code as one's own, desktop only (R-4, ADR-0006 amendment; 2026-11-02):
 
 - `ToolLibrary.adopt(name, actor=, role=, expected_hash=)` makes the current version of an `untrusted` tool
