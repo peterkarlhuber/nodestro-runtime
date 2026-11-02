@@ -12,6 +12,9 @@ cancel, cleanup) check what the host saw.
 The probes plant canaries first: a secret file in the home directory, a fake Nodestro data directory with a
 ``secrets.json``, an API key in Nodestro's own environment, a TCP server on the loopback interface and a UNIX socket
 server. A probe fails if any canary is read or contacted.
+
+The raw system call numbers in the probes are x86-64 numbers (``asm/unistd_64.h``); :func:`run_all` refuses to run
+on any other architecture rather than report refusals of the wrong calls.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import platform
 import secrets
 import socket
 import subprocess
@@ -666,6 +670,10 @@ def run_all() -> list[Result]:
     status = LinuxSandbox.status()
     if not status.available:
         raise SandboxError(f"The built-in sandbox is not available here: {status.reason}: {status.detail}")
+    if platform.machine() != "x86_64":
+        # The raw system call numbers of the probes (and of the seccomp filter) are x86-64 numbers; on another
+        # architecture they name other calls, so a "refused" there would prove nothing (docs/sandbox-arm64.md).
+        raise SandboxError(f"The security probes are written for x86-64, this is {platform.machine()}")
     with tempfile.TemporaryDirectory(prefix="nodestro-probes-") as directory:
         canaries = _Canaries(Path(directory))
         try:

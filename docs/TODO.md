@@ -203,9 +203,16 @@ None known.
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** #17, #23, desktop systems workflow
 - **What:** The built-in sandbox (Landlock + seccomp) is validated on Ubuntu 24.04 and Debian 13, x86_64, including
-  the packaged desktop in VMs. Other distributions, kernels with older Landlock ABIs, and aarch64 are untested; the
-  sandbox then reports itself unavailable and untrusted tools need Docker.
-- **Next step:** Add further systems to the probe matrix when they are to be supported.
+  the packaged desktop in VMs. Other distributions and kernels with older Landlock ABIs are untested; the sandbox
+  then reports itself unavailable and untrusted tools need Docker. aarch64 was audited on 2026-11-02
+  ([sandbox-arm64.md](sandbox-arm64.md)): the seccomp filter and the probes use x86-64 system call numbers, so the
+  sandbox is deliberately unavailable there; host check, confinement check and the filter's `arch` check each fail
+  closed, tested by `tests/test_sandbox_arch.py` and the CI job `builtin-sandbox-arm64` on `ubuntu-24.04-arm`. The
+  probes refuse to run on non-x86-64 machines. The filter is a deny list: calls newer than the list (`quotactl_fd`,
+  `statmount`, `listmount`) are allowed on x86-64 (finding A6, low).
+- **Next step:** Add further systems to the probe matrix when they are to be supported. aarch64 support, if needed
+  again (macOS VM guest, paused), follows the checklist in the decision of sandbox-arm64.md; review the deny list
+  against current kernels (A6).
 
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
