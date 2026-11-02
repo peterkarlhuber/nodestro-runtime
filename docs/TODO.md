@@ -108,10 +108,14 @@ None known.
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`
 - **What:** The server profile can use Axentra (off by default) for keyring secrets, tenant links and the audit and
   usage mirrors, and identity (`NODESTRO_IDENTITY_BACKEND=mirror|axentra`, backfill and reconcile). Open: a staging
-  rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys,
-  a dedicated database role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, mirroring run usage (needs a per-run
-  idempotency key and a billing decision), Axentra-side enforcement of limits, and a staging run of
+  rehearsal of the identity switch on a production copy, Axentra-backed OIDC login (`OidcService`), API keys
+  when publication comes to the server (decision and boundary in the doc, "API keys (M6)"), a dedicated database
+  role instead of `NODESTRO_AXENTRA_ALLOW_SUPERUSER`, limit enforcement in the budget admission with reservations
+  (design in the doc, "Usage"; run usage is mirrored, enforcement stays off), a Studio view of the inbox
+  (`/api/notifications`), worker-side metrics (the worker has no listener), and a staging run of
   migrate/backfill/reencrypt/reconcile with restore. Jobs stay Nodestro's (different guarantees, see the doc).
+  Rejected: moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
+  source), e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch).
 - **Next step:** An independent security review of the identity mirror, then a staging rehearsal, before any switch is
   turned on in production. No switch is activated in production by this work.
 
