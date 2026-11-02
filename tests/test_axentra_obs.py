@@ -466,6 +466,75 @@ def test_the_start_refuses_a_key_with_other_bytes_under_a_known_key_id(database:
     assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy)) == []
 
 
+def _seed_axentra_login_state(services: Any) -> None:
+    """A row of one of Axentra's own keyring columns (an OIDC login start), under the services' active key."""
+    from datetime import datetime, timezone
+
+    from axentra.data.database import DbScope
+
+    box = services.platform.secrets
+    state = "ab" * 32
+    with services.platform.db.transaction(DbScope.platform()) as tx:
+        tx.execute(
+            "INSERT INTO axentra_login_states (state_hash, provider, nonce, code_verifier, return_to, expires_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                state,
+                "default",
+                box.encrypt("n", f"axentra_login_states:{state}:nonce"),
+                box.encrypt("v", f"axentra_login_states:{state}:code_verifier"),
+                "/",
+                datetime.now(timezone.utc) + timedelta(hours=1),
+            ),
+        )
+
+
+def test_the_start_refuses_other_bytes_for_a_key_id_only_axentras_columns_use(database: Any) -> None:
+    """SR-04a: the key-bytes check sampled only Nodestro's documents. A key id used only by Axentra's own keyring
+    columns (here a login state; no tenant secret uses it) with other bytes started, and those values were lost."""
+    legacy = SecretBox(b"L" * 32)
+    ring, _keys = _ring("k1")
+    services = _services(database, keyring=ring)
+    impostor_ring, _ = _ring("k1")  # the same key id, other bytes
+    impostor = _services(database, keyring=impostor_ring)
+    try:
+        _seed_axentra_login_state(services)
+        assert stored_secret_formats(database) == {}  # Nodestro's documents hold no value under k1
+        assert services.key_samples() == {"k1": (True, [])}
+        right = axentra_platform.secret_key_problems(
+            database, _keyring_box(ring, legacy), axentra_samples=services.key_samples()
+        )
+        assert right == []
+        axentra_platform.require_readable_secrets(
+            database,
+            AxentraConfig(enabled=True, keyring=ring),
+            _keyring_box(ring, legacy),
+            services.kids_in_use(),
+            services.key_samples(),
+        )
+
+        samples = impostor.key_samples()
+        assert samples == {"k1": (False, ["axentra_login_states.nonce", "axentra_login_states.code_verifier"])}
+        box = _keyring_box(impostor_ring, legacy)
+        assert axentra_platform.secret_key_problems(database, box) == []  # Nodestro's documents alone: it started
+        impostor_config = AxentraConfig(enabled=True, keyring=impostor_ring)
+        assert secrets_rollback_problems(impostor_config, {}, impostor.kids_in_use()) == []  # ids alone: passes
+        with pytest.raises(NodestroError) as caught:
+            axentra_platform.require_readable_secrets(database, impostor_config, box, impostor.kids_in_use(), samples)
+        (problem,) = caught.value.params["problems"]
+        assert (problem["field"], problem["value"]) == ("NODESTRO_AXENTRA_KEYRING", "k1")
+        assert "2 stored secrets" in problem["reason"] and "axentra_login_states.nonce" in problem["reason"]
+        assert impostor_ring.split(":", 1)[1] not in str(caught.value.params)
+        assert ring.split(":", 1)[1] not in str(caught.value.params)
+
+        # A value of Nodestro's documents that proves the key is enough (the same key id, the same bytes).
+        _seed_secrets(database, _keyring_box(ring, legacy))
+        assert axentra_platform.secret_key_problems(database, _keyring_box(ring, legacy), axentra_samples={}) == []
+    finally:
+        impostor.close()
+        services.close()
+
+
 def test_reencrypting_with_v1_moves_axs1_values_back_so_axentra_can_be_switched_off(database: Any) -> None:
     legacy = SecretBox(b"L" * 32)
     ring, _ = _ring("k1")

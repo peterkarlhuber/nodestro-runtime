@@ -636,3 +636,75 @@ def test_trace_export_sanitizing_and_import_carry_the_chat(tmp_path: Path) -> No
     (copy,) = RunChat(store).messages(imported.id)
     assert copy.run_id == copy.target_run_id == imported.id and copy.status == "considered"
     assert copy.client_id is None and copy.content == message.content
+
+
+# SR-03a: a suspended tenant's answers stop -----------------------------------------------------------------------
+
+
+async def _paused_run(workspace: Workspace, ids: dict[str, str]) -> Run:
+    writer = team(workspace, "WRITER", "Writer", approval="branch")
+    ids["team"] = writer.id
+    started = await workspace.run(workspace.save_workflow(boss(writer)), RunIn(input="go"))
+    await until(lambda: (workspace.runs.get(started.id) or started).status == "paused")
+    return started
+
+
+def _script(ids: dict[str, str], chat: Any) -> dict[str, list[Any]]:
+    return {
+        BOSS: [parsed(lambda model: model(action="delegate", member=ids["team"], task="Draft", reason="start"))],
+        "WRITER": [text("draft")],
+        CHAT: [chat],
+    }
+
+
+async def test_a_stopped_answer_fails_its_question_and_a_late_answer_is_not_stored(make: Make) -> None:
+    ids: dict[str, str] = {}
+    entered, release = threading.Event(), threading.Event()
+    workspace = make(_script(ids, blocking("a late answer", entered, release)))
+    started = await _paused_run(workspace, ids)
+    chat = workspace.runs.chat
+    question = send(workspace, started, "question", "Where are we?")
+    answering = asyncio.create_task(
+        asyncio.to_thread(answer_question, workspace.runs, chat, workspace.usage_log, question, model="anthropic:x")
+    )
+    await until(entered.is_set)
+    try:
+        assert chat.cancel_answers("identity.tenant_suspended") == [question.id]
+        assert chat.cancel_answers("identity.tenant_suspended") == []  # idempotent
+        stored = chat.get(started.id, question.id)
+        assert stored is not None and (stored.status, stored.code) == ("failed", "identity.tenant_suspended")
+    finally:
+        release.set()
+    result = await answering
+    assert result.id == question.id and result.kind == "question"
+    # The model's answer arrived after the stop: it is not stored, the question stays failed.
+    assert [item.kind for item in chat.messages(started.id)] == ["question"]
+    stored = chat.get(started.id, question.id)
+    assert stored is not None and (stored.status, stored.code) == ("failed", "identity.tenant_suspended")
+    assert chat.cancel_answers("identity.tenant_suspended") == []  # the answer ended
+
+
+async def test_an_answer_stopped_before_its_request_never_calls_the_model(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ids: dict[str, str] = {}
+    workspace = make(_script(ids, text("never asked")))
+    started = await _paused_run(workspace, ids)
+    chat = workspace.runs.chat
+    question = send(workspace, started, "question", "Where are we?")
+    original = run_chat.snapshot_text
+    stopped: list[str] = []
+
+    def suspend_meanwhile(*args: Any, **kwargs: Any) -> str:
+        stopped.extend(chat.cancel_answers("identity.tenant_suspended"))  # the tenant is suspended right now
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run_chat, "snapshot_text", suspend_meanwhile)
+    result = await asyncio.to_thread(
+        answer_question, workspace.runs, chat, workspace.usage_log, question, model="anthropic:x"
+    )
+    assert stopped == [question.id] and result.id == question.id
+    stored = chat.get(started.id, question.id)
+    assert stored is not None and (stored.status, stored.code) == ("failed", "identity.tenant_suspended")
+    calls = workspace.fake.messages.calls  # type: ignore[attr-defined]
+    assert not any(CHAT in str(call.get("system")) for call in calls)

@@ -31,7 +31,8 @@ Instruction status (:data:`InstructionStatus`):
 - ``expired``: the orchestrator (or the run) ended before a decision could take it into account.
 
 Question status: ``pending`` -> ``answered`` (the answer is a message of kind ``answer`` with ``reply_to``) or
-``failed`` (``code``).
+``failed`` (``code``). :meth:`RunChat.cancel_answers` fails the questions this process is answering (the API calls it
+when their tenant is suspended, with ``identity.tenant_suspended``).
 """
 
 from __future__ import annotations
@@ -298,7 +299,9 @@ class RunChat:
         self.store = store
         self.clock = clock
         #: Questions being answered in this process (their answers are not timed out while they work).
-        self._answering: set[str] = set()
+        self._answering: dict[str, RunMessage] = {}
+        #: Answers stopped by :meth:`cancel_answers`: their model request is not sent, their answer is not stored.
+        self._stopped: set[str] = set()
         self._lock = threading.Lock()
 
     # -- reading
@@ -541,13 +544,28 @@ class RunChat:
 
     # -- answers
 
-    def begin_answer(self, message_id: str) -> None:
+    def begin_answer(self, question: RunMessage) -> None:
         with self._lock:
-            self._answering.add(message_id)
+            self._answering[question.id] = question
 
     def end_answer(self, message_id: str) -> None:
         with self._lock:
-            self._answering.discard(message_id)
+            self._answering.pop(message_id, None)
+            self._stopped.discard(message_id)
+
+    def answer_stopped(self, message_id: str) -> bool:
+        """Whether :meth:`cancel_answers` stopped the answer to question ``message_id``."""
+        with self._lock:
+            return message_id in self._stopped
+
+    def cancel_answers(self, code: str) -> list[str]:
+        """Stop every answer this process is writing (its tenant was suspended, security review SR-03a): each
+        question fails with ``code`` at once, a model request not sent yet is not sent, and an answer that arrives
+        later is not stored (the question is no longer pending). Idempotent; returns the questions stopped."""
+        with self._lock:
+            working = [item for item in self._answering.values() if item.id not in self._stopped]
+            self._stopped.update(item.id for item in working)
+        return [item.id for item in working if self.fail_question(item, code) is not None]
 
     def record_answer(
         self,
@@ -892,8 +910,13 @@ def answer_question(
     from .schemas import AgentConfig
 
     limits = limits or chat_limits()
-    chat.begin_answer(question.id)
+    chat.begin_answer(question)
     tracker = None
+
+    def on_request(_args: dict[str, Any]) -> None:
+        if chat.answer_stopped(question.id):  # cancel_answers: the tenant was suspended
+            raise NodestroError("run_chat.answer_stopped", "The answer was stopped")
+
     try:
         root = manager.get(question.run_id)
         located = find_target(manager.get, root, question.target_run_id, question.node_id) if root else None
@@ -928,7 +951,7 @@ def answer_question(
                 connect=manager.connect,
                 tracker=tracker,
                 name="run_chat",
-                hooks={},
+                hooks={"on_request": on_request},
                 attended=True,
             )
         except NodestroError as exc:

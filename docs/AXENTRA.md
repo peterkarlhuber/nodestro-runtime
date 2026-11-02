@@ -159,17 +159,23 @@ run by `tests/test_tenant_filters.py` of the runtime and of the API:
 - tenant tables are every `nodestro_*` table with a `tenant_id` column in the migrations (read at test time, so a new
   table is covered at once): documents, files, chunks, memory files, jobs, run events, schedule firings, sessions,
   memberships, login states, bootstrap tokens (runs, schedules and secrets are collections of the documents table);
-- every string expression of `nodestro_runtime` and `nodestro_api` is rebuilt as Python would build it (constants,
-  `+` and implicit concatenation, f-strings, `str.format`, `join`, psycopg `sql.SQL`/`Identifier`/`Placeholder`/
-  `Composed`; names resolved to module constants, local assignments with each conditional `+=` taken and not taken,
-  and loops over constant tuples), and every variant that names a tenant table is parsed with PostgreSQL's own
-  grammar (`pglast`, a dev dependency);
+- every string expression of `nodestro_runtime` and `nodestro_api` is rebuilt as Python would build it (string and
+  bytes constants, `+` and implicit concatenation, f-strings, `str.format`, `join` of a literal list or of a name
+  holding one, psycopg `sql.SQL`/`Identifier`/`Placeholder`/`Composed`; `.replace` and other methods that change the
+  text add an unknown part), and every variant that names a tenant table is parsed with PostgreSQL's own grammar
+  (`pglast`, a dev dependency);
+- a name is resolved to every value it can hold at each place it is read, inside a string expression and on its own
+  (`query += " OR ..."; db._query(query)`, `query = query + ...`): module constants, the local assignments and `+=`
+  before the read (and after it in a loop around it), each conditional assignment or `+=` taken and not taken, and
+  loops over constant tuples; a `+=` that a loop repeats is an unknown part, and more than 256 variants are reported
+  as dynamic (SR-01a);
 - each reference to a tenant table (`FROM`, joins, `USING`, `UPDATE`/`DELETE` targets, subqueries, CTEs, set
   operations) must be bound by a top-level `AND` conjunct `tenant_id = <param>` or `tenant_id = ANY(<param>)` (or
   equal to the `tenant_id` of a bound or enclosing reference); `INSERT` must list `tenant_id`; `TRUNCATE`, `COPY`,
   `MERGE` are refused;
 - a statement with a part that cannot be resolved is reported as dynamic, one the parser rejects as unparsed; neither
-  passes silently;
+  passes silently. A text that starts with an unknown part (an imported fragment, `self.BASE + "..."`, a function's
+  result) followed by SQL words is reported as dynamic too, not dropped (SR-01b);
 - the exceptions are in `tenant_sql_allowlist.py` of each package: the module and the whole normalized statement,
   each with its reason (worker claim, heartbeat and finish by job id, the reaper, housekeeping, session lookup by
   token hash, operator commands, metrics aggregates). Matching is exact, and an entry that matches nothing fails.
@@ -196,6 +202,12 @@ Rotation:
 3. A value that cannot be read is **never overwritten or dropped**: it is reported (`tenant/collection/key:field`, no
    values) and the command exits with code 2.
 4. Remove the old key only after a run reports `pending: 0` and `failed: []`.
+
+The start (`check`, `api`, `worker`) refuses a keyring that lacks a key id still in use, in Nodestro's documents or in
+Axentra's own keyring columns (login states, webhook secrets, notification messages, the inbox), and it decrypts up to
+five stored values per key id and column, in both places (`secret_key_problems`, `AxentraServices.key_samples`):
+other bytes under a known key id are refused, also for a key id only Axentra's columns use (security review SR-04,
+SR-04a). Problems name locations, never values.
 
 The same procedure moves v1 values to the keyring (`NODESTRO_SECRETS_FORMAT=axs1`). Until every v1 value is
 re-encrypted, `NODESTRO_SECRET_KEY` must stay set.
@@ -298,6 +310,12 @@ identity). A suspended tenant is closed, not deleted:
   call; the orphan sweep later marks the run interrupted, so it can be continued after resuming), stop runs they
   execute for it within `reap_every` without storing more (as after a lost lease), and fire no schedules and no
   tool-wait sweeps for it. The check is `IdentityStore.tenant_active`, answered by the identity backend.
+- API processes stop what its context started in the background within `suspension_check` seconds
+  (`server_app.stop_tenant_work`, stop code `identity.tenant_suspended`): batches, benchmarks with their judge,
+  assistant answers, architect drafts, live run chat answers (`RunChat.cancel_answers`: the question fails at once and
+  a late answer is not stored) and Python environment installations (`PythonEnvironments.cancel_installs`: stopped
+  before their next step; a `uv` or `docker build` command already running finishes, bounded by its timeout, but its
+  result is never checked or used). Security review SR-03, SR-03a.
 - In `axentra` mode a tenant counts as suspended when **either** side says so: a suspension made directly in Axentra
   closes it at once (fail closed), and resuming it needs Nodestro's command when Nodestro's side is suspended. In
   `nodestro`/`mirror` mode Nodestro's status decides (`mirror` writes it to Axentra too). The backfill copies a

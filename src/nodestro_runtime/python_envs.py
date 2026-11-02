@@ -651,6 +651,10 @@ class PythonEnvironments:
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
         self._analysis: dict[str, ToolDependencies] = {}
+        #: Scopes whose installation this process started and has not finished (queued or running).
+        self._installing: set[str] = set()
+        #: Scope -> the code :meth:`cancel_installs` stopped its installation with.
+        self._stopped: dict[str, str] = {}
 
     @property
     def images(self) -> ContainerImages:
@@ -1063,6 +1067,7 @@ class PythonEnvironments:
                 raise NodestroError("deps.installing", "An installation is already running for this environment")
             env.install = InstallState(status="installing", step="deps.step.queued", started_at=now())
             self._put(env)
+            self._installing.add(scope)
             return env
         plan, needed = approve
         env = self.get(plan.scope) or PythonEnvironment(scope=plan.scope, kind=plan.kind, ref=plan.ref)
@@ -1100,6 +1105,7 @@ class PythonEnvironments:
         env.history.append(EnvChange(kind="approved", details=details or ["confirmed"]))
         env.install = InstallState(status="installing", step="deps.step.queued", started_at=now())
         self._put(env)
+        self._installing.add(env.scope)
         return env
 
     # ---- installation ----------------------------------------------------------------
@@ -1130,8 +1136,35 @@ class PythonEnvironments:
         threading.Thread(target=self._install, args=(scope, list(modules), None, resolved), daemon=True).start()
         return env
 
+    def cancel_installs(self, code: str) -> list[str]:
+        """Stop every installation this process started (its tenant was suspended, security review SR-03a): one that
+        waits does not start, a running one stops before its next step (a ``uv`` or ``docker build`` command that
+        already runs finishes first, bounded by its timeout, but its result is never checked or used) and fails with
+        ``code``. Idempotent; returns the scopes stopped."""
+        with self._lock:
+            found = sorted(scope for scope in self._installing if scope not in self._stopped)
+            for scope in found:
+                self._stopped[scope] = code
+        return found
+
+    def _check_stopped(self, scope: str) -> None:
+        with self._lock:
+            code = self._stopped.get(scope)
+        if code is not None:
+            raise _InstallProblem(problem(code, "The installation was stopped"))
+
     def _install(
         self, scope: str, modules: Iterable[str], log: Callable[[str], None] | None, trust: TrustClass = "untrusted"
+    ) -> None:
+        try:
+            self._install_scope(scope, modules, log, trust)
+        finally:
+            with self._lock:
+                self._installing.discard(scope)
+                self._stopped.pop(scope, None)
+
+    def _install_scope(
+        self, scope: str, modules: Iterable[str], log: Callable[[str], None] | None, trust: TrustClass
     ) -> None:
         with self._scope_lock(scope):
             env = self.get(scope)
@@ -1147,6 +1180,7 @@ class PythonEnvironments:
                     log(line)
 
             def step(code: str) -> None:
+                self._check_stopped(scope)
                 state.step = code
                 self._update_install(scope, state)
 
@@ -1176,6 +1210,7 @@ class PythonEnvironments:
                             modules=", ".join(missing),
                         )
                     )
+                self._check_stopped(scope)
                 (staging / _MARKER).write_text(
                     json.dumps({"scope": scope, "lock_sha": _sha(env.lock), "installed_at": now().isoformat()}),
                     encoding="utf-8",
@@ -1241,6 +1276,7 @@ class PythonEnvironments:
                         modules=", ".join(missing),
                     )
                 )
+            self._check_stopped(scope)
             self._images_ready[tag] = _sha(env.lock)
             state.status, state.step, state.error = "installed", None, None
             kind, details = "installed", [f"{len(env.packages)} packages", f"image {tag}"]

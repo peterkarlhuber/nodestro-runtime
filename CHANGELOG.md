@@ -2,7 +2,30 @@
 
 ## Unreleased
 
-<<<<<<< HEAD
+- Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
+  probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty
+  `noexec` tmpfs mounts on `/run` and `/var/tmp`, which the sandbox gateway now allows too.
+
+Security re-review fixes (SR-01a, SR-01b, SR-03a, SR-04a; 2026-11-02):
+
+- SR-01a: the static tenant check resolves a name where it is read, also on its own (`query += " OR ..."`;
+  `db._query(query)`, `query = query + ...`, a returned name): every value it can hold there is checked, with each
+  assignment and `+=` before it (and after it in a loop around it), conditional ones taken and not taken, assignments
+  of functions that declare it `global`; a `+=` that a loop repeats is an unknown part, and more than 256 variants are
+  reported as dynamic. The `+=` branches of `storage_postgres` (`replace_if`, `list`) are now checked.
+- SR-01b: a text that starts with an unknown part (an imported fragment, `self.BASE + "..."`, a function's result,
+  a parameter) followed by SQL words is reported as dynamic instead of being dropped, unless it is allowlisted with
+  its reason. `str.join` of a name holding a list (an unknown part when the list is changed), `.replace` and other
+  methods that change a text, and bytes literals are rebuilt too; only the known parts of a text count as naming a
+  tenant table. `docs/AXENTRA.md` describes what is resolved.
+- SR-03a: `RunChat.cancel_answers(code)` fails the questions this process is answering (a request not sent yet is
+  not sent, a late answer is not stored), `PythonEnvironments.cancel_installs(code)` stops installations before
+  their next step; the API calls both for a suspended tenant (`identity.tenant_suspended`).
+  `RunChat.begin_answer` takes the question.
+- SR-04a: the start's key-bytes check also decrypts samples of Axentra's own keyring columns
+  (`AxentraServices.key_samples`; `secret_key_problems` and `require_readable_secrets` take `axentra_samples`), so
+  other bytes under a key id that only those columns use are refused.
+
 Security review fixes (SR-01, SR-03, SR-04, SR-05, SR-07, SR-08, SR-09):
 
 - `tests/test_tenant_filters.py` parses every SQL statement of the runtime and the API with PostgreSQL's grammar
@@ -19,11 +42,6 @@ Security review fixes (SR-01, SR-03, SR-04, SR-05, SR-07, SR-08, SR-09):
   `FileObject.used_at`; `AxentraFiles.check` creates the local storage directory.
 - Every path that creates an Axentra tenant cuts its name to 200 characters (`axentra_platform.axentra_tenant_name`,
   `NAME_LIMIT`).
-=======
-- Pin orkexa 3364fb8 (orkexa #34, security review DS-8, DS-9, DS-10): the Docker self-test checks the mount table,
-  probes seccomp and requires an enforcing AppArmor profile where the host reports AppArmor; containers get empty
-  `noexec` tmpfs mounts on `/run` and `/var/tmp`, which the sandbox gateway now allows too.
->>>>>>> origin/master
 
 Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 
@@ -43,13 +61,13 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
   `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
 - New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
 
-Axentra pin: `a8ea5d535feb63fda3a2ea66701c232c093849ee` (webhook backoff settings and the setup_already_completed/email_taken codes; security review fixes SR-02/SR-04/SR-05/SR-06 with migration
+Axentra pin: `024da57c15b064ea3abcf4119518707fbcc4e7b5` (re-review Lows AX-R1: malformed cursors are 400
+`invalid_cursor`; AX-R2: `invitation_accepted` after single sign-on). Before: `a8ea5d535feb63fda3a2ea66701c232c093849ee` (webhook backoff settings and the setup_already_completed/email_taken codes; security review fixes SR-02/SR-04/SR-05/SR-06 with migration
 0011, session resolution in one transaction, P1 fixes for suspended tenants and invitation links; replaces `f6ae01d`).
 
 Previous Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
-<<<<<<< HEAD
 Performance (Axentra migration, requirement 15, 2026-11-02; numbers in `docs/AXENTRA.md`, "Performance"):
 
 - Fix: the identity reads of `NODESTRO_IDENTITY_BACKEND=axentra` compared `nodestro_axentra_ids` (collation `"C"`)
@@ -60,6 +78,7 @@ Performance (Axentra migration, requirement 15, 2026-11-02; numbers in `docs/AXE
   ever settled; it now reads only its candidate runs' events by key (0.04 s instead of 0.7 s at 10,000 runs, flat).
   Test: `tests/test_axentra_run_usage_reads.py`.
 - Measured with Axentra `69c06a5` (session resolution in one transaction; needs a pin bump to take effect).
+
 Legacy cleanup (Axentra migration M12, 2026-11-02):
 
 - `AxentraServices.start` refuses to run without the process's database pool (`axentra.unavailable`): Axentra never
@@ -69,7 +88,7 @@ Legacy cleanup (Axentra migration M12, 2026-11-02):
   (`nodestro-server axentra backfill-identity` links tenants) and `AxentraLink.reverse`.
 - `docs/AXENTRA.md` lists every legacy path that stays, why, and its removal precondition; RT-036 tracks the
   contract step.
-=======
+
 Security: containers that run package code (security review DS-1, DS-5, DS-7, DS-9; RT-038):
 
 - DS-1: the module check after an image build (`ContainerImages.missing_modules`) ran the image by tag with a plain
@@ -131,7 +150,6 @@ Docker-first sandbox selection and library environments (security review DS-2, D
   `status`, `plan`, `install`, `ensure`, `sandbox` and `ToolEnvironment` take an optional `trust` (additive); tool
   jobs plan as `untrusted`. `PythonEnvironments` takes `docker_state`.
 - New `tests/test_docker_first.py`; selection, routing and built-in sandbox tests adjusted to the new policy.
->>>>>>> origin/master
 
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 

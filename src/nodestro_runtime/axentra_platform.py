@@ -487,6 +487,51 @@ class AxentraServices:
         found = self.reencrypt_columns(dry_run=True).get("by_kid", {})
         return {str(kid): int(n) for kid, n in found.items() if kid != "?"}
 
+    def key_samples(self, *, samples: int | None = None) -> dict[str, tuple[bool, list[str]]]:
+        """Whether the configured keyring holds the bytes that encrypted Axentra's own keyring columns (security
+        review SR-04a): per key id the keyring has, up to ``samples`` (:data:`KEY_CHECK_SAMPLES`) stored values of
+        each column are decrypted. AES-GCM authenticates a value under its key, so one that decrypts proves the key
+        bytes. Returns ``kid -> (proven, the columns of the values that did not decrypt)`` for
+        :func:`secret_key_problems`; key ids the keyring lacks are :func:`secrets_rollback_problems`'. Read-only;
+        nothing is decrypted beyond the samples, and nothing of a value is returned."""
+        from axentra.config.secrets import PREFIX
+        from axentra.data.database import DbScope
+        from psycopg import sql
+
+        limit = KEY_CHECK_SAMPLES if samples is None else samples
+        platform = self.platform
+        platform.db.open()
+        box = platform.secrets
+        kids = set(box.keyring.kids)
+        found: dict[str, tuple[bool, list[str]]] = {}
+        for column in platform.encrypted_columns:
+            names = list(dict.fromkeys([column.key_column, column.column, *column.context_columns]))
+            fields = sql.SQL(", ").join([sql.Identifier(name) for name in names])
+            value = sql.Identifier(column.column)
+            query = sql.SQL(
+                "SELECT {fields} FROM (SELECT {fields}, row_number() OVER (PARTITION BY split_part({value}, '.', 2)"
+                " ORDER BY {key}::text) AS sample FROM {table} WHERE {value} LIKE %s) AS sampled WHERE sample <= %s"
+            ).format(
+                fields=fields, value=value, key=sql.Identifier(column.key_column), table=sql.Identifier(column.table)
+            )
+            with platform.db.transaction(DbScope.platform(), read_only=True) as tx:
+                if not tx.scalar("SELECT to_regclass(%s) IS NOT NULL", (column.table,)):
+                    continue  # a product table whose migration is not applied
+                rows = tx.all(query.as_string(tx.conn), (f"{PREFIX}.%", limit))
+            for row in rows:
+                token = str(row[column.column])
+                kid = token.split(".")[1]
+                proven, failed = found.get(kid, (False, []))
+                if kid not in kids or proven:
+                    continue
+                try:
+                    box.decrypt(token, column.context(row))
+                except Exception:  # other key bytes, a damaged value or another context
+                    found[kid] = (False, [*failed, column.label])
+                else:
+                    found[kid] = (True, failed)
+        return found
+
 
 def keyring_secret_box(config: AxentraConfig, legacy: SecretBox | None) -> KeyringSecretBox:
     """The tenant secret box for ``config`` without opening the database (only the keyring is needed)."""
@@ -811,7 +856,11 @@ KEY_CHECK_SAMPLES = 5
 
 
 def secret_key_problems(
-    database: PostgresDatabase, box: Any, *, samples: int = KEY_CHECK_SAMPLES
+    database: PostgresDatabase,
+    box: Any,
+    *,
+    samples: int = KEY_CHECK_SAMPLES,
+    axentra_samples: Mapping[str, tuple[bool, list[str]]] | None = None,
 ) -> list[dict[str, str]]:
     """Whether the configured keys are the keys the stored tenant secrets were encrypted with (security review
     SR-04): comparing key ids is not enough, new bytes under an old id would make every value under it unreadable.
@@ -821,7 +870,11 @@ def secret_key_problems(
     value that decrypts proves the key bytes; when none does, the key differs (or every value tried was damaged) and
     the start is refused. Key ids the keyring lacks are :func:`secrets_rollback_problems`'; with the v1 format
     retired (``box.legacy is None``) v1 values are not tried. Read-only; nothing is decrypted beyond the samples, and
-    problems name locations, never values."""
+    problems name locations, never values.
+
+    ``axentra_samples`` (:meth:`AxentraServices.key_samples`, SR-04a): the same proof from Axentra's own keyring
+    columns. A key id used only there (or whose values in Nodestro's documents are all damaged) is proven by them;
+    without them such a key id would start with other bytes."""
     from .server_settings import ENCRYPTED_PREFIX
 
     keyring_kids: set[str] | None = None
@@ -857,6 +910,12 @@ def secret_key_problems(
                 tried.setdefault(kind, []).append(f"{tenant_id}/{collection}/{key}:{name}")
             else:
                 proven.add(kind)
+    for kid, (decrypted, failed) in (axentra_samples or {}).items():
+        kind = f"axs1:{kid}"
+        if decrypted:
+            proven.add(kind)
+        elif failed:
+            tried.setdefault(kind, []).extend(failed)
     problems = []
     for kind, where in sorted(tried.items()):
         if kind in proven:
@@ -870,7 +929,7 @@ def secret_key_problems(
             {
                 "field": field,
                 "value": kind.split(":", 1)[1] if kind != "v1" else "v1",
-                "reason": f"{label} does not decrypt any of the {len(where)} stored tenant secrets tried under it "
+                "reason": f"{label} does not decrypt any of the {len(where)} stored secrets tried under it "
                 f"(for example {where[0]}): its bytes differ from the key that encrypted them; configure the "
                 "original key again (a new key needs a new key id, behind which the old one stays until "
                 "'secrets reencrypt' reports pending: 0)",
@@ -884,14 +943,15 @@ def require_readable_secrets(
     config: AxentraConfig,
     box: Any | None = None,
     axentra_kids: Mapping[str, int] | None = None,
+    axentra_samples: Mapping[str, tuple[bool, list[str]]] | None = None,
 ) -> None:
     """Refuse to serve (``profile.invalid``) when the configuration cannot read every stored tenant secret
     (:func:`secrets_rollback_problems`) or, given the secret ``box``, when a configured key is not the one the stored
-    values were encrypted with (:func:`secret_key_problems`); ``check``, ``api`` and ``worker`` call it after the
-    schema check."""
+    values were encrypted with (:func:`secret_key_problems`, with ``axentra_samples`` from Axentra's own columns);
+    ``check``, ``api`` and ``worker`` call it after the schema check."""
     problems = secrets_rollback_problems(config, stored_secret_formats(database), axentra_kids)
     if not problems and box is not None:
-        problems = secret_key_problems(database, box)
+        problems = secret_key_problems(database, box, axentra_samples=axentra_samples)
     if problems:
         raise NodestroError(
             "profile.invalid",
