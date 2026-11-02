@@ -178,9 +178,16 @@ _RESOLVE_LIMITS = ContainerLimits(
 #:
 #: - ``network``: ``--network none`` replaced by Docker's default network (no ``--network``) or one named network
 #:   (never ``host``, ``container:<id>``, ``ns:<path>`` or another namespace mode);
-#: - ``exec_tmp``: ``noexec`` dropped from the ``/tmp`` tmpfs, every other option of it kept;
+#: - ``exec_tmp``: ``noexec`` of the ``/tmp`` tmpfs replaced by ``exec``, every other option of it kept (Docker mounts
+#:   a tmpfs ``noexec`` unless its options say ``exec``, so only dropping ``noexec`` leaves it non-executable);
 #: - ``proxy_env``: ``--env`` for the proxy variables only, without credentials.
 ShapeAllowance = Literal["network", "exec_tmp", "proxy_env"]
+
+
+def _exec_tmp(value: str) -> str:
+    """The ``/tmp:<options>`` tmpfs value with ``noexec`` replaced by ``exec`` (the ``exec_tmp`` allowance)."""
+    return "/tmp:" + ",".join("exec" if item == "noexec" else item for item in value[5:].split(","))
+
 #: What the resolve container may differ in (it is started only on the desktop profile, RT-038).
 RESOLVE_ALLOWANCES: frozenset[ShapeAllowance] = frozenset({"network", "exec_tmp", "proxy_env"})
 #: ``docker run`` flags of the proven shape that take no value.
@@ -245,7 +252,7 @@ def _normalized(
                 raise ValueError(f"the network {value!r} is not allowed")
             continue
         if flag == "--tmpfs" and value is not None and value.startswith("/tmp:") and "exec_tmp" in allow:
-            kept.append((flag, "/tmp:" + ",".join(item for item in value[5:].split(",") if item != "noexec")))
+            kept.append((flag, _exec_tmp(value)))
             continue
         if flag == "--env" and candidate and "proxy_env" in allow:
             if value is None or not _allowed_proxy_env(value):
@@ -908,7 +915,7 @@ class ContainerImages:
                     args += [flag, network]
                 continue
             if flag == "--tmpfs" and value is not None and value.startswith("/tmp:"):
-                value = "/tmp:" + ",".join(item for item in value[5:].split(",") if item != "noexec")
+                value = _exec_tmp(value)
             args += [flag] if value is None else [flag, value]
         for variable, setting in proxies.items():
             args += ["--env", f"{variable}={setting}"]

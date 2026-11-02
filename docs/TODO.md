@@ -110,9 +110,9 @@ None known.
   by hand. Both are built from Orkexa's `run_args` and checked against it right before they start
   (`container_images.check_shape`, `sandbox.shape_mismatch` otherwise, nothing started): the module check must be
   exactly the self-tested shape; the resolve container may differ only in `RESOLVE_ALLOWANCES` (`--network none`
-  replaced by Docker's default or one named network, never `host` or another namespace mode; `noexec` dropped from
-  `/tmp`; `--env` for proxy variables without credentials). The resolve container thereby gained the noexec `/work`
-  and the sealed `/run` and `/var/tmp` of the proven shape, and its sandbox runs Orkexa's self-test with exactly its
+  replaced by Docker's default or one named network, never `host` or another namespace mode; `noexec` of `/tmp`
+  replaced by `exec`; `--env` for proxy variables without credentials). The resolve container thereby gained the
+  noexec `/work` and the sealed `/run` and `/var/tmp` of the proven shape, and its sandbox runs Orkexa's self-test with exactly its
   own limits (`_RESOLVE_LIMITS`: memory, CPU, processes, open files, file size, tmpfs and `/dev/shm` sizes), so those
   values are proven in the resolver image too. What the self-test cannot prove is the allowed differences themselves:
   the network (by design) and the executable `/tmp`. An in-container probe of the resolve shape was not added: it
@@ -124,7 +124,7 @@ None known.
   that has only a source distribution are known only after its build script ran, so resolving and building cannot be
   separated in one step. A proxy that needs credentials no longer works for the resolver (credentials are not passed
   into code that can read them). `/tmp` in the resolve container is meant to be executable (compilers and build tools
-  run there), but is not yet (see the real-engine findings below). The resolver is used only for plans a person
+  run there; see the real-engine findings below). The resolver is used only for plans a person
   explicitly accepted (library dialog), never for generated tools.
 - **Real-engine test (added 2026-11-02; not yet run in CI):** `tests/test_resolve_real_engine.py` runs
   `compile_in_container` against a real daemon (`NODESTRO_DOCKER_TESTS=1`, a separate step of the CI `docker`
@@ -143,19 +143,17 @@ None known.
   and a cancelled resolve are stopped and their containers removed; proxy credentials appear nowhere (run command,
   inspect output, the container's environment, its output, the installation log), and only credential-free proxy
   variables reach it. Locally (cgroup v1) the approved-path tests skip with the self-test's refusal.
-- **Real-engine findings (2026-11-02, open):**
-  - The resolve self-test refuses every daemon, cgroup v2 included: the pinned `UV_IMAGE` sets no `LANG`, so Python's
-    C-locale coercion (PEP 538) puts `LC_CTYPE=C.UTF-8` into the self-test's environment, and Orkexa's
-    `evaluate_self_test` refuses it ("unexpected environment variables: LC_CTYPE"). The environment images on
-    `python:<v>-slim` set `LANG=C.UTF-8` and are not affected. Until this is fixed, desktop source builds fail with
-    `deps.build_required` (reason `sandbox.unavailable`) and the approved-path tests fail in CI. Fix options (owner
-    decision): Orkexa accepts the coerced `LC_CTYPE` (an Orkexa change and a new pin), or a resolver image that sets
-    `LANG` (a new `UV_IMAGE` pin).
-  - `/tmp` of the resolve container is not executable: Docker mounts a `--tmpfs` `noexec` unless its options say
-    `exec`, so dropping `noexec` (the `exec_tmp` allowance) has no effect (seen on Docker 29.9;
-    `test_build_tools_can_run_programs_from_the_resolve_container_s_tmp`). Making it executable means `exec` in
-    `_resolve_args` and in the `exec_tmp` normalization of `check_shape`; it widens what build code can do, so it
-    waits for an owner decision.
+- **Real-engine findings (2026-11-02):**
+  - Fixed in Orkexa (pin bump pending): the resolve self-test refused every daemon, cgroup v2 included. The pinned
+    `UV_IMAGE` sets no `LANG`, so Python's C-locale coercion (PEP 538) put `LC_CTYPE=C.UTF-8` into the self-test's
+    `os.environ`, and `evaluate_self_test` refused it ("unexpected environment variables: LC_CTYPE"). Orkexa's
+    self-test now reports `/proc/self/environ`, the environment the container was started with; its allowlist is
+    unchanged. Until Nodestro pins that Orkexa commit, desktop source builds end with `deps.build_required` (reason
+    `sandbox.unavailable`), fail-closed. The environment images on `python:<v>-slim` set `LANG` and were not affected.
+  - Fixed: `/tmp` of the resolve container was not executable. Docker mounts a `--tmpfs` `noexec` unless its options
+    say `exec`, so only dropping `noexec` had no effect. The `exec_tmp` allowance now replaces `noexec` with `exec`
+    (`_resolve_args` and `check_shape`), which is what R-5 accepted ("an executable `/tmp`"); `/work` stays
+    `noexec`.
   - Fixed: the resolve container's proven shape is built from the sandbox's own limits (what its self-test ran), not
     from the constant, so a sandbox that proved other limits is refused (`sandbox.shape_mismatch`).
 - **Next step:** Decide and fix the two open findings, then see the real-engine test pass in the CI `docker` job.

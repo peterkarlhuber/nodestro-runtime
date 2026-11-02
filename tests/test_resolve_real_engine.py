@@ -517,7 +517,7 @@ def test_the_resolve_container_runs_with_the_proven_limits(proven: Resolver) -> 
         for flag, flag_value in _options(expected, proven.image_id)
         if flag == "--tmpfs" and flag_value
     }
-    tmpfs["/tmp"] = ",".join(item for item in tmpfs["/tmp"].split(",") if item != "noexec")  # exec_tmp
+    tmpfs["/tmp"] = ",".join("exec" if item == "noexec" else item for item in tmpfs["/tmp"].split(","))  # exec_tmp
 
     # What the daemon applied (docker container inspect).
     host, config = found["HostConfig"], found["Config"]
