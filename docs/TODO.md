@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 5 |
-| P3 Low | 20 |
+| P3 Low | 21 |
 | P4 Optional | 6 |
 
 **Release blockers:** None for this repository.
@@ -104,14 +104,30 @@ None known.
   Nodestro Local Docker is its own (`nodestro-<12 hex digits of SHA-256 of the resolved data directory and the
   installation id>`, done 2026-11-02): such an installation removes all of its own containers at the start
   (`reap(owner, remove_all=True)`), then the expired ones every 60 s, and never touches another installation's
-  containers on the same daemon. Local MCP servers use `nodestro-mcp-<id>` and are never reaped (they live as long as
-  their connection). A server's API and worker processes share the owner `nodestro` and reap only expired
+  containers on the same daemon. Local MCP servers use `nodestro-mcp-<id>`, which the tool reaper never touches; they
+  are reaped separately (RT-037). A server's API and worker processes share the owner `nodestro` and reap only expired
   containers. Open: through the sandbox gateway containers cannot be listed, so there the gateway's own reconcile does
   the work; containers an earlier release left with the owner `nodestro` on a desktop are no longer removed at the
   start (they have a deadline; a server on the same daemon removes them once expired, otherwise `docker rm`); a copy of
   a data directory (with its `python/installation-id`) at the same path on the same daemon, e.g. a second Nodestro
   Local Docker container on a copied volume, shares the owner.
 - **Next step:** A real-daemon test of the reaper (two owners on one daemon) in the CI `docker` job.
+
+### RT-037 · Local MCP containers and the sandbox gateway: residual risks (DS-4, DS-11)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** security review DS-4, DS-11; `mcp.stdio.prove`,
+  `docker_status.DockerMonitor.reap_mcp_once`, `sandbox_gateway.Gateway.require_limits`
+- **What:** Done 2026-11-02: every local MCP server container start needs Orkexa's preflight and the self-test of its
+  image in the container's exact shape, and runs the image by the checked id; this installation's MCP containers are
+  reaped at the start (all started before the reaper, safe because the process holds the data directory lock) and
+  once expired (every 60 s). The gateway drops request environment variables, checks a tagged image's lock label and
+  creates it by id, and confirms the daemon's limits and seccomp profile again after 5 s. Open: a server's processes
+  share `nodestro-mcp` and reap only expired MCP containers (deadline 7 days); through the sandbox gateway containers
+  cannot be listed, so its own reconcile (`max_lifetime`, 600 s by default) also ends MCP connections older than that;
+  a daemon reconfigured between the preflight and a container start is noticed only at the next start; the gateway
+  still inspects and removes `nodestro-env:*` tags without the lock-label check.
+- **Next step:** Real-daemon test of the MCP proof and reaper in the CI `docker` job; decide whether the gateway
+  should exempt MCP containers from `max_lifetime` or give them their own limit.
 
 ## Bugs and reliability
 

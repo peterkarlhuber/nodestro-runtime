@@ -5,6 +5,24 @@
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
 
+Local MCP servers and the sandbox gateway (security review DS-4, DS-11, 2026-11-02):
+
+- Fix (DS-4): a local MCP stdio server's container started whenever the setting said `docker`, without Orkexa's
+  preflight and self-test, and by tag. Every start now requires the preflight and the in-container self-test of that
+  image in the stdio container's exact shape (`mcp.stdio.prove`, `McpService.stdio_proof`; passed self-tests are
+  remembered per daemon, image id and shape) and runs the image by the checked id; `launch` refuses a tag. A daemon
+  that fails (cgroup v1, unenforced limits, unconfined seccomp) starts nothing (`sandbox.isolation_required` with the
+  Docker backend's `reason`). The hub runs the proof off the event loop.
+- Fix (DS-4): containers of the installation's MCP owner (`nodestro-mcp-<id>`, deadline 7 days) were never reaped.
+  The Docker monitor's reaper now removes them (`DockerMonitor.reap_mcp_once`): at the start of a process that holds
+  the data directory lock every one started before the reaper, and every 60 s those past their deadline (a server's
+  processes: only expired ones). Other installations' containers carry another owner and are never listed.
+  `docker_status.MCP_LIFETIME` is the stdio containers' deadline.
+- Fix (DS-11): the sandbox gateway passed up to 64 request environment variables into the container; none are passed
+  now. A `nodestro-env:<key>` tag is accepted for a container only when the image carries the lock label, and the
+  container is created by the checked image id. The daemon's limits and seccomp profile are confirmed again after
+  `LIMITS_TTL` (5 s, the runtime's preflight interval) instead of once per gateway process.
+
 Run queue delivery semantics (Axentra migration M11 / G-8, 2026-11-02):
 
 - Decision: runs stay on Nodestro's own queue permanently (M11 closed by architecture decision; reasons and evidence
