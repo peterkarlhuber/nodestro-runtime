@@ -22,6 +22,7 @@ from typing import Any
 
 from orkexa import Tool
 
+from ..docker_status import mcp_owner
 from ..platform_events import platform_events
 from ..problems import NodestroError
 from ..release import McpToolRef
@@ -354,6 +355,7 @@ class McpService:
             memory_mb=server.stdio.memory_mb,
             docker=images.docker,
             docker_env=images._cli_environment(),
+            owner=mcp_owner(images.owner),
         )
 
     # ---- discovery -------------------------------------------------------------------------

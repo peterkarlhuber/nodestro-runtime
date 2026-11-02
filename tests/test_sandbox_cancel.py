@@ -67,7 +67,7 @@ def test_the_built_in_sandbox_ignores_other_runs(tmp_path: Path) -> None:
 
 
 def test_a_container_call_of_a_cancelled_run_has_its_container_removed(tmp_path: Path) -> None:
-    # A stand-in docker CLI: ``run`` waits like a container; ``rm -f <name>`` ends the ``run`` of that name.
+    # A stand-in docker CLI: ``run`` waits like a container; ``kill``/``rm -f <name>`` end the ``run`` of that name.
     log = tmp_path / "docker.log"
     docker = _script(
         tmp_path / "docker",
@@ -75,14 +75,21 @@ def test_a_container_call_of_a_cancelled_run_has_its_container_removed(tmp_path:
         f"log, root = {str(log)!r}, {str(tmp_path)!r}\n"
         "args = sys.argv[1:]\n"
         "open(log, 'a').write(json.dumps(args) + '\\n')\n"
-        "name = args[args.index('--name') + 1] if '--name' in args else args[-1]\n"
-        "if args[0] == 'rm':\n"
-        "    os.kill(int(open(os.path.join(root, name)).read()), signal.SIGTERM)\n"
+        "if args[0] in ('kill', 'rm'):\n"
+        "    path = os.path.join(root, args[-1])\n"
+        "    if os.path.exists(path):\n"
+        "        os.kill(int(open(path).read()), signal.SIGTERM)\n"
+        "        os.unlink(path)\n"
         "    sys.exit(0)\n"
+        "if args[0] == 'ps':\n"
+        "    sys.exit(0)\n"
+        "name = args[args.index('--name') + 1]\n"
         "open(os.path.join(root, name), 'w').write(str(os.getpid()))\n"
         "time.sleep(60)\n",
     )
     sandbox = StreamedSandbox(image="nodestro-env:test", docker=str(docker), timeout=20.0)
+    # Preflight and self-test are Orkexa's (tested there); this test is about cancelling one call.
+    sandbox._require_ready = lambda: "sha256:" + "ab" * 32  # type: ignore[method-assign]
     workdir = tmp_path / "call"
     workdir.mkdir()
     _, check = _cancel_after(0.5)
@@ -93,10 +100,28 @@ def test_a_container_call_of_a_cancelled_run_has_its_container_removed(tmp_path:
             sandbox._execute(workdir, "{}")
     finally:
         sandbox_cancel.reset(token)
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < 8
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert calls[0][0] == "run" and calls[1][:2] == ["rm", "-f"]
-    assert calls[1][2] == calls[0][calls[0].index("--name") + 1]
+    name = calls[0][calls[0].index("--name") + 1]
+    assert calls[0][0] == "run" and ["kill", name] in calls and ["rm", "-f", name] in calls
+    assert "org.orkexa.sandbox=nodestro" in calls[0]
+
+
+def test_cancel_stops_every_call_of_a_container_sandbox(tmp_path: Path) -> None:
+    # Sandbox.cancel() (Orkexa's) reaches Nodestro's container sandboxes too: they are Orkexa DockerSandboxes.
+    docker = _script(
+        tmp_path / "docker",
+        "import sys, time\nif sys.argv[1] in ('kill', 'rm', 'ps'):\n    sys.exit(0)\ntime.sleep(60)\n",
+    )
+    sandbox = StreamedSandbox(image="nodestro-env:test", docker=str(docker), timeout=20.0)
+    sandbox._require_ready = lambda: "sha256:" + "ab" * 32  # type: ignore[method-assign]
+    workdir = tmp_path / "call"
+    workdir.mkdir()
+    threading.Timer(0.5, sandbox.cancel).start()
+    began = time.monotonic()
+    with pytest.raises(SandboxError, match="cancelled"):
+        sandbox._execute(workdir, "{}")
+    assert time.monotonic() - began < 8
 
 
 class _WaitingSandbox(SubprocessSandbox):

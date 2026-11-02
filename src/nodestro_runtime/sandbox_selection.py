@@ -3,7 +3,8 @@
 The ``sandbox`` setting has three modes:
 
 * ``auto`` (the default when nothing was chosen): untrusted code runs in the built-in Linux sandbox where this
-  computer passed its checks, otherwise in a Docker container if Docker is running, otherwise it is refused.
+  computer passed its checks, otherwise in a Docker container if Docker passed its preflight and self-test,
+  otherwise it is refused.
   Code a person wrote runs in a host subprocess, as before.
 * ``subprocess`` (chosen explicitly, kept from earlier releases): like ``auto``, but never Docker: untrusted
   code runs only in the built-in Linux sandbox, otherwise it is refused.
@@ -14,9 +15,12 @@ Server and Nodestro Local Docker always run tool code in containers; the setting
 Orkexa reports what each backend enforces (:class:`orkexa.dynamic.SandboxCapabilities`) and whether it can run
 here (:meth:`orkexa.dynamic.Sandbox.probe`); this module turns that into the report the studio shows. Whether a
 backend may run untrusted code is :class:`~nodestro_runtime.sandbox_policy.SandboxPolicy`'s decision alone:
-only containers and the built-in Linux sandbox (desktop, tested systems, self-test passed) are released for it.
-The macOS sandbox of Orkexa is reported as *experimental* and never used; Windows has no native sandbox yet.
-A backend that is merely available is never released because of its name or technology.
+only containers (preflight and in-container self-test passed, :mod:`nodestro_runtime.docker_status`) and the
+built-in Linux sandbox (desktop, tested systems, self-test passed) are released for it. Docker's status comes from a
+background check, so the report never waits for the daemon (state ``checking`` until the first check finished).
+Orkexa's macOS (Seatbelt) sandbox was removed: macOS reports ``macos-seatbelt`` as ``unavailable`` (``removed``);
+Windows has no native sandbox. A backend that is merely available is never released because of its name or
+technology.
 
 The operating system is always the one of the computer the runtime runs on, not the browser's.
 """
@@ -27,13 +31,12 @@ import platform
 import sys
 from typing import Literal
 
-from orkexa.dynamic import DockerSandbox, MacOSSandbox
-
 from .builtin_sandbox import LinuxSandbox
+from .docker_status import DockerStatus, approved_status, unavailable_status
 from .sandbox_policy import SandboxPolicy
 from .schemas import SandboxBackendStatus, SandboxSelection
 
-BackendState = Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable"]
+BackendState = Literal["approved", "experimental", "unavailable", "not-isolating", "not-applicable", "checking"]
 SandboxMode = Literal["auto", "subprocess", "docker"]
 MODES: tuple[SandboxMode, ...] = ("auto", "subprocess", "docker")
 
@@ -73,23 +76,12 @@ def _native(policy: SandboxPolicy) -> SandboxBackendStatus:
             notes=list(caps.notes),
         )
     if system == "macos":
-        caps = MacOSSandbox().capabilities()
-        if not desktop:
-            return SandboxBackendStatus(
-                name="macos-seatbelt", state="not-applicable", reason="server", maturity=caps.maturity
-            )
-        probe = MacOSSandbox.probe()
+        # Orkexa's Seatbelt sandbox was removed (not releasable): reported, never probed, never used.
         return SandboxBackendStatus(
             name="macos-seatbelt",
-            available=probe.available,
-            # Implemented and self-tested, but not reviewed and not released: never used for any code.
-            state="experimental" if probe.available else "unavailable",
-            reason="not-released" if probe.available else probe.reason,
-            detail=probe.detail,
-            isolation=caps.isolation,
-            maturity=caps.maturity,
-            memory=caps.memory,
-            notes=list(caps.notes),
+            state="unavailable" if desktop else "not-applicable",
+            reason="removed" if desktop else "server",
+            detail="The macOS sandbox was removed; AI-generated code runs in Docker on macOS",
         )
     return SandboxBackendStatus(
         name="windows-native" if system == "windows" else f"{system}-native",
@@ -99,22 +91,33 @@ def _native(policy: SandboxPolicy) -> SandboxBackendStatus:
     )
 
 
-def backends(policy: SandboxPolicy, docker_available: bool) -> list[SandboxBackendStatus]:
-    """Every backend of this computer: the native one of its operating system, Docker and the subprocess."""
-    docker = DockerSandbox().capabilities()
+def docker_status_of(docker: DockerStatus | bool) -> DockerStatus:
+    """The Docker status, also from the earlier ``docker_available`` flag (``True`` counts as proven)."""
+    if isinstance(docker, DockerStatus):
+        return docker
+    if docker:
+        return approved_status("Docker is available")
+    return unavailable_status("docker-unreachable", "Docker is not reachable")
+
+
+def _docker_argument(docker: DockerStatus | bool | None, docker_available: bool | None) -> DockerStatus:
+    if docker is None:
+        docker = bool(docker_available)
+    return docker_status_of(docker)
+
+
+def backends(
+    policy: SandboxPolicy, docker: DockerStatus | bool | None = None, *, docker_available: bool | None = None
+) -> list[SandboxBackendStatus]:
+    """Every backend of this computer: the native one of its operating system, Docker and the subprocess.
+
+    ``docker`` is the Docker sandbox's status (:meth:`nodestro_runtime.workspace.Workspace.docker_status`); a bool
+    (or ``docker_available``) is still understood: ``True`` counts as passed preflight and self-test."""
+    status = _docker_argument(docker, docker_available)
     desktop = policy.profile == "desktop"
     return [
         _native(policy),
-        SandboxBackendStatus(
-            name="docker",
-            available=docker_available,
-            state="approved" if docker_available else "unavailable",
-            reason="" if docker_available else "unreachable",
-            isolation=docker.isolation,
-            maturity=docker.maturity,
-            memory=docker.memory,
-            notes=list(docker.notes),
-        ),
+        status.backend(),
         SandboxBackendStatus(
             name="subprocess",
             available=desktop,
@@ -127,8 +130,18 @@ def backends(policy: SandboxPolicy, docker_available: bool) -> list[SandboxBacke
     ]
 
 
-def select(policy: SandboxPolicy, mode: SandboxMode, docker_available: bool) -> SandboxSelection:
-    """Where untrusted and user-authored code runs now, or why untrusted code is refused."""
+def select(
+    policy: SandboxPolicy,
+    mode: SandboxMode,
+    docker: DockerStatus | bool | None = None,
+    *,
+    docker_available: bool | None = None,
+) -> SandboxSelection:
+    """Where untrusted and user-authored code runs now, or why untrusted code is refused.
+
+    Docker counts only when its preflight and self-test passed (state ``approved``); in Docker mode, on a server and
+    in Nodestro Local Docker everything is refused until then, with the Docker backend's reason."""
+    status = _docker_argument(docker, docker_available)
     system, machine = runtime_platform()
 
     def result(untrusted: str, user_authored: str, reason: str = "", detail: str = "") -> SandboxSelection:
@@ -145,22 +158,31 @@ def select(policy: SandboxPolicy, mode: SandboxMode, docker_available: bool) -> 
         )
 
     if policy.profile != "desktop" or mode == "docker":
-        if docker_available or policy.profile != "desktop":
+        if status.approved:
             return result("docker", "docker")
-        detail = "Docker is selected but not reachable; no tool code runs until it is started"
-        return result("", "", "docker-unreachable", detail)
+        where = "Docker is selected" if policy.profile == "desktop" else "Tool code runs only in Docker here"
+        if status.state == "checking":
+            detail = f"{where}; its preflight and self-test are still running, so no tool code runs yet"
+        else:
+            detail = f"{where} but the sandbox is not available ({status.detail}); no tool code runs until it passes"
+        return result("", "", status.reason or "docker-unreachable", detail)
     if policy.builtin_available():
         return result("linux-builtin", "subprocess")
-    if mode == "auto" and docker_available:
+    if mode == "auto" and status.approved:
         return result("docker", "subprocess")
     native = _native(policy)
     detail = (
         f"The built-in sandbox is not available here ({native.reason}: {native.detail})"
         if system == "linux"
-        else f"Nodestro has no released native sandbox for {system}"
+        else f"Nodestro has no native sandbox for {system}"
     )
-    hint = "start Docker" if mode == "auto" else "choose Automatic or Docker and start Docker"
+    if mode == "auto" and status.state == "checking":
+        hint = "wait until Docker's check finished"
+    elif mode == "auto":
+        hint = f"start Docker (now: {status.reason})"
+    else:
+        hint = "choose Automatic or Docker and start Docker"
     return result("", "subprocess", "no-isolation", f"{detail}; AI-generated code is refused. To run it, {hint}.")
 
 
-__all__ = ["MODES", "SandboxMode", "backends", "runtime_platform", "select"]
+__all__ = ["MODES", "SandboxMode", "backends", "docker_status_of", "runtime_platform", "select"]

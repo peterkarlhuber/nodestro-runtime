@@ -6,11 +6,10 @@ binds the run's cancel check to the agent's thread (:func:`bind`, a context vari
 threads that run tool calls), and a sandbox that supports it polls :func:`requested` while one call runs:
 
 - the built-in Linux sandbox kills the call's process group;
-- the container sandboxes Nodestro builds (:class:`nodestro_runtime.container_images.StreamedSandbox`) remove the
-  call's container (``docker rm -f``), which also ends the docker client.
-
-Orkexa's ``SubprocessSandbox`` and ``DockerSandbox`` poll the same check (the context variable is Orkexa's own,
-:mod:`orkexa.dynamic.lifecycle`, ORK-001): they kill the call's process group, or remove its container.
+- Orkexa's ``SubprocessSandbox`` and ``DockerSandbox`` poll the same check (the context variable is Orkexa's own,
+  :mod:`orkexa.dynamic.lifecycle`, ORK-001): they kill the call's process group, or kill and remove its container.
+  The container sandboxes Nodestro builds (:class:`nodestro_runtime.container_images.StreamedSandbox`) are Orkexa
+  ``DockerSandbox`` instances, so this covers them, and so does :meth:`orkexa.dynamic.Sandbox.cancel`.
 """
 
 from __future__ import annotations

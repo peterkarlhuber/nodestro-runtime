@@ -10,7 +10,9 @@ Every piece of tool code belongs to a trust class:
 
 The policy, not the call site, decides whether a sandbox may run a class. Two sandboxes count as isolating:
 
-* a container (:class:`orkexa.dynamic.DockerSandbox`), in every profile;
+* a container (:class:`orkexa.dynamic.DockerSandbox`), in every profile, once its daemon passed Orkexa's preflight
+  and in-container self-test (:mod:`nodestro_runtime.docker_status`); before that, or when they failed, a container
+  sandbox does not count, and untrusted code is refused;
 * the built-in Linux sandbox (:class:`nodestro_runtime.builtin_sandbox.LinuxSandbox`, Landlock and seccomp), in the
   desktop profile only, and only on a computer where its self-test passed and whose distribution is one of the
   tested systems (:data:`nodestro_runtime.builtin_sandbox.TESTED_SYSTEMS`). In the ``local-container`` profile it
@@ -34,6 +36,7 @@ from typing import Literal, get_args
 
 from orkexa.dynamic import DockerSandbox, Sandbox
 
+from . import docker_status
 from .builtin_sandbox import LinuxSandbox
 from .problems import NodestroError
 from .profile import DEFAULT_PROFILE, ProfileKind
@@ -60,16 +63,27 @@ def isolation_of(sandbox: Sandbox) -> Isolation:
     """How well a sandbox separates the code it runs from this computer.
 
     Orkexa's ``DockerSandbox`` isolates with a container (no network, read-only, no capabilities, unprivileged user,
-    limits); a subclass keeps those flags. The built-in ``LinuxSandbox`` isolates with the kernel (``kernel``) when
-    this computer passed its checks (:meth:`LinuxSandbox.status`). Every other sandbox, including a subprocess with a
-    custom interpreter, runs on the host as the user, and so does Orkexa's experimental ``MacOSSandbox``: it is
-    implemented and self-tested, but not reviewed or released, so it never counts as isolating here, whatever its
-    capability report says."""
+    limits; a subclass keeps those flags), but only counts as ``container`` once its daemon passed the preflight and
+    the in-container self-test (:func:`self_test_passed`); until then it is ``none``, so untrusted code is refused.
+    The built-in ``LinuxSandbox`` isolates with the kernel (``kernel``) when this computer passed its checks
+    (:meth:`LinuxSandbox.status`). Every other sandbox, including a subprocess with a custom interpreter, runs on the
+    host as the user. Orkexa's ``MacOSSandbox`` was removed (a placeholder that runs nothing) and never counts."""
     if isinstance(sandbox, DockerSandbox):
-        return "container"
+        return "container" if self_test_passed(sandbox) else "none"
     if isinstance(sandbox, LinuxSandbox) and LinuxSandbox.status().available:
         return "kernel"
     return "none"
+
+
+def self_test_passed(sandbox: DockerSandbox) -> bool:
+    """Whether the daemon of a container sandbox is proven (:func:`nodestro_runtime.docker_status.daemon_proven`).
+
+    Never blocks: the check runs in the background. A sandbox may answer for itself with a ``self_test_passed()``
+    method (the test double :class:`nodestro_runtime.testing.ContainerDouble`)."""
+    own = getattr(sandbox, "self_test_passed", None)
+    if callable(own):
+        return bool(own())
+    return docker_status.daemon_proven(sandbox.docker, getattr(sandbox, "environ", None))
 
 
 @dataclass(frozen=True)
@@ -106,6 +120,17 @@ class SandboxPolicy:
             return
         label = f"{name!r} " if name else ""
         reason, detail = "", ""
+        if isinstance(sandbox, DockerSandbox):
+            reason = docker_status.last_reason(sandbox.docker, getattr(sandbox, "environ", None))
+            raise NodestroError(
+                "sandbox.isolation_required",
+                f"The tool code {label}is {trust} and runs only in an isolating sandbox; the Docker sandbox has not "
+                f"passed its preflight and in-container self-test on this computer ({reason}), so nothing is run. "
+                "See Settings, Sandbox.",
+                name=name,
+                trust=trust,
+                reason=reason,
+            )
         if self.profile == "desktop":
             status = LinuxSandbox.status()
             reason, detail = status.reason, status.detail
@@ -136,4 +161,12 @@ class SandboxPolicy:
             )
 
 
-__all__ = ["HOST_AWS_ENV", "TRUST_CLASSES", "Isolation", "SandboxPolicy", "TrustClass", "isolation_of"]
+__all__ = [
+    "HOST_AWS_ENV",
+    "TRUST_CLASSES",
+    "Isolation",
+    "SandboxPolicy",
+    "TrustClass",
+    "isolation_of",
+    "self_test_passed",
+]

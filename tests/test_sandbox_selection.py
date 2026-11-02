@@ -6,16 +6,16 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from orkexa.dynamic import MacOSSandbox, SubprocessSandbox
+from orkexa.dynamic import SubprocessSandbox
 import pytest
 
-from nodestro_runtime import sandbox_cancel, sandbox_selection
+from nodestro_runtime import docker_status, sandbox_cancel, sandbox_selection
 from nodestro_runtime.builtin_sandbox import LinuxSandbox, SandboxStatus
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.profile import RuntimeProfile
 from nodestro_runtime.sandbox_policy import SandboxPolicy, isolation_of
 from nodestro_runtime.schemas import SettingsIn
-from nodestro_runtime.testing import ContainerDouble
+from nodestro_runtime.testing import ContainerDouble, StaticDockerMonitor
 from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE, ToolLibrary
 from nodestro_runtime.workspace import Workspace
 
@@ -70,21 +70,45 @@ def test_docker_mode_and_servers_run_everything_in_containers(monkeypatch: pytes
     assert docker.untrusted == docker.user_authored == "docker"
     stopped = sandbox_selection.select(DESKTOP, "docker", docker_available=False)
     assert stopped.blocked and stopped.reason == "docker-unreachable" and stopped.user_authored == ""
-    server = sandbox_selection.select(SERVER, "auto", docker_available=False)
+    server = sandbox_selection.select(SERVER, "auto", docker_status.approved_status())
     assert server.untrusted == "docker" and server.profile == "server"
+    # Without a proven Docker a server runs no tool code either, and says why.
+    refused = sandbox_selection.select(SERVER, "auto", docker_status.unavailable_status("docker-limits", "no pids"))
+    assert refused.blocked and refused.reason == "docker-limits" and "no pids" in refused.detail
 
 
-def test_the_macos_sandbox_is_reported_but_never_released(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("reason", docker_status.DOCKER_REASONS)
+def test_docker_is_approved_only_after_preflight_and_self_test(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
     _on(monkeypatch, "macos")
-    from orkexa.dynamic import SandboxProbe
+    state = "checking" if reason == "docker-checking" else "unavailable"
+    status = docker_status.DockerStatus(state, reason, "detail")  # type: ignore[arg-type]
+    row = sandbox_selection.backends(DESKTOP, status)[1]
+    assert (row.name, row.state, row.reason, row.available) == ("docker", state, reason, False)
+    auto = sandbox_selection.select(DESKTOP, "auto", status)
+    assert auto.blocked and auto.reason == "no-isolation" and auto.untrusted == ""
+    docker = sandbox_selection.select(DESKTOP, "docker", status)
+    assert docker.blocked and docker.reason == reason
+    approved = sandbox_selection.backends(DESKTOP, docker_status.approved_status())[1]
+    assert approved.state == "approved" and approved.available
 
-    monkeypatch.setattr(MacOSSandbox, "probe", classmethod(lambda cls, refresh=False: SandboxProbe("macos", True)))
+
+def test_the_macos_sandbox_is_reported_as_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _on(monkeypatch, "macos")
     native = sandbox_selection.backends(DESKTOP, docker_available=False)[0]
-    assert native.name == "macos-seatbelt" and native.available
-    assert native.state == "experimental" and native.reason == "not-released"
-    # Even an available macOS sandbox is never chosen and never accepted by the policy.
+    assert (native.name, native.state, native.reason, native.available) == (
+        "macos-seatbelt",
+        "unavailable",
+        "removed",
+        False,
+    )
+    server = sandbox_selection.backends(SERVER, docker_available=False)[0]
+    assert (server.name, server.state, server.reason) == ("macos-seatbelt", "not-applicable", "server")
+    # Never chosen and never accepted by the policy (Orkexa's placeholder runs nothing).
     assert sandbox_selection.select(DESKTOP, "auto", docker_available=False).blocked
-    sandbox = MacOSSandbox()
+    from orkexa.dynamic import MacOSSandbox
+
+    with pytest.warns(DeprecationWarning):
+        sandbox = MacOSSandbox()
     assert isolation_of(sandbox) == "none"
     assert not DESKTOP.allows("untrusted", sandbox)
 
@@ -142,8 +166,15 @@ def test_no_fallback_without_docker_and_none_for_another_interpreter(tmp_path: P
 # ---- the workspace and stored settings ------------------------------------------------------
 
 
+def _monitor(monkeypatch: pytest.MonkeyPatch, docker: bool) -> StaticDockerMonitor:
+    status = docker_status.approved_status() if docker else docker_status.unavailable_status()
+    monitor = StaticDockerMonitor(status)
+    monkeypatch.setattr(docker_status, "monitor_for", lambda *a, **k: monitor)
+    return monitor
+
+
 def _workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: bool) -> Workspace:
-    monkeypatch.setattr("orkexa.dynamic.DockerSandbox.available", staticmethod(lambda *a, **k: docker))
+    _monitor(monkeypatch, docker)
     return Workspace(tmp_path / "data", integrations=[])
 
 
@@ -180,7 +211,7 @@ def test_stored_choices_are_kept(
 
 
 def test_containers_only_profiles_ignore_the_desktop_modes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("orkexa.dynamic.DockerSandbox.available", staticmethod(lambda *a, **k: True))
+    _monitor(monkeypatch, True)
     workspace = Workspace(profile=RuntimeProfile(kind="local-container", data_dir=tmp_path / "data"), integrations=[])
     try:
         assert workspace.sandbox_policy.profile == "local-container"

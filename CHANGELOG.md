@@ -19,7 +19,6 @@ Run budget decisions (BUDGET-1, 2026-11-02; see `docs/BUDGET.md`):
 - `Run.started_by`, `Run.budget` and `RunSummary.budget`; new error codes `run.budget_ended`,
   `run.budget_checkpoint_lost` and `budget.*`. Unattended runs (schedule, batch, benchmark, api) fail as before.
 - New `tests/test_run_budget.py` and `tests/test_worker_budget.py` (PostgreSQL workers, tenants, racing decisions).
-- Orkexa pin `e220f70` (orkexa #32: `RequestSuspended`, request-stage turn checkpoints, `BudgetTracker.set_limit`).
 
 Axentra pin: `f6ae01d4fe5945d56b322673202860f93e2213a9` (access definitions, OIDC on host routes, inbox channel,
 shared pool, runtime roles; replaces `f114920`).
@@ -66,6 +65,101 @@ Database roles, one connection pool, migration checksums (Axentra migration, wor
   `tests/test_storage_postgres.py`; `NODESTRO_TEST_RUNTIME_ROLE=1` runs every PostgreSQL test as a runtime role
   (migrations as the owner). Measurements: `tests/bench_shared_pool.py`, `tests/bench_nodestro_rls.py`
   (`docs/AXENTRA.md`). Needs Axentra with `Database.on_pool` and the `joined`/`join` scope fix.
+
+One container owner per installation (Docker-first plan R2 follow-up, 2026-11-02):
+
+- A desktop and Nodestro Local Docker label their sandbox containers with their own owner,
+  `docker_status.installation_owner(data_dir, installation)` = `nodestro-<12 hex digits of SHA-256 of the resolved
+  data directory and the random installation id>` (`Workspace.sandbox_owner`); the self-test, the runtime-image
+  sandbox, the environments' sandboxes (`ContainerImages(owner=...)`, `ContainerImages.owner`) and the reaper use it.
+  The start-up reaper (`remove_all`) therefore removes only this installation's containers: two installations on one
+  Docker daemon no longer remove each other's running containers. A server's tenants keep the shared owner
+  `nodestro` (`OWNER`) and reap only expired containers.
+- Local MCP servers: `docker_status.mcp_owner(owner)` = `nodestro-mcp-<id>` (`nodestro-mcp` for `OWNER`, still
+  `MCP_OWNER`), with the week-long deadline; `mcp.stdio.launch(owner=...)` (new optional parameter).
+- `monitor_for(..., owner=...)` (new optional parameter): one monitor per daemon and owner;
+  `python_envs.installation_id(root)` is the installation id behind `PythonEnvironments.installation`.
+- The sandbox gateway already passes on any well-formed owner label (tests added for the new owners).
+- Orkexa pin moved to `e220f706611dc8f2cc7cb4c87e44306a25f93fbf` (Orkexa PR #31: container shape, stdin
+  transport, preflight, self-test, reaper; and PR #32: backward-compatible budget primitives).
+
+Docker-first sandbox status (Docker-first plan R2, 2026-11-02):
+
+- New `nodestro_runtime.docker_status`: `DockerMonitor` checks Docker in a background thread, Orkexa's preflight at
+  most every 5 s and the in-container self-test (in the runtime image) once per daemon fingerprint (a failed one again
+  after 5 min or on request). `Workspace.docker_status(refresh=False) -> SandboxBackendStatus` never waits for
+  `docker info` (a first settings read used to run it inline with a 10 s timeout); it reports `checking` until the
+  first check finished. One monitor per daemon and process (`monitor_for`), shared by a server's tenants.
+- Docker is `approved` only after preflight and self-test passed; `sandbox_policy.isolation_of` returns `container`
+  only for a sandbox whose daemon passed them (`docker_status.daemon_proven`, never blocking), otherwise untrusted
+  code is refused (`sandbox.isolation_required`, parameter `reason`). Docker mode, servers and Nodestro Local Docker
+  report `blocked` with the Docker reason until then (they used to report `docker` regardless).
+- `sandbox_selection.backends()` / `select()` take the Docker status; the earlier bool (`docker_available`) still
+  works (`True` counts as proven). `Settings.docker_available` is now "preflight and self-test passed".
+- `SandboxBackendStatus` (additive, all optional): `engine`, `rootless`, `cgroup_version`, `checks`
+  (`SandboxCheck`: `name`, `ok`, `detail`), `tested_at`; state `checking`; reasons `docker-missing`,
+  `docker-unreachable`, `docker-limits`, `docker-seccomp`, `docker-rootless-cgroup`, `docker-os-type`,
+  `docker-selftest`, `docker-image`, `docker-checking`. A rootful daemon on Linux carries a note that docker group
+  membership is root-equivalent (see `docs/docker-sandbox.md`).
+- Reaper: a desktop and Nodestro Local Docker remove all of their `nodestro`-labelled containers at the start, then
+  every process removes expired ones every 60 s (only that owner).
+- macOS: Orkexa's Seatbelt sandbox was removed; `macos-seatbelt` is reported as `unavailable` with the reason
+  `removed` (never probed); the `MacOSSandbox` import is gone.
+- Tests: workspaces get a static "Docker missing" monitor unless a module is marked `real_docker_status`
+  (`testing.StaticDockerMonitor`); `ContainerDouble` counts as self-tested. Tracked follow-ups: RT-033, RT-034.
+
+One container shape from Orkexa (Docker-first plan R1, 2026-11-02; needs Orkexa PR #31):
+
+- `sandbox_run_args` (same signature, new optional `owner` and `lifetime_s`) is now Orkexa's
+  `orkexa.dynamic.docker.run_args`: besides the earlier flags `--ipc private`, `--shm-size 16m`,
+  `--ulimit nofile=1024:1024`, `--ulimit fsize=16 MiB`, `--ulimit core=0:0`, `--log-driver none`, `nodev` tmpfs
+  (`/work` with `mode=1777`) and the labels `org.orkexa.sandbox=<owner>` and `org.orkexa.deadline=<epoch>`.
+  Tool containers carry the owner `nodestro` (`container_images.OWNER`), local MCP servers `nodestro-mcp`
+  (`MCP_OWNER`, deadline a week ahead, so the tool reaper never removes a live server).
+- `StreamedSandbox` is a thin `orkexa.dynamic.DockerSandbox` (`transport="stdin"`, owner `nodestro`, `environ` for
+  every docker CLI call): every call runs the image by its id, only after Orkexa's preflight and in-container
+  self-test passed; `Sandbox.cancel()` and a cancelled run (`sandbox_cancel`) kill and remove the call's container
+  (Orkexa's), the runtime-local cancel watcher is gone. Containers are named `orkexa-sandbox-<hex>`.
+- `RuntimeImageSandbox` resolves its tag on first use (also for `command()` and `self_test()`) and runs the image by
+  id. The desktop profile now uses it too (Docker mode and the `auto` fallback); Orkexa's `orkexa-sandbox` image is
+  no longer used by Nodestro.
+- Environment images carry only Orkexa's sandbox runner (`runner_files()`); the image key uses
+  `runner_fingerprint()` (`orkexa_fingerprint()` returns it), so every environment image is rebuilt once. `_BOOTSTRAP`
+  is Orkexa's `BOOTSTRAP`.
+- Sandbox gateway: `plan_create` accepts Orkexa's shape (`IpcMode` private only; `ShmSize` at most 64 MB, default
+  16 MB; `Ulimits` only `nofile` <= 1024, `fsize` <= 64 MB, `core` = 0, soft = hard, defaults filled in; `LogConfig`
+  only `none`; the two `org.orkexa.*` labels when well-formed, other labels dropped as before), container names
+  `orkexa-selftest-*`, and images by id (`sha256:<64 hex>`) only when the daemon reports a `nodestro-env:<key>` tag and
+  the lock label for exactly that id (also for `GET /images/<id>/json`; removal stays by tag). Every earlier refusal
+  stays. The build context must hold exactly Orkexa's runner modules.
+
+No package build scripts on the host (Docker-first plan R4, 2026-11-02):
+
+- `UvRunner.compile` resolves with `--no-build` by default and `UvRunner.sync` installs host virtual environments
+  with `--no-build`, so no package's build script runs on the host. `PythonEnvironments.plan` always resolves with
+  `--no-build` on the host; `builds` now means that a person accepted a source build (`deps.build_required`).
+- New `ContainerImages.compile_in_container`: for such an accepted plan, `uv pip compile --generate-hashes` runs in a
+  container of uv's image, pinned by its multi-arch digest (`UV_IMAGE`, uv 0.9.5), with network only for that step, no bind mounts, only the
+  proxy variables (by name), `--cap-drop ALL`, `no-new-privileges`, user `65534`, a read-only root and a tmpfs `/tmp`;
+  requirements, the previous lock and the build CA travel on stdin, the lock comes back on stdout. An image without a
+  real digest is refused (`deps.build_unavailable`); if it cannot run, the plan reports `deps.build_required` with the
+  parameter `reason` (`sandbox.unavailable` without Docker). The Docker CLI 28 wording "failed to connect to the docker
+  API" now also counts as Docker not running. Container image builds keep `--only-binary=:all:`.
+  Tracked follow-ups: RT-032.
+
+Environment image caps and collection (Docker-first plan R3, 2026-11-02):
+
+- `ContainerImages.build` removes a freshly built image larger than `NODESTRO_MAX_IMAGE_GB` (default 8 GiB) and fails
+  with the new code `deps.image_too_large`; an invalid value fails the build before Docker runs (`deps.image_failed`).
+- New `ContainerImages.gc(max_images=20, max_bytes=20 GiB, keep=...)`: removes the least recently used environment
+  images beyond either limit. Only `nodestro-env:<key>` images that carry `org.nodestro.lock-sha256` are counted or
+  removed (never a foreign image), never a kept one, never one a container still uses. Last uses are recorded in
+  `<data>/python/image-usage.json`; where images cannot be listed (the sandbox gateway) the record alone is used.
+  `build` collects after each new image; a failed collection never fails the build.
+- `PythonEnvironments` keeps the images of every environment of its store and the runtime image; with
+  `remove_images=False` (a server, shared daemon) nothing is collected.
+- New `nodestro_runtime.image_limits` holds the image names and limits shared with the sandbox gateway (its limits are
+  unchanged: 32 images, 20 GB). Tracked follow-ups: RT-031.
 
 Axentra platform services in the server profile (Axentra migration, 2026-11-02; everything off by default):
 

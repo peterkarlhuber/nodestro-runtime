@@ -8,9 +8,10 @@ import itertools
 from pathlib import Path
 from typing import Any
 
-from orkexa.dynamic import DockerSandbox, Sandbox, SubprocessSandbox, ValidationResult
+from orkexa.dynamic import DockerSandbox, Sandbox, SandboxProbe, SubprocessSandbox, ValidationResult
 import pytest
 
+from nodestro_runtime import docker_status
 from nodestro_runtime.builtin_sandbox import LinuxSandbox, SandboxStatus
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.profile import PROFILE_KINDS
@@ -106,7 +107,28 @@ def test_only_a_docker_or_a_checked_builtin_sandbox_counts_as_isolating() -> Non
     class Claims(SubprocessSandbox):
         isolated = True  # a claim, not a container
 
+    # A container counts only once its daemon passed the preflight and the in-container self-test.
+    assert isolation_of(DockerSandbox()) == "none"
+    assert not SandboxPolicy("server").allows("untrusted", DockerSandbox())
+    with pytest.raises(NodestroError) as refused:
+        SandboxPolicy("server").require("untrusted", DockerSandbox(), name="t")
+    assert refused.value.code == "sandbox.isolation_required" and "self-test" in str(refused.value)
+    assert refused.value.params["reason"] == "docker-checking"
+    docker_status.record_proof("docker", None, SandboxProbe("docker", False, "limits", "no memory limit"))
+    assert isolation_of(DockerSandbox()) == "none"
+    assert docker_status.last_reason("docker", None) == "docker-limits"
+    docker_status.record_proof("docker", None, SandboxProbe("docker", True))
     assert isolation_of(DockerSandbox()) == "container"
+    assert SandboxPolicy("server").allows("untrusted", DockerSandbox())
+    # A failure of one image does not revoke the daemon's proof (Orkexa refuses that image's calls itself) ...
+    docker_status.record_proof("docker", None, SandboxProbe("docker", False, "self-test", "secret-like ENV"))
+    assert isolation_of(DockerSandbox()) == "container"
+    # ... one of the daemon does; another daemon is not proven by this one's pass.
+    docker_status.record_proof("docker", None, SandboxProbe("docker", False, "unreachable", "stopped"))
+    assert isolation_of(DockerSandbox()) == "none"
+    docker_status.record_proof("docker", None, SandboxProbe("docker", True))
+    assert isolation_of(DockerSandbox(environ={"DOCKER_HOST": "tcp://elsewhere:2376"})) == "none"
+    assert isolation_of(ContainerDouble()) == "container"  # the test double answers for itself
     assert isolation_of(Claims(acknowledge_unsafe=True)) == "none"
     assert isolation_of(SubprocessSandbox(acknowledge_unsafe=True)) == "none"
     assert isolation_of(LinuxSandbox()) == "none"  # its checks did not pass on this (test) computer
@@ -258,8 +280,7 @@ def test_the_workspace_keeps_provenance_and_forgets_it_after_a_restore(tmp_path:
 def test_the_agent_check_reports_an_untrusted_tool_without_isolation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Without Docker: where it runs, the automatic mode would use it (tests/test_sandbox_selection.py).
-    monkeypatch.setattr(DockerSandbox, "available", staticmethod(lambda *a, **k: False))
+    # Without Docker (the test setup's monitor reports it missing): the automatic mode would use it.
     workspace = Workspace(tmp_path / "data", integrations=[])
     try:
         save_generated(workspace.tools, ContainerDouble())
