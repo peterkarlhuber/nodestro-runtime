@@ -1,0 +1,50 @@
+name: Platforms
+
+# Nodestro Runtime must import and start on every operating system the desktop supports, also where the built-in
+# Linux sandbox and Docker are missing (then only code that needs isolation is refused). This job runs the
+# platform tests (tests/test_platform_start.py) on real macOS and Windows runners, on both CPU architectures.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  start:
+    name: start (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest: Apple Silicon (arm64); macos-15-intel: x86-64; windows-11-arm: ARM64.
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      # The Nodestro components and orkexa are cloned by pip; the token exists only in this step's environment.
+      - name: Install with read access to the Nodestro repositories
+        env:
+          NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
+        run: |
+          if [ -n "$NODESTRO_READ" ]; then
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
+            export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
+          fi
+          pip install -e ".[dev]"
+      - name: System
+        run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
+      - name: Import the workspace (the path that failed on macOS)
+        run: python -c "import nodestro_runtime.workspace as w; print('imported', w.__name__)"
+      - run: pytest -v tests/test_platform_start.py
