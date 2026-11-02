@@ -7,7 +7,9 @@ the API's source, parses each candidate with PostgreSQL's grammar and requires `
 are cross-tenant by design are listed in :mod:`nodestro_runtime.tenant_sql_allowlist` (and the API's own list), each
 with its reason, matched on the whole normalized text.
 
-The check reads source only; it runs the same with and without ``NODESTRO_TEST_RUNTIME_ROLE``.
+The check reads source only; it runs the same with and without ``NODESTRO_TEST_RUNTIME_ROLE``. What it guarantees and
+what it does not: the check's module docstring and ``docs/AXENTRA.md`` ("Remaining isolation risk"). Every bypass of
+the security review (rounds 1 to 3, issue #89) is a regression test below.
 """
 
 from __future__ import annotations
@@ -660,3 +662,236 @@ def test_a_join_of_a_constant_list_is_resolved(tmp_path: Path) -> None:
     assert [s.text for s in report.checked] == [
         "SELECT data FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
     ]
+
+
+# --- security review round 3 (issue #89): the probes that still passed, each one a regression test ------------------
+
+_BASE = '"SELECT data FROM nodestro_documents WHERE tenant_id = %s"'
+
+#: name -> (source, the kind of finding it must produce). Sources that import ``BASE`` get a ``frag.py`` next to them.
+ROUND3_PROBES = {
+    # SR-01a: `+=` on a parameter (the parameter's value is unknown, the text after it is SQL)
+    "+= on a parameter": ('def f(db, q):\n    q += " OR true"\n    db.execute(q)\n', "dynamic"),
+    "conditional += on a parameter": (
+        'def run(db, q, wide=False):\n    if wide:\n        q += " OR true"\n    return db.execute(q)\n',
+        "dynamic",
+    ),
+    "+= on a parameter with a SQL default": (
+        f'def f(db, q={_BASE}):\n    q += " OR true"\n    db.execute(q)\n',
+        "dynamic",
+    ),
+    # SR-01a: closures and lambdas that read a name of the enclosing function
+    "lambda reads the outer name": (
+        f'def f(db):\n    q = {_BASE}\n    q += " OR true"\n    run = lambda: db.execute(q)\n    run()\n',
+        "leak",
+    ),
+    "nested function reads the outer name": (
+        f'def f(db):\n    q = {_BASE}\n    q += " OR true"\n    def g():\n        db.execute(q)\n    g()\n',
+        "leak",
+    ),
+    "nested function widens the outer name (nonlocal)": (
+        f'def f(db):\n    q = {_BASE}\n    def widen():\n        nonlocal q\n        q += " OR true"\n'
+        "    widen()\n    db.execute(q)\n",
+        "dynamic",
+    ),
+    # SR-01a: `+=` on an attribute, an item or a class attribute
+    "+= on self.q": (
+        f"class S:\n    def __init__(self):\n        self.q = {_BASE}\n\n    def f(self, db):\n"
+        '        self.q += " OR true"\n        db.execute(self.q)\n',
+        "dynamic",
+    ),
+    "+= on a class attribute": (
+        f'class S:\n    Q = {_BASE}\n    Q += " OR true"\n\n    def f(self, db):\n        db.execute(self.Q)\n',
+        "dynamic",
+    ),
+    "+= on a dict item": (
+        f'Q = {{"a": {_BASE}}}\n\ndef f(db):\n    Q["a"] += " OR true"\n    db.execute(Q["a"])\n',
+        "dynamic",
+    ),
+    "+= on a list item": (
+        f'def f(db):\n    qs = [{_BASE}]\n    qs[0] += " OR true"\n    db.execute(qs[0])\n',
+        "dynamic",
+    ),
+    # SR-01a: % formatting with SQL as the argument
+    "% formatting wraps a name": (
+        f'def f(db):\n    q = {_BASE}\n    q = "%s OR true" % q\n    db.execute(q)\n',
+        "leak",
+    ),
+    "% formatting with a tuple wraps a name": (
+        f'def f(db):\n    q = {_BASE}\n    db.execute("%s OR true" % (q,))\n',
+        "leak",
+    ),
+    "% formatting with a dict wraps a name": (
+        f'def f(db):\n    q = {_BASE}\n    db.execute("%(q)s OR true" % {{"q": q}})\n',
+        "leak",
+    ),
+    "% formatting of an unknown value": ('def f(db, q):\n    db.execute("%s OR true" % q)\n', "dynamic"),
+    # SR-01b: lower-case SQL or a comment after an unknown part
+    "tuple-unpacked alias += lower-case or": (
+        f'def f(db, x):\n    q = {_BASE}\n    q2, p = q, x\n    q2 += " or true"\n    db.execute(q2, p)\n',
+        "dynamic",
+    ),
+    "method result += lower-case or": (
+        "class S:\n    def _base(self):\n"
+        f"        return {_BASE}\n\n"
+        '    def f(self, db):\n        q = self._base()\n        q += " or true"\n        db.execute(q)\n',
+        "dynamic",
+    ),
+    "self.BASE + lower-case or": (
+        f'class S:\n    BASE = {_BASE}\n\n    def f(self, db):\n        db.execute(self.BASE + " or true")\n',
+        "dynamic",
+    ),
+    "imported fragment + lower-case or": (
+        'from .frag import BASE\n\ndef f(db):\n    db.execute(f"{BASE} or 1=1")\n',
+        "dynamic",
+    ),
+    "imported fragment + comment": ('from .frag import BASE\n\ndef f(db):\n    db.execute(BASE + " --")\n', "dynamic"),
+    "imported fragment + block comment": (
+        'from .frag import BASE\n\ndef f(db):\n    db.execute(BASE + " /* x */")\n',
+        "dynamic",
+    ),
+    # SR-01b: SQL fragments that only unknown parts put together
+    "walrus through a call": (
+        f'import operator\n\ndef f(db):\n    q = {_BASE}\n    (q := operator.add(q, " OR true"))\n    db.execute(q)\n',
+        "dynamic",
+    ),
+    "two class attributes": (
+        f'class S:\n    BASE = {_BASE}\n    WIDE = " OR true"\n\n'
+        "    def f(self, db):\n        db.execute(self.BASE + self.WIDE)\n",
+        "dynamic",
+    ),
+    "tuple items by index": (
+        f'QS = ({_BASE}, " OR true")\n\ndef f(db):\n    db.execute(QS[0] + QS[1])\n',
+        "leak",
+    ),
+    # SR-01d: a table name split across constant pieces
+    "table name split by + of constants": (
+        'def f(db):\n    db.execute("SELECT data FROM nodestro_" + "documents WHERE id = %s")\n',
+        "leak",
+    ),
+    "table name completed after a constant prefix": (
+        'P = "nodestro_"\n\ndef f(db):\n    db.execute(f"SELECT data FROM {P}documents WHERE id = %s")\n',
+        "leak",
+    ),
+    "table name split by a constant between": (
+        'P = "nodestro_"\n\ndef f(db):\n    db.execute("SELECT data FROM " + P + "documents WHERE id = %s")\n',
+        "leak",
+    ),
+    "table name joined from parts": (
+        'def f(db):\n    t = "_".join(["nodestro", "documents"])\n'
+        '    db.execute(f"SELECT data FROM {t} WHERE id = %s")\n',
+        "leak",
+    ),
+    # A quoted name in another case is another table in PostgreSQL; the check treats it as the tenant table.
+    "quoted table name in mixed case": ("Q = 'SELECT data FROM \"Nodestro_documents\" WHERE id = %s'\n", "leak"),
+}
+
+
+def _scan_probe(source: str, tmp_path: Path) -> Report:
+    root = tmp_path / "sample"
+    root.mkdir(exist_ok=True)
+    (root / "frag.py").write_text(f"BASE = {_BASE}\n", encoding="utf-8")
+    return _scan(source, tmp_path)
+
+
+@pytest.mark.parametrize("name", sorted(ROUND3_PROBES))
+def test_the_round3_probes_are_caught(name: str, tmp_path: Path) -> None:
+    source, kind = ROUND3_PROBES[name]
+    report = _scan_probe(source, tmp_path)
+    assert kind in [f.kind for f in report.findings], (name, [str(f) for f in report.findings])
+
+
+ROUND3_CLEAN = {
+    "+= of an AND filter": (
+        f'def f(db, x):\n    q = {_BASE}\n    if x:\n        q += " AND id = %s"\n    db.execute(q)\n'
+    ),
+    "alias, then only the original is extended": (
+        f'def f(db):\n    q = {_BASE}\n    q2 = q\n    q += " AND id = %s"\n    db.execute(q2)\n    db.execute(q)\n'
+    ),
+    "% formatting of a bound statement": (
+        "def f(db, t):\n"
+        '    db.execute("%s AND id = %%s" % "SELECT data FROM nodestro_documents WHERE tenant_id = %s")\n'
+    ),
+    "messages with lower-case words after an unknown part": (
+        "def f(name, exe, parts, n):\n"
+        "    print(f'{name} must be yes or no')\n"
+        "    print(f'{name} is used by another process; stop it first or choose another data directory')\n"
+        "    print(name + ' or enter it in the settings', ' or '.join(parts), f'{exe} --version')\n"
+        "    print(f'{name} would call itself (directly or through other sub-workflows)')\n"
+        "    print('%s must be 1 or 0' % name)\n"
+    ),
+    "counters and text built with +=": (
+        "class R:\n    def f(self, delta, index):\n        self.count += 1\n        self.text += delta\n"
+        "        self.counts['a'] += 1\n        index += 1\n        return index\n"
+    ),
+    "a closure that reads a value that is not SQL": (
+        "def f(items):\n    label = 'x'\n    label += 'y'\n    return sorted(items, key=lambda i: (label, i))\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROUND3_CLEAN))
+def test_the_round3_controls_pass(name: str, tmp_path: Path) -> None:
+    _assert_clean(_scan_probe(ROUND3_CLEAN[name], tmp_path))
+
+
+ROUND3_LEAKING_SQL = [
+    # the inner `d` shadows the outer one: `d.tenant_id = d.tenant_id` is true for every row of the inner table
+    "SELECT (SELECT count(*) FROM nodestro_jobs d WHERE d.tenant_id = d.tenant_id) FROM nodestro_documents d"
+    " WHERE d.tenant_id = %s",
+    "SELECT (SELECT count(*) FROM nodestro_jobs j, axentra_memberships d WHERE j.tenant_id = d.tenant_id)"
+    " FROM nodestro_documents d WHERE d.tenant_id = %s",
+    # SQL that the server runs from a string: not checked, so not passed
+    "DO $$ BEGIN DELETE FROM nodestro_documents; END $$",
+    "SELECT query_to_xml('SELECT * FROM nodestro_documents', true, true, '')",
+    # writes that put a row into, or take it from, another tenant
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) VALUES ('other', %s, %s)",
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) VALUES (%s, %s, %s), ('other', %s, %s)",
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) SELECT 'other', kind, ref FROM nodestro_jobs"
+    " WHERE tenant_id = %s",
+    "INSERT INTO nodestro_jobs (tenant_id, id, status) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE"
+    " SET status = excluded.status",
+    "INSERT INTO nodestro_jobs (tenant_id, id, status) VALUES (%s, %s, %s) ON CONFLICT ON CONSTRAINT k DO UPDATE"
+    " SET status = excluded.status",
+    "INSERT INTO nodestro_jobs (tenant_id, id, status) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE"
+    " SET tenant_id = excluded.tenant_id",
+    "UPDATE nodestro_jobs SET tenant_id = %s WHERE tenant_id = %s AND id = %s",
+]
+
+ROUND3_BOUND_SQL = [
+    "SELECT d.id, (SELECT max(ref) FROM nodestro_jobs WHERE tenant_id = d.tenant_id) FROM nodestro_documents d"
+    " WHERE d.tenant_id = %s",
+    "SELECT d.data FROM nodestro_documents d, LATERAL (SELECT * FROM nodestro_jobs j WHERE j.tenant_id = d.tenant_id)"
+    " x WHERE d.tenant_id = %s",
+    "INSERT INTO nodestro_run_events (tenant_id, run_id, seq, event) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) VALUES (%s::text, %s, %s), (%s, %s, %s)",
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) SELECT %s, 'k', x FROM unnest(%s::text[]) AS t(x)",
+    "INSERT INTO nodestro_jobs (tenant_id, kind, ref) SELECT d.tenant_id, 'k', d.id FROM nodestro_documents d"
+    " WHERE d.tenant_id = %s",
+    "INSERT INTO nodestro_files (tenant_id, namespace, id, entry) VALUES (%s, %s, %s, %s)"
+    " ON CONFLICT (tenant_id, namespace, id) DO UPDATE SET tenant_id = excluded.tenant_id, entry = excluded.entry",
+    "SELECT count(*) FROM pg_class WHERE relname = 'nodestro_documents'",
+]
+
+
+@pytest.mark.parametrize("text", ROUND3_LEAKING_SQL)
+def test_the_round3_sql_probes_fail(text: str) -> None:
+    assert check_sql(text, TABLES) != []
+
+
+@pytest.mark.parametrize("text", ROUND3_BOUND_SQL)
+def test_the_round3_bound_sql_passes(text: str) -> None:
+    assert check_sql(text, TABLES) == []
+
+
+def test_a_fragment_outside_a_known_statement_passes_only_when_fixed_or_allowlisted(tmp_path: Path) -> None:
+    source = "class S:\n    WIDE = ' OR true'\n"
+    report = _scan(source, tmp_path)
+    assert [(f.kind, f.text, f.detail) for f in report.findings] == [
+        ("dynamic", "{statement not known} OR true", "SQL that continues a statement that is not known")
+    ]
+    allowlist = {("sample/sample.py", "{statement not known} OR true"): "a reason for the test"}
+    report = _scan(source, tmp_path, allowlist=allowlist)
+    assert report.findings == [] and len(report.allowed) == 1
+    # The value of a followed `name += ...` is checked where the name is read, not as a fragment.
+    _assert_clean(_scan(f"def f(db):\n    q = {_BASE}\n    q += ' AND id = %s'\n    db.execute(q)\n", tmp_path))
