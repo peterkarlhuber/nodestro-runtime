@@ -25,6 +25,10 @@ CROSS_TENANT = {
     "DELETE FROM nodestro_run_events WHERE created_at < clock_timestamp() - %s": (
         "housekeeping of the leader: run events older than the retention, of every tenant"
     ),
+    "SELECT collection, id, coalesce(raw, data::text) FROM nodestro_documents WHERE collection = ANY(%s)": (
+        "start check (axentra_platform.stored_secret_formats): counts stored secrets by format over every tenant,"
+        " decrypts nothing and returns counts only"
+    ),
 }
 
 
