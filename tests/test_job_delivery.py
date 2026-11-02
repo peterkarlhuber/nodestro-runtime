@@ -550,3 +550,67 @@ async def test_a_failing_ownership_check_makes_no_external_call(
     assert counting.calls == {"BILL": 1}
     assert [job.status for job in queue.jobs("alpha", RUN_JOB, started.id)] == ["failed"]
     assert queue.claim("anyone") is None
+
+
+# ---- a tenant suspended while its run executes (security review SR-03) ------------------------------------------
+
+
+async def test_a_suspended_tenants_run_makes_no_call_after_the_suspension(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process], world: SideEffects
+) -> None:
+    """The tenant is suspended while a model call of its run is in flight. When the model then asks for the tool,
+    the worker must not post the invoice: the ownership check before the tool call asks the tenant's status too, so
+    the run stops at its next step instead of at the worker's next periodic sweep (up to 15 s later)."""
+    release = threading.Event()
+    counting = Counting()
+    api_db, worker_db = connect(), connect()
+    api = processes(api_db)
+    worker = processes(worker_db, {"BILL": counting.answer("BILL", invoicing(release))})
+    queue = JobQueue(api_db)
+    started = await api_start(api, queue, chain("Bill", agent("bill", "BILL", [TOOL])))
+    suspended: set[str] = set()
+    asked: list[str] = []
+
+    def tenant_active(tenant_id: str) -> bool:
+        asked.append(tenant_id)
+        return tenant_id not in suspended
+
+    runner = RunWorker(JobQueue(worker_db), worker, name="w1", heartbeat=60, tenant_active=tenant_active)
+    executing = asyncio.ensure_future(runner.run_once())
+    deadline = time.monotonic() + 10
+    while counting.calls.get("BILL") != 1:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.02)
+    suspended.add("alpha")
+    runner._tenant_seen.clear()  # the "active" answer of the first step is not reused (as after TENANT_CHECK_SECONDS)
+    release.set()
+    await asyncio.wait_for(executing, 20)
+    assert world.calls == []
+    assert counting.calls == {"BILL": 1}
+    assert asked == ["alpha", "alpha"]  # before the model request and before the tool call
+    stored = api("alpha").runs.get(started.id)
+    assert stored is not None and stored.status == "running"  # nothing more stored; the orphan sweep interrupts it
+    assert [job.status for job in queue.jobs("alpha", RUN_JOB, started.id)] == ["failed"]
+
+
+def test_a_tenants_active_answer_is_reused_briefly_and_a_suspension_never(
+    connect: Callable[[], PostgresDatabase], processes: Callable[..., Process]
+) -> None:
+    database = connect()
+    answers = iter([True, False, True])
+    asked: list[str] = []
+
+    def tenant_active(tenant_id: str) -> bool:
+        asked.append(tenant_id)
+        return next(answers)
+
+    runner = RunWorker(JobQueue(database), processes(database), tenant_active=tenant_active, tenant_check=60)
+    assert runner._tenant_allows("alpha") is True
+    assert runner._tenant_allows("alpha") is True  # reused
+    assert asked == ["alpha"]
+    runner.tenant_check = 0
+    assert runner._tenant_allows("alpha") is False
+    assert runner._tenant_allows("alpha") is True  # a suspension is not cached: resuming works at once
+    assert asked == ["alpha"] * 3
+    # Without a status check (the desktop, older callers) only the lease counts.
+    assert RunWorker(JobQueue(database), processes(database))._tenant_allows("alpha") is True
