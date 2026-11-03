@@ -40,9 +40,10 @@ Backend audit round 2, runtime fixes (2026-11-03):
 Orkexa pin: `bc8c4edae637b2e53f7f63f86f84846ea2e70e43` (orkexa #40, audit round 2: sandbox and tool hardening
 ORK2-01..04/06/08/09, unknown provider prefixes raise (DX-02); 2026-11-03).
 
-Axentra pin: `f7829cfda56dbd1da4919d77ac49980b9bc1be36` (axentra #31 and #32, audit round 2: schedule jobs follow the
+Axentra pin: `a87224291b561981ed8afab6131e18d8c9eecc01` (axentra #31, #32 and #38, audit round 2: schedule jobs follow the
 creator's current access, webhook deadline, `/v1/me` without tenant cap, invitation re-checks, problem type URNs;
-SHA-pinned CI and digest-pinned image; 2026-11-03).
+SHA-pinned CI and digest-pinned image; own-tenant overview counts, usage backdating limited to the open billing
+period; 2026-11-03).
 
 Previous Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).
