@@ -19,7 +19,18 @@
   prompt speed, context window and processor with the model (`InstalledModel.speed`, `ModelSpeed`).
 - `recommend(..., require=...)`: capabilities the work needs beyond the task profile (e.g. `vision` for a tool agent
   that reads images), for the per-agent models of example copies (EX-011).
-- Pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
+- Hybrid knowledge search weighs full-text hits by their evidence, on SQLite (through orkexa's `SQLiteIndex`) and on
+  PostgreSQL (`PostgresIndex`) alike. Reciprocal rank fusion ignored how strong a full-text match is, so with a query
+  in another language than the documents a file sharing one accidental word with it (`days`, `de`, a number)
+  outranked the right vector hit (the offline proof's English query found `security.md` instead of `urlaub.md`). Each
+  candidate now scores the min-max normalized cosine similarity plus its full-text evidence, the squared IDF-weighted
+  share of the query's words it contains (`orkexa.retrieval.fuse_hybrid`; word weights count the tenant's chunks).
+  On a 120-query eval (lexical queries with codes and names, paraphrases, cross-lingual queries in six languages, hard
+  negatives; qwen3-embedding:0.6b) PostgreSQL hybrid recall@1 rose from 0.48 to 0.93 (fts 0.38, vector 0.89); lexical
+  queries 0.98 (fts 0.95). `fts` and `vector` are unchanged; `PostgresIndex(fusion="rrf")` keeps the earlier fusion,
+  `lexical_weight=` sets the full-text share (default 0.5). Hybrid hits carry the fused score in [0, 1]. Needs an orkexa
+  pin that contains `fuse_hybrid` (orkexa PR for this change).
+- Pin orkexa 4ec738c (orkexa #44: evidence-weighted hybrid fusion). Earlier: pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
   extra (`gguf`). New catalog entry `mdenseon:307m` (LightOn, Apache-2.0) with `source="build"`: the catalog download
   builds it from pinned upstream files and checks its reference vectors; `LocalModelService.build()` builds it from
   local files (job kind `build`). It is an alternative, suggested only with the European preference. An alternative

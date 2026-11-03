@@ -10,6 +10,12 @@ Search: the words of a chunk's title and text (letters and digits; lower case, d
 matches any of its words or word prefixes, like :class:`orkexa.SQLiteIndex`; results are ranked by ``ts_rank``
 instead of BM25, so the order of equally good hits can differ from the desktop.
 
+Hybrid search fuses both rankings as :class:`orkexa.SQLiteIndex` does (:func:`orkexa.retrieval.fuse_hybrid`): the
+min-max normalized cosine similarity plus the full-text evidence of each candidate, the squared IDF-weighted share of
+the query's words it contains (word weights count the chunks of the tenant's namespace). ``ts_rank`` only picks the
+full-text candidates, so the fused order does not depend on it. ``fusion="rrf"`` keeps the earlier reciprocal rank
+fusion.
+
 Vectors (migration ``0010``): like :class:`orkexa.SQLiteIndex`, each namespace keeps its vectors in a *space* bound to
 one embedding model identity (``nodestro_vector_spaces``, ``nodestro_chunk_vectors``). With pgvector installed the
 database ranks them (an exact cosine distance); without it the runtime does, over the same rows. Searches are
@@ -29,7 +35,18 @@ import unicodedata
 from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
 from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
 from orkexa.memory import MemoryBackend
-from orkexa.retrieval import RetrievalError, RetrievalMode, VectorStatus, check_mode
+from orkexa.retrieval import (
+    HYBRID_FUSIONS,
+    LEXICAL_WEIGHT,
+    HybridFusion,
+    RetrievalError,
+    RetrievalMode,
+    VectorStatus,
+    check_mode,
+    fuse_hybrid,
+    lexical_evidence,
+    word_weight,
+)
 
 from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
@@ -150,9 +167,18 @@ class PostgresIndex(Index):
         overlap: int = 200,
         embeddings: EmbeddingModel | None = None,
         mode: RetrievalMode | None = None,
+        fusion: HybridFusion = "evidence",
+        lexical_weight: float = LEXICAL_WEIGHT,
     ) -> None:
         super().__init__(max_chars=max_chars, overlap=overlap)
         _check(tenant_id, namespace)
+        if fusion not in HYBRID_FUSIONS:
+            raise ValueError(f"fusion must be one of {', '.join(HYBRID_FUSIONS)}, not {fusion!r}")
+        if not 0.0 <= lexical_weight <= 1.0:
+            raise ValueError("lexical_weight must be between 0 and 1")
+        #: How ``hybrid`` combines full text and vectors (``evidence`` or ``rrf``), and the full-text share.
+        self.fusion: HybridFusion = fusion
+        self.lexical_weight = lexical_weight
         self.database = database
         self.tenant_id = tenant_id
         self.namespace = namespace
@@ -487,8 +513,9 @@ class PostgresIndex(Index):
         mode: RetrievalMode | None = None,
         sources: Iterable[str] | None = None,
     ) -> builtins.list[Hit]:
-        """The ``k`` best chunks by full text, vectors or both (reciprocal rank fusion), limited to ``sources``
-        before ranking. ``vector`` and ``hybrid`` never fall back to full text."""
+        """The ``k`` best chunks by full text, vectors or both, limited to ``sources`` before ranking. ``vector`` and
+        ``hybrid`` never fall back to full text. ``hybrid`` fuses ``max(4 * k, 20)`` candidates of each ranking by
+        :func:`orkexa.retrieval.fuse_hybrid` (scores in [0, 1]), or by reciprocal rank fusion with ``fusion="rrf"``."""
         if k < 1:
             raise ValueError("k must be positive")
         chosen = check_mode(mode or self.mode or "fts")
@@ -506,8 +533,24 @@ class PostgresIndex(Index):
                 hit.ranks = {"vector": rank + 1}
             return hits
         depth = max(k * 4, 20)
-        fused: dict[int, tuple[float, Hit, dict[str, int]]] = {}
         rankings = (("fts", self._fts(query, depth, allowed)), ("vector", self._vector(query, depth, allowed)))
+        if self.fusion == "evidence":
+            found: dict[int, Hit] = {}
+            positions: dict[int, dict[str, int]] = {}
+            for name, ranked in rankings:
+                for rank, hit in enumerate(ranked):
+                    found.setdefault(hit.id, hit)
+                    positions.setdefault(hit.id, {})[name] = rank + 1
+            vector = [(hit.id, hit.score) for hit in rankings[1][1]]
+            lexical = self._lexical_evidence(query, builtins.list(found))
+            result = []
+            for chunk_id, score in fuse_hybrid(vector, lexical, lexical_weight=self.lexical_weight)[:k]:
+                hit = found[chunk_id]
+                hit.score = score
+                hit.ranks = positions[chunk_id]
+                result.append(hit)
+            return result
+        fused: dict[int, tuple[float, Hit, dict[str, int]]] = {}
         for name, ranked in rankings:
             for rank, hit in enumerate(ranked):
                 score, kept, ranks = fused.get(hit.id, (0.0, hit, {}))
@@ -520,6 +563,32 @@ class PostgresIndex(Index):
             hit.ranks = ranks
             result.append(hit)
         return result
+
+    def _lexical_evidence(self, query: str, chunk_ids: builtins.list[int]) -> dict[int, float]:
+        """:func:`orkexa.retrieval.lexical_evidence` of ``chunk_ids``: which query words (as prefixes, like
+        :func:`_tsquery`) each contains, weighted by how many chunks of this namespace contain them."""
+        words = builtins.list(dict.fromkeys(search_words(query)))
+        found: dict[int, builtins.list[str]] = {chunk_id: [] for chunk_id in chunk_ids}
+        if not words:
+            return lexical_evidence({}, found)
+        word_query = "to_tsquery('simple', quote_literal(w) || ':*')"
+        counts = self.database._query(
+            f"SELECT w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s"
+            f" AND search @@ {word_query}) FROM unnest(%s::text[]) AS w",
+            (self.tenant_id, self.namespace, words),
+        )
+        total = len(self)
+        weights = {str(word): word_weight(int(count), total) for word, count in counts}
+        if chunk_ids:
+            rows = self.database._query(
+                "SELECT c.id, w FROM nodestro_chunks c, unnest(%s::text[]) AS w"
+                " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = ANY(%s)"
+                f" AND c.search @@ {word_query}",
+                (words, self.tenant_id, self.namespace, chunk_ids),
+            )
+            for chunk_id, word in rows:
+                found[int(chunk_id)].append(str(word))
+        return lexical_evidence(weights, found)
 
     # ---- what KnowledgeChunks does on SQLite -------------------------------------------------------
 
