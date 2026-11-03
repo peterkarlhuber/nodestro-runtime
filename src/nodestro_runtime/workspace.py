@@ -714,6 +714,7 @@ class Workspace:
             embedding_model=values.get("embedding_model") or None,
             strict_offline=bool(values.get("strict_offline")),
             prefer_european_models=bool(values.get("prefer_european_models")),
+            local_reasoning="full" if values.get("local_reasoning") == "full" else "auto",
             model_defaults="local" if fallback_model == LOCAL_DEFAULT_MODEL else "kept",
         )
 
@@ -878,6 +879,13 @@ class Workspace:
     def selection_preferences(self) -> SelectionPreferences:
         """What the local model selection prefers: European models when the setting is on (D13)."""
         return SelectionPreferences(region="eu" if self._stored("prefer_european_models") else None)
+
+    def reasoning_saving(self) -> bool:
+        """Whether the CPU saving mode applies now: the setting ``local_reasoning`` is ``auto`` (the default) and the
+        local model server has no GPU (see ``agent_builder.reasoning_reduction``). An unknown server never saves."""
+        if self._stored("local_reasoning") == "full":
+            return False
+        return self.local_models.accelerated() is False
 
     def _update_bedrock(self, entry: dict[str, Any], change: Mapping[str, Any]) -> None:
         """Check and store a change of the Bedrock settings (region, sign-in, profile name, residency)."""
@@ -1307,6 +1315,7 @@ class Workspace:
             capabilities=dict(stored.get("capabilities") or {}),
             client=client,
             reported=reported,
+            reasoning_saving=provider == "ollama" and self.reasoning_saving(),
         )
 
     def provider_settings(self, provider: str) -> dict[str, Any]:

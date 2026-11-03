@@ -22,6 +22,7 @@ from . import contracts, graph
 from .agent_builder import ConfigIssue
 from .engine import _PLACEHOLDER, MAX_DEPTH, _usable_team, check_workflow, node_label, start_fields
 from .graph import BRANCHING, ancestors, comment_sources, data_sources, workflow_refs
+from .local_service import LOCAL_CONTEXT_LENGTH, SMALL_CONTEXT, InstalledModel
 from .orchestrator import select_teams
 from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
@@ -476,6 +477,7 @@ def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
                     model=model,
                 )
             )
+    found += _local_limits(nodestro, workflow, installed)
     for node in workflow.nodes:
         config = node.agent if node.type == "agent" else None
         if config is None or not config.tools or not _valid(config.model) or provider_of(config.model) != "ollama":
@@ -489,6 +491,73 @@ def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
                     level="error",
                     node_id=node.id,
                     model=config.model,
+                )
+            )
+    return found
+
+
+_NO_MODEL = InstalledModel(name="", size=0, digest="", kind="chat")
+
+
+def _local_limits(nodestro: Workspace, workflow: Workflow, installed: Mapping[str, InstalledModel]) -> list[CheckIssue]:
+    """The local server's context window against what the agents need, and the CPU saving mode (RT-050/RT-051).
+
+    A window below 16,384 tokens (Ollama's own default without a large GPU is 4,096) or below an agent's
+    ``max_tokens`` ends answers early (prompt, thinking and answer share it); an agent whose effort ``medium`` the CPU
+    saving mode answers without thinking is named, so the reduction is never silent."""
+    found: list[CheckIssue] = []
+    service = nodestro.local_models
+    window = service.context_window(list(installed.values()))
+    agents = [
+        node
+        for node in workflow.nodes
+        if node.type == "agent" and node.agent is not None and _valid(node.agent.model)
+        if provider_of(node.agent.model) == "ollama"
+    ]
+    if window is not None:
+        if window < SMALL_CONTEXT:
+            found.append(
+                _issue(
+                    "check.local_context_small",
+                    f"The local model server gives models a context window of {window} tokens; agents need at least "
+                    f"{SMALL_CONTEXT} (set OLLAMA_CONTEXT_LENGTH={LOCAL_CONTEXT_LENGTH} on that server)",
+                    level="warning",
+                    tokens=window,
+                    recommended=LOCAL_CONTEXT_LENGTH,
+                )
+            )
+        for node in agents:
+            assert node.agent is not None
+            if node.agent.max_tokens >= window:
+                found.append(
+                    _issue(
+                        "check.local_max_tokens",
+                        f"The answer limit ({node.agent.max_tokens} tokens) does not fit the local context window "
+                        f"({window} tokens) with the prompt",
+                        level="warning",
+                        node_id=node.id,
+                        tokens=window,
+                        max_tokens=node.agent.max_tokens,
+                    )
+                )
+    if nodestro.reasoning_saving():
+        saved = [
+            node.id
+            for node in agents
+            if node.agent is not None
+            and node.agent.effort == "medium"
+            and "reasoning_effort" not in node.agent.request_options
+            and "thinking" in installed.get(_local_name(node.agent.model), _NO_MODEL).capabilities
+        ]
+        if saved:
+            found.append(
+                _issue(
+                    "check.local_reasoning_saving",
+                    "This computer runs local models without a GPU: agents with effort medium answer without the long "
+                    "thinking phase (CPU saving mode). Choose effort high for an agent, or switch the mode off in the "
+                    "settings, to keep it",
+                    level="info",
+                    nodes=", ".join(saved),
                 )
             )
     return found

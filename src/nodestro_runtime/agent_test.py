@@ -66,6 +66,8 @@ class AgentTestResult(BaseModel):
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
     usage: Usage = Field(default_factory=Usage)
+    #: ``cpu_saving`` when the local model answered without thinking in the CPU saving mode (as a run's step).
+    reasoning_reduced: str | None = None
     evaluation: EvaluationRecord | None = None
     memory: dict[str, str] | None = None
     #: True when the agent worked on a copy of its persistent memory space.
@@ -207,6 +209,7 @@ class AgentTester:
                 sandbox=self.tool_sandbox(request.workflow_id) if request.workflow_id else None,
                 # before_tool applies the per-call rules to every call while the gate exists.
                 gated=gate is not None,
+                on_built=lambda built: setattr(result, "reasoning_reduced", built.reasoning_reduced),
             )
             result.output = outcome.output
             result.evaluation = outcome.evaluation

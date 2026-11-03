@@ -71,7 +71,7 @@ from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
 from . import contracts, flow_driver, graph, run_budget, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
-from .agent_builder import AgentBuilder, run_own_tool
+from .agent_builder import AgentBuilder, BuiltAgent, run_own_tool
 from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
@@ -3857,8 +3857,17 @@ class RunManager:
             # A decision the budget cannot admit stops before it is sent (BUDGET-1): the orchestrator waits and asks
             # this decision again when the run continues (every earlier step is recorded).
             suspendable=context.budget_gate is not None,
+            on_built=lambda built: self._note_reasoning(context, node.id, context.run.nodes[node.id], built),
         )
         return decision_of(outcome.output)
+
+    def _note_reasoning(self, context: _RunContext, node_id: str, state: NodeRun, built: BuiltAgent) -> None:
+        """Record on the step that its agent thinks less than its effort asks (the CPU saving mode, RT-050), once."""
+        reason = built.reasoning_reduced
+        if reason is None or state.reasoning_reduced == reason:
+            return
+        state.reasoning_reduced = reason
+        self._emit(context, "reasoning_reduced", node_id, reason=reason)
 
     def _run_agent_sync(
         self,
@@ -4014,6 +4023,7 @@ class RunManager:
                 gated=gate is not None,
                 refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
                 suspendable=context.budget_gate is not None,
+                on_built=lambda built: self._note_reasoning(context, node_id, state, built),
             )
             state.output = outcome.output
             state.memory = outcome.memory
@@ -4161,6 +4171,7 @@ def execute_agent(
     gated: bool = False,
     refinement: Mapping[str, Any] | None = None,
     suspendable: bool = False,
+    on_built: Callable[[BuiltAgent], None] | None = None,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -4174,6 +4185,7 @@ def execute_agent(
     Used by workflow runs and by the agent test in the inspector, so both behave the same.
     Agent and judge each use the connection of their own provider. ``gated`` must be true only when the
     ``before_tool`` hook applies the shared per-call approval rules to every call (MCP tools that change data need it).
+    ``on_built`` sees the built agent before it is asked (e.g. to record a reduced reasoning, RT-050).
     """
     built = builder.build(
         config,
@@ -4189,6 +4201,8 @@ def execute_agent(
         attended=attended,
         gated=gated,
     )
+    if on_built is not None:
+        on_built(built)
     agent = built.agent
     evaluation: EvaluationRecord | None = None
     if config.quality.enabled and config.quality.criteria:

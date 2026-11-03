@@ -65,7 +65,7 @@ from .problems import NodestroError
 logger = logging.getLogger(__name__)
 
 Mode = Literal["managed", "container", "external", "unavailable"]
-JobKind = Literal["pull", "build", "install_runtime", "import_package", "import_gguf", "move_models"]
+JobKind = Literal["pull", "build", "install_runtime", "import_package", "import_gguf", "move_models", "benchmark"]
 JobState = Literal["running", "done", "failed", "cancelled"]
 
 #: Where the local model settings are stored (one document; the app settings stay untouched).
@@ -80,6 +80,19 @@ _SHOW_TTL = 600.0
 LOCAL_CONTEXT_LENGTH = 32768
 
 
+class ModelSpeed(BaseModel):
+    """How fast an installed model answered here, measured by :meth:`LocalModelService.benchmark` (never estimated)."""
+
+    #: Generated tokens per second (Ollama's ``eval_count`` / ``eval_duration``).
+    tokens_per_second: float
+    #: Prompt tokens read per second (``prompt_eval_count`` / ``prompt_eval_duration``), when Ollama reports it.
+    prompt_tokens_per_second: float | None = None
+    measured_at: datetime
+    #: The context window the model was loaded with, and where it ran (``/api/ps``: share of it in GPU memory).
+    context_length: int | None = None
+    processor: Literal["gpu", "cpu", "mixed"] | None = None
+
+
 class InstalledModel(BaseModel):
     name: str
     size: int
@@ -92,6 +105,8 @@ class InstalledModel(BaseModel):
     #: Part of Nodestro's catalog, and whether its digest is the verified one of the catalog.
     catalog: bool = False
     verified: bool = False
+    #: The last measured speed on this computer (``None``: not measured yet).
+    speed: ModelSpeed | None = None
 
 
 class LocalJob(BaseModel):
@@ -132,8 +147,41 @@ class LocalStatus(BaseModel):
     detected_external: str | None = None
     #: The strict offline mode is on: downloads are refused, the managed server runs without a proxy.
     offline: bool = False
+    #: The context window (tokens) models get: ``configured`` when Nodestro starts the server with it (managed,
+    #: Local Docker), ``server`` when read from a model the server has loaded (``/api/ps``), else ``unknown``.
+    context_length: int | None = None
+    context_source: Literal["configured", "server", "unknown"] = "unknown"
+    #: Whether models run on a GPU: from the models loaded now (``/api/ps``), else from this computer's hardware
+    #: when the server runs here; ``None`` when not known (an external server on another computer).
+    accelerated: bool | None = None
     error_code: str | None = None
     error: str | None = None
+
+
+class LocalAdvice(BaseModel):
+    """A hint about the local models of this computer; the interface shows its own text for the ``code``.
+
+    ``value`` and ``recommended`` depend on the code: tokens for ``local.context_small``, tokens per second times ten
+    for ``local.model_slow``, bytes for ``local.memory_low``."""
+
+    code: str
+    severity: Literal["info", "warning"] = "info"
+    model: str | None = None
+    value: int | None = None
+    recommended: int | None = None
+
+
+#: Below this context window agents run out of room (prompt, thinking and answer share it).
+SMALL_CONTEXT = 16384
+#: Below this measured speed (tokens per second) a model is slow for agent work.
+SLOW_TOKENS_PER_SECOND = 8.0
+#: Below this memory only the smallest models run.
+LOW_MEMORY = 8 * 1024**3
+_PS_TTL = 30.0
+_BENCHMARK_PROMPT = (
+    "Write a short, plain paragraph (about eighty words) that explains why a team should write down the decisions it "
+    "makes in meetings. Do not use lists."
+)
 
 
 class LocalModelService:
@@ -173,6 +221,7 @@ class LocalModelService:
         self._jobs: dict[str, LocalJob] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._show: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._ps: tuple[float, list[dict[str, Any]]] | None = None
 
     # ---- settings ------------------------------------------------------------------------------------------
 
@@ -329,6 +378,8 @@ class LocalModelService:
         url = self.ollama_url()
         status.base_url = url
         if url is None:
+            status.context_length, status.context_source = self._window([], [])
+            status.accelerated = self._accelerated([])
             return status
         try:
             client = self._client_factory(url)
@@ -337,7 +388,186 @@ class LocalModelService:
             status.models = self.installed(client)
         except OllamaError as exc:
             status.error_code, status.error = exc.code, str(exc)
+        loaded = self._loaded(client) if status.running else []
+        status.context_length, status.context_source = self._window(loaded, status.models)
+        status.accelerated = self._accelerated(loaded)
         return status
+
+    def _window(
+        self, loaded: list[dict[str, Any]], models: list[InstalledModel]
+    ) -> tuple[int | None, Literal["configured", "server", "unknown"]]:
+        if self.mode in ("managed", "container"):
+            return self.context_length, "configured"
+        chat = {model.name for model in models if model.kind == "chat"}
+        # Embedding models load with their own small window; only chat models tell what agents get.
+        windows = [
+            int(item["context_length"])
+            for item in loaded
+            if isinstance(item.get("context_length"), int) and item.get("name") in chat
+        ]
+        return (min(windows), "server") if windows else (None, "unknown")
+
+    def context_window(self, models: list[InstalledModel] | None = None) -> int | None:
+        """The context window agents get (configured, or read from a loaded chat model); ``None``: not known.
+        Never starts the managed server."""
+        if self.mode in ("managed", "container"):
+            return self.context_length
+        if self.ollama_url() is None:
+            return None
+        try:
+            found = models if models is not None else self.installed()
+        except NodestroError:
+            return None
+        return self._window(self._loaded(), found)[0]
+
+    def _loaded(self, client: OllamaClient | None = None) -> list[dict[str, Any]]:
+        """The models the server has loaded now (``/api/ps``; cached briefly, ``[]`` when it cannot answer)."""
+        cached = self._ps
+        if cached is not None and time.monotonic() - cached[0] < _PS_TTL:
+            return cached[1]
+        try:
+            loaded = (client or self.client()).running()
+        except (OllamaError, NodestroError):
+            return []
+        self._ps = (time.monotonic(), loaded)
+        return loaded
+
+    def _here(self) -> bool:
+        """Whether the server runs on this computer (managed, the Local Docker container, a loopback address)."""
+        return self.mode in ("managed", "container") or _loopback(self.ollama_url())
+
+    def _accelerated(self, loaded: list[dict[str, Any]]) -> bool | None:
+        if self._here():
+            # This computer's hardware decides: Ollama 0.40 reports part of a model in GPU memory (``size_vram``)
+            # even on a computer without any GPU device (measured: "28%/72% CPU/GPU" on a 4-vCPU VM).
+            return self.hardware().gpu != "none"
+        sizes = [(int(item.get("size") or 0), int(item.get("size_vram") or 0)) for item in loaded]
+        sizes = [(size, vram) for size, vram in sizes if size > 0]
+        if not sizes:
+            return None
+        if all(vram == 0 for _size, vram in sizes):
+            return False
+        # Another computer: only a model that is (almost) entirely in GPU memory counts; a split is not known.
+        return True if any(vram * 10 >= size * 9 for size, vram in sizes) else None
+
+    def accelerated(self) -> bool | None:
+        """Whether local models run on a GPU (``None``: not known); never starts the managed server."""
+        if self.ollama_url() is None:
+            return None if self.mode == "external" else self.hardware().gpu != "none"
+        return self._accelerated(self._loaded())
+
+    def speeds(self) -> dict[str, ModelSpeed]:
+        """The measured speeds of installed models, by model name (see :meth:`benchmark`)."""
+        stored = self.settings().get("speeds") or {}
+        result = {}
+        for name, value in stored.items():
+            with suppress(ValueError, TypeError):
+                result[name] = ModelSpeed.model_validate(value)
+        return result
+
+    def benchmark(self, name: str) -> LocalJob:
+        """Measure how fast an installed chat model answers here: a short fixed request without thinking.
+
+        Loads the model (as an agent's first request would), so it takes a while on a computer without a GPU. The
+        result is stored with the model (:meth:`speeds`) and shown instead of any estimate."""
+        name = _model_name(name)
+        client = self.client()
+        details = self.details(name, client=client)
+        if not details:
+            raise NodestroError("local.model_missing", f"{name} is not installed", model=name)
+        capabilities = details.get("capabilities") or []
+        if "completion" not in capabilities:
+            raise NodestroError("local.not_chat_model", f"{name} is not a chat model", model=name)
+
+        def work(job: LocalJob, cancel: threading.Event) -> None:
+            job.message = "loading"
+            body: dict[str, Any] = {
+                "model": name,
+                "prompt": _BENCHMARK_PROMPT,
+                "stream": False,
+                "options": {"num_predict": 96, "temperature": 0},
+            }
+            if "thinking" in capabilities:
+                body["think"] = False
+            data = client.http.request("POST", "/api/generate", body, timeout=900.0, model=name) or {}
+            if cancel.is_set():
+                return
+            generated, spent = _int_of(data.get("eval_count")), _int_of(data.get("eval_duration"))
+            if not generated or not spent:
+                raise NodestroError("local.benchmark_failed", f"{name} reported no generation timing", model=name)
+            read, reading = _int_of(data.get("prompt_eval_count")), _int_of(data.get("prompt_eval_duration"))
+            self._ps = None
+            loaded = next((item for item in self._loaded(client) if item.get("name") in (name, f"{name}:latest")), {})
+            size, vram = int(loaded.get("size") or 0), int(loaded.get("size_vram") or 0)
+            processor: Literal["gpu", "cpu", "mixed"] | None = None
+            if self._here() and self.hardware().gpu == "none":
+                processor = "cpu"  # whatever ``size_vram`` says (see _accelerated)
+            elif size:
+                processor = "gpu" if vram >= size else "cpu" if vram == 0 else "mixed"
+            speed = ModelSpeed(
+                tokens_per_second=round(generated / (spent / 1e9), 2),
+                prompt_tokens_per_second=round(read / (reading / 1e9), 2) if read and reading else None,
+                measured_at=datetime.now(UTC),
+                context_length=loaded.get("context_length") if isinstance(loaded.get("context_length"), int) else None,
+                processor=processor,
+            )
+            with self._lock:
+                speeds = dict(self.settings().get("speeds") or {})
+                speeds[name] = speed.model_dump(mode="json")
+                self._save(speeds=speeds)
+            job.message = f"{speed.tokens_per_second} tokens/s"
+            job.completed = job.total = generated
+
+        return self._run("benchmark", name, work)
+
+    def advice(self, status: LocalStatus, *, reasoning_saving: bool = False) -> list[LocalAdvice]:
+        """Hints for this computer: a small context window, no GPU, slow or too large models, little memory.
+
+        ``reasoning_saving``: the workspace's CPU saving mode is on (``local_reasoning`` ``auto``); shown when it
+        applies here."""
+        hints: list[LocalAdvice] = []
+        if status.context_length is not None and status.context_length < SMALL_CONTEXT:
+            hints.append(
+                LocalAdvice(
+                    code="local.context_small",
+                    severity="warning",
+                    value=status.context_length,
+                    recommended=LOCAL_CONTEXT_LENGTH,
+                )
+            )
+        elif status.running and status.context_source == "unknown":
+            hints.append(LocalAdvice(code="local.context_unknown", recommended=LOCAL_CONTEXT_LENGTH))
+        hardware = self.hardware()
+        if status.accelerated is False:
+            hints.append(LocalAdvice(code="local.cpu_only", value=hardware.cpus))
+            if reasoning_saving:
+                hints.append(LocalAdvice(code="local.reasoning_saving"))
+        if hardware.ram_bytes is not None and hardware.ram_bytes < LOW_MEMORY:
+            hints.append(
+                LocalAdvice(
+                    code="local.memory_low", severity="warning", value=hardware.ram_bytes, recommended=LOW_MEMORY
+                )
+            )
+        limit = max(hardware.ram_bytes or 0, hardware.gpu_memory_bytes or 0)
+        for model in status.models:
+            if model.kind != "chat":
+                continue
+            if model.speed is not None and model.speed.tokens_per_second < SLOW_TOKENS_PER_SECOND:
+                hints.append(
+                    LocalAdvice(
+                        code="local.model_slow",
+                        severity="warning",
+                        model=model.name,
+                        value=int(model.speed.tokens_per_second * 10),
+                        recommended=int(SLOW_TOKENS_PER_SECOND * 10),
+                    )
+                )
+            # Loaded, a model needs about a fifth more than its file (context and runtime buffers).
+            if limit and model.size * 6 // 5 > limit:
+                hints.append(
+                    LocalAdvice(code="local.model_too_large", severity="warning", model=model.name, value=model.size)
+                )
+        return hints
 
     # ---- models --------------------------------------------------------------------------------------------
 
@@ -348,6 +578,7 @@ class LocalModelService:
         except OllamaError as exc:
             raise _error(exc) from None
         result = []
+        speeds = self.speeds()
         for model in found:
             if model.remote:
                 continue  # cloud models never count as local
@@ -365,6 +596,7 @@ class LocalModelService:
                     embedding_length=details.get("embedding_length") or model.embedding_length,
                     catalog=entry is not None,
                     verified=entry is not None and entry.digest == model.digest,
+                    speed=speeds.get(model.name),
                 )
             )
         return result
@@ -678,6 +910,41 @@ class LocalModelService:
 
 #: The orkexa recipes of catalog models with ``source="build"``.
 _RECIPES: dict[str, GGUFRecipe] = {MDENSEON.name: MDENSEON}
+
+
+class BuildInput(BaseModel):
+    """One pinned upstream file a catalog model is built from (what an offline build needs on this computer)."""
+
+    role: Literal["weights", "template"]
+    url: str
+    sha256: str
+    #: Bytes; for the template the length of the header the build reads (a longer file with it is accepted).
+    size: int | None = None
+
+
+def build_inputs(name: str) -> list[BuildInput]:
+    """The pinned files of a catalog model built from upstream files (``[]`` for every other model)."""
+    recipe = _RECIPES.get(name.removeprefix("ollama:"))
+    if recipe is None:
+        return []
+    return [
+        BuildInput(role="weights", url=recipe.weights.url, sha256=recipe.weights.sha256, size=recipe.weights.size),
+        BuildInput(role="template", url=recipe.template.url, sha256=recipe.template.sha256, size=recipe.template.size),
+    ]
+
+
+def _int_of(value: Any) -> int:
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _loopback(url: str | None) -> bool:
+    """Whether the server's address is this computer (its hardware is the one :func:`detect_hardware` sees)."""
+    if not url:
+        return False
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
 
 
 def _context_length(value: str | None) -> int:

@@ -731,6 +731,9 @@ class NodeRun(_Model):
     error_params: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
+    #: Why the step's local model thought less than its effort asks: ``cpu_saving`` (the CPU saving mode of the
+    #: workspace setting ``local_reasoning``, RT-050); ``None`` when it ran as configured.
+    reasoning_reduced: str | None = None
     evaluation: EvaluationRecord | None = None
     memory: dict[str, str] | None = None
     started_at: datetime | None = None
@@ -952,6 +955,9 @@ class SettingsIn(_Model):
     strict_offline: bool | None = None
     #: Prefer European local models among equally suited ones (never a cloud service, never a weaker model).
     prefer_european_models: bool | None = None
+    #: The CPU saving mode of local thinking models (``auto``: on a server without a GPU, effort ``medium`` answers
+    #: without the thinking phase; ``full``: always as the agent's effort says).
+    local_reasoning: Literal["auto", "full"] | None = None
 
 
 class BuiltinSandboxStatus(_Model):
@@ -1075,5 +1081,8 @@ class Settings(_Model):
     strict_offline: bool = False
     #: Whether the model selection prefers European local models among equally suited ones.
     prefer_european_models: bool = False
+    #: The CPU saving mode of local thinking models: ``auto`` (default) lets effort ``medium`` answer without the
+    #: thinking phase when the local model server has no GPU; effort ``high`` is never reduced. ``full`` turns it off.
+    local_reasoning: Literal["auto", "full"] = "auto"
     #: Whether this installation started with local default models (``local``) or kept its cloud defaults (``kept``).
     model_defaults: Literal["local", "kept"] = "kept"
