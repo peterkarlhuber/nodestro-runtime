@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
+import http.server
 from pathlib import Path
+import threading
 from typing import Any
 
 from orkexa.pricing import ModelPrice, TokenRates
 import pytest
 
+from nodestro_runtime import reconciliation
+from nodestro_runtime.pricing_sync import HttpSettings
 from nodestro_runtime.reconciliation import (
     ANTHROPIC_ANALYTICS_BETA,
     ANTHROPIC_COST_URL,
@@ -287,3 +292,76 @@ async def test_nodestro_estimates_cover_runs_and_the_usage_ledger(tmp_path: Path
         assert nodestro_estimates(workspace, date(2020, 1, 1), date(2020, 1, 2)) == {}
     finally:
         workspace.close()
+
+
+# ---- RT2-08: admin keys never follow a redirect ----------------------------------------------------------------------
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Answers every GET with a redirect (``redirect_to`` set) or with JSON, and records the headers it got."""
+
+    redirect_to: str | None = None
+    seen: list[dict[str, str]]
+
+    def do_GET(self) -> None:
+        self.seen.append(dict(self.headers.items()))
+        if self.redirect_to is not None:
+            self.send_response(302)
+            self.send_header("Location", self.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = b'{"data": []}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+@contextmanager
+def _server(redirect_to: str | None = None) -> Iterator[tuple[str, list[dict[str, str]]]]:
+    seen: list[dict[str, str]] = []
+    handler = type("Handler", (_Recorder,), {"redirect_to": redirect_to, "seen": seen})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("target", ["other host", "same host"])
+def test_a_redirect_of_the_billing_api_is_not_followed_with_the_admin_key(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    with _server() as (elsewhere, landed):
+        location = f"{elsewhere}/steal" if target == "other host" else "/v1/organization/costs?moved=1"
+        with _server(redirect_to=location) as (api, asked):
+            with pytest.raises(reconciliation.ReconciliationError) as error:
+                reconciliation._fetch(
+                    f"{api}/v1/organization/costs", {"Authorization": "Bearer sk-admin-secret"}, HttpSettings()
+                )
+            assert "redirect" in str(error.value).lower()
+            assert len(asked) == 1 and asked[0].get("Authorization") == "Bearer sk-admin-secret"
+        assert landed == []  # the key never reached the redirect's target
+        # Without a redirect the same request is answered as before.
+        body = reconciliation._fetch(f"{elsewhere}/ok", {"Authorization": "Bearer k"}, HttpSettings())
+        assert body == {"data": []} and landed[0].get("Authorization") == "Bearer k"
+
+
+def test_get_json_checks_the_host_and_uses_the_fetch_without_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(reconciliation, "_fetch", lambda url, _headers, _settings: calls.append(url) or {"ok": 1})
+    assert reconciliation.get_json(reconciliation.OPENAI_COSTS_URL, {}, [("a", "1")]) == {"ok": 1}
+    assert calls == [f"{reconciliation.OPENAI_COSTS_URL}?a=1"]
+    with pytest.raises(reconciliation.ReconciliationError):
+        reconciliation.get_json("https://example.com/v1/costs", {}, [])
