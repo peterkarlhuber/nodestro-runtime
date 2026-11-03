@@ -308,8 +308,8 @@ def test_nothing_starts_or_downloads_when_a_workspace_opens(tmp_path: Path, monk
 
 
 def test_local_usage_is_counted_but_never_shown_as_a_free_total() -> None:
-    from orkexa.pricing import PricingBasis
     from orkexa.core.types import TokenUsage
+    from orkexa.pricing import PricingBasis
     from orkexa.usage import record_token_usage, summarize_usage
 
     from nodestro_runtime.engine import add_usage, usage_of
