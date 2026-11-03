@@ -20,6 +20,10 @@ Backend audit round 2, runtime fixes (2026-11-03):
   both stores: SQLite schema version 2 (backup first, as for version 1; an older release refuses the upgraded
   database) and PostgreSQL migration `0009_created_order` (function `nodestro_created_order`, two partial indexes on
   runs). `list` is unchanged.
+- RT2-06: `tests/test_worker_tool_changes.py` runs the runtime sandbox's self-test once per module and skips with its
+  verdict when the self-test refuses the daemon (e.g. cgroup v1) instead of failing every test with `tool.sandbox`. In
+  CI (`GITHUB_ACTIONS`), with `NODESTRO_REQUIRE_DOCKER=1` or with the new `NODESTRO_REQUIRE_SANDBOX=1` a refusal is a
+  failure, so CI coverage is unchanged.
 
 Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).
