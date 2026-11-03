@@ -928,8 +928,8 @@ def build_inputs(name: str) -> list[BuildInput]:
     if recipe is None:
         return []
     return [
-        BuildInput(role=role, url=source.url, sha256=source.sha256, size=source.size)
-        for role, source in (("weights", recipe.weights), ("template", recipe.template))
+        BuildInput(role="weights", url=recipe.weights.url, sha256=recipe.weights.sha256, size=recipe.weights.size),
+        BuildInput(role="template", url=recipe.template.url, sha256=recipe.template.sha256, size=recipe.template.size),
     ]
 
 
