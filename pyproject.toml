@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@0861c1b2b79209c388a5e996035e5676a96f6d75",
+    "orkexa[all,pdf] @ git+https://github.com/peterkarlhuber/orkexa.git@bc8c4edae637b2e53f7f63f86f84846ea2e70e43",
     "pydantic>=2.6,<3",
     # Builds the Python environments of tools with third-party libraries (see python_envs.py).
     "uv>=0.5",
@@ -37,12 +37,12 @@ dependencies = [
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@2767a2eb3705161db674fb7ba887dd15d422e12e",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@a87224291b561981ed8afab6131e18d8c9eecc01",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@2767a2eb3705161db674fb7ba887dd15d422e12e",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@a87224291b561981ed8afab6131e18d8c9eecc01",
     "mypy>=1.13",
     # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
     "pglast>=7,<9",

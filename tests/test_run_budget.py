@@ -121,6 +121,7 @@ async def test_a_request_that_could_exceed_the_budget_pauses_before_it_is_sent(m
     assert request.limit_usd == Decimal("0.01") and request.spent_usd == 0
     (blocked,) = request.requests
     assert blocked.refused and blocked.node_id == "a" and blocked.bounded
+    assert blocked.agent == "a" and blocked.label == "A"  # the step as the workflow names it (NSL-13)
     assert blocked.max_cost_usd is not None and blocked.max_cost_usd > Decimal("0.01")
     # The suggestion admits exactly this request: what it can cost at most, rounded up to the cent.
     assert request.suggested_limit_usd == run_budget.ceil_cent(blocked.max_cost_usd)
@@ -344,6 +345,7 @@ async def test_parallel_agents_wait_for_one_decision(make: Make) -> None:
     assert {paused.nodes[key].status for key in "abc"} == {"awaiting_budget"}
     request = pending(workspace, paused)
     assert sorted(item.node_id for item in request.requests) == ["a", "b", "c"]
+    assert sorted(item.label or "" for item in request.requests) == ["A", "B", "C"]
     assert sum(item.refused for item in request.requests) == 1
     assert calls(workspace) == 0
     done = await decide(workspace, paused, limit="5.00")
@@ -382,6 +384,8 @@ async def test_a_sub_workflow_limit_is_raised_alone_and_the_parent_limit_still_a
     assert inner is not None and inner.nodes["a"].status == "awaiting_budget"
     assert request.block.scope == "subworkflow" and request.block.run_id == inner.id
     assert request.block.node_id == "child" and request.block.label == "Child"
+    # The waiting step is the child run's node, named as in the child workflow.
+    assert [(item.run_id, item.node_id, item.label) for item in request.requests] == [(inner.id, "a", "A")]
     # Raising the sub-workflow's limit: the parent's limit of $0.02 is still too small, which is the next decision.
     still = await decide(workspace, paused, limit="5.00")
     assert still.status == "paused"

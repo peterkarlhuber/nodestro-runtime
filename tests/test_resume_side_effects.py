@@ -198,7 +198,11 @@ def test_only_calls_that_may_have_run_count() -> None:
     assert resume._may_have_run(call(status="allowed"))
     # Asked and never answered (the run stopped), refused, or a read-only built-in tool: nothing ran outside.
     assert not resume._may_have_run(call(status="pending"))
-    assert not resume._may_have_run(call(error=True))
+    assert not resume._may_have_run(call(error=True, status="denied"))
+    assert not resume._may_have_run(call(error=True, status="rejected"))
+    # A call that reached the tool and then failed (e.g. timed out after sending) may have had its effect (RT2-01).
+    assert resume._may_have_run(call(error=True))
+    assert resume._may_have_run(call(error=True, status="approved"))
     assert not resume._may_have_run(call("calculator"))
     # A tool an extension adds counts like any other tool (it may change things).
     assert resume._may_have_run(call("send_note"))

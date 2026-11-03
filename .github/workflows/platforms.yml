@@ -32,16 +32,9 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      # The Nodestro components and orkexa are cloned by pip; the token exists only in this step's environment.
-      - name: Install with read access to the Nodestro repositories
-        env:
-          NODESTRO_READ: ${{ secrets.NODESTRO_READ }}
+      # The Nodestro components and orkexa are public: pip clones them anonymously over https.
+      - name: Install
         run: |
-          if [ -n "$NODESTRO_READ" ]; then
-            export GIT_CONFIG_COUNT=1
-            export GIT_CONFIG_KEY_0="url.https://x-access-token:${NODESTRO_READ}@github.com/peterkarlhuber/.insteadOf"
-            export GIT_CONFIG_VALUE_0="https://github.com/peterkarlhuber/"
-          fi
           # Windows ARM64: cryptography (needed by google-auth through orkexa) published win_arm64 wheels last for
           # 46.0.3; newer versions would be compiled from source, which needs Rust and OpenSSL on the runner.
           if [ "$RUNNER_OS" = "Windows" ] && [ "$RUNNER_ARCH" = "ARM64" ]; then

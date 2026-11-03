@@ -32,11 +32,13 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from datetime import datetime
 import hashlib
 from importlib import resources
 import json
 import os
 import re
+import select
 import threading
 import time
 from typing import Any
@@ -45,7 +47,7 @@ import weakref
 from pydantic import BaseModel
 
 from .problems import NodestroError
-from .storage import BeforeMigration, DamagedDocuments, ModelT
+from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time
 
 try:  # optional: nodestro-runtime[postgres]
     import psycopg
@@ -98,6 +100,9 @@ def _encode(text: str) -> tuple[str, str | None]:
 
 #: The exact JSON text of a row.
 _JSON = "coalesce(raw, data::text)"
+#: The creation order of :meth:`PostgresStore.list_page` (RT2-05): the document's ``created_at`` as a time, ``NULL``
+#: when it is missing or not a time; the expression of the indexes of migration 0009, which a query must repeat.
+_CREATED_ORDER = "nodestro_created_order(data ->> 'created_at')"
 
 
 def _setting(given: float | None, variable: str, default: float, *, minimum: float) -> Any:
@@ -156,6 +161,32 @@ RUNTIME_TABLE_PRIVILEGES = "SELECT, INSERT, UPDATE, DELETE"
 SCHEMA_VERSION_TABLES = ("nodestro_schema_migrations", "axentra_schema_migrations")
 
 
+def _server_spoke(connection: Any) -> bool:
+    """Whether data or the end of the stream waits on the socket of an idle connection (no round trip)."""
+    try:
+        fd = connection.pgconn.socket
+    except Exception:  # no socket any more: certainly not usable
+        return True
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+            return bool(poller.poll(0))
+        readable, _, failed = select.select([fd], [], [fd], 0)
+        return bool(readable or failed)
+    except (OSError, ValueError):
+        return True
+
+
+def _still_usable(connection: Any) -> bool:
+    """Whether a connection answers an empty statement (one round trip)."""
+    try:
+        ConnectionPool.check_connection(connection)
+    except Exception:
+        return False
+    return True
+
+
 class PostgresDatabase:
     """A pool of PostgreSQL connections shared by the stores of every tenant, with its schema migrations.
 
@@ -166,8 +197,10 @@ class PostgresDatabase:
     The pool holds at most ``pool_size`` connections (default ``NODESTRO_DATABASE_POOL_SIZE``, else 8). A
     connection that sat idle in the pool for more than :data:`CHECK_AFTER_IDLE` seconds is checked before it is
     handed out, so a connection the server dropped (a restart, a failover, an idle timeout of a proxy) is replaced
-    instead of failing the next call. A read outside a transaction that meets a lost connection anyway is retried on
-    another one; a write is not repeated (it may have been applied) and fails. The pool discards lost connections.
+    instead of failing the next call; so is, on every checkout, a connection the server closed or spoke on while it
+    sat idle, which shows on its socket without a round trip (RT2-03). A read outside a transaction that meets a lost
+    connection anyway is retried on another one; a write is not repeated (it may have been applied) and fails. The
+    pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
     transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
@@ -251,12 +284,26 @@ class PostgresDatabase:
 
     @contextmanager
     def _connection(self, timeout: float | None = None) -> Iterator[Any]:
-        """A pooled connection; notes when it goes back (no ``reset`` callback: that returns through a worker)."""
-        with self._pool.connection(timeout=timeout) as connection:
-            try:
-                yield connection
-            finally:
-                self._returned[connection] = time.monotonic()
+        """A pooled connection; notes when it goes back (no ``reset`` callback: that returns through a worker).
+
+        An idle connection in the pool has no statement in flight, so the server has nothing to say on it; data (or
+        the end of the stream) waiting on its socket means the server closed it (a restart, a failover,
+        ``pg_terminate_backend``) or sent a notice. That costs no round trip to find out, so it is looked at on every
+        checkout, and such a connection is checked and, when it is broken, closed (the pool discards it) before
+        another one is taken, without the pool's back-off between failed checks. Nothing was sent on it yet, so this
+        never repeats a statement: a write must never meet such a connection, because a failed write is not repeated
+        (RT2-03). After ``pool_size`` broken connections the next one is handed out as it is."""
+        attempts = self.pool_size + 1
+        for attempt in range(1, attempts + 1):
+            with self._pool.connection(timeout=timeout) as connection:
+                if attempt < attempts and _server_spoke(connection) and not _still_usable(connection):
+                    connection.close()
+                    continue
+                try:
+                    yield connection
+                finally:
+                    self._returned[connection] = time.monotonic()
+                return
 
     def _check_if_idle(self, connection: Any) -> None:
         """Check a connection that sat idle (raises when it is broken; the pool then opens another one)."""
@@ -483,11 +530,16 @@ class PostgresDatabase:
                     " version integer PRIMARY KEY, name text NOT NULL,"
                     " applied_at timestamptz NOT NULL DEFAULT now(), checksum text)"
                 )
-                if not self._has_checksums():  # a table of a release before checksums
-                    db.execute("ALTER TABLE nodestro_schema_migrations ADD COLUMN IF NOT EXISTS checksum text")
+                # A table of a release before checksums gets its column only after the backup (OPS2-01): ALTER TABLE
+                # holds an ACCESS EXCLUSIVE lock until this transaction ends, and the backup (pg_dump on another
+                # connection) would wait for it while this transaction waits for the backup. Before the backup this
+                # transaction takes no lock that a reader waits for; the applied migrations are checked (by name
+                # without the column) without writing anything.
+                checksums = self._has_checksums()
                 current = self.schema_version
-                self._verify_applied(steps, adopt=True)
+                self._verify_applied(steps, adopt=False)
                 if current == target:
+                    self._adopt_checksums(db, steps, checksums)
                     return current
                 if current > target:
                     raise NodestroError(
@@ -522,6 +574,7 @@ class PostgresDatabase:
                             found=current,
                             supported=target,
                         ) from exc
+                self._adopt_checksums(db, steps, checksums)
                 step = current
                 try:
                     with db.transaction():  # a savepoint: the failure below is reported, then everything rolls back
@@ -549,6 +602,13 @@ class PostgresDatabase:
                     ) from exc
                 return current
 
+    def _adopt_checksums(self, db: Any, steps: Mapping[int, tuple[str, PostgresStep]], checksums: bool) -> None:
+        """Inside :meth:`migrate`, after the backup: give a schema table of a release before checksums its column and
+        record the checksums of the migrations applied without them."""
+        if not checksums:
+            db.execute("ALTER TABLE nodestro_schema_migrations ADD COLUMN IF NOT EXISTS checksum text")
+        self._verify_applied(steps, adopt=True)
+
     def _has_checksums(self) -> bool:
         rows = self._query(
             "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('nodestro_schema_migrations')"
@@ -559,14 +619,18 @@ class PostgresDatabase:
     def _verify_applied(self, steps: Mapping[int, tuple[str, PostgresStep]], *, adopt: bool) -> None:
         """Refuse applied migrations whose shipped file differs (``storage.migration_changed``); with ``adopt``
         (under the migration lock), record the checksum of rows written before checksums were kept, after checking
-        that the file name is the one that was applied."""
+        that the file name is the one that was applied. A table of a release before checksums has only the names
+        to compare (and nothing is adopted until :meth:`migrate` added the column)."""
+        query = "SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version"
         if not self._has_checksums():
-            return
+            exists = self._query("SELECT to_regclass('nodestro_schema_migrations') IS NOT NULL")
+            if not exists or not exists[0][0]:
+                return
+            query = "SELECT version, name, NULL::text FROM nodestro_schema_migrations ORDER BY version"
+            adopt = False
         changed: builtins.list[str] = []
         adopted: builtins.list[tuple[str, int]] = []
-        for version, name, checksum in self._query(
-            "SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version"
-        ):
+        for version, name, checksum in self._query(query):
             if version not in steps:
                 continue  # newer than this release: refused as storage.schema_too_new
             shipped_name, step = steps[version]
@@ -876,6 +940,48 @@ class PostgresStore:
             params = (*params, limit)
         rows = self.database._query(query, params)
         return [item for _key, item in self.damaged.parse(collection, rows, model)]
+
+    def list_page(
+        self,
+        collection: str,
+        model: type[ModelT],
+        *,
+        limit: int,
+        before: tuple[datetime, str] | None = None,
+        top_level: bool = False,
+        summary: bool = False,
+    ) -> tuple[builtins.list[ModelT], bool]:
+        """One keyset page of the tenant's documents by creation, newest first (see
+        :class:`~nodestro_runtime.storage.DocumentStore`); indexed for ``runs`` (migration 0009), so a page costs
+        ``limit + 1`` index entries, not the whole collection. Returns the page and whether more documents follow."""
+        if collection not in PAGED_COLLECTIONS:
+            raise ValueError(f"list_page has no index for the collection {collection!r}")
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        self._check()
+        # The collection is a literal, so the partial indexes of migration 0009 apply in every plan (also in a
+        # generic plan of a prepared statement, which knows no parameter values).
+        where = "tenant_id = %s AND collection = 'runs' AND " + _CREATED_ORDER + " IS NOT NULL"
+        params: builtins.list[Any] = [self.tenant_id]
+        if top_level:
+            where += " AND (data ->> 'parent_run_id') IS NULL"
+        if before is not None:
+            moment, after = before
+            where += " AND (" + _CREATED_ORDER + ", id) < (%s::timestamptz, %s)"
+            params += [cursor_time(moment), after]
+        data = _JSON
+        if summary:
+            data = (
+                "CASE WHEN raw IS NULL THEN (SELECT jsonb_object_agg(entry.key, entry.value)"
+                " FROM jsonb_each(data) AS entry WHERE entry.key = ANY(%s))::text ELSE raw END"
+            )
+            params = [builtins.list(model.model_fields), *params]
+        rows = self.database._query(
+            f"SELECT id, {data} FROM nodestro_documents WHERE {where} ORDER BY {_CREATED_ORDER} DESC, id DESC LIMIT %s",
+            (*params, limit + 1),
+        )
+        more = len(rows) > limit
+        return [item for _key, item in self.damaged.parse(collection, rows[:limit], model)], more
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, in update order."""

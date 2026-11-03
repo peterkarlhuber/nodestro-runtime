@@ -244,6 +244,16 @@ model) is left out of `list`, `items`, `list_prefix` and `find` of `SQLiteStore`
 collection and id (`SQLiteStore.damaged` keeps them); the start-up recovery skips it too. `get` of that one document
 still raises.
 
+**Keyset run listing.** `store.list_page("runs", model, limit=n, before=None, top_level=False, summary=False)`
+returns `(page, more)`: at most `n` runs, newest `created_at` first (ties: higher id first), strictly after the
+cursor `before = (created_at, run_id)` of the previous page's last run (`run_id=""`: everything older than that
+time; a time without zone counts as UTC), `top_level=True` leaves out runs with a `parent_run_id`, `summary=True`
+reads only the top-level fields the model declares (e.g. `RunSummary`, without the run's nodes and workflow), and
+`more` says whether older runs follow. Both stores read one page from an index (SQLite schema version 2,
+PostgreSQL migration `0009_created_order`), whatever the number of runs; times compare at the store's precision
+(milliseconds on SQLite, microseconds on PostgreSQL), so take the cursor from the returned run, not from a rounded
+copy. Runs without a readable `created_at` (and damaged documents) are not listed. `list` is unchanged.
+
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `pip install "nodestro-runtime[postgres]"` (psycopg 3) and is not
 used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns one connection; `database.store(tenant_id)` gives
@@ -405,7 +415,7 @@ quickstart above.
 Docker and network); `NODESTRO_REQUIRE_DOCKER=1` makes a missing Docker fail instead of skip, as in the CI job
 `docker`.
 
-CI needs the repository secret `NODESTRO_READ` (read access to Orkexa and the Nodestro repositories).
+CI needs no secret: Orkexa and the Nodestro repositories are public and are installed anonymously.
 
 Open work (release blockers, known bugs, security follow-ups, debt) is listed in [docs/TODO.md](docs/TODO.md).
 

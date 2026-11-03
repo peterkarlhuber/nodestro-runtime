@@ -94,20 +94,43 @@ class ProviderReport(BaseModel):
 JsonGetter = Callable[[str, Mapping[str, str], list[tuple[str, str]]], Any]
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect (RT2-08): urllib would repeat the request with all its headers, the admin key included,
+    at whatever address the answer names, and only the first address is checked against :data:`_ALLOWED_HOSTS`. The
+    billing APIs answer directly; a redirect is an error, never followed."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        host = urllib.parse.urlsplit(req.full_url).hostname
+        raise ReconciliationError(f"The billing API of {host} answered with a redirect (HTTP {code}); not followed")
+
+
 def get_json(
     url: str, headers: Mapping[str, str], params: list[tuple[str, str]], *, http: HttpSettings | None = None
 ) -> Any:
-    """One HTTPS GET of a provider's admin API; size- and time-limited. Never logs the headers (keys)."""
+    """One HTTPS GET of a provider's admin API; size- and time-limited, no redirects. Never logs the headers (keys)."""
     settings = http or HttpSettings()
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or parts.hostname not in _ALLOWED_HOSTS:
         raise ReconciliationError(f"Not an allowed billing API: {url}")
     query = urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        f"{url}?{query}" if query else url, headers={**headers, "Accept": "application/json"}
-    )
+    return _fetch(f"{url}?{query}" if query else url, headers, settings)
+
+
+def _fetch(url: str, headers: Mapping[str, str], settings: HttpSettings) -> Any:
+    """The GET of :func:`get_json` (whose allowlist checked ``url``) with an opener that never follows a redirect."""
+    parts = urllib.parse.urlsplit(url)
+    request = urllib.request.Request(url, headers={**headers, "Accept": "application/json"})
+    opener = urllib.request.build_opener(_NoRedirects)
     try:
-        with urllib.request.urlopen(request, timeout=settings.timeout) as response:
+        with opener.open(request, timeout=settings.timeout) as response:
             data: bytes = response.read(settings.max_bytes + 1)
     except urllib.error.HTTPError as exc:
         raise ReconciliationError(f"HTTP {exc.code} from {parts.hostname}") from None

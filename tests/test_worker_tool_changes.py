@@ -5,7 +5,11 @@ directory, as on a server. Before the fix, a worker kept the tools it read when 
 or deletion in the API it ran the old code, and an advance approval or a decision for the old version still let it
 run. Real PostgreSQL only (``NODESTRO_REQUIRE_POSTGRES=1`` turns a missing database into a failure). A server checks
 and runs tool code only in containers, so the tests need a reachable Docker daemon: without one they are skipped,
-except in CI (``GITHUB_ACTIONS``) or with ``NODESTRO_REQUIRE_DOCKER=1``, where a missing daemon is a failure.
+except in CI (``GITHUB_ACTIONS``) or with ``NODESTRO_REQUIRE_DOCKER=1``, where a missing daemon is a failure. The same
+holds for a daemon whose containers the sandbox's self-test refuses (for example cgroup v1, whose limits it cannot
+prove; audit RT2-06): the tests are skipped with the self-test's verdict as the reason, except in CI or with
+``NODESTRO_REQUIRE_DOCKER=1`` or ``NODESTRO_REQUIRE_SANDBOX=1``, where the refusal is a failure, so CI never loses
+them silently.
 """
 
 from __future__ import annotations
@@ -49,6 +53,27 @@ pytestmark = pytest.mark.skipif(
     not _DOCKER_REQUIRED and not _docker_daemon(),
     reason="needs a Docker daemon (a server runs tool code in containers)",
 )
+
+
+_SANDBOX_REQUIRED = _DOCKER_REQUIRED or os.environ.get("NODESTRO_REQUIRE_SANDBOX") == "1"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _sandbox_self_test(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """The self-test of the sandbox the tool calls use (the runtime image's), once per module: every container call
+    of these tests runs it too, so a daemon it refuses fails each of them with ``tool.sandbox`` for a reason that has
+    nothing to do with tool changes. Skipped then, with the verdict; a failure where the sandbox is required."""
+    workspace = Workspace(tmp_path_factory.mktemp("sandbox-self-test"), integrations=[])
+    try:
+        probe = workspace._runtime_sandbox().self_test()
+    finally:
+        workspace.close()
+    if probe.available:
+        return
+    verdict = f"the Docker sandbox's self-test refuses this daemon ({probe.reason}): {probe.detail}"
+    if _SANDBOX_REQUIRED:
+        pytest.fail(f"{verdict} (CI, NODESTRO_REQUIRE_DOCKER=1 or NODESTRO_REQUIRE_SANDBOX=1 require it)")
+    pytest.skip(verdict)
 
 
 @pytest.fixture(autouse=True)

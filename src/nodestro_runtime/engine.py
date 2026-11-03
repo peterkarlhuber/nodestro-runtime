@@ -1562,6 +1562,7 @@ class RunManager:
             requests=requests,
             deadline_hours=hours,
             on_request=lambda found, created: self._budget_requested(context, found, created),
+            labels=self._node_label_of,
         )
         pending = run.budget.pending_request_id if run.budget is not None else None
         if pending:
@@ -1569,6 +1570,15 @@ class RunManager:
             if found is not None and found.status == "pending":
                 gate.pending = found
         return gate
+
+    def _node_label_of(self, run_id: str, node_id: str) -> str | None:
+        """The label of a node of a run that executes here (a budget request names the step that waits, NSL-13)."""
+        context = self._contexts.get(run_id)
+        run = context.run if context is not None else self.store.get("runs", run_id, Run)
+        if run is None:
+            return None
+        node = next((item for item in run.workflow.nodes if item.id == node_id), None)
+        return node_label(node) if node is not None else None
 
     def _budget_requested(self, context: _RunContext, found: run_budget.BudgetRequest, created: bool) -> None:
         """A budget request was opened (``created``) or another request joined it: store it, record it in the run

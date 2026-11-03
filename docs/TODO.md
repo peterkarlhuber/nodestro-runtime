@@ -3,7 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-01 against `master` at `a42b672`.
+> **Last full review:** 2026-11-03 against `master` at `bcfea7f` (backend audit round 2).
 
 ## Summary
 
@@ -11,9 +11,9 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 8 |
-| P3 Low | 25 |
-| P4 Optional | 7 |
+| P2 Medium | 7 |
+| P3 Low | 26 |
+| P4 Optional | 9 |
 
 **Release blockers:** None for this repository.
 
@@ -290,7 +290,7 @@ None known.
 ### RT-007 · `engine.py` / `RunManager` keeps growing
 
 - **Priority:** P3 Low · **Status:** Open (deliberately deferred) · **Refs:** backend audit D-13
-- **What:** `engine.py` has 3,865 lines (3,381 at the audit start); approvals, persistence, resume and orchestration
+- **What:** `engine.py` has 4,633 lines (3,381 at the first audit start, 3,865 on 2026-11-01); approvals, persistence, resume and orchestration
   live in one class, which raises the regression risk of every change.
 - **Next step:** Extract one clearly bounded part (tool approvals, persistence or resume) with the next functional
   change to it; no big-bang refactor.
@@ -362,6 +362,22 @@ None known.
 - **What:** `UsageLog.entries(since=...)` loads the whole collection and filters in Python; `/api/usage` takes about
   0.8 s (SQLite) / 1.4 s (PostgreSQL) at 5,000 runs and grows linearly.
 - **Next step:** A store-level time filter (or SQL aggregation) for usage entries and run costs; the API uses it.
+
+### RT-042 · API run list and the remaining 500-run windows still read whole collections
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit round 2 RT2-05 / API2-04, earlier C-15
+- **What:** `DocumentStore.list_page("runs", ...)` (keyset paging, SQLite schema 2, PostgreSQL migration 0009) exists,
+  but the API's `GET /api/runs` still reads all runs for a `before=` page; `launcher.py` (cost estimate) and
+  `preview.py` still use a fixed window of 500 runs. With 10,000 stored runs a full read takes about 9 s on SQLite and
+  13.5 s on PostgreSQL.
+- **Next step:** nodestro-api switches `list_runs` to `list_page` (API-014); then replace the two 500-run windows.
+
+### RT-043 · Per-node overhead grows with workflow length
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** backend audit round 2 RT2-07
+- **What:** Each node saves the whole run document; measured 24 ms per node at 10 nodes and 42 ms at 50 nodes
+  (scripted model, shared machine). No memory leak over 600 runs.
+- **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
 
@@ -512,14 +528,12 @@ None known.
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
 
-### RT-029 · CI requires the `NODESTRO_READ` token although the dependencies are public
+### RT-044 · Office XML DTD guard scans only the start of each part
 
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** #75, backend audit D-08 residual
-- **What:** The CI install steps exit when the `NODESTRO_READ` secret is missing and still call the components
-  private. All Nodestro repositories and orkexa are public now, so runs without secrets (Dependabot, forks) fail early.
-- **Next step:** Install the git dependencies anonymously, make the token optional or remove it, fix the comments.
-- **Depends on:** none; the same change is tracked in nodestro-api #50, nodestro-sdk #47, nodestro-integrations #36,
-  nodestro-examples #40, nodestro-server #25, nodestro-desktop #17 and nodestro-studio #85.
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** backend audit round 2 RT2-09
+- **What:** The DOCTYPE check reads the first 2/4 KB of an XML part. expat already refuses entity expansion, so this
+  is defence in depth only.
+- **Next step:** Scan the whole part (streaming) when the file is touched next.
 
 ## Later optimizations
 
@@ -577,7 +591,6 @@ None known.
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
-| RT-029 | all component repositories | `NODESTRO_READ` CI change (api #50, sdk #47, integrations #36, examples #40, server #25, desktop #17, studio #85) | Same change everywhere |
 
 ## Maintaining this file
 

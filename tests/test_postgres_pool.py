@@ -110,6 +110,28 @@ def test_every_pooled_connection_can_be_dropped(database: PostgresDatabase) -> N
     assert {row[0] for row in database._query("SELECT pg_backend_pid()")}.isdisjoint(pids)
 
 
+def test_writes_right_after_every_pooled_connection_was_dropped_succeed(database: PostgresDatabase) -> None:
+    """RT2-03: a connection the server closed while it sat in the pool is replaced before a write gets it, also within
+    ``CHECK_AFTER_IDLE`` of its last use (writes are never repeated, so the check has to happen before)."""
+    store = database.store("acme")
+    store.put_raw("x", "0", {"a": 0})
+    with (
+        database._pool.connection() as one,
+        database._pool.connection() as two,
+        database._pool.connection() as three,
+        database._pool.connection() as four,
+    ):
+        pids = {connection.info.backend_pid for connection in (one, two, three, four)}
+    _terminate(pids)
+    time.sleep(0.2)  # well within CHECK_AFTER_IDLE: the idle check alone would not run
+    for index in range(1, 2 * database.pool_size + 1):
+        store.put_raw("x", str(index), {"a": index})
+    with store.transaction():
+        store.put_raw("x", "in-transaction", {"a": -1})
+    assert len(store.items("x", _Any)) == 2 * database.pool_size + 2
+    assert {row[0] for row in database._query("SELECT pg_backend_pid()")}.isdisjoint(pids)
+
+
 def test_a_failed_transaction_on_a_lost_connection_leaves_the_database_usable(database: PostgresDatabase) -> None:
     store = database.store("acme")
     with pytest.raises(psycopg.OperationalError), store.transaction():

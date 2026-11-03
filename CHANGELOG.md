@@ -2,7 +2,50 @@
 
 ## Unreleased
 
-Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
+Backend audit round 2, runtime fixes (2026-11-03):
+
+- OPS2-01: `migrate` of a PostgreSQL database written before migration checksums (v0.2.0-preview.1) no longer
+  deadlocks with its own pre-migration backup: the `checksum` column of `nodestro_schema_migrations` is added (and the
+  checksums recorded) after `before_migration` returned, so `pg_dump` on another connection never waits for the
+  migration transaction's ACCESS EXCLUSIVE lock. The backup stays required and is still taken first; applied
+  migrations are checked by name before it.
+- RT2-01: continuing a failed run asks for confirmation also for tool calls that reached the tool and then ended with
+  an error (a timeout after the request was sent may hide a completed effect). Only calls refused or still waiting
+  before they ran (approval state `pending`, `denied`, `rejected`, `expired`, `cancelled`) are left out.
+- RT2-02: the approvals inbox (`run_views.pending_approvals`) finds paused runs through the store's indexed status
+  lookup (`find("runs", "status", ("paused",))`), tenant-scoped as before, instead of scanning the 5,000 most recently
+  updated runs; an old waiting run no longer drops out of the inbox.
+- RT2-03: right after a database restart or failover, writes no longer fail on pooled connections the server had
+  closed. Every checkout looks at the idle connection's socket (no round trip); data or end-of-stream there means the
+  server closed it (or sent a notice), so it is checked and, when broken, discarded before another one is taken.
+  Nothing is ever re-sent: a write that failed after it was sent still fails.
+- RT2-05 (enabler for the API's run list, API2-04): `DocumentStore.list_page("runs", model, limit=, before=,
+  top_level=, summary=)` is a keyset page of runs by creation (newest first, ties by id, strictly after the cursor
+  `(created_at, id)`), returning `(page, more)`; `summary=True` reads only the model's top-level fields. Indexed on
+  both stores: SQLite schema version 2 (backup first, as for version 1; an older release refuses the upgraded
+  database) and PostgreSQL migration `0009_created_order` (function `nodestro_created_order`, two partial indexes on
+  runs). `list` is unchanged.
+- RT2-06: `tests/test_worker_tool_changes.py` runs the runtime sandbox's self-test once per module and skips with its
+  verdict when the self-test refuses the daemon (e.g. cgroup v1) instead of failing every test with `tool.sandbox`. In
+  CI (`GITHUB_ACTIONS`), with `NODESTRO_REQUIRE_DOCKER=1` or with the new `NODESTRO_REQUIRE_SANDBOX=1` a refusal is a
+  failure, so CI coverage is unchanged.
+- RT2-08: the billing API client of the cost reconciliation (`reconciliation.get_json`) no longer follows redirects:
+  urllib repeated the request with the admin key at whatever address a redirect named, and only the first address
+  was checked against the allowlist. A redirect is now an error (`ReconciliationError`).
+- NSL-13: a waiting model request of a budget decision carries the node's label (`BudgetRequest.requests[].label`,
+  additive, `null` for requests stored before): the label of the node in its own workflow (a child run's node in the
+  child workflow), so the decision card can name the step instead of the raw node id. `agent` stays the cost
+  tracker's agent name (the node id).
+
+Orkexa pin: `bc8c4edae637b2e53f7f63f86f84846ea2e70e43` (orkexa #40, audit round 2: sandbox and tool hardening
+ORK2-01..04/06/08/09, unknown provider prefixes raise (DX-02); 2026-11-03).
+
+Axentra pin: `a87224291b561981ed8afab6131e18d8c9eecc01` (axentra #31, #32 and #38, audit round 2: schedule jobs follow the
+creator's current access, webhook deadline, `/v1/me` without tenant cap, invitation re-checks, problem type URNs;
+SHA-pinned CI and digest-pinned image; own-tenant overview counts, usage backdating limited to the open billing
+period; 2026-11-03).
+
+Previous Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).
 
 The resolve path on a real Docker engine (RT-038; 2026-11-02):

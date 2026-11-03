@@ -7,7 +7,8 @@ library's ``SQLiteMemory``, ``SQLiteFileStore`` and ``SQLiteIndex`` use their ow
 file; the SQL that Nodestro runs on those tables is in :mod:`nodestro_runtime.sqlite_tables`.
 
 Schema versions (SQLite): the database records its version in ``PRAGMA user_version``. Earlier releases used
-version 0; version 1 adds the indexes of the list and find queries (:data:`MIGRATIONS`). :meth:`SQLiteStore.migrate`
+version 0; version 1 adds the indexes of the list and find queries, version 2 the creation-order indexes of the
+keyset run listing :meth:`SQLiteStore.list_page` (:data:`MIGRATIONS`). :meth:`SQLiteStore.migrate`
 writes a backup first (the ``before_migration`` hook; a new, empty database needs none), runs every step in one
 transaction, and refuses a database written by a newer release (``storage.schema_too_new``) instead of misreading
 it.
@@ -37,7 +38,7 @@ _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 logger = logging.getLogger(__name__)
 
 #: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 #: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
 #: transaction :meth:`SQLiteStore.migrate` opened (it must not commit).
 Migration = Callable[[sqlite3.Connection], None]
@@ -63,8 +64,51 @@ def _list_and_find_indexes(db: sqlite3.Connection) -> None:
         )
 
 
+#: The creation order of :meth:`SQLiteStore.list_page`: a document's top-level ``created_at`` as UTC text at
+#: millisecond precision (``NULL`` when it is missing or not a time). Indexed by migration 2 for ``runs``; the query
+#: must use exactly this expression for the index to apply.
+#: Only text that starts with a date is converted: ``strftime`` of the word ``now`` is not deterministic, and SQLite
+#: refuses a write whose indexed expression is not.
+CREATED_ORDER = (
+    "CASE WHEN json_extract(data, '$.created_at') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+    " THEN strftime('%Y-%m-%dT%H:%M:%f', json_extract(data, '$.created_at')) END"
+)
+#: The collections :meth:`DocumentStore.list_page` serves: those with its indexes (SQLite version 2, PostgreSQL
+#: migration 0009). Another collection needs indexes of its own first; until then ``list_page`` refuses it.
+PAGED_COLLECTIONS = ("runs",)
+
+
+def _created_order_indexes(db: sqlite3.Connection) -> None:
+    """Version 2 (RT2-05): the keyset run listing (:meth:`SQLiteStore.list_page`) reads one page of runs by creation
+    from an index, of all runs or of the top-level runs only (sub-workflow and team runs can outnumber them by far),
+    instead of reading every run. Partial indexes: only runs with valid JSON (a damaged document never stops a
+    write). The SQL is written out (not built from :data:`CREATED_ORDER`) so this step never changes."""
+    order = (
+        "CASE WHEN json_extract(data, '$.created_at') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+        " THEN strftime('%Y-%m-%dT%H:%M:%f', json_extract(data, '$.created_at')) END"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS nodestro_documents_runs_created ON nodestro_documents"
+        f" (collection, ({order}) DESC, id DESC) WHERE collection = 'runs' AND json_valid(data)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS nodestro_documents_runs_created_top ON nodestro_documents"
+        f" (collection, ({order}) DESC, id DESC)"
+        " WHERE collection = 'runs' AND json_valid(data) AND json_extract(data, '$.parent_run_id') IS NULL"
+    )
+
+
 #: The steps of this release, by the version they lead to.
-MIGRATIONS: Mapping[int, Migration] = {1: _list_and_find_indexes}
+MIGRATIONS: Mapping[int, Migration] = {1: _list_and_find_indexes, 2: _created_order_indexes}
+
+
+def cursor_time(moment: datetime) -> str:
+    """A cursor's time as ISO text for the stores' creation order (a time without zone counts as UTC)."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.isoformat()
+
+
 #: Called with (current version, target version) before a migration changes anything; writes a backup.
 BeforeMigration = Callable[[int, int], None]
 
@@ -90,6 +134,14 @@ class DocumentStore(Protocol):
 
     - ``put``/``put_raw`` insert or replace; ``put`` also marks the document as updated now, ``put_raw`` keeps the
       update time of an existing document.
+    - ``list_page`` is a keyset page by creation (RT2-05): documents with a readable top-level ``created_at``,
+      newest first (ties: higher id first), strictly after the cursor ``before = (created_at, id)`` in that order
+      (``id`` ``""``: everything older than the time), with ``top_level`` only those without ``parent_run_id``;
+      at most ``limit`` of them and whether more follow. The order compares creation times at the store's
+      precision (SQLite: milliseconds, PostgreSQL: microseconds), so a page continues exactly where the cursor of
+      the previous one points. ``summary`` reads only the top-level fields ``model`` declares (PostgreSQL returns a
+      document it keeps as exact text, one with a NUL character, whole). Only the collections of
+      :data:`PAGED_COLLECTIONS` (``runs``) are served; ``list`` stays as it is.
     - ``list`` returns the most recently updated first (ties in id order); ``find``, in update order, the
       documents whose top-level field has one of the values; ``items``, ``list_prefix`` in id order.
       ``list_prefix``/``delete_prefix`` treat the prefix literally (``%`` and ``_`` are ordinary characters).
@@ -132,6 +184,17 @@ class DocumentStore(Protocol):
     def find(
         self, collection: str, field: str, values: Iterable[str], model: type[ModelT]
     ) -> builtins.list[ModelT]: ...
+
+    def list_page(
+        self,
+        collection: str,
+        model: type[ModelT],
+        *,
+        limit: int,
+        before: tuple[datetime, str] | None = None,
+        top_level: bool = False,
+        summary: bool = False,
+    ) -> tuple[builtins.list[ModelT], bool]: ...
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]: ...
 
@@ -347,6 +410,53 @@ class SQLiteStore:
                 "SELECT id, data FROM nodestro_documents WHERE collection = ? AND NOT json_valid(data)", (collection,)
             ).fetchall()
         return [item for _key, item in self.damaged.parse(collection, rows, model)]
+
+    def list_page(
+        self,
+        collection: str,
+        model: type[ModelT],
+        *,
+        limit: int,
+        before: tuple[datetime, str] | None = None,
+        top_level: bool = False,
+        summary: bool = False,
+    ) -> tuple[builtins.list[ModelT], bool]:
+        """One keyset page of a collection of :data:`PAGED_COLLECTIONS` by creation, newest first (see
+        :class:`DocumentStore`); indexed by schema version 2, so a page costs ``limit + 1`` index entries, not the
+        whole collection. Returns the page and whether more documents follow."""
+        if collection not in PAGED_COLLECTIONS:
+            raise ValueError(f"list_page has no index for the collection {collection!r}")
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        # The collection is a literal, so the partial indexes of version 2 apply.
+        where = ["collection = 'runs'", "json_valid(data)", f"{CREATED_ORDER} IS NOT NULL"]
+        params: builtins.list[Any] = []
+        if top_level:
+            where.append("json_extract(data, '$.parent_run_id') IS NULL")
+        if before is not None:
+            moment, after = before
+            text = cursor_time(moment)
+            # ``<=`` on the order alone lets SQLite range-scan the index; the rest picks the rows after the cursor.
+            where.append(f"{CREATED_ORDER} <= strftime('%Y-%m-%dT%H:%M:%f', ?)")
+            where.append(f"({CREATED_ORDER} < strftime('%Y-%m-%dT%H:%M:%f', ?) OR id < ?)")
+            params += [text, text, after]
+        data = "data"
+        if summary:
+            fields = builtins.list(model.model_fields)
+            marks = ", ".join("?" for _ in fields)
+            data = (
+                "(SELECT json_group_object(entry.key, nodestro_documents.data -> entry.key)"
+                f" FROM json_each(nodestro_documents.data) AS entry WHERE entry.key IN ({marks}))"
+            )
+            params = [*fields, *params]
+        query = (
+            f"SELECT id, {data} FROM nodestro_documents WHERE {' AND '.join(where)}"
+            f" ORDER BY {CREATED_ORDER} DESC, id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._connection.execute(query, (*params, limit + 1)).fetchall()
+        more = len(rows) > limit
+        return [item for _key, item in self.damaged.parse(collection, rows[:limit], model)], more
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]:
         """``(id, document)`` pairs of a collection, in id order."""
