@@ -70,6 +70,11 @@ SETTINGS_COLLECTION = "settings"
 SETTINGS_ID = "local_models"
 #: How long ``/api/show`` results are reused (they change only with a pull or delete, which clear the cache).
 _SHOW_TTL = 600.0
+#: The context window of the managed server and the Local Docker container (``NODESTRO_OLLAMA_CONTEXT_LENGTH``).
+#: Ollama's own default without a large GPU is 4096 tokens, shared by the prompt, the thinking and the answer: too
+#: small for agents (a thinking model ran out of it after about 3,500 output tokens). 32768 costs about 1.1 GB more
+#: memory with qwen3.5:4b (measured: 4.8 GB instead of 3.7 GB loaded).
+LOCAL_CONTEXT_LENGTH = 32768
 
 
 class InstalledModel(BaseModel):
@@ -158,6 +163,7 @@ class LocalModelService:
         self.bundled_binary = Path(bundled) if bundled else None
         self.container_url = (env.get("NODESTRO_OLLAMA_URL") or "").rstrip("/") or None
         shared = env.get("NODESTRO_OLLAMA_MODELS_DIR") or ""
+        self.context_length = _context_length(env.get("NODESTRO_OLLAMA_CONTEXT_LENGTH"))
         self.container_models_dir = Path(shared) if shared else None
         self._managed: ManagedOllama | None = None
         self._lock = threading.RLock()
@@ -209,7 +215,11 @@ class LocalModelService:
         with self._lock:
             if self._managed is None:
                 self._managed = ManagedOllama(
-                    self.home, binary=self.runtime_binary(), models_dir=self.models_dir(), offline=self._offline()
+                    self.home,
+                    binary=self.runtime_binary(),
+                    models_dir=self.models_dir(),
+                    offline=self._offline(),
+                    environment={"OLLAMA_CONTEXT_LENGTH": str(self.context_length)},
                 )
             return self._managed
 
@@ -614,6 +624,15 @@ class LocalModelService:
         self._show.clear()
         if running:
             self.start()
+
+
+def _context_length(value: str | None) -> int:
+    """The context window from ``NODESTRO_OLLAMA_CONTEXT_LENGTH`` (2048 to 262144), else the default."""
+    try:
+        number = int(value or "")
+    except ValueError:
+        return LOCAL_CONTEXT_LENGTH
+    return number if 2048 <= number <= 262_144 else LOCAL_CONTEXT_LENGTH
 
 
 def _overrides(capabilities: Iterable[str], known: Mapping[str, str]) -> dict[str, str]:

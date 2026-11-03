@@ -211,6 +211,9 @@ def test_the_managed_server_provides_ollama_without_a_saved_url(managed: Workspa
     assert "capabilities" not in connection.agent_kwargs("ollama:unknown-model:1b")
     status = managed.local_models.status()
     assert status.running and status.version == "0.40.14"
+    # Ollama's 4096-token default is too small for agents: the managed server gets a larger context window.
+    assert managed.local_models._managed is not None
+    assert managed.local_models._managed.environment == {"OLLAMA_CONTEXT_LENGTH": "32768"}
     assert {model.name: model.verified for model in status.models} == {
         "qwen3.5:4b": True,
         "qwen3-embedding:0.6b": True,
@@ -495,3 +498,11 @@ def test_the_european_preference_is_a_stored_setting(tmp_path: Path) -> None:
         choice = workspace.local_models.recommend("write")
         assert choice.model.startswith("ollama:")
         assert {"preferred_region", "preferred_region_unavailable"} & set(choice.reasons)
+
+
+def test_the_context_window_can_be_set_within_bounds() -> None:
+    from nodestro_runtime.local_service import LOCAL_CONTEXT_LENGTH, _context_length
+
+    assert _context_length(None) == LOCAL_CONTEXT_LENGTH == 32768
+    assert _context_length("8192") == 8192
+    assert _context_length("1024") == _context_length("1000000") == _context_length("big") == LOCAL_CONTEXT_LENGTH

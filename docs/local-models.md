@@ -49,7 +49,7 @@ of the same suitability, even when it still needs a download, and keeps an insta
 It never chooses a weaker model, never a cloud service (every catalog model runs locally), and never overrides a model
 stored on an agent: a manual choice always wins, and the strict offline mode still refuses downloads. Entries may limit
 themselves to task profiles (`tasks`): `devstral-small-2:24b` is a coding model and needs a GPU that holds it. Its
-context length is left unset because the published sources disagree; `ministral-3:14b` is listed but not yet
+context length is Mistral AI's 256K (the 393,216 some sources give is the YaRN maximum); `ministral-3:14b` is listed but not yet
 verified in a run here (`notes`). The embedding standard stays `qwen3-embedding:0.6b`.
 
 A recommendation is a suggestion: callers store the chosen model explicitly. New installations use
@@ -67,6 +67,14 @@ models have no graded effort (any level thinks, without a limit), so at effort `
 counts against `max_tokens`: on a CPU a small model can spend thousands of tokens and many minutes thinking about one
 step, so fast steps (sorting, extraction, short structured answers) should run at `low`. An agent's own
 `request_options.reasoning_effort` wins.
+
+### Context window
+
+Ollama gives a model 4096 tokens of context unless it runs on a large GPU, and the prompt, the thinking and the answer
+share them: an agent then ends with `stop_reason='length'` long before its `max_tokens`. The managed server of the
+desktop starts with `OLLAMA_CONTEXT_LENGTH=32768` (`NODESTRO_OLLAMA_CONTEXT_LENGTH`, 2048 to 262144); with
+`qwen3.5:4b` that is about 4.8 GB of memory instead of 3.7 GB. Nodestro Local Docker sets the same in its Ollama
+container. An Ollama you run yourself keeps its own setting: start it with `OLLAMA_CONTEXT_LENGTH=32768`.
 
 ## Knowledge search
 

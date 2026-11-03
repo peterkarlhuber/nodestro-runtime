@@ -229,8 +229,10 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         rank=3,
         cpu_friendly=False,
         tasks=["coding"],
+        context=262_144,
         alternative=True,
-        notes="European coding agent model for a GPU; context length unconfirmed (the sources differ; not yet tested)",
+        # Mistral AI states 256K; the 393,216 some sources give is the YaRN maximum, not the trained context.
+        notes="European coding agent model for a GPU (not yet tested here)",
     ),
     LocalModelInfo(
         name="qwen3-embedding:0.6b",
