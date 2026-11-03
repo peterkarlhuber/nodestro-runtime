@@ -415,7 +415,7 @@ quickstart above.
 Docker and network); `NODESTRO_REQUIRE_DOCKER=1` makes a missing Docker fail instead of skip, as in the CI job
 `docker`.
 
-CI needs the repository secret `NODESTRO_READ` (read access to Orkexa and the Nodestro repositories).
+CI needs no secret: Orkexa and the Nodestro repositories are public and are installed anonymously.
 
 Open work (release blockers, known bugs, security follow-ups, debt) is listed in [docs/TODO.md](docs/TODO.md).
 
