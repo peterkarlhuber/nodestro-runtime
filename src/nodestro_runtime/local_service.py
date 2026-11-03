@@ -46,7 +46,16 @@ from orkexa.local import (
 )
 from pydantic import BaseModel, Field
 
-from .local_models import CATALOG, OLLAMA_VERSION, Hardware, Recommendation, catalog_model, detect_hardware, recommend
+from .local_models import (
+    CATALOG,
+    OLLAMA_VERSION,
+    Hardware,
+    Recommendation,
+    SelectionPreferences,
+    catalog_model,
+    detect_hardware,
+    recommend,
+)
 from .problems import NodestroError
 
 logger = logging.getLogger(__name__)
@@ -372,7 +381,7 @@ class LocalModelService:
         except NodestroError:
             return {}
 
-    def recommend(self, task: str) -> Recommendation:
+    def recommend(self, task: str, preferences: SelectionPreferences | None = None) -> Recommendation:
         installed: list[InstalledModel] = []
         with suppress(NodestroError):  # no server: recommend from the catalog alone
             installed = self.installed()
@@ -381,6 +390,7 @@ class LocalModelService:
             self.hardware(),
             [model.name for model in installed],
             capabilities={model.name: model.capabilities for model in installed},
+            preferences=preferences,
         )
 
     def delete(self, name: str) -> None:

@@ -849,9 +849,12 @@ class Workspace:
             bedrock_policy=self._bedrock_policy_for_tenant(),
             local_container=self._local_container(),
         )
-        if name == "ollama" and not stored.get("base_url") and self.local_models.provides_endpoint():
-            status.configured = True
-            status.local_server = True
+        if name == "ollama" and not stored.get("base_url"):
+            if self.local_models.provides_endpoint():
+                status.configured = True
+                status.local_server = True
+            elif self._client_factory is not None and self._client_factory(name) is not None:
+                status.configured = True  # an injected client (tests, embedding applications) is the server
         return status
 
     def _knowledge_retrieval(self) -> tuple[Any, str | None]:
