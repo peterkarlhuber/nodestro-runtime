@@ -54,8 +54,8 @@ def test_the_migration_adds_the_indexes_after_a_backup(tmp_path: Path) -> None:
     calls: list[tuple[int, int]] = []
     try:
         assert store.migrate(before_migration=lambda *versions: calls.append(versions)) == 0
-        assert calls == [(0, SCHEMA_VERSION)] and SCHEMA_VERSION == 1
-        assert store.schema_version == 1
+        assert calls == [(0, SCHEMA_VERSION)] and SCHEMA_VERSION == 2
+        assert store.schema_version == 2
         with store.maintenance() as connection:
             names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
         assert {"nodestro_documents_updated", *(f"nodestro_documents_{field}" for field in INDEXED_FIELDS)} <= names
@@ -91,7 +91,7 @@ def test_the_migration_adds_the_indexes_after_a_backup(tmp_path: Path) -> None:
         with store.maintenance() as connection:
             connection.execute("UPDATE nodestro_documents SET data = '{not json' WHERE collection = 'broken'")
         # Opening again: nothing to do.
-        assert store.migrate(before_migration=None) == 1
+        assert store.migrate(before_migration=None) == SCHEMA_VERSION
     finally:
         store.close()
 
@@ -114,7 +114,7 @@ def test_an_old_data_directory_is_backed_up_and_migrated_when_opened(tmp_path: P
         assert workspace.sqlite_store.schema_version == SCHEMA_VERSION
     finally:
         workspace.close()
-    backups = list((data / "backups").glob("pre-migration-0-to-1-*.db"))
+    backups = list((data / "backups").glob(f"pre-migration-0-to-{SCHEMA_VERSION}-*.db"))
     assert len(backups) == 1
     copy = sqlite3.connect(backups[0])
     try:
@@ -134,7 +134,7 @@ def test_a_new_data_directory_writes_no_backup(tmp_path: Path) -> None:
 
 
 def test_the_release_ships_exactly_this_migration() -> None:
-    assert sorted(storage.MIGRATIONS) == [1]
+    assert sorted(storage.MIGRATIONS) == [1, 2]
 
 
 # ---- PostgreSQL ---------------------------------------------------------------------------------------------

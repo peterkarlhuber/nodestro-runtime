@@ -348,7 +348,7 @@ def test_the_current_version_needs_no_migration_and_no_backup(database: SQLiteSt
     assert database.migrate(before_migration=lambda *versions: calls.append(versions)) == SCHEMA_VERSION
     assert database.migrate(before_migration=None) == SCHEMA_VERSION  # nothing to do, so no backup needed
     assert calls == [(0, SCHEMA_VERSION)]
-    assert sorted(storage.MIGRATIONS) == [1] == [SCHEMA_VERSION]
+    assert sorted(storage.MIGRATIONS) == [1, 2] and SCHEMA_VERSION == 2
 
 
 def test_a_migration_backs_up_first_and_runs_every_step(database: SQLiteStore) -> None:
@@ -479,9 +479,9 @@ def test_an_existing_data_directory_opens_unchanged(tmp_path: Path) -> None:
     assert [row for row in after["nodestro_documents"] if row[0] == "settings"] == before["nodestro_documents"]
     assert after["index_chunks"] == before["index_chunks"]
     assert after["memory_files"] == before["memory_files"]
-    # Schema version 1 only added indexes, after a backup of the database as it was.
-    assert _version(directory / DATABASE) == SCHEMA_VERSION == 1
-    backups = list((directory / "backups").glob("pre-migration-0-to-1-*.db"))
+    # Schema versions 1 and 2 only added indexes, after a backup of the database as it was.
+    assert _version(directory / DATABASE) == SCHEMA_VERSION == 2
+    backups = list((directory / "backups").glob("pre-migration-0-to-2-*.db"))
     assert len(backups) == 1 and _version(backups[0]) == 0
     assert _rows(backups[0]) == before
 

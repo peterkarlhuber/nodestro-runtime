@@ -14,6 +14,12 @@ Backend audit round 2, runtime fixes (2026-11-03):
   closed. Every checkout looks at the idle connection's socket (no round trip); data or end-of-stream there means the
   server closed it (or sent a notice), so it is checked and, when broken, discarded before another one is taken.
   Nothing is ever re-sent: a write that failed after it was sent still fails.
+- RT2-05 (enabler for the API's run list, API2-04): `DocumentStore.list_page("runs", model, limit=, before=,
+  top_level=, summary=)` is a keyset page of runs by creation (newest first, ties by id, strictly after the cursor
+  `(created_at, id)`), returning `(page, more)`; `summary=True` reads only the model's top-level fields. Indexed on
+  both stores: SQLite schema version 2 (backup first, as for version 1; an older release refuses the upgraded
+  database) and PostgreSQL migration `0009_created_order` (function `nodestro_created_order`, two partial indexes on
+  runs). `list` is unchanged.
 
 Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).

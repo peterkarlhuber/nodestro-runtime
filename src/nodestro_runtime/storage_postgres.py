@@ -32,6 +32,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from datetime import datetime
 import hashlib
 from importlib import resources
 import json
@@ -46,7 +47,7 @@ import weakref
 from pydantic import BaseModel
 
 from .problems import NodestroError
-from .storage import BeforeMigration, DamagedDocuments, ModelT
+from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time
 
 try:  # optional: nodestro-runtime[postgres]
     import psycopg
@@ -99,6 +100,9 @@ def _encode(text: str) -> tuple[str, str | None]:
 
 #: The exact JSON text of a row.
 _JSON = "coalesce(raw, data::text)"
+#: The creation order of :meth:`PostgresStore.list_page` (RT2-05): the document's ``created_at`` as a time, ``NULL``
+#: when it is missing or not a time; the expression of the indexes of migration 0009, which a query must repeat.
+_CREATED_ORDER = "nodestro_created_order(data ->> 'created_at')"
 
 
 def _setting(given: float | None, variable: str, default: float, *, minimum: float) -> Any:
@@ -919,6 +923,48 @@ class PostgresStore:
             params = (*params, limit)
         rows = self.database._query(query, params)
         return [item for _key, item in self.damaged.parse(collection, rows, model)]
+
+    def list_page(
+        self,
+        collection: str,
+        model: type[ModelT],
+        *,
+        limit: int,
+        before: tuple[datetime, str] | None = None,
+        top_level: bool = False,
+        summary: bool = False,
+    ) -> tuple[builtins.list[ModelT], bool]:
+        """One keyset page of the tenant's documents by creation, newest first (see
+        :class:`~nodestro_runtime.storage.DocumentStore`); indexed for ``runs`` (migration 0009), so a page costs
+        ``limit + 1`` index entries, not the whole collection. Returns the page and whether more documents follow."""
+        if collection not in PAGED_COLLECTIONS:
+            raise ValueError(f"list_page has no index for the collection {collection!r}")
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        self._check()
+        # The collection is a literal, so the partial indexes of migration 0009 apply in every plan (also in a
+        # generic plan of a prepared statement, which knows no parameter values).
+        where = "tenant_id = %s AND collection = 'runs' AND " + _CREATED_ORDER + " IS NOT NULL"
+        params: builtins.list[Any] = [self.tenant_id]
+        if top_level:
+            where += " AND (data ->> 'parent_run_id') IS NULL"
+        if before is not None:
+            moment, after = before
+            where += " AND (" + _CREATED_ORDER + ", id) < (%s::timestamptz, %s)"
+            params += [cursor_time(moment), after]
+        data = _JSON
+        if summary:
+            data = (
+                "CASE WHEN raw IS NULL THEN (SELECT jsonb_object_agg(entry.key, entry.value)"
+                " FROM jsonb_each(data) AS entry WHERE entry.key = ANY(%s))::text ELSE raw END"
+            )
+            params = [builtins.list(model.model_fields), *params]
+        rows = self.database._query(
+            f"SELECT id, {data} FROM nodestro_documents WHERE {where} ORDER BY {_CREATED_ORDER} DESC, id DESC LIMIT %s",
+            (*params, limit + 1),
+        )
+        more = len(rows) > limit
+        return [item for _key, item in self.damaged.parse(collection, rows[:limit], model)], more
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, in update order."""
