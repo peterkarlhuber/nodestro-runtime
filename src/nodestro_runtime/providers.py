@@ -259,6 +259,17 @@ class Connection:
     bedrock: BedrockSettings | None = None
     session_factory: Callable[[], Any] | None = None
     require_session: bool = False
+    #: The capabilities a local model server reports for a model (``/api/show`` of Ollama), by model id; the
+    #: declared ``capabilities`` of the settings win over them.
+    reported: Callable[[str], Mapping[str, Any]] | None = None
+
+    def declared_for(self, model: str | None) -> dict[str, Any]:
+        """The capability overrides for ``model``: reported by the server, then the declared ones on top."""
+        values: dict[str, Any] = {}
+        if model is not None and self.reported is not None:
+            values.update(self.reported(model_id(model)))
+        values.update(self.capabilities)
+        return values
 
     def __repr__(self) -> str:
         if self.provider == "bedrock":
@@ -270,8 +281,9 @@ class Connection:
         base_url = redact(self.base_url) if self.base_url else None
         return f"Connection(provider={self.provider!r}, base_url={base_url!r}, key={'set' if self.api_key else None})"
 
-    def agent_kwargs(self) -> dict[str, Any]:
-        """Keyword arguments for ``orkexa.Agent``/``Evaluator``: provider, credentials, endpoint, overrides."""
+    def agent_kwargs(self, model: str | None = None) -> dict[str, Any]:
+        """Keyword arguments for ``orkexa.Agent``/``Evaluator``: provider, credentials, endpoint, overrides (with
+        ``model``: also the capabilities its server reports)."""
         kwargs: dict[str, Any] = {"provider": self.provider}
         if self.provider == "bedrock":
             # No key, no endpoint, no declared capabilities: AWS credentials come from the options' session.
@@ -289,8 +301,9 @@ class Connection:
                 kwargs["api_key"] = self.api_key
             if self.base_url:
                 kwargs["base_url"] = self.base_url
-        if self.capabilities:
-            kwargs["capabilities"] = dict(self.capabilities)
+        capabilities = self.declared_for(model)
+        if capabilities:
+            kwargs["capabilities"] = capabilities
         return kwargs
 
     def options(self, request_options: Mapping[str, Any] | None = None) -> Any:
@@ -354,13 +367,13 @@ class Connection:
         except ConfigurationError as exc:
             raise NodestroError("config.reserved_request_options", str(exc), keys=", ".join(sorted(extra))) from None
 
-    def settings(self) -> ProviderSettings:
+    def settings(self, model: str | None = None) -> ProviderSettings:
         """The connection as ``orkexa.dynamic.ProviderSettings`` (Coding Agent, Agent Architect).
 
         The options are always given, so the dynamic components build native ``orkexa.Agent``
         objects for every provider.
         """
-        kwargs = self.agent_kwargs()
+        kwargs = self.agent_kwargs(model)
         return ProviderSettings(
             api_key=kwargs.get("api_key"),
             base_url=kwargs.get("base_url"),
@@ -378,7 +391,7 @@ class Connection:
         default = info.default_base_url if info is not None else None
         config = ProviderConfig(base_url=self.base_url or default, client=object())
         adapter = create_provider(self.provider, config)
-        return adapter.capabilities(model_id(model)).merged(dict(self.capabilities) or None)
+        return adapter.capabilities(model_id(model)).merged(self.declared_for(model) or None)
 
     def effort(self, model: str, wanted: Any) -> Any:
         """``wanted`` when the model supports a reasoning effort, else ``None`` (internal assistants)."""
@@ -533,6 +546,9 @@ class ProviderStatus(BaseModel):
     base_url: str | None = None
     base_url_default: str | None = None
     capabilities: dict[str, str] = Field(default_factory=dict)
+    #: Ollama only: Nodestro provides the server itself (the managed one of the desktop, or the container of Nodestro
+    #: Local Docker), so the provider is configured without a saved base URL.
+    local_server: bool = False
     #: Bedrock only (``None`` for the other providers): the sign-in method in effect, the region, the profile
     #: name (desktop), the data residency and whether the operator forces it, the methods this profile allows,
     #: the regions the operator allows, whether the operator assigned a role (server tenants), the last check.

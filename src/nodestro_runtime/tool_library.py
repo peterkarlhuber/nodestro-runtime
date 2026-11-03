@@ -1241,7 +1241,7 @@ class ToolLibrary:
                 model=qualify(model),
                 system_prompt=CODING_PROMPT,
                 effort=connection.effort(model, "high"),
-                credentials={connection.provider: connection.settings()},
+                credentials={connection.provider: connection.settings(model)},
                 usage_tracker=tracker,
             )
             builder = _ReservingToolBuilder(

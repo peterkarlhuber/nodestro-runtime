@@ -274,6 +274,7 @@ def usage_of(
         known_cost_usd=float(summary.known_cost_usd),
         cost_complete=cost is not None,
         unpriced_requests=summary.unpriced_requests,
+        local_requests=summary.local_requests,
         stale_price_requests=stale_requests,
         missing_cost_components=list(summary.missing_cost_components)[:_MAX_LISTED],
         pricing_versions=_merged([record.pricing_version for record in used if record.pricing_version]),
@@ -336,6 +337,7 @@ def add_usage(first: Usage, second: Usage) -> Usage:
         "total_tokens",
         "stale_price_requests",
         "uncapped_requests",
+        "local_requests",
     )
     data = {name: getattr(first, name) + getattr(second, name) for name in counted}
     return Usage(
@@ -4201,7 +4203,7 @@ def execute_agent(
             options=judge_connection.options(),
             usage_tracker=tracker,
             name=f"{name}:judge",
-            **judge_connection.agent_kwargs(),
+            **judge_connection.agent_kwargs(judge),
         )
         pin = getattr(tracker, "pin_conditions", None)
         if pin is not None:

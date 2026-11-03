@@ -12,6 +12,12 @@ empty: no collection). A collection is a label, not a second store: agents still
 exactly the files assigned to them, so new knowledge never changes what a workflow or a
 running workflow sees. Files taken over from runs (:mod:`nodestro_runtime.adoption`) keep where
 they came from in their metadata (``origin_*``).
+
+Retrieval modes (local models, D9): ``fts`` full-text search (the default), ``vector`` semantic search with an
+embedding model, ``hybrid`` both. The workspace setting chooses the mode and the embedding model; an agent may choose
+another mode (``KnowledgeConfig.retrieval``). Vectors exist only after a person built the semantic index
+(:meth:`KnowledgeBase.start_reindex`); they belong to one embedding model, and another model needs a reindex. An
+agent view (:class:`ScopedIndex`) limits a search to the agent's files *before* ranking, in every mode.
 """
 
 from __future__ import annotations
@@ -19,22 +25,26 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+import logging
 from pathlib import Path
 import tempfile
 import threading
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 from orkexa import Chunk, FileStore, Hit, Index, SQLiteFileStore, SQLiteIndex, StoredFile
-from pydantic import BaseModel
+from orkexa.embeddings import EmbeddingModel
+from orkexa.local import OllamaError
+from orkexa.retrieval import RetrievalError, RetrievalMode
+from pydantic import BaseModel, Field
 
 from . import documents
 from .extensions import OcrEngine
+from .problems import NodestroError
 from .schemas import KnowledgeConfig
 from .sqlite_tables import KnowledgeChunks
 
-#: The most chunks a scoped search looks at in the shared index.
-_MAX_CANDIDATES = 20_000
+logger = logging.getLogger(__name__)
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
 
 
@@ -76,6 +86,45 @@ class CollectionInfo(BaseModel):
     files: int
 
 
+IndexState = Literal["off", "ready", "incomplete", "building", "reindex_required", "unavailable"]
+
+
+class KnowledgeIndexStatus(BaseModel):
+    """The semantic index of the knowledge base: which model filled it and how complete it is."""
+
+    #: The workspace's retrieval mode and embedding model (settings).
+    mode: Literal["fts", "vector", "hybrid"] = "fts"
+    embedding_model: str | None = None
+    #: ``off`` (no vectors), ``ready``, ``incomplete`` (chunks without vectors, e.g. added while the model server was
+    #: down), ``building`` (a reindex runs or was interrupted), ``reindex_required`` (the vectors belong to another
+    #: model than the chosen one) or ``unavailable`` (this storage cannot hold vectors).
+    state: IndexState = "off"
+    chunks: int = 0
+    embedded: int = 0
+    #: The embedding model (and digest, dimensions) the vectors belong to.
+    active: dict[str, Any] | None = None
+    building: dict[str, Any] | None = None
+    building_embedded: int = 0
+    job: ReindexJob | None = None
+    #: PostgreSQL: whether pgvector ranks the vectors (``None`` on SQLite).
+    pgvector: bool | None = None
+    detail: str = ""
+
+
+class ReindexJob(BaseModel):
+    state: Literal["running", "done", "failed", "cancelled"] = "running"
+    model: str
+    completed: int = 0
+    total: int = 0
+    error_code: str | None = None
+    error: str | None = None
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finished_at: datetime | None = None
+
+
+KnowledgeIndexStatus.model_rebuild()
+
+
 class ScopedFileStore(FileStore):
     """A read-only view of a store that shows only ``file_ids``."""
 
@@ -107,12 +156,16 @@ class ScopedFileStore(FileStore):
 
 
 class ScopedIndex(Index):
-    """A read-only view of an index that returns only chunks of ``file_ids``."""
+    """A read-only view of an index that searches only the chunks of ``file_ids``, ranked by ``mode``.
 
-    def __init__(self, base: Index, file_ids: Iterable[str]) -> None:
+    The files limit the candidates *before* ranking (the index filters by source), so other files never take the
+    places of the assigned ones, in full-text, vector and hybrid search alike."""
+
+    def __init__(self, base: Index, file_ids: Iterable[str], mode: RetrievalMode | None = None) -> None:
         super().__init__(max_chars=base.max_chars, overlap=base.overlap)
         self.base = base
         self.file_ids = frozenset(file_ids)
+        self.mode = mode
 
     def add_chunks(self, chunks: Iterable[Chunk]) -> list[int]:
         raise PermissionError("This view is read-only")
@@ -121,15 +174,18 @@ class ScopedIndex(Index):
         raise PermissionError("This view is read-only")
 
     def search(self, query: str, k: int = 5) -> list[Hit]:
-        # Over-fetch from the shared index and keep the assigned files only; widen the search while
-        # other files fill the results, so a large knowledge base never hides the assigned files.
-        limit = max(k * 20, 50)
-        while True:
-            hits = self.base.search(query, limit)
-            found = [hit for hit in hits if hit.source in self.file_ids]
-            if len(found) >= k or len(hits) < limit or limit >= _MAX_CANDIDATES:
-                return found[:k]
-            limit = min(limit * 4, _MAX_CANDIDATES)
+        return self.retrieve(query, k)
+
+    def retrieve(
+        self,
+        query: str,
+        k: int = 5,
+        *,
+        mode: RetrievalMode | None = None,
+        sources: Iterable[str] | None = None,
+    ) -> list[Hit]:
+        allowed = self.file_ids if sources is None else self.file_ids & set(sources)
+        return self.base.retrieve(query, k, mode=mode or self.mode, sources=sorted(allowed))
 
 
 class ChunkAccess(Protocol):
@@ -180,6 +236,12 @@ class KnowledgeBase:
         self.ocr_engine = engine
         #: Whether scanned PDFs are recognised on upload (a setting; off by default).
         self.ocr_enabled: Callable[[], bool] = lambda: False
+        #: The workspace's retrieval mode and embedding model (settings; default full text, no model).
+        self.retrieval: Callable[[], tuple[RetrievalMode, str | None]] = lambda: ("fts", None)
+        #: The embedding model of a name (the workspace connects it to the local model server).
+        self.embedding_model: Callable[[str], EmbeddingModel] | None = None
+        self._job: ReindexJob | None = None
+        self._job_cancel: threading.Event | None = None
 
     def ocr_available(self) -> bool:
         return self.runner() is not None
@@ -272,7 +334,7 @@ class KnowledgeBase:
         with self._lock:
             entry = self.store.add(data, name=name, description=description, media_type=media_type, metadata=metadata)
             try:
-                self._index_new(entry, data, name, converted)
+                self._index_with_fallback(lambda: self._index_new(entry, data, name, converted))
             except BaseException:
                 # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
                 self.delete(entry.id)
@@ -299,6 +361,179 @@ class KnowledgeBase:
             self._mark(entry.id, scanned="yes")
             if self.ocr_enabled():
                 self.recognise(entry.id)
+
+    # ---- semantic index ----------------------------------------------------------------------------------------
+
+    def _vectors(self) -> Any:
+        """The vector state of the index (``None``: this index cannot hold vectors)."""
+        status = getattr(self.index, "vector_status", None)
+        return status() if status is not None else None
+
+    def _model(self, name: str | None = None) -> EmbeddingModel | None:
+        chosen = name or self.retrieval()[1]
+        if not chosen or self.embedding_model is None:
+            return None
+        return self.embedding_model(chosen)
+
+    def _sync_embeddings(self) -> None:
+        """Give the index the embedding model its vectors belong to (the active space, else the one being built), so
+        new chunks get vectors and vector searches embed their query with the same model; ``None`` without vectors."""
+        if not hasattr(self.index, "embeddings"):
+            return
+        vectors = self._vectors()
+        target = None if vectors is None else (vectors.active or vectors.building)
+        current = getattr(self.index, "embeddings", None)
+        if target is None:
+            setattr(self.index, "embeddings", None)  # noqa: B010 (an attribute of the vector-capable indexes only)
+            return
+        if current is not None:
+            try:
+                identity = current.identity()
+            except (OllamaError, NodestroError):
+                identity = None
+            if identity is not None and identity.model == target.get("model"):
+                return
+        setattr(self.index, "embeddings", self._model(str(target.get("model"))))  # noqa: B010
+
+    def _index_with_fallback(self, work: Callable[[], object]) -> None:
+        """Index new text; when the embedding model cannot be reached, index it without vectors (a later reindex
+        adds them, the status shows ``incomplete``) instead of refusing the upload."""
+        self._sync_embeddings()
+        try:
+            work()
+        except OllamaError as exc:
+            if getattr(self.index, "embeddings", None) is None:
+                raise
+            logger.warning("New knowledge is indexed without vectors: %s", exc)
+            model = getattr(self.index, "embeddings", None)
+            setattr(self.index, "embeddings", None)  # noqa: B010
+            try:
+                work()
+            finally:
+                setattr(self.index, "embeddings", model)  # noqa: B010
+
+    def index_status(self) -> KnowledgeIndexStatus:
+        mode, model = self.retrieval()
+        status = KnowledgeIndexStatus(mode=mode, embedding_model=model, job=self._job)
+        pgvector = getattr(self.index, "pgvector", None)
+        try:
+            vectors = self._vectors()
+            status.pgvector = pgvector() if pgvector is not None else None
+        except Exception as exc:  # e.g. a PostgreSQL schema without migration 0010
+            status.state, status.detail = "unavailable", str(exc)
+            return status
+        if vectors is None:
+            status.state = "unavailable"
+            return status
+        status.chunks, status.embedded = vectors.chunks, vectors.embedded
+        status.active, status.building = vectors.active, vectors.building
+        status.building_embedded = vectors.building_embedded
+        if vectors.building is not None:
+            status.state = "building"
+        elif vectors.active is None:
+            status.state = "off"
+        elif model and vectors.active.get("model") != model:
+            status.state = "reindex_required"
+        elif vectors.embedded < vectors.chunks:
+            status.state = "incomplete"
+        else:
+            status.state = "ready"
+        return status
+
+    def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
+        """Build (or complete, or switch) the semantic index with an embedding model, in the background.
+
+        Searches keep using the current vectors until every chunk has a vector of the new model; then the index
+        switches in one transaction. Cancelled or interrupted, starting it again continues where it stopped."""
+        name = model_name or self.retrieval()[1]
+        if not name:
+            raise NodestroError("knowledge.embedding_model_missing", "Choose an embedding model first")
+        if self._vectors() is None:
+            raise NodestroError("knowledge.vectors_unavailable", "This knowledge base cannot hold vectors")
+        model = self._model(name)
+        if model is None:
+            raise NodestroError("knowledge.embedding_model_missing", "No embedding model is available")
+        with self._lock:
+            if self._job is not None and self._job.state == "running":
+                raise NodestroError("knowledge.reindex_running", "The semantic index is already being built")
+            job = ReindexJob(model=name)
+            cancel = threading.Event()
+            self._job, self._job_cancel = job, cancel
+        reindex = self.index.reindex  # type: ignore[attr-defined]
+
+        def progress(done: int, total: int) -> None:
+            job.completed, job.total = done, total
+
+        def body() -> None:
+            try:
+                for _attempt in range(3):  # chunks added meanwhile: embed them too
+                    try:
+                        reindex(model, progress=progress, cancel=cancel)
+                        break
+                    except RetrievalError as exc:
+                        if exc.code != "vector_incomplete":
+                            raise
+                job.state = "done"
+            except RetrievalError as exc:
+                job.state = "cancelled" if exc.code == "cancelled" else "failed"
+                job.error_code, job.error = f"knowledge.{exc.code}", str(exc)
+            except OllamaError as exc:
+                job.state = "failed"
+                job.error_code, job.error = f"local.{exc.code}", str(exc)
+            except Exception as exc:  # reported on the job
+                logger.exception("Building the semantic index failed")
+                job.state = "failed"
+                job.error_code, job.error = "knowledge.reindex_failed", str(exc)
+            finally:
+                job.finished_at = datetime.now(UTC)
+
+        threading.Thread(target=body, name="nodestro-reindex", daemon=True).start()
+        return self.index_status()
+
+    def cancel_reindex(self) -> KnowledgeIndexStatus:
+        if self._job_cancel is not None:
+            self._job_cancel.set()
+        return self.index_status()
+
+    def drop_vectors(self) -> KnowledgeIndexStatus:
+        """Remove the semantic index (full-text search stays)."""
+        if self._job is not None and self._job.state == "running":
+            raise NodestroError("knowledge.reindex_running", "Stop building the semantic index first")
+        drop = getattr(self.index, "drop_vectors", None)
+        if drop is not None:
+            with self._lock:
+                drop()
+                self.index.embeddings = None  # type: ignore[attr-defined]
+        return self.index_status()
+
+    def effective_mode(self, config: KnowledgeConfig) -> RetrievalMode:
+        return self.retrieval()[0] if config.retrieval == "default" else config.retrieval
+
+    def check_mode(self, mode: RetrievalMode) -> None:
+        """Refuse a vector or hybrid search the semantic index cannot serve (never a silent full-text fallback)."""
+        if mode == "fts":
+            return
+        status = self.index_status()
+        if status.state in ("off", "unavailable"):
+            raise NodestroError(
+                "knowledge.vectors_missing",
+                f"{mode} search needs the semantic index: build it in the knowledge settings, or use full-text search",
+                mode=mode,
+            )
+        if status.active is None:
+            # A first semantic index is being built: until it is complete, vector search has nothing to use.
+            raise NodestroError(
+                "knowledge.index_building",
+                f"{mode} search can be used once the semantic index is complete",
+                mode=mode,
+            )
+
+    def _prepare_search(self, mode: RetrievalMode) -> None:
+        """Check the mode can be served and give the index the model of its vectors. Until a reindex to another
+        chosen model completes, searches use the current vectors (status ``reindex_required`` says so)."""
+        if mode != "fts":
+            self.check_mode(mode)
+            self._sync_embeddings()
 
     def _attach_file_id(self, file_id: str) -> None:
         """Let every chunk of a file point to it (an agent can then load the whole file after a hit)."""
@@ -334,7 +569,9 @@ class KnowledgeBase:
         with self._lock:
             self.index.delete(file_id)
             text = f"{documents.ocr_intro(result)}\n\n{result.text}"
-            self.index.add(text, source=file_id, title=entry.name, file_id=file_id, metadata={"ocr": "yes"})
+            self._index_with_fallback(
+                lambda: self.index.add(text, source=file_id, title=entry.name, file_id=file_id, metadata={"ocr": "yes"})
+            )
         self._mark(
             file_id,
             ocr="done",
@@ -368,9 +605,13 @@ class KnowledgeBase:
             self.store.delete(file_id)
             self.index.delete(file_id)
 
-    def search(self, query: str, file_ids: Iterable[str] | None = None, k: int = 8) -> list[Hit]:
-        index: Index = self.index if file_ids is None else ScopedIndex(self.index, file_ids)
-        return index.search(query, k)
+    def search(
+        self, query: str, file_ids: Iterable[str] | None = None, k: int = 8, *, mode: RetrievalMode | None = None
+    ) -> list[Hit]:
+        """Search the knowledge base (``mode``: default the workspace's), limited to ``file_ids`` before ranking."""
+        chosen = mode or self.retrieval()[0]
+        self._prepare_search(chosen)
+        return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
 
     # ---- per-agent views -----------------------------------------------------------
 
@@ -381,4 +622,6 @@ class KnowledgeBase:
             return None, None
         if config.mode == "on_demand":
             return ScopedFileStore(self.store, file_ids), None
-        return None, ScopedIndex(self.index, file_ids)
+        mode = self.effective_mode(config)
+        self._prepare_search(mode)
+        return None, ScopedIndex(self.index, file_ids, mode)

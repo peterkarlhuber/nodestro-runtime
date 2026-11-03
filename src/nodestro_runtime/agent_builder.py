@@ -194,12 +194,16 @@ class AgentBuilder:
         self.memory_spaces = memory_spaces
         #: The capabilities declared in a provider's settings (OpenAI-compatible endpoints), for validation.
         self.declared: Callable[[str], dict[str, Any]] = lambda _provider: {}
+        #: The capabilities the local model server reports for a model (by model id; Ollama only).
+        self.reported: Callable[[str], dict[str, Any]] = lambda _model: {}
 
     def capabilities(self, model: str) -> ModelCapabilities:
         """What ``model`` supports (Orkexa's values plus declared ones); all unknown for invalid names."""
         try:
             provider = provider_of(check_model(model))
-            return Connection(provider=provider, capabilities=self.declared(provider)).model_capabilities(model)
+            reported = self.reported if provider == "ollama" else None
+            connection = Connection(provider=provider, capabilities=self.declared(provider), reported=reported)
+            return connection.model_capabilities(model)
         except (NodestroError, ValueError):
             return ModelCapabilities()
 
@@ -309,7 +313,7 @@ class AgentBuilder:
             options=options,
             max_retries=MAX_RETRIES,
             usage_tracker=usage_tracker,
-            **connection.agent_kwargs(),
+            **connection.agent_kwargs(model),
             **(hooks or {}),
         )
         pin = getattr(usage_tracker, "pin_conditions", None)
