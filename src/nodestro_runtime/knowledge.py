@@ -14,10 +14,13 @@ running workflow sees. Files taken over from runs (:mod:`nodestro_runtime.adopti
 they came from in their metadata (``origin_*``).
 
 Retrieval modes (local models, D9): ``fts`` full-text search (the default), ``vector`` semantic search with an
-embedding model, ``hybrid`` both. The workspace setting chooses the mode and the embedding model; an agent may choose
-another mode (``KnowledgeConfig.retrieval``). Vectors exist only after a person built the semantic index
-(:meth:`KnowledgeBase.start_reindex`); they belong to one embedding model, and another model needs a reindex. An
-agent view (:class:`ScopedIndex`) limits a search to the agent's files *before* ranking, in every mode.
+embedding model, ``hybrid`` both: the vector ranking plus each candidate's full-text evidence, the share of the
+query's words it contains (:func:`orkexa.retrieval.fuse_hybrid`, the same on SQLite and PostgreSQL), so a full-text
+hit on one accidental word of a query in another language no longer outranks the right vector hit. The workspace
+setting chooses the mode and the embedding model; an agent may choose another mode (``KnowledgeConfig.retrieval``).
+Vectors exist only after a person built the semantic index (:meth:`KnowledgeBase.start_reindex`); they belong to one
+embedding model, and another model needs a reindex. An agent view (:class:`ScopedIndex`) limits a search to the
+agent's files *before* ranking, in every mode.
 """
 
 from __future__ import annotations

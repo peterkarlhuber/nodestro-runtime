@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterator
 import math
 from pathlib import Path
 import time
+from typing import Any
 
 from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
 from orkexa.local import OllamaError
@@ -159,6 +160,41 @@ def test_the_semantic_index_finds_meaning_and_scopes_before_ranking(make: Callab
     assert added.searchable
 
 
+def test_a_weak_full_text_hit_no_longer_outranks_the_vector_hit(make: Callable[[str], KnowledgeBase]) -> None:
+    """The offline proof's failure, on SQLite and PostgreSQL: the query shares one word ("days") with a document of
+    its own language, and nothing with the German document vectors rank first."""
+    knowledge = make("alpha")
+    hr = knowledge.add(b"Jeder hat 30 Arbeitstage holiday pro Kalenderjahr.", name="urlaub.md").id
+    security = knowledge.add(b"Passwords are rotated every 180 days.", name="security.md").id
+    knowledge.add(b"Pakete verlassen das Lager in drei Werktagen.", name="versand.md")
+    knowledge.start_reindex()
+    wait(knowledge)
+    query = "How many vacation days do employees get?"
+    assert [hit.source for hit in knowledge.search(query, mode="fts", k=1)] == [security]
+    assert [hit.source for hit in knowledge.search(query, mode="vector", k=1)] == [hr]
+    hits = knowledge.search(query, mode="hybrid", k=3)
+    assert [hit.source for hit in hits][:2] == [hr, security]
+    assert hits[0].ranks == {"vector": 1} and hits[1].ranks == {"fts": 1, "vector": 2}
+    assert all(0.0 <= hit.score <= 1.0 for hit in hits)
+    knowledge.index.fusion = "rrf"  # type: ignore[attr-defined]
+    assert knowledge.search(query, mode="hybrid", k=1)[0].source == security  # the earlier fusion
+
+
+def test_hybrid_keeps_exact_codes_that_vectors_cannot_tell_apart(make: Callable[[str], KnowledgeBase]) -> None:
+    knowledge = make("alpha")
+    ids = {
+        code: knowledge.add(f"Delivery of valve KH-{code} within three days.".encode(), name=f"kh{code}.md").id
+        for code in ("2201", "2102", "2210", "2120")
+    }
+    knowledge.start_reindex()
+    wait(knowledge)
+    assert knowledge.search("KH-2210 delivery", mode="fts", k=1)[0].source == ids["2210"]
+    assert knowledge.search("KH-2210 delivery", mode="hybrid", k=1)[0].source == ids["2210"]
+    scoped = knowledge.search("KH-2210 delivery", [ids["2201"], ids["2120"]], 4, mode="hybrid")
+    assert {hit.source for hit in scoped} == {ids["2201"], ids["2120"]}  # the scope still limits before ranking
+    assert knowledge.search("KH-2120", [ids["2201"], ids["2120"]], 1, mode="hybrid")[0].source == ids["2120"]
+
+
 def test_an_agent_view_follows_its_retrieval_mode(make: Callable[[str], KnowledgeBase]) -> None:
     knowledge = make("alpha")
     ids = fill(knowledge)
@@ -271,3 +307,18 @@ def test_semantic_search_with_a_real_embedding_model(tmp_path: Path) -> None:
         assert hits[0].source == ids["returns.md"]
         hybrid = workspace.knowledge.search("Urlaubstage der Mitarbeiter", [ids["hr.md"], ids["shipping.md"]], 2)
         assert hybrid[0].source == ids["hr.md"]
+
+
+def test_the_postgres_index_checks_its_fusion_options() -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from nodestro_runtime.postgres_tables import PostgresIndex
+
+    database: Any = SimpleNamespace(_lock=threading.RLock())  # the checks run before any query
+    with pytest.raises(ValueError, match="fusion"):
+        PostgresIndex(database, "alpha", fusion="max")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="lexical_weight"):
+        PostgresIndex(database, "alpha", lexical_weight=2.0)
+    index = PostgresIndex(database, "alpha", fusion="rrf", lexical_weight=0.25)
+    assert (index.fusion, index.lexical_weight) == ("rrf", 0.25)
