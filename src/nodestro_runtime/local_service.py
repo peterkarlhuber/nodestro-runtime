@@ -20,7 +20,7 @@ Downloads (runtime, models) are separate, explicit jobs, refused in the strict o
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 import logging
@@ -34,6 +34,7 @@ import uuid
 
 from orkexa.local import (
     ManagedOllama,
+    ModelDetails,
     OllamaClient,
     OllamaError,
     check_model_name,
@@ -369,13 +370,24 @@ class LocalModelService:
             "capabilities": list(details.capabilities),
             "context_length": details.context_length,
             "embedding_length": details.embedding_length,
-            "overrides": details.capability_overrides(),
+            "overrides": _overrides(details.capabilities, details.capability_overrides()),
         }
         self._show[name] = (time.monotonic(), value)
         return value
 
     def capability_overrides(self, model: str) -> dict[str, str]:
-        """The Orkexa capabilities an installed model reports (``{}`` when no server answers or it is missing)."""
+        """The Orkexa capabilities an installed model reports (``{}`` when it is missing).
+
+        Never starts the managed server: while none runs, a suggested model has the capabilities the verified
+        catalog lists (a running server's ``/api/show`` values replace them); any other model has none.
+        """
+        name = model.removeprefix("ollama:")
+        if self.ollama_url() is None and name not in self._show:
+            entry = catalog_model(name)
+            if entry is None or entry.kind != "chat":
+                return {}
+            listed = tuple(entry.listed_capabilities)
+            return _overrides(listed, ModelDetails(name=name, capabilities=listed).capability_overrides())
         try:
             return dict(self.details(model).get("overrides") or {})
         except NodestroError:
@@ -594,6 +606,15 @@ class LocalModelService:
         self._show.clear()
         if running:
             self.start()
+
+
+def _overrides(capabilities: Iterable[str], known: Mapping[str, str]) -> dict[str, str]:
+    """Orkexa's capability values plus reasoning: Ollama reports ``thinking`` for models that reason and takes the
+    effort as ``reasoning_effort`` on its OpenAI-compatible API (sent with ``send_reasoning_effort``)."""
+    values = dict(known)
+    if "completion" in capabilities:
+        values.setdefault("reasoning", "supported" if "thinking" in capabilities else "unsupported")
+    return values
 
 
 def _copy_store(source: Path, target: Path, job: LocalJob, cancel: threading.Event) -> None:

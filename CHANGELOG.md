@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Preflight checks local models while a local server answers: `check.local_model_missing`,
+  `check.local_model_not_chat`, `check.local_model_no_tools` (errors). Nothing is started or downloaded for the check.
+- Fix: the agent check of a local model used no capabilities its server reports, so a local agent with tools or
+  persistent memory, or with an effort (the default `medium`), was refused before the run although the run would
+  have accepted it. The check now uses `/api/show` like the run, and the verified catalog's capabilities while no
+  local server runs (the check never starts it). Ollama's `thinking` means `reasoning: supported`; the effort of
+  such a model is sent as `reasoning_effort`, and a local model that cannot reason gets no effort instead of a
+  refusal. Found by running all example templates on a local model.
 - Model selection preferences (`local_models.SelectionPreferences`): the languages of the work and a preferred
   publisher region decide between equally suited local models and are named in the recommendation's reasons;
   catalog entries record `vendor`, `region` and documented `languages`.

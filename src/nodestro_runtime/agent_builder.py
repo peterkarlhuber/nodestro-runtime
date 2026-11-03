@@ -14,7 +14,7 @@ streaming, reasoning effort ...); such errors appear in the inspector.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 import keyword
 import re
@@ -302,7 +302,7 @@ class AgentBuilder:
             files=files,
             index=index,
             output_format=output_model(config.output),
-            effort=config.effort,
+            effort=_effort(config, connection, model),
             tool_choice=tool_choice,
             max_tokens=config.max_tokens,
             max_tool_rounds=config.max_tool_rounds,
@@ -341,7 +341,7 @@ class AgentBuilder:
         try:
             # Checked as for a run that asks before every call (gated): validation never runs a tool. Paths that
             # do not ask (agent test without a gate, tool test panel) refuse such tools when they build them.
-            self.build(config, connection=_validation_connection(self.declared, config), gated=True)
+            self.build(config, connection=_validation_connection(self.declared, config, self.reported), gated=True)
         except NodestroError as exc:
             field = (
                 "tools"
@@ -390,14 +390,32 @@ class _NeverCalled:
         raise RuntimeError("validation must not call the API")
 
 
-def _validation_connection(declared: Callable[[str], dict[str, Any]], config: AgentConfig) -> Connection:
+def _effort(config: AgentConfig, connection: Connection, model: str) -> Any:
+    """The agent's reasoning effort. A local model that cannot reason (its server reports no ``thinking``) has no
+    effort to set, so the setting (by default ``medium``) is left out instead of refusing the agent; a local model
+    that thinks gets it as ``reasoning_effort``."""
+    if config.effort is None or provider_of(model) != "ollama":
+        return config.effort
+    return connection.effort(model, config.effort)
+
+
+def _validation_connection(
+    declared: Callable[[str], dict[str, Any]],
+    config: AgentConfig,
+    reported: Callable[[str], Mapping[str, Any]] | None = None,
+) -> Connection:
     """The agent's connection with a client that is never called: no key needed, no request made.
 
-    The declared capabilities of the provider's settings count, so the inspector shows what a run
-    would refuse.
+    The declared capabilities of the provider's settings count, and for a local model what its server reports, so
+    the inspector shows what a run would refuse (and nothing a run would accept).
     """
     provider = provider_of(check_model(config.model))
-    return Connection(provider=provider, capabilities=declared(provider), client=_NeverCalled())
+    return Connection(
+        provider=provider,
+        capabilities=declared(provider),
+        client=_NeverCalled(),
+        reported=reported if provider == "ollama" else None,
+    )
 
 
 def _check_context(agent: Agent[Any], blocks: list[ContentBlock]) -> None:

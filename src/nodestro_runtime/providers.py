@@ -317,7 +317,11 @@ class Connection:
             return OpenAIOptions(request_options=extra)
         if self.provider == "gemini":
             return GeminiOptions(request_options=extra)
-        if self.provider in ("compatible", "ollama", "vllm"):
+        if self.provider == "ollama":
+            # Ollama takes the effort of a thinking model as reasoning_effort (only models whose server reports
+            # ``thinking`` get one, see agent_builder._effort and local_service._overrides).
+            return CompatibleOptions(send_reasoning_effort=True, request_options=extra)
+        if self.provider in ("compatible", "vllm"):
             return CompatibleOptions(request_options=extra)
         if self.provider == "bedrock":
             return self._bedrock_options(extra)

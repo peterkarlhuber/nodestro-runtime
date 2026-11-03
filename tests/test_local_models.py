@@ -23,6 +23,7 @@ from nodestro_runtime.local_models import (
     catalog_model,
     recommend,
 )
+from nodestro_runtime.local_service import InstalledModel
 from nodestro_runtime.preflight import preflight
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.schemas import DEFAULT_AGENT_MODEL, SettingsIn, Workflow
@@ -353,3 +354,71 @@ def test_preferences_decide_only_between_equally_suited_models() -> None:
     assert french.model == plain.model and "languages_unverified" not in french.reasons
     rare = recommend("write", laptop, preferences=SelectionPreferences(languages=["eu"]))  # Basque
     assert rare.model == plain.model and "languages_unverified" in rare.reasons
+
+
+def test_the_check_names_missing_and_unsuitable_local_models(
+    managed: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def agent(node_id: str, model: str, tools: list[str] | None = None) -> dict[str, object]:
+        config = {"name": node_id, "model": model, "task": "x", "tools": tools or []}
+        return {"id": node_id, "type": "agent", "agent": config}
+
+    workflow = Workflow.model_validate(
+        {
+            "id": "w",
+            "name": "Local",
+            "nodes": [
+                {"id": "s", "type": "start"},
+                agent("ok", "ollama:qwen3.5:4b", ["calculator"]),
+                agent("missing", "ollama:qwen3.5:9b"),
+                agent("embed", "ollama:qwen3-embedding:0.6b"),
+                agent("plain", "ollama:plain-model", ["calculator"]),
+                {"id": "o", "type": "output"},
+            ],
+            "edges": [
+                {"id": f"e{i}", "source": "s", "target": target}
+                for i, target in enumerate(["ok", "missing", "embed", "plain"])
+            ]
+            + [{"id": "eo", "source": "ok", "target": "o"}],
+        }
+    )
+    # Nothing is checked (and nothing starts) while no local server runs.
+    codes = {item.code for item in preflight(managed, workflow).problems}
+    assert not {code for code in codes if code.startswith("check.local_model")}
+    assert managed.local_models._managed is None
+    managed.local_models.start()
+    real = managed.local_models.installed
+    plain = InstalledModel(name="plain-model:latest", size=1, digest="0" * 64, kind="chat", capabilities=["completion"])
+    monkeypatch.setattr(managed.local_models, "installed", lambda client=None: [*real(client), plain])
+    issues = {(item.code, item.node_id, item.params.get("model")) for item in preflight(managed, workflow).problems}
+    local = {issue for issue in issues if issue[0].startswith("check.local_model")}
+    assert local == {
+        ("check.local_model_missing", None, "ollama:qwen3.5:9b"),
+        ("check.local_model_not_chat", None, "ollama:qwen3-embedding:0.6b"),
+        ("check.local_model_no_tools", "plain", "ollama:plain-model"),
+    }
+
+
+def test_local_agents_validate_with_what_the_server_reports(managed: Workspace) -> None:
+    from nodestro_runtime.agent_builder import _effort
+    from nodestro_runtime.providers import Connection
+    from nodestro_runtime.schemas import AgentConfig
+
+    # Persistent memory needs tool calls and the default effort is medium: the check knows both from /api/show.
+    config = AgentConfig.model_validate(
+        {"name": "A", "model": LOCAL_DEFAULT_MODEL, "task": "x", "memory": {"mode": "persistent", "space": "s"}}
+    )
+    assert config.effort == "medium"
+    # Before the server runs, the verified catalog stands in for /api/show; the check starts nothing.
+    assert [issue.code for issue in managed.builder.validate(config) if issue.level == "error"] == []
+    assert managed.local_models._managed is None
+    managed.local_models.start()
+    assert [issue.code for issue in managed.builder.validate(config) if issue.level == "error"] == []
+    connection = managed.connection("ollama")
+    assert connection.agent_kwargs(LOCAL_DEFAULT_MODEL)["capabilities"]["reasoning"] == "supported"
+    assert connection.options().send_reasoning_effort  # a thinking model gets the effort as reasoning_effort
+    assert _effort(config, connection, LOCAL_DEFAULT_MODEL) == "medium"
+    # A model that cannot reason has no effort to set: left out, never a refused agent.
+    plain = Connection(provider="ollama", client=object(), reported=lambda _model: {"reasoning": "unsupported"})
+    assert _effort(config, plain, "ollama:plain:1b") is None
+    assert _effort(config, Connection(provider="anthropic", client=object()), DEFAULT_AGENT_MODEL) == "medium"
