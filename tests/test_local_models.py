@@ -335,3 +335,21 @@ def test_local_usage_is_counted_but_never_shown_as_a_free_total() -> None:
     assert usage.local_requests == 1 and usage.requests == 1 and usage.cost_complete
     assert usage.estimated_cost_usd == 0 and usage.pricing_sources == ["local"]
     assert add_usage(usage, usage).local_requests == 2
+
+
+def test_preferences_decide_only_between_equally_suited_models() -> None:
+    from nodestro_runtime.local_models import CATALOG, SelectionPreferences, recommend
+
+    laptop = Hardware(system="Linux", machine="x86_64", cpus=8, ram_bytes=16 * GB, gpu="none")
+    plain = recommend("write", laptop)
+    # No model of the region: the same choice, and the reasons say the preference could not be met.
+    europe = recommend("write", laptop, preferences=SelectionPreferences(region="eu"))
+    assert europe.model == plain.model and europe.quality == plain.quality
+    assert "preferred_region_unavailable" in europe.reasons and "preferred_region" not in plain.reasons
+    assert "preferred_region" in recommend("write", laptop, preferences=SelectionPreferences(region="cn")).reasons
+    # Languages: every catalog model documents the six studio languages; an undocumented one is named, not hidden.
+    assert all({"de", "fr", "pt"} <= set(model.languages) for model in CATALOG)
+    french = recommend("write", laptop, preferences=SelectionPreferences(languages=["fr", "pt-BR"]))
+    assert french.model == plain.model and "languages_unverified" not in french.reasons
+    rare = recommend("write", laptop, preferences=SelectionPreferences(languages=["eu"]))  # Basque
+    assert rare.model == plain.model and "languages_unverified" in rare.reasons

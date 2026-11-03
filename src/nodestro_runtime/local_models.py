@@ -34,6 +34,11 @@ LOCAL_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 ModelKind = Literal["chat", "embedding"]
 Quality = Literal["recommended", "acceptable", "limited", "insufficient"]
+#: Where the model's publisher is based (its origin, not where it runs: every catalog model runs on this computer).
+Region = Literal["eu", "us", "cn", "other"]
+
+#: The six interface languages of Nodestro (the ones a model must list for "all languages of the studio").
+STUDIO_LANGUAGES = ("de", "en", "es", "fr", "it", "pt")
 
 _GB = 1_000_000_000
 
@@ -62,6 +67,21 @@ class LocalModelInfo(BaseModel):
     context: int | None = None
     dimensions: int | None = None
     notes: str = ""
+    #: The publisher and its region (origin only: open weights run offline wherever they come from).
+    vendor: str = ""
+    region: Region = "other"
+    #: Languages the publisher documents (ISO 639-1); an unlisted language is unverified, not unsupported.
+    languages: list[str] = Field(default_factory=list)
+
+
+class SelectionPreferences(BaseModel):
+    """What the person prefers beyond the task (D13): a publisher region and the languages of the work.
+
+    A preference only decides between models that are equally suited: it never makes a model look better than it
+    is, and the recommendation names it in its reasons."""
+
+    region: Region | None = None
+    languages: list[str] = Field(default_factory=list)
 
 
 CATALOG: tuple[LocalModelInfo, ...] = (
@@ -74,6 +94,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["completion", "vision", "tools", "thinking"],
         min_ollama="0.30.0",
         license="Apache-2.0",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=6 * _GB,
         rank=1,
         context=262_144,
@@ -88,6 +111,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["completion", "vision", "tools", "thinking"],
         min_ollama="0.30.0",
         license="Apache-2.0",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=10 * _GB,
         rank=2,
         notes="Everyday agent work: writing, tools, documents and images",
@@ -101,6 +127,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["completion", "vision", "tools", "thinking"],
         min_ollama="0.30.0",
         license="Apache-2.0",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=26 * _GB,
         rank=3,
         notes="Demanding work; a mixture of experts (3B active), fast enough on a CPU with enough memory",
@@ -114,6 +143,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["completion", "vision", "tools", "thinking"],
         min_ollama="0.32.12",
         license="Apache-2.0",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=22 * _GB,
         rank=3,
         cpu_friendly=False,
@@ -128,6 +160,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
         license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=2 * _GB,
         context=32_768,
         dimensions=1024,
@@ -142,6 +177,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
         license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=5 * _GB,
         notes="More precise semantic search; slower indexing",
     ),
@@ -154,6 +192,9 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
         license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        vendor="Alibaba (Qwen)",
+        region="cn",
+        languages=list(STUDIO_LANGUAGES),
         memory_bytes=8 * _GB,
         notes="The most precise semantic search; needs a GPU for large knowledge bases",
     ),
@@ -335,12 +376,15 @@ def recommend(
     installed: Iterable[str] = (),
     *,
     capabilities: Mapping[str, Iterable[str]] | None = None,
+    preferences: SelectionPreferences | None = None,
 ) -> Recommendation:
     """The local model for ``task`` (a key of :data:`TASKS`) on ``hardware``.
 
     An installed model that is good enough wins over a better one that needs a download; among the models that fit,
     the largest up to the task's ideal is chosen. ``capabilities`` (from ``/api/show`` of installed models, by name)
     replace the listed ones where known: a model that does not report a needed capability is not suggested.
+    ``preferences``: models that document all the work's languages come first where any do; a preferred region
+    decides only between models of the same suitability.
     """
     profile = TASKS.get(task)
     if profile is None:
@@ -348,26 +392,52 @@ def recommend(
     present = _installed_names(installed)
     reported = {name.removeprefix("ollama:"): set(values) for name, values in (capabilities or {}).items()}
 
+    wishes = preferences or SelectionPreferences()
+    notes: list[str] = []
+
     def capable(model: LocalModelInfo) -> bool:
         known = reported.get(model.name, set(model.listed_capabilities))
         return all(need in known for need in profile.needs)
 
+    def speaks(models: list[LocalModelInfo]) -> list[LocalModelInfo]:
+        if not wishes.languages:
+            return models
+        wanted = {code.split("-")[0].lower() for code in wishes.languages}
+        listed = [m for m in models if wanted <= set(m.languages)]
+        if listed:
+            return listed
+        notes.append("languages_unverified")
+        return models
+
+    def other_region(model: LocalModelInfo) -> bool:
+        return wishes.region is not None and model.region != wishes.region
+
     if profile.id == "embedding":
-        candidates = [m for m in CATALOG if m.kind == "embedding" and capable(m) and fits(m, hardware)]
+        candidates = speaks([m for m in CATALOG if m.kind == "embedding" and capable(m) and fits(m, hardware)])
         # The small model stays the default: another embedding model means reindexing everything.
-        ordered = sorted(candidates, key=lambda m: (m.name not in present, m.memory_bytes))
-        return _result(profile, ordered, present, hardware, ideal_name=LOCAL_EMBEDDING_MODEL)
-    chat = [m for m in CATALOG if m.kind == "chat" and capable(m) and m.rank >= profile.minimum]
+        ordered = sorted(candidates, key=lambda m: (m.name not in present, other_region(m), m.memory_bytes))
+        return _result(
+            profile, ordered, present, hardware, ideal_name=LOCAL_EMBEDDING_MODEL, wishes=wishes, notes=notes
+        )
+    chat = speaks([m for m in CATALOG if m.kind == "chat" and capable(m) and m.rank >= profile.minimum])
     usable = [m for m in chat if fits(m, hardware)]
     # Prefer the CPU-friendly model of a rank when no GPU holds the dense one.
     # Prefer a model that fits in GPU memory, then the CPU-friendly one of a rank, then the smaller one.
     usable.sort(
-        key=lambda m: (-min(m.rank, profile.ideal), not _in_gpu(m, hardware), not m.cpu_friendly, m.memory_bytes)
+        key=lambda m: (
+            -min(m.rank, profile.ideal),
+            other_region(m),
+            not _in_gpu(m, hardware),
+            not m.cpu_friendly,
+            m.memory_bytes,
+        )
     )
     ideal = next((m for m in sorted(chat, key=lambda m: (m.rank != profile.ideal, not m.cpu_friendly))), None)
     installed_usable = [m for m in usable if m.name in present]
     ordered = installed_usable + [m for m in usable if m not in installed_usable]
-    return _result(profile, ordered, present, hardware, ideal_name=ideal.name if ideal else None)
+    return _result(
+        profile, ordered, present, hardware, ideal_name=ideal.name if ideal else None, wishes=wishes, notes=notes
+    )
 
 
 def _result(
@@ -377,9 +447,13 @@ def _result(
     hardware: Hardware,
     *,
     ideal_name: str | None,
+    wishes: SelectionPreferences,
+    notes: list[str],
 ) -> Recommendation:
     if not ordered:
-        return Recommendation(task=profile.id, model=None, quality="insufficient", reasons=["no_fit"], better=None)
+        return Recommendation(
+            task=profile.id, model=None, quality="insufficient", reasons=["no_fit", *notes], better=None
+        )
     chosen = ordered[0]
     reasons: list[str] = []
     installed = chosen.name in present
@@ -396,6 +470,10 @@ def _result(
                 reasons.append("hardware_limit")
     if hardware.gpu == "none" and profile.ideal >= 3:
         reasons.append("no_gpu")  # the dense large model is left out: too slow on a CPU
+    if wishes.region is not None:
+        # Named either way, so the choice stays explainable: the preference was met, or no equal model had it.
+        reasons.append("preferred_region" if chosen.region == wishes.region else "preferred_region_unavailable")
+    reasons.extend(notes)
     return Recommendation(
         task=profile.id,
         model=f"ollama:{chosen.name}",
@@ -409,11 +487,15 @@ def _result(
 
 
 def recommend_all(
-    hardware: Hardware, installed: Iterable[str] = (), *, capabilities: Mapping[str, Iterable[str]] | None = None
+    hardware: Hardware,
+    installed: Iterable[str] = (),
+    *,
+    capabilities: Mapping[str, Iterable[str]] | None = None,
+    preferences: SelectionPreferences | None = None,
 ) -> list[Recommendation]:
     """A recommendation for every task of :data:`TASKS`."""
     names = list(installed)
-    return [recommend(task, hardware, names, capabilities=capabilities) for task in TASKS]
+    return [recommend(task, hardware, names, capabilities=capabilities, preferences=preferences) for task in TASKS]
 
 
 __all__ = [
@@ -422,11 +504,14 @@ __all__ = [
     "LOCAL_DEFAULT_MODEL",
     "LOCAL_EMBEDDING_MODEL",
     "OLLAMA_VERSION",
+    "STUDIO_LANGUAGES",
     "TASKS",
     "TIER_TASKS",
     "Hardware",
     "LocalModelInfo",
     "Recommendation",
+    "Region",
+    "SelectionPreferences",
     "TaskProfile",
     "catalog_model",
     "detect_hardware",

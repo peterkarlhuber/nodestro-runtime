@@ -35,6 +35,12 @@ for a task profile (`classify`, `extract`, `write`, `document_vision`, `tool_age
 * an installed model that is good enough wins over a better one that needs a download; the result says so
   (`quality`: `recommended`, `acceptable`, `limited`, `insufficient`; `better`; `reasons`).
 
+`SelectionPreferences` add what the person prefers: the languages of the work (models that document all of them
+come first; `languages_unverified` when none does) and a publisher region (`region`, e.g. `eu`), which decides only
+between models of the same suitability and is named in the reasons (`preferred_region`,
+`preferred_region_unavailable`). The region is the publisher's origin, not where data goes: every catalog model runs
+on this computer. Each catalog entry records `vendor`, `region` and the documented `languages`.
+
 A recommendation is a suggestion: callers store the chosen model explicitly. New installations use
 `ollama:qwen3.5:4b` for agents and `ollama:qwen3.5:9b` for assistants; existing installations keep the cloud
 defaults they had (`Settings.model_defaults`), so an update changes no model.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Model selection preferences (`local_models.SelectionPreferences`): the languages of the work and a preferred
+  publisher region decide between equally suited local models and are named in the recommendation's reasons;
+  catalog entries record `vendor`, `region` and documented `languages`.
 - A client injected for Ollama (`client_factory`) counts as its configured server, so preflight no longer asks
   for the local model runtime in tests and embedding applications.
 
