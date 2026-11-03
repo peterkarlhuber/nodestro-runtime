@@ -530,11 +530,16 @@ class PostgresDatabase:
                     " version integer PRIMARY KEY, name text NOT NULL,"
                     " applied_at timestamptz NOT NULL DEFAULT now(), checksum text)"
                 )
-                if not self._has_checksums():  # a table of a release before checksums
-                    db.execute("ALTER TABLE nodestro_schema_migrations ADD COLUMN IF NOT EXISTS checksum text")
+                # A table of a release before checksums gets its column only after the backup (OPS2-01): ALTER TABLE
+                # holds an ACCESS EXCLUSIVE lock until this transaction ends, and the backup (pg_dump on another
+                # connection) would wait for it while this transaction waits for the backup. Before the backup this
+                # transaction takes no lock that a reader waits for; the applied migrations are checked (by name
+                # without the column) without writing anything.
+                checksums = self._has_checksums()
                 current = self.schema_version
-                self._verify_applied(steps, adopt=True)
+                self._verify_applied(steps, adopt=False)
                 if current == target:
+                    self._adopt_checksums(db, steps, checksums)
                     return current
                 if current > target:
                     raise NodestroError(
@@ -569,6 +574,7 @@ class PostgresDatabase:
                             found=current,
                             supported=target,
                         ) from exc
+                self._adopt_checksums(db, steps, checksums)
                 step = current
                 try:
                     with db.transaction():  # a savepoint: the failure below is reported, then everything rolls back
@@ -596,6 +602,13 @@ class PostgresDatabase:
                     ) from exc
                 return current
 
+    def _adopt_checksums(self, db: Any, steps: Mapping[int, tuple[str, PostgresStep]], checksums: bool) -> None:
+        """Inside :meth:`migrate`, after the backup: give a schema table of a release before checksums its column and
+        record the checksums of the migrations applied without them."""
+        if not checksums:
+            db.execute("ALTER TABLE nodestro_schema_migrations ADD COLUMN IF NOT EXISTS checksum text")
+        self._verify_applied(steps, adopt=True)
+
     def _has_checksums(self) -> bool:
         rows = self._query(
             "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('nodestro_schema_migrations')"
@@ -606,14 +619,18 @@ class PostgresDatabase:
     def _verify_applied(self, steps: Mapping[int, tuple[str, PostgresStep]], *, adopt: bool) -> None:
         """Refuse applied migrations whose shipped file differs (``storage.migration_changed``); with ``adopt``
         (under the migration lock), record the checksum of rows written before checksums were kept, after checking
-        that the file name is the one that was applied."""
+        that the file name is the one that was applied. A table of a release before checksums has only the names
+        to compare (and nothing is adopted until :meth:`migrate` added the column)."""
+        query = "SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version"
         if not self._has_checksums():
-            return
+            exists = self._query("SELECT to_regclass('nodestro_schema_migrations') IS NOT NULL")
+            if not exists or not exists[0][0]:
+                return
+            query = "SELECT version, name, NULL::text FROM nodestro_schema_migrations ORDER BY version"
+            adopt = False
         changed: builtins.list[str] = []
         adopted: builtins.list[tuple[str, int]] = []
-        for version, name, checksum in self._query(
-            "SELECT version, name, checksum FROM nodestro_schema_migrations ORDER BY version"
-        ):
+        for version, name, checksum in self._query(query):
             if version not in steps:
                 continue  # newer than this release: refused as storage.schema_too_new
             shipped_name, step = steps[version]

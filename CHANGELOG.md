@@ -4,6 +4,11 @@
 
 Backend audit round 2, runtime fixes (2026-11-03):
 
+- OPS2-01: `migrate` of a PostgreSQL database written before migration checksums (v0.2.0-preview.1) no longer
+  deadlocks with its own pre-migration backup: the `checksum` column of `nodestro_schema_migrations` is added (and the
+  checksums recorded) after `before_migration` returned, so `pg_dump` on another connection never waits for the
+  migration transaction's ACCESS EXCLUSIVE lock. The backup stays required and is still taken first; applied
+  migrations are checked by name before it.
 - RT2-01: continuing a failed run asks for confirmation also for tool calls that reached the tool and then ended with
   an error (a timeout after the request was sent may hide a completed effect). Only calls refused or still waiting
   before they ran (approval state `pending`, `denied`, `rejected`, `expired`, `cancelled`) are left out.
