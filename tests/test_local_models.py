@@ -422,3 +422,10 @@ def test_local_agents_validate_with_what_the_server_reports(managed: Workspace) 
     plain = Connection(provider="ollama", client=object(), reported=lambda _model: {"reasoning": "unsupported"})
     assert _effort(config, plain, "ollama:plain:1b") is None
     assert _effort(config, Connection(provider="anthropic", client=object()), DEFAULT_AGENT_MODEL) == "medium"
+
+
+def test_a_refused_ollama_address_leaves_capabilities_unknown(tmp_path: Path) -> None:
+    with Workspace(tmp_path / "data", integrations=[]) as workspace:
+        # An address with credentials, stored before such addresses were refused: no exception escapes the check.
+        workspace.store.put_raw("settings", "app", {"providers": {"ollama": {"base_url": "http://u:pw@h/v1"}}})
+        assert workspace.local_models.capability_overrides("llama3.1:8b") == {}

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix: an Ollama address the client refuses (one with credentials, saved before such addresses were refused) no
+  longer makes the agent check fail with a `ConfigurationError`; the capabilities stay unknown (runtime #102 asked
+  the server during the check).
 - Preflight checks local models while a local server answers: `check.local_model_missing`,
   `check.local_model_not_chat`, `check.local_model_no_tools` (errors). Nothing is started or downloaded for the check.
 - Fix: the agent check of a local model used no capabilities its server reports, so a local agent with tools or

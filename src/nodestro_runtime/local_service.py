@@ -390,7 +390,9 @@ class LocalModelService:
             return _overrides(listed, ModelDetails(name=name, capabilities=listed).capability_overrides())
         try:
             return dict(self.details(model).get("overrides") or {})
-        except NodestroError:
+        except (NodestroError, ValueError):
+            # No answer, or an address the client refuses (e.g. one with credentials, saved before such addresses
+            # were refused): nothing is known, and the agent check names what that leaves unknown.
             return {}
 
     def recommend(self, task: str, preferences: SelectionPreferences | None = None) -> Recommendation:
