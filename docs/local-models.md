@@ -52,6 +52,16 @@ themselves to task profiles (`tasks`): `devstral-small-2:24b` is a coding model 
 context length is Mistral AI's 256K (the 393,216 some sources give is the YaRN maximum); `ministral-3:14b` is listed but not yet
 verified in a run here (`notes`). The embedding standard stays `qwen3-embedding:0.6b`.
 
+LightOn's `mdenseon:307m` (Apache-2.0, 768 dimensions, 8192 tokens) is the optional European embedding model. It is
+not in the Ollama registry: `source="build"` entries are built by an orkexa recipe (`orkexa.local.MDENSEON`) from
+pinned upstream files (1.2 GB weights and a 6 MB template header, each checked by SHA-256) into a reproducible GGUF,
+and the model is kept only if it reproduces the recipe's reference vectors. A download in the catalog
+(`LocalModelService.pull`) runs that build with `download=True`; `LocalModelService.build(name, weights=...,
+template=...)` builds from files on this computer (air gap). The document and query prefixes the model was trained
+with (`"document: "`, `"query: "`) come from orkexa's `KNOWN_PREFIXES` and are part of the index identity. It is
+suggested only with the European preference and only while no embedding model is installed: switching an existing
+index to another model means rebuilding it (`Settings.embedding_model`, then rebuild the index).
+
 A recommendation is a suggestion: callers store the chosen model explicitly. New installations use
 `ollama:qwen3.5:4b` for agents and `ollama:qwen3.5:9b` for assistants; existing installations keep the cloud
 defaults they had (`Settings.model_defaults`), so an update changes no model.

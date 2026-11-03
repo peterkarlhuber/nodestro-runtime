@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
+  extra (`gguf`). New catalog entry `mdenseon:307m` (LightOn, Apache-2.0) with `source="build"`: the catalog download
+  builds it from pinned upstream files and checks its reference vectors; `LocalModelService.build()` builds it from
+  local files (job kind `build`). It is an alternative, suggested only with the European preference. An alternative
+  of another region than the preferred one is no longer suggested.
 - Fix: the managed Ollama server starts with a 32768-token context window (`OLLAMA_CONTEXT_LENGTH`, set with
   `NODESTRO_OLLAMA_CONTEXT_LENGTH`). Ollama's default without a large GPU is 4096 tokens for prompt, thinking and
   answer together, so local agents of the example templates ended with `stop_reason='length'` after about 3,500

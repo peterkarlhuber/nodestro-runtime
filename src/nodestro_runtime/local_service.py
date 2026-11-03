@@ -33,10 +33,13 @@ from typing import Any, Literal
 import uuid
 
 from orkexa.local import (
+    MDENSEON,
+    GGUFRecipe,
     ManagedOllama,
     ModelDetails,
     OllamaClient,
     OllamaError,
+    build_model,
     check_model_name,
     detect_ollama,
     import_package,
@@ -62,7 +65,7 @@ from .problems import NodestroError
 logger = logging.getLogger(__name__)
 
 Mode = Literal["managed", "container", "external", "unavailable"]
-JobKind = Literal["pull", "install_runtime", "import_package", "import_gguf", "move_models"]
+JobKind = Literal["pull", "build", "install_runtime", "import_package", "import_gguf", "move_models"]
 JobState = Literal["running", "done", "failed", "cancelled"]
 
 #: Where the local model settings are stored (one document; the app settings stay untouched).
@@ -492,8 +495,13 @@ class LocalModelService:
         return job
 
     def pull(self, name: str) -> LocalJob:
-        """Download a model (needs the internet; refused in the strict offline mode)."""
+        """Download a model (needs the internet; refused in the strict offline mode).
+
+        A catalog model that is built from pinned upstream weights (``source="build"``) downloads those and is built."""
         name = _model_name(name)
+        entry = catalog_model(name)
+        if entry is not None and entry.source == "build":
+            return self.build(name, download=True)
         self._refuse_offline("downloading a model")
         client = self.client()
 
@@ -504,6 +512,48 @@ class LocalModelService:
                     job.total, job.completed = item.total, item.completed or 0
 
         return self._run("pull", name, work)
+
+    def build(
+        self, name: str, *, weights: str | None = None, template: str | None = None, download: bool = False
+    ) -> LocalJob:
+        """Build a catalog model from its pinned upstream files (e.g. ``mdenseon:307m``) and check its reference
+        vectors. ``weights`` and ``template`` are files on this computer (offline); ``download`` fetches the missing
+        ones (refused in the strict offline mode)."""
+        name = _model_name(name)
+        recipe = _RECIPES.get(name)
+        if recipe is None:
+            raise NodestroError("local.not_buildable", f"{name} is not built from upstream files", model=name)
+        if download:
+            self._refuse_offline("downloading model weights")
+        files = {
+            key: Path(value).expanduser() for key, value in (("weights", weights), ("template", template)) if value
+        }
+        for path in files.values():
+            if not path.is_file():
+                raise NodestroError("local.file_missing", f"{path} does not exist", path=str(path))
+        if not download and len(files) < 2:
+            raise NodestroError(
+                "local.archive_or_download", "Choose the weights and template files or allow the download"
+            )
+        client = self.client()
+        self.home.mkdir(parents=True, exist_ok=True)
+
+        def work(job: LocalJob, cancel: threading.Event) -> None:
+            def progress(text: str) -> None:
+                job.message = text
+
+            build_model(
+                client,
+                recipe,
+                weights=files.get("weights"),
+                template=files.get("template"),
+                download=download,
+                work_dir=self.home,  # next to the models, not a small temporary file system
+                progress=progress,
+                cancel=cancel,
+            )
+
+        return self._run("build", name, work)
 
     def install_runtime(self, *, archive: str | None = None, download: bool = False) -> LocalJob:
         """Install the pinned runtime from a local release archive, or download it (desktop only)."""
@@ -624,6 +674,10 @@ class LocalModelService:
         self._show.clear()
         if running:
             self.start()
+
+
+#: The orkexa recipes of catalog models with ``source="build"``.
+_RECIPES: dict[str, GGUFRecipe] = {MDENSEON.name: MDENSEON}
 
 
 def _context_length(value: str | None) -> int:
