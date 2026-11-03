@@ -42,6 +42,8 @@ import threading
 from typing import Any, Literal
 
 from orkexa.dynamic import Sandbox
+from orkexa.embeddings import OllamaEmbeddings
+from orkexa.local import OllamaError, check_model_name
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
@@ -59,6 +61,8 @@ from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
+from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL
+from .local_service import LocalModelService
 from .mcp.hub import McpHub, McpLimits
 from .mcp.models import SERVERS as MCP_SERVERS
 from .mcp.netguard import EgressPolicy
@@ -138,6 +142,25 @@ DATABASE = "nodestro.db"
 #: Held while a workspace is open: a second process on the same data directory would mark the first
 #: one's runs as interrupted, clean up its installations and run every schedule a second time.
 LOCK_FILE = "nodestro.lock"
+
+
+#: The installation's own bookkeeping (never the user's settings): which default models it started with.
+INSTALLATION = "installation"
+MODEL_DEFAULTS = "model_defaults"
+
+
+def _retrieval_mode(value: Any) -> Any:
+    return value if value in ("fts", "vector", "hybrid") else "fts"
+
+
+def _embedding_name(name: str) -> str:
+    """An Ollama embedding model name (``ollama:`` prefix allowed); cloud models are refused."""
+    bare = str(name).strip().removeprefix("ollama:")
+    try:
+        check_model_name(bare)
+    except OllamaError as exc:
+        raise NodestroError("config.embedding_model_invalid", str(exc), model=str(name)) from None
+    return bare
 
 
 class DataDirectoryLock:
@@ -304,6 +327,7 @@ class Workspace:
             self._sqlite = Store(database)
             self.store = self._sqlite
             self.tenant_id = LOCAL_TENANT
+            fresh = self._sqlite._is_empty()
             try:
                 self._sqlite.migrate(before_migration=before_migration or self._backup_before_migration)
             except BaseException:
@@ -313,6 +337,7 @@ class Workspace:
                 raise
             self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(database)
+            self._store_model_defaults(fresh=fresh)
         else:
             self.store = storage.store
             self.tenant_id = storage.tenant_id
@@ -329,6 +354,8 @@ class Workspace:
         self._bedrock_checked = 0.0
         self._bedrock_check_lock = threading.Lock()
         self.knowledge.ocr_enabled = lambda: bool(self._stored("ocr_enabled"))
+        self.knowledge.retrieval = self._knowledge_retrieval
+        self.knowledge.embedding_model = self._embedding_model
         # A workspace on handed-in storage serves a tenant of a server: its tool code runs only in containers,
         # whatever the profile or a stored (for example imported) setting says (ADR-0006).
         self.sandbox_policy = SandboxPolicy("server" if storage is not None else self.profile.kind)
@@ -359,6 +386,17 @@ class Workspace:
         self.tools.mcp = self.mcp
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
+        # Local models (Ollama): the managed server of the desktop, the container of Nodestro Local Docker, or the
+        # operator's endpoint on a server. Nothing starts here (see local_service).
+        self.local_models = LocalModelService(
+            data_dir,
+            "server" if storage is not None else self.profile.kind,
+            store=self.store,
+            offline=self.strict_offline,
+            external_url=lambda: self._providers().get("ollama", {}).get("base_url") or None,
+            environ={} if storage is not None else None,
+        )
+        self.builder.reported = self.local_models.capability_overrides
         self._client_factory = client_factory
         self.runs = RunManager(
             self.store,
@@ -470,6 +508,21 @@ class Workspace:
         except Exception:  # cleaning up is housekeeping; it never stops Nodestro from starting
             logging.getLogger(__name__).exception("Cleaning up input files failed")
 
+    def _store_model_defaults(self, *, fresh: bool) -> None:
+        """Record once which default models this installation started with (D4): a new installation uses local models,
+        an existing one keeps the cloud models it used until now, so an update changes no model. The user's settings
+        are not touched; a default model the user saves always wins."""
+        if self.store.get_raw(INSTALLATION, MODEL_DEFAULTS) is None:
+            local = fresh and self.profile.kind != "server"
+            self.store.put_raw(INSTALLATION, MODEL_DEFAULTS, {"origin": "local" if local else "kept"})
+
+    def _default_models(self) -> tuple[str, str]:
+        """The default and assistant model when the settings name none (see :meth:`_store_model_defaults`)."""
+        marker = self.store.get_raw(INSTALLATION, MODEL_DEFAULTS) or {}
+        if marker.get("origin") == "local":
+            return LOCAL_DEFAULT_MODEL, LOCAL_ASSISTANT_MODEL
+        return DEFAULT_AGENT_MODEL, DEFAULT_ASSISTANT_MODEL
+
     def _backup_before_migration(self, current: int, target: int) -> None:
         """Copy the database before a schema migration (the default ``before_migration``)."""
         backup_migrated_database(self.sqlite_store, self.data_dir / "backups", current, target)
@@ -515,6 +568,7 @@ class Workspace:
             for run_id in live:
                 self.runs.cancel(run_id)
         self.mcp.hub.close()
+        self.local_models.close()
         self.knowledge.close()
         self.memory.close()
         self.store.close()
@@ -630,13 +684,14 @@ class Workspace:
         values = self.store.get_raw("settings", "app") or {}
         budget = values.get("default_budget_usd", 2.0)
         stored = self._providers(values)
-        default_model = values.get("default_model") or DEFAULT_AGENT_MODEL
+        fallback_model, fallback_assistant = self._default_models()
+        default_model = values.get("default_model") or fallback_model
         docker = self._docker_state()  # one snapshot; never waits for the daemon
         return Settings(
             providers=[self._provider_status(name, stored.get(name, {})) for name in PROVIDERS],
             default_provider=provider_of(default_model),
             default_model=default_model,
-            assistant_model=values.get("assistant_model") or DEFAULT_ASSISTANT_MODEL,
+            assistant_model=values.get("assistant_model") or fallback_assistant,
             default_budget_usd=budget,
             sandbox=self._sandbox_kind(),
             docker_available=docker.approved,
@@ -654,6 +709,10 @@ class Workspace:
             max_run_budget_usd=run_budget.stored_amount(values.get("max_run_budget_usd")),
             operator_max_run_budget_usd=run_budget.operator_cap(server=self._server_tenant),
             budget_decision_hours=run_budget.decision_hours(values.get("budget_decision_hours")),
+            knowledge_retrieval=_retrieval_mode(values.get("knowledge_retrieval")),
+            embedding_model=values.get("embedding_model") or None,
+            strict_offline=bool(values.get("strict_offline")),
+            model_defaults="local" if fallback_model == LOCAL_DEFAULT_MODEL else "kept",
         )
 
     def _budget_policy(self) -> tuple[Decimal | None, int]:
@@ -751,6 +810,12 @@ class Workspace:
         for key in ("default_model", "assistant_model"):
             if changes.get(key):
                 changes[key] = check_model(changes[key])
+        if changes.get("embedding_model"):
+            changes["embedding_model"] = _embedding_name(changes["embedding_model"])
+        if changes.get("knowledge_retrieval") in ("vector", "hybrid") and not (
+            changes.get("embedding_model") or values.get("embedding_model")
+        ):
+            changes["embedding_model"] = LOCAL_EMBEDDING_MODEL
         if changes.pop("clear_max_run_budget", None):
             values.pop("max_run_budget_usd", None)
             changes.pop("max_run_budget_usd", None)
@@ -776,7 +841,7 @@ class Workspace:
         return policy
 
     def _provider_status(self, name: str, stored: Mapping[str, Any]) -> Any:
-        return provider_status(
+        status = provider_status(
             name,
             stored,
             self._environ,
@@ -784,6 +849,26 @@ class Workspace:
             bedrock_policy=self._bedrock_policy_for_tenant(),
             local_container=self._local_container(),
         )
+        if name == "ollama" and not stored.get("base_url") and self.local_models.provides_endpoint():
+            status.configured = True
+            status.local_server = True
+        return status
+
+    def _knowledge_retrieval(self) -> tuple[Any, str | None]:
+        values = self.store.get_raw("settings", "app") or {}
+        return _retrieval_mode(values.get("knowledge_retrieval")), values.get("embedding_model") or None
+
+    def _embedding_model(self, name: str) -> OllamaEmbeddings:
+        """An Ollama embedding model on the server agents use (the managed one, the container, or the operator's)."""
+        connection = self.connection("ollama")
+        base = (connection.base_url or "").removesuffix("/v1").rstrip("/")
+        if not base:
+            raise NodestroError("local.not_running", "No local model server is running")
+        return OllamaEmbeddings(_embedding_name(name), base_url=base, allow_remote=True)
+
+    def strict_offline(self) -> bool:
+        """Whether the strict offline mode is on: only local models and local tools, no downloads (D12)."""
+        return bool(self._stored("strict_offline"))
 
     def _update_bedrock(self, entry: dict[str, Any], change: Mapping[str, Any]) -> None:
         """Check and store a change of the Bedrock settings (region, sign-in, profile name, residency)."""
@@ -1183,6 +1268,21 @@ class Workspace:
             return self._bedrock_connection(stored)
         key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
+        reported = None
+        if provider == "ollama":
+            reported = self.local_models.capability_overrides
+            if base_url is None and self._client_factory is None:
+                # The server Nodestro provides: the managed one (started now if needed) or the container's.
+                try:
+                    base_url = self.local_models.openai_url()
+                except NodestroError as exc:
+                    raise MissingApiKeyError(provider, code=exc.code, message=str(exc)) from None
+                if base_url is None and self.local_models.mode == "managed":
+                    raise MissingApiKeyError(
+                        provider,
+                        code="local.runtime_missing",
+                        message="The local model runtime is not installed: set it up in the settings (local models)",
+                    )
         if base_url and info.base_url:
             check_endpoint_allowed(base_url, self._endpoints)  # also a URL stored before the operator changed the list
         client = self._client_factory(provider) if self._client_factory is not None else None
@@ -1197,6 +1297,7 @@ class Workspace:
             base_url=base_url if info.base_url else None,
             capabilities=dict(stored.get("capabilities") or {}),
             client=client,
+            reported=reported,
         )
 
     def provider_settings(self, provider: str) -> dict[str, Any]:

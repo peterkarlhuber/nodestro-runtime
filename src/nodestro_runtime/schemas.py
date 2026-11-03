@@ -104,11 +104,15 @@ class KnowledgeConfig(_Model):
     ``context`` puts the files into the prompt, ``on_demand`` gives the agent the
     ``files`` tool to load them when needed, ``search`` gives it the ``search``
     tool over their text (RAG with citations).
+
+    ``retrieval`` is how ``search`` ranks: ``default`` follows the workspace setting, ``fts`` full text,
+    ``vector`` semantic search (needs the semantic index), ``hybrid`` both.
     """
 
     file_ids: list[str] = Field(default_factory=list)
     mode: Literal["context", "on_demand", "search"] = "on_demand"
     citations: bool = False
+    retrieval: Literal["default", "fts", "vector", "hybrid"] = "default"
 
 
 class MemoryConfig(_Model):
@@ -573,6 +577,9 @@ class Usage(_Model):
     cost_complete: bool | None = None
     #: Requests whose cost is unknown or incomplete.
     unpriced_requests: int = 0
+    #: Requests to local models (Ollama): no external API billing, so their API cost is 0; the local operating costs
+    #: (hardware, energy) are not recorded. Show them as such, never as a free total.
+    local_requests: int = 0
     #: Requests priced with a price that was stale (not checked for ``warn_after``) at the time.
     stale_price_requests: int = 0
     #: Cost components that could not be priced (``input:openai:gpt-x``, ``fee:web_search_call``, ...).
@@ -938,6 +945,11 @@ class SettingsIn(_Model):
     clear_max_run_budget: bool | None = None
     #: How long a budget decision of an attended run waits before the run ends (hours).
     budget_decision_hours: int | None = Field(default=None, ge=1, le=720)
+    #: How knowledge search ranks by default (``fts``, ``vector``, ``hybrid``) and with which embedding model.
+    knowledge_retrieval: Literal["fts", "vector", "hybrid"] | None = None
+    embedding_model: str | None = None
+    #: The strict offline mode: only local models and local tools, no downloads or price updates (D12).
+    strict_offline: bool | None = None
 
 
 class BuiltinSandboxStatus(_Model):
@@ -1055,3 +1067,9 @@ class Settings(_Model):
     operator_max_run_budget_usd: Decimal | None = None
     #: How long a budget decision of an attended run waits before the run ends (hours).
     budget_decision_hours: int = 24
+    knowledge_retrieval: Literal["fts", "vector", "hybrid"] = "fts"
+    #: The Ollama embedding model of the semantic index (``None``: none chosen yet).
+    embedding_model: str | None = None
+    strict_offline: bool = False
+    #: Whether this installation started with local default models (``local``) or kept its cloud defaults (``kept``).
+    model_defaults: Literal["local", "kept"] = "kept"

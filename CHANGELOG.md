@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+Local models, embeddings and RAG (2026-11-03, see `docs/local-models.md`):
+- Local models through Ollama: `local_models` (the verified catalog of `qwen3.5:4b/9b`, `qwen3.6:35b-a3b`,
+  `qwen3.8:27b`, `qwen3-embedding:0.6b/4b/8b` with digests and sizes; task profiles; hardware detection;
+  `recommend()`), `local_service.LocalModelService` (`Workspace.local_models`: the managed Ollama of the desktop,
+  the Ollama container of Nodestro Local Docker via `NODESTRO_OLLAMA_URL`, the operator's endpoint on a server;
+  status, model list with `/api/show` capabilities, pull/import/runtime/model-folder jobs). Nothing starts or downloads
+  when a workspace opens.
+- The Ollama provider counts as configured when Nodestro provides the server (`ProviderStatus.local_server`);
+  `Connection.agent_kwargs(model)` adds the capabilities the installed model reports (declared ones still win).
+- New installations default to `ollama:qwen3.5:4b` (agents) and `ollama:qwen3.5:9b` (assistants); existing
+  installations keep their cloud defaults (`installation/model_defaults`, `Settings.model_defaults`). Stored
+  workflows and settings are never changed.
+- Knowledge retrieval modes `fts` (default), `vector`, `hybrid`: `Settings.knowledge_retrieval`,
+  `Settings.embedding_model`, `KnowledgeConfig.retrieval` (`default` follows the setting). `KnowledgeBase`
+  `index_status()`, `start_reindex()`, `cancel_reindex()`, `drop_vectors()`; vectors are bound to the embedding model
+  identity and switched atomically. `ScopedIndex` limits searches to the agent's files before ranking (it used to
+  filter after ranking). Vector and hybrid search never fall back to full text.
+- PostgreSQL migration `0010_knowledge_vectors`: `nodestro_vector_spaces`, `nodestro_chunk_vectors` (tenant-scoped);
+  pgvector ranks where installed (the migration installs it when available), the runtime ranks otherwise.
+- Strict offline mode (`Settings.strict_offline`): preflight errors `check.offline_cloud_model`,
+  `check.offline_remote_endpoint`, `check.offline_server_tool`, `check.offline_mcp`; downloads are refused. New checks
+  `check.local_runtime_missing`, `check.vectors_missing`, `check.reindex_required`, `check.index_building`.
+- Local usage: `Usage.local_requests`; local models are priced by Orkexa with a zero API price of source `local` (no
+  external API billing; local operating costs are not recorded), so strict price mode admits them and preflight no
+  longer reports them as unpriced. The catalog lists local models with `price_status: local`.
+
 Backend audit round 2, runtime fixes (2026-11-03):
 - The `dev` extra installs `moto[server]`, so the S3 backend test of the Axentra file storage
   (`tests/test_axentra_storage.py`) runs in CI instead of being skipped (found in the joint integration run).

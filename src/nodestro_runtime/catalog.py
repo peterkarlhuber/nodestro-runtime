@@ -39,7 +39,8 @@ class ModelInfo(BaseModel):
     cache_write_1h_usd_per_mtok: float | None = None
     cache_read_usd_per_mtok: float | None = None
     recommended: bool = False
-    #: ``current``, ``stale``, ``pending_review``, ``custom`` (an individual price) or ``unknown`` (no price).
+    #: ``current``, ``stale``, ``pending_review``, ``custom`` (an individual price), ``unknown`` (no price) or ``local``
+    #: (a local model: no external API billing; local operating costs are not recorded).
     price_status: str = "unknown"
     #: Orkexa's quality of the price (``verified``, ``contract``, ``unverified``, ``estimated``).
     price_quality: str | None = None
@@ -104,6 +105,39 @@ _BEDROCK_MODELS: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
+def _local_models() -> list[ModelInfo]:
+    """The chat models of the local catalog (Ollama): no external API billing, so no price fields."""
+    from .local_models import CATALOG, LOCAL_DEFAULT_MODEL
+
+    result = []
+    for entry in CATALOG:
+        if entry.kind != "chat":
+            continue
+        qualified = f"ollama:{entry.name}"
+        result.append(
+            ModelInfo(
+                id=qualified,
+                provider="ollama",
+                model=entry.name,
+                label=_LOCAL_LABELS.get(entry.name, entry.name),
+                tier="Local",
+                description=entry.notes,
+                recommended=qualified == LOCAL_DEFAULT_MODEL or entry.cpu_friendly,
+                price_status="local",
+                price_source="local",
+            )
+        )
+    return result
+
+
+_LOCAL_LABELS = {
+    "qwen3.5:4b": "Qwen3.5 4B (local)",
+    "qwen3.5:9b": "Qwen3.5 9B (local)",
+    "qwen3.6:35b-a3b": "Qwen3.6 35B-A3B (local)",
+    "qwen3.8:27b": "Qwen3.8 27B (local)",
+}
+
+
 def _priced(
     provider: str,
     model_id: str,
@@ -154,8 +188,9 @@ def _priced(
 
 
 def models(pricing: PricingService | None = None) -> list[ModelInfo]:
-    """The suggested models: Anthropic's (current generation first), then examples of other providers, then
-    Amazon Bedrock suggestions (EU inference profiles; never verified access, see :data:`_BEDROCK_MODELS`).
+    """The suggested models: Anthropic's (current generation first), local models (Ollama,
+    :mod:`nodestro_runtime.local_models`), examples of other providers, then Amazon Bedrock suggestions (EU inference
+    profiles; never verified access, see :data:`_BEDROCK_MODELS`).
 
     Prices come from ``pricing`` (the workspace's catalog) or, without it, from Orkexa's built-in prices.
     """
@@ -178,6 +213,7 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
                 pricing=pricing,
             )
         )
+    result += _local_models()
     for provider, model_id, label, tier, description in _OTHER_MODELS:
         result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
     for provider, model_id, label, tier, description in _BEDROCK_MODELS:

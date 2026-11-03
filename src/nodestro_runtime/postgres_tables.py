@@ -8,8 +8,12 @@ and lock of a :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Ever
 Search: the words of a chunk's title and text (letters and digits; lower case, diacritics removed, as SQLite's
 ``unicode61 remove_diacritics 2`` tokenizer does) are kept in ``search_text`` and indexed as a ``tsvector``. A query
 matches any of its words or word prefixes, like :class:`orkexa.SQLiteIndex`; results are ranked by ``ts_rank``
-instead of BM25, so the order of equally good hits can differ from the desktop. Vector search is not available on
-PostgreSQL yet.
+instead of BM25, so the order of equally good hits can differ from the desktop.
+
+Vectors (migration ``0010``): like :class:`orkexa.SQLiteIndex`, each namespace keeps its vectors in a *space* bound to
+one embedding model identity (``nodestro_vector_spaces``, ``nodestro_chunk_vectors``). With pgvector installed the
+database ranks them (an exact cosine distance); without it the runtime does, over the same rows. Searches are
+limited to the allowed sources before ranking.
 """
 
 from __future__ import annotations
@@ -23,7 +27,9 @@ from typing import TYPE_CHECKING, Any
 import unicodedata
 
 from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
+from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
 from orkexa.memory import MemoryBackend
+from orkexa.retrieval import RetrievalError, RetrievalMode, VectorStatus, check_mode
 
 from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
@@ -142,6 +148,8 @@ class PostgresIndex(Index):
         namespace: str = "default",
         max_chars: int = 1500,
         overlap: int = 200,
+        embeddings: EmbeddingModel | None = None,
+        mode: RetrievalMode | None = None,
     ) -> None:
         super().__init__(max_chars=max_chars, overlap=overlap)
         _check(tenant_id, namespace)
@@ -149,6 +157,10 @@ class PostgresIndex(Index):
         self.tenant_id = tenant_id
         self.namespace = namespace
         self._lock = database._lock
+        #: The embedding model new chunks are embedded with (``None``: full-text only).
+        self.embeddings = embeddings
+        self.mode = check_mode(mode) if mode is not None else None
+        self._pgvector: bool | None = None
 
     def close(self) -> None:
         """Nothing to do: the connection belongs to the database."""
@@ -172,8 +184,16 @@ class PostgresIndex(Index):
         ids: builtins.list[int] = []
         if not kept:
             return ids
+        identity = None
+        vectors: builtins.list[builtins.list[float]] | None = None
+        if self.embeddings is not None:
+            identity = self.embeddings.identity()
+            vectors = [[float(x) for x in vector] for vector in self.embeddings.embed_documents([c.text for c in kept])]
+            if len(vectors) != len(kept):
+                raise ValueError("The embedding model must return one vector per text")
         with self.database._transaction() as db:
-            for chunk in kept:
+            space = self._active_for(identity) if identity is not None else None
+            for position, chunk in enumerate(kept):
                 row = db.execute(
                     "INSERT INTO nodestro_chunks"
                     " (tenant_id, namespace, source, title, file_id, metadata, text, search_text)"
@@ -190,6 +210,14 @@ class PostgresIndex(Index):
                     ),
                 ).fetchone()
                 ids.append(int(row[0]))
+                if vectors is not None and space is not None and identity is not None:
+                    if len(vectors[position]) != identity.dimensions:
+                        raise ValueError("The embedding model returned a vector of another size")
+                    db.execute(
+                        "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
+                        " VALUES (%s, %s, %s, %s, %s)",
+                        (self.tenant_id, self.namespace, space, int(row[0]), vectors[position]),
+                    )
         return ids
 
     def delete(self, source: str) -> int:
@@ -223,6 +251,275 @@ class PostgresIndex(Index):
             )
             for rank, (chunk_id, source, title, file_id, metadata, text) in enumerate(rows)
         ]
+
+    # ---- vectors (migration 0010) -----------------------------------------------------------------------------
+
+    def _space(self, state: str) -> tuple[str, EmbeddingIdentity] | None:
+        rows = self.database._query(
+            "SELECT space, identity::text FROM nodestro_vector_spaces"
+            " WHERE tenant_id = %s AND namespace = %s AND state = %s",
+            (self.tenant_id, self.namespace, state),
+        )
+        return (str(rows[0][0]), EmbeddingIdentity.from_dict(json.loads(rows[0][1]))) if rows else None
+
+    def _active_for(self, identity: EmbeddingIdentity) -> str:
+        """The active space for ``identity``, created when there is none and no chunk lacks a vector."""
+        space = f"{self.namespace}:{identity.key}"
+        current = self._space("active")
+        if current is not None:
+            if current[1].key != identity.key:
+                raise RetrievalError(
+                    "reindex_required",
+                    f"The vectors belong to {current[1].model}, not to {identity.model}; reindex first",
+                )
+            return current[0]
+        building = self._space("building")
+        if building is not None:
+            if building[0] == space:
+                return space
+            raise RetrievalError("reindex_required", "A reindex for another embedding model is running")
+        if len(self):
+            raise RetrievalError("reindex_required", "The index holds chunks without vectors; reindex first")
+        self.database._write(
+            "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state)"
+            " VALUES (%s, %s, %s, %s::jsonb, %s, 'active')",
+            (self.tenant_id, self.namespace, space, json.dumps(identity.to_dict()), identity.dimensions),
+        )
+        return space
+
+    def _count_vectors(self, space: str) -> int:
+        rows = self.database._query(
+            "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s AND namespace = %s AND space = %s",
+            (self.tenant_id, self.namespace, space),
+        )
+        return int(rows[0][0])
+
+    def pgvector(self) -> bool:
+        """Whether the database ranks vectors itself (pgvector is installed)."""
+        if self._pgvector is None:
+            rows = self.database._query("SELECT to_regtype('vector') IS NOT NULL")
+            self._pgvector = bool(rows and rows[0][0])
+        return self._pgvector
+
+    def vector_status(self) -> VectorStatus:
+        active = self._space("active")
+        building = self._space("building")
+        return VectorStatus(
+            chunks=len(self),
+            active=active[1].to_dict() if active else None,
+            embedded=self._count_vectors(active[0]) if active else 0,
+            building=building[1].to_dict() if building else None,
+            building_embedded=self._count_vectors(building[0]) if building else 0,
+        )
+
+    def _discard(self, space: str) -> None:
+        self.database._write(
+            "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space = %s",
+            (self.tenant_id, self.namespace, space),
+        )
+
+    def discard_reindex(self) -> None:
+        building = self._space("building")
+        if building is not None:
+            self._discard(building[0])
+
+    def drop_vectors(self) -> int:
+        status = self.vector_status()
+        self.database._write(
+            "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s",
+            (self.tenant_id, self.namespace),
+        )
+        return status.embedded + status.building_embedded
+
+    def reindex(
+        self,
+        embeddings: EmbeddingModel | None = None,
+        *,
+        batch_size: int = 32,
+        progress: Any = None,
+        cancel: Any = None,
+    ) -> VectorStatus:
+        """Embed every chunk into the space of ``embeddings`` and switch to it (as ``orkexa.SQLiteIndex.reindex``)."""
+        model = embeddings or self.embeddings
+        if model is None:
+            raise RetrievalError("vector_unavailable", "reindex() needs an embedding model")
+        identity = model.identity()
+        space = f"{self.namespace}:{identity.key}"
+        active = self._space("active")
+        if active is None or active[0] != space:
+            building = self._space("building")
+            if building is not None and building[0] != space:
+                self._discard(building[0])
+            self.database._write(
+                "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state)"
+                " VALUES (%s, %s, %s, %s::jsonb, %s, 'building') ON CONFLICT (tenant_id, namespace, space) DO NOTHING",
+                (self.tenant_id, self.namespace, space, json.dumps(identity.to_dict()), identity.dimensions),
+            )
+        total = len(self)
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
+            rows = self.database._query(
+                "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
+                " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s"
+                " AND v.chunk_id = c.id) ORDER BY c.id LIMIT %s",
+                (self.tenant_id, self.namespace, self.tenant_id, space, batch_size),
+            )
+            if not rows:
+                break
+            vectors = model.embed_documents([str(row[1]) for row in rows])
+            if len(vectors) != len(rows):
+                raise RetrievalError("vector_unavailable", "The embedding model returned a wrong number of vectors")
+            with self.database._transaction() as db:
+                for (chunk_id, _), vector in zip(rows, vectors, strict=True):
+                    if len(vector) != identity.dimensions:
+                        raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
+                    db.execute(
+                        "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
+                        " VALUES (%s, %s, %s, %s, %s) ON CONFLICT (tenant_id, space, chunk_id)"
+                        " DO UPDATE SET embedding = excluded.embedding",
+                        (self.tenant_id, self.namespace, space, int(chunk_id), [float(x) for x in vector]),
+                    )
+            if progress is not None:
+                progress(self._count_vectors(space), total)
+        with self.database._transaction() as db:
+            missing = db.execute(
+                "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
+                " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s"
+                " AND v.chunk_id = c.id)",
+                (self.tenant_id, self.namespace, self.tenant_id, space),
+            ).fetchone()[0]
+            if missing:
+                raise RetrievalError("vector_incomplete", f"{missing} chunks were added during the reindex")
+            db.execute(
+                "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space <> %s",
+                (self.tenant_id, self.namespace, space),
+            )
+            db.execute(
+                "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = %s AND namespace = %s"
+                " AND space = %s",
+                (self.tenant_id, self.namespace, space),
+            )
+        self.embeddings = model
+        return self.vector_status()
+
+    def _hits(self, rows: Iterable[tuple[Any, ...]]) -> builtins.list[Hit]:
+        return [
+            Hit(
+                id=int(chunk_id),
+                score=float(score),
+                source=source,
+                title=title,
+                file_id=file_id,
+                metadata=json.loads(metadata),
+                text=text,
+            )
+            for chunk_id, source, title, file_id, metadata, text, score in rows
+        ]
+
+    def _fts(self, query: str, k: int, sources: builtins.list[str] | None) -> builtins.list[Hit]:
+        expression = _tsquery(query)
+        if not expression:
+            return []
+        scope = " AND source = ANY(%s)" if sources is not None else ""
+        params: tuple[Any, ...] = (expression, self.tenant_id, self.namespace)
+        if sources is not None:
+            params += (sources,)
+        rows = self.database._query(
+            "SELECT id, source, title, file_id, metadata::text, text, ts_rank(search, query, 1) FROM nodestro_chunks,"
+            " to_tsquery('simple', %s) AS query"
+            f" WHERE tenant_id = %s AND namespace = %s AND search @@ query{scope}"
+            " ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
+            (*params, k),
+        )
+        return self._hits(rows)
+
+    def _vector(self, query: str, k: int, sources: builtins.list[str] | None) -> builtins.list[Hit]:
+        model = self.embeddings
+        active = self._space("active")
+        if model is None or active is None:
+            raise RetrievalError("vector_unavailable", "This knowledge base has no semantic index yet")
+        space, stored = active
+        if stored.key != model.identity().key:
+            raise RetrievalError("reindex_required", f"The vectors belong to {stored.model}; reindex first")
+        vector = [float(x) for x in model.embed_query(query)]
+        scope = " AND c.source = ANY(%s)" if sources is not None else ""
+        base: tuple[Any, ...] = (self.tenant_id, space, self.tenant_id, self.namespace)
+        if sources is not None:
+            base += (sources,)
+        if self.pgvector():
+            literal = "[" + ",".join(repr(x) for x in vector) + "]"
+            rows = self.database._query(
+                "SELECT c.id, c.source, c.title, c.file_id, c.metadata::text, c.text,"
+                " 1 - (v.embedding::vector <=> %s::vector) FROM nodestro_chunk_vectors v"
+                " JOIN nodestro_chunks c ON c.id = v.chunk_id"
+                f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}"
+                " ORDER BY v.embedding::vector <=> %s::vector, c.id LIMIT %s",
+                (literal, *base, literal, k),
+            )
+            return self._hits(rows)
+        candidates = self.database._query(
+            "SELECT c.id, v.embedding FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id"
+            f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}",
+            base,
+        )
+        # The stored vectors are normalized: the dot product is the cosine similarity.
+        similarity = [
+            (sum(a * b for a, b in zip(vector, embedding, strict=False)), int(chunk_id))
+            for chunk_id, embedding in candidates
+        ]
+        scored = sorted(similarity, key=lambda item: (-item[0], item[1]))[:k]
+        if not scored:
+            return []
+        rows = self.database._query(
+            "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks"
+            " WHERE tenant_id = %s AND namespace = %s AND id = ANY(%s)",
+            (self.tenant_id, self.namespace, [chunk_id for _, chunk_id in scored]),
+        )
+        by_id = {int(row[0]): row for row in rows}
+        return self._hits((*by_id[chunk_id], score) for score, chunk_id in scored if chunk_id in by_id)
+
+    def retrieve(
+        self,
+        query: str,
+        k: int = 5,
+        *,
+        mode: RetrievalMode | None = None,
+        sources: Iterable[str] | None = None,
+    ) -> builtins.list[Hit]:
+        """The ``k`` best chunks by full text, vectors or both (reciprocal rank fusion), limited to ``sources``
+        before ranking. ``vector`` and ``hybrid`` never fall back to full text."""
+        if k < 1:
+            raise ValueError("k must be positive")
+        chosen = check_mode(mode or self.mode or "fts")
+        allowed = None if sources is None else builtins.list(dict.fromkeys(sources))
+        if allowed is not None and not allowed:
+            return []
+        if chosen == "fts":
+            hits = self._fts(query, k, allowed)
+            for rank, hit in enumerate(hits):
+                hit.ranks = {"fts": rank + 1}
+            return hits
+        if chosen == "vector":
+            hits = self._vector(query, k, allowed)
+            for rank, hit in enumerate(hits):
+                hit.ranks = {"vector": rank + 1}
+            return hits
+        depth = max(k * 4, 20)
+        fused: dict[int, tuple[float, Hit, dict[str, int]]] = {}
+        rankings = (("fts", self._fts(query, depth, allowed)), ("vector", self._vector(query, depth, allowed)))
+        for name, ranked in rankings:
+            for rank, hit in enumerate(ranked):
+                score, kept, ranks = fused.get(hit.id, (0.0, hit, {}))
+                ranks[name] = rank + 1
+                fused[hit.id] = (score + 1.0 / (_RRF_K + rank + 1), kept, ranks)
+        ordered = sorted(fused.values(), key=lambda item: (-item[0], item[1].id))[:k]
+        result = []
+        for score, hit, ranks in ordered:
+            hit.score = score
+            hit.ranks = ranks
+            result.append(hit)
+        return result
 
     # ---- what KnowledgeChunks does on SQLite -------------------------------------------------------
 

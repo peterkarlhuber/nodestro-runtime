@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
-from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
+from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot, is_local_inference
 from pydantic import BaseModel
 
 from . import contracts, graph
@@ -314,6 +314,8 @@ def _priced(
         lookup = snapshot.lookup(provider, model_id(model))
     except NodestroError:
         return True  # an invalid name is reported by the agent's own check
+    if is_local_inference(provider):
+        return True  # no external API billing (a registered price would still count)
     if lookup.price is None:
         return False
     known = dict(conditions(provider)) if conditions is not None else {}
@@ -347,10 +349,130 @@ def _provider_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue
         if PROVIDERS[provider].auth == "aws":
             found += _bedrock_issues(nodestro)
             continue
+        if provider == "ollama" and nodestro.local_models.mode == "managed":
+            found.append(
+                _issue(
+                    "check.local_runtime_missing",
+                    "Local models are not set up yet: install the local model runtime in the settings",
+                    level="error",
+                    provider=provider,
+                )
+            )
+            continue
         exc = MissingApiKeyError(provider)
         code = "check.api_key_missing" if exc.code == "api_key_missing" else "check.provider_not_configured"
         found.append(_issue(code, str(exc), level="error", **exc.params))
     return found
+
+
+def workflow_models(workflow: Workflow) -> set[str]:
+    """Every model a run of ``workflow`` may call: agents with fallbacks and judges, orchestrators."""
+    models = agent_models(workflow)
+    for node in workflow.nodes:
+        if node.type == "agent" and node.agent is not None:
+            models.update(node.agent.fallbacks)
+        orchestrator = getattr(node, "orchestrator", None)
+        if orchestrator is not None and getattr(orchestrator, "model", None):
+            models.add(orchestrator.model)
+    return models
+
+
+def _offline_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
+    """The strict offline mode (D12): nothing of the run may need the internet."""
+    if not nodestro.strict_offline():
+        return []
+    found: list[CheckIssue] = []
+    for model in sorted(workflow_models(workflow)):
+        try:
+            provider = provider_of(model)
+        except NodestroError:
+            continue
+        if provider != "ollama":
+            found.append(
+                _issue(
+                    "check.offline_cloud_model",
+                    f"{model} needs the internet; the strict offline mode allows local models only",
+                    level="error",
+                    model=model,
+                )
+            )
+    if "ollama" in {provider_of(m) for m in workflow_models(workflow) if _valid(m)}:
+        url = nodestro.local_models.ollama_url() or nodestro.provider_settings("ollama").get("base_url") or ""
+        if url and not is_local_endpoint(url):
+            found.append(
+                _issue(
+                    "check.offline_remote_endpoint",
+                    "The local model server is not on this computer; the strict offline mode allows local servers only",
+                    level="error",
+                )
+            )
+    for node in workflow.nodes:
+        config = node.agent if node.type == "agent" else None
+        if config is None:
+            continue
+        if config.server_tools:
+            found.append(
+                _issue(
+                    "check.offline_server_tool",
+                    "Server tools run at a cloud provider; the strict offline mode does not allow them",
+                    level="error",
+                    node_id=node.id,
+                    names=", ".join(config.server_tools),
+                )
+            )
+        remote = [name for name in config.tools if name.startswith("mcp__") and not _local_mcp(nodestro, name)]
+        if remote:
+            found.append(
+                _issue(
+                    "check.offline_mcp",
+                    "Remote MCP tools need the network; the strict offline mode allows local ones only",
+                    level="error",
+                    node_id=node.id,
+                    names=", ".join(remote),
+                )
+            )
+    return found
+
+
+def _knowledge_mode_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
+    """Agents that search their knowledge semantically need the semantic index (never a silent fallback)."""
+    found: list[CheckIssue] = []
+    for node in workflow.nodes:
+        config = node.agent if node.type == "agent" else None
+        if config is None or config.knowledge.mode != "search" or not config.knowledge.file_ids:
+            continue
+        mode = nodestro.knowledge.effective_mode(config.knowledge)
+        try:
+            nodestro.knowledge.check_mode(mode)
+        except NodestroError as exc:
+            code = f"check.{exc.code.split('.')[-1]}"
+            found.append(_issue(code, str(exc), level="error", node_id=node.id, mode=mode))
+    return found
+
+
+def _local_mcp(nodestro: Workspace, tool_name: str) -> bool:
+    """A local stdio server (it runs in a sandbox container here) or an HTTP server on this computer."""
+    found = nodestro.mcp.find(tool_name)
+    if found is None:
+        return True  # an unknown tool is reported by the agent's own check
+    server = found[0]
+    return server.transport == "stdio" or is_local_endpoint(server.url)
+
+
+def _valid(model: str) -> bool:
+    try:
+        provider_of(model)
+    except NodestroError:
+        return False
+    return True
+
+
+def is_local_endpoint(url: str) -> bool:
+    """Whether a model server address is on this computer or in Nodestro Local Docker's internal network."""
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1", "ollama") or host.startswith("127.")
 
 
 def _bedrock_issues(nodestro: Workspace) -> list[CheckIssue]:
@@ -812,6 +934,8 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
         problems.append(_issue("check.budget_none", "The budget is 0: the run would stop at the first request"))
     problems += _dependency_issues(nodestro, workflow)
     problems += _provider_issues(nodestro, workflow)
+    problems += _offline_issues(nodestro, workflow)
+    problems += _knowledge_mode_issues(nodestro, workflow)
     pending = nodestro.tool_drafts.pending_names() | (pending_tools or set())
     agents = {
         node.id: _mark_unapproved(nodestro.builder.validate(node.agent), pending)

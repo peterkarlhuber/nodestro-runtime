@@ -17,6 +17,7 @@ package; the runtime itself depends on neither.
 | Workflow model | `schemas`, `graph`, `conditions`, `forms`, `catalog`, `versions`, `release` |
 | Execution | `engine` (DAG, parallel branches, live events, budget, cancellation), `launcher`, `preflight`, `resume`, `run_views`, `usage_log`, `traces` |
 | Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities) |
+| Local models | `local_models` (catalog, task- and hardware-aware recommendations), `local_service` (the Ollama server per profile, model jobs); see [docs/local-models.md](docs/local-models.md) |
 | Tools | `tool_library`, `builtin_tools`, `tool_drafts`, `python_deps`, `python_envs`, `python_tools` |
 | Knowledge, memory, files | `knowledge`, `memory_spaces`, `documents`, `input_files`, `file_formats`, `file_delivery`, `office`, `reports`, `adoption`, `sanitize`, `preview` |
 | Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` (`DocumentStore`, `SQLiteStore`), `sqlite_tables` |

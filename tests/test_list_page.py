@@ -249,7 +249,7 @@ def test_postgres_0008_with_runs_is_upgraded_and_pages_use_the_index() -> None:
     database = PostgresDatabase(dsn, schema=schema)
     try:
         steps = postgres_migrations()
-        assert max(steps) == 9 and sorted(steps) == list(range(1, 10))  # no gap: the runner refuses one
+        assert max(steps) >= 9 and sorted(steps) == list(range(1, max(steps) + 1))  # no gap: the runner refuses one
         assert steps[9][0] == "0009_created_order.sql"
         database.migrate(migrations={version: step for version, step in steps.items() if version <= 8})
         assert database.schema_version == 8
@@ -267,7 +267,8 @@ def test_postgres_0008_with_runs_is_upgraded_and_pages_use_the_index() -> None:
         with pytest.raises(Exception) as refused:
             database.migrate()
         assert getattr(refused.value, "code", "") == "storage.backup_required"
-        assert database.migrate(before_migration=lambda *_: None) == 8
+        upto_9 = {version: step for version, step in steps.items() if version <= 9}
+        assert database.migrate(migrations=upto_9, before_migration=lambda *_: None) == 8
         assert database.schema_version == 9
 
         # Tenant-scoped like every query; the newest run of another tenant never shows.
