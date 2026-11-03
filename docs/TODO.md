@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 8 |
+| P2 Medium | 7 |
 | P3 Low | 26 |
 | P4 Optional | 9 |
 
@@ -528,15 +528,6 @@ None known.
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
 
-### RT-029 · CI requires the `NODESTRO_READ` token although the dependencies are public
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** #75, backend audit D-08 residual
-- **What:** The CI install steps exit when the `NODESTRO_READ` secret is missing and still call the components
-  private. All Nodestro repositories and orkexa are public now, so runs without secrets (Dependabot, forks) fail early.
-- **Next step:** Install the git dependencies anonymously, make the token optional or remove it, fix the comments.
-- **Depends on:** none; the same change is tracked in nodestro-api #50, nodestro-sdk #47, nodestro-integrations #36,
-  nodestro-examples #40, nodestro-server #25, nodestro-desktop #17 and nodestro-studio #85.
-
 ### RT-044 · Office XML DTD guard scans only the start of each part
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** backend audit round 2 RT2-09
@@ -600,7 +591,6 @@ None known.
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
-| RT-029 | all component repositories | `NODESTRO_READ` CI change (api #50, sdk #47, integrations #36, examples #40, server #25, desktop #17, studio #85) | Same change everywhere |
 
 ## Maintaining this file
 
