@@ -3,6 +3,8 @@
 ## Unreleased
 
 Backend audit round 2, runtime fixes (2026-11-03):
+- The `dev` extra installs `moto[server]`, so the S3 backend test of the Axentra file storage
+  (`tests/test_axentra_storage.py`) runs in CI instead of being skipped (found in the joint integration run).
 
 - OPS2-01: `migrate` of a PostgreSQL database written before migration checksums (v0.2.0-preview.1) no longer
   deadlocks with its own pre-migration backup: the `checksum` column of `nodestro_schema_migrations` is added (and the

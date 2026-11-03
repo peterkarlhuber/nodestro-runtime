@@ -44,6 +44,8 @@ dev = [
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@a87224291b561981ed8afab6131e18d8c9eecc01",
     "mypy>=1.13",
+    # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
+    "moto[server]>=5",
     # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
     "pglast>=7,<9",
     "pytest>=8",
