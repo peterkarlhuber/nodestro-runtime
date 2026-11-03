@@ -29,7 +29,7 @@
   negatives; qwen3-embedding:0.6b) PostgreSQL hybrid recall@1 rose from 0.48 to 0.93 (fts 0.38, vector 0.89); lexical
   queries 0.98 (fts 0.95). `fts` and `vector` are unchanged; `PostgresIndex(fusion="rrf")` keeps the earlier fusion,
   `lexical_weight=` sets the full-text share (default 0.5). Hybrid hits carry the fused score in [0, 1]. Needs an orkexa
-  pin that contains `fuse_hybrid` (orkexa PR for this change).
+  pin that contains `fuse_hybrid` (orkexa #44, pinned at 4ec738c).
 - Pin orkexa 4ec738c (orkexa #44: evidence-weighted hybrid fusion). Earlier: pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
   extra (`gguf`). New catalog entry `mdenseon:307m` (LightOn, Apache-2.0) with `source="build"`: the catalog download
   builds it from pinned upstream files and checks its reference vectors; `LocalModelService.build()` builds it from
