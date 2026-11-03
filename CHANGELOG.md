@@ -10,6 +10,10 @@ Backend audit round 2, runtime fixes (2026-11-03):
 - RT2-02: the approvals inbox (`run_views.pending_approvals`) finds paused runs through the store's indexed status
   lookup (`find("runs", "status", ("paused",))`), tenant-scoped as before, instead of scanning the 5,000 most recently
   updated runs; an old waiting run no longer drops out of the inbox.
+- RT2-03: right after a database restart or failover, writes no longer fail on pooled connections the server had
+  closed. Every checkout looks at the idle connection's socket (no round trip); data or end-of-stream there means the
+  server closed it (or sent a notice), so it is checked and, when broken, discarded before another one is taken.
+  Nothing is ever re-sent: a write that failed after it was sent still fails.
 
 Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).

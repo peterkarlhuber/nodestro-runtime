@@ -37,6 +37,7 @@ from importlib import resources
 import json
 import os
 import re
+import select
 import threading
 import time
 from typing import Any
@@ -156,6 +157,32 @@ RUNTIME_TABLE_PRIVILEGES = "SELECT, INSERT, UPDATE, DELETE"
 SCHEMA_VERSION_TABLES = ("nodestro_schema_migrations", "axentra_schema_migrations")
 
 
+def _server_spoke(connection: Any) -> bool:
+    """Whether data or the end of the stream waits on the socket of an idle connection (no round trip)."""
+    try:
+        fd = connection.pgconn.socket
+    except Exception:  # no socket any more: certainly not usable
+        return True
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+            return bool(poller.poll(0))
+        readable, _, failed = select.select([fd], [], [fd], 0)
+        return bool(readable or failed)
+    except (OSError, ValueError):
+        return True
+
+
+def _still_usable(connection: Any) -> bool:
+    """Whether a connection answers an empty statement (one round trip)."""
+    try:
+        ConnectionPool.check_connection(connection)
+    except Exception:
+        return False
+    return True
+
+
 class PostgresDatabase:
     """A pool of PostgreSQL connections shared by the stores of every tenant, with its schema migrations.
 
@@ -166,8 +193,10 @@ class PostgresDatabase:
     The pool holds at most ``pool_size`` connections (default ``NODESTRO_DATABASE_POOL_SIZE``, else 8). A
     connection that sat idle in the pool for more than :data:`CHECK_AFTER_IDLE` seconds is checked before it is
     handed out, so a connection the server dropped (a restart, a failover, an idle timeout of a proxy) is replaced
-    instead of failing the next call. A read outside a transaction that meets a lost connection anyway is retried on
-    another one; a write is not repeated (it may have been applied) and fails. The pool discards lost connections.
+    instead of failing the next call; so is, on every checkout, a connection the server closed or spoke on while it
+    sat idle, which shows on its socket without a round trip (RT2-03). A read outside a transaction that meets a lost
+    connection anyway is retried on another one; a write is not repeated (it may have been applied) and fails. The
+    pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
     transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
@@ -251,12 +280,26 @@ class PostgresDatabase:
 
     @contextmanager
     def _connection(self, timeout: float | None = None) -> Iterator[Any]:
-        """A pooled connection; notes when it goes back (no ``reset`` callback: that returns through a worker)."""
-        with self._pool.connection(timeout=timeout) as connection:
-            try:
-                yield connection
-            finally:
-                self._returned[connection] = time.monotonic()
+        """A pooled connection; notes when it goes back (no ``reset`` callback: that returns through a worker).
+
+        An idle connection in the pool has no statement in flight, so the server has nothing to say on it; data (or
+        the end of the stream) waiting on its socket means the server closed it (a restart, a failover,
+        ``pg_terminate_backend``) or sent a notice. That costs no round trip to find out, so it is looked at on every
+        checkout, and such a connection is checked and, when it is broken, closed (the pool discards it) before
+        another one is taken, without the pool's back-off between failed checks. Nothing was sent on it yet, so this
+        never repeats a statement: a write must never meet such a connection, because a failed write is not repeated
+        (RT2-03). After ``pool_size`` broken connections the next one is handed out as it is."""
+        attempts = self.pool_size + 1
+        for attempt in range(1, attempts + 1):
+            with self._pool.connection(timeout=timeout) as connection:
+                if attempt < attempts and _server_spoke(connection) and not _still_usable(connection):
+                    connection.close()
+                    continue
+                try:
+                    yield connection
+                finally:
+                    self._returned[connection] = time.monotonic()
+                return
 
     def _check_if_idle(self, connection: Any) -> None:
         """Check a connection that sat idle (raises when it is broken; the pool then opens another one)."""
