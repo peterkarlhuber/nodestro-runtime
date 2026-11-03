@@ -123,7 +123,7 @@ def _tool_choice(config: AgentConfig) -> str | dict[str, str]:
     return "required" if choice.type == "any" else choice.type
 
 
-def _options(config: AgentConfig, provider: str, connection: Connection) -> Any:
+def _options(config: AgentConfig, provider: str, connection: Connection, model: str) -> Any:
     """Orkexa's options for the provider; Anthropic-only settings of another provider are an error.
 
     Request options that would add tools or a provider-hosted MCP server are refused first
@@ -154,7 +154,19 @@ def _options(config: AgentConfig, provider: str, connection: Connection) -> Any:
                 option=name,
                 provider=provider,
             )
+    if provider == "ollama" and _thinks_off(config, connection, model):
+        return connection.options({**config.request_options, "reasoning_effort": "none"})
     return connection.options(config.request_options)
+
+
+def _thinks_off(config: AgentConfig, connection: Connection, model: str) -> bool:
+    """Whether a local thinking model runs without thinking: at effort ``low`` (Ollama's thinking models have no
+    graded effort, any level thinks without a limit) unless the agent's request options set ``reasoning_effort``."""
+    return (
+        config.effort == "low"
+        and "reasoning_effort" not in config.request_options
+        and connection.effort(model, config.effort) is not None
+    )
 
 
 def _messages(config: AgentConfig) -> list[dict[str, Any]]:
@@ -241,7 +253,7 @@ class AgentBuilder:
                 f"The connection of {connection.provider} cannot run a model of {provider}",
                 provider=provider,
             )
-        options = _options(config, provider, connection)
+        options = _options(config, provider, connection, model)
         unknown = [tool for tool in config.tools if tool not in self.tools]
         if unknown:
             raise NodestroError(
@@ -393,9 +405,11 @@ class _NeverCalled:
 def _effort(config: AgentConfig, connection: Connection, model: str) -> Any:
     """The agent's reasoning effort. A local model that cannot reason (its server reports no ``thinking``) has no
     effort to set, so the setting (by default ``medium``) is left out instead of refusing the agent; a local model
-    that thinks gets it as ``reasoning_effort``."""
+    that thinks gets it as ``reasoning_effort``; at ``low`` it does not think at all (see :func:`_thinks_off`)."""
     if config.effort is None or provider_of(model) != "ollama":
         return config.effort
+    if _thinks_off(config, connection, model):
+        return None  # sent as reasoning_effort "none" (see _options)
     return connection.effort(model, config.effort)
 
 

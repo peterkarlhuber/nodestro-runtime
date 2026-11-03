@@ -61,6 +61,13 @@ installed), `check.local_model_not_chat` (an embedding model as an agent) and `c
 with tools on a model whose `/api/show` lacks `tools`). The check never starts the managed server or downloads
 anything; without a running server the run itself reports a missing model.
 
+A local model whose server reports `thinking` gets the agent's effort as `reasoning_effort`. Ollama's thinking
+models have no graded effort (any level thinks, without a limit), so at effort `low` Nodestro sends
+`reasoning_effort: "none"` and the model answers without thinking; `medium` (the default) and above think. Thinking
+counts against `max_tokens`: on a CPU a small model can spend thousands of tokens and many minutes thinking about one
+step, so fast steps (sorting, extraction, short structured answers) should run at `low`. An agent's own
+`request_options.reasoning_effort` wins.
+
 ## Knowledge search
 
 | Mode | Ranking | Needs |

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Local thinking models at effort `low` no longer think (`reasoning_effort: "none"`): Ollama has no graded effort,
+  and a 4B model on a CPU thought until `max_tokens` ran out on classification and structured-output steps of the
+  example templates. `medium` and above still think; an agent's own `request_options.reasoning_effort` wins.
 - European local models: `ministral-3:3b/8b/14b` and `devstral-small-2:24b` (Mistral AI) in the verified catalog as
   alternatives (`LocalModelInfo.alternative`, task-limited entries via `LocalModelInfo.tasks`). New setting
   `prefer_european_models`: the recommendation then prefers an equally suited European model (never a weaker one,

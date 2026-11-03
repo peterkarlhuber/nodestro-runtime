@@ -456,6 +456,26 @@ def test_local_agents_validate_with_what_the_server_reports(managed: Workspace) 
     assert _effort(config, Connection(provider="anthropic", client=object()), DEFAULT_AGENT_MODEL) == "medium"
 
 
+def test_a_local_model_at_effort_low_does_not_think() -> None:
+    from nodestro_runtime.agent_builder import _effort, _options
+    from nodestro_runtime.providers import Connection
+    from nodestro_runtime.schemas import AgentConfig
+
+    thinking = Connection(provider="ollama", client=object(), reported=lambda _model: {"reasoning": "supported"})
+    low = AgentConfig.model_validate({"name": "A", "model": LOCAL_DEFAULT_MODEL, "task": "x", "effort": "low"})
+    # Ollama's thinking models have no graded effort: low turns thinking off instead of thinking without a limit.
+    assert _effort(low, thinking, LOCAL_DEFAULT_MODEL) is None
+    assert _options(low, "ollama", thinking, LOCAL_DEFAULT_MODEL).request_options == {"reasoning_effort": "none"}
+    medium = low.model_copy(update={"effort": "medium"})
+    assert _effort(medium, thinking, LOCAL_DEFAULT_MODEL) == "medium"
+    assert _options(medium, "ollama", thinking, LOCAL_DEFAULT_MODEL).request_options == {}
+    # The agent's own request option wins, and a model that cannot reason gets nothing.
+    own = low.model_copy(update={"request_options": {"reasoning_effort": "high"}})
+    assert _options(own, "ollama", thinking, LOCAL_DEFAULT_MODEL).request_options == {"reasoning_effort": "high"}
+    plain = Connection(provider="ollama", client=object(), reported=lambda _model: {"reasoning": "unsupported"})
+    assert _options(low, "ollama", plain, "ollama:plain:1b").request_options == {}
+
+
 def test_a_refused_ollama_address_leaves_capabilities_unknown(tmp_path: Path) -> None:
     with Workspace(tmp_path / "data", integrations=[]) as workspace:
         # An address with credentials, stored before such addresses were refused: no exception escapes the check.
