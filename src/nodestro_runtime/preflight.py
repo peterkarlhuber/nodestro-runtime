@@ -453,8 +453,8 @@ def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
         if not client.is_running():  # a short probe, so an unreachable server never slows the check down
             return []
         installed = {_local_name(model.name): model for model in service.installed(client)}
-    except NodestroError:
-        return []  # the server stopped answering; the run reports it
+    except (NodestroError, ValueError):
+        return []  # no answer or a refused address; the run reports it
     found: list[CheckIssue] = []
     for model in sorted(used):
         entry = installed.get(_local_name(model))

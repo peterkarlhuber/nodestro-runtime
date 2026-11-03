@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Local thinking models at effort `low` no longer think (`reasoning_effort: "none"`): Ollama has no graded effort,
+  and a 4B model on a CPU thought until `max_tokens` ran out on classification and structured-output steps of the
+  example templates. `medium` and above still think; an agent's own `request_options.reasoning_effort` wins.
+- European local models: `ministral-3:3b/8b/14b` and `devstral-small-2:24b` (Mistral AI) in the verified catalog as
+  alternatives (`LocalModelInfo.alternative`, task-limited entries via `LocalModelInfo.tasks`). New setting
+  `prefer_european_models`: the recommendation then prefers an equally suited European model (never a weaker one,
+  never a cloud service); without it Qwen stays the standard. A stored model choice always wins.
+- Fix: an Ollama address the client refuses (one with credentials, saved before such addresses were refused) no
+  longer makes the agent check fail with a `ConfigurationError`; the capabilities stay unknown (runtime #102 asked
+  the server during the check).
 - Preflight checks local models while a local server answers: `check.local_model_missing`,
   `check.local_model_not_chat`, `check.local_model_no_tools` (errors). Nothing is started or downloaded for the check.
 - Fix: the agent check of a local model used no capabilities its server reports, so a local agent with tools or

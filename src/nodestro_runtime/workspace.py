@@ -61,7 +61,7 @@ from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
-from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL
+from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL, SelectionPreferences
 from .local_service import LocalModelService
 from .mcp.hub import McpHub, McpLimits
 from .mcp.models import SERVERS as MCP_SERVERS
@@ -393,6 +393,7 @@ class Workspace:
             "server" if storage is not None else self.profile.kind,
             store=self.store,
             offline=self.strict_offline,
+            preferences=self.selection_preferences,
             external_url=lambda: self._providers().get("ollama", {}).get("base_url") or None,
             environ={} if storage is not None else None,
         )
@@ -712,6 +713,7 @@ class Workspace:
             knowledge_retrieval=_retrieval_mode(values.get("knowledge_retrieval")),
             embedding_model=values.get("embedding_model") or None,
             strict_offline=bool(values.get("strict_offline")),
+            prefer_european_models=bool(values.get("prefer_european_models")),
             model_defaults="local" if fallback_model == LOCAL_DEFAULT_MODEL else "kept",
         )
 
@@ -872,6 +874,10 @@ class Workspace:
     def strict_offline(self) -> bool:
         """Whether the strict offline mode is on: only local models and local tools, no downloads (D12)."""
         return bool(self._stored("strict_offline"))
+
+    def selection_preferences(self) -> SelectionPreferences:
+        """What the local model selection prefers: European models when the setting is on (D13)."""
+        return SelectionPreferences(region="eu" if self._stored("prefer_european_models") else None)
 
     def _update_bedrock(self, entry: dict[str, Any], change: Mapping[str, Any]) -> None:
         """Check and store a change of the Bedrock settings (region, sign-in, profile name, residency)."""

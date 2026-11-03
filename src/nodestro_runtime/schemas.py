@@ -950,6 +950,8 @@ class SettingsIn(_Model):
     embedding_model: str | None = None
     #: The strict offline mode: only local models and local tools, no downloads or price updates (D12).
     strict_offline: bool | None = None
+    #: Prefer European local models among equally suited ones (never a cloud service, never a weaker model).
+    prefer_european_models: bool | None = None
 
 
 class BuiltinSandboxStatus(_Model):
@@ -1071,5 +1073,7 @@ class Settings(_Model):
     #: The Ollama embedding model of the semantic index (``None``: none chosen yet).
     embedding_model: str | None = None
     strict_offline: bool = False
+    #: Whether the model selection prefers European local models among equally suited ones.
+    prefer_european_models: bool = False
     #: Whether this installation started with local default models (``local``) or kept its cloud defaults (``kept``).
     model_defaults: Literal["local", "kept"] = "kept"

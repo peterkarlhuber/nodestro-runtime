@@ -72,6 +72,11 @@ class LocalModelInfo(BaseModel):
     region: Region = "other"
     #: Languages the publisher documents (ISO 639-1); an unlisted language is unverified, not unsupported.
     languages: list[str] = Field(default_factory=list)
+    #: The tasks it is meant for (keys of :data:`TASKS`); empty: every task its capabilities and rank allow.
+    tasks: list[str] = Field(default_factory=list)
+    #: An alternative to the standard models (Qwen): recommended only when the person prefers its region, or when no
+    #: standard model fits. Without a preference the standard models win between equally suited ones.
+    alternative: bool = False
 
 
 class SelectionPreferences(BaseModel):
@@ -150,6 +155,82 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         rank=3,
         cpu_friendly=False,
         notes="Demanding work on a GPU (a dense model: slow on a CPU)",
+    ),
+    # European alternatives (Peter's approval of 2026-11-03; facts from the Ollama registry and Mistral AI's model
+    # cards, checked 2026-11-03). Ministral follows instructions reliably only with a system prompt, which Nodestro
+    # always sends.
+    LocalModelInfo(
+        name="ministral-3:3b",
+        kind="chat",
+        family="ministral-3",
+        download_bytes=2_953_840_294,
+        digest="f04aa1c738f64e13c625b82ae92504fc0260fa6723b509ed1ece0fa188179b1d",
+        listed_capabilities=["completion", "vision", "tools"],
+        min_ollama="0.13.1",
+        license="Apache-2.0",
+        vendor="Mistral AI",
+        region="eu",
+        languages=["en", "fr", "es", "de", "it", "pt", "nl", "zh", "ja", "ko", "ar"],
+        memory_bytes=5 * _GB,
+        rank=1,
+        context=262_144,
+        alternative=True,
+        notes="European alternative for small tasks: classifying, extracting, short texts, simple tools",
+    ),
+    LocalModelInfo(
+        name="ministral-3:8b",
+        kind="chat",
+        family="ministral-3",
+        download_bytes=6_022_236_102,
+        digest="1922accd5827ebe6829e536369195db25eaf664528dc66206d646ea3bb386b71",
+        listed_capabilities=["completion", "vision", "tools"],
+        min_ollama="0.13.1",
+        license="Apache-2.0",
+        vendor="Mistral AI",
+        region="eu",
+        languages=["en", "fr", "es", "de", "it", "pt", "nl", "zh", "ja", "ko", "ar"],
+        memory_bytes=9 * _GB,
+        rank=2,
+        context=262_144,
+        alternative=True,
+        notes="European alternative for everyday agent work: writing, tools, documents and images",
+    ),
+    LocalModelInfo(
+        name="ministral-3:14b",
+        kind="chat",
+        family="ministral-3",
+        download_bytes=9_082_537_031,
+        digest="4760c35aeb9d9e9c6174c2492562c0b999e80a222804fd96b1915ab72bbcdcf7",
+        listed_capabilities=["completion", "vision", "tools"],
+        min_ollama="0.13.1",
+        license="Apache-2.0",
+        vendor="Mistral AI",
+        region="eu",
+        languages=["en", "fr", "es", "de", "it", "pt", "nl", "zh", "ja", "ko", "ar"],
+        memory_bytes=12 * _GB,
+        rank=2,
+        context=262_144,
+        alternative=True,
+        notes="European alternative for more demanding everyday work; slower on a CPU (not yet tested by Nodestro)",
+    ),
+    LocalModelInfo(
+        name="devstral-small-2:24b",
+        kind="chat",
+        family="devstral-small-2",
+        download_bytes=15_177_373_679,
+        digest="24277f07f62db8f9cb68e9dfc679ea1818a7fbac47a50eff0a701d3f645b63c8",
+        listed_capabilities=["completion", "vision", "tools"],
+        min_ollama="0.13.3",
+        license="Apache-2.0 (Mistral AI's model card; the Ollama manifest has no license layer)",
+        vendor="Mistral AI",
+        region="eu",
+        languages=["en", "fr", "es", "de", "it", "pt", "nl", "zh", "ja", "ko", "ar"],
+        memory_bytes=20 * _GB,
+        rank=3,
+        cpu_friendly=False,
+        tasks=["coding"],
+        alternative=True,
+        notes="European coding agent model for a GPU; context length unconfirmed (the sources differ; not yet tested)",
     ),
     LocalModelInfo(
         name="qwen3-embedding:0.6b",
@@ -412,6 +493,10 @@ def recommend(
     def other_region(model: LocalModelInfo) -> bool:
         return wishes.region is not None and model.region != wishes.region
 
+    def unrequested(model: LocalModelInfo) -> bool:
+        """An alternative model nobody asked for: without a region preference the standard models come first."""
+        return wishes.region is None and model.alternative
+
     if profile.id == "embedding":
         candidates = speaks([m for m in CATALOG if m.kind == "embedding" and capable(m) and fits(m, hardware)])
         # The small model stays the default: another embedding model means reindexing everything.
@@ -419,12 +504,19 @@ def recommend(
         return _result(
             profile, ordered, present, hardware, ideal_name=LOCAL_EMBEDDING_MODEL, wishes=wishes, notes=notes
         )
-    chat = speaks([m for m in CATALOG if m.kind == "chat" and capable(m) and m.rank >= profile.minimum])
+    chat = speaks(
+        [
+            m
+            for m in CATALOG
+            if m.kind == "chat" and capable(m) and m.rank >= profile.minimum and (not m.tasks or profile.id in m.tasks)
+        ]
+    )
     usable = [m for m in chat if fits(m, hardware)]
     # Prefer the CPU-friendly model of a rank when no GPU holds the dense one.
     # Prefer a model that fits in GPU memory, then the CPU-friendly one of a rank, then the smaller one.
     usable.sort(
         key=lambda m: (
+            unrequested(m),
             -min(m.rank, profile.ideal),
             other_region(m),
             not _in_gpu(m, hardware),
@@ -432,9 +524,26 @@ def recommend(
             m.memory_bytes,
         )
     )
-    ideal = next((m for m in sorted(chat, key=lambda m: (m.rank != profile.ideal, not m.cpu_friendly))), None)
-    installed_usable = [m for m in usable if m.name in present]
+    ideal = next(
+        (
+            m
+            for m in sorted(
+                chat, key=lambda m: (unrequested(m), m.rank != profile.ideal, other_region(m), not m.cpu_friendly)
+            )
+        ),
+        None,
+    )
+    installed_usable = [m for m in usable if m.name in present and not unrequested(m)]
     ordered = installed_usable + [m for m in usable if m not in installed_usable]
+    if wishes.region is not None and usable:
+        # A preferred region wins over an installed model of another region, but only among the best suited
+        # models: the preference may suggest a download, never a weaker model.
+        best = min(usable[0].rank, profile.ideal)
+        preferred = [m for m in usable if m.region == wishes.region and min(m.rank, profile.ideal) == best]
+        preferred.sort(key=lambda m: m.name not in present)
+        if preferred:
+            # Only the choice moves: an installed model stays the first alternative.
+            ordered = [preferred[0]] + [m for m in ordered if m is not preferred[0]]
     return _result(
         profile, ordered, present, hardware, ideal_name=ideal.name if ideal else None, wishes=wishes, notes=notes
     )

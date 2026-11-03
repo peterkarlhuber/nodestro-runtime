@@ -25,7 +25,7 @@ models there, check them and switch; the old folder is kept).
 
 ## Which model
 
-`local_models.CATALOG` holds the seven suggested models with registry digest, download size, listed capabilities,
+`local_models.CATALOG` holds the eleven suggested models with registry digest, download size, listed capabilities,
 minimum Ollama version and license (checked on 2026-11-03). `recommend(task, hardware, installed)` picks the model
 for a task profile (`classify`, `extract`, `write`, `document_vision`, `tool_agent`, `analysis`, `coding`, `judge`,
 `orchestrator`, `architect`, `assistant`, `embedding`):
@@ -41,6 +41,17 @@ between models of the same suitability and is named in the reasons (`preferred_r
 `preferred_region_unavailable`). The region is the publisher's origin, not where data goes: every catalog model runs
 on this computer. Each catalog entry records `vendor`, `region` and the documented `languages`.
 
+European models (approved 2026-11-03): Mistral AI's `ministral-3:3b`, `ministral-3:8b`, `ministral-3:14b` and
+`devstral-small-2:24b` are catalog entries marked `alternative`. Qwen stays the general standard: without a region
+preference an alternative is never the choice. The setting "Prefer European models" (`Settings.prefer_european_models`,
+`LocalModelService.preferences()`) sets `region="eu"`; the recommendation then suggests the best suited European model
+of the same suitability, even when it still needs a download, and keeps an installed model as the first alternative.
+It never chooses a weaker model, never a cloud service (every catalog model runs locally), and never overrides a model
+stored on an agent: a manual choice always wins, and the strict offline mode still refuses downloads. Entries may limit
+themselves to task profiles (`tasks`): `devstral-small-2:24b` is a coding model and needs a GPU that holds it. Its
+context length is left unset because the published sources disagree; `ministral-3:14b` is listed but not yet
+verified in a run here (`notes`). The embedding standard stays `qwen3-embedding:0.6b`.
+
 A recommendation is a suggestion: callers store the chosen model explicitly. New installations use
 `ollama:qwen3.5:4b` for agents and `ollama:qwen3.5:9b` for assistants; existing installations keep the cloud
 defaults they had (`Settings.model_defaults`), so an update changes no model.
@@ -49,6 +60,13 @@ While a local server answers, preflight checks each local model a workflow uses:
 installed), `check.local_model_not_chat` (an embedding model as an agent) and `check.local_model_no_tools` (an agent
 with tools on a model whose `/api/show` lacks `tools`). The check never starts the managed server or downloads
 anything; without a running server the run itself reports a missing model.
+
+A local model whose server reports `thinking` gets the agent's effort as `reasoning_effort`. Ollama's thinking
+models have no graded effort (any level thinks, without a limit), so at effort `low` Nodestro sends
+`reasoning_effort: "none"` and the model answers without thinking; `medium` (the default) and above think. Thinking
+counts against `max_tokens`: on a CPU a small model can spend thousands of tokens and many minutes thinking about one
+step, so fast steps (sorting, extraction, short structured answers) should run at `low`. An agent's own
+`request_options.reasoning_effort` wins.
 
 ## Knowledge search
 
