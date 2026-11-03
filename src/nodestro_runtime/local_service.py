@@ -432,15 +432,23 @@ class LocalModelService:
         self._ps = (time.monotonic(), loaded)
         return loaded
 
+    def _here(self) -> bool:
+        """Whether the server runs on this computer (managed, the Local Docker container, a loopback address)."""
+        return self.mode in ("managed", "container") or _loopback(self.ollama_url())
+
     def _accelerated(self, loaded: list[dict[str, Any]]) -> bool | None:
+        if self._here():
+            # This computer's hardware decides: Ollama 0.40 reports part of a model in GPU memory (``size_vram``)
+            # even on a computer without any GPU device (measured: "28%/72% CPU/GPU" on a 4-vCPU VM).
+            return self.hardware().gpu != "none"
         sizes = [(int(item.get("size") or 0), int(item.get("size_vram") or 0)) for item in loaded]
         sizes = [(size, vram) for size, vram in sizes if size > 0]
-        if sizes:
-            # A model counts as accelerated when most of it is in GPU memory (Ollama splits larger ones).
-            return any(vram * 2 >= size for size, vram in sizes)
-        if self.mode in ("managed", "container") or _loopback(self.ollama_url()):
-            return self.hardware().gpu != "none"
-        return None
+        if not sizes:
+            return None
+        if all(vram == 0 for _size, vram in sizes):
+            return False
+        # Another computer: only a model that is (almost) entirely in GPU memory counts; a split is not known.
+        return True if any(vram * 10 >= size * 9 for size, vram in sizes) else None
 
     def accelerated(self) -> bool | None:
         """Whether local models run on a GPU (``None``: not known); never starts the managed server."""
@@ -492,7 +500,9 @@ class LocalModelService:
             loaded = next((item for item in self._loaded(client) if item.get("name") in (name, f"{name}:latest")), {})
             size, vram = int(loaded.get("size") or 0), int(loaded.get("size_vram") or 0)
             processor: Literal["gpu", "cpu", "mixed"] | None = None
-            if size:
+            if self._here() and self.hardware().gpu == "none":
+                processor = "cpu"  # whatever ``size_vram`` says (see _accelerated)
+            elif size:
                 processor = "gpu" if vram >= size else "cpu" if vram == 0 else "mixed"
             speed = ModelSpeed(
                 tokens_per_second=round(generated / (spent / 1e9), 2),

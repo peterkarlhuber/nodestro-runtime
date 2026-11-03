@@ -187,7 +187,7 @@ def test_an_external_server_reports_its_context_window_from_a_loaded_model(tmp_p
     assert status.mode == "external" and status.running
     # The embedding model's own small window does not count; the chat model's does.
     assert (status.context_length, status.context_source) == (4096, "server")
-    assert status.accelerated is False  # nothing of the model is in GPU memory
+    assert status.accelerated is False  # this computer has no GPU
     codes = {hint.code: hint for hint in service.advice(status, reasoning_saving=True)}
     small = codes["local.context_small"]
     assert small.severity == "warning" and small.value == 4096 and small.recommended == LOCAL_CONTEXT_LENGTH
@@ -205,12 +205,27 @@ def test_an_unmeasured_external_server_says_its_window_is_unknown(tmp_path: Path
     assert "local.context_unknown" in codes and "local.cpu_only" not in codes
 
 
-def test_a_model_mostly_in_gpu_memory_counts_as_accelerated(tmp_path: Path) -> None:
-    client = FakeOllama(loaded=[{"name": "qwen3.5:4b", "size": 4000, "size_vram": 3000, "context_length": 32768}])
+def test_a_remote_model_in_gpu_memory_counts_as_accelerated(tmp_path: Path) -> None:
+    client = FakeOllama(loaded=[{"name": "qwen3.5:4b", "size": 4000, "size_vram": 4000, "context_length": 32768}])
     service = _service(tmp_path, client, url="http://192.168.1.20:11434/v1")
     status = service.status()
     assert status.accelerated is True and status.context_length == 32768
     assert [hint.code for hint in service.advice(status, reasoning_saving=True)] == ["local.model_too_large"]
+    # A split model on another computer is not known to be fast or slow.
+    client.loaded = [{"name": "qwen3.5:4b", "size": 4000, "size_vram": 2900, "context_length": 32768}]
+    service._ps = None
+    assert service.status().accelerated is None
+
+
+def test_this_computers_hardware_wins_over_what_ollama_reports(tmp_path: Path) -> None:
+    # Measured with Ollama 0.40.14 on a VM without any GPU device: "28%/72% CPU/GPU" (size_vram 2.7 of 3.7 GB).
+    client = FakeOllama(
+        loaded=[{"name": "qwen3.5:4b", "size": 3718166607, "size_vram": 2683746385, "context_length": 4096}]
+    )
+    service = _service(tmp_path, client, url="http://127.0.0.1:11434/v1", hardware=CPU)
+    assert service.status().accelerated is False
+    service = _service(tmp_path, FakeOllama(), url="http://127.0.0.1:11434/v1", hardware=GPU)
+    assert service.status().accelerated is True
 
 
 def test_the_managed_server_has_its_configured_window(tmp_path: Path) -> None:
