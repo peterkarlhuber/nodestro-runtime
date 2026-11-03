@@ -11,9 +11,9 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 7 |
-| P3 Low | 27 |
-| P4 Optional | 9 |
+| P2 Medium | 8 |
+| P3 Low | 29 |
+| P4 Optional | 10 |
 
 **Release blockers:** None for this repository.
 
@@ -479,6 +479,14 @@ None known.
   again (macOS VM guest, paused), follows the checklist in the decision of sandbox-arm64.md; review the deny list
   against current kernels (A6).
 
+### RT-049 · Managed Ollama untested on macOS and Windows
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** #99, orkexa ORK-030
+- **What:** `local_service` (managed Ollama, model folder moves, imports) was tested on Linux x86-64 with a real
+  Ollama 0.40.14 and a fake binary. macOS, Windows, GPUs and the large models (`qwen3.6:35b-a3b`, `qwen3.8:27b`) were
+  not run.
+- **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU.
+
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** `sandbox_policy.py`, `sandbox_selection.py`, Orkexa ADR 0012
@@ -543,9 +551,29 @@ None known.
   is defence in depth only.
 - **Next step:** Scan the whole part (streaming) when the file is touched next.
 
+### RT-046 · Semantic reindex runs in the API process
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #99 (`KnowledgeBase.start_reindex`)
+- **What:** The reindex of the semantic index runs in a thread of the process that started it. It resumes where it
+  stopped when started again, but a restart of that process stops it, and on a server another API process does not
+  see its progress.
+- **Next step:** Run it as a job of the server's job queue (`jobs.py`) with a lease, like runs.
+
+### RT-048 · pgvector installed after migration 0010
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #99, `migrations/postgres/0010_knowledge_vectors.sql`
+- **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
+  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema.
+- **Next step:** A `nodestro-server` check that reports it, and the command in the operator documentation.
+
 ## Later optimizations
 
-None known.
+### RT-047 · Exact vector search only
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** #99, orkexa ORK-032
+- **What:** Vector and hybrid knowledge search rank exactly (SQLite `vec_distance_cosine`, PostgreSQL pgvector or the
+  runtime). That is right for desktop-sized knowledge bases; without pgvector the runtime reads every candidate vector.
+- **Next step:** Only for large tenants: an HNSW index per space (pgvector) once a model's dimensions are fixed.
 
 ## Accepted risks
 
