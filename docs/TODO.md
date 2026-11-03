@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 26 |
+| P3 Low | 27 |
 | P4 Optional | 9 |
 
 **Release blockers:** None for this repository.
@@ -285,6 +285,14 @@ None known.
 - **Next step:** Resolved by activating approval checkpoints; otherwise consider delaying claims of a worker with no
   free waiting slot (needs a separate go). Operators can raise `max_waiting` meanwhile.
 
+### RT-045 · No atomic insert-if-absent for raw store records
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit round 2 re-verification R2V-03
+- **What:** `DocumentStore` has `get_raw` and `put_raw` only, so callers that must reserve a key once across
+  processes (the API's `Idempotency-Key` records, nodestro-api API-043) can only lock within one process.
+- **Next step:** Add `put_raw_if_absent` (SQLite `INSERT ... ON CONFLICT DO NOTHING`, PostgreSQL the same) that
+  reports whether the record was created, with tests on both stores.
+
 ## Architecture and modularity
 
 ### RT-007 · `engine.py` / `RunManager` keeps growing
@@ -363,14 +371,14 @@ None known.
   0.8 s (SQLite) / 1.4 s (PostgreSQL) at 5,000 runs and grows linearly.
 - **Next step:** A store-level time filter (or SQL aggregation) for usage entries and run costs; the API uses it.
 
-### RT-042 · API run list and the remaining 500-run windows still read whole collections
+### RT-042 · Filtered run lists and the remaining 500-run windows still read whole collections
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit round 2 RT2-05 / API2-04, earlier C-15
-- **What:** `DocumentStore.list_page("runs", ...)` (keyset paging, SQLite schema 2, PostgreSQL migration 0009) exists,
-  but the API's `GET /api/runs` still reads all runs for a `before=` page; `launcher.py` (cost estimate) and
-  `preview.py` still use a fixed window of 500 runs. With 10,000 stored runs a full read takes about 9 s on SQLite and
-  13.5 s on PostgreSQL.
-- **Next step:** nodestro-api switches `list_runs` to `list_page` (API-014); then replace the two 500-run windows.
+- **What:** `DocumentStore.list_page("runs", ...)` (keyset paging, SQLite schema 2, PostgreSQL migration 0009) is
+  used by the API's unfiltered `GET /api/runs` since nodestro-api #74. Filtered run lists, `launcher.py` (cost
+  estimate) and `preview.py` still use a fixed window of 500 runs. With 10,000 stored runs a full read takes about 9 s
+  on SQLite and 13.5 s on PostgreSQL.
+- **Next step:** Store-level filters for `list_page`; then replace the 500-run windows.
 
 ### RT-043 · Per-node overhead grows with workflow length
 
@@ -589,6 +597,7 @@ None known.
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
 | RT-022 | orkexa | ORK-007 | Orkexa's sandbox review for 3.14 comes first |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
+| RT-045 | nodestro-api | API-043 (idempotent run starts across processes) | Store primitive first, then the API uses it |
 | — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
 
