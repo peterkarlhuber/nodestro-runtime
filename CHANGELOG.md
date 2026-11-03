@@ -37,7 +37,11 @@ Backend audit round 2, runtime fixes (2026-11-03):
   child workflow), so the decision card can name the step instead of the raw node id. `agent` stays the cost
   tracker's agent name (the node id).
 
-Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
+Axentra pin: `36f493e479509a4ada721a2ca108d73eeaa8cb8e` (axentra #31, audit round 2: schedule jobs follow the
+creator's current access, webhook deadline, `/v1/me` without tenant cap, invitation re-checks, problem type URNs;
+2026-11-03).
+
+Previous Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).
 
 The resolve path on a real Docker engine (RT-038; 2026-11-02):
