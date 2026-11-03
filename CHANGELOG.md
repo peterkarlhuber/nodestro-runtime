@@ -27,6 +27,10 @@ Backend audit round 2, runtime fixes (2026-11-03):
 - RT2-08: the billing API client of the cost reconciliation (`reconciliation.get_json`) no longer follows redirects:
   urllib repeated the request with the admin key at whatever address a redirect named, and only the first address
   was checked against the allowlist. A redirect is now an error (`ReconciliationError`).
+- NSL-13: a waiting model request of a budget decision carries the node's label (`BudgetRequest.requests[].label`,
+  additive, `null` for requests stored before): the label of the node in its own workflow (a child run's node in the
+  child workflow), so the decision card can name the step instead of the raw node id. `agent` stays the cost
+  tracker's agent name (the node id).
 
 Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).

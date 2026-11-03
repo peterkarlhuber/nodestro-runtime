@@ -152,7 +152,11 @@ class BlockedRequest(BaseModel):
 
     run_id: str
     node_id: str
+    #: The agent's name in the cost tracker (the node id, with the team member for orchestrator teams).
     agent: str
+    #: The node's label as the workflow shows it (its label, else the agent's name, else its id; NSL-13), for the
+    #: decision card; ``None`` in requests stored before it existed or when the node is not known.
+    label: str | None = None
     model: str
     #: Its most expensive outcome in USD (``None``: no upper bound, e.g. no price, provider-native tools, images).
     max_cost_usd: Decimal | None = None
@@ -445,6 +449,8 @@ class RunBudgetGate:
     requests: BudgetRequests
     deadline_hours: int = DEFAULT_DECISION_HOURS
     on_request: Callable[[BudgetRequest, bool], None] | None = None
+    #: ``(run id, node id) -> label`` of a node of this run or of one of its child runs (``None``: not known).
+    labels: Callable[[str, str], str | None] | None = None
     pending: BudgetRequest | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -530,11 +536,18 @@ class RunBudgetGate:
                 status = str(lookup(provider, model)[0])
             except Exception:  # the price catalog is only shown here
                 status = None
+        label = None
+        if self.labels is not None:
+            try:
+                label = self.labels(run_id, node_id)
+            except Exception:  # only shown on the decision card
+                label = None
         found.requests.append(
             BlockedRequest(
                 run_id=run_id,
                 node_id=node_id,
                 agent=agent,
+                label=label,
                 model=f"{provider}:{model}",
                 max_cost_usd=bound,
                 bounded=bound is not None,
