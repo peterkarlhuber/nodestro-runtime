@@ -485,6 +485,7 @@ def recommend(
     *,
     capabilities: Mapping[str, Iterable[str]] | None = None,
     preferences: SelectionPreferences | None = None,
+    require: Iterable[str] = (),
 ) -> Recommendation:
     """The local model for ``task`` (a key of :data:`TASKS`) on ``hardware``.
 
@@ -492,7 +493,8 @@ def recommend(
     the largest up to the task's ideal is chosen. ``capabilities`` (from ``/api/show`` of installed models, by name)
     replace the listed ones where known: a model that does not report a needed capability is not suggested.
     ``preferences``: models that document all the work's languages come first where any do; a preferred region
-    decides only between models of the same suitability.
+    decides only between models of the same suitability. ``require``: capabilities the work needs beyond the task's
+    profile (e.g. ``vision`` for an agent with tools that also reads images).
     """
     profile = TASKS.get(task)
     if profile is None:
@@ -503,9 +505,11 @@ def recommend(
     wishes = preferences or SelectionPreferences()
     notes: list[str] = []
 
+    needs = {*profile.needs, *require}
+
     def capable(model: LocalModelInfo) -> bool:
         known = reported.get(model.name, set(model.listed_capabilities))
-        return all(need in known for need in profile.needs)
+        return all(need in known for need in needs)
 
     def speaks(models: list[LocalModelInfo]) -> list[LocalModelInfo]:
         if not wishes.languages:

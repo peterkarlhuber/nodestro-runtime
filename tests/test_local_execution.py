@@ -380,3 +380,14 @@ def test_the_workflow_check_names_a_small_window_and_the_saving_mode(tmp_path: P
         assert saving.level == "info" and saving.params == {"nodes": "a"}  # effort high stays as it is
         workspace.update_settings(SettingsIn(local_reasoning="full"))
         assert "check.local_reasoning_saving" not in {issue.code for issue in preflight(workspace, workflow).problems}
+
+
+def test_a_recommendation_can_require_more_than_the_task_profile() -> None:
+    from nodestro_runtime.local_models import recommend
+
+    # An installed model that does not report vision is not chosen for work that reads images.
+    reported = {"qwen3.5:4b": ["completion", "tools"], "qwen3.5:9b": ["completion", "tools", "vision"]}
+    plain = recommend("tool_agent", CPU, ["qwen3.5:4b", "qwen3.5:9b"], capabilities=reported)
+    assert plain.model is not None
+    seeing = recommend("tool_agent", CPU, ["qwen3.5:4b", "qwen3.5:9b"], capabilities=reported, require=["vision"])
+    assert seeing.model == "ollama:qwen3.5:9b" and "ollama:qwen3.5:4b" not in seeing.alternatives
