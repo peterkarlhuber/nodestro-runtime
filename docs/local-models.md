@@ -86,6 +86,43 @@ desktop starts with `OLLAMA_CONTEXT_LENGTH=32768` (`NODESTRO_OLLAMA_CONTEXT_LENG
 `qwen3.5:4b` that is about 4.8 GB of memory instead of 3.7 GB. Nodestro Local Docker sets the same in its Ollama
 container. An Ollama you run yourself keeps its own setting: start it with `OLLAMA_CONTEXT_LENGTH=32768`.
 
+`LocalStatus.context_length` says which window agents get: `configured` (the managed server and the Local Docker
+container, from `NODESTRO_OLLAMA_CONTEXT_LENGTH`), `server` (an external server, read from a chat model it has loaded,
+`/api/ps`) or `unknown` (an external server before it has loaded a model). The overview's advice
+(`LocalModelService.advice`, `GET /api/local-models` → `advice`) warns with `local.context_small` below 16,384 tokens;
+the workflow check adds `check.local_context_small` and, per agent, `check.local_max_tokens` when the answer limit does
+not fit the window. Ollama's OpenAI-compatible endpoint ignores a per-request context size, so the setting belongs to
+the server.
+
+### Computers without a GPU: the CPU saving mode
+
+Without a GPU a 4B model writes about 5 tokens per second (4 vCPU), and a thinking model at effort `medium` can think
+for many minutes per step. The workspace setting `local_reasoning` decides:
+
+- `auto` (default): when the local model server has no GPU, thinking models answer at effort `medium` without the
+  thinking phase (`reasoning_effort: "none"`). Effort `high` and an agent's own `request_options.reasoning_effort` are
+  never reduced, and cloud providers are never touched. The step records it (`NodeRun.reasoning_reduced =
+  "cpu_saving"`, run event `reasoning_reduced`; the agent test's `reasoning_reduced`), and the workflow check names
+  the agents in advance (`check.local_reasoning_saving`, info). To keep the thinking for one agent, set its effort to
+  `high`; to keep it everywhere, set `local_reasoning` to `full`.
+- `full`: every agent thinks as its effort says.
+
+Whether the server has a GPU: for a server on this computer (managed, Local Docker, a loopback address) this
+computer's hardware decides (`detect_hardware`), because Ollama 0.40.14 reports part of a model in GPU memory
+(`size_vram`) even on a computer without any GPU device. For a server on another computer `/api/ps` decides: nothing in
+GPU memory means CPU, (almost) all of it means GPU, a split or no loaded model means unknown, and an unknown server never
+saves. `LocalStatus.accelerated` shows the result.
+
+Speeds are measured, never estimated: `LocalModelService.benchmark` (`POST /api/local-models/benchmark`) asks an
+installed chat model one short fixed question without thinking and stores tokens per second, prompt speed, context
+window and processor with the model (`InstalledModel.speed`); below 8 tokens per second the advice says
+`local.model_slow`. Other hints: `local.cpu_only`, `local.memory_low` (below 8 GB), `local.model_too_large` (a model
+bigger than this computer's memory).
+
+Parallel model runs: Ollama 0.40.14 answers one request per model at a time (`OLLAMA_NUM_PARALLEL=1`) and queues the
+others, and it loads another model next to it while memory allows. Parallel teams of an orchestrator therefore wait for
+each other on one CPU instead of competing for it, which is what a CPU needs; Nodestro does not raise the setting.
+
 ## Knowledge search
 
 | Mode | Ranking | Needs |

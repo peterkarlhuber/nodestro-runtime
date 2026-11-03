@@ -912,6 +912,27 @@ class LocalModelService:
 _RECIPES: dict[str, GGUFRecipe] = {MDENSEON.name: MDENSEON}
 
 
+class BuildInput(BaseModel):
+    """One pinned upstream file a catalog model is built from (what an offline build needs on this computer)."""
+
+    role: Literal["weights", "template"]
+    url: str
+    sha256: str
+    #: Bytes; for the template the length of the header the build reads (a longer file with it is accepted).
+    size: int | None = None
+
+
+def build_inputs(name: str) -> list[BuildInput]:
+    """The pinned files of a catalog model built from upstream files (``[]`` for every other model)."""
+    recipe = _RECIPES.get(name.removeprefix("ollama:"))
+    if recipe is None:
+        return []
+    return [
+        BuildInput(role=role, url=source.url, sha256=source.sha256, size=source.size)
+        for role, source in (("weights", recipe.weights), ("template", recipe.template))
+    ]
+
+
 def _int_of(value: Any) -> int:
     return value if isinstance(value, int) and value > 0 else 0
 

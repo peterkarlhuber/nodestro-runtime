@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- CPU saving mode for local thinking models (RT-050): new setting `local_reasoning` (`auto`, default, or `full`).
+  With `auto` and a local model server without a GPU, agents at effort `medium` answer without the thinking phase
+  (`reasoning_effort: "none"`); effort `high` and an agent's own `reasoning_effort` are never reduced, cloud providers
+  are unchanged. The step records it (`NodeRun.reasoning_reduced`, run event `reasoning_reduced`,
+  `AgentTestResult.reasoning_reduced`) and the workflow check names the agents (`check.local_reasoning_saving`).
+  `Connection.reasoning_saving`, `Workspace.reasoning_saving()`, `agent_builder.reasoning_reduction()`.
+- Context window and hardware of the local model server (RT-051): `LocalStatus.context_length`, `context_source`
+  (`configured`, `server` from `/api/ps`, `unknown`) and `accelerated`. For a server on this computer its hardware
+  decides whether models run on a GPU (Ollama 0.40.14 reports `size_vram` even without a GPU device).
+  `LocalModelService.advice()` (`LocalAdvice` codes `local.context_small`, `local.context_unknown`, `local.cpu_only`,
+  `local.reasoning_saving`, `local.model_slow`, `local.model_too_large`, `local.memory_low`). Workflow check warnings
+  `check.local_context_small` and `check.local_max_tokens`.
+- `build_inputs(name)`: the pinned upstream files of a catalog model built offline (for the build dialog).
+- Measured speed of local models: `LocalModelService.benchmark()` (job kind `benchmark`) stores tokens per second,
+  prompt speed, context window and processor with the model (`InstalledModel.speed`, `ModelSpeed`).
+- `recommend(..., require=...)`: capabilities the work needs beyond the task profile (e.g. `vision` for a tool agent
+  that reads images), for the per-agent models of example copies (EX-011).
 - Pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
   extra (`gguf`). New catalog entry `mdenseon:307m` (LightOn, Apache-2.0) with `source="build"`: the catalog download
   builds it from pinned upstream files and checks its reference vectors; `LocalModelService.build()` builds it from
