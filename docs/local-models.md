@@ -25,7 +25,7 @@ models there, check them and switch; the old folder is kept).
 
 ## Which model
 
-`local_models.CATALOG` holds the seven suggested models with registry digest, download size, listed capabilities,
+`local_models.CATALOG` holds the eleven suggested models with registry digest, download size, listed capabilities,
 minimum Ollama version and license (checked on 2026-11-03). `recommend(task, hardware, installed)` picks the model
 for a task profile (`classify`, `extract`, `write`, `document_vision`, `tool_agent`, `analysis`, `coding`, `judge`,
 `orchestrator`, `architect`, `assistant`, `embedding`):
@@ -40,6 +40,17 @@ come first; `languages_unverified` when none does) and a publisher region (`regi
 between models of the same suitability and is named in the reasons (`preferred_region`,
 `preferred_region_unavailable`). The region is the publisher's origin, not where data goes: every catalog model runs
 on this computer. Each catalog entry records `vendor`, `region` and the documented `languages`.
+
+European models (approved 2026-11-03): Mistral AI's `ministral-3:3b`, `ministral-3:8b`, `ministral-3:14b` and
+`devstral-small-2:24b` are catalog entries marked `alternative`. Qwen stays the general standard: without a region
+preference an alternative is never the choice. The setting "Prefer European models" (`Settings.prefer_european_models`,
+`LocalModelService.preferences()`) sets `region="eu"`; the recommendation then suggests the best suited European model
+of the same suitability, even when it still needs a download, and keeps an installed model as the first alternative.
+It never chooses a weaker model, never a cloud service (every catalog model runs locally), and never overrides a model
+stored on an agent: a manual choice always wins, and the strict offline mode still refuses downloads. Entries may limit
+themselves to task profiles (`tasks`): `devstral-small-2:24b` is a coding model and needs a GPU that holds it. Its
+context length is left unset because the published sources disagree; `ministral-3:14b` is listed but not yet
+verified in a run here (`notes`). The embedding standard stays `qwen3-embedding:0.6b`.
 
 A recommendation is a suggestion: callers store the chosen model explicitly. New installations use
 `ollama:qwen3.5:4b` for agents and `ollama:qwen3.5:9b` for assistants; existing installations keep the cloud

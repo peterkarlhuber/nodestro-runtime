@@ -139,6 +139,7 @@ class LocalModelService:
         store: Any,
         offline: Callable[[], bool],
         external_url: Callable[[], str | None],
+        preferences: Callable[[], SelectionPreferences] | None = None,
         environ: Mapping[str, str] | None = None,
         hardware: Callable[[], Hardware] = detect_hardware,
         client_factory: Callable[[str], OllamaClient] | None = None,
@@ -149,6 +150,7 @@ class LocalModelService:
         self.store = store
         self._offline = offline
         self._external_url = external_url
+        self._preferences = preferences or SelectionPreferences
         self._hardware_source = hardware
         self._hardware: Hardware | None = None
         self._client_factory = client_factory or (lambda url: OllamaClient(url, allow_remote=True))
@@ -395,6 +397,10 @@ class LocalModelService:
             # were refused): nothing is known, and the agent check names what that leaves unknown.
             return {}
 
+    def preferences(self) -> SelectionPreferences:
+        """The stored selection preferences (e.g. European models first); a manual model choice always wins."""
+        return self._preferences()
+
     def recommend(self, task: str, preferences: SelectionPreferences | None = None) -> Recommendation:
         installed: list[InstalledModel] = []
         with suppress(NodestroError):  # no server: recommend from the catalog alone
@@ -404,7 +410,7 @@ class LocalModelService:
             self.hardware(),
             [model.name for model in installed],
             capabilities={model.name: model.capabilities for model in installed},
-            preferences=preferences,
+            preferences=preferences if preferences is not None else self.preferences(),
         )
 
     def delete(self, name: str) -> None:

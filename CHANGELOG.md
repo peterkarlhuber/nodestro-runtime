@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- European local models: `ministral-3:3b/8b/14b` and `devstral-small-2:24b` (Mistral AI) in the verified catalog as
+  alternatives (`LocalModelInfo.alternative`, task-limited entries via `LocalModelInfo.tasks`). New setting
+  `prefer_european_models`: the recommendation then prefers an equally suited European model (never a weaker one,
+  never a cloud service); without it Qwen stays the standard. A stored model choice always wins.
 - Fix: an Ollama address the client refuses (one with credentials, saved before such addresses were refused) no
   longer makes the agent check fail with a `ConfigurationError`; the capabilities stay unknown (runtime #102 asked
   the server during the check).

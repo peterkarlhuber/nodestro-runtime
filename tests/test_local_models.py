@@ -46,6 +46,10 @@ def test_the_catalog_holds_the_verified_models() -> None:
         "qwen3.5:9b",
         "qwen3.6:35b-a3b",
         "qwen3.8:27b",
+        "ministral-3:3b",
+        "ministral-3:8b",
+        "ministral-3:14b",
+        "devstral-small-2:24b",
         "qwen3-embedding:0.6b",
         "qwen3-embedding:4b",
         "qwen3-embedding:8b",
@@ -95,7 +99,16 @@ def test_reported_capabilities_replace_the_listed_ones() -> None:
 
 def test_the_model_catalog_lists_local_models_without_prices() -> None:
     local = [info for info in models() if info.provider == "ollama"]
-    assert [info.model for info in local] == ["qwen3.5:4b", "qwen3.5:9b", "qwen3.6:35b-a3b", "qwen3.8:27b"]
+    assert [info.model for info in local] == [
+        "qwen3.5:4b",
+        "qwen3.5:9b",
+        "qwen3.6:35b-a3b",
+        "qwen3.8:27b",
+        "ministral-3:3b",
+        "ministral-3:8b",
+        "ministral-3:14b",
+        "devstral-small-2:24b",
+    ]
     assert all(info.price_status == "local" and info.input_usd_per_mtok is None for info in local)
 
 
@@ -343,10 +356,29 @@ def test_preferences_decide_only_between_equally_suited_models() -> None:
 
     laptop = Hardware(system="Linux", machine="x86_64", cpus=8, ram_bytes=16 * GB, gpu="none")
     plain = recommend("write", laptop)
-    # No model of the region: the same choice, and the reasons say the preference could not be met.
+    # Without a preference Qwen stays the standard; the European models are alternatives.
+    assert plain.model == "ollama:qwen3.5:9b" and "preferred_region" not in plain.reasons
+    assert all(not recommend(task, laptop).model.startswith(("ollama:ministral", "ollama:devstral")) for task in TASKS)
     europe = recommend("write", laptop, preferences=SelectionPreferences(region="eu"))
-    assert europe.model == plain.model and europe.quality == plain.quality
-    assert "preferred_region_unavailable" in europe.reasons and "preferred_region" not in plain.reasons
+    assert europe.model == "ollama:ministral-3:8b" and europe.quality == plain.quality == "recommended"
+    assert "preferred_region" in europe.reasons and "ollama:qwen3.5:9b" in europe.alternatives
+    # The preference suggests an equally suited download over an installed model, never a weaker model.
+    small = recommend("classify", laptop, ["qwen3.5:4b"], preferences=SelectionPreferences(region="eu"))
+    assert (
+        small.model == "ollama:ministral-3:3b" and not small.installed and small.alternatives[0] == "ollama:qwen3.5:4b"
+    )
+    # Devstral is a coding model: never suggested for other work, and only on a GPU that holds it.
+    workstation = Hardware(
+        system="Linux", machine="x86_64", cpus=16, ram_bytes=64 * GB, gpu="nvidia", gpu_memory_bytes=24 * GB
+    )
+    eu = SelectionPreferences(region="eu")
+    assert recommend("coding", workstation, preferences=eu).model == "ollama:devstral-small-2:24b"
+    assert recommend("analysis", workstation, preferences=eu).model != "ollama:devstral-small-2:24b"
+    assert recommend("coding", workstation).model != "ollama:devstral-small-2:24b"  # Qwen without the preference
+    assert recommend("coding", laptop, preferences=eu).model != "ollama:devstral-small-2:24b"
+    # A region without models of the needed suitability: Qwen, and the reasons say so.
+    vision = recommend("embedding", laptop, preferences=eu)
+    assert vision.model == "ollama:qwen3-embedding:0.6b" and "preferred_region_unavailable" in vision.reasons
     assert "preferred_region" in recommend("write", laptop, preferences=SelectionPreferences(region="cn")).reasons
     # Languages: every catalog model documents the six studio languages; an undocumented one is named, not hidden.
     assert all({"de", "fr", "pt"} <= set(model.languages) for model in CATALOG)
@@ -429,3 +461,17 @@ def test_a_refused_ollama_address_leaves_capabilities_unknown(tmp_path: Path) ->
         # An address with credentials, stored before such addresses were refused: no exception escapes the check.
         workspace.store.put_raw("settings", "app", {"providers": {"ollama": {"base_url": "http://u:pw@h/v1"}}})
         assert workspace.local_models.capability_overrides("llama3.1:8b") == {}
+
+
+def test_the_european_preference_is_a_stored_setting(tmp_path: Path) -> None:
+    with Workspace(tmp_path / "data", integrations=[]) as workspace:
+        assert not workspace.settings().prefer_european_models
+        assert workspace.local_models.preferences().region is None
+        assert workspace.update_settings(SettingsIn(prefer_european_models=True)).prefer_european_models
+        assert workspace.local_models.preferences().region == "eu"
+        # The preference changes only the local suggestion: the cloud defaults and the strict offline mode stay.
+        settings = workspace.settings()
+        assert not settings.strict_offline
+        choice = workspace.local_models.recommend("write")
+        assert choice.model.startswith("ollama:")
+        assert {"preferred_region", "preferred_region_unavailable"} & set(choice.reasons)
