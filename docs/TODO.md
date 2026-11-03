@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 8 |
-| P3 Low | 29 |
+| P2 Medium | 9 |
+| P3 Low | 32 |
 | P4 Optional | 10 |
 
 **Release blockers:** None for this repository.
@@ -354,6 +354,17 @@ None known.
 
 ## Performance
 
+### RT-050 · Multi-agent examples on local models are slow without a GPU
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:** #103, #104
+- **What:** Measured on 4 vCPU / 16 GB without a GPU, Ollama 0.40.14, `qwen3.5:4b` (Q4_K_M) with a 32k context:
+  about 5 output tokens per second. A triage step with thinking off takes 17-20 s, but the example workflows with
+  two to five agents at thinking effort "medium" did not finish within 40 minutes (`customer-service`,
+  `research-hypotheses`). Thinking dominates: one probe needed 1089 tokens (234 s) with effort "low" before #103,
+  and 58 tokens without thinking. All 24 examples pass the workflow check with local models.
+- **Next step:** Decide whether effort "medium" also switches thinking off for local models when no GPU is found, or
+  whether the recommendation shows an expected duration. Measure again on a GPU and on Apple silicon (RT-049).
+
 ### RT-008 · PostgreSQL store throughput and serialized writes
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
@@ -486,6 +497,35 @@ None known.
   Ollama 0.40.14 and a fake binary. macOS, Windows, GPUs and the large models (`qwen3.6:35b-a3b`, `qwen3.8:27b`) were
   not run.
 - **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU.
+
+### RT-051 · An external Ollama keeps its own context window
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #104
+- **What:** The managed Ollama and the Local Docker container start with `OLLAMA_CONTEXT_LENGTH=32768`
+  (`NODESTRO_OLLAMA_CONTEXT_LENGTH`). An Ollama that the person or an operator runs keeps its default, which is 4096
+  tokens without a large GPU. Prompt, thinking and answer share that window, so runs end with `stop_reason=length`
+  long before `max_tokens`. The OpenAI-compatible endpoint ignores a per-request context size.
+- **Next step:** Read `context_length` from `/api/ps` and warn in the local models overview when it is below 8192;
+  document the variable for operator servers.
+
+### RT-052 · Ministral models need an explicit system prompt
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #103, EU evaluation 2026-11-03
+- **What:** `ministral-3:3b` and `ministral-3:8b` routed 2/6 and 4/6 cases right without a system prompt and 6/6 with
+  one, and they ask for confirmation before tools such as `create_refund` in multi-step chains. `ministral-3:14b`
+  and `devstral-small-2:24b` are in the catalog but were not run on this hardware (14 GB and 15 GB of memory).
+- **Next step:** Run the 14b and 24b models on a larger machine; consider a catalog hint that these models need
+  agent instructions.
+
+### RT-053 · The mDenseOn build depends on a third-party template header
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** #104, orkexa #43 / ORK-035
+- **What:** `mdenseon:307m` is built offline from the pinned LightOn weights and a 6 MB GGUF header taken from a
+  community repository (`mykor/mmBERT-base-GGUF`), checked by SHA-256 and against reference vectors. The build needs
+  `gguf` and `numpy` (orkexa `[convert]`), which the desktop and server images now carry. Reindex timing for a large
+  knowledge base with mDenseOn was not measured.
+- **Next step:** Replace the community header with one generated from llama.cpp's converter in CI; measure indexing
+  throughput against `qwen3-embedding:0.6b`.
 
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
