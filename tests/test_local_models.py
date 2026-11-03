@@ -53,6 +53,7 @@ def test_the_catalog_holds_the_verified_models() -> None:
         "qwen3-embedding:0.6b",
         "qwen3-embedding:4b",
         "qwen3-embedding:8b",
+        "mdenseon:307m",
     ]
     for model in CATALOG:
         assert len(model.digest) == 64 and model.download_bytes > 0
@@ -211,6 +212,9 @@ def test_the_managed_server_provides_ollama_without_a_saved_url(managed: Workspa
     assert "capabilities" not in connection.agent_kwargs("ollama:unknown-model:1b")
     status = managed.local_models.status()
     assert status.running and status.version == "0.40.14"
+    # Ollama's 4096-token default is too small for agents: the managed server gets a larger context window.
+    assert managed.local_models._managed is not None
+    assert managed.local_models._managed.environment == {"OLLAMA_CONTEXT_LENGTH": "32768"}
     assert {model.name: model.verified for model in status.models} == {
         "qwen3.5:4b": True,
         "qwen3-embedding:0.6b": True,
@@ -377,7 +381,7 @@ def test_preferences_decide_only_between_equally_suited_models() -> None:
     assert recommend("coding", workstation).model != "ollama:devstral-small-2:24b"  # Qwen without the preference
     assert recommend("coding", laptop, preferences=eu).model != "ollama:devstral-small-2:24b"
     # A region without models of the needed suitability: Qwen, and the reasons say so.
-    vision = recommend("embedding", laptop, preferences=eu)
+    vision = recommend("embedding", laptop, preferences=SelectionPreferences(region="us"))
     assert vision.model == "ollama:qwen3-embedding:0.6b" and "preferred_region_unavailable" in vision.reasons
     assert "preferred_region" in recommend("write", laptop, preferences=SelectionPreferences(region="cn")).reasons
     # Languages: every catalog model documents the six studio languages; an undocumented one is named, not hidden.
@@ -495,3 +499,37 @@ def test_the_european_preference_is_a_stored_setting(tmp_path: Path) -> None:
         choice = workspace.local_models.recommend("write")
         assert choice.model.startswith("ollama:")
         assert {"preferred_region", "preferred_region_unavailable"} & set(choice.reasons)
+
+
+def test_the_context_window_can_be_set_within_bounds() -> None:
+    from nodestro_runtime.local_service import LOCAL_CONTEXT_LENGTH, _context_length
+
+    assert _context_length(None) == LOCAL_CONTEXT_LENGTH == 32768
+    assert _context_length("8192") == 8192
+    assert _context_length("1024") == _context_length("1000000") == _context_length("big") == LOCAL_CONTEXT_LENGTH
+
+
+def test_mdenseon_is_built_and_suggested_only_with_the_european_preference(managed: Workspace) -> None:
+    from nodestro_runtime.local_models import CATALOG, SelectionPreferences, recommend
+
+    entry = next(model for model in CATALOG if model.name == "mdenseon:307m")
+    assert entry.source == "build" and entry.alternative and entry.region == "eu" and entry.dimensions == 768
+    laptop = Hardware(system="Linux", machine="x86_64", cpus=8, ram_bytes=16 * GB, gpu="none")
+    assert recommend("embedding", laptop).model == "ollama:qwen3-embedding:0.6b"
+    europe = recommend("embedding", laptop, preferences=SelectionPreferences(region="eu"))
+    assert europe.model == "ollama:mdenseon:307m" and "preferred_region" in europe.reasons
+    # An installed index model stays: another embedding model means reindexing everything.
+    kept = recommend("embedding", laptop, ["qwen3-embedding:0.6b"], preferences=SelectionPreferences(region="eu"))
+    assert kept.model == "ollama:qwen3-embedding:0.6b" and "ollama:mdenseon:307m" in kept.alternatives
+    # A download of a built model fetches its pinned inputs, which the strict offline mode refuses; an offline build
+    # needs both files.
+    with pytest.raises(NodestroError) as error:
+        managed.local_models.build("mdenseon:307m")
+    assert error.value.code == "local.archive_or_download"
+    with pytest.raises(NodestroError) as error:
+        managed.local_models.build("qwen3.5:4b", download=True)
+    assert error.value.code == "local.not_buildable"
+    managed.update_settings(SettingsIn(strict_offline=True))
+    with pytest.raises(NodestroError) as error:
+        managed.local_models.pull("mdenseon:307m")
+    assert error.value.code == "local.offline_download"

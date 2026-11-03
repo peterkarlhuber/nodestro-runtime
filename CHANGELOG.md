@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Pin orkexa 71f8aaf (orkexa #43: `build_model` and the `MDENSEON` recipe, embedding prefixes) with its `convert`
+  extra (`gguf`). New catalog entry `mdenseon:307m` (LightOn, Apache-2.0) with `source="build"`: the catalog download
+  builds it from pinned upstream files and checks its reference vectors; `LocalModelService.build()` builds it from
+  local files (job kind `build`). It is an alternative, suggested only with the European preference. An alternative
+  of another region than the preferred one is no longer suggested.
+- Fix: the managed Ollama server starts with a 32768-token context window (`OLLAMA_CONTEXT_LENGTH`, set with
+  `NODESTRO_OLLAMA_CONTEXT_LENGTH`). Ollama's default without a large GPU is 4096 tokens for prompt, thinking and
+  answer together, so local agents of the example templates ended with `stop_reason='length'` after about 3,500
+  output tokens although `max_tokens` was 8000.
+- `devstral-small-2:24b` lists Mistral AI's 256K context.
 - Local thinking models at effort `low` no longer think (`reasoning_effort: "none"`): Ollama has no graded effort,
   and a 4B model on a CPU thought until `max_tokens` ran out on classification and structured-output steps of the
   example templates. `medium` and above still think; an agent's own `request_options.reasoning_effort` wins.

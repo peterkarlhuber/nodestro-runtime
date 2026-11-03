@@ -33,10 +33,13 @@ from typing import Any, Literal
 import uuid
 
 from orkexa.local import (
+    MDENSEON,
+    GGUFRecipe,
     ManagedOllama,
     ModelDetails,
     OllamaClient,
     OllamaError,
+    build_model,
     check_model_name,
     detect_ollama,
     import_package,
@@ -62,7 +65,7 @@ from .problems import NodestroError
 logger = logging.getLogger(__name__)
 
 Mode = Literal["managed", "container", "external", "unavailable"]
-JobKind = Literal["pull", "install_runtime", "import_package", "import_gguf", "move_models"]
+JobKind = Literal["pull", "build", "install_runtime", "import_package", "import_gguf", "move_models"]
 JobState = Literal["running", "done", "failed", "cancelled"]
 
 #: Where the local model settings are stored (one document; the app settings stay untouched).
@@ -70,6 +73,11 @@ SETTINGS_COLLECTION = "settings"
 SETTINGS_ID = "local_models"
 #: How long ``/api/show`` results are reused (they change only with a pull or delete, which clear the cache).
 _SHOW_TTL = 600.0
+#: The context window of the managed server and the Local Docker container (``NODESTRO_OLLAMA_CONTEXT_LENGTH``).
+#: Ollama's own default without a large GPU is 4096 tokens, shared by the prompt, the thinking and the answer: too
+#: small for agents (a thinking model ran out of it after about 3,500 output tokens). 32768 costs about 1.1 GB more
+#: memory with qwen3.5:4b (measured: 4.8 GB instead of 3.7 GB loaded).
+LOCAL_CONTEXT_LENGTH = 32768
 
 
 class InstalledModel(BaseModel):
@@ -158,6 +166,7 @@ class LocalModelService:
         self.bundled_binary = Path(bundled) if bundled else None
         self.container_url = (env.get("NODESTRO_OLLAMA_URL") or "").rstrip("/") or None
         shared = env.get("NODESTRO_OLLAMA_MODELS_DIR") or ""
+        self.context_length = _context_length(env.get("NODESTRO_OLLAMA_CONTEXT_LENGTH"))
         self.container_models_dir = Path(shared) if shared else None
         self._managed: ManagedOllama | None = None
         self._lock = threading.RLock()
@@ -209,7 +218,11 @@ class LocalModelService:
         with self._lock:
             if self._managed is None:
                 self._managed = ManagedOllama(
-                    self.home, binary=self.runtime_binary(), models_dir=self.models_dir(), offline=self._offline()
+                    self.home,
+                    binary=self.runtime_binary(),
+                    models_dir=self.models_dir(),
+                    offline=self._offline(),
+                    environment={"OLLAMA_CONTEXT_LENGTH": str(self.context_length)},
                 )
             return self._managed
 
@@ -482,8 +495,13 @@ class LocalModelService:
         return job
 
     def pull(self, name: str) -> LocalJob:
-        """Download a model (needs the internet; refused in the strict offline mode)."""
+        """Download a model (needs the internet; refused in the strict offline mode).
+
+        A catalog model that is built from pinned upstream weights (``source="build"``) downloads those and is built."""
         name = _model_name(name)
+        entry = catalog_model(name)
+        if entry is not None and entry.source == "build":
+            return self.build(name, download=True)
         self._refuse_offline("downloading a model")
         client = self.client()
 
@@ -494,6 +512,48 @@ class LocalModelService:
                     job.total, job.completed = item.total, item.completed or 0
 
         return self._run("pull", name, work)
+
+    def build(
+        self, name: str, *, weights: str | None = None, template: str | None = None, download: bool = False
+    ) -> LocalJob:
+        """Build a catalog model from its pinned upstream files (e.g. ``mdenseon:307m``) and check its reference
+        vectors. ``weights`` and ``template`` are files on this computer (offline); ``download`` fetches the missing
+        ones (refused in the strict offline mode)."""
+        name = _model_name(name)
+        recipe = _RECIPES.get(name)
+        if recipe is None:
+            raise NodestroError("local.not_buildable", f"{name} is not built from upstream files", model=name)
+        if download:
+            self._refuse_offline("downloading model weights")
+        files = {
+            key: Path(value).expanduser() for key, value in (("weights", weights), ("template", template)) if value
+        }
+        for path in files.values():
+            if not path.is_file():
+                raise NodestroError("local.file_missing", f"{path} does not exist", path=str(path))
+        if not download and len(files) < 2:
+            raise NodestroError(
+                "local.archive_or_download", "Choose the weights and template files or allow the download"
+            )
+        client = self.client()
+        self.home.mkdir(parents=True, exist_ok=True)
+
+        def work(job: LocalJob, cancel: threading.Event) -> None:
+            def progress(text: str) -> None:
+                job.message = text
+
+            build_model(
+                client,
+                recipe,
+                weights=files.get("weights"),
+                template=files.get("template"),
+                download=download,
+                work_dir=self.home,  # next to the models, not a small temporary file system
+                progress=progress,
+                cancel=cancel,
+            )
+
+        return self._run("build", name, work)
 
     def install_runtime(self, *, archive: str | None = None, download: bool = False) -> LocalJob:
         """Install the pinned runtime from a local release archive, or download it (desktop only)."""
@@ -614,6 +674,19 @@ class LocalModelService:
         self._show.clear()
         if running:
             self.start()
+
+
+#: The orkexa recipes of catalog models with ``source="build"``.
+_RECIPES: dict[str, GGUFRecipe] = {MDENSEON.name: MDENSEON}
+
+
+def _context_length(value: str | None) -> int:
+    """The context window from ``NODESTRO_OLLAMA_CONTEXT_LENGTH`` (2048 to 262144), else the default."""
+    try:
+        number = int(value or "")
+    except ValueError:
+        return LOCAL_CONTEXT_LENGTH
+    return number if 2048 <= number <= 262_144 else LOCAL_CONTEXT_LENGTH
 
 
 def _overrides(capabilities: Iterable[str], known: Mapping[str, str]) -> dict[str, str]:

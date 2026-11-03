@@ -41,6 +41,8 @@ Region = Literal["eu", "us", "cn", "other"]
 STUDIO_LANGUAGES = ("de", "en", "es", "fr", "it", "pt")
 
 _GB = 1_000_000_000
+#: The Ollama digest of ``mdenseon:307m`` as orkexa's recipe builds it (the GGUF file is reproducible).
+MDENSEON_DIGEST = "4e2c0eb5b4b1aa81934f580a79cb974394a6cf8a99cc0a97f6a18de75968ead2"
 
 
 class LocalModelInfo(BaseModel):
@@ -77,6 +79,9 @@ class LocalModelInfo(BaseModel):
     #: An alternative to the standard models (Qwen): recommended only when the person prefers its region, or when no
     #: standard model fits. Without a preference the standard models win between equally suited ones.
     alternative: bool = False
+    #: ``registry``: pulled from the Ollama registry. ``build``: built from pinned upstream weights by an orkexa recipe
+    #: (:func:`orkexa.local.build_model`); ``download_bytes`` is then the size of those inputs.
+    source: Literal["registry", "build"] = "registry"
 
 
 class SelectionPreferences(BaseModel):
@@ -229,8 +234,10 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         rank=3,
         cpu_friendly=False,
         tasks=["coding"],
+        context=262_144,
         alternative=True,
-        notes="European coding agent model for a GPU; context length unconfirmed (the sources differ; not yet tested)",
+        # Mistral AI states 256K; the 393,216 some sources give is the YaRN maximum, not the trained context.
+        notes="European coding agent model for a GPU (not yet tested here)",
     ),
     LocalModelInfo(
         name="qwen3-embedding:0.6b",
@@ -278,6 +285,26 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         languages=list(STUDIO_LANGUAGES),
         memory_bytes=8 * _GB,
         notes="The most precise semantic search; needs a GPU for large knowledge bases",
+    ),
+    LocalModelInfo(
+        name="mdenseon:307m",
+        kind="embedding",
+        family="mdenseon",
+        # The pinned inputs of orkexa.local.MDENSEON: the safetensors weights and the template GGUF header.
+        download_bytes=1_227_771_776 + 6_036_928,
+        digest=MDENSEON_DIGEST,
+        listed_capabilities=["embedding"],
+        min_ollama="0.40.14",
+        license="Apache-2.0",
+        vendor="LightOn",
+        region="eu",
+        languages=["en", "fr", "de", "it", "es", "pt", "sv", "no", "ar"],
+        memory_bytes=1 * _GB,
+        context=8_192,
+        dimensions=768,
+        alternative=True,
+        source="build",
+        notes="European multilingual semantic search; built offline from pinned weights (620 MB in Ollama)",
     ),
 )
 
@@ -494,11 +521,13 @@ def recommend(
         return wishes.region is not None and model.region != wishes.region
 
     def unrequested(model: LocalModelInfo) -> bool:
-        """An alternative model nobody asked for: without a region preference the standard models come first."""
-        return wishes.region is None and model.alternative
+        """An alternative model nobody asked for: the standard models come first unless its region is preferred."""
+        return model.alternative and model.region != wishes.region
 
     if profile.id == "embedding":
-        candidates = speaks([m for m in CATALOG if m.kind == "embedding" and capable(m) and fits(m, hardware)])
+        candidates = speaks(
+            [m for m in CATALOG if m.kind == "embedding" and capable(m) and fits(m, hardware) and not unrequested(m)]
+        )
         # The small model stays the default: another embedding model means reindexing everything.
         ordered = sorted(candidates, key=lambda m: (m.name not in present, other_region(m), m.memory_bytes))
         return _result(
