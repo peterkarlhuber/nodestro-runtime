@@ -237,6 +237,14 @@ def test_without_a_runtime_ollama_is_not_configured(tmp_path: Path, monkeypatch:
         codes = {item.code for item in preflight(workspace, workflow).problems}
         assert "check.local_runtime_missing" in codes
         assert "check.model_unpriced" not in codes  # a local model has no external API price to miss
+    # An injected client (tests, applications that embed the runtime) is the server: no runtime needed.
+    fake = object()
+    factory = lambda provider: fake if provider == "ollama" else None  # noqa: E731
+    with Workspace(tmp_path / "injected", integrations=[], client_factory=factory) as workspace:
+        ollama = next(item for item in workspace.settings().providers if item.id == "ollama")
+        assert ollama.configured and not ollama.local_server
+        codes = {item.code for item in preflight(workspace, workflow).problems}
+        assert "check.local_runtime_missing" not in codes
 
 
 def test_downloads_are_refused_in_the_strict_offline_mode(managed: Workspace) -> None:
