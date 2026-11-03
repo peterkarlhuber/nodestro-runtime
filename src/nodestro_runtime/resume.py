@@ -17,8 +17,10 @@ node whether its earlier result can be taken over:
   of sub-workflow and orchestrator nodes (and of their children), and calls that started
   but whose node never stored its result because the process stopped
   (:mod:`nodestro_runtime.tool_journal`). Only Nodestro's own read-only built-in tools
-  (:data:`~nodestro_runtime.tool_policy.BUILTIN_CAPABILITIES`), calls that ended with an
-  error and calls that were still waiting for (or were refused) a person's approval are left out.
+  (:data:`~nodestro_runtime.tool_policy.BUILTIN_CAPABILITIES`) and calls that were still waiting
+  for (or were refused) a person's approval or the per-call rules are left out. A call that
+  reached the tool and then ended with an error counts: the error may come after the effect
+  (a timeout after the request was sent, a lost response, a tool that failed after writing).
 
 Reused nodes count no cost in the new run: their cost stays with the earlier run, so the
 usage dashboard never counts it twice. When nothing can be reused safely, the plan says
@@ -255,8 +257,14 @@ _NOT_RUN = frozenset({"pending", "rejected", "expired", "cancelled", "denied"})
 
 def _may_have_run(call: ToolCallRecord) -> bool:
     """Whether a recorded call ran (or may have) and can have had effects; a call that waited for a person when the
-    run stopped is stored with its question, but it never ran."""
-    if call.name in BUILTIN_CAPABILITIES or call.is_error:
+    run stopped is stored with its question, but it never ran.
+
+    Refusals before the call reached the tool always carry their approval state (the gate stores ``denied``,
+    ``rejected``, ``expired``, ... with the call), so an error alone never proves that nothing happened: a call that
+    timed out or failed after it was sent counts like a successful one (RT2-01). Errors Orkexa reports before the
+    tool function starts (invalid arguments) are counted too, on the safe side: they cost a confirmation, never an
+    unconfirmed repetition."""
+    if call.name in BUILTIN_CAPABILITIES:
         return False
     return call.approval is None or call.approval.status not in _NOT_RUN
 

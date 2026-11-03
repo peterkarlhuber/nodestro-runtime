@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Backend audit round 2, runtime fixes (2026-11-03):
+
+- RT2-01: continuing a failed run asks for confirmation also for tool calls that reached the tool and then ended with
+  an error (a timeout after the request was sent may hide a completed effect). Only calls refused or still waiting
+  before they ran (approval state `pending`, `denied`, `rejected`, `expired`, `cancelled`) are left out.
+
 Axentra pin: `2767a2eb3705161db674fb7ba887dd15d422e12e` (axentra #29, R4-1: the GET OIDC start refuses invitations and
 `return_to` tokens are never adopted; 2026-11-02).
 
