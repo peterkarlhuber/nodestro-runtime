@@ -82,6 +82,8 @@ class BuiltAgent:
     agent: Agent[Any]
     context_blocks: list[ContentBlock] = field(default_factory=list)
     memory: MemoryBackend | None = None
+    #: Why the agent thinks less than its effort asks (``cpu_saving``, see :func:`reasoning_reduction`), else ``None``.
+    reasoning_reduced: str | None = None
 
 
 def output_model(config: OutputConfig) -> type[BaseModel] | None:
@@ -160,13 +162,31 @@ def _options(config: AgentConfig, provider: str, connection: Connection, model: 
 
 
 def _thinks_off(config: AgentConfig, connection: Connection, model: str) -> bool:
-    """Whether a local thinking model runs without thinking: at effort ``low`` (Ollama's thinking models have no
-    graded effort, any level thinks without a limit) unless the agent's request options set ``reasoning_effort``."""
-    return (
-        config.effort == "low"
-        and "reasoning_effort" not in config.request_options
-        and connection.effort(model, config.effort) is not None
-    )
+    """Whether a local thinking model runs without thinking (see :func:`reasoning_reduction`)."""
+    return _no_thinking(config, connection, model) is not None
+
+
+def _no_thinking(config: AgentConfig, connection: Connection, model: str) -> str | None:
+    if "reasoning_effort" in config.request_options or connection.effort(model, config.effort) is None:
+        return None  # the agent chose its own reasoning setting, or the model does not think
+    if config.effort == "low":
+        return "low_effort"
+    if config.effort == "medium" and connection.reasoning_saving:
+        return "cpu_saving"
+    return None
+
+
+def reasoning_reduction(config: AgentConfig, connection: Connection, model: str) -> str | None:
+    """Why a local thinking model answers without thinking although its effort asks for some, else ``None``.
+
+    Ollama's thinking models have no graded effort: any level thinks without a limit, and on a computer without a
+    GPU (about 5 tokens per second) a single answer can take many minutes. So they do not think at effort ``low``
+    (what ``low`` means), and, in the CPU saving mode (``connection.reasoning_saving``: the workspace setting
+    ``local_reasoning`` is ``auto`` and the server has no GPU), at effort ``medium`` either: then this returns
+    ``cpu_saving``, which the run records on the agent's step. Effort ``high`` and an agent's own
+    ``reasoning_effort`` request option are never reduced."""
+    reason = _no_thinking(config, connection, model) if provider_of(model) == "ollama" else None
+    return reason if reason == "cpu_saving" else None
 
 
 def _messages(config: AgentConfig) -> list[dict[str, Any]]:
@@ -341,7 +361,12 @@ class AgentBuilder:
                 f"Tool choice names a tool the agent does not have: {config.tool_choice.name}",
                 name=config.tool_choice.name,
             )
-        return BuiltAgent(agent=agent, context_blocks=context_blocks, memory=memory)
+        return BuiltAgent(
+            agent=agent,
+            context_blocks=context_blocks,
+            memory=memory,
+            reasoning_reduced=reasoning_reduction(config, connection, model),
+        )
 
     def validate(self, config: AgentConfig) -> list[ConfigIssue]:
         """Problems the inspector shows; uses the library's own model rules."""

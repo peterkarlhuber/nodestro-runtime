@@ -450,9 +450,14 @@ def test_local_agents_validate_with_what_the_server_reports(managed: Workspace) 
     assert managed.local_models._managed is None
     managed.local_models.start()
     assert [issue.code for issue in managed.builder.validate(config) if issue.level == "error"] == []
+    # A computer with a GPU: the effort is sent as it is (the CPU saving mode has its own tests).
+    managed.local_models._hardware = Hardware(
+        system="linux", machine="x86_64", cpus=8, ram_bytes=32 * 1024**3, gpu="nvidia", gpu_memory_bytes=24 * 1024**3
+    )
     connection = managed.connection("ollama")
     assert connection.agent_kwargs(LOCAL_DEFAULT_MODEL)["capabilities"]["reasoning"] == "supported"
     assert connection.options().send_reasoning_effort  # a thinking model gets the effort as reasoning_effort
+    assert not connection.reasoning_saving
     assert _effort(config, connection, LOCAL_DEFAULT_MODEL) == "medium"
     # A model that cannot reason has no effort to set: left out, never a refused agent.
     plain = Connection(provider="ollama", client=object(), reported=lambda _model: {"reasoning": "unsupported"})

@@ -262,6 +262,9 @@ class Connection:
     #: The capabilities a local model server reports for a model (``/api/show`` of Ollama), by model id; the
     #: declared ``capabilities`` of the settings win over them.
     reported: Callable[[str], Mapping[str, Any]] | None = None
+    #: Ollama: the CPU saving mode applies (the workspace's ``local_reasoning`` is ``auto`` and the server has no
+    #: GPU): thinking models answer at effort ``medium`` without thinking (see ``agent_builder.reasoning_reduction``).
+    reasoning_saving: bool = False
 
     def declared_for(self, model: str | None) -> dict[str, Any]:
         """The capability overrides for ``model``: reported by the server, then the declared ones on top."""
