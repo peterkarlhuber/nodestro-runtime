@@ -50,12 +50,13 @@ class PendingApproval(BaseModel):
 
 
 def _paused_runs(ctx: Workspace) -> list[Run]:
+    """Every paused run, however old (RT2-02): looked up through the store's status index, not a window of the
+    newest runs, so a waiting run never drops out of the inbox because newer runs were stored."""
     found: dict[str, Run] = {}
-    for summary in ctx.store.list("runs", RunSummary, limit=5000):
-        if summary.status == "paused":
-            run = ctx.runs.get(summary.id)
-            if run is not None:
-                found[run.id] = run
+    for summary in ctx.store.find("runs", "status", ("paused",), RunSummary):
+        run = ctx.runs.get(summary.id)
+        if run is not None and run.status == "paused":
+            found[run.id] = run
     for run in ctx.runs.live_runs():
         if any(state.status == "awaiting_approval" for state in run.nodes.values()):
             found[run.id] = run
