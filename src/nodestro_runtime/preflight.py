@@ -434,6 +434,66 @@ def _offline_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]
     return found
 
 
+def _local_name(model: str) -> str:
+    name = model.removeprefix("ollama:")
+    return name if ":" in name else f"{name}:latest"
+
+
+def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
+    """Local models must be installed and able to do what their agent needs.
+
+    Checked only while a local server answers: the check never starts the managed server or downloads anything.
+    """
+    used = {model for model in workflow_models(workflow) if _valid(model) and provider_of(model) == "ollama"}
+    service = nodestro.local_models
+    if not used or service.ollama_url() is None:
+        return []
+    try:
+        client = service.client()
+        if not client.is_running():  # a short probe, so an unreachable server never slows the check down
+            return []
+        installed = {_local_name(model.name): model for model in service.installed(client)}
+    except NodestroError:
+        return []  # the server stopped answering; the run reports it
+    found: list[CheckIssue] = []
+    for model in sorted(used):
+        entry = installed.get(_local_name(model))
+        if entry is None:
+            found.append(
+                _issue(
+                    "check.local_model_missing",
+                    f"{model} is not installed on the local model server; download or import it in the settings",
+                    level="error",
+                    model=model,
+                )
+            )
+        elif entry.kind == "embedding":
+            found.append(
+                _issue(
+                    "check.local_model_not_chat",
+                    f"{model} is an embedding model and cannot answer as an agent",
+                    level="error",
+                    model=model,
+                )
+            )
+    for node in workflow.nodes:
+        config = node.agent if node.type == "agent" else None
+        if config is None or not config.tools or not _valid(config.model) or provider_of(config.model) != "ollama":
+            continue
+        entry = installed.get(_local_name(config.model))
+        if entry is not None and entry.kind == "chat" and "tools" not in entry.capabilities:
+            found.append(
+                _issue(
+                    "check.local_model_no_tools",
+                    f"{config.model} does not support tool calls, but the agent uses tools; choose a model that does",
+                    level="error",
+                    node_id=node.id,
+                    model=config.model,
+                )
+            )
+    return found
+
+
 def _knowledge_mode_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
     """Agents that search their knowledge semantically need the semantic index (never a silent fallback)."""
     found: list[CheckIssue] = []
@@ -936,6 +996,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
     problems += _provider_issues(nodestro, workflow)
     problems += _offline_issues(nodestro, workflow)
     problems += _knowledge_mode_issues(nodestro, workflow)
+    problems += _local_model_issues(nodestro, workflow)
     pending = nodestro.tool_drafts.pending_names() | (pending_tools or set())
     agents = {
         node.id: _mark_unapproved(nodestro.builder.validate(node.agent), pending)

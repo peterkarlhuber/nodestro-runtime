@@ -45,6 +45,11 @@ A recommendation is a suggestion: callers store the chosen model explicitly. New
 `ollama:qwen3.5:4b` for agents and `ollama:qwen3.5:9b` for assistants; existing installations keep the cloud
 defaults they had (`Settings.model_defaults`), so an update changes no model.
 
+While a local server answers, preflight checks each local model a workflow uses: `check.local_model_missing` (not
+installed), `check.local_model_not_chat` (an embedding model as an agent) and `check.local_model_no_tools` (an agent
+with tools on a model whose `/api/show` lacks `tools`). The check never starts the managed server or downloads
+anything; without a running server the run itself reports a missing model.
+
 ## Knowledge search
 
 | Mode | Ranking | Needs |
