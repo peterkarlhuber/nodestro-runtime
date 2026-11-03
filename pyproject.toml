@@ -23,7 +23,7 @@ dependencies = [
     "orkexa[all,pdf,local] @ git+https://github.com/peterkarlhuber/orkexa.git@9b06a5edc5435ab53a1b0a174c3fe3431cc6e04b",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
-    "sqlite-vec>=0.1.6; not (sys_platform == 'win32' and platform_machine == 'ARM64')",
+    "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "pydantic>=2.6,<3",
     # Builds the Python environments of tools with third-party libraries (see python_envs.py).
     "uv>=0.5",
