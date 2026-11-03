@@ -4,6 +4,7 @@
 
 - A client injected for Ollama (`client_factory`) counts as its configured server, so preflight no longer asks
   for the local model runtime in tests and embedding applications.
+
 Local models, embeddings and RAG (2026-11-03, see `docs/local-models.md`):
 - Local models through Ollama: `local_models` (the verified catalog of `qwen3.5:4b/9b`, `qwen3.6:35b-a3b`,
   `qwen3.8:27b`, `qwen3-embedding:0.6b/4b/8b` with digests and sizes; task profiles; hardware detection;
