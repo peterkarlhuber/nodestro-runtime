@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pin orkexa 6e61862 (orkexa #46): the request for the structured answer asks for the conversation's language (a
+  German workflow's analysis came back in English).
 - Pin orkexa 014144b (orkexa #45): an agent on a local Ollama model with tools and a structured result now calls its
   tools. Ollama compiles the result's schema into a grammar, so before, such an agent could only write JSON and
   estimated every figure itself; the live production-downtime run with `qwen3.5:4b` failed with
