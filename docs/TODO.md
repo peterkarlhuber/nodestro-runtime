@@ -3,7 +3,8 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-03 against `master` at `fc7c591` (close-out of the backend audit round 2).
+> **Last full review:** 2026-11-04 against `master` at `c6f0240` (internal backend audit round 3; fixes RT3-01 to
+> RT3-08 in the PR that updates this line).
 
 ## Summary
 
@@ -12,7 +13,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 8 |
-| P3 Low | 31 |
+| P3 Low | 33 |
 | P4 Optional | 11 |
 
 **Release blockers:** None for this repository.
@@ -263,8 +264,8 @@ None known.
 
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** #69
 - **What:** Orchestrator decisions (`effort="medium"`) and run chat answers (`effort="low"`) set an effort without
-  checking the model. Orkexa refuses that on OpenAI-compatible endpoints and non-reasoning models, so an orchestrator
-  or assistant model on `compatible`, `ollama` or `vllm` fails on every call.
+  checking the model. Ollama is fixed (#102/#103: an effort only for models that report `thinking`). Still open for
+  `compatible`, `vllm` and non-reasoning OpenAI models: `engine._decide_sync` and `run_chat.answer_question`.
 - **Next step:** Use `providers.effort(model, ...)` in `engine._decide_sync` and `run_chat.answer_question`; add tests.
 
 ### RT-005 · Approval decision returns the run still as `paused` (X-01)
@@ -298,7 +299,7 @@ None known.
 ### RT-007 · `engine.py` / `RunManager` keeps growing
 
 - **Priority:** P3 Low · **Status:** Open (deliberately deferred) · **Refs:** backend audit D-13
-- **What:** `engine.py` has 4,633 lines (3,381 at the first audit start, 3,865 on 2026-11-01); approvals, persistence, resume and orchestration
+- **What:** `engine.py` has 4,707 lines (3,381 at the first audit start, 3,865 on 2026-11-01); approvals, persistence, resume and orchestration
   live in one class, which raises the regression risk of every change.
 - **Next step:** Extract one clearly bounded part (tool approvals, persistence or resume) with the next functional
   change to it; no big-bang refactor.
@@ -454,8 +455,12 @@ None known.
   total, and it does not look at figures in free text. A small local model sometimes reports a correct figure it did
   not compute: in the live household-budget runs with `qwen3.5:4b` (2026-11-04) one of two runs failed with
   `run.value_unverified` after its correction, the other computed the surplus with the calculator and passed. The step
-  then fails safely (no decision on the figure), but the run has to be repeated.
-- **Next step:** Show an unbacked key figure in the agent test as a warning (not a failure); consider letting a field
+  then fails safely (no decision on the figure), but the run has to be repeated. Since audit round 3 (RT3-01) numbers
+  echoed from a tool's input and changed tables no longer count, and the correction pass only computes (RT3-03). The
+  check still proves provenance only: a calculation written out from made-up numbers, `table_totals` over a table the
+  step's input does not contain, or another tool whose result contains the number (input files, knowledge search)
+  still back a value; calls of every node of the run count, also parallel branches.
+- **Next step:** Count only computing tools and the calls of the step and its ancestors. Show an unbacked key figure in the agent test as a warning (not a failure); consider letting a field
   name the tool and argument it must come from when a workflow needs more than provenance; measure the failure rate of
   small local models over more runs before deciding on a second correction.
 
@@ -467,7 +472,23 @@ None known.
   tools, unattended calls, stdio servers that are not Python packages).
 - **Next step:** Owner decision per topic; none is planned now.
 
+### RT-055 · Copies of examples do not remember their origin
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** UX round 3 handover B-1; examples EX-003, studio ST-007, ST-031
+- **What:** A workflow copied from an example does not store which example, language and offline connections it came
+  from, so the studio cannot mark the sample-data mode or offer an update of the copy.
+- **Next step:** Store the origin (example id, version, language, offline connections) on the copy; expose it read-only
+  in the API.
+
 ## Tests and quality assurance
+
+### RT-056 · The test double cannot finish orchestrators
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** UX round 3 handover B-3
+- **What:** The scripted test model never ends an orchestrator's loop and answers German placeholder text in every
+  language, so the three orchestrated examples cannot be verified end to end in the studio's browser tests.
+- **Next step:** Let the test double finish orchestrations (a final decision after the members ran) and answer in the
+  run's language.
 
 ### RT-017 · Fixes that still need an independent or Docker-backed check
 
@@ -609,7 +630,8 @@ None known.
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** #99, orkexa ORK-032
 - **What:** Vector and hybrid knowledge search rank exactly (SQLite `vec_distance_cosine`, PostgreSQL pgvector or the
-  runtime). That is right for desktop-sized knowledge bases; without pgvector the runtime reads every candidate vector.
+  runtime). That is right for desktop-sized knowledge bases; without pgvector the runtime reads every candidate vector,
+  so each query transfers every vector of the namespace from PostgreSQL.
 - **Next step:** Only for large tenants: an HNSW index per space (pgvector) once a model's dimensions are fixed.
 
 ## Accepted risks
