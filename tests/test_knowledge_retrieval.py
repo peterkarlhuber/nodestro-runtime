@@ -322,3 +322,28 @@ def test_the_postgres_index_checks_its_fusion_options() -> None:
         PostgresIndex(database, "alpha", lexical_weight=2.0)
     index = PostgresIndex(database, "alpha", fusion="rrf", lexical_weight=0.25)
     assert (index.fusion, index.lexical_weight) == ("rrf", 0.25)
+
+
+def test_a_rebuilt_embedding_model_needs_a_reindex_but_uploads_keep_working(
+    make: Callable[[str], KnowledgeBase],
+) -> None:
+    """RT3-08: the embedding model got a new digest on the server (a pull or rebuild): the status says
+    ``reindex_required``, an upload is indexed without vectors instead of failing, and a reindex fixes both."""
+    knowledge = make("t1")
+    knowledge.settings["mode"] = "hybrid"  # type: ignore[attr-defined]
+    knowledge.add(DOCS["returns.md"].encode(), name="returns.md")
+    knowledge.start_reindex()
+    wait(knowledge)
+    assert knowledge.index_status().state == "ready"
+    knowledge.models["concepts:1"].digest = "d2"  # type: ignore[attr-defined]
+    assert knowledge.index_status().state == "reindex_required"
+    with pytest.raises(NodestroError) as error:
+        knowledge.search("refund money", mode="hybrid")
+    assert error.value.code == "knowledge.reindex_required"
+    added = knowledge.add(DOCS["shipping.md"].encode(), name="shipping.md")  # raised RetrievalError before
+    assert added.id in {item.id for item in knowledge.files()}
+    knowledge.start_reindex()
+    wait(knowledge)
+    status = knowledge.index_status()
+    assert status.state == "ready" and status.embedded == status.chunks
+    assert knowledge.search("refund money", mode="hybrid")

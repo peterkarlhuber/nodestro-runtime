@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- An embedding model that got a new digest on the server (a pull or rebuild; audit round 3, RT3-08): the knowledge
+  status now says `reindex_required` (it compared only the model name and showed `ready`), and an upload is indexed
+  without vectors instead of failing with an unhandled `RetrievalError` (`reindex_required`, an HTTP 500 in the API);
+  a knowledge search reports `knowledge.reindex_required` (was an unhandled error); a reindex adds the vectors.
+  Prepares the orkexa pin that refreshes cached embedding identities (ORK3-07).
+
 - A run start no longer blocks the event loop on a local model server (audit round 3, RT3-04): `launch` runs the
   pre-check and the provider check in a worker thread, and a model's `/api/show` that got no answer (timeout,
   unreachable) is not asked again for 30 seconds (also `/api/ps`). Before, starting a three-agent workflow on an Ollama

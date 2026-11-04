@@ -36,7 +36,7 @@ import threading
 from typing import Any, Literal, Protocol
 
 from orkexa import Chunk, FileStore, Hit, Index, SQLiteFileStore, SQLiteIndex, StoredFile
-from orkexa.embeddings import EmbeddingModel
+from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
 from orkexa.local import OllamaError
 from orkexa.retrieval import RetrievalError, RetrievalMode
 from pydantic import BaseModel, Field
@@ -404,8 +404,12 @@ class KnowledgeBase:
         self._sync_embeddings()
         try:
             work()
-        except OllamaError as exc:
-            if getattr(self.index, "embeddings", None) is None:
+        except (OllamaError, RetrievalError) as exc:
+            # ``reindex_required``: the embedding model changed on the server (a pull or rebuild gave it another
+            # digest), so its vectors would not match the index's; the status says ``reindex_required`` (RT3-08).
+            if getattr(self.index, "embeddings", None) is None or (
+                isinstance(exc, RetrievalError) and exc.code != "reindex_required"
+            ):
                 raise
             logger.warning("New knowledge is indexed without vectors: %s", exc)
             model = getattr(self.index, "embeddings", None)
@@ -435,13 +439,22 @@ class KnowledgeBase:
             status.state = "building"
         elif vectors.active is None:
             status.state = "off"
-        elif model and vectors.active.get("model") != model:
+        elif model and (vectors.active.get("model") != model or self._model_changed(model, vectors.active)):
             status.state = "reindex_required"
         elif vectors.embedded < vectors.chunks:
             status.state = "incomplete"
         else:
             status.state = "ready"
         return status
+
+    def _model_changed(self, name: str, active: dict[str, Any]) -> bool:
+        """Whether the embedding model ``name`` is now another build than the one the active vectors belong to (a new
+        digest after a pull or rebuild, RT3-08); ``False`` when the model cannot be asked."""
+        try:
+            model = self._model(name)
+            return model is not None and model.identity().key != EmbeddingIdentity.from_dict(active).key
+        except (OllamaError, NodestroError, ValueError, KeyError, TypeError):
+            return False
 
     def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
         """Build (or complete, or switch) the semantic index with an embedding model, in the background.
@@ -614,7 +627,13 @@ class KnowledgeBase:
         """Search the knowledge base (``mode``: default the workspace's), limited to ``file_ids`` before ranking."""
         chosen = mode or self.retrieval()[0]
         self._prepare_search(chosen)
-        return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
+        try:
+            return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
+        except RetrievalError as exc:
+            if exc.code != "reindex_required":
+                raise
+            # The vectors belong to another model or build (e.g. a new digest after a pull): a reindex is needed.
+            raise NodestroError("knowledge.reindex_required", str(exc)) from None
 
     # ---- per-agent views -----------------------------------------------------------
 
