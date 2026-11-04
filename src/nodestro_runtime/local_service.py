@@ -495,9 +495,11 @@ class LocalModelService:
             }
             if "thinking" in capabilities:
                 body["think"] = False
-            data = client.http.request("POST", "/api/generate", body, timeout=900.0, model=name) or {}
-            if cancel.is_set():
-                return
+            data = _cancellable(
+                lambda: client.http.request("POST", "/api/generate", body, timeout=900.0, model=name) or {}, cancel
+            )
+            if data is None or cancel.is_set():
+                return  # cancelled: the job ends now, the request is left to finish on its own (RT3-07)
             generated, spent = _int_of(data.get("eval_count")), _int_of(data.get("eval_duration"))
             if not generated or not spent:
                 raise NodestroError("local.benchmark_failed", f"{name} reported no generation timing", model=name)
@@ -961,6 +963,29 @@ def _loopback(url: str | None) -> bool:
 
     host = (urlsplit(url).hostname or "").lower()
     return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+
+
+def _cancellable(work: Callable[[], Any], cancel: threading.Event) -> Any:
+    """``work()`` in a helper thread; ``None`` as soon as ``cancel`` is set (its result is then dropped). For one
+    blocking request that cannot be interrupted, e.g. a benchmark that may wait minutes for a model to load."""
+    result: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            result["value"] = work()
+        except BaseException as exc:  # handed to the caller below
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, name="nodestro-local-request", daemon=True).start()
+    while not finished.wait(0.2):
+        if cancel.is_set():
+            return None
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def _context_length(value: str | None) -> int:

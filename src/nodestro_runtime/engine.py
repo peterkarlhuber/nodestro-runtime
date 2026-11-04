@@ -91,7 +91,7 @@ from .orchestrator import (
 )
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
-from .providers import Connection, check_model, model_id, provider_of
+from .providers import Connection, check_model, interrupt_client, model_id, provider_of
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
@@ -737,6 +737,49 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     return value
+
+
+class _Interruptible:
+    """The connections an agent's turn opened, closed when its run is cancelled (RT3-05).
+
+    Cancelling a run or reaching its time limit only sets a flag that the agent checks between events; a request
+    that waits for a model server (a local one may be told to wait up to ``LOCAL_REQUEST_TIMEOUT``) would keep its
+    thread until the answer. A watcher closes the clients of this turn's connections as soon as the flag is set, so
+    the request fails now and the step ends as cancelled. Only clients Nodestro made itself are closed
+    (:func:`~nodestro_runtime.providers.interrupt_client`): each belongs to this one connection."""
+
+    def __init__(self, cancelled: CancelFlag, connect: Callable[[str], Connection]) -> None:
+        self._cancelled = cancelled
+        self._connect = connect
+        self._opened: list[Connection] = []
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self.interrupted = False
+        threading.Thread(target=self._watch, name="nodestro-cancel-watch", daemon=True).start()
+
+    def connect(self, provider: str) -> Connection:
+        connection = self._connect(provider)
+        with self._lock:
+            self._opened.append(connection)
+        if self._cancelled.is_set():
+            self._interrupt()
+        return connection
+
+    def _interrupt(self) -> None:
+        with self._lock:
+            opened = list(self._opened)
+        for connection in opened:
+            if interrupt_client(connection.client):
+                self.interrupted = True
+
+    def _watch(self) -> None:
+        while not self._done.wait(0.2):
+            if self._cancelled.is_set():
+                self._interrupt()
+                return
+
+    def close(self) -> None:
+        self._done.set()
 
 
 class CancelFlag:
@@ -3845,21 +3888,29 @@ class RunManager:
             effort="medium",
             max_tool_rounds=0,
         )
-        outcome = execute_agent(
-            context.env.builder,
-            agent,
-            prompt,
-            connect=self.connect,
-            tracker=context.tracker,
-            name=node.id,
-            hooks={"on_request": on_request},
-            cancelled=context.cancelled.is_set,
-            attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
-            # A decision the budget cannot admit stops before it is sent (BUDGET-1): the orchestrator waits and asks
-            # this decision again when the run continues (every earlier step is recorded).
-            suspendable=context.budget_gate is not None,
-            on_built=lambda built: self._note_reasoning(context, node.id, context.run.nodes[node.id], built),
-        )
+        interruptible = _Interruptible(context.cancelled, self.connect)
+        try:
+            outcome = execute_agent(
+                context.env.builder,
+                agent,
+                prompt,
+                connect=interruptible.connect,
+                tracker=context.tracker,
+                name=node.id,
+                hooks={"on_request": on_request},
+                cancelled=context.cancelled.is_set,
+                attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
+                # A decision the budget cannot admit stops before it is sent (BUDGET-1): the orchestrator waits and
+                # asks this decision again when the run continues (every earlier step is recorded).
+                suspendable=context.budget_gate is not None,
+                on_built=lambda built: self._note_reasoning(context, node.id, context.run.nodes[node.id], built),
+            )
+        except Exception:
+            if interruptible.interrupted:
+                raise RunCancelled("The run was cancelled") from None  # while the decision waited (RT3-05)
+            raise
+        finally:
+            interruptible.close()
         return decision_of(outcome.output)
 
     def _check_values(
@@ -4036,14 +4087,16 @@ class RunManager:
                 _proposal_tool(state, config, lambda: self._emit(context, "knowledge_proposed", node_id))
             )
         suspended = False
+        interruptible: _Interruptible | None = None
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
+            interruptible = _Interruptible(context.cancelled, self.connect)
             ask = functools.partial(
                 execute_agent,
                 context.env.builder,
                 config,
-                connect=self.connect,
+                connect=interruptible.connect,
                 tracker=context.tracker,
                 name=node_id,
                 hooks=hooks,
@@ -4096,9 +4149,16 @@ class RunManager:
             state.status = "failed"
             _fail(state, problem("tool.checkpoint_stale", f"The agent changed while it waited: {exc}"))
         except Exception as exc:  # API errors, budget, invalid configuration
-            state.status = "failed"
-            _fail(state, node_problem(exc))
+            if context.cancelled.is_set():
+                # The run was cancelled (or reached its time limit) while a request waited: its client was closed.
+                state.status = "cancelled"
+                _fail(state, problem("run.node_cancelled", "Cancelled"))
+            else:
+                state.status = "failed"
+                _fail(state, node_problem(exc))
         finally:
+            if interruptible is not None:
+                interruptible.close()
             sandbox_cancel.reset(cancel_token)
             if budget_checkpoint is not None and not suspended:
                 tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)

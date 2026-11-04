@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Cancelling a run, or its time limit, now ends a model request that waits for a local or self-hosted model server
+  at once (audit round 3, RT3-05): the turn's connections made by Nodestro (`compatible`, `ollama`, `vllm`) shut
+  their sockets down when the run is cancelled, so the step ends as `cancelled` (or the run with `run.time_limit`)
+  instead of holding its thread until the request timeout (an hour for local servers). Orchestrator decisions too.
+  Clients injected by an embedding application are left alone. Cancelling a speed measurement of a local model ends
+  the job at once as well, while the model may still be loading (RT3-07).
+
 - An embedding model that got a new digest on the server (a pull or rebuild; audit round 3, RT3-08): the knowledge
   status now says `reindex_required` (it compared only the model name and showed `ready`), and an upload is indexed
   without vectors instead of failing with an unhandled `RetrievalError` (`reindex_required`, an HTTP 500 in the API);
