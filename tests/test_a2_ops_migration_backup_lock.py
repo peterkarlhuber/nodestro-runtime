@@ -38,10 +38,16 @@ def test_a_backup_on_another_connection_can_read_the_schema_table(schema: str, o
     database = PostgresDatabase(postgres_support.DSN, schema=schema)
     try:
         database.migrate(migrations={v: s for v, s in steps.items() if v <= 4})  # the v0.2.0-preview.1 schema
-        if old_table:
-            database._write("ALTER TABLE nodestro_schema_migrations DROP COLUMN checksum", ())
-        else:
-            database._write("UPDATE nodestro_schema_migrations SET checksum = NULL", ())
+        # As the owner: with NODESTRO_TEST_RUNTIME_ROLE=1 ``database`` connects as the restricted runtime role, which
+        # may neither alter nor write the schema table (audit round 3, RT3-06).
+        change = (
+            "ALTER TABLE nodestro_schema_migrations DROP COLUMN checksum"
+            if old_table
+            else "UPDATE nodestro_schema_migrations SET checksum = NULL"
+        )
+        with psycopg.connect(postgres_support.DSN, autocommit=True) as owner:
+            owner.execute(f'SET search_path TO "{schema}"')
+            owner.execute(change)
         seen: list[tuple[int, int]] = []
 
         def dump_like_pg_dump(current: int, target: int) -> None:

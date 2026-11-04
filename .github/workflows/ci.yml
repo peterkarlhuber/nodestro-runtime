@@ -47,6 +47,13 @@ jobs:
       - run: ruff format --check .
       - run: mypy
       - run: pytest
+      # The PostgreSQL tests again as a production server runs: a restricted runtime role (no DDL, no BYPASSRLS, owns
+      # nothing) for every database the tests open; the CI user stays the owner that migrates (tests/postgres_support.py).
+      - name: PostgreSQL tests as the restricted runtime role
+        if: matrix.python == '3.13'
+        env:
+          NODESTRO_TEST_RUNTIME_ROLE: "1"
+        run: pytest $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
       # Known vulnerabilities in the installed dependencies (as orkexa's CI checks them). Blocking: an advisory that
       # was reviewed and cannot be fixed yet goes into PIP_AUDIT_IGNORE (space-separated IDs, with the reason here).
       - name: Dependency audit

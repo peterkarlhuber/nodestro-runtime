@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- CI runs the PostgreSQL tests a second time as the restricted runtime role (`NODESTRO_TEST_RUNTIME_ROLE=1`, Python
+  3.13 job), as a production server connects; the two migration-backup tests that changed the schema table through
+  the runtime role's connection now do it as the owner (audit round 3, RT3-06).
+
 - Cancelling a run, or its time limit, now ends a model request that waits for a local or self-hosted model server
   at once (audit round 3, RT3-05): the turn's connections made by Nodestro (`compatible`, `ollama`, `vllm`) shut
   their sockets down when the run is cancelled, so the step ends as `cancelled` (or the run with `run.time_limit`)
