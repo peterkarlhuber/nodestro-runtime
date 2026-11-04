@@ -75,6 +75,7 @@ from .agent_builder import AgentBuilder, BuiltAgent, run_own_tool
 from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
 from .cost_tracking import PricedTracker, PriceMode, stale_requests
+from .file_delivery import TOOL_NAME as FILES_TOOL_NAME
 from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
@@ -104,6 +105,7 @@ from .schemas import (
     GuidanceRef,
     InputField,
     KnowledgeProposal,
+    MemoryConfig,
     Node,
     NodeRun,
     NodeStatus,
@@ -116,6 +118,7 @@ from .schemas import (
     RunWarning,
     ToolCallApproval,
     ToolCallRecord,
+    ToolChoice,
     Usage,
     Workflow,
     now,
@@ -3936,7 +3939,9 @@ class RunManager:
         if not failed:
             return outcome
         self._emit(context, "values_unverified", node_id, fields=[item.field for item in failed], attempt=1)
-        outcome = ask(correction_prompt(prompt, failed), resume=None, refinement=None)
+        with context.lock:
+            earlier = [call for call in state.tool_calls if not call.is_error and call.output]
+        outcome = self._ask_correction(config, correction_prompt(prompt, failed, earlier), ask)
         failed = failed_of(outcome.output)
         if not failed:
             return outcome
@@ -3949,6 +3954,34 @@ class RunManager:
             reason=first.reason,
             fields=[item.field for item in failed],
         )
+
+    @staticmethod
+    def _ask_correction(config: AgentConfig, prompt: str, ask: Callable[..., AgentOutcome]) -> AgentOutcome:
+        """The agent's one correction of a checked figure, as a new turn that can only compute (RT3-03).
+
+        The new turn does not see the first one's conversation, so it would typically do the whole task again: every
+        tool that may have effects outside the run (by the rule of :mod:`.resume`, RT2-01: everything except
+        Nodestro's built-in tools) is left out, as are provider server tools, the memory tool and knowledge
+        proposals. It keeps the built-in tools (calculator, ``table_totals``), the run's input files and knowledge
+        search, and it is told what the first turn's calls returned. It never waits for a budget decision: the
+        waiting turn could not be continued with the full agent."""
+        kept = [name for name in config.tools if name in tool_policy.BUILTIN_CAPABILITIES]
+        choice = config.tool_choice
+        if choice.type == "tool" and choice.name not in kept:
+            choice = ToolChoice()
+        computing = config.model_copy(
+            update={"tools": kept, "server_tools": [], "memory": MemoryConfig(), "tool_choice": choice}
+        )
+        assert isinstance(ask, functools.partial)
+        keywords = dict(ask.keywords)
+        keywords.update(
+            resume=None,
+            refinement=None,
+            suspendable=False,
+            extra_tools=[tool for tool in keywords.get("extra_tools") or () if tool.name == FILES_TOOL_NAME],
+        )
+        result: AgentOutcome = ask.func(*ask.args[:1], computing, prompt, **keywords)
+        return result
 
     def _note_reasoning(self, context: _RunContext, node_id: str, state: NodeRun, built: BuiltAgent) -> None:
         """Record on the step that its agent thinks less than its effort asks (the CPU saving mode, RT-050), once."""

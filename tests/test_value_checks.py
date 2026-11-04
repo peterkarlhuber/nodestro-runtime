@@ -315,3 +315,39 @@ async def test_a_run_refuses_a_figure_the_tool_only_repeated(tmp_path: Path) -> 
         assert done.status == "failed"
         assert done.nodes["a"].error_code == "run.value_unverified"
         assert done.nodes["a"].error_params["reason"] == "not_from_tool"
+
+
+async def test_the_correction_only_computes_and_never_repeats_a_tool_with_effects(tmp_path: Path) -> None:
+    # RT3-03: the correction is a new turn; a stored tool (which may have effects outside the run) ran in the first
+    # one and is not offered again, while the built-in tools are, and the earlier results are in the prompt.
+    from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
+
+    own = "celsius_to_fahrenheit"
+    fake = ScriptedClient(
+        {
+            "Analyst": [
+                tool_use(own, {"celsius": 100}),
+                _share(2.83),
+                tool_use(own, {"celsius": 100}),  # what a model redoing the whole task asks for
+                tool_use("table_totals", TOTALS_CALL),
+                _share(4.62),
+            ]
+        }
+    )
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[]) as workspace:
+        result, _ = workspace.tools.save_custom(
+            CUSTOM_TOOL_TEMPLATE,
+            CUSTOM_TESTS_TEMPLATE,
+            own,
+            trust=workspace.tools.editor_trust(own, CUSTOM_TOOL_TEMPLATE),
+        )
+        assert result.ok, result
+        saved = workspace.save_workflow(_flow(tools=[own, "table_totals"]))
+        done = await workspace.wait((await workspace.run(saved, RunIn(input=LOG))).id, timeout=30)
+        assert done.status == "succeeded", done.error
+        ran = [call for call in done.nodes["a"].tool_calls if call.name == own and not call.is_error]
+        assert len(ran) == 1  # it ran in the first turn only
+        correction = fake.messages.calls[2]
+        offered = {tool.get("name") for tool in correction.get("tools") or []}
+        assert "table_totals" in offered and own not in offered
+        assert "212.0" in str(correction["messages"]) and "must not be repeated" in str(correction["messages"])

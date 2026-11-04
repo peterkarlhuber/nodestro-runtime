@@ -308,8 +308,10 @@ def unverified_fields(
     return failed
 
 
-def correction_prompt(prompt: str, failed: list[Unverified]) -> str:
-    """The task again, with why each checked value was not accepted (the agent's one chance to correct it)."""
+def correction_prompt(prompt: str, failed: list[Unverified], earlier: Iterable[ToolCallRecord] = ()) -> str:
+    """The task again, with why each checked value was not accepted (the agent's one chance to correct it), and what
+    the step's tool calls so far returned: the correction is a new turn, and its tools that could have effects
+    outside the run are not offered again (RT3-03)."""
     lines: list[str] = []
     for item in failed:
         if item.reason == "table_incomplete":
@@ -332,7 +334,22 @@ def correction_prompt(prompt: str, failed: list[Unverified]) -> str:
                 "based on (for example income minus all expenses, not only a part of it and not the result "
                 "itself). Report exactly the tool's result, rounded to at most two decimals."
             )
-    return (
+    text = (
         f"{prompt}\n\nYour previous answer was not accepted, because these values must be computed with a tool:\n"
         + "\n".join(lines)
     )
+    done = list(earlier)[:_EARLIER_CALLS]
+    if done:
+        text += (
+            "\n\nYour tool calls so far already ran and must not be repeated; only the tools for computing are "
+            "available now. Their results:\n"
+            + "\n".join(
+                f"- {call.name}({json.dumps(call.input, ensure_ascii=False)[:300]}) -> {(call.output or '')[:500]}"
+                for call in done
+            )
+        )
+    return text
+
+
+#: How many earlier tool calls the correction lists.
+_EARLIER_CALLS = 20

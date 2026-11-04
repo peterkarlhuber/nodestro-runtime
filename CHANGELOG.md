@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The correction pass of a checked key figure no longer runs the agent's tools again (audit round 3, RT3-03): it
+  gets only the built-in computing tools (e.g. `table_totals`) and the results of the first attempt's tool calls, and
+  runs without MCP servers, memory, other extra tools (only the run's file delivery stays) or a resumable pause. Before, a model that
+  redid the whole task called tools with effects (an own tool, a server tool) a second time.
+
 - CI runs the PostgreSQL tests a second time as the restricted runtime role (`NODESTRO_TEST_RUNTIME_ROLE=1`, Python
   3.13 job), as a production server connects; the two migration-backup tests that changed the schema table through
   the runtime role's connection now do it as the owner (audit round 3, RT3-06).
