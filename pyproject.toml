@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@22f29101ad12aebc5a71d5e2f90ea9c23fe23603",
+    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@e9c2147da68db01199394f51c1b7ef90067cb4f9",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
@@ -40,12 +40,12 @@ dependencies = [
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@a87224291b561981ed8afab6131e18d8c9eecc01",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@a87224291b561981ed8afab6131e18d8c9eecc01",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",

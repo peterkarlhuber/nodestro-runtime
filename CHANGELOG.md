@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Pin orkexa `e9c2147da68db01199394f51c1b7ef90067cb4f9` (orkexa #49, audit round 3: retrieval integrity on reindex,
+  non-finite vectors refused, managed Ollama lifecycle with orphan reclaim, embedding identity follows the model
+  digest (`reindex_required`, handled by RT3-08), safe model builds) and axentra
+  `0a1d1cc72f3312140ffb9dff73184af392e40626` (axentra #41, audit round 3: an API key's rights are bounded by its
+  creator's current access, `403 api_key_creator_lost_access`).
+
 - Continuing or restarting a run (`POST /api/runs/{id}/resume`) no longer blocks the event loop on a local model
   server (audit round 3, RT3-11): the resume plan, whose pre-check may ask the server about its models, runs in a
   worker thread, as a run start does since RT3-04.
