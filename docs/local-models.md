@@ -118,6 +118,12 @@ computer's hardware decides (`detect_hardware`), because Ollama 0.40.14 reports 
 GPU memory means CPU, (almost) all of it means GPU, a split or no loaded model means unknown, and an unknown server never
 saves. `LocalStatus.accelerated` shows the result.
 
+Measured on 4 vCPU without a GPU (Ollama 0.40.14, `qwen3.5:4b` Q4_K_M, 32k context), one real `production-downtime`
+run (German, one test case, no AI judge of the test series): with `full` 6535 s, 6 requests, 28191 output tokens;
+with `auto` 893 s, 4 requests, 5157 output tokens (7.3 times faster). Both runs finished. The deterministic checks
+failed in both on the same agent, which computed the downtime share without its calculator (3.31 % and 2.83 %
+instead of 4.6 %); one run per mode does not show a quality difference between the modes.
+
 Speeds are measured, never estimated: `LocalModelService.benchmark` (`POST /api/local-models/benchmark`) asks an
 installed chat model one short fixed question without thinking and stores tokens per second, prompt speed, context
 window and processor with the model (`InstalledModel.speed`); below 8 tokens per second the advice says
