@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The model catalog (`GET /api/meta`, on every page load) reads the stored reference prices once instead of once
+  per catalog model (UX round 3, B1): `PricingService.view()` reads and resolves the prices for many models, and a
+  stored price version is parsed only once per service (a version's prices never change). With a synchronized price
+  list of about 1,500 prices `catalog.models()` took 1.7 s, now 28 ms; without one 0.5 ms as before.
+
 - The correction pass of a checked key figure no longer runs the agent's tools again (audit round 3, RT3-03): it
   gets only the built-in computing tools (e.g. `table_totals`) and the results of the first attempt's tool calls, and
   runs without MCP servers, memory, other extra tools (only the run's file delivery stays) or a resumable pause. Before, a model that

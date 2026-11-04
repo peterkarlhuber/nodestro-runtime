@@ -367,6 +367,42 @@ def test_the_catalog_shows_prices_and_their_status(service: PricingService) -> N
     assert {info.id: info for info in catalog.models()}["anthropic:claude-opus-5-5"].price_status == "current"
 
 
+def test_the_catalog_reads_the_stored_prices_once(
+    service: PricingService, store: DocumentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UX round 3 B1: GET /api/meta re-read and re-parsed the stored price list for every catalog model (1.7 s)."""
+    first = service.submit(_candidate("litellm-1", _price("gpt-5.5", "1.25", "10")))
+    assert first.active_version == "litellm-1"
+    reads: list[str] = []
+    parses: list[str] = []
+    get, parse = store.get, StoredSnapshot.snapshot
+
+    def counting_get(collection: str, key: str, model: type) -> object:  # type: ignore[type-arg]
+        if collection == SNAPSHOTS:
+            reads.append(key)
+        return get(collection, key, model)
+
+    def counting_parse(record: StoredSnapshot) -> PriceSnapshot:
+        parses.append(record.version)
+        return parse(record)
+
+    monkeypatch.setattr(store, "get", counting_get)
+    monkeypatch.setattr(StoredSnapshot, "snapshot", counting_parse)
+    shown = {info.id: info for info in catalog.models(service)}
+    assert reads == ["litellm-1"] and parses == ["litellm-1"]
+    assert shown["openai:gpt-5.5"].price_status == "current" and shown["openai:gpt-5.5"].price_version == "litellm-1"
+    reads.clear()
+    parses.clear()
+    catalog.models(service)
+    assert reads == ["litellm-1"] and parses == []  # the same version is not parsed again
+    # A new version and a new override are seen at once.
+    service.submit(_candidate("litellm-2", _price("gpt-5.5", "1.30", "10.5")))
+    service.set_override(_price("gemini-3-pro", "2", "8", provider="gemini", source="custom"))
+    shown = {info.id: info for info in catalog.models(service)}
+    assert shown["openai:gpt-5.5"].input_usd_per_mtok == 1.30 and shown["openai:gpt-5.5"].price_version == "litellm-2"
+    assert shown["gemini:gemini-3-pro"].price_status == "custom"
+
+
 # ---- tenants ---------------------------------------------------------------------------------------------
 
 
