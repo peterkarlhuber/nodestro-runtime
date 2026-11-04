@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A run start no longer blocks the event loop on a local model server (audit round 3, RT3-04): `launch` runs the
+  pre-check and the provider check in a worker thread, and a model's `/api/show` that got no answer (timeout,
+  unreachable) is not asked again for 30 seconds (also `/api/ps`). Before, starting a three-agent workflow on an Ollama
+  address that accepts connections but does not answer made 17 requests on the event loop, each waiting up to the
+  client's 30-second timeout, so the API served nothing else meanwhile.
+
 - A stored tool saved before a built-in tool of the same name existed (e.g. an own `table_totals`) no longer stops
   the workspace from opening ("Tool name already registered", audit round 3, RT3-02): the built-in tool wins, the
   stored files stay on disk, a warning names the tool and `ToolLibrary.shadowed` lists it.

@@ -178,6 +178,9 @@ SLOW_TOKENS_PER_SECOND = 8.0
 #: Below this memory only the smallest models run.
 LOW_MEMORY = 8 * 1024**3
 _PS_TTL = 30.0
+#: How long a model's ``/api/show`` that got no answer (timeout, unreachable) is not asked again.
+_FAILED_TTL = 30.0
+_UNANSWERED = frozenset({"timeout", "unreachable"})
 _BENCHMARK_PROMPT = (
     "Write a short, plain paragraph (about eighty words) that explains why a team should write down the decisions it "
     "makes in meetings. Do not use lists."
@@ -221,6 +224,7 @@ class LocalModelService:
         self._jobs: dict[str, LocalJob] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._show: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._show_failed: dict[str, tuple[float, NodestroError]] = {}
         self._ps: tuple[float, list[dict[str, Any]]] | None = None
 
     # ---- settings ------------------------------------------------------------------------------------------
@@ -318,6 +322,8 @@ class LocalModelService:
             )
         server = self._managed_server()
         server._binary = self.runtime_binary()
+        self._show_failed.clear()
+        self._ps = None
         try:
             return server.start()
         except OllamaError as exc:
@@ -428,7 +434,7 @@ class LocalModelService:
         try:
             loaded = (client or self.client()).running()
         except (OllamaError, NodestroError):
-            return []
+            loaded = []  # remembered like an answer: a server that does not answer is not asked again at once
         self._ps = (time.monotonic(), loaded)
         return loaded
 
@@ -607,12 +613,20 @@ class LocalModelService:
         cached = self._show.get(name)
         if cached is not None and time.monotonic() - cached[0] < _SHOW_TTL:
             return cached[1]
+        failed = self._show_failed.get(name)
+        if failed is not None and time.monotonic() - failed[0] < _FAILED_TTL:
+            raise failed[1]
         try:
             details = (client or self.client()).show(name)
         except OllamaError as exc:
             if exc.code == "model_missing":
                 return {}
-            raise _error(exc) from None
+            error = _error(exc)
+            if exc.code in _UNANSWERED:
+                # A server that does not answer costs the client's whole timeout per request; a run start asks for
+                # the same model several times (RT3-04), so the failure is remembered briefly too.
+                self._show_failed[name] = (time.monotonic(), error)
+            raise error from None
         value = {
             "capabilities": list(details.capabilities),
             "context_length": details.context_length,
@@ -722,6 +736,7 @@ class LocalModelService:
                 job.finished_at = datetime.now(UTC)
                 self._cancel.pop(job.id, None)
                 self._show.clear()
+                self._show_failed.clear()
 
         threading.Thread(target=body, name=f"nodestro-local-{kind}", daemon=True).start()
         return job
@@ -904,6 +919,7 @@ class LocalModelService:
                 self._managed.stop()
                 self._managed = None
         self._show.clear()
+        self._show_failed.clear()
         if running:
             self.start()
 
