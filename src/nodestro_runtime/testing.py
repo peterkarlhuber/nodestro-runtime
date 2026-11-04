@@ -13,7 +13,7 @@ SDK tests) simulates models the same way. Nothing here is used outside tests.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from copy import deepcopy
 from pathlib import Path
 import re
@@ -144,6 +144,31 @@ class ScriptedClient:
 # ---- a client that answers every request ----------------------------------------------
 
 
+#: The numbers :func:`sample_value` answers (``int`` and ``float`` fields).
+SAMPLE_NUMBERS: tuple[float, ...] = (1234.5, 7)
+
+
+def _tool_results(request: dict[str, Any]) -> int:
+    return sum(
+        1
+        for message in request.get("messages", [])
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    )
+
+
+def computing_call(request: dict[str, Any], numbers: Sequence[float]) -> Message | None:
+    """A double that computes like a careful model: an agent with the calculator first computes ``numbers`` with it,
+    one call each, so key figures that must come from a tool (``source="tool"``) are backed by a tool result."""
+    offered = [tool.get("name", "") for tool in request.get("tools") or [] if isinstance(tool, dict)]
+    name = next((item for item in offered if item == "calculator" or item.endswith("__calculator")), None)
+    done = _tool_results(request)
+    if name is None or done >= len(numbers):
+        return None
+    return tool_use(name, {"expression": repr(float(numbers[done]))}, call_id=f"toolu_compute_{done}")
+
+
 def sample_value(annotation: Any, request: dict[str, Any]) -> Any:
     origin = get_origin(annotation)
     if origin is Literal:
@@ -191,6 +216,9 @@ class AnswerAll:
     def _answer(self, request: dict[str, Any]) -> Any:
         with self._lock:
             self.calls.append({key: value for key, value in request.items() if key != "output_format"})
+        computed = computing_call(request, SAMPLE_NUMBERS)
+        if computed is not None:
+            return computed
         model = request.get("output_format")
         if model is not None:
             return Parsed(text("{}"), sample_instance(model, request))

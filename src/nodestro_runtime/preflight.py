@@ -1025,6 +1025,42 @@ def _dependency_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIss
     return found
 
 
+def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
+    """Key figures that must come from a tool (``source="tool"``) where no tool can compute them."""
+    found: list[CheckIssue] = []
+    for node in workflow.nodes:
+        agent = node.agent
+        if node.type != "agent" or agent is None:
+            continue
+        for item in agent.output.fields:
+            if item.source != "tool":
+                continue
+            if agent.output.mode != "structured" or item.type not in ("number", "integer"):
+                found.append(
+                    _issue(
+                        "check.value_source_type",
+                        f"{item.name} must come from a tool, but only numbers of a structured result are checked",
+                        level="warning",
+                        node_id=node.id,
+                        field=item.name,
+                    )
+                )
+                continue
+            earlier = {node.id} | graph.ancestors(workflow, node.id)
+            if not any(
+                other.agent is not None and other.agent.tools for other in workflow.nodes if other.id in earlier
+            ):
+                found.append(
+                    _issue(
+                        "check.value_source_no_tool",
+                        f"{item.name} must come from a tool, but neither this agent nor one before it has a tool",
+                        node_id=node.id,
+                        field=item.name,
+                    )
+                )
+    return found
+
+
 def _contract_issues(workflow: Workflow) -> list[CheckIssue]:
     """Result nodes whose contract the agents before them cannot be seen to fulfil."""
     return [
@@ -1057,6 +1093,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
         *_subworkflow_issues(nodestro, workflow),
         *_orchestrator_issues(nodestro, workflow),
         *_contract_issues(workflow),
+        *_checked_value_issues(workflow),
     ]
     budget = workflow.budget_usd if workflow.budget_usd is not None else nodestro.settings().default_budget_usd
     if budget is not None and budget <= 0:

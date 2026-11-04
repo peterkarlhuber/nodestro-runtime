@@ -130,6 +130,10 @@ class OutputField(_Model):
     type: OutputFieldType = "string"
     description: str = ""
     required: bool = True
+    #: Where a number must come from (agents' results only; a contract ignores it). ``model``: the agent's answer.
+    #: ``tool``: a key figure that later steps rely on; it must be the result of a tool call of this step or an
+    #: earlier one (:mod:`nodestro_runtime.value_checks`), otherwise the step fails with ``run.value_unverified``.
+    source: Literal["model", "tool"] = "model"
 
 
 class OutputConfig(_Model):
