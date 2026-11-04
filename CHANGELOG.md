@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A stored tool saved before a built-in tool of the same name existed (e.g. an own `table_totals`) no longer stops
+  the workspace from opening ("Tool name already registered", audit round 3, RT3-02): the built-in tool wins, the
+  stored files stay on disk, a warning names the tool and `ToolLibrary.shadowed` lists it.
+
 - Checked key figures (audit round 3, RT3-01): a `table_totals` result backs only what the tool computed (totals,
   means, extremes, shares, row counts), no longer the reference total or a column or group name it repeats from its
   input; a calculator call backs nothing when it only repeats one number in another spelling (`46_3`, `0x1cf`) or
