@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- Pin orkexa `e9c2147da68db01199394f51c1b7ef90067cb4f9` (orkexa #49, audit round 3: retrieval integrity on reindex,
+  non-finite vectors refused, managed Ollama lifecycle with orphan reclaim, embedding identity follows the model
+  digest (`reindex_required`, handled by RT3-08), safe model builds) and axentra
+  `0a1d1cc72f3312140ffb9dff73184af392e40626` (axentra #41, audit round 3: an API key's rights are bounded by its
+  creator's current access, `403 api_key_creator_lost_access`).
+
+- Continuing or restarting a run (`POST /api/runs/{id}/resume`) no longer blocks the event loop on a local model
+  server (audit round 3, RT3-11): the resume plan, whose pre-check may ask the server about its models, runs in a
+  worker thread, as a run start does since RT3-04.
+
+- The local model catalog's `license` is the SPDX id only (e.g. `Apache-2.0`); where it comes from is the new code
+  `license_source` (`ollama`: the manifest's license layer, `upstream`: the publisher's model card because the Ollama
+  manifest has none). Before, four entries carried an English note in `license`, shown untranslated in every
+  language (UX round 3, B4). An exported package's model license list no longer carries that note.
+
+- The model catalog (`GET /api/meta`, on every page load) reads the stored reference prices once instead of once
+  per catalog model (UX round 3, B1): `PricingService.view()` reads and resolves the prices for many models, and a
+  stored price version is parsed only once per service (a version's prices never change). With a synchronized price
+  list of about 1,500 prices `catalog.models()` took 1.7 s, now 28 ms; without one 0.5 ms as before.
+
+- The correction pass of a checked key figure no longer runs the agent's tools again (audit round 3, RT3-03): it
+  gets only the built-in computing tools (e.g. `table_totals`) and the results of the first attempt's tool calls, and
+  runs without MCP servers, memory, other extra tools (only the run's file delivery stays) or a resumable pause. Before, a model that
+  redid the whole task called tools with effects (an own tool, a server tool) a second time.
+
+- CI runs the PostgreSQL tests a second time as the restricted runtime role (`NODESTRO_TEST_RUNTIME_ROLE=1`, Python
+  3.13 job), as a production server connects; the two migration-backup tests that changed the schema table through
+  the runtime role's connection now do it as the owner (audit round 3, RT3-06).
+
+- Cancelling a run, or its time limit, now ends a model request that waits for a local or self-hosted model server
+  at once (audit round 3, RT3-05): the turn's connections made by Nodestro (`compatible`, `ollama`, `vllm`) shut
+  their sockets down when the run is cancelled, so the step ends as `cancelled` (or the run with `run.time_limit`)
+  instead of holding its thread until the request timeout (an hour for local servers). Orchestrator decisions too.
+  Clients injected by an embedding application are left alone. Cancelling a speed measurement of a local model ends
+  the job at once as well, while the model may still be loading (RT3-07).
+
+- An embedding model that got a new digest on the server (a pull or rebuild; audit round 3, RT3-08): the knowledge
+  status now says `reindex_required` (it compared only the model name and showed `ready`), and an upload is indexed
+  without vectors instead of failing with an unhandled `RetrievalError` (`reindex_required`, an HTTP 500 in the API);
+  a knowledge search reports `knowledge.reindex_required` (was an unhandled error); a reindex adds the vectors.
+  Prepares the orkexa pin that refreshes cached embedding identities (ORK3-07).
+
+- A run start no longer blocks the event loop on a local model server (audit round 3, RT3-04): `launch` runs the
+  pre-check and the provider check in a worker thread, and a model's `/api/show` that got no answer (timeout,
+  unreachable) is not asked again for 30 seconds (also `/api/ps`). Before, starting a three-agent workflow on an Ollama
+  address that accepts connections but does not answer made 17 requests on the event loop, each waiting up to the
+  client's 30-second timeout, so the API served nothing else meanwhile.
+
+- A stored tool saved before a built-in tool of the same name existed (e.g. an own `table_totals`) no longer stops
+  the workspace from opening ("Tool name already registered", audit round 3, RT3-02): the built-in tool wins, the
+  stored files stay on disk, a warning names the tool and `ToolLibrary.shadowed` lists it.
+
+- Checked key figures (audit round 3, RT3-01): a `table_totals` result backs only what the tool computed (totals,
+  means, extremes, shares, row counts), no longer the reference total or a column or group name it repeats from its
+  input; a calculator call backs nothing when it only repeats one number in another spelling (`46_3`, `0x1cf`) or
+  rounds or transforms a single number (`round(463.2)`). When the step's input has the table, the table passed to
+  `table_totals` must have exactly its rows (none left out, added or changed; `table_changed`), compared by the
+  values of the value column when the agent renamed or left out other columns. The check still proves provenance
+  only: a calculation written out from made-up numbers passes.
+
 - Pin orkexa 22f2910 (orkexa #47): `install_runtime` prepares the Ollama runtime of another platform
   (`find_binary(root, system)`), for Nodestro's portable packages built for a different target platform.
 - A checked key figure is no longer backed by a calculator call that only repeats it (expression `463`): numbers a

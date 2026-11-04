@@ -59,8 +59,11 @@ async def launch(
     preset: dict[str, NodeRun] | None = None,
     started_by: str | None = None,
 ) -> Run:
-    blocking_problems(ctx, workflow)
-    ctx.require_providers(agent_models(workflow))  # fail fast: every provider the agents use is configured
+    # The pre-check may ask a local model server about its models (blocking requests, up to the client's timeout
+    # each): never on the event loop, which serves every other request meanwhile (RT3-04).
+    await asyncio.to_thread(blocking_problems, ctx, workflow)
+    # Fail fast: every provider the agents use is configured (a local server may be asked whether it has a GPU).
+    await asyncio.to_thread(ctx.require_providers, agent_models(workflow))
     # Approved libraries whose environment is missing (e.g. after a restore) are installed now,
     # exactly in the approved versions.
     needed = ctx.python.needed_for_workflow(workflow)

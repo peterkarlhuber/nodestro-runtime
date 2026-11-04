@@ -20,7 +20,7 @@ from pydantic import BaseModel, model_validator
 from .tool_policy import UNKNOWN, ToolCapability, server_tool_capability
 
 if TYPE_CHECKING:
-    from .pricing import PricingService
+    from .pricing import PriceView, PricingService
 
 
 class ModelInfo(BaseModel):
@@ -147,7 +147,7 @@ def _priced(
     recommended: bool,
     *,
     snapshot: PriceSnapshot,
-    pricing: PricingService | None,
+    view: PriceView | None,
 ) -> ModelInfo:
     info = ModelInfo(
         id=f"{provider}:{model_id}",
@@ -176,11 +176,11 @@ def _priced(
     if regional is not None:
         info.price_region = regional.default
         info.price_regions = [option.value for option in regional.options]
-    if pricing is None:
+    if view is None:
         info.price_status = "current"
         info.price_version = snapshot.version
         return info
-    entry = pricing.entry(provider, model_id)
+    entry = view.entry(provider, model_id)
     if entry is not None:
         info.price_status = entry.status
         info.price_version = entry.version
@@ -194,7 +194,8 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
 
     Prices come from ``pricing`` (the workspace's catalog) or, without it, from Orkexa's built-in prices.
     """
-    snapshot = pricing.effective_snapshot() if pricing is not None else BUILTIN_SNAPSHOT
+    view = pricing.view() if pricing is not None else None
+    snapshot = view.snapshot if view is not None else BUILTIN_SNAPSHOT
     ordered = [*_RECOMMENDED, *(m for m in MODEL_PRICING if m not in _RECOMMENDED)]
     result = []
     for model_id in ordered:
@@ -210,12 +211,12 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
                 description,
                 model_id in _RECOMMENDED,
                 snapshot=snapshot,
-                pricing=pricing,
+                view=view,
             )
         )
     result += _local_models()
     for provider, model_id, label, tier, description in _OTHER_MODELS:
-        result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, pricing=pricing))
+        result.append(_priced(provider, model_id, label, tier, description, True, snapshot=snapshot, view=view))
     for provider, model_id, label, tier, description in _BEDROCK_MODELS:
         result.append(
             _with_capabilities(
@@ -227,7 +228,7 @@ def models(pricing: PricingService | None = None) -> list[ModelInfo]:
                     description + _BEDROCK_SUGGESTION,
                     model_id.startswith("eu.anthropic.claude-sonnet"),
                     snapshot=snapshot,
-                    pricing=pricing,
+                    view=view,
                 )
             )
         )

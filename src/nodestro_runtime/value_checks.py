@@ -6,9 +6,18 @@ checks it after the agent answered (:func:`unverified_fields`):
 
 - the value must be the result of a successful tool call of this step or of an earlier step of the run, rounded to
   the decimals the agent reported (the calculator, ``table_totals``, a stored tool), and not a number the call
-  already had in its input (a calculator called with the value itself computed nothing);
-- when that result came from ``table_totals``, the table the agent passed must have every row of the matching table
-  in the step's input, so a total over a shortened table does not count.
+  already had in its input (a calculator called with the value itself, in any spelling, computed nothing; neither
+  did one that only rounds or transforms a single number). Of a ``table_totals`` result only what the tool computed
+  counts (totals, means, extremes, shares, row counts), never what it repeats from its input (the reference total,
+  column and group names);
+- when that result came from ``table_totals`` and the step's input has a table with the same columns, the table the
+  agent passed must have exactly the rows of that table: none left out (a total over a shortened table does not
+  count), none added and none changed. A passed table with other columns is compared with the input's tables that
+  have its value column, by the values of that column.
+
+The check proves where a value comes from, not that the tool got the right figures: a calculator call written out
+from made-up numbers, or ``table_totals`` over a made-up table whose value column no table of the step's input has
+(e.g. a table that came from a tool), still backs its result.
 
 A value that fails is sent back to the agent once with the reason; a second failure fails the step with
 ``run.value_unverified``, so no decision is made on an unchecked figure.
@@ -16,7 +25,10 @@ A value that fails is sent back to the agent once with the reason; a second fail
 
 from __future__ import annotations
 
+import ast
+from collections import Counter
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 import json
 import math
@@ -36,7 +48,8 @@ _NUMERIC = ("number", "integer")
 
 @dataclass(frozen=True)
 class Unverified:
-    """A checked field that failed: ``reason`` is ``missing``, ``not_from_tool`` or ``table_incomplete``."""
+    """A checked field that failed: ``reason`` is ``missing``, ``not_from_tool``, ``table_incomplete`` or
+    ``table_changed`` (rows added or changed)."""
 
     field: str
     value: Any
@@ -76,18 +89,95 @@ def _numbers(text: str) -> list[float]:
     return found
 
 
+#: The values ``table_totals`` computes (:func:`~nodestro_runtime.builtin_tools.summarize_table`), at the top level and
+#: per group. Everything else in its result repeats its input (``column``, ``reference_total``, ``group``).
+_TOTALS_KEYS = frozenset(
+    {
+        "rows",
+        "skipped_rows",
+        "total",
+        "mean",
+        "min",
+        "max",
+        "share_of_reference_percent",
+        "share_percent",
+        "cumulative_share_percent",
+    }
+)
+
+
+def _computed_totals(output: str) -> list[float] | None:
+    """The numbers ``table_totals`` computed, from its JSON result; ``None`` when the result is not one."""
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        try:
+            parsed = ast.literal_eval(output)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return None
+    if not isinstance(parsed, Mapping):
+        return None
+    found: list[float] = []
+    for item in (parsed, *(group for group in parsed.get("groups") or () if isinstance(group, Mapping))):
+        for key, value in item.items():
+            if key in _TOTALS_KEYS and isinstance(value, (int, float)) and not isinstance(value, bool):
+                found.append(float(value))
+    return found
+
+
+def _given(record: ToolCallRecord) -> set[float]:
+    """The numbers a call had in its input. For the calculator also every numeric literal as Python reads it
+    (``0x1cf``, ``46_3`` and ``4.63e2`` are all 463)."""
+    given = set(_numbers(json.dumps(record.input, ensure_ascii=False)))
+    expression = record.input.get("expression") if record.name == "calculator" else None
+    if isinstance(expression, str):
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except (SyntaxError, ValueError, MemoryError, RecursionError):
+            return given
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                with suppress(OverflowError):
+                    given.add(float(node.value))
+    return given
+
+
+def _operands(record: ToolCallRecord) -> int:
+    """How many numbers (literals, ``pi``, ``e``) a calculator expression combines; ``0`` when it does not parse."""
+    expression = record.input.get("expression")
+    if not isinstance(expression, str):
+        return 0
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return 0
+    return sum(
+        1
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+        )
+        or (isinstance(node, ast.Name) and node.id in ("pi", "e"))
+    )
+
+
 def tool_numbers(record: ToolCallRecord) -> list[float]:
     """The numbers a successful tool call computed: those of its result that its input did not already contain.
 
-    A calculator call with the expression ``463`` returns 463, but computed nothing, so it backs no value. A
-    ``table_totals`` result counts in full: the tool adds up the table itself, and the row check guards its input.
+    A calculator call with the expression ``463`` returns 463, but computed nothing, so it backs no value; nor does
+    one that only rounds or transforms a single number (``round(463.2)``). Of a ``table_totals`` result only what it
+    computed counts (the row check guards its input); the reference total and names it repeats do not.
     """
     if record.is_error or not record.output:
         return []
-    found = _numbers(record.output)
     if record.name == "table_totals":
-        return found
-    given = set(_numbers(json.dumps(record.input, ensure_ascii=False)))
+        computed = _computed_totals(record.output)
+        if computed is not None:
+            return computed
+    if record.name == "calculator" and _operands(record) < 2:
+        return []
+    found = _numbers(record.output)
+    given = _given(record)
     return [number for number in found if number not in given]
 
 
@@ -104,7 +194,9 @@ def _matches(reported: float, computed: float) -> bool:
     return abs(reported - computed) <= tolerance
 
 
-def _table_rows(record: ToolCallRecord) -> tuple[list[str], int] | None:
+def _table_rows(record: ToolCallRecord) -> tuple[list[str], list[tuple[Any, ...]]] | None:
+    """The header and the counted rows (those with a number in the value column) of the table a ``table_totals``
+    call was given."""
     table = record.input.get("table")
     if record.name != "table_totals" or not isinstance(table, str):
         return None
@@ -113,29 +205,74 @@ def _table_rows(record: ToolCallRecord) -> tuple[list[str], int] | None:
         return None
     header, rows = parsed
     column = str(record.input.get("value_column") or "")
-    counted = sum(1 for row in rows if _value_cell(header, row, column) is not None)
-    return header, counted
+    return header, _counted(header, rows, column)
 
 
-def _value_cell(header: list[str], row: list[str], column: str) -> float | None:
+def _counted(header: list[str], rows: list[list[str]], column: str) -> list[tuple[Any, ...]]:
+    """Each row with a number in the value column, compared by that number and its other cells (case and outer
+    spaces aside), so a row counts as the same however the table was written (Markdown, CSV, aligned)."""
+    found: list[tuple[Any, ...]] = []
+    index = _value_index(header, column)
+    if index is None:
+        return found
+    for row in rows:
+        if index >= len(row):
+            continue
+        value = number_of(row[index])
+        if value is None:
+            continue
+        found.append((value, *(cell.strip().casefold() for position, cell in enumerate(row) if position != index)))
+    return found
+
+
+def _value_index(header: list[str], column: str) -> int | None:
     wanted = column.strip().casefold()
     indexes = [index for index, title in enumerate(header) if title.casefold() == wanted] or [
         index for index, title in enumerate(header) if wanted and wanted in title.casefold()
     ]
-    if not indexes or indexes[0] >= len(row):
-        return None
-    return number_of(row[indexes[0]])
+    return indexes[0] if indexes else None
 
 
-def _input_rows(source_text: str, header: list[str], column: str) -> int | None:
-    """The data rows of the table in the input with the same columns; ``None`` when the input has none."""
+def _input_tables(source_text: str, header: list[str], column: str) -> tuple[list[list[tuple[Any, ...]]], bool]:
+    """The counted rows of every table in the input with the same columns, and ``True``. Without such a table: the
+    tables that have the value column (the agent may have left out or renamed other columns), compared by their
+    values only, and ``False``. No list: the input has no table to compare with."""
     wanted = [title.casefold() for title in header]
-    best: int | None = None
-    for other_header, rows in parse_tables(source_text):
-        if [title.casefold() for title in other_header] != wanted:
-            continue
-        counted = sum(1 for row in rows if _value_cell(other_header, row, column) is not None)
-        best = counted if best is None else max(best, counted)
+    tables = parse_tables(source_text)
+    same = [
+        _counted(other_header, rows, column)
+        for other_header, rows in tables
+        if [title.casefold() for title in other_header] == wanted
+    ]
+    if same:
+        return same, True
+    return [
+        [(row[0],) for row in _counted(other_header, rows, column)]
+        for other_header, rows in tables
+        if _value_index(other_header, column) is not None
+    ], False
+
+
+def _table_problem(record: ToolCallRecord, name: str, value: Any, source_text: str) -> Unverified | None:
+    """Why the table of a ``table_totals`` call does not back ``value`` (``None``: it does, or the input has no table
+    with its value column to compare it with)."""
+    rows = _table_rows(record)
+    if rows is None:
+        return None
+    header, passed = rows
+    tables, whole_rows = _input_tables(source_text, header, str(record.input.get("value_column") or ""))
+    if not tables:
+        return None
+    given = Counter(passed if whole_rows else [(row[0],) for row in passed])
+    best: Unverified | None = None
+    for in_input in tables:
+        expected = Counter(in_input)
+        if given == expected:
+            return None
+        reason = "table_incomplete" if not given - expected else "table_changed"  # only rows left out, or not
+        candidate = Unverified(name, value, reason, rows_passed=len(passed), rows_in_input=len(in_input))
+        if best is None or (best.reason == "table_changed" and candidate.reason == "table_incomplete"):
+            best = candidate
     return best
 
 
@@ -161,31 +298,31 @@ def unverified_fields(
         if not backing:
             failed.append(Unverified(name, value, "not_from_tool"))
             continue
-        shortened: Unverified | None = None
+        problem: Unverified | None = None
         for record in backing:
-            rows = _table_rows(record)
-            if rows is None:
-                shortened = None
+            problem = _table_problem(record, name, value, source_text)
+            if problem is None:
                 break
-            header, passed = rows
-            in_input = _input_rows(source_text, header, str(record.input.get("value_column") or ""))
-            if in_input is None or passed >= in_input:
-                shortened = None
-                break
-            shortened = Unverified(name, value, "table_incomplete", rows_passed=passed, rows_in_input=in_input)
-        if shortened is not None:
-            failed.append(shortened)
+        if problem is not None:
+            failed.append(problem)
     return failed
 
 
-def correction_prompt(prompt: str, failed: list[Unverified]) -> str:
-    """The task again, with why each checked value was not accepted (the agent's one chance to correct it)."""
+def correction_prompt(prompt: str, failed: list[Unverified], earlier: Iterable[ToolCallRecord] = ()) -> str:
+    """The task again, with why each checked value was not accepted (the agent's one chance to correct it), and what
+    the step's tool calls so far returned: the correction is a new turn, and its tools that could have effects
+    outside the run are not offered again (RT3-03)."""
     lines: list[str] = []
     for item in failed:
         if item.reason == "table_incomplete":
             lines.append(
                 f"- {item.field}: the table you passed to table_totals had {item.rows_passed} rows, the input has "
                 f"{item.rows_in_input}. Pass the whole table unchanged."
+            )
+        elif item.reason == "table_changed":
+            lines.append(
+                f"- {item.field}: the table you passed to table_totals is not the table of the input (rows were "
+                "added or changed). Pass the whole table exactly as it appears in the input."
             )
         elif item.reason == "missing":
             lines.append(f"- {item.field}: the value is missing. Compute it with a tool and report it.")
@@ -197,7 +334,22 @@ def correction_prompt(prompt: str, failed: list[Unverified]) -> str:
                 "based on (for example income minus all expenses, not only a part of it and not the result "
                 "itself). Report exactly the tool's result, rounded to at most two decimals."
             )
-    return (
+    text = (
         f"{prompt}\n\nYour previous answer was not accepted, because these values must be computed with a tool:\n"
         + "\n".join(lines)
     )
+    done = list(earlier)[:_EARLIER_CALLS]
+    if done:
+        text += (
+            "\n\nYour tool calls so far already ran and must not be repeated; only the tools for computing are "
+            "available now. Their results:\n"
+            + "\n".join(
+                f"- {call.name}({json.dumps(call.input, ensure_ascii=False)[:300]}) -> {(call.output or '')[:500]}"
+                for call in done
+            )
+        )
+    return text
+
+
+#: How many earlier tool calls the correction lists.
+_EARLIER_CALLS = 20

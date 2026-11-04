@@ -178,6 +178,9 @@ SLOW_TOKENS_PER_SECOND = 8.0
 #: Below this memory only the smallest models run.
 LOW_MEMORY = 8 * 1024**3
 _PS_TTL = 30.0
+#: How long a model's ``/api/show`` that got no answer (timeout, unreachable) is not asked again.
+_FAILED_TTL = 30.0
+_UNANSWERED = frozenset({"timeout", "unreachable"})
 _BENCHMARK_PROMPT = (
     "Write a short, plain paragraph (about eighty words) that explains why a team should write down the decisions it "
     "makes in meetings. Do not use lists."
@@ -221,6 +224,7 @@ class LocalModelService:
         self._jobs: dict[str, LocalJob] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._show: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._show_failed: dict[str, tuple[float, NodestroError]] = {}
         self._ps: tuple[float, list[dict[str, Any]]] | None = None
 
     # ---- settings ------------------------------------------------------------------------------------------
@@ -318,6 +322,8 @@ class LocalModelService:
             )
         server = self._managed_server()
         server._binary = self.runtime_binary()
+        self._show_failed.clear()
+        self._ps = None
         try:
             return server.start()
         except OllamaError as exc:
@@ -428,7 +434,7 @@ class LocalModelService:
         try:
             loaded = (client or self.client()).running()
         except (OllamaError, NodestroError):
-            return []
+            loaded = []  # remembered like an answer: a server that does not answer is not asked again at once
         self._ps = (time.monotonic(), loaded)
         return loaded
 
@@ -489,9 +495,11 @@ class LocalModelService:
             }
             if "thinking" in capabilities:
                 body["think"] = False
-            data = client.http.request("POST", "/api/generate", body, timeout=900.0, model=name) or {}
-            if cancel.is_set():
-                return
+            data = _cancellable(
+                lambda: client.http.request("POST", "/api/generate", body, timeout=900.0, model=name) or {}, cancel
+            )
+            if data is None or cancel.is_set():
+                return  # cancelled: the job ends now, the request is left to finish on its own (RT3-07)
             generated, spent = _int_of(data.get("eval_count")), _int_of(data.get("eval_duration"))
             if not generated or not spent:
                 raise NodestroError("local.benchmark_failed", f"{name} reported no generation timing", model=name)
@@ -607,12 +615,20 @@ class LocalModelService:
         cached = self._show.get(name)
         if cached is not None and time.monotonic() - cached[0] < _SHOW_TTL:
             return cached[1]
+        failed = self._show_failed.get(name)
+        if failed is not None and time.monotonic() - failed[0] < _FAILED_TTL:
+            raise failed[1]
         try:
             details = (client or self.client()).show(name)
         except OllamaError as exc:
             if exc.code == "model_missing":
                 return {}
-            raise _error(exc) from None
+            error = _error(exc)
+            if exc.code in _UNANSWERED:
+                # A server that does not answer costs the client's whole timeout per request; a run start asks for
+                # the same model several times (RT3-04), so the failure is remembered briefly too.
+                self._show_failed[name] = (time.monotonic(), error)
+            raise error from None
         value = {
             "capabilities": list(details.capabilities),
             "context_length": details.context_length,
@@ -722,6 +738,7 @@ class LocalModelService:
                 job.finished_at = datetime.now(UTC)
                 self._cancel.pop(job.id, None)
                 self._show.clear()
+                self._show_failed.clear()
 
         threading.Thread(target=body, name=f"nodestro-local-{kind}", daemon=True).start()
         return job
@@ -904,6 +921,7 @@ class LocalModelService:
                 self._managed.stop()
                 self._managed = None
         self._show.clear()
+        self._show_failed.clear()
         if running:
             self.start()
 
@@ -945,6 +963,29 @@ def _loopback(url: str | None) -> bool:
 
     host = (urlsplit(url).hostname or "").lower()
     return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+
+
+def _cancellable(work: Callable[[], Any], cancel: threading.Event) -> Any:
+    """``work()`` in a helper thread; ``None`` as soon as ``cancel`` is set (its result is then dropped). For one
+    blocking request that cannot be interrupted, e.g. a benchmark that may wait minutes for a model to load."""
+    result: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            result["value"] = work()
+        except BaseException as exc:  # handed to the caller below
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, name="nodestro-local-request", daemon=True).start()
+    while not finished.wait(0.2):
+        if cancel.is_set():
+            return None
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def _context_length(value: str | None) -> int:

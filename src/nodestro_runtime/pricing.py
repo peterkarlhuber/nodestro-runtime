@@ -420,6 +420,19 @@ def _snapshot_record(snapshot: PriceSnapshot, state: SnapshotState, at: datetime
     )
 
 
+class PriceView:
+    """The effective prices of a workspace at one moment (:meth:`PricingService.view`)."""
+
+    def __init__(self, snapshot: PriceSnapshot, entries: list[PriceEntry]) -> None:
+        self.snapshot = snapshot
+        self._by_key = {(entry.provider, entry.model): entry for entry in entries}
+
+    def entry(self, provider: str, model: str) -> PriceEntry | None:
+        """The effective price of a model, resolved the way Orkexa resolves it (aliases, dated ids)."""
+        price = self.snapshot.lookup(provider, model).price
+        return None if price is None else self._by_key.get((price.provider, price.model))
+
+
 class PricingService:
     """The price catalog of one workspace: reference snapshots, overrides, status and the Orkexa resolver.
 
@@ -453,6 +466,8 @@ class PricingService:
         self._lock = threading.RLock()
         self._resolver: PriceResolver | None = None
         self._resolver_key: tuple[str, str] | None = None
+        #: The last stored snapshot read, parsed (key: version and content hash; a version's data never changes).
+        self._parsed: tuple[tuple[str, str], PriceSnapshot] | None = None
 
     # ---- reading ---------------------------------------------------------------------------------------
 
@@ -470,15 +485,23 @@ class PricingService:
 
     def reference_snapshot(self) -> PriceSnapshot:
         """The active reference snapshot; Orkexa's built-in prices until one was activated."""
-        record = self._active_record()
+        return self._reference(self._active_record())
+
+    def _reference(self, record: StoredSnapshot | None) -> PriceSnapshot:
         if record is None:
             return self._builtin
+        key = (record.version, record.content_hash)
+        parsed = self._parsed
+        if parsed is not None and parsed[0] == key:
+            return parsed[1]
         try:
-            return record.snapshot()
+            snapshot = record.snapshot()
         except PricingError:
             # A stored snapshot this release cannot read (corrupted, or written by a newer release): never price
             # with half of it; fall back to the built-in prices and say so in the status.
             return self._builtin
+        self._parsed = (key, snapshot)
+        return snapshot
 
     def overrides(self) -> list[StoredOverride]:
         return [override for _, override in self.store.items(OVERRIDES, StoredOverride)]
@@ -500,11 +523,14 @@ class PricingService:
 
     def effective_snapshot(self) -> PriceSnapshot:
         """The reference snapshot with the workspace's overrides applied: the prices Orkexa uses."""
-        reference = self.reference_snapshot()
-        overrides = [override.model_price() for override in self.overrides()]
-        if not overrides:
+        return self._effective(self.reference_snapshot(), self.overrides())
+
+    @staticmethod
+    def _effective(reference: PriceSnapshot, overrides: list[StoredOverride]) -> PriceSnapshot:
+        prices = [override.model_price() for override in overrides]
+        if not prices:
             return reference
-        return reference.with_prices(overrides)
+        return reference.with_prices(prices)
 
     def resolver(self) -> PriceResolver:
         """The Orkexa resolver of this workspace; the same instance across price changes (it is republished).
@@ -596,12 +622,16 @@ class PricingService:
     def entries(self) -> list[PriceEntry]:
         """Every effective price (reference prices and overrides), sorted by provider and model."""
         record = self._active_record()
-        reference = self.reference_snapshot()
+        return self._entries(record, self._reference(record), self.overrides())
+
+    def _entries(
+        self, record: StoredSnapshot | None, reference: PriceSnapshot, overrides: list[StoredOverride]
+    ) -> list[PriceEntry]:
         pending = self._pending_models()
         by_key = {
             (price.provider, price.model): self._entry(price, record=record, pending=pending) for price in reference
         }
-        for override in self.overrides():
+        for override in overrides:
             key = (override.provider, override.model)
             by_key[key] = self._entry(
                 override.model_price(), record=None, pending=pending, overridden=True, reference=by_key.get(key)
@@ -610,13 +640,14 @@ class PricingService:
 
     def entry(self, provider: str, model: str) -> PriceEntry | None:
         """The effective price of a model, resolved the way Orkexa resolves it (aliases, dated ids)."""
-        lookup = self.effective_snapshot().lookup(provider, model)
-        if lookup.price is None:
-            return None
-        for entry in self.entries():
-            if entry.provider == lookup.price.provider and entry.model == lookup.price.model:
-                return entry
-        return None
+        return self.view().entry(provider, model)
+
+    def view(self) -> PriceView:
+        """The effective prices and their entries, read once: for asking about many models (the model catalog)."""
+        record = self._active_record()
+        reference = self._reference(record)
+        overrides = self.overrides()
+        return PriceView(self._effective(reference, overrides), self._entries(record, reference, overrides))
 
     def request_conditions(self, provider: str) -> dict[str, str]:
         """The tariff conditions of the workspace's requests to ``provider`` that are known before a request is sent.

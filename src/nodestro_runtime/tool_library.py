@@ -556,9 +556,21 @@ class ToolLibrary:
 
     def _load(self, path: Path | None, sandbox: Sandbox) -> ToolRegistry:
         seen = _fingerprint(path)
+        shadowed: set[str] = set()
         registry = ToolRegistry(path, sandbox=sandbox)
         for tool in self.builtin.values():
+            assert tool.name is not None
+            if registry.versions(tool.name):
+                # A stored tool saved before a built-in tool of the same name existed (e.g. ``table_totals``): the
+                # built-in one wins, because the engine, the tool policy and the resume plan know a built-in tool by
+                # its name alone. The stored files stay on disk (``shadowed`` names such tools).
+                logger.warning(
+                    "The stored tool %r has the name of a built-in tool and is not loaded; rename it", tool.name
+                )
+                registry._records.pop(tool.name, None)
+                shadowed.add(tool.name)
             registry.register_trusted(tool)
+        self.shadowed = frozenset(shadowed)
         self._seen = seen
         return registry
 

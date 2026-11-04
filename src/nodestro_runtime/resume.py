@@ -29,6 +29,7 @@ so and offers a complete new start instead.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -299,7 +300,9 @@ async def resume(
     """Start the continued run (or, with ``restart``, a complete new run linked to the old one). The new run starts
     with the regular budget again (BUDGET-1): raises of the earlier run were for that run only."""
     source = _source(ctx, run_id)
-    found = plan(ctx, run_id)
+    # The plan runs the pre-check, which may ask a local model server about its models (blocking requests, up to the
+    # client's timeout each): never on the event loop, which serves every other request meanwhile (RT3-11, RT3-04).
+    found = await asyncio.to_thread(plan, ctx, run_id)
     if source.trigger == "api" and source.release_id:
         return await _resume_api(ctx, source, found, mode=mode, confirm=confirm)
     current = ctx.store.get("workflows", source.workflow_id, Workflow)

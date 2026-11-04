@@ -21,9 +21,13 @@ separates the provider.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+import contextlib
 from dataclasses import dataclass, field, fields
 import os
+import socket
+import threading
 from typing import Any, Literal
+import weakref
 
 from orkexa import (
     AnthropicOptions,
@@ -804,12 +808,69 @@ def endpoint_client(base_url: str, api_key: str | None, *, timeout: float | None
     extra: dict[str, Any] = {}
     if timeout is not None:
         extra["timeout"] = httpx.Timeout(timeout, connect=10.0)
-    return openai.OpenAI(
-        api_key=api_key or _NO_KEY,
-        base_url=base_url,
-        http_client=openai.DefaultHttpxClient(follow_redirects=False),
-        **extra,
-    )
+    http_client = openai.DefaultHttpxClient(follow_redirects=False)
+    client = openai.OpenAI(api_key=api_key or _NO_KEY, base_url=base_url, http_client=http_client, **extra)
+    _OWNED_CLIENTS[client] = _track_sockets(http_client)
+    return client
+
+
+class _SocketTracker:
+    """A network backend of the HTTP connection pool that remembers the sockets it opened, so that
+    :func:`interrupt_client` can shut them down: closing the client alone does not end a request that is already
+    waiting for an answer. Everything else is the wrapped backend's."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.sockets: weakref.WeakSet[socket.socket] = weakref.WeakSet()
+
+    def connect_tcp(self, *args: Any, **kwargs: Any) -> Any:
+        stream = self._inner.connect_tcp(*args, **kwargs)
+        found = stream.get_extra_info("socket")
+        if isinstance(found, socket.socket):
+            with self._lock:
+                self.sockets.add(found)
+        return stream
+
+    def shutdown(self) -> None:
+        with self._lock:
+            opened = list(self.sockets)
+        for item in opened:
+            with contextlib.suppress(OSError):
+                item.shutdown(socket.SHUT_RDWR)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _track_sockets(http_client: Any) -> _SocketTracker | None:
+    """Put a :class:`_SocketTracker` into the client's connection pool (``None`` when the pool looks different)."""
+    pool = getattr(getattr(http_client, "_transport", None), "_pool", None)
+    inner = getattr(pool, "_network_backend", None)
+    if inner is None:
+        return None
+    tracker = _SocketTracker(inner)
+    pool._network_backend = tracker  # type: ignore[union-attr]
+    return tracker
+
+
+#: Clients :func:`endpoint_client` made, with the tracker of their sockets: each belongs to one :class:`Connection`,
+#: so interrupting it stops only that connection's requests (:func:`interrupt_client`). Injected clients (tests,
+#: embedding applications) are not here.
+_OWNED_CLIENTS: weakref.WeakKeyDictionary[Any, _SocketTracker | None] = weakref.WeakKeyDictionary()
+
+
+def interrupt_client(client: Any) -> bool:
+    """End the requests a client :func:`endpoint_client` made is waiting for, now, and close it (a cancelled run,
+    RT3-05); ``False`` (nothing done) for any other client."""
+    if client is None or client not in _OWNED_CLIENTS:
+        return False
+    tracker = _OWNED_CLIENTS.get(client)
+    if tracker is not None:
+        tracker.shutdown()
+    with contextlib.suppress(Exception):
+        client.close()
+    return True
 
 
 def check_capabilities(values: Mapping[str, str]) -> dict[str, str]:

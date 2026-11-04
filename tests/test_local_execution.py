@@ -274,6 +274,30 @@ def test_the_speed_is_measured_never_estimated(tmp_path: Path) -> None:
     assert [(hint.model, hint.value) for hint in hints] == [("qwen3.5:4b", 48)]
 
 
+def test_cancelling_a_benchmark_ends_it_while_the_model_still_loads(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    client = FakeOllama()
+    release = threading.Event()
+    answer = client.http.request
+
+    def slow(method: str, path: str, body: Any = None, **kwargs: Any) -> Any:
+        release.wait(30)  # a model that takes long to load on a computer without a GPU
+        return answer(method, path, body, **kwargs)
+
+    client.http.request = slow  # type: ignore[method-assign]
+    service = _service(tmp_path, client, url="http://127.0.0.1:11434/v1")
+    job = service.benchmark("qwen3.5:4b")
+    time.sleep(0.2)
+    started = time.monotonic()
+    service.cancel(job.id)
+    assert _wait(service, job.id).state == "cancelled"
+    assert time.monotonic() - started < 5  # RT3-07: it waited for the request (up to 900 s) before
+    release.set()
+    assert all(model.speed is None for model in service.status().models)  # nothing measured is stored
+
+
 def test_only_installed_chat_models_can_be_measured(tmp_path: Path) -> None:
     from nodestro_runtime.problems import NodestroError
 
