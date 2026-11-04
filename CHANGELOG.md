@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Pin orkexa 014144b (orkexa #45): an agent on a local Ollama model with tools and a structured result now calls its
+  tools. Ollama compiles the result's schema into a grammar, so before, such an agent could only write JSON and
+  estimated every figure itself; the live production-downtime run with `qwen3.5:4b` failed with
+  `run.value_unverified` (3.41 % instead of 4.62 %). Orkexa now offers the tools without the schema and asks for
+  the structured answer in one more request.
 - Checked key figures: `OutputField.source` (`model`, default, or `tool`). A number field with `tool` is accepted only
   as the result of a tool call of the step or an earlier step of the run (`nodestro_runtime.value_checks`), and a
   total from `table_totals` only over the whole table of the step's input. A value that fails goes back to the agent
