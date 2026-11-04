@@ -4201,22 +4201,30 @@ def execute_agent(
         attended=attended,
         gated=gated,
     )
+    judging = config.quality.enabled and bool(config.quality.criteria)
+    judge = check_model(config.quality.judge_model) if judging else None
+    judge_connection = connect(provider_of(judge)) if judge is not None else None
+    judge_saves = judge is not None and judge_connection is not None and _judge_saves(judge_connection, judge)
+    if judge_saves and built.reasoning_reduced is None:
+        built.reasoning_reduced = "cpu_saving"  # the step says so even when only its judge answers without thinking
     if on_built is not None:
         on_built(built)
     agent = built.agent
     evaluation: EvaluationRecord | None = None
-    if config.quality.enabled and config.quality.criteria:
+    if judge is not None and judge_connection is not None:
         criteria = [
             Criterion(name=c.name, description=c.description, required=c.required) for c in config.quality.criteria
         ]
-        judge = check_model(config.quality.judge_model)
-        judge_connection = connect(provider_of(judge))
+        # The judge's effort is Orkexa's default ("medium"), never an explicit request: in the CPU saving mode a
+        # local thinking judge answers without thinking like an agent at effort "medium" (RT-050).
+        judge_kwargs: dict[str, Any] = {"effort": None} if judge_saves else {}
         evaluator = Evaluator(
             criteria,
             model=model_id(judge),
-            options=judge_connection.options(),
+            options=judge_connection.options({"reasoning_effort": "none"} if judge_saves else None),
             usage_tracker=tracker,
             name=f"{name}:judge",
+            **judge_kwargs,
             **judge_connection.agent_kwargs(judge),
         )
         pin = getattr(tracker, "pin_conditions", None)
@@ -4269,6 +4277,15 @@ def execute_agent(
             ) from None
     memory = built.memory.files() if isinstance(built.memory, EphemeralMemory) else None
     return AgentOutcome(output=_jsonable(result), evaluation=evaluation, memory=memory)
+
+
+def _judge_saves(connection: Connection, judge: str) -> bool:
+    """Whether a quality judge on a local thinking model answers without thinking (the CPU saving mode, RT-050)."""
+    return (
+        provider_of(judge) == "ollama"
+        and connection.reasoning_saving
+        and connection.effort(judge, "medium") is not None
+    )
 
 
 class AgentSuspended(Exception):

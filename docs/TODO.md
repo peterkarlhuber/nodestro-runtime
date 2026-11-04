@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 32 |
+| P3 Low | 31 |
 | P4 Optional | 10 |
 
 **Release blockers:** None for this repository.
@@ -497,16 +497,6 @@ None known.
   Ollama 0.40.14 and a fake binary. macOS, Windows, GPUs and the large models (`qwen3.6:35b-a3b`, `qwen3.8:27b`) were
   not run.
 - **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU.
-
-### RT-051 · An external Ollama keeps its own context window
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #104
-- **What:** The managed Ollama and the Local Docker container start with `OLLAMA_CONTEXT_LENGTH=32768`
-  (`NODESTRO_OLLAMA_CONTEXT_LENGTH`). An Ollama that the person or an operator runs keeps its default, which is 4096
-  tokens without a large GPU. Prompt, thinking and answer share that window, so runs end with `stop_reason=length`
-  long before `max_tokens`. The OpenAI-compatible endpoint ignores a per-request context size.
-- **Next step:** Read `context_length` from `/api/ps` and warn in the local models overview when it is below 8192;
-  document the variable for operator servers.
 
 ### RT-052 · Ministral models need an explicit system prompt
 

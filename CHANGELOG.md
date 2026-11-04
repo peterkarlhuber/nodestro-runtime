@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixes found by the RT-050 measurement with a real local model on a CPU: a quality judge of a local thinking model
+  answers without thinking in the CPU saving mode as well (its effort is Orkexa's default, not an explicit request; the
+  step is marked `cpu_saving`), and the client of a local model server waits up to `LOCAL_REQUEST_TIMEOUT` (3600 s,
+  connect 10 s) instead of the OpenAI SDK's 600 s. Before, the judge thought for longer than ten minutes in one
+  unstreamed answer and failed the step after three attempts (`run.provider_unreachable`), and the request of a
+  parallel branch timed out while the server worked on the other one and was sent again. `endpoint_client(...,
+  timeout=)`.
+
 - CPU saving mode for local thinking models (RT-050): new setting `local_reasoning` (`auto`, default, or `full`).
   With `auto` and a local model server without a GPU, agents at effort `medium` answer without the thinking phase
   (`reasoning_effort: "none"`); effort `high` and an agent's own `reasoning_effort` are never reduced, cloud providers
