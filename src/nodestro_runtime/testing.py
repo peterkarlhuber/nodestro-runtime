@@ -166,7 +166,9 @@ def computing_call(request: dict[str, Any], numbers: Sequence[float]) -> Message
     done = _tool_results(request)
     if name is None or done >= len(numbers):
         return None
-    return tool_use(name, {"expression": repr(float(numbers[done]))}, call_id=f"toolu_compute_{done}")
+    # Double the number and halve it again (exact in binary floating point): the result is not in the input.
+    expression = f"{float(numbers[done]) * 2!r} / 2"
+    return tool_use(name, {"expression": expression}, call_id=f"toolu_compute_{done}")
 
 
 def sample_value(annotation: Any, request: dict[str, Any]) -> Any:

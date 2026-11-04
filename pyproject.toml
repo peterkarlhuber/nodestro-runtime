@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@014144bbd5cfc7586a2afb009b4e32a152af6a49",
+    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@6e618621bba8defbd18a17ccc68ac2b3cc89869c",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
