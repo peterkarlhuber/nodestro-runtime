@@ -13,7 +13,7 @@
 | P1 High | 1 |
 | P2 Medium | 8 |
 | P3 Low | 31 |
-| P4 Optional | 10 |
+| P4 Optional | 11 |
 
 **Release blockers:** None for this repository.
 
@@ -442,6 +442,18 @@ None known.
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** Bedrock final report section 7
 - **What:** `UsageEntry` has no region, so usage views cannot show Bedrock costs by region.
 - **Next step:** Add an optional region field when a Bedrock request is recorded.
+
+### RT-054 · Checked key figures: agent tests and the inputs of a tool call
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** `value_checks`, `OutputField.source`, CHANGELOG (checked
+  key figures)
+- **What:** A key figure with `source="tool"` is checked in workflow runs only. The agent test in the inspector shows
+  the value without the check, because a step that copies a figure computed by an earlier step (a reality check, a
+  plausibility check) has no earlier steps there. The check proves that a value is a tool result, and for
+  `table_totals` that no input row was left out; it does not prove that the agent passed the right column or reference
+  total, and it does not look at figures in free text.
+- **Next step:** Show an unbacked key figure in the agent test as a warning (not a failure); consider letting a field
+  name the tool and argument it must come from when a workflow needs more than provenance.
 
 ### RT-016 · Deferred scope decisions
 

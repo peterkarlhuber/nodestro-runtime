@@ -136,6 +136,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
+from .value_checks import Unverified, checked_fields, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
 
@@ -3861,6 +3862,43 @@ class RunManager:
         )
         return decision_of(outcome.output)
 
+    def _check_values(
+        self,
+        context: _RunContext,
+        node_id: str,
+        state: NodeRun,
+        config: AgentConfig,
+        prompt: str,
+        extra: list[ContentBlock],
+        outcome: AgentOutcome,
+        ask: Callable[..., AgentOutcome],
+    ) -> AgentOutcome:
+        """Key figures (``source="tool"``) must come from a tool result: one correction, then the step fails."""
+        source_text = "\n\n".join([prompt, *(block["text"] for block in extra if block.get("type") == "text")])
+
+        def failed_of(result: Any) -> list[Unverified]:
+            with context.lock:
+                calls = [call for node in context.run.nodes.values() for call in node.tool_calls]
+            return unverified_fields(config.output, result, calls, source_text)
+
+        failed = failed_of(outcome.output)
+        if not failed:
+            return outcome
+        self._emit(context, "values_unverified", node_id, fields=[item.field for item in failed], attempt=1)
+        outcome = ask(correction_prompt(prompt, failed), resume=None, refinement=None)
+        failed = failed_of(outcome.output)
+        if not failed:
+            return outcome
+        first = failed[0]
+        raise NodestroError(
+            "run.value_unverified",
+            f"{first.field} = {first.value!r} is not backed by a tool result ({first.reason})",
+            field=first.field,
+            value=first.value,
+            reason=first.reason,
+            fields=[item.field for item in failed],
+        )
+
     def _note_reasoning(self, context: _RunContext, node_id: str, state: NodeRun, built: BuiltAgent) -> None:
         """Record on the step that its agent thinks less than its effort asks (the CPU saving mode, RT-050), once."""
         reason = built.reasoning_reduced
@@ -4001,10 +4039,10 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
-            outcome = execute_agent(
+            ask = functools.partial(
+                execute_agent,
                 context.env.builder,
                 config,
-                prompt,
                 connect=self.connect,
                 tracker=context.tracker,
                 name=node_id,
@@ -4025,6 +4063,9 @@ class RunManager:
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
             )
+            outcome = ask(prompt)
+            if checked_fields(config.output):
+                outcome = self._check_values(context, node_id, state, config, prompt, extra, outcome, ask)
             state.output = outcome.output
             state.memory = outcome.memory
             if config.knowledge_proposals.enabled and outcome.output not in (None, ""):

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Checked key figures: `OutputField.source` (`model`, default, or `tool`). A number field with `tool` is accepted only
+  as the result of a tool call of the step or an earlier step of the run (`nodestro_runtime.value_checks`), and a
+  total from `table_totals` only over the whole table of the step's input. A value that fails goes back to the agent
+  once (event `values_unverified`), then the step fails with `run.value_unverified`, so a condition never decides on
+  an estimated number. Found in the RT-050 measurement: `production-downtime` reported a downtime share of 3.31 % and
+  2.83 % instead of 4.62 % without calling its calculator, and the second value skipped the quality branch. Workflow
+  check codes `check.value_source_type` (warning) and `check.value_source_no_tool` (error).
+- New built-in tool `table_totals`: exact count, total, mean, min, max, groups in Pareto order with shares and the
+  share of a reference total over a column of a Markdown or CSV table; reads `1,234.5`, `1.234,5`, `14 400` and units
+  in cells. Self-contained like the other built-in tools, so the sandbox probes can run it.
+- `testing.AnswerAll` computes like a careful model: an agent offered the calculator first computes the sample numbers
+  with it (`computing_call`, `SAMPLE_NUMBERS`), so example workflows with checked figures still run to the end.
+
 - Fixes found by the RT-050 measurement with a real local model on a CPU: a quality judge of a local thinking model
   answers without thinking in the CPU saving mode as well (its effort is Orkexa's default, not an explicit request; the
   step is marked `cpu_saving`), and the client of a local model server waits up to `LOCAL_REQUEST_TIMEOUT` (3600 s,

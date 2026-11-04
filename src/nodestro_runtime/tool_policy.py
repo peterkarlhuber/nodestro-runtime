@@ -63,6 +63,7 @@ BUILTIN_CAPABILITIES: dict[str, ToolCapability] = {
     "current_datetime": _READ_INTERNAL,
     "days_between": _READ_INTERNAL,
     "text_statistics": _READ_INTERNAL,
+    "table_totals": _READ_INTERNAL,
 }
 
 #: The provider's server tools (``catalog.SERVER_TOOLS``). They run at the provider and never pass Nodestro's tool
