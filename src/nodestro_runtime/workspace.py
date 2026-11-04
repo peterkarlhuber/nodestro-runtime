@@ -74,6 +74,7 @@ from .pricing import PricingService
 from .problems import NodestroError
 from .profile import RuntimeProfile
 from .providers import (
+    LOCAL_REQUEST_TIMEOUT,
     PROVIDERS,
     Connection,
     MissingApiKeyError,
@@ -1303,9 +1304,10 @@ class Workspace:
         if base_url and info.base_url:
             check_endpoint_allowed(base_url, self._endpoints)  # also a URL stored before the operator changed the list
         client = self._client_factory(provider) if self._client_factory is not None else None
-        if client is None and base_url and info.base_url and self._endpoints is not None:
+        if client is None and base_url and info.base_url and (self._endpoints is not None or provider == "ollama"):
             # A server: the endpoint was checked against the allowlist, and a redirect must not lead elsewhere.
-            client = endpoint_client(base_url, key)
+            # A local model server gets more time per request than the SDK's default (LOCAL_REQUEST_TIMEOUT).
+            client = endpoint_client(base_url, key, timeout=LOCAL_REQUEST_TIMEOUT if provider == "ollama" else None)
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
             raise MissingApiKeyError(provider)
         return Connection(

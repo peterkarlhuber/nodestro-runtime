@@ -783,19 +783,32 @@ def check_endpoint_allowed(url: str, allowed: Iterable[str] | None) -> None:
 _NO_KEY = "nodestro-no-api-key"
 
 
-def endpoint_client(base_url: str, api_key: str | None) -> Any:
+#: Seconds a local model server may take for one answer, or before it sends the next part of a streamed one.
+#: Without a GPU a local model writes about 5 tokens per second, and its server answers one request at a time
+#: (``OLLAMA_NUM_PARALLEL`` 1): a request of a parallel branch waits until the other one is done, and a quality judge's
+#: answer comes in one piece. The SDK's default of 600 seconds failed such requests although the server was working
+#: (RT-050). The run's own limits (its duration, budget, cancellation) still apply.
+LOCAL_REQUEST_TIMEOUT = 3600.0
+
+
+def endpoint_client(base_url: str, api_key: str | None, *, timeout: float | None = None) -> Any:
     """An OpenAI SDK client for an allow-listed endpoint (``compatible``, ``ollama``, ``vllm``) that never follows
     redirects.
 
     :func:`check_endpoint_allowed` checks only the configured base URL; an endpoint that answers with a redirect would
     otherwise send the request (the prompt) on to any address, also one the operator did not allow. A redirect is
-    reported as the endpoint's error instead."""
+    reported as the endpoint's error instead. ``timeout``: seconds per request (default: the SDK's)."""
+    import httpx
     import openai
 
+    extra: dict[str, Any] = {}
+    if timeout is not None:
+        extra["timeout"] = httpx.Timeout(timeout, connect=10.0)
     return openai.OpenAI(
         api_key=api_key or _NO_KEY,
         base_url=base_url,
         http_client=openai.DefaultHttpxClient(follow_redirects=False),
+        **extra,
     )
 
 

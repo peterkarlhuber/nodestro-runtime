@@ -107,11 +107,22 @@ for many minutes per step. The workspace setting `local_reasoning` decides:
   `high`; to keep it everywhere, set `local_reasoning` to `full`.
 - `full`: every agent thinks as its effort says.
 
+A quality judge (`quality.enabled`) of a local thinking model counts like an agent at effort `medium`: its effort is
+Orkexa's default, not a request for thoroughness, so in the CPU saving mode it also answers without thinking, and the
+step is marked even when the agent itself keeps thinking at effort `high`. A judge's answer comes in one piece (it is
+not streamed), so a judge that thinks for many minutes on a CPU used to run into the client timeout.
+
 Whether the server has a GPU: for a server on this computer (managed, Local Docker, a loopback address) this
 computer's hardware decides (`detect_hardware`), because Ollama 0.40.14 reports part of a model in GPU memory
 (`size_vram`) even on a computer without any GPU device. For a server on another computer `/api/ps` decides: nothing in
 GPU memory means CPU, (almost) all of it means GPU, a split or no loaded model means unknown, and an unknown server never
 saves. `LocalStatus.accelerated` shows the result.
+
+Measured on 4 vCPU without a GPU (Ollama 0.40.14, `qwen3.5:4b` Q4_K_M, 32k context), one real `production-downtime`
+run (German, one test case, no AI judge of the test series): with `full` 6535 s, 6 requests, 28191 output tokens;
+with `auto` 893 s, 4 requests, 5157 output tokens (7.3 times faster). Both runs finished. The deterministic checks
+failed in both on the same agent, which computed the downtime share without its calculator (3.31 % and 2.83 %
+instead of 4.6 %); one run per mode does not show a quality difference between the modes.
 
 Speeds are measured, never estimated: `LocalModelService.benchmark` (`POST /api/local-models/benchmark`) asks an
 installed chat model one short fixed question without thinking and stores tokens per second, prompt speed, context
@@ -122,6 +133,11 @@ bigger than this computer's memory).
 Parallel model runs: Ollama 0.40.14 answers one request per model at a time (`OLLAMA_NUM_PARALLEL=1`) and queues the
 others, and it loads another model next to it while memory allows. Parallel teams of an orchestrator therefore wait for
 each other on one CPU instead of competing for it, which is what a CPU needs; Nodestro does not raise the setting.
+A waiting request receives nothing until its turn comes, so the client of a local model server waits up to
+`LOCAL_REQUEST_TIMEOUT` (3600 seconds) for an answer or for the next part of a streamed one, instead of the OpenAI
+SDK's 600 seconds: with the SDK's default the request of the second of two parallel agents timed out after ten minutes
+while the server was busy with the first and had to be sent again, and after three such attempts a step fails with
+`run.provider_unreachable`. The run's own limits (its duration, budget and cancellation) still apply.
 
 ## Knowledge search
 

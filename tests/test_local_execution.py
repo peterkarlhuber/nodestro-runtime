@@ -391,3 +391,74 @@ def test_a_recommendation_can_require_more_than_the_task_profile() -> None:
     assert plain.model is not None
     seeing = recommend("tool_agent", CPU, ["qwen3.5:4b", "qwen3.5:9b"], capabilities=reported, require=["vision"])
     assert seeing.model == "ollama:qwen3.5:9b" and "ollama:qwen3.5:4b" not in seeing.alternatives
+
+
+# ---- the quality judge and the request timeout of a local server -------------------------------------------------
+
+
+class _Stop(Exception):
+    pass
+
+
+class _Builder:
+    def build(self, config: AgentConfig, **_kwargs: Any) -> Any:
+        from nodestro_runtime.agent_builder import BuiltAgent
+
+        return BuiltAgent(agent=object())
+
+
+def _judged(
+    monkeypatch: pytest.MonkeyPatch, connection: Connection, effort: str = "high"
+) -> tuple[dict[str, Any], Any]:
+    from nodestro_runtime import engine
+
+    seen: dict[str, Any] = {}
+    built: list[Any] = []
+
+    def evaluator(criteria: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(engine, "Evaluator", evaluator)
+    config = _agent(
+        effort=effort,
+        quality={"enabled": True, "criteria": [{"name": "c", "description": "d"}], "judge_model": LOCAL_DEFAULT_MODEL},
+    )
+    with pytest.raises(_Stop):
+        engine.execute_agent(
+            _Builder(),  # type: ignore[arg-type]
+            config,
+            "x",
+            connect=lambda _provider: connection,
+            tracker=None,  # type: ignore[arg-type]
+            name="A",
+            hooks={},
+            on_built=built.append,
+        )
+    return seen, built[0]
+
+
+def test_a_local_thinking_judge_answers_without_thinking_in_the_saving_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The judge's effort is Orkexa's default ("medium"), not a request for thoroughness: the mode applies to it, and
+    # the step says so even when the agent itself (effort "high") keeps thinking.
+    seen, built = _judged(monkeypatch, _connection(saving=True))
+    assert seen["effort"] is None and seen["options"].request_options == {"reasoning_effort": "none"}
+    assert built.reasoning_reduced == "cpu_saving"
+    # Without the mode the judge keeps its default effort.
+    seen, built = _judged(monkeypatch, _connection(saving=False))
+    assert "effort" not in seen and seen["options"].request_options == {}
+    assert built.reasoning_reduced is None
+    # A judge model that does not think has nothing to reduce.
+    seen, built = _judged(monkeypatch, _connection(saving=True, reported={"reasoning": "unsupported"}))
+    assert "effort" not in seen and built.reasoning_reduced is None
+
+
+def test_a_local_server_gets_more_time_per_request_than_the_sdk_default(tmp_path: Path) -> None:
+    from nodestro_runtime.providers import LOCAL_REQUEST_TIMEOUT
+
+    with Workspace(tmp_path / "data", integrations=[]) as workspace:
+        workspace.store.put_raw("settings", "app", {"providers": {"ollama": {"base_url": "http://127.0.0.1:11434/v1"}}})
+        connection = workspace.connection("ollama")
+        assert connection.client is not None
+        assert connection.client.timeout.read == LOCAL_REQUEST_TIMEOUT
+        assert connection.client.timeout.connect == 10.0

@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 9 |
-| P3 Low | 32 |
+| P2 Medium | 8 |
+| P3 Low | 31 |
 | P4 Optional | 10 |
 
 **Release blockers:** None for this repository.
@@ -354,17 +354,6 @@ None known.
 
 ## Performance
 
-### RT-050 · Multi-agent examples on local models are slow without a GPU
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** #103, #104
-- **What:** Measured on 4 vCPU / 16 GB without a GPU, Ollama 0.40.14, `qwen3.5:4b` (Q4_K_M) with a 32k context:
-  about 5 output tokens per second. A triage step with thinking off takes 17-20 s, but the example workflows with
-  two to five agents at thinking effort "medium" did not finish within 40 minutes (`customer-service`,
-  `research-hypotheses`). Thinking dominates: one probe needed 1089 tokens (234 s) with effort "low" before #103,
-  and 58 tokens without thinking. All 24 examples pass the workflow check with local models.
-- **Next step:** Decide whether effort "medium" also switches thinking off for local models when no GPU is found, or
-  whether the recommendation shows an expected duration. Measure again on a GPU and on Apple silicon (RT-049).
-
 ### RT-008 · PostgreSQL store throughput and serialized writes
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
@@ -496,17 +485,9 @@ None known.
 - **What:** `local_service` (managed Ollama, model folder moves, imports) was tested on Linux x86-64 with a real
   Ollama 0.40.14 and a fake binary. macOS, Windows, GPUs and the large models (`qwen3.6:35b-a3b`, `qwen3.8:27b`) were
   not run.
-- **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU.
-
-### RT-051 · An external Ollama keeps its own context window
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #104
-- **What:** The managed Ollama and the Local Docker container start with `OLLAMA_CONTEXT_LENGTH=32768`
-  (`NODESTRO_OLLAMA_CONTEXT_LENGTH`). An Ollama that the person or an operator runs keeps its default, which is 4096
-  tokens without a large GPU. Prompt, thinking and answer share that window, so runs end with `stop_reason=length`
-  long before `max_tokens`. The OpenAI-compatible endpoint ignores a per-request context size.
-- **Next step:** Read `context_length` from `/api/ps` and warn in the local models overview when it is below 8192;
-  document the variable for operator servers.
+- **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU. The
+  CPU saving mode (RT-050, done) was measured only on Linux without a GPU; on a GPU it must stay off (`accelerated`),
+  and the GPU detection of a remote server (`/api/ps` `size_vram`) needs a real GPU server.
 
 ### RT-052 · Ministral models need an explicit system prompt
 
