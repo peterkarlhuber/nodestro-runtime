@@ -451,9 +451,13 @@ None known.
   the value without the check, because a step that copies a figure computed by an earlier step (a reality check, a
   plausibility check) has no earlier steps there. The check proves that a value is a tool result, and for
   `table_totals` that no input row was left out; it does not prove that the agent passed the right column or reference
-  total, and it does not look at figures in free text.
+  total, and it does not look at figures in free text. A small local model sometimes reports a correct figure it did
+  not compute: in the live household-budget runs with `qwen3.5:4b` (2026-11-04) one of two runs failed with
+  `run.value_unverified` after its correction, the other computed the surplus with the calculator and passed. The step
+  then fails safely (no decision on the figure), but the run has to be repeated.
 - **Next step:** Show an unbacked key figure in the agent test as a warning (not a failure); consider letting a field
-  name the tool and argument it must come from when a workflow needs more than provenance.
+  name the tool and argument it must come from when a workflow needs more than provenance; measure the failure rate of
+  small local models over more runs before deciding on a second correction.
 
 ### RT-016 · Deferred scope decisions
 
