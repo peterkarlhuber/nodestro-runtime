@@ -111,6 +111,17 @@ def test_a_value_no_tool_computed_is_refused() -> None:
     )
 
 
+def test_a_calculator_call_with_the_value_itself_backs_nothing() -> None:
+    # A household check reported a surplus of 463 that no tool computed; echoing it through the calculator must not
+    # make it "checked", while the whole calculation does.
+    echo = _call("calculator", {"expression": "463"}, 463.0)
+    [failed] = unverified_fields(OUTPUT, {"downtime_share_percent": 463}, [echo], LOG)
+    assert failed.reason == "not_from_tool"
+    computed = _call("calculator", {"expression": "4605 - 2422 - 1720"}, 463.0)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": 463}, [computed], LOG) == []
+    assert "written out from the figures" in correction_prompt("Task", [failed])
+
+
 def test_a_total_over_a_shortened_table_is_refused() -> None:
     shortened = "\n".join(TABLE.splitlines()[:-3])  # the last three rows left out
     record = _totals(shortened)

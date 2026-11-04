@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A checked key figure is no longer backed by a calculator call that only repeats it (expression `463`): numbers a
+  call already had in its input do not count (`table_totals` results count in full). The correction tells the agent
+  to write out the whole calculation from its figures. Found in a live household-budget run, where the check agent
+  reported a correct surplus that no tool had computed and the correction computed only a part of it.
 - Pin orkexa 6e61862 (orkexa #46): the request for the structured answer asks for the conversation's language (a
   German workflow's analysis came back in English).
 - Pin orkexa 014144b (orkexa #45): an agent on a local Ollama model with tools and a structured result now calls its

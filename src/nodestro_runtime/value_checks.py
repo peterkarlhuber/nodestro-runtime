@@ -5,7 +5,8 @@ a key figure (a share, a total, a margin) that later steps decide on, so the mod
 checks it after the agent answered (:func:`unverified_fields`):
 
 - the value must be the result of a successful tool call of this step or of an earlier step of the run, rounded to
-  the decimals the agent reported (the calculator, ``table_totals``, a stored tool);
+  the decimals the agent reported (the calculator, ``table_totals``, a stored tool), and not a number the call
+  already had in its input (a calculator called with the value itself computed nothing);
 - when that result came from ``table_totals``, the table the agent passed must have every row of the matching table
   in the step's input, so a total over a shortened table does not count.
 
@@ -65,17 +66,29 @@ def _as_dict(value: Any) -> Mapping[str, Any] | None:
     return None
 
 
-def tool_numbers(record: ToolCallRecord) -> list[float]:
-    """The numbers in a successful tool call's result."""
-    if record.is_error or not record.output:
-        return []
+def _numbers(text: str) -> list[float]:
     found: list[float] = []
-    for match in _NUMBER.finditer(record.output):
+    for match in _NUMBER.finditer(text):
         try:
             found.append(float(match.group(0)))
         except ValueError:
             continue
     return found
+
+
+def tool_numbers(record: ToolCallRecord) -> list[float]:
+    """The numbers a successful tool call computed: those of its result that its input did not already contain.
+
+    A calculator call with the expression ``463`` returns 463, but computed nothing, so it backs no value. A
+    ``table_totals`` result counts in full: the tool adds up the table itself, and the row check guards its input.
+    """
+    if record.is_error or not record.output:
+        return []
+    found = _numbers(record.output)
+    if record.name == "table_totals":
+        return found
+    given = set(_numbers(json.dumps(record.input, ensure_ascii=False)))
+    return [number for number in found if number not in given]
 
 
 def _decimals(value: float) -> int:
@@ -178,9 +191,11 @@ def correction_prompt(prompt: str, failed: list[Unverified]) -> str:
             lines.append(f"- {item.field}: the value is missing. Compute it with a tool and report it.")
         else:
             lines.append(
-                f"- {item.field}: {item.value} is not the result of a tool call. Compute it with a tool "
-                "(table_totals for totals and shares of table rows, otherwise the calculator) and report exactly "
-                "the tool's result, rounded to at most two decimals."
+                f"- {item.field}: {item.value} is not the result of a tool call. Compute it with a tool, even if "
+                "you or an earlier step already know it: table_totals for totals and shares of table rows, "
+                "otherwise one calculator call with the whole calculation written out from the figures it is "
+                "based on (for example income minus all expenses, not only a part of it and not the result "
+                "itself). Report exactly the tool's result, rounded to at most two decimals."
             )
     return (
         f"{prompt}\n\nYour previous answer was not accepted, because these values must be computed with a tool:\n"
