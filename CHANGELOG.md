@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Continuing or restarting a run (`POST /api/runs/{id}/resume`) no longer blocks the event loop on a local model
+  server (audit round 3, RT3-11): the resume plan, whose pre-check may ask the server about its models, runs in a
+  worker thread, as a run start does since RT3-04.
+
 - The local model catalog's `license` is the SPDX id only (e.g. `Apache-2.0`); where it comes from is the new code
   `license_source` (`ollama`: the manifest's license layer, `upstream`: the publisher's model card because the Ollama
   manifest has none). Before, four entries carried an English note in `license`, shown untranslated in every
