@@ -14,7 +14,7 @@
 | P1 High | 1 |
 | P2 Medium | 8 |
 | P3 Low | 33 |
-| P4 Optional | 11 |
+| P4 Optional | 12 |
 
 **Release blockers:** None for this repository.
 
@@ -479,6 +479,13 @@ None known.
   from, so the studio cannot mark the sample-data mode or offer an update of the copy.
 - **Next step:** Store the origin (example id, version, language, offline connections) on the copy; expose it read-only
   in the API.
+
+### RT-057 · Missing-key message inside an exported app
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** UX round 3 DX handover B14
+- **What:** A missing provider key always gets the studio's advice (settings), also when the runtime serves an exported
+  app, where the key belongs in the environment or `.env`.
+- **Next step:** Let the message depend on the context: in serving mode name the environment variable and `.env`.
 
 ## Tests and quality assurance
 
