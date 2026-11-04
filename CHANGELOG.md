@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pin orkexa 22f2910 (orkexa #47): `install_runtime` prepares the Ollama runtime of another platform
+  (`find_binary(root, system)`), for Nodestro's portable packages built for a different target platform.
 - A checked key figure is no longer backed by a calculator call that only repeats it (expression `463`): numbers a
   call already had in its input do not count (`table_totals` results count in full). The correction tells the agent
   to write out the whole calculation from its figures. Found in a live household-budget run, where the check agent
