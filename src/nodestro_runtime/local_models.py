@@ -59,7 +59,11 @@ class LocalModelInfo(BaseModel):
     #: The capabilities the Ollama library lists (``/api/show`` of the installed model is what counts).
     listed_capabilities: list[str]
     min_ollama: str
+    #: The SPDX id of the model's license, e.g. ``Apache-2.0``.
     license: str
+    #: Where the license comes from (a code; the UI words it): ``ollama``, the license layer of the Ollama manifest;
+    #: ``upstream``, the publisher's model card, because the Ollama manifest has no license layer.
+    license_source: Literal["ollama", "upstream"] = "ollama"
     #: Estimated memory to run it with a moderate context (RAM, or GPU memory when it runs there), in bytes.
     memory_bytes: int
     #: Rank among the chat models (1 small ... 3 large); 0 for embedding models.
@@ -226,7 +230,8 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         digest="24277f07f62db8f9cb68e9dfc679ea1818a7fbac47a50eff0a701d3f645b63c8",
         listed_capabilities=["completion", "vision", "tools"],
         min_ollama="0.13.3",
-        license="Apache-2.0 (Mistral AI's model card; the Ollama manifest has no license layer)",
+        license="Apache-2.0",
+        license_source="upstream",
         vendor="Mistral AI",
         region="eu",
         languages=["en", "fr", "es", "de", "it", "pt", "nl", "zh", "ja", "ko", "ar"],
@@ -247,7 +252,8 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         digest="ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d",
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
-        license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        license="Apache-2.0",
+        license_source="upstream",
         vendor="Alibaba (Qwen)",
         region="cn",
         languages=list(STUDIO_LANGUAGES),
@@ -264,7 +270,8 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         digest="df5bd2e3c74cd8d069d21dc038f1b359fcdc9458fce1c99bd43c9eb1518ff907",
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
-        license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        license="Apache-2.0",
+        license_source="upstream",
         vendor="Alibaba (Qwen)",
         region="cn",
         languages=list(STUDIO_LANGUAGES),
@@ -279,7 +286,8 @@ CATALOG: tuple[LocalModelInfo, ...] = (
         digest="64b933495768fbd3b87c20583d379728a07471e0c66733a9df87cd1901b3c44b",
         listed_capabilities=["embedding"],
         min_ollama="0.30.0",
-        license="Apache-2.0 (upstream; the Ollama manifest has no license layer)",
+        license="Apache-2.0",
+        license_source="upstream",
         vendor="Alibaba (Qwen)",
         region="cn",
         languages=list(STUDIO_LANGUAGES),

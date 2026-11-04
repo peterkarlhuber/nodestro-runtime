@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The local model catalog's `license` is the SPDX id only (e.g. `Apache-2.0`); where it comes from is the new code
+  `license_source` (`ollama`: the manifest's license layer, `upstream`: the publisher's model card because the Ollama
+  manifest has none). Before, four entries carried an English note in `license`, shown untranslated in every
+  language (UX round 3, B4). An exported package's model license list no longer carries that note.
+
 - The model catalog (`GET /api/meta`, on every page load) reads the stored reference prices once instead of once
   per catalog model (UX round 3, B1): `PricingService.view()` reads and resolves the prices for many models, and a
   stored price version is parsed only once per service (a version's prices never change). With a synchronized price

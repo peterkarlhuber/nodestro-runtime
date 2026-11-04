@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import textwrap
@@ -538,3 +539,11 @@ def test_mdenseon_is_built_and_suggested_only_with_the_european_preference(manag
     with pytest.raises(NodestroError) as error:
         managed.local_models.pull("mdenseon:307m")
     assert error.value.code == "local.offline_download"
+
+
+def test_the_catalog_license_is_an_id_and_its_source_a_code() -> None:
+    """UX round 3 B4: the license mixed the SPDX id with an English note, shown untranslated in every language."""
+    for entry in CATALOG:
+        assert re.fullmatch(r"[A-Za-z0-9.+-]+", entry.license), entry.name
+    sources = {entry.name: entry.license_source for entry in CATALOG}
+    assert sources["devstral-small-2:24b"] == "upstream" and sources["qwen3.5:4b"] == "ollama"
