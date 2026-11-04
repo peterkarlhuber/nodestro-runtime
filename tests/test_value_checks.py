@@ -226,3 +226,92 @@ def test_the_check_names_a_checked_value_without_any_tool(tmp_path: Path) -> Non
         saved = workspace.save_workflow(_flow(tools=["table_totals"]))
         check = preflight(workspace, Workflow.model_validate(saved.model_dump()))
         assert "check.value_source_no_tool" not in {item.code for item in check.problems}
+
+
+# ---- what a made-up figure cannot pass (audit round 3, RT3-01) ----------------------------------------------------
+
+
+def _calc(expression: str) -> ToolCallRecord:
+    from nodestro_runtime.builtin_tools import calculator
+
+    return _call("calculator", {"expression": expression}, calculator.function(expression))
+
+
+@pytest.mark.parametrize("expression", ["46_3", "0x1cf", "0o717", "4.63e2", "round(463.2)", "abs(-463)", "463.0"])
+def test_a_calculator_that_only_repeats_or_rounds_one_number_backs_nothing(expression: str) -> None:
+    [failed] = unverified_fields(OUTPUT, {"downtime_share_percent": 463}, [_calc(expression)], LOG)
+    assert failed.reason == "not_from_tool"
+
+
+def test_table_totals_backs_what_it_computed_not_what_it_repeats() -> None:
+    # The reference total and the names come back in the result, but the tool did not compute them.
+    echo = _call(
+        "table_totals",
+        {"table": TABLE, "value_column": "Duration", "reference_total": 7.5},
+        table_totals.function(TABLE, "Duration", reference_total=7.5),
+    )
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": 7.5}, [echo], LOG)[0].reason == "not_from_tool"
+    named = "| No. | 7.5 |\n|---|---|\n| 1 | 2 |"
+    record = _call("table_totals", {"table": named, "value_column": "7.5"}, table_totals.function(named, "7.5"))
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": 7.5}, [record], "")[0].reason == "not_from_tool"
+    # Row counts and group shares are computed and still count.
+    grouped = _call(
+        "table_totals",
+        {"table": TABLE, "value_column": "Duration", "group_by": "Machine"},
+        table_totals.function(TABLE, "Duration", group_by="Machine"),
+    )
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": round(365 / 665 * 100, 2)}, [grouped], LOG) == []
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": 12}, [grouped], LOG) == []
+
+
+def _over(table: str) -> tuple[ToolCallRecord, float]:
+    value = table_totals.function(table, "Duration", reference_total=14400)["share_of_reference_percent"]
+    return _totals(table), round(value, 2)
+
+
+def test_a_total_over_a_table_with_changed_or_added_rows_is_refused() -> None:
+    changed = TABLE.replace("| 120 |", "| 420 |")
+    record, value = _over(changed)
+    [failed] = unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG)
+    assert (failed.reason, failed.rows_passed, failed.rows_in_input) == ("table_changed", 12, 12)
+    added = TABLE + "| 13 | Filler | 300 | F-03 |\n"
+    record, value = _over(added)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG)[0].reason == "table_changed"
+    assert "rows were added or changed" in correction_prompt("Task", [failed])
+
+
+def test_a_table_with_renamed_or_fewer_columns_is_compared_by_its_values() -> None:
+    lines = TABLE.splitlines()
+    renamed = "\n".join(["| No. | Machine | Duration (mins) | Fault code |", *lines[1:-3]])  # and rows left out
+    record, value = _over(renamed)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG)[0].reason == "table_incomplete"
+    made_up = "| No. | Machine | Duration (mins) |\n|---|---|---|\n| 1 | Filler | 665 |"
+    record, value = _over(made_up)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG)[0].reason == "table_changed"
+    # Only the columns it needs, every row: the same values, so the total counts.
+    two = "| Machine | Duration (min) |\n|---|---|\n" + "\n".join(
+        f"| {row.split('|')[2].strip()} | {row.split('|')[3].strip()} |" for row in lines[2:]
+    )
+    record, value = _over(two)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG) == []
+
+
+def test_the_same_table_written_differently_still_counts() -> None:
+    csv = "No.;Machine;Duration (min);Fault code\n" + "\n".join(
+        ";".join(cell.strip() for cell in row.strip("|").split("|")) for row in TABLE.splitlines()[2:]
+    )
+    record, value = _over(csv)
+    assert unverified_fields(OUTPUT, {"downtime_share_percent": value}, [record], LOG) == []
+
+
+async def test_a_run_refuses_a_figure_the_tool_only_repeated(tmp_path: Path) -> None:
+    echo = {"table": TABLE, "value_column": "Duration", "reference_total": 2.83}
+    fake = ScriptedClient(
+        {"Analyst": [tool_use("table_totals", echo), _share(2.83), tool_use("table_totals", echo), _share(2.83)]}
+    )
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[]) as workspace:
+        saved = workspace.save_workflow(_flow(tools=["table_totals"]))
+        done = await workspace.wait((await workspace.run(saved, RunIn(input=LOG))).id, timeout=20)
+        assert done.status == "failed"
+        assert done.nodes["a"].error_code == "run.value_unverified"
+        assert done.nodes["a"].error_params["reason"] == "not_from_tool"

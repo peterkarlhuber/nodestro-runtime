@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Checked key figures (audit round 3, RT3-01): a `table_totals` result backs only what the tool computed (totals,
+  means, extremes, shares, row counts), no longer the reference total or a column or group name it repeats from its
+  input; a calculator call backs nothing when it only repeats one number in another spelling (`46_3`, `0x1cf`) or
+  rounds or transforms a single number (`round(463.2)`). When the step's input has the table, the table passed to
+  `table_totals` must have exactly its rows (none left out, added or changed; `table_changed`), compared by the
+  values of the value column when the agent renamed or left out other columns. The check still proves provenance
+  only: a calculation written out from made-up numbers passes.
+
 - Pin orkexa 22f2910 (orkexa #47): `install_runtime` prepares the Ollama runtime of another platform
   (`find_binary(root, system)`), for Nodestro's portable packages built for a different target platform.
 - A checked key figure is no longer backed by a calculator call that only repeats it (expression `463`): numbers a
