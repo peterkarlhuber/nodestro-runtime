@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Strict offline mode: `Workspace.connection` and `connect_model` refuse every provider except Ollama with
+  `check.offline_cloud_model` before any request. Assistants, architects, run chat answers and orchestrator decisions
+  can no longer reach a cloud model; before, only runs were refused. OpenAI-compatible and vLLM endpoints count as
+  cloud models, also on localhost. `PricingSyncService.run` takes `paused`.
+
+- Orchestrator decisions and live run chat answers set a reasoning effort only for models that support one, so
+  orchestrators and team leads work with models without one, such as GPT-4o and most OpenAI-compatible and vLLM
+  servers (RT-004).
+
+- A run whose budget decision expires while it still executes now ends `failed` with `run.budget_exceeded`
+  (expired), like a paused run; before, it ended `cancelled`.
+
+- Without sqlite-vec (e.g. Windows on ARM) the semantic index reports `unavailable` with the reason in `detail`, and a
+  reindex is refused with `knowledge.vectors_unavailable` instead of failing.
+
 - Pin orkexa `e9c2147da68db01199394f51c1b7ef90067cb4f9` (orkexa #49, audit round 3: retrieval integrity on reindex,
   non-finite vectors refused, managed Ollama lifecycle with orphan reclaim, embedding identity follows the model
   digest (`reindex_required`, handled by RT3-08), safe model builds) and axentra
