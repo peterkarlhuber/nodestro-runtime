@@ -2342,7 +2342,9 @@ class RunManager:
         run = context.run
         statuses = {state.status for state in run.nodes.values()}
         if context.stop is not None:
-            run.status = "cancelled"
+            # A person ended the run (approval rejected, budget ended): cancelled. A budget request that closed
+            # without a decision (deadline) fails the run, as the sweep fails a paused one (BUDGET-1).
+            run.status = "failed" if context.stop.code == "run.budget_exceeded" else "cancelled"
             _fail(run, context.stop)
         elif context.flow_stop is not None and context.flow_stop.code == "flow.loop_exhausted":
             run.status = "failed"
@@ -3882,22 +3884,25 @@ class RunManager:
             self._check_owned(context)
             context.tracker.check()
 
-        agent = AgentConfig(
-            name=node_label(node),
-            model=config.model,
-            system_prompt=orchestrator_prompt(config)
-            + (f"\n\nInstructions:\n{config.instructions}" if config.instructions else ""),
-            output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
-            effort="medium",
-            max_tool_rounds=0,
-        )
         interruptible = _Interruptible(context.cancelled, self.connect)
         try:
+            # One connection for the decision: it also says whether the model takes a reasoning effort (RT-004), so
+            # a model without one (GPT-4o, most compatible or vLLM servers) is asked without instead of refused.
+            connection = interruptible.connect(provider_of(config.model))
+            agent = AgentConfig(
+                name=node_label(node),
+                model=config.model,
+                system_prompt=orchestrator_prompt(config)
+                + (f"\n\nInstructions:\n{config.instructions}" if config.instructions else ""),
+                output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
+                effort=connection.effort(config.model, "medium"),
+                max_tool_rounds=0,
+            )
             outcome = execute_agent(
                 context.env.builder,
                 agent,
                 prompt,
-                connect=interruptible.connect,
+                connect=lambda _provider: connection,
                 tracker=context.tracker,
                 name=node.id,
                 hooks={"on_request": on_request},

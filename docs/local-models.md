@@ -154,7 +154,10 @@ instructions). Choosing another model shows `reindex_required`; searches keep us
 until the reindex to the new model finished and switched in one transaction. A reindex can be cancelled and
 continues where it stopped. Files uploaded while the model server is down are indexed for full text and reported as
 `incomplete` until the next reindex embeds them. Vector and hybrid search never fall back to full text: a missing
-index is a preflight error.
+index is a preflight error. The index state is `unavailable` only when the storage cannot hold vectors (`detail` says
+why): a SQLite installation without sqlite-vec (no wheel for Windows on ARM), where a reindex is refused with
+`knowledge.vectors_unavailable`, or a PostgreSQL schema without the vector tables. PostgreSQL without pgvector is not
+`unavailable` (the runtime ranks the vectors itself).
 
 An agent's view (`ScopedIndex`) limits the candidates to the agent's files *before* ranking, in every mode, so
 other files never take their places. On PostgreSQL every query is tenant-scoped; pgvector ranks the vectors where
@@ -164,6 +167,12 @@ installed (migration `0010` installs it when available), the runtime ranks the s
 
 The strict offline mode (`Settings.strict_offline`) makes preflight refuse cloud models (also fallbacks, judges,
 orchestrators), a model server that is not local, server tools and remote MCP servers; downloads are refused and the
-managed server runs without proxy variables. Local models have no external API billing: Orkexa prices them at zero
+managed server runs without proxy variables. Outside runs, `Workspace.connection`/`connect_model` refuse a cloud
+model with the same code `check.offline_cloud_model` before any request, so assistants, the architects, run chat
+answers and orchestrator decisions cannot reach a cloud provider either (also when the mode is switched on during a
+run). Only Ollama counts as local: an OpenAI-compatible or vLLM endpoint is treated as a cloud model even on
+`localhost`, because Nodestro cannot tell where such a server sends the data. The background price check makes no
+request while the mode is on (checked each round). The managed server is not restarted when the mode is switched:
+it keeps the proxy variables it started with until Nodestro restarts. Local models have no external API billing: Orkexa prices them at zero
 with source `local`, and usage counts them in `Usage.local_requests`. Local operating costs (hardware, energy) are
 not recorded, so an interface shows "local, no API billing" instead of a total of 0.

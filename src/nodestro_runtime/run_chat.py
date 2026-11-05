@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 from .mcp_access import UNATTENDED_TRIGGERS
 from .problems import NodestroError
+from .providers import provider_of
 from .schemas import Node, NodeRun, Run, Usage, new_id, now
 from .storage import DocumentStore
 
@@ -934,21 +935,24 @@ def answer_question(
             pricing=manager.pricing,
             mode=manager.price_mode(),
         )
-        agent = AgentConfig(
-            name="Run chat",
-            model=model,
-            system_prompt=ANSWER_SYSTEM_PROMPT,
-            effort="low",
-            max_tool_rounds=0,
-            max_tokens=1500,
-        )
         prompt = f"<<<snapshot\n{text}\nsnapshot>>>\n\nQuestion: {question.content}"
         try:
+            # The answer's effort only where the model takes one (RT-004): GPT-4o, most compatible and vLLM servers
+            # would refuse it.
+            connection = manager.connect(provider_of(model))
+            agent = AgentConfig(
+                name="Run chat",
+                model=model,
+                system_prompt=ANSWER_SYSTEM_PROMPT,
+                effort=connection.effort(model, "low"),
+                max_tool_rounds=0,
+                max_tokens=1500,
+            )
             outcome = execute_agent(
                 manager.builder,
                 agent,
                 prompt,
-                connect=manager.connect,
+                connect=lambda _provider: connection,
                 tracker=tracker,
                 name="run_chat",
                 hooks={"on_request": on_request},

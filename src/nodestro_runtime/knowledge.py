@@ -92,6 +92,16 @@ class CollectionInfo(BaseModel):
 IndexState = Literal["off", "ready", "incomplete", "building", "reindex_required", "unavailable"]
 
 
+def sqlite_vectors_missing() -> str | None:
+    """Why a SQLite knowledge base cannot hold vectors here, else ``None``: sqlite-vec is not installed (it has no
+    wheel for Windows on ARM)."""
+    import importlib.util
+
+    if importlib.util.find_spec("sqlite_vec") is None:
+        return "sqlite-vec is not installed on this platform"
+    return None
+
+
 class KnowledgeIndexStatus(BaseModel):
     """The semantic index of the knowledge base: which model filled it and how complete it is."""
 
@@ -100,7 +110,9 @@ class KnowledgeIndexStatus(BaseModel):
     embedding_model: str | None = None
     #: ``off`` (no vectors), ``ready``, ``incomplete`` (chunks without vectors, e.g. added while the model server was
     #: down), ``building`` (a reindex runs or was interrupted), ``reindex_required`` (the vectors belong to another
-    #: model than the chosen one) or ``unavailable`` (this storage cannot hold vectors).
+    #: model than the chosen one) or ``unavailable`` (this storage cannot hold vectors: no sqlite-vec on this platform,
+    #: or a PostgreSQL schema without the vector tables; ``detail`` says why). A model server that cannot be reached
+    #: is never ``unavailable``: new chunks then stay without vectors (``incomplete``).
     state: IndexState = "off"
     chunks: int = 0
     embedded: int = 0
@@ -368,9 +380,12 @@ class KnowledgeBase:
     # ---- semantic index ----------------------------------------------------------------------------------------
 
     def _vectors(self) -> Any:
-        """The vector state of the index (``None``: this index cannot hold vectors)."""
+        """The vector state of the index (``None``: this index cannot hold vectors, also a SQLite index on a platform
+        without sqlite-vec, which Orkexa needs to build and search vectors)."""
         status = getattr(self.index, "vector_status", None)
-        return status() if status is not None else None
+        if status is None or (isinstance(self.index, SQLiteIndex) and sqlite_vectors_missing()):
+            return None
+        return status()
 
     def _model(self, name: str | None = None) -> EmbeddingModel | None:
         chosen = name or self.retrieval()[1]
@@ -431,6 +446,8 @@ class KnowledgeBase:
             return status
         if vectors is None:
             status.state = "unavailable"
+            if isinstance(self.index, SQLiteIndex):
+                status.detail = sqlite_vectors_missing() or ""
             return status
         status.chunks, status.embedded = vectors.chunks, vectors.embedded
         status.active, status.building = vectors.active, vectors.building

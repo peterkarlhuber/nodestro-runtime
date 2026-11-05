@@ -303,6 +303,31 @@ def test_the_strict_offline_mode_blocks_cloud_models_and_server_tools(managed: W
     assert "check.offline_cloud_model" in codes and "check.offline_server_tool" in codes
 
 
+def test_the_strict_offline_mode_refuses_cloud_connections_before_any_request(tmp_path: Path) -> None:
+    """Assistants, architects, run chat answers and orchestrator decisions connect through the workspace: in the
+    strict offline mode a cloud model is refused there with the workflow check's code, not only in the check."""
+    from nodestro_runtime.testing import ScriptedClient
+
+    fake = ScriptedClient({})
+    workspace = Workspace(tmp_path / "data", client_factory=lambda _provider: fake, integrations=[])
+    try:
+        assert workspace.connect_model("anthropic:claude-haiku-5-5").provider == "anthropic"  # online: allowed
+        workspace.update_settings(SettingsIn(strict_offline=True))
+        for model in ("anthropic:claude-haiku-5-5", "openai:gpt-4o", "compatible:llama", "vllm:qwen"):
+            with pytest.raises(NodestroError) as error:
+                workspace.connect_model(model)
+            assert error.value.code == "check.offline_cloud_model" and error.value.params["model"] == model
+        with pytest.raises(NodestroError) as error:
+            workspace.connection("openai")  # what agents and orchestrator decisions use
+        assert error.value.code == "check.offline_cloud_model"
+        assert workspace.connect_model(LOCAL_DEFAULT_MODEL).provider == "ollama"  # local models stay allowed
+        assert not fake.messages.calls
+        workspace.update_settings(SettingsIn(strict_offline=False))
+        assert workspace.connect_model("openai:gpt-4o").provider == "openai"
+    finally:
+        workspace.close()
+
+
 def test_the_model_folder_can_move(managed: Workspace, tmp_path: Path) -> None:
     target = tmp_path / "ssd" / "models"
     assert managed.local_models.set_models_dir(str(target), transfer="use") is None
