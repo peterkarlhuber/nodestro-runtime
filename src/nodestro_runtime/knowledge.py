@@ -94,14 +94,11 @@ IndexState = Literal["off", "ready", "incomplete", "building", "reindex_required
 
 def sqlite_vectors_missing() -> str | None:
     """Why a SQLite knowledge base cannot hold vectors here, else ``None``: sqlite-vec is not installed (it has no
-    wheel for Windows on ARM) or this Python's sqlite3 cannot load extensions."""
+    wheel for Windows on ARM)."""
     import importlib.util
-    import sqlite3
 
     if importlib.util.find_spec("sqlite_vec") is None:
         return "sqlite-vec is not installed on this platform"
-    if not hasattr(sqlite3.Connection, "enable_load_extension"):
-        return "This Python's sqlite3 cannot load extensions, which sqlite-vec needs"
     return None
 
 
