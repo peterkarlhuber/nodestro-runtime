@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 34 |
+| P3 Low | 37 |
 | P4 Optional | 12 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -335,6 +335,25 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Apply the long timeout only between streamed chunks with a shorter header timeout, and set
   `max_retries=0` for local endpoints; add a test with a silent socket server.
 
+### RT-059 · Switching the strict offline mode does not restart the managed Ollama
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** product check 2026-11-05, `local_service.LocalModelService._managed_server`
+- **What:** The managed server gets `offline` (no proxy variables) once, when its `ManagedOllama` object is made;
+  stopping and starting it in the settings reuses that object. Switching the strict offline mode on therefore leaves
+  a running managed server with its proxy route until Nodestro restarts. Model calls to cloud providers, downloads
+  and the price check are refused at once; only the local server's own network route lags behind.
+- **Next step:** On a change of `strict_offline`, restart the managed server with `offline` (orkexa
+  `ManagedOllama.restart(offline=...)`) when no local request is running, or mark it for a restart; add a test.
+
+### RT-061 · The workflow check does not check an orchestrator's model capabilities
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** product check 2026-11-05, RT-004 (fixed)
+- **What:** An orchestrator decision needs structured output. A model without it (an OpenAI-compatible endpoint
+  whose capabilities are not declared reports `unknown`) fails at the first decision with Orkexa's capability error;
+  the workflow check says nothing beforehand. The reasoning effort no longer causes this (RT-004).
+- **Next step:** Report a `check.orchestrator_model_unsupported` error when the orchestrator model's
+  `structured_output` is not `supported` through its connection; the studio needs its text in six languages.
+
 ## Architecture and modularity
 
 ### RT-007 · `engine.py` / `RunManager` keeps growing
@@ -566,6 +585,17 @@ Items that need an independent or external review (an internal audit does not re
   knowledge base with mDenseOn was not measured.
 - **Next step:** Replace the community header with one generated from llama.cpp's converter in CI; measure indexing
   throughput against `qwen3-embedding:0.6b`.
+
+### RT-060 · Only NVIDIA and Apple GPUs are detected
+
+- **Priority:** P3 Low · **Status:** Open (needs AMD/Intel hardware) · **Refs:** product check 2026-11-05,
+  `local_models.detect_hardware`, `local_service.LocalModelService._accelerated`
+- **What:** `detect_hardware` knows `nvidia` (nvidia-smi) and Apple silicon only; on this computer the hardware
+  decides over Ollama's `size_vram` (which reports GPU memory even on a VM without a GPU). An AMD (ROCm) or Intel/AMD
+  (Vulkan) GPU that Ollama uses therefore counts as "no GPU": the CPU saving mode switches thinking off at effort
+  `medium` and the advice says the computer is slow. Workaround: the setting `local_reasoning: full`.
+- **Next step:** Detect ROCm and Vulkan devices (or trust Ollama's `size_vram` once a model is fully loaded and the
+  device is real) and test it on such hardware; do not guess without a device to test on.
 
 ### RT-019 · No isolating sandbox without Docker on macOS and Windows
 
