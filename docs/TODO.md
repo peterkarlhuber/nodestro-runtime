@@ -3,8 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-04 against `master` at `c6f0240` (internal backend audit round 3; fixes RT3-01 to
-> RT3-08 in the PR that updates this line).
+> **Last full review:** 2026-11-05 against `master` at `53d7980` (quality round 3 close-out; TODO consolidated).
 
 ## Summary
 
@@ -13,10 +12,12 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 8 |
-| P3 Low | 33 |
+| P3 Low | 34 |
 | P4 Optional | 12 |
 
-**Release blockers:** None for this repository.
+**Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
+every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
+(`NODESTRO_TOOL_APPROVALS`).
 
 The engine, both stores, the built-in Linux sandbox (#17/#23), Amazon Bedrock (#66), live run chat (#67/#68) and the
 orchestration work up to M6b are merged; the backend audit fixes are in (#64/#65). What remains is mostly the
@@ -39,6 +40,14 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+Items that need an independent or external review (an internal audit does not replace it):
+
+- RT-001: tool approvals and approval checkpoints; `NODESTRO_TOOL_APPROVALS` stays off until it is done.
+- RT-030: the Axentra migration of the server profile (condition SR-01 is met; the external sign-off is outstanding).
+- RT-017: an independent or Docker-backed re-check of some earlier audit fixes (listed under Tests).
+- Owned elsewhere: the portable export (nodestro-api #85 with the hardening of #87, nodestro-studio #121) is tracked
+  in nodestro-api; live tests of the Axentra provider adapters are tracked in axentra.
 
 ### RT-001 · Independent security review of tool approvals (S-2) and approval checkpoints (M6b)
 
@@ -66,6 +75,36 @@ None known.
 - **Next step:** Inspect each created container's limits and remove it on mismatch (`sandbox_gateway.py`); evaluate
   `runsc` support with a CI job that has it installed.
 
+### RT-030 · Axentra migration follow-ups
+
+- **Priority:** P2 Medium · **Status:** Needs external review · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`,
+  nodestro-server SRV-019
+- **What:** Every Axentra integration of the server profile is merged and off by default; none is active in
+  production. Open:
+  - an organizationally independent security review: the separate agent's review was accepted on 2026-11-02 (condition
+    SR-01 met, its Lows fixed and re-reviewed, the round-3 gaps of the static tenant SQL check fixed in #89, a suspended
+    tenant's tool generation jobs stopped (NF-1, nodestro-api #69), the remaining isolation risk without RLS stated in
+    the doc); round 4 accepted too, its Lows R4-3 to R4-7 handled (no installation starts for a stopped tool job;
+    the tenant SQL check's misses fixed or listed in the remaining isolation risk); an external sign-off is still
+    outstanding;
+  - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
+    `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
+    against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);
+  - production activation decisions per switch, after the review and the rehearsal;
+  - API keys when publication comes to the server (boundary decided in the doc, "API keys (M6)");
+  - limit enforcement in the budget admission with reservations (design in the doc, "Usage"; quotas are
+    informational until then) and quota defaults per plan;
+  - a Studio view of the inbox (`/api/notifications` exists) and process counters of the worker (it has no metrics
+    listener; its side shows only in the database-derived metrics).
+- **Rejected:** moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
+  source); e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch); shadow
+  modes and database mirror triggers from the migration plan (the identity mirror writes both sides in one
+  transaction, so there is nothing to compare or trigger); moving knowledge files (already in PostgreSQL with their
+  search index); running jobs on Axentra (M11, variant A), Nodestro's migrations on Axentra's runner (M9) and
+  row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
+- **Next step:** The external security sign-off, then the staging rehearsal. No switch is activated in production by
+  this work.
+
 ### RT-032 · Source builds of Python packages only in a container: pin the resolver image
 
 - **Priority:** P2 Medium · **Status:** Open · **Refs:** Docker-first plan R4, `container_images.UV_IMAGE`,
@@ -77,9 +116,9 @@ None known.
   (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
   packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
   (which refuses containers with network and foreign images); outside the desktop source builds are off
-  (`deps.source_build_disabled`, RT-038). Studio has no text for the `reason` parameter yet.
+  (`deps.source_build_disabled`, RT-038).
 - **Next step:** The real-Docker test of the resolve container exists (`tests/test_resolve_real_engine.py`, CI
-  `docker` job); its approved path waits for the RT-038 real-engine findings. The gateway offers a resolve container
+  `docker` job) and passes there, approved path included (master `53d7980`). The gateway offers a resolve container
   only together with a proven filtered build network (RT-040).
 
 ### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
@@ -127,11 +166,11 @@ None known.
   into code that can read them). `/tmp` in the resolve container is meant to be executable (compilers and build tools
   run there; see the real-engine findings below). The resolver is used only for plans a person
   explicitly accepted (library dialog), never for generated tools.
-- **Real-engine test (added 2026-11-02; not yet run in CI):** `tests/test_resolve_real_engine.py` runs
-  `compile_in_container` against a real daemon (`NODESTRO_DOCKER_TESTS=1`, a separate step of the CI `docker`
-  job). On any daemon it proves: the self-test runs first, in the pinned image by its id and with exactly
-  `_RESOLVE_LIMITS`; a resolve shape with an extra flag and a sandbox that proved other limits are refused with no
-  resolve container created (checked with `docker events`): by the self-test on an unproven daemon, by the shape
+- **Real-engine test (added 2026-11-02; passes in the CI `docker` job, 13 tests on master `53d7980`):**
+  `tests/test_resolve_real_engine.py` runs `compile_in_container` against a real daemon (`NODESTRO_DOCKER_TESTS=1`,
+  a separate step of the CI `docker` job). On any daemon it proves: the self-test runs first, in the pinned image by
+  its id and with exactly `_RESOLVE_LIMITS`; a resolve shape with an extra flag and a sandbox that proved other
+  limits are refused with no resolve container created (checked with `docker events`): by the self-test on an unproven daemon, by the shape
   check (`sandbox.shape_mismatch`) on a proven one; a moved local tag of the
   resolver's name is never tested or run; off the desktop an accepted source build reports
   `deps.source_build_disabled` with no docker CLI call, container or pull; the desktop plan falls back to
@@ -157,10 +196,8 @@ None known.
     `noexec`.
   - Fixed: the resolve container's proven shape is built from the sandbox's own limits (what its self-test ran), not
     from the constant, so a sandbox that proved other limits is refused (`sandbox.shape_mismatch`).
-- **Next step:** Decide and fix the two open findings, then see the real-engine test pass in the CI `docker` job.
-  RT-040 (a proven filtered build network, or iterative resolving without network) stays open and is not approved.
-  A real-Docker test of `missing_modules` is still missing. Studio needs texts for `deps.source_build_disabled` and
-  `sandbox.shape_mismatch`.
+- **Next step:** RT-040 (a proven filtered build network, or iterative resolving without network) stays open and is
+  not approved. A real-Docker test of `missing_modules` is still missing.
 
 ### RT-040 · A filtered build network, so servers can build Python packages from source again
 
@@ -186,11 +223,11 @@ None known.
   checks itself (Orkexa). New schema fields `engine`, `rootless`, `cgroup_version`, `checks`, `tested_at` and the
   reasons `docker-*`. Open: the first self-test needs the runtime image, which is built on demand (network, uv), so the
   first start with Docker stays `checking` until that build finished (or reports `docker-image`); a call made while
-  `checking` is refused instead of waiting; the API endpoints (`/api/sandbox/status`, `/api/sandbox/self-test`, plan
-  A1), the SDK models and the Studio texts for the new reasons and fields are not there yet; the status was tested with
-  stand-ins only (no daemon in the development container).
-- **Next step:** A1/S1/ST1 in nodestro-api, nodestro-sdk and nodestro-studio; a real-daemon test of the background
-  check in the CI `docker` job; decide whether a tool call should wait (bounded) for a running first check.
+  `checking` is refused instead of waiting; the background check was tested with stand-ins only (no daemon in the
+  development container). The API endpoints (nodestro-api `sandbox_status.py`), the SDK model (`SandboxStatus`) and
+  the Studio texts exist; remaining Studio work is nodestro-studio ST-033.
+- **Next step:** A real-daemon test of the background check in the CI `docker` job; decide whether a tool call should
+  wait (bounded) for a running first check.
 
 ### RT-036 · Docker-first for untrusted code and its libraries (DS-2, DS-3): follow-ups
 
@@ -201,15 +238,16 @@ None known.
   built-in Linux sandbox, always with Nodestro's own interpreter; `subprocess` never runs untrusted code (reason
   `subprocess-mode`). Untrusted code's libraries are never a host venv (no `uv pip sync`, no host `verify_imports`):
   container images in `auto`/`docker`, refused in `subprocess`/`linux` (`sandbox.libraries_need_isolation`, param
-  `mode`). Open: Studio and the API need texts for the `linux` mode, the reason `subprocess-mode`, the `auto` refusal
-  now carrying Docker's reason instead of `no-isolation`, and the status `unsupported` with
-  `sandbox.isolation_required` / `sandbox.libraries_need_isolation`; installations that chose `subprocess` to use the
+  `mode`). The `linux` choice is in the SDK and the Studio settings, and the Studio has texts for the reason
+  `subprocess-mode` and for the `auto` refusal with Docker's reason. Open: Studio wording for the status `unsupported`
+  with `sandbox.isolation_required` / `sandbox.libraries_need_isolation` (not verified; nodestro-studio ST-033);
+  installations that chose `subprocess` to use the
   built-in sandbox must choose `linux` (no automatic migration); host venvs that earlier releases built for untrusted
   scopes stay on disk unused until `cleanup`/removal; local MCP servers still need Docker mode (`containers()`), also
   in `auto` with Docker approved; a scope's trust for an unsaved tool comes from the code digest the caller passes
   (`Needed.digests`), so an API plan without code (reinstall) falls back to the stored tools (unknown counts as
   untrusted).
-- **Next step:** API/SDK/Studio texts and the `linux` choice in the settings; decide whether `auto` should also allow
+- **Next step:** Check the remaining Studio wording with ST-033; decide whether `auto` should also allow
   local MCP servers once Docker is approved; optionally run the built-in sandbox with an environment's packages by
   starting the interpreter with `-S` and adding site-packages after confinement.
 
@@ -256,9 +294,9 @@ None known.
   label) beyond 20 images or 20 GiB, never one an environment of the store names. Open: a server (shared daemon,
   `remove_images=False`) does not collect, so its operator still prunes; through the sandbox gateway images cannot be
   listed, so collection there sees only images in the data directory's usage record (`python/image-usage.json`);
-  the size cap and collection were tested only with the fake docker CLI; Studio has no translated text for
-  `deps.image_too_large` yet.
-- **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job, and the Studio error text.
+  the size cap and collection were tested only with the fake docker CLI. (The Studio text for `deps.image_too_large`
+  exists in all six languages.)
+- **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job.
 
 ### RT-004 · Internal agents set a fixed reasoning effort
 
@@ -294,45 +332,27 @@ None known.
 - **Next step:** Add `put_raw_if_absent` (SQLite `INSERT ... ON CONFLICT DO NOTHING`, PostgreSQL the same) that
   reports whether the record was created, with tests on both stores.
 
+### RT-058 · Waiting local model requests: long header timeout and SDK retries
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** internal backend audit round 3 (RT3-05, rest), #107,
+  `providers.endpoint_client`, `providers.LOCAL_REQUEST_TIMEOUT`
+- **What:** Since runtime #113 cancel and the run time limit end a request that waits for a local model server. Still
+  open: the clients for `ollama` connections wait up to `LOCAL_REQUEST_TIMEOUT` (3600 s) for the response headers,
+  and the OpenAI SDK's default retries repeat a timed-out request. Without a cancel (a run with no time limit, an
+  orchestrator decision outside a run) a silent server keeps the thread that long.
+- **Next step:** Apply the long timeout only between streamed chunks with a shorter header timeout, and set
+  `max_retries=0` for local endpoints; add a test with a silent socket server.
+
 ## Architecture and modularity
 
 ### RT-007 · `engine.py` / `RunManager` keeps growing
 
 - **Priority:** P3 Low · **Status:** Open (deliberately deferred) · **Refs:** backend audit D-13
-- **What:** `engine.py` has 4,707 lines (3,381 at the first audit start, 3,865 on 2026-11-01); approvals, persistence, resume and orchestration
-  live in one class, which raises the regression risk of every change.
+- **What:** `engine.py` has 4,800 lines on 2026-11-05 (3,381 at the first audit start, 3,865 on 2026-11-01);
+  approvals, persistence, resume and orchestration live in one class, which raises the regression risk of every
+  change.
 - **Next step:** Extract one clearly bounded part (tool approvals, persistence or resume) with the next functional
   change to it; no big-bang refactor.
-
-### RT-030 · Axentra migration follow-ups
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** `docs/AXENTRA.md`, `axentra_platform.py`,
-  nodestro-server SRV-019
-- **What:** Every Axentra integration of the server profile is merged and off by default; none is active in
-  production. Open:
-  - an organizationally independent security review: the separate agent's review was accepted on 2026-11-02 (condition
-    SR-01 met, its Lows fixed and re-reviewed, the round-3 gaps of the static tenant SQL check fixed in #89, a suspended
-    tenant's tool generation jobs stopped (NF-1, nodestro-api #69), the remaining isolation risk without RLS stated in
-    the doc); round 4 accepted too, its Lows R4-3 to R4-7 handled (no installation starts for a stopped tool job;
-    the tenant SQL check's misses fixed or listed in the remaining isolation risk); an external sign-off is still
-    outstanding;
-  - a staging rehearsal on a production copy under the owner/runtime roles: `migrate --backup-dir`,
-    `backfill-identity`, `reconcile-identity`, `secrets reencrypt`, `axentra reconcile`, `files migrate/verify`
-    against a real S3 bucket (so far only moto's S3 server), then a restore of the backup (nodestro-server SRV-019);
-  - production activation decisions per switch, after the review and the rehearsal;
-  - API keys when publication comes to the server (boundary decided in the doc, "API keys (M6)");
-  - limit enforcement in the budget admission with reservations (design in the doc, "Usage"; quotas are
-    informational until then) and quota defaults per plan;
-  - a Studio view of the inbox (`/api/notifications` exists) and process counters of the worker (it has no metrics
-    listener; its side shows only in the database-derived metrics).
-- **Rejected:** moving the usage dashboard to Axentra's meters (they lack the AI detail; Nodestro's records stay the
-  source); e-mail notifications by default (inbox only; an e-mail channel would be its own explicit switch); shadow
-  modes and database mirror triggers from the migration plan (the identity mirror writes both sides in one
-  transaction, so there is nothing to compare or trigger); moving knowledge files (already in PostgreSQL with their
-  search index); running jobs on Axentra (M11, variant A), Nodestro's migrations on Axentra's runner (M9) and
-  row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
-- **Next step:** The external security sign-off, then the staging rehearsal. No switch is activated in production by
-  this work.
 
 ### RT-039 · Axentra contract step (M12): remove the legacy paths
 
@@ -480,12 +500,15 @@ None known.
 - **Next step:** Store the origin (example id, version, language, offline connections) on the copy; expose it read-only
   in the API.
 
-### RT-057 · Missing-key message inside an exported app
+### RT-057 · Setup advice in missing-key and local-runtime messages ignores the context
 
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** UX round 3 DX handover B14
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** UX round 3 DX handovers B14 and B3 (runtime part)
 - **What:** A missing provider key always gets the studio's advice (settings), also when the runtime serves an exported
-  app, where the key belongs in the environment or `.env`.
-- **Next step:** Let the message depend on the context: in serving mode name the environment variable and `.env`.
+  app, where the key belongs in the environment or `.env`. The preflight issue `check.local_runtime_missing`
+  (`preflight.py`) says only "install the local model runtime in the settings": it names neither the API route for
+  SDK users (`POST /api/local-models/runtime`) nor the models that are missing.
+- **Next step:** Let the message depend on the context: in serving mode name the environment variable and `.env`; in
+  `check.local_runtime_missing` name the settings page and the API route and add `params.models`.
 
 ## Tests and quality assurance
 
@@ -530,8 +553,8 @@ None known.
   Ollama 0.40.14 and a fake binary. macOS, Windows, GPUs and the large models (`qwen3.6:35b-a3b`, `qwen3.8:27b`) were
   not run.
 - **Next step:** Run the local-model tests and a real workflow on macOS (Apple silicon) and Windows, with a GPU. The
-  CPU saving mode (RT-050, done) was measured only on Linux without a GPU; on a GPU it must stay off (`accelerated`),
-  and the GPU detection of a remote server (`/api/ps` `size_vram`) needs a real GPU server.
+  CPU saving mode (RT-050, done in #107) was measured only on Linux without a GPU; on a GPU it must stay off
+  (`accelerated`), and the GPU detection of a remote server (`/api/ps` `size_vram`) needs a real GPU server.
 
 ### RT-052 · Ministral models need an explicit system prompt
 
@@ -676,9 +699,8 @@ None known.
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
-| — | orkexa | ORK-001 (orkexa #22), B-03: cancel `SubprocessSandbox`/`DockerSandbox` calls | Orkexa owns the change; then runtime passes the cancel signal through `sandbox_cancel` |
 | — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Afterwards the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
-| — | orkexa | A-05: redirects when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
+| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
 | RT-005 | nodestro-api, nodestro-sdk | API-018 (decision response model) | Follow the new run state |
 | RT-009 | nodestro-api | API-013 (`/api/usage` latency) | API uses the store-level filter |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
@@ -689,10 +711,10 @@ None known.
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
+| RT-049 | orkexa, nodestro-desktop | ORK-030, DSK-022 (managed Ollama on macOS/Windows) | Orkexa owns the managed server; runtime reruns its local-model tests there |
 | RT-022 | orkexa | ORK-007 | Orkexa's sandbox review for 3.14 comes first |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | RT-045 | nodestro-api | API-043 (idempotent run starts across processes) | Store primitive first, then the API uses it |
-| — | nodestro-examples, nodestro-studio | EX-002 / ST-032 (ED-17): possible short `label` on `OutputField` | Decision pending in examples; runtime adds the field only if chosen |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
 
 ## CI access to private repositories
