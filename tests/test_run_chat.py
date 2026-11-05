@@ -708,3 +708,44 @@ async def test_an_answer_stopped_before_its_request_never_calls_the_model(
     assert stored is not None and (stored.status, stored.code) == ("failed", "identity.tenant_suspended")
     calls = workspace.fake.messages.calls  # type: ignore[attr-defined]
     assert not any(CHAT in str(call.get("system")) for call in calls)
+
+
+@pytest.mark.parametrize(("model", "effort"), [("openai:gpt-4o", None), ("anthropic:x", "low")])
+async def test_an_answer_sets_an_effort_only_where_the_model_takes_one(
+    make: Make, monkeypatch: pytest.MonkeyPatch, model: str, effort: str | None
+) -> None:
+    """RT-004: GPT-4o (like most compatible or vLLM servers) refuses a reasoning effort, so none is sent."""
+    from nodestro_runtime import engine
+
+    ids: dict[str, str] = {}
+    workspace = make(_script(ids, text("never asked")))
+    started = await _paused_run(workspace, ids)
+    chat = workspace.runs.chat
+    question = send(workspace, started, "question", "Where are we?")
+    seen: list[Any] = []
+
+    def capture(_builder: Any, config: Any, _prompt: str, **kwargs: Any) -> Any:
+        seen.append((config.effort, kwargs["connect"](model.split(":")[0]).provider))
+        raise NodestroError("test.stop", "stop")
+
+    monkeypatch.setattr(engine, "execute_agent", capture)
+    result = await asyncio.to_thread(answer_question, workspace.runs, chat, workspace.usage_log, question, model=model)
+    assert seen == [(effort, model.split(":")[0])]
+    assert result.status == "failed" and result.code == "test.stop"
+
+
+async def test_the_strict_offline_mode_refuses_a_cloud_answer_before_its_request(make: Make) -> None:
+    from nodestro_runtime.schemas import SettingsIn
+
+    ids: dict[str, str] = {}
+    workspace = make(_script(ids, text("never asked")))
+    started = await _paused_run(workspace, ids)
+    chat = workspace.runs.chat
+    question = send(workspace, started, "question", "Where are we?")
+    workspace.update_settings(SettingsIn(strict_offline=True))
+    result = await asyncio.to_thread(
+        answer_question, workspace.runs, chat, workspace.usage_log, question, model="anthropic:x"
+    )
+    assert result.status == "failed" and result.code == "check.offline_cloud_model"
+    calls = workspace.fake.messages.calls  # type: ignore[attr-defined]
+    assert not any(CHAT in str(call.get("system")) for call in calls)

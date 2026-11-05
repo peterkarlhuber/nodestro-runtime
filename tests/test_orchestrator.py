@@ -318,3 +318,31 @@ def test_select_teams_respects_the_pool_size() -> None:
     ]
     chosen = select_teams(config, None, candidates, lambda _workflow: True)
     assert [member.workflow_id for member in chosen] == ["wf_c0", "wf_c1"]
+
+
+@pytest.mark.parametrize(("model", "effort"), [("openai:gpt-4o", None), ("openai:gpt-5", "medium")])
+async def test_a_decision_sets_an_effort_only_where_the_model_takes_one(
+    make: Make, monkeypatch: pytest.MonkeyPatch, model: str, effort: str | None
+) -> None:
+    """RT-004: a decision used to ask every model with effort ``medium``; Orkexa refuses that for a model without
+    a reasoning effort (GPT-4o, most compatible or vLLM servers) before any request, so such an orchestrator failed."""
+    from orkexa.errors import UnsupportedCapabilityError
+
+    from nodestro_runtime import engine
+
+    workspace = make({"RESEARCH": [text("unused")]})
+    research = team(workspace, "RESEARCH", "Research")
+    connection = workspace.connect_model(model)
+    if effort is None:  # the failure the fixed effort caused
+        with pytest.raises(UnsupportedCapabilityError):
+            connection.model_capabilities(model).require("reasoning", provider="openai", model=model)
+    seen: list[Any] = []
+
+    def capture(_builder: Any, config: Any, _prompt: str, **kwargs: Any) -> Any:
+        seen.append((config.model, config.effort, kwargs["connect"]("openai").provider))
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(engine, "execute_agent", capture)
+    done = await run(workspace, boss(research, model=model))
+    assert seen == [(model, effort, "openai")]
+    assert done.status == "failed"

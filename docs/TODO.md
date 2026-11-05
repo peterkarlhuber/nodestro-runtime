@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 8 |
+| P2 Medium | 7 |
 | P3 Low | 34 |
 | P4 Optional | 12 |
 
@@ -297,14 +297,6 @@ Items that need an independent or external review (an internal audit does not re
   the size cap and collection were tested only with the fake docker CLI. (The Studio text for `deps.image_too_large`
   exists in all six languages.)
 - **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job.
-
-### RT-004 · Internal agents set a fixed reasoning effort
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** #69
-- **What:** Orchestrator decisions (`effort="medium"`) and run chat answers (`effort="low"`) set an effort without
-  checking the model. Ollama is fixed (#102/#103: an effort only for models that report `thinking`). Still open for
-  `compatible`, `vllm` and non-reasoning OpenAI models: `engine._decide_sync` and `run_chat.answer_question`.
-- **Next step:** Use `providers.effort(model, ...)` in `engine._decide_sync` and `run_chat.answer_question`; add tests.
 
 ### RT-005 · Approval decision returns the run still as `paused` (X-01)
 
