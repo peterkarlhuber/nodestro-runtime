@@ -2342,7 +2342,9 @@ class RunManager:
         run = context.run
         statuses = {state.status for state in run.nodes.values()}
         if context.stop is not None:
-            run.status = "cancelled"
+            # A person ended the run (approval rejected, budget ended): cancelled. A budget request that closed
+            # without a decision (deadline) fails the run, as the sweep fails a paused one (BUDGET-1).
+            run.status = "failed" if context.stop.code == "run.budget_exceeded" else "cancelled"
             _fail(run, context.stop)
         elif context.flow_stop is not None and context.flow_stop.code == "flow.loop_exhausted":
             run.status = "failed"

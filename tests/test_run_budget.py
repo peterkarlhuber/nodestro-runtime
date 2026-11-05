@@ -545,3 +545,30 @@ async def test_a_decision_stored_before_a_crash_is_carried_out_by_the_sweep(make
     done = await workspace.wait(paused.id, timeout=20)
     assert done.status == "succeeded", done.error
     assert done.budget is not None and done.budget.limit_usd == Decimal("1.00")
+
+
+async def test_an_overdue_decision_fails_a_run_that_still_executes_too(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deadline ends a run the same way whether it is paused (the sweep ends it) or still executes (it reads the
+    expiry when its graph stops): ``failed`` with ``run.budget_exceeded`` (``expired``), as BUDGET.md documents.
+    The executing run used to end ``cancelled``."""
+    workspace = make({"A": [text("ok")]})
+    manager = workspace.runs
+    original = manager._budget_continues
+    requests = BudgetRequests(workspace.store)
+
+    def expire_first(context: Any) -> bool:
+        # The sweep (another thread or process) expires the request while this execution still runs.
+        for item in requests.of_run(context.run.id):
+            if item.status == "pending":
+                requests.update(item, deadline=now() - timedelta(seconds=1))
+        manager.sweep_budget_waits(resume=False)
+        return original(context)
+
+    monkeypatch.setattr(manager, "_budget_continues", expire_first)
+    done = await start(workspace, single(0.01))
+    assert done.status == "failed" and done.error_code == "run.budget_exceeded", (done.status, done.error_code)
+    assert done.error_params.get("expired") is True
+    assert requests.of_run(done.id)[0].status == "expired"
+    assert calls(workspace) == 0
