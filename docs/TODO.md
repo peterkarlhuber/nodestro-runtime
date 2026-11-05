@@ -699,6 +699,7 @@ Items that need an independent or external review (an internal audit does not re
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
+| — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
 | — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Afterwards the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
 | RT-005 | nodestro-api, nodestro-sdk | API-018 (decision response model) | Follow the new run state |
