@@ -154,7 +154,10 @@ instructions). Choosing another model shows `reindex_required`; searches keep us
 until the reindex to the new model finished and switched in one transaction. A reindex can be cancelled and
 continues where it stopped. Files uploaded while the model server is down are indexed for full text and reported as
 `incomplete` until the next reindex embeds them. Vector and hybrid search never fall back to full text: a missing
-index is a preflight error.
+index is a preflight error. The index state is `unavailable` only when the storage cannot hold vectors (`detail` says
+why): a SQLite installation without sqlite-vec (no wheel for Windows on ARM) or a Python whose sqlite3 cannot load
+extensions, where a reindex is refused with `knowledge.vectors_unavailable`, or a PostgreSQL schema without the vector
+tables. PostgreSQL without pgvector is not `unavailable` (the runtime ranks the vectors itself).
 
 An agent's view (`ScopedIndex`) limits the candidates to the agent's files *before* ranking, in every mode, so
 other files never take their places. On PostgreSQL every query is tenant-scoped; pgvector ranks the vectors where

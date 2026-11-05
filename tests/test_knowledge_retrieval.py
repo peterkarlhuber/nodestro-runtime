@@ -347,3 +347,33 @@ def test_a_rebuilt_embedding_model_needs_a_reindex_but_uploads_keep_working(
     status = knowledge.index_status()
     assert status.state == "ready" and status.embedded == status.chunks
     assert knowledge.search("refund money", mode="hybrid")
+
+
+def test_without_sqlite_vec_the_index_is_unavailable_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No sqlite-vec (Windows on ARM has no wheel): the index used to report ``off`` and a reindex failed inside
+    Orkexa with an ImportError. Now it is ``unavailable`` with the reason, and a reindex is refused up front."""
+    import importlib.util
+
+    from nodestro_runtime import knowledge as module
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "sqlite_vec" else real(name, *a))
+    knowledge = KnowledgeBase(tmp_path / "nodestro.db")
+    try:
+        knowledge.retrieval = lambda: ("vector", "concepts:1")  # type: ignore[assignment,return-value]
+        knowledge.embedding_model = lambda name: ConceptEmbeddings(name)
+        knowledge.add(b"Employees have 30 days of vacation per year.", name="hr.md")
+        status = knowledge.index_status()
+        assert status.state == "unavailable" and "sqlite-vec" in status.detail
+        assert module.sqlite_vectors_missing() is not None
+        with pytest.raises(NodestroError) as refused:
+            knowledge.start_reindex()
+        assert refused.value.code == "knowledge.vectors_unavailable"
+        with pytest.raises(NodestroError) as search:
+            knowledge.search("vacation", mode="vector")
+        assert search.value.code == "knowledge.vectors_missing"
+        assert knowledge.search("vacation", k=1, mode="fts")  # full-text search keeps working
+    finally:
+        knowledge.close()
