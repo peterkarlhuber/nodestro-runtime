@@ -3,7 +3,7 @@
 # Python dependencies are left out: pyproject.toml pins the (public) Nodestro components by git commit, and those
 # pins move only with the platform's pin cascade (studio scripts/check_versions.py); third-party ranges resolve
 # fresh in every CI run, whose blocking pip-audit step catches known vulnerabilities.
-# cooldown: a new release is proposed only after a few days (a week for majors), so a broken or compromised release
+# cooldown: a new release is proposed only after a few days, so a broken or compromised release
 # is usually withdrawn before it reaches a pull request; security updates are not delayed. Merging stays manual
 # (no auto-merge; nodestro-studio docs/TODO.md ST-052).
 version: 2
@@ -14,7 +14,6 @@ updates:
       interval: weekly
     cooldown:
       default-days: 3
-      semver-major-days: 7
     open-pull-requests-limit: 3
     groups:
       github-actions:
