@@ -358,3 +358,32 @@ def test_the_background_loop_syncs_when_due_and_stops(pricing: PricingService, c
 
     asyncio.run(main())
     assert pricing.state().last_success_at == T0
+
+
+def test_the_background_loop_makes_no_request_while_paused(pricing: PricingService, clock: Clock) -> None:
+    """The strict offline mode can be switched on while the loop runs: its rounds then fetch nothing."""
+    fetched: list[str] = []
+
+    def fetch(url: str, settings: HttpSettings) -> bytes:
+        fetched.append(url)
+        return json.dumps(COST_MAP).encode()
+
+    source = LiteLLMSource(fetch_bytes=fetch, sleep=lambda _s: None)
+    sync = PricingSyncService(pricing, [source], clock=clock)
+    offline = [True]
+
+    async def main() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(sync.run(stop, check_every=timedelta(milliseconds=10), paused=lambda: offline[0]))
+        await asyncio.sleep(0.1)
+        assert not fetched and pricing.state().last_success_at is None
+        offline[0] = False  # switched off again: the next round syncs
+        for _ in range(200):
+            if pricing.state().last_success_at is not None:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(main())
+    assert fetched and pricing.state().last_success_at == T0

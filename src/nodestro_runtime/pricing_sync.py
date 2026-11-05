@@ -559,13 +559,20 @@ class PricingSyncService:
             invalid=sum(1 for issue in result.issues if issue.severity == "error"),
         )
 
-    async def run(self, stop: asyncio.Event, *, check_every: timedelta = timedelta(hours=1)) -> None:
+    async def run(
+        self,
+        stop: asyncio.Event,
+        *,
+        check_every: timedelta = timedelta(hours=1),
+        paused: Callable[[], bool] | None = None,
+    ) -> None:
         """Sync at start when the prices are due, then whenever they become due, until ``stop`` is set.
 
-        Runs the blocking sync in a thread, so the event loop (the API) keeps serving.
+        Runs the blocking sync in a thread, so the event loop (the API) keeps serving. While ``paused()`` is true
+        (the strict offline mode, which can be switched on and off while the API runs) a round makes no request.
         """
         while not stop.is_set():
-            if self.due():
+            if not (paused is not None and paused()) and self.due():
                 try:
                     await asyncio.to_thread(self.sync)
                 except Exception:  # logged; the next round tries again

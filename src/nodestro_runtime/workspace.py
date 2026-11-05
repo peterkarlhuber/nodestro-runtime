@@ -1276,14 +1276,16 @@ class Workspace:
     def connection(self, provider: str) -> Connection:
         """How agents of ``provider`` reach it; raises :class:`MissingApiKeyError` when it is not configured.
 
-        A key from the environment wins over a stored one.
+        A key from the environment wins over a stored one. In the strict offline mode a configured cloud provider is
+        refused with ``check.offline_cloud_model`` before any request (assistants, architects, run chat answers and
+        orchestrator decisions all connect here; the workflow check refuses runs earlier).
         """
         info = PROVIDERS.get(provider)
         if info is None:
             raise NodestroError("provider.unknown", f"Unknown provider {provider!r}", provider=provider)
         stored = self._providers().get(provider, {})
         if info.auth == "aws":
-            return self._bedrock_connection(stored)
+            return self._refuse_offline(self._bedrock_connection(stored), info.label)
         key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
         reported = None
@@ -1310,15 +1312,28 @@ class Workspace:
             client = endpoint_client(base_url, key, timeout=LOCAL_REQUEST_TIMEOUT if provider == "ollama" else None)
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
             raise MissingApiKeyError(provider)
-        return Connection(
-            provider=provider,
-            api_key=key,
-            base_url=base_url if info.base_url else None,
-            capabilities=dict(stored.get("capabilities") or {}),
-            client=client,
-            reported=reported,
-            reasoning_saving=provider == "ollama" and self.reasoning_saving(),
+        return self._refuse_offline(
+            Connection(
+                provider=provider,
+                api_key=key,
+                base_url=base_url if info.base_url else None,
+                capabilities=dict(stored.get("capabilities") or {}),
+                client=client,
+                reported=reported,
+                reasoning_saving=provider == "ollama" and self.reasoning_saving(),
+            ),
+            info.label,
         )
+
+    def _refuse_offline(self, connection: Connection, label: str) -> Connection:
+        """``connection``, unless the strict offline mode is on and it is not the local model server (D12).
+
+        Every provider but Ollama counts as a cloud model here, also an OpenAI-compatible or vLLM server on this
+        computer, as in the workflow check (``check.offline_cloud_model``): Nodestro cannot tell where it sends data.
+        An unconfigured provider keeps its own error (``MissingApiKeyError``), which is raised before this."""
+        if connection.provider != "ollama" and self.strict_offline():
+            raise _offline_cloud_model(label, connection.provider)
+        return connection
 
     def provider_settings(self, provider: str) -> dict[str, Any]:
         """The stored settings of one provider (may contain its key: never return it from an endpoint)."""
@@ -1332,8 +1347,12 @@ class Workspace:
         return [key for key in dict.fromkeys(keys) if key]
 
     def connect_model(self, model: str) -> Connection:
-        """The connection of a model's provider."""
-        return self.connection(provider_of(model))
+        """The connection of a model's provider; a cloud model in the strict offline mode is refused first (also
+        when its provider is not configured: a key would not help)."""
+        provider = provider_of(model)
+        if provider != "ollama" and self.strict_offline():
+            raise _offline_cloud_model(model, provider)
+        return self.connection(provider)
 
     def allowed_models(self) -> list[str]:
         """The models the assistants may choose for new agents: the defaults and the suggested models
@@ -1355,6 +1374,16 @@ class Workspace:
         """Fail fast before work starts: every provider of ``models`` must be configured."""
         for provider in sorted({provider_of(model) for model in wanted}):
             self.connection(provider)
+
+
+def _offline_cloud_model(model: str, provider: str) -> NodestroError:
+    """The refusal of a cloud model in the strict offline mode (the workflow check's code and wording)."""
+    return NodestroError(
+        "check.offline_cloud_model",
+        f"{model} needs the internet; the strict offline mode allows local models only",
+        model=model,
+        provider=provider,
+    )
 
 
 __all__ = ["DATABASE", "LOCAL_TENANT", "MissingApiKeyError", "Workspace", "WorkspaceStorage"]
