@@ -641,8 +641,8 @@ Items that need an independent or external review (an internal audit does not re
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit D-05, `.github/dependabot.yml`
 - **What:** Dependencies are ranges without a lock or constraints file, so image rebuilds resolve differently over
-  time; Dependabot covers only GitHub Actions (the `dependabot.yml` comment still calls the git-URL dependencies
-  private, which is no longer true).
+  time; Dependabot covers only GitHub Actions (its comment says why: component pins move with the pin cascade, CI's
+  blocking `pip-audit` covers the third-party ranges; corrected in the dependency round of 2026-11-05).
 - **Next step:** A hashed constraints file for CI and images, or a scheduled `pip-audit` plus upgrade check. Decide
   together with nodestro-studio ST-028 and nodestro-server SRV-014.
 
@@ -721,6 +721,7 @@ Items that need an independent or external review (an internal audit does not re
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
+| (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
 | — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Afterwards the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
