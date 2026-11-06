@@ -409,6 +409,7 @@ class Workspace:
             external_url=lambda: self._providers().get("ollama", {}).get("base_url") or None,
             environ={} if storage is not None else None,
         )
+        self.local_models.idle = lambda: not self.runs.has_live_runs()
         self.builder.reported = self.local_models.capability_overrides
         self.builder.local_window = self._local_window
         self.builder.output_overrides = lambda: output_limits.stored_overrides(self._stored("output_limits"))
@@ -876,6 +877,8 @@ class Workspace:
         if changes.get("sandbox"):
             self.tools.set_sandbox(make_sandbox(changes["sandbox"], self.sandbox_policy, self._container_sandbox()))
             self._apply_sandbox_mode()
+        if "strict_offline" in changes:
+            self.local_models.sync_offline()  # the managed server's network route follows the mode (RT-059)
         return self.settings()
 
     # ---- Amazon Bedrock ------------------------------------------------------------

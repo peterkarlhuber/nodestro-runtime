@@ -575,3 +575,50 @@ def test_the_catalog_license_is_an_id_and_its_source_a_code() -> None:
         assert re.fullmatch(r"[A-Za-z0-9.+-]+", entry.license), entry.name
     sources = {entry.name: entry.license_source for entry in CATALOG}
     assert sources["devstral-small-2:24b"] == "upstream" and sources["qwen3.5:4b"] == "ollama"
+
+
+def _child_environment(workspace: Workspace) -> dict[str, str]:
+    server = workspace.local_models._managed
+    assert server is not None and server._process is not None
+    raw = Path(f"/proc/{server._process.pid}/environ").read_bytes()
+    return dict(item.split("=", 1) for item in raw.decode().split("\0") if "=" in item)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the server's environment from /proc")
+def test_switching_the_strict_offline_mode_restarts_the_managed_server(
+    managed: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RT-059: the running managed server takes the new mode (no proxy route when offline) without a restart of
+    Nodestro; while a run uses it, the restart waits."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    managed.connection("ollama")  # starts the server
+    server = managed.local_models._managed
+    assert server is not None and server.offline is False
+    first = server._process.pid
+    assert _child_environment(managed).get("HTTPS_PROXY") == "http://proxy.example:3128"
+    # A run is executing: the switch is stored, the server keeps running until nothing uses it.
+    busy = [True]
+    managed.local_models.idle = lambda: not busy[0]
+    managed.update_settings(SettingsIn(strict_offline=True))
+    assert server.offline is False and server._process.pid == first
+    busy[0] = False
+    status = managed.local_models.status()  # the next look at the server restarts it
+    assert status.offline and status.running
+    assert server.offline is True and server._process.pid != first
+    assert "HTTPS_PROXY" not in _child_environment(managed)
+    # Switched off again while idle: restarted at once, with the proxy route.
+    second = server._process.pid
+    managed.update_settings(SettingsIn(strict_offline=False))
+    assert server.offline is False and server._process.pid != second
+    assert _child_environment(managed).get("HTTPS_PROXY") == "http://proxy.example:3128"
+
+
+def test_a_stopped_managed_server_takes_the_mode_at_its_next_start(managed: Workspace) -> None:
+    managed.connection("ollama")
+    managed.local_models.stop()
+    server = managed.local_models._managed
+    assert server is not None and server.base_url is None
+    managed.update_settings(SettingsIn(strict_offline=True))
+    assert server.offline is True and server.base_url is None  # not started by the switch
+    managed.local_models.start()
+    assert server.offline is True and server.base_url is not None
