@@ -35,7 +35,7 @@ Nodestro API and studio and may change between versions.
 
 ## Installation
 
-Requires Python 3.11 or newer (CI tests 3.11 and 3.13).
+Requires Python 3.11 or newer (CI tests 3.11, 3.13 and 3.14).
 
 ```bash
 pip install "nodestro-runtime @ git+https://github.com/peterkarlhuber/nodestro-runtime.git@<commit>"
