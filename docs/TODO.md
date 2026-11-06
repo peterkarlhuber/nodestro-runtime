@@ -3,7 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-06 against master at 085e94f (TODO abatement round)
+> **Last full review:** 2026-11-06 against master at 802fa8f (TODO abatement round)
 
 ## Summary
 
@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 24 |
+| P3 Low | 23 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -576,14 +576,6 @@ None known.
   ("Ausgabe", "Entscheidung", "Freigabe"); `schemas.py` "Neuer Workflow". They are kept on purpose for prompt
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
-
-### RT-046 · Semantic reindex runs in the API process
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #99 (`KnowledgeBase.start_reindex`)
-- **What:** The reindex of the semantic index runs in a thread of the process that started it. It resumes where it
-  stopped when started again, but a restart of that process stops it, and on a server another API process does not
-  see its progress.
-- **Next step:** Run it as a job of the server's job queue (`jobs.py`) with a lease, like runs.
 
 ### RT-048 · pgvector installed after migration 0010
 
