@@ -444,9 +444,12 @@ def test_the_check_names_missing_and_unsuitable_local_models(
             + [{"id": "eo", "source": "ok", "target": "o"}],
         }
     )
-    # Nothing is checked (and nothing starts) while no local server runs.
-    codes = {item.code for item in preflight(managed, workflow).problems}
-    assert not {code for code in codes if code.startswith("check.local_model")}
+    # While no local server runs, nothing starts: the managed server's (empty) model folder tells what is missing.
+    found = {(item.code, item.params.get("model")) for item in preflight(managed, workflow).problems}
+    assert {item for item in found if item[0].startswith("check.local_model")} == {
+        ("check.local_model_missing", model)
+        for model in ("ollama:qwen3.5:4b", "ollama:qwen3.5:9b", "ollama:qwen3-embedding:0.6b", "ollama:plain-model")
+    }
     assert managed.local_models._managed is None
     managed.local_models.start()
     real = managed.local_models.installed

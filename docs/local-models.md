@@ -84,6 +84,41 @@ and the next start turns them into `local.interrupted`. Both are retryable and c
 The interface (`frontend/src/components/Progress.tsx`, `pages/LocalModelJobs.tsx`) polls the jobs every second while
 one runs and every 10 s otherwise. A job started elsewhere therefore appears without a reload.
 
+## Missing local models (`local_readiness`)
+
+`nodestro_runtime.local_readiness` answers one question for every caller: can this local model be used now, and if
+not, why and what may this person do? `diagnose(ws, model, action=, needs=, can_install=, switchable=)` returns
+`None` for a ready (or non-local) model, else a `ModelProblem`:
+
+- `cause`, never lumped together as "missing": `model_missing`, `runtime_missing`, `server_stopped`,
+  `server_unreachable`, `server_missing`, `model_name_invalid` (also Ollama cloud names), `disk_full` (catalog size
+  against the free space of the model folder, partial files counted), `capability_missing` (`ModelNeeds`: kind chat
+  or embedding, capabilities such as `tools` or `structured_output` from `/api/show`), `hardware_insufficient`.
+- `location` (`this_computer`, `container`, `remote` with `host`, `server` for the server profile) and `mode`.
+- `actions`, computed here and only here (`_offered`): `download`, `setup_server`, `retry`, `choose_model`,
+  `ask_admin`, `open_settings`. `blocked` says why no download is offered: `permission` (no install permission),
+  `operator` (server profile: the operator installs), `offline` (strict offline mode).
+- Facts for the dialog: catalog download and memory size, free and partial bytes, `fits`, and the running download
+  (`job`, followed instead of starting another) or the last stopped one (`previous_job`, resumable).
+
+`alternatives(ws, needs, exclude)` lists ready models that can do the step: installed local models and the allowed
+models of configured cloud providers (none in the strict offline mode; a cloud model whose capability is known to be
+`unsupported` is left out). `require_ready()` raises `NodestroError("model.local_unavailable", problem=...,
+alternatives=[...])`; `check_override()` accepts a per-action model only if it is among those alternatives
+(`model.choice_invalid`). Nothing here starts a download: with `start=False` and a stopped managed server the answer
+comes from the model folder (`scan_store`), so unattended paths never start the server either.
+
+An injected client (`client_factory` answering for `ollama`) means there is no local model server: `diagnose` returns
+`None` then, as the run does not need one.
+
+Unattended runs: `preflight._local_model_issues` reads the managed model folder when the server is not running, so a
+schedule, batch or published API start is refused with `check.local_model_missing` (`params.model`) before anything
+starts; nothing downloads. A run that still reaches a missing model (an external server lost it meanwhile) maps
+Ollama's 404 "model ... not found" to `run.local_model_missing` (`engine.provider_problem`) instead of an API error.
+
+`LocalModelService.pull(name, attach=True)` returns the running download of the same model (also when another
+request started it a moment earlier), so a second click, tab or dialog never starts a second download.
+
 ## Which model
 
 `local_models.CATALOG` holds the eleven suggested models with registry digest, download size, listed capabilities,

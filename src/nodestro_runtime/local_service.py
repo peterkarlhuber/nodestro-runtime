@@ -826,13 +826,35 @@ class LocalModelService:
         threading.Thread(target=body, name=f"nodestro-local-{kind}", daemon=True).start()
         return job
 
-    def pull(self, name: str) -> LocalJob:
+    def running_download(self, name: str) -> LocalJob | None:
+        """The download (or build) of ``name`` that runs now, if any."""
+        name = _model_name(name)
+        with self._lock:
+            for job in self._jobs.values():
+                if job.state == "running" and job.kind in ("pull", "build") and job.target == name:
+                    return job
+        return None
+
+    def pull(self, name: str, *, attach: bool = False) -> LocalJob:
         """Download a model (needs the internet; refused in the strict offline mode).
+
+        ``attach`` returns the download of the same model that runs already instead of refusing a second one
+        (``local.job_running``): a second click, another tab or another dialog follows the same job.
 
         A catalog model that is built from pinned upstream weights (``source="build"``) downloads those and is built.
         The job goes through Ollama's own steps (manifest, download, verify, finalize) with the bytes of all files
         added up; a download that was interrupted continues where it stopped (Ollama keeps partial files)."""
         name = _model_name(name)
+        if attach:
+            running = self.running_download(name)
+            if running is not None:
+                return running
+            try:
+                return self.pull(name)
+            except NodestroError as exc:  # started by another request in between: follow that one
+                if exc.code == "local.job_running" and isinstance(exc.params.get("job"), str):
+                    return self.job(exc.params["job"])
+                raise
         entry = catalog_model(name)
         if entry is not None and entry.source == "build":
             return self.build(name, download=True)

@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
+from orkexa.local import OllamaError, scan_store
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot, is_local_inference
 from pydantic import BaseModel
 
@@ -447,8 +448,12 @@ def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
     """
     used = {model for model in workflow_models(workflow) if _valid(model) and provider_of(model) == "ollama"}
     service = nodestro.local_models
-    if not used or service.ollama_url() is None:
+    if not used:
         return []
+    if service.ollama_url() is None:
+        # The managed server is not running (it starts with the run): its model folder tells what is installed,
+        # so a run, also an unattended one, is refused before it starts the server for a model that is not there.
+        return _stored_model_issues(nodestro, used)
     try:
         client = service.client()
         if not client.is_running():  # a short probe, so an unreachable server never slows the check down
@@ -494,6 +499,28 @@ def _local_model_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIs
                 )
             )
     return found
+
+
+def _stored_model_issues(nodestro: Workspace, used: set[str]) -> list[CheckIssue]:
+    """``check.local_model_missing`` from the managed server's model folder while that server is not running (only
+    when its runtime is installed: without it the provider check names the missing setup)."""
+    service = nodestro.local_models
+    if service.mode != "managed" or service.runtime_binary() is None:
+        return []
+    try:
+        stored = {_local_name(item.name) for item in scan_store(service.models_dir())}
+    except (OllamaError, OSError):
+        stored = set()  # no folder yet: nothing is installed
+    return [
+        _issue(
+            "check.local_model_missing",
+            f"{model} is not installed on the local model server; download or import it in the settings",
+            level="error",
+            model=model,
+        )
+        for model in sorted(used)
+        if _local_name(model) not in stored
+    ]
 
 
 _NO_MODEL = InstalledModel(name="", size=0, digest="", kind="chat")

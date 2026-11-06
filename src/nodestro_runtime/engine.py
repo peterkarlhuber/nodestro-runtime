@@ -4593,6 +4593,10 @@ def node_problem(exc: BaseException) -> Problem:
 _OVERLOADED_STATUSES = frozenset({503, 529})
 
 
+#: The model an Ollama 404 names (``model "qwen3.5:9b" not found``, quotes possibly escaped in JSON).
+_OLLAMA_MISSING = re.compile(r"model\s+\\?[\"']?([\w.:/@-]+?)\\?[\"']?\s+not found")
+
+
 def provider_problem(exc: ProviderError, text: str) -> Problem:
     """A provider failure as a code the UI can act on (AD-01).
 
@@ -4605,6 +4609,7 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     - ``run.provider_rate_limited``: too many requests or tokens for the account.
     - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
       ``overloaded`` error inside a stream, which arrives without that status).
+    - ``run.local_model_missing``: the local model server (Ollama) does not have the model (404); ``params.model``.
     - ``run.api_error``: anything else (other 4xx/5xx), as before.
 
     ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
@@ -4613,6 +4618,11 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     provider = exc.provider or ""
     status = exc.status_code
     known: dict[str, Any] = {"provider": provider} if status is None else {"provider": provider, "status": status}
+    if provider == "ollama" and status == 404:
+        # The local model server does not have the model (Ollama: 'model "x" not found, try pulling it first'): a
+        # missing prerequisite an authorized person fixes by downloading it, never a generic API error.
+        named = _OLLAMA_MISSING.search(text)
+        return problem("run.local_model_missing", text, provider=provider, model=named.group(1) if named else "")
     if isinstance(exc, AuthenticationError) or status in (401, 403):
         return problem("run.provider_auth", text, **known)
     if isinstance(exc, ProviderConnectionError):
