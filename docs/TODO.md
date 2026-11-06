@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 38 |
+| P3 Low | 40 |
 | P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -344,6 +344,18 @@ Items that need an independent or external review (an internal audit does not re
   and the price check are refused at once; only the local server's own network route lags behind.
 - **Next step:** On a change of `strict_offline`, restart the managed server with `offline` (orkexa
   `ManagedOllama.restart(offline=...)`) when no local request is running, or mark it for a restart; add a test.
+
+### RT-067 · Small local thinking models loop on tool calls
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-5)
+- **What:** After the 400 fix, the production-downtime example on qwen3.5:2b (CPU) failed twice with `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). Every request was accepted.
+- **Next step:** Compare tool looping with and without reasoning sent back; consider a higher default `max_tool_rounds` for local thinking models.
+
+### RT-068 · Request timeout too short for local models on CPU
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-2)
+- **What:** On CPU the SDK's default 600 s timeout expired on a slow request; the retry that followed is safe but slow.
+- **Next step:** A timeout suited to CPU for local Ollama connections, taken from the hardware profile.
 
 ## Architecture and modularity
 

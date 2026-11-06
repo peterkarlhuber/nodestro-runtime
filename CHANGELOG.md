@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed: an Ollama 400 "invalid message content type: <nil>" in multi-step agent runs with thinking models (cause and
+  fix in Orkexa). A provider that refuses the conversation now fails the step with `run.provider_rejected_messages`
+  (technical text ends with a content-free outline), a too-large conversation with `run.provider_context_exceeded`;
+  neither is retried.
 - Settings, attachments and providers (2026-11-06):
   - Output limits of Nodestro's own AI steps are configurable (`output_limits`: setting, then built-in default,
     then capped by the model and reported when lowered); run chat answers up to 4,000 tokens (was 1,500). Agent
