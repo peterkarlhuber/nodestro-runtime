@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa import MODEL_PRICING
 from orkexa.pricing import BUILTIN_SNAPSHOT, PriceSnapshot
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from .tool_policy import UNKNOWN, ToolCapability, server_tool_capability
 
@@ -265,6 +265,11 @@ class ServerToolInfo(BaseModel):
     definition: dict[str, Any]
     #: What the tool may do (S-1). Server tools run at the provider and never pass Nodestro's per-call rules.
     capability: ToolCapability = UNKNOWN
+    #: The providers whose API runs this tool with the definition above (Anthropic's Messages API).
+    providers: list[str] = Field(default_factory=lambda: ["anthropic"])
+    #: Providers with a comparable native tool that Nodestro does not offer: its fees are not in the price catalog,
+    #: so a run's cost could not be estimated or limited (shown as not available, with that reason).
+    unpriced_providers: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -282,6 +287,7 @@ SERVER_TOOLS: dict[str, ServerToolInfo] = {
             label="Web search",
             description="Searches the web and cites its sources (run by Anthropic; $10 per 1,000 searches).",
             definition={"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
+            unpriced_providers=["openai", "gemini"],
         ),
         ServerToolInfo(
             key="web_fetch",
@@ -294,6 +300,7 @@ SERVER_TOOLS: dict[str, ServerToolInfo] = {
             label="Code execution",
             description="Runs Python in a sandbox at Anthropic. Not together with web search or web fetch.",
             definition={"type": "code_execution_20260521", "name": "code_execution"},
+            unpriced_providers=["openai", "gemini"],
         ),
     )
 }

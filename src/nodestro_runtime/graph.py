@@ -231,6 +231,10 @@ def fingerprints(
     for node in topological_order(workflow):
         # Who may steer an orchestrator live does not change what its result depends on.
         config = node.model_dump(mode="json", exclude={"position": True, "orchestrator": {"live_steering"}})
+        agent = config.get("agent")
+        if isinstance(agent, dict) and agent.get("thinking_budget") is None:
+            # Added later with a default that changes nothing: runs of earlier releases keep their fingerprints.
+            agent.pop("thinking_budget", None)
         parts: dict[str, Any] = {"node": config}
         parts["inputs"] = sorted(
             (result.get(edge.source, ""), edge.source, edge.source_handle or "") for edge in incoming[node.id]

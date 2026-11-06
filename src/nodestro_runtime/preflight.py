@@ -724,6 +724,24 @@ def _orchestrator_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckI
         if node.type != "orchestrator" or node.orchestrator is None:
             continue
         label = node_label(node)
+        model = node.orchestrator.model
+        if model and _valid(model):
+            # Every decision is a structured answer (RT-061): a model without structured output (or an endpoint
+            # whose capabilities are not declared) would fail at the first decision.
+            support = nodestro.builder.capabilities(model).support("structured_output")
+            if support != "supported":
+                found.append(
+                    _issue(
+                        "check.orchestrator_model_unsupported",
+                        f"{label}: the model {model} cannot return the structured decisions of an orchestrator "
+                        f"(structured output is {support})",
+                        level="error",
+                        node_id=node.id,
+                        name=label,
+                        model=model,
+                        support=support,
+                    )
+                )
         select = node.orchestrator.select
         if select is not None and select.capabilities:
             chosen = [member for member in node.orchestrator.members if member.matched]

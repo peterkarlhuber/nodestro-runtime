@@ -70,6 +70,7 @@ from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .mcp_access import is_mcp_tool
+from .output_limits import OPERATIONS
 from .problems import NodestroError, Problem, problem
 from .providers import Connection, qualify
 from .sandbox_policy import HOST_AWS_ENV, Isolation, SandboxPolicy, TrustClass, isolation_of
@@ -544,6 +545,11 @@ class ToolLibrary:
         #: The ``auto`` sandbox mode on the desktop: the container sandbox for code that needs isolation (Docker-first,
         #: ADR-0006); ``None`` while Docker has not passed its checks or in other modes.
         self.container_fallback: Callable[[], Sandbox | None] | None = None
+        #: The output limit of the Coding Agent that writes a tool (the workspace's ``output_limits.tool_generation``,
+        #: capped by the model's maximum; set by the workspace).
+        self.generation_max_tokens: Callable[[str, Connection], int] = lambda _model, _connection: OPERATIONS[
+            "tool_generation"
+        ]
         #: The desktop's ``sandbox`` setting (set by the workspace): ``auto``, ``subprocess``, ``linux`` or ``docker``.
         #: Code that needs isolation is moved to the built-in Linux sandbox only in ``linux`` mode (chosen explicitly);
         #: ``None`` (a library without a workspace) never moves it there.
@@ -1253,6 +1259,7 @@ class ToolLibrary:
                 model=qualify(model),
                 system_prompt=CODING_PROMPT,
                 effort=connection.effort(model, "high"),
+                max_tokens=self.generation_max_tokens(model, connection),
                 credentials={connection.provider: connection.settings(model)},
                 usage_tracker=tracker,
             )
