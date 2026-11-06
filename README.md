@@ -15,12 +15,17 @@ package; the runtime itself depends on neither.
 | Area | Modules |
 | --- | --- |
 | Workflow model | `schemas`, `graph`, `conditions`, `forms`, `catalog`, `versions`, `release` |
-| Execution | `engine` (DAG, parallel branches, live events, budget, cancellation), `launcher`, `preflight`, `resume`, `run_views`, `usage_log`, `traces` |
-| Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities) |
+| Execution | `engine` (DAG, parallel branches, live events, budget, cancellation), `launcher`, `preflight`, `resume`, `run_views`, `run_budget` (budget decisions), `usage_log`, `traces`, `error_codes` (catalog of problem codes) |
+| Orchestration and run chat | `orchestrator` (an orchestrator node that picks teams at run time), `flow_driver`, `run_chat` (live chat with a running workflow) |
+| Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities), `bedrock` (Amazon Bedrock), `model_profile`, `reasoning`, `output_limits`, `pricing`, `pricing_sync`, `cost_tracking`, `reconciliation` (estimates against bills) |
 | Local models | `local_models` (catalog, task- and hardware-aware recommendations), `local_service` (the Ollama server per profile, model jobs); see [docs/local-models.md](docs/local-models.md) |
-| Tools | `tool_library`, `builtin_tools`, `tool_drafts`, `python_deps`, `python_envs`, `python_tools` |
+| Tools | `tool_library`, `builtin_tools`, `tool_drafts`, `tool_provenance`, `tool_adoption`, `python_deps`, `python_envs`, `python_tools`, `value_checks` |
+| Tool approvals | `tool_approvals`, `tool_checkpoints`, `tool_policy`, `tool_preflight`, `tool_journal` (off by default: `NODESTRO_TOOL_APPROVALS`) |
+| Sandboxes | `sandbox_policy` (trust classes, ADR-0006), `sandbox_selection`, `builtin_sandbox` (Linux), `container_images`, `sandbox_gateway`, `sandbox_probes`, `docker_status`, `sandbox_cancel`, `sandbox_confine`, `image_limits` |
+| MCP | `mcp` (client hub, OAuth, stdio servers in containers, network guard), `mcp_access` |
 | Knowledge, memory, files | `knowledge`, `memory_spaces`, `documents`, `input_files`, `file_formats`, `file_delivery`, `office`, `reports`, `adoption`, `sanitize`, `preview` |
-| Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` (`DocumentStore`, `SQLiteStore`), `sqlite_tables` |
+| Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` (`DocumentStore`, `SQLiteStore`), `sqlite_tables`, `profile` (desktop or server) |
+| Server | `storage_postgres`, `postgres_tables`, `postgres_import`, `jobs` (run queue, workers, leases, schedules), `server_settings`, `identity_store`, `axentra_*` (Axentra platform), `platform_events`, `tenant_sql_check` |
 | Extensions | `extensions` (contract for integrations, entry point group `nodestro.integrations`) |
 | Testing | `testing` (simulated provider clients and uv; never a real request) |
 
@@ -171,9 +176,9 @@ Text and thinking deltas beyond 5,000 events are published but not kept for late
 subscriber that falls 10,000 events behind is ended (it reads the run again).
 
 **Tools.** Built-in tools run in the process. Custom and AI-generated tools are checked statically and run in
-a sandbox: a separate Python process with an empty environment, time and memory limits (`subprocess`), or a Docker
-container without network (`docker`). The process sandbox limits what a tool can do by accident; it is not a
-security boundary against hostile code. Third-party Python packages are installed only after a person approved
+a sandbox: a separate Python process with an empty environment, time and memory limits (`subprocess`), a Docker
+container without network (`docker`), or the built-in Linux sandbox (`linux`, desktop only). The process sandbox
+limits what a tool can do by accident; it is not a security boundary against hostile code. Third-party Python packages are installed only after a person approved
 the exact versions of every package (`python_envs`), into a separate environment per workflow or tool.
 
 **Checked key figures.** A number field of an agent's structured result can declare `source="tool"`
@@ -193,8 +198,9 @@ figures inside free text are not checked.
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).
 `nodestro_runtime.sandbox_policy.SandboxPolicy` decides before any code runs: untrusted code runs only in an
-isolating sandbox (Docker); in the process sandbox it is refused with `sandbox.isolation_required`, and nothing is
-executed. There is no setting, environment variable or confirmation that lifts this. Consequences without Docker:
+isolating sandbox (a Docker container; on the desktop also the built-in Linux sandbox once this computer passed its
+checks and it was chosen explicitly); in the process sandbox it is refused with `sandbox.isolation_required`, and
+nothing is executed. There is no setting, environment variable or confirmation that lifts this. Consequences without Docker:
 tool generation does not start, tool drafts cannot be tested or approved, and agents that use untrusted tools fail
 the workflow check before a run starts. Provenance is stored per tool (`tool_provenance`); editing an untrusted tool,
 re-creating it under the same name or copying its code into a new tool keeps it untrusted, tools stored before this
@@ -270,7 +276,8 @@ copy. Runs without a readable `created_at` (and damaged documents) are not liste
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `pip install "nodestro-runtime[postgres]"` (psycopg 3) and is not
-used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns one connection; `database.store(tenant_id)` gives
+used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns a pool of connections (`pool_size`, default
+`NODESTRO_DATABASE_POOL_SIZE`, else 8) shared by every tenant's store; `database.store(tenant_id)` gives
 the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store
 never reads or changes another tenant's documents. `database.migrate(before_migration=...)` applies the numbered SQL
 files in `nodestro_runtime/migrations/postgres` under an advisory lock (several processes may start at once) and
