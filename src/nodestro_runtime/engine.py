@@ -49,6 +49,7 @@ from orkexa import (
     DataResidencyError,
     EphemeralMemory,
     Evaluator,
+    InvalidRequestError,
     MemoryBackend,
     OrkexaError,
     ProviderConnectionError,
@@ -4622,6 +4623,13 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
       ``overloaded`` error inside a stream, which arrives without that status).
     - ``run.local_model_missing``: the local model server (Ollama) does not have the model (404); ``params.model``.
+    - ``run.provider_rejected_messages``: the provider refused the conversation the agent sent
+      (a message's content, role or tool call/result pairing; Orkexa's
+      ``InvalidRequestError.reason == "messages"``). The technical text ends with the outline of
+      the refused conversation: roles and part kinds, never content. Retrying the same request
+      cannot help.
+    - ``run.provider_context_exceeded``: the conversation is larger than the model's context
+      window (``reason == "context_length"``).
     - ``run.api_error``: anything else (other 4xx/5xx), as before.
 
     ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
@@ -4641,6 +4649,10 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
         return problem("run.provider_unreachable", text, **known)
     if isinstance(exc, RateLimitError) or status == 429:
         return problem("run.provider_rate_limited", text, **known)
+    if isinstance(exc, InvalidRequestError) and exc.reason == "messages":
+        return problem("run.provider_rejected_messages", text, **known)
+    if isinstance(exc, InvalidRequestError) and exc.reason == "context_length":
+        return problem("run.provider_context_exceeded", text, **known)
     client_error = status is not None and 400 <= status < 500
     if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
         return problem("run.provider_overloaded", text, **known)
