@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- TODO abatement round 3 (2026-11-06):
+  - `KnowledgeBase.reindex_queue` (`ReindexQueue`): with a queue attached, `start_reindex`, `cancel_reindex` and
+    `drop_vectors` go through the server's job queue; `execute_reindex` builds the index for a worker and reports
+    progress. `jobs.ReindexWorker` claims `reindex` jobs with a lease and heartbeat, `jobs.QueuedReindex` is the
+    queue for one tenant, and `JobQueue.report` stores a running job's progress; a job whose worker stopped is
+    `knowledge.reindex_interrupted` (RT-046).
+  - `Workspace.background_work()` names what runs in this process (runs, tool jobs, run chats, Python installs,
+    local model jobs, reindex), so a server can tell whether an idle workspace may be closed.
 - TODO abatement round 2 (2026-11-06):
   - Orkexa pinned to `1b61fda` (orkexa PR #55): `ToolRegistry.refresh()`, Bedrock prompt caching, Python 3.14
     support, and compatible endpoints that refuse redirects.
