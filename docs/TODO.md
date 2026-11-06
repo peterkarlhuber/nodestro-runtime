@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 27 |
+| P3 Low | 24 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -433,25 +433,11 @@ Items that need an independent or external review (an internal audit does not re
   tools, unattended calls, stdio servers that are not Python packages).
 - **Next step:** Owner decision per topic; none is planned now.
 
-### RT-055 · Copies of examples do not remember their origin
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** UX round 3 handover B-1; examples EX-003, studio ST-007, ST-031
-- **What:** A workflow copied from an example does not store which example, language and offline connections it came
-  from, so the studio cannot mark the sample-data mode or offer an update of the copy.
-- **Next step:** Store the origin (example id, version, language, offline connections) on the copy; expose it read-only
-  in the API.
-
 ### RT-062 · Capabilities of non-catalog local models are known only after the download
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (missing-model stream)
 - **What:** For a local model that is neither in the catalog nor installed, a missing capability (tools, vision, embeddings) is found only after the download.
 - **Next step:** Read the capabilities from the registry manifest before the download and report `capability_missing` up front.
-
-### RT-063 · Reasoning of the architect's CodingAgent and AgentArchitect sub-requests is not streamed
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (thinking stream, THINK-1)
-- **What:** The Workflow Architect streams its own reasoning; the sub-requests that write tools and agents show only an activity status.
-- **Next step:** Forward their reasoning events through the same `ReasoningStreamInfo` channel.
 
 ### RT-064 · Overall pull ETA for local model downloads
 
@@ -473,8 +459,8 @@ Items that need an independent or external review (an internal audit does not re
 - **What:** The answering test double (`testing.AnswerAll`) finishes orchestrations since the TODO abatement round, but
   its text answers are German placeholders ("Ergebnis des Agenten.", "Beispiel") in every language. Tests of other
   repositories assert this exact text, and a run has no language field the double could follow.
-- **Next step:** Decide where the run's language comes from (the copied example's language, RT-055); then answer in it
-  and update the asserting tests together.
+- **Next step:** Decide where the run's language comes from (a copied example now stores its language in
+  `Workflow.origin`, but other workflows have none); then answer in it and update the asserting tests together.
 
 ### RT-017 · Fixes that still need an independent or Docker-backed check
 
@@ -574,15 +560,6 @@ None known.
 
 ## Technical debt
 
-### RT-022 · Python 3.14 untested
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** `pyproject.toml`, CI matrix 3.11/3.13
-- **What:** Python 3.11 is the minimum of all Nodestro repositories and orkexa since 2026-11-02 (3.10 reached end of
-  life in October 2026). 3.14 is not in the CI matrices or classifiers: every dependency installs on 3.14 (checked
-  2026-11-02), but orkexa's sandbox policy test fails there (ORK-007).
-- **Next step:** After ORK-007, add 3.14 to the matrices and classifiers of all Python repositories at once.
-- **Depends on:** orkexa ORK-007
-
 ### RT-023 · Reproducible Python dependencies
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit D-05, `.github/dependabot.yml`
@@ -655,8 +632,7 @@ None known.
 |---|---|---|---|
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
-| — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Available in orkexa `630901f` (branch ws-ork, not pinned yet); after the pin moves, the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
-| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
+| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `1b61fda`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | RT-015 | nodestro-api | API-021 (region in usage views) | Runtime records the region first |
@@ -664,7 +640,6 @@ None known.
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
 | RT-049 | orkexa, nodestro-desktop | ORK-030, DSK-022 (managed Ollama on macOS/Windows) | Orkexa owns the managed server; runtime reruns its local-model tests there |
-| RT-022 | orkexa | ORK-007 | Orkexa supports 3.14 in `630901f` (branch ws-ork, not pinned yet); add 3.14 here after the pin moves |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
 

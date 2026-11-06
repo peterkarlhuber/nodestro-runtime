@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- TODO abatement round 2 (2026-11-06):
+  - Orkexa pinned to `1b61fda` (orkexa PR #55): `ToolRegistry.refresh()`, Bedrock prompt caching, Python 3.14
+    support, and compatible endpoints that refuse redirects.
+  - `ToolLibrary.registry` reads tools stored by another process with `ToolRegistry.refresh()` and keeps the same
+    registry object; the rebuilding workaround from #57 is gone.
+  - Bedrock Claude models that support caching map `cache_control` and `cache_ttl` to cache points after the system
+    prompt, the tools and the last user message (was `not_mapped`).
+  - `Workflow.origin` (`WorkflowOrigin`: example id, version, language, offline and connected connections, copy
+    time): where a copied example came from. It is read-only, and saving a workflow keeps it (RT-055).
+  - CI and classifiers include Python 3.14; the Landlock rule struct names its packed layout, which 3.14 asks for
+    (RT-022).
 - TODO abatement round (2026-11-06):
   - Agents that read content they did not write (tools, server tools, memory, files, knowledge) are told in their
     system prompt that it is data, not instructions; background material is introduced as reference data (RT-002).
