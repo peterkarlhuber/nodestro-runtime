@@ -73,4 +73,22 @@ def test_postgres_reproduces_the_recorded_results(fixture: dict[str, Any]) -> No
         recorded = fixture["results"][backend]
         assert notes == recorded["meta"]["notes"][identity], backend
         for query_id, by_mode in runs.items():
-            assert by_mode == recorded["runs"][identity][query_id], (backend, identity, query_id)
+            expected = recorded["runs"][identity][query_id]
+            assert _same(by_mode, expected), (backend, identity, query_id, by_mode, expected)
+
+
+def _same(found: Any, recorded: Any) -> bool:
+    """Equal, except that a full-precision score may differ in its last bits: Python 3.12 made ``sum()`` of floats
+    compensated, so the runtime's cosine (pg-a) differs by one ulp between Python versions. Ids, order, modes and the
+    scores rounded to six places stay exact."""
+    if isinstance(found, dict) and isinstance(recorded, dict):
+        return found.keys() == recorded.keys() and all(_same(found[k], recorded[k]) for k in found)
+    if isinstance(found, list) and isinstance(recorded, list):
+        return len(found) == len(recorded) and all(_same(a, b) for a, b in zip(found, recorded, strict=True))
+    if found == recorded:
+        return True
+    try:
+        a, b = float(found), float(recorded)
+    except (TypeError, ValueError):
+        return False
+    return abs(a - b) <= 1e-12 * max(1.0, abs(b))
