@@ -1,0 +1,4 @@
+# Skipped tests of the CI job platforms start (macos-15-intel) (MUP-ONA A0; checked by scripts/check_skips.py).
+# One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
+tests.test_platform_start::test_import_without_linux_kernel_functions[darwin]  # simulates the other systems on Linux only
+tests.test_platform_start::test_import_without_linux_kernel_functions[win32]  # simulates the other systems on Linux only

@@ -1,0 +1,3 @@
+# Skipped tests of the CI job platforms start (ubuntu-latest) (MUP-ONA A0; checked by scripts/check_skips.py).
+# One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
+tests.test_platform_start::test_untrusted_code_is_refused_without_isolation  # the runner has the built-in sandbox (non-root user, Landlock)

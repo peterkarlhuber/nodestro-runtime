@@ -591,6 +591,7 @@ None known.
 - **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
   keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema.
 - **Next step:** A `nodestro-server` check that reports it, and the command in the operator documentation.
+- **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
 
 ## Later optimizations
 
@@ -601,6 +602,7 @@ None known.
   runtime). That is right for desktop-sized knowledge bases; without pgvector the runtime reads every candidate vector,
   so each query transfers every vector of the namespace from PostgreSQL.
 - **Next step:** Only for large tenants: an HNSW index per space (pgvector) once a model's dimensions are fixed.
+- **Plan:** MUP-ONA MP-B7 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
 
 ## Accepted risks
 
@@ -625,6 +627,81 @@ None known.
 - **What:** In standard price mode a request without a price is still sent; its cost stays unknown (never zero) and is
   not counted against a budget, so local models stay usable. Strict price mode refuses it.
 - **Next step:** None planned.
+
+## MUP-ONA
+
+Packages of the MUP-ONA plan
+([MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)) that
+change this repository. Each entry is removed in the
+PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
+
+### RT-MUP-A1 · PDF extraction with a guaranteed end (MUP-ONA MP-A1)
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** Knowledge uploads extract PDF text in the API process (`documents.py` imports orkexa's private `_pdf_pages`,
+  `file_formats.py` has a second path); a thread timeout does not stop `pypdf`.
+- **Next step:** After orkexa's `pdf_pages_isolated`: both paths use it, with the limits configurable
+  (`NODESTRO_PDF_TIMEOUT_SECONDS`, `NODESTRO_PDF_MAX_PAGES`, ...).
+
+### RT-MUP-A7 · Price sync integrity (MUP-ONA MP-A7, VB-1)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** `pricing_sync.py` follows redirects and imports the LiteLLM price file from `main` without an integrity
+  check.
+- **Next step:** No redirects; a pinned source or a configured SHA-256; a mismatch imports nothing and warns.
+
+### RT-MUP-A8 · Shared security test vectors (MUP-ONA MP-A8)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** `netguard`, JWT and `sanitize` are tested with their own cases only, not against the corpus Axentra uses.
+- **Next step:** `tests/vectors/security-vectors.json` (canonical, versioned) with its tests; Axentra keeps a
+  checksummed copy.
+
+### RT-MUP-A11 · Tenant SQL checker anchored in CI (MUP-ONA MP-A11, PS-10)
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** The API scan in `tests/test_tenant_filters.py` is skipped in this repository's CI (no API checkout), and
+  `tenant_id = ANY(%s)` is accepted without an allowlist entry.
+- **Next step:** Marker `tenant_api_scan` with `NODESTRO_API_SRC`/`NODESTRO_REQUIRE_API_SCAN`, a `tenant-sql-api` CI job
+  with a public API checkout, and `allow_any=False` with reasoned allowlist entries.
+
+### RT-MUP-B1 · Backend conformance suite against Nodestro's classes (MUP-ONA MP-B1)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** `PostgresIndex`, `PostgresFileStore` and `PostgresMemory` are not measured against a shared contract suite.
+- **Next step:** Run orkexa's public conformance suite (T-CONF) against them once it exists; documented drifts as strict
+  xfails.
+
+### RT-MUP-B3 · PostgreSQL drift and pgvector in CI (MUP-ONA MP-B3)
+
+- **Priority:** P2 Medium · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** Ten documented differences between `PostgresIndex` and `SQLiteIndex`; pgvector is not tested in a required
+  job.
+- **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
+  tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
+
+### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** The generic PostgreSQL index, file store and memory code is mixed with product code; its SQL is not a
+  catalog.
+- **Next step:** Prepare the generic part for orkexa with a statement catalog while proving the tenant SQL check keeps
+  its coverage (T-PAR). Needs gate G1.
+
+### RT-MUP-B6 · Switch to orkexa's PostgreSQL backend (MUP-ONA MP-B6)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **What:** Nodestro keeps its own copy of the generic PostgreSQL backend.
+- **Next step:** Use `orkexa.backends.postgres`, remove the copy, and prove upgrade and rollback on FX-PG-0 (U1-U8).
+  Needs gate G1.
 
 ## Cross-repository dependencies
 
