@@ -133,7 +133,9 @@ class DocumentStore(Protocol):
     Contract (tested for every implementation in ``tests/test_storage_contract.py``):
 
     - ``put``/``put_raw`` insert or replace; ``put`` also marks the document as updated now, ``put_raw`` keeps the
-      update time of an existing document.
+      update time of an existing document. ``put_raw_if_absent`` inserts only when no document has the key, as one
+      atomic step that is safe across threads, processes and database connections (reserving a key once, such as an
+      ``Idempotency-Key``), and returns whether it inserted; an existing document is left as it is.
     - ``list_page`` is a keyset page by creation (RT2-05): documents with a readable top-level ``created_at``,
       newest first (ties: higher id first), strictly after the cursor ``before = (created_at, id)`` in that order
       (``id`` ``""``: everything older than the time), with ``top_level`` only those without ``parent_run_id``;
@@ -170,6 +172,8 @@ class DocumentStore(Protocol):
     def put(self, collection: str, key: str, model: BaseModel) -> None: ...
 
     def put_raw(self, collection: str, key: str, value: Any) -> None: ...
+
+    def put_raw_if_absent(self, collection: str, key: str, value: Any) -> bool: ...
 
     def replace_if(
         self, collection: str, key: str, model: BaseModel, *, field: str, expected: str, live_until: str | None = None
@@ -362,6 +366,15 @@ class SQLiteStore:
                 " ON CONFLICT (collection, id) DO UPDATE SET data = excluded.data",
                 (collection, key, json.dumps(value)),
             )
+
+    def put_raw_if_absent(self, collection: str, key: str, value: Any) -> bool:
+        with self._transaction() as db:
+            cursor = db.execute(
+                "INSERT INTO nodestro_documents (collection, id, data) VALUES (?, ?, ?)"
+                " ON CONFLICT (collection, id) DO NOTHING",
+                (collection, key, json.dumps(value)),
+            )
+            return cursor.rowcount == 1
 
     def get_raw(self, collection: str, key: str) -> Any | None:
         with self._lock:

@@ -883,6 +883,17 @@ class PostgresStore:
         self._check()
         self._put(collection, key, json.dumps(value), touch=False)
 
+    def put_raw_if_absent(self, collection: str, key: str, value: Any) -> bool:
+        """One ``INSERT ... ON CONFLICT DO NOTHING``: atomic for every connection; ``True`` when it inserted."""
+        self._check()
+        data, raw = _encode(json.dumps(value))
+        inserted = self.database._write(
+            "INSERT INTO nodestro_documents (tenant_id, collection, id, data, raw) VALUES (%s, %s, %s, %s::jsonb, %s)"
+            " ON CONFLICT (tenant_id, collection, id) DO NOTHING",
+            (self.tenant_id, collection, key, data, raw),
+        )
+        return inserted == 1
+
     def replace_if(
         self, collection: str, key: str, model: BaseModel, *, field: str, expected: str, live_until: str | None = None
     ) -> bool:
