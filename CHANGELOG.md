@@ -1853,6 +1853,12 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     `make_legacy_pg.py` and a restore test (T-FX-1); the ranking corpus FX-RANK-0 with its PostgreSQL results
     (`tests/fixtures/ranking/`, T-RANK-0); every CI pytest job compares its skipped tests with
     `tests/ci/skipped-<job>.txt` (`scripts/check_skips.py`, T-SKIP-1).
+  - tests/ci: the tenant SQL check is anchored in CI (A11). `check_sql`/`scan_package` take `allow_any` (default
+    off): `tenant_id = ANY(<param>)` no longer binds a reference and needs an allowlist entry with its reason
+    (no statement of the runtime or the API uses it). The API scan tests carry the marker `tenant_api_scan` and
+    read `NODESTRO_API_SRC`; `NODESTRO_REQUIRE_API_SCAN=1` fails instead of skipping. The new job
+    `tenant-sql-api` scans a public checkout of nodestro-api with this commit's checker, including a planted
+    leak. `CONTRIBUTING.md`: a checker or migration change needs a green nodestro-api `tenant-sql` run.
 
 ## 0.2.0 (2026-10-29)
 

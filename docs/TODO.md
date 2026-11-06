@@ -660,15 +660,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** `tests/vectors/security-vectors.json` (canonical, versioned) with its tests; Axentra keeps a
   checksummed copy.
 
-### RT-MUP-A11 · Tenant SQL checker anchored in CI (MUP-ONA MP-A11, PS-10)
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** The API scan in `tests/test_tenant_filters.py` is skipped in this repository's CI (no API checkout), and
-  `tenant_id = ANY(%s)` is accepted without an allowlist entry.
-- **Next step:** Marker `tenant_api_scan` with `NODESTRO_API_SRC`/`NODESTRO_REQUIRE_API_SCAN`, a `tenant-sql-api` CI job
-  with a public API checkout, and `allow_any=False` with reasoned allowlist entries.
-
 ### RT-MUP-B1 · Backend conformance suite against Nodestro's classes (MUP-ONA MP-B1)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**
