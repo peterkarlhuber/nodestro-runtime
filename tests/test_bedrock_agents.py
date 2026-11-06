@@ -150,11 +150,12 @@ def test_request_options_cannot_change_the_connection(options: dict[str, Any], t
     ],
 )
 def test_anthropic_only_options_stay_refused_for_claude_on_bedrock(change: dict[str, Any], tmp_path: Path) -> None:
+    # Converse has none of these options (by capability, not by provider name: model_profile.option_support).
     workspace = Workspace(tmp_path / "ws", integrations=[])
     try:
         config = AgentConfig.model_validate({"model": CLAUDE, **change})
         issues = workspace.builder.validate(config)
-        assert "config.anthropic_only" in {issue.code for issue in issues}
+        assert {"config.option_unsupported", "config.native_tool_unsupported"} & {issue.code for issue in issues}
     finally:
         workspace.close()
 
