@@ -114,6 +114,7 @@ from .schemas import (
     SettingsIn,
     Workflow,
     WorkflowIn,
+    keep_origin,
     now,
 )
 from .server_settings import TenantSecrets, is_encrypted
@@ -1169,7 +1170,7 @@ class Workspace:
             self.store.lock("workflows", saved.id)  # ``previous`` stays the state this save replaces
             previous = self.store.get("workflows", saved.id, Workflow)
             # Legacy exemptions (S-2, D10b) come only from the activation step, never from a save, copy or import.
-            saved = keep_only_inherited(saved, previous)
+            saved = keep_origin(keep_only_inherited(saved, previous), previous)
             self.store.put("workflows", saved.id, saved)
             self.versions.record(saved, previous=previous)
         return saved
