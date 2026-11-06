@@ -18,6 +18,7 @@ from copy import deepcopy
 from pathlib import Path
 import re
 import threading
+import time
 import types
 from types import SimpleNamespace
 from typing import Any, Literal, Union, get_args, get_origin
@@ -92,6 +93,10 @@ def parsed(output_factory: Callable[[type[Any]], Any]) -> Callable[[dict[str, An
     return respond
 
 
+#: Seconds between the thinking deltas of a scripted stream; browser tests set it to watch reasoning arrive live.
+STREAM_DELAY = 0.0
+
+
 class _Stream:
     def __init__(self, response: Any) -> None:
         self.response = response
@@ -111,6 +116,8 @@ class _Stream:
                 yield SimpleNamespace(type="content_block_start", index=index, content_block=block)
                 thought = getattr(block, "thinking", "") or ""
                 for start in range(0, len(thought), 24):  # several deltas, as a real stream sends them
+                    if STREAM_DELAY:
+                        time.sleep(STREAM_DELAY)
                     yield SimpleNamespace(type="thinking", thinking=thought[start : start + 24])
                 yield SimpleNamespace(type="content_block_stop", index=index)
 

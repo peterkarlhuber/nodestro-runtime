@@ -50,7 +50,15 @@ to the interface and what each provider can deliver.
      `request_option`, `requested`, `reason`) for every provider, so the interface can explain an empty stream.
 5. **Studio.** One component (`components/ReasoningView.tsx`) shows the states everywhere: *thinking* (status only),
    *thinking text*, *reasoning summary*, *not transmitted* (redacted, or the provider sends no text) and *not exposed*
-   (the model does not reason or the provider never sends reasoning), clearly apart from the answer.
+   (the model does not reason or the provider never sends reasoning), clearly apart from the answer. It is used by
+   the assistant (`MessageView`), the run chat (`TeamLeaderChat`, live answers from `answering`), workflow runs and
+   the agent test (`RunDetails`, from the `thinking*` fields of a step), and the architect (`ArchitectReasoning`).
+   `lib/reasoningTrace.ts` applies the live events the way the server keeps them.
+6. **Display preference.** `lib/thinkingDisplay.ts`: `live` (the text opens while it arrives), `collapsed` (default;
+   the status shows, the text is one click away) or `status` (never the text). Kept in the browser
+   (`localStorage`), globally (settings, *Reasoning display*) and per conversation (`conversation:<id>`,
+   `run-chat:<run id>`); it never reaches the server and changes no workflow. The workspace setting
+   `reasoning_summaries` (administrators) is a separate switch: it decides what OpenAI and Gemini are asked to send.
 
 ## What each provider transmits
 
@@ -78,5 +86,7 @@ answer and no budget rule; reasoning tokens are billed by the provider whether o
   setting, the agent test, live chat answers) and `tests/test_run_chat.py::test_an_answer_streams_its_reasoning_live_and_keeps_it`.
 - API: `tests/test_reasoning_api.py` (assistant SSE order and snapshot consistency, architect steps, capabilities)
   and `tests/test_run_chat_api.py::test_an_answer_streams_its_reasoning_and_text_live`.
-- Studio: `components/ReasoningView.test.tsx`, the store and the e2e suites (`assistant`, `runchat`, `architect`)
-  with doubles that stream thinking.
+- Studio: `components/ReasoningView.test.tsx` (the five states, the display modes, the event reducers, the
+  preference) and the browser suites `e2e/reasoning.mjs` (assistant, settings, themes, French, phone width),
+  `e2e/runChat.mjs` and `e2e/architect.mjs`, whose servers stream Claude-shaped thinking slowly
+  (`nodestro_runtime.testing.thinking` with `STREAM_DELAY`).
