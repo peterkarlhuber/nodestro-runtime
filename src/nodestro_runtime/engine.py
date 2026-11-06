@@ -93,6 +93,7 @@ from .orchestrator import (
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, interrupt_client, model_id, provider_of
+from .reasoning import ReasoningKind, ReasoningTrace, reasoning_hook
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
@@ -4038,10 +4039,20 @@ class RunManager:
             state.text += delta
             self._emit(context, "text", node_id, delta=delta)
 
-        def on_thinking(delta: str) -> None:
+        trace = ReasoningTrace(text=state.thinking, phases=state.thinking_phases)
+
+        def on_thinking(delta: str, kind: ReasoningKind) -> None:
             context.check()
-            state.thinking += delta
-            self._emit(context, "thinking", node_id, delta=delta)
+            added = trace.delta(delta, kind)
+            state.thinking, state.thinking_kind = trace.text, trace.kind
+            state.thinking_phases = trace.phases
+            self._emit(context, "thinking", node_id, delta=added, reasoning_kind=kind)
+
+        def on_reasoning_status(phase: str, kind: str | None, redacted: bool) -> None:
+            context.check()
+            trace.status(phase, redacted)
+            state.thinking_phases, state.thinking_redacted = trace.phases, trace.redacted
+            self._emit(context, "thinking_status", node_id, state=phase, reasoning_kind=kind, redacted=redacted)
 
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
@@ -4103,8 +4114,9 @@ class RunManager:
             "after_tool": after_tool,
             "on_response": on_response,
         }
-        if config.thinking_display in ("summarized", "updates"):
-            hooks["on_thinking"] = on_thinking
+        # Whatever reasoning the provider transmits is passed on, for every provider; showing it is the interface's
+        # choice (Anthropic's thinking_display decides whether Claude sends text at all).
+        hooks["on_event"] = reasoning_hook(on_thinking, on_reasoning_status)
 
         extra: list[ContentBlock] = []
         extra_tools: list[Tool] = []

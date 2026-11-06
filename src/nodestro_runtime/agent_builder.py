@@ -273,7 +273,7 @@ class AgentBuilder:
                 f"The connection of {connection.provider} cannot run a model of {provider}",
                 provider=provider,
             )
-        options = _options(config, provider, connection, model)
+        options = connection.with_reasoning_summaries(_options(config, provider, connection, model))
         unknown = [tool for tool in config.tools if tool not in self.tools]
         if unknown:
             raise NodestroError(

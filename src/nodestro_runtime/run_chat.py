@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 from .mcp_access import UNATTENDED_TRIGGERS
 from .problems import NodestroError
 from .providers import provider_of
+from .reasoning import ReasoningTrace, trace_hook
 from .schemas import Node, NodeRun, Run, Usage, new_id, now
 from .storage import DocumentStore
 
@@ -206,10 +207,21 @@ class RunMessage(BaseModel):
     usage: Usage | None = None
     snapshot_at: datetime | None = None
     snapshot_digest: str | None = None
+    #: Answers: the reasoning the provider transmitted while the answer was written (text only where it sends it).
+    reasoning: ReasoningTrace | None = None
 
     @property
     def key(self) -> str:
         return message_key(self.run_id, self.seq)
+
+
+class LiveAnswer(BaseModel):
+    """An answer being written in this process: what has arrived so far (shown live, never stored as such)."""
+
+    question_id: str
+    run_id: str
+    reasoning: ReasoningTrace = Field(default_factory=ReasoningTrace)
+    text: str = ""
 
 
 def known_cost(usage: Usage | None) -> float:
@@ -303,6 +315,8 @@ class RunChat:
         self._answering: dict[str, RunMessage] = {}
         #: Answers stopped by :meth:`cancel_answers`: their model request is not sent, their answer is not stored.
         self._stopped: set[str] = set()
+        #: What the answers this process is writing have streamed so far (reasoning and text), by question id.
+        self._live: dict[str, LiveAnswer] = {}
         self._lock = threading.Lock()
 
     # -- reading
@@ -545,14 +559,30 @@ class RunChat:
 
     # -- answers
 
-    def begin_answer(self, question: RunMessage) -> None:
+    def begin_answer(self, question: RunMessage) -> LiveAnswer:
+        """Mark ``question`` as being answered here; returns its live progress (filled by the answer's hooks)."""
         with self._lock:
             self._answering[question.id] = question
+            live = self._live[question.id] = LiveAnswer(question_id=question.id, run_id=question.run_id)
+            return live
 
     def end_answer(self, message_id: str) -> None:
         with self._lock:
             self._answering.pop(message_id, None)
             self._stopped.discard(message_id)
+            self._live.pop(message_id, None)
+
+    def live_answers(self, run_id: str) -> list[LiveAnswer]:
+        """Copies of the answers to ``run_id``'s questions this process is writing right now. Another process's
+        answers are not seen here: their question shows as pending until the answer is stored."""
+        with self._lock:
+            return [item.model_copy(deep=True) for item in self._live.values() if item.run_id == run_id]
+
+    def update_live(self, question_id: str, change: Callable[[LiveAnswer], None]) -> None:
+        with self._lock:
+            live = self._live.get(question_id)
+            if live is not None:
+                change(live)
 
     def answer_stopped(self, message_id: str) -> bool:
         """Whether :meth:`cancel_answers` stopped the answer to question ``message_id``."""
@@ -577,6 +607,7 @@ class RunChat:
         usage: Usage,
         snapshot_at: datetime,
         snapshot_digest: str,
+        reasoning: ReasoningTrace | None = None,
     ) -> RunMessage | None:
         """Store the answer to ``question`` and mark it ``answered`` (one transaction); ``None`` when the question
         was answered or failed meanwhile (nothing is stored)."""
@@ -600,6 +631,7 @@ class RunChat:
                 usage=usage,
                 snapshot_at=snapshot_at,
                 snapshot_digest=snapshot_digest,
+                reasoning=reasoning,
                 created_at=self.clock(),
                 status_at=self.clock(),
             )
@@ -913,10 +945,21 @@ def answer_question(
     limits = limits or chat_limits()
     chat.begin_answer(question)
     tracker = None
+    trace = ReasoningTrace()
 
     def on_request(_args: dict[str, Any]) -> None:
         if chat.answer_stopped(question.id):  # cancel_answers: the tenant was suspended
             raise NodestroError("run_chat.answer_stopped", "The answer was stopped")
+
+    def on_event(event: Any) -> None:
+        record(event)
+        snapshot = trace.model_copy()
+        chat.update_live(question.id, lambda live: setattr(live, "reasoning", snapshot))
+
+    def on_text(delta: str) -> None:
+        chat.update_live(question.id, lambda live: setattr(live, "text", live.text + delta))
+
+    record = trace_hook(trace)
 
     try:
         root = manager.get(question.run_id)
@@ -955,7 +998,7 @@ def answer_question(
                 connect=lambda _provider: connection,
                 tracker=tracker,
                 name="run_chat",
-                hooks={"on_request": on_request},
+                hooks={"on_request": on_request, "on_event": on_event, "on_text": on_text},
                 attended=True,
             )
         except NodestroError as exc:
@@ -970,6 +1013,7 @@ def answer_question(
             usage=_usage(tracker, usage_of) or Usage(),
             snapshot_at=taken,
             snapshot_digest=snapshot_digest(text),
+            reasoning=trace.model_copy(update={"active": False}) if trace.phases else None,
         )
         return answer or question
     finally:

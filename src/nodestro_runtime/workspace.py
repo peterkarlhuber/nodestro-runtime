@@ -716,6 +716,7 @@ class Workspace:
             strict_offline=bool(values.get("strict_offline")),
             prefer_european_models=bool(values.get("prefer_european_models")),
             local_reasoning="full" if values.get("local_reasoning") == "full" else "auto",
+            reasoning_summaries=bool(values.get("reasoning_summaries")),
             model_defaults="local" if fallback_model == LOCAL_DEFAULT_MODEL else "kept",
         )
 
@@ -1321,6 +1322,7 @@ class Workspace:
                 client=client,
                 reported=reported,
                 reasoning_saving=provider == "ollama" and self.reasoning_saving(),
+                reasoning_summaries=bool(self._stored("reasoning_summaries")),
             ),
             info.label,
         )

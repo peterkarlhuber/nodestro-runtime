@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import contextlib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 import os
 import socket
 import threading
@@ -269,6 +269,9 @@ class Connection:
     #: Ollama: the CPU saving mode applies (the workspace's ``local_reasoning`` is ``auto`` and the server has no
     #: GPU): thinking models answer at effort ``medium`` without thinking (see ``agent_builder.reasoning_reduction``).
     reasoning_saving: bool = False
+    #: Ask for reasoning summaries where the provider sends them only on request (OpenAI ``reasoning_summary``,
+    #: Gemini ``include_thoughts``): the workspace setting ``reasoning_summaries`` (see :mod:`.reasoning`).
+    reasoning_summaries: bool = False
 
     def declared_for(self, model: str | None) -> dict[str, Any]:
         """The capability overrides for ``model``: reported by the server, then the declared ones on top."""
@@ -321,9 +324,9 @@ class Connection:
         if self.provider == "anthropic":
             return AnthropicOptions(request_options=extra)
         if self.provider == "openai":
-            return OpenAIOptions(request_options=extra)
+            return self.with_reasoning_summaries(OpenAIOptions(request_options=extra))
         if self.provider == "gemini":
-            return GeminiOptions(request_options=extra)
+            return self.with_reasoning_summaries(GeminiOptions(request_options=extra))
         if self.provider == "ollama":
             # Ollama takes the effort of a thinking model as reasoning_effort (only models whose server reports
             # ``thinking`` get one, see agent_builder._effort and local_service._overrides).
@@ -333,6 +336,19 @@ class Connection:
         if self.provider == "bedrock":
             return self._bedrock_options(extra)
         return None
+
+    def with_reasoning_summaries(self, options: Any) -> Any:
+        """``options`` asking for reasoning summaries when the workspace wants them (``reasoning_summaries``).
+
+        Only OpenAI's and Gemini's options have such a request; an explicit choice in the options is kept, and Orkexa
+        sends it only to models that reason. Summaries are display information: they never change the answer."""
+        if not self.reasoning_summaries:
+            return options
+        if isinstance(options, OpenAIOptions) and options.reasoning_summary is None:
+            return replace(options, reasoning_summary="auto")
+        if isinstance(options, GeminiOptions) and not options.include_thoughts:
+            return replace(options, include_thoughts=True)
+        return options
 
     def _tenant_client(self, service: str) -> Any:
         from .bedrock import tenant_client
@@ -407,6 +423,16 @@ class Connection:
     def effort(self, model: str, wanted: Any) -> Any:
         """``wanted`` when the model supports a reasoning effort, else ``None`` (internal assistants)."""
         return wanted if self.model_capabilities(model).supports("reasoning") else None
+
+    def reasoning_stream(self, model: str) -> Any:
+        """What ``model``'s stream transmits of its reasoning through this connection
+        (:class:`~nodestro_runtime.reasoning.ReasoningStreamInfo`)."""
+        from .reasoning import stream_info
+
+        info = PROVIDERS.get(self.provider)
+        default = info.default_base_url if info is not None else None
+        adapter = create_provider(self.provider, ProviderConfig(base_url=self.base_url or default, client=object()))
+        return stream_info(adapter, model_id(model), self.model_capabilities(model), summaries=self.reasoning_summaries)
 
 
 def env_key(provider: str, environ: Mapping[str, str] | None = None) -> tuple[str | None, str | None]:

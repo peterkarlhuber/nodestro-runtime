@@ -749,3 +749,38 @@ async def test_the_strict_offline_mode_refuses_a_cloud_answer_before_its_request
     assert result.status == "failed" and result.code == "check.offline_cloud_model"
     calls = workspace.fake.messages.calls  # type: ignore[attr-defined]
     assert not any(CHAT in str(call.get("system")) for call in calls)
+
+
+async def test_an_answer_streams_its_reasoning_live_and_keeps_it(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nodestro_runtime.testing import thinking
+
+    ids: dict[str, str] = {}
+    workspace = make(_script(ids, thinking("The writer is waiting for approval.", "It waits for your approval.")))
+    started = await _paused_run(workspace, ids)
+    chat = workspace.runs.chat
+    question = send(workspace, started, "question", "Where are we?")
+    seen: list[tuple[str, str]] = []
+    original = chat.update_live
+
+    def watch(question_id: str, change: Any) -> None:
+        original(question_id, change)
+        for live in chat.live_answers(started.id):
+            seen.append((live.reasoning.text, live.text))
+
+    monkeypatch.setattr(chat, "update_live", watch)
+    answer = await asyncio.to_thread(
+        answer_question, workspace.runs, chat, workspace.usage_log, question, model="anthropic:x"
+    )
+    # The reasoning arrived in pieces before the answer's text; the live state ends with the answer.
+    assert seen[0] == ("", "")  # the phase started: shown as "thinking" before any text
+    assert next(item for item in seen if item[0])[1] == ""
+    assert seen[-1] == ("The writer is waiting for approval.", "It waits for your approval.")
+    assert chat.live_answers(started.id) == []
+    assert answer.reasoning is not None
+    assert (answer.reasoning.text, answer.reasoning.kind, answer.reasoning.active) == (
+        "The writer is waiting for approval.",
+        "summary",
+        False,
+    )
+    stored = chat.get(started.id, answer.id)
+    assert stored is not None and stored.reasoning == answer.reasoning
