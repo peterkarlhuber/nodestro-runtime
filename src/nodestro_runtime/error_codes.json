@@ -51,7 +51,7 @@
   "check.local_model_no_tools": ["model", "node_id"],
   "check.local_model_not_chat": ["model"],
   "check.local_reasoning_saving": ["nodes"],
-  "check.local_runtime_missing": ["provider"],
+  "check.local_runtime_missing": ["models", "provider", "route"],
   "check.merge_exclusive": ["decision", "name", "node_id"],
   "check.merge_partial": ["branches", "name", "node_id"],
   "check.model_unpriced": ["model", "node_id"],

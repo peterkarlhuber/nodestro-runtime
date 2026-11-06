@@ -253,9 +253,15 @@ def test_without_a_runtime_ollama_is_not_configured(tmp_path: Path, monkeypatch:
                 "edges": [{"id": "e1", "source": "s", "target": "a"}, {"id": "e2", "source": "a", "target": "o"}],
             }
         )
-        codes = {item.code for item in preflight(workspace, workflow).problems}
+        problems = preflight(workspace, workflow).problems
+        codes = {item.code for item in problems}
         assert "check.local_runtime_missing" in codes
         assert "check.model_unpriced" not in codes  # a local model has no external API price to miss
+        # RT-057: the issue names the missing models and the API route for SDK users, besides the settings page.
+        missing = next(item for item in problems if item.code == "check.local_runtime_missing")
+        assert missing.params["models"] == [LOCAL_DEFAULT_MODEL]
+        assert missing.params["route"] == "/api/local-models/runtime"
+        assert "Settings → Local models" in missing.message and LOCAL_DEFAULT_MODEL in missing.message
     # An injected client (tests, applications that embed the runtime) is the server: no runtime needed.
     fake = object()
     factory = lambda provider: fake if provider == "ollama" else None  # noqa: E731

@@ -335,14 +335,21 @@ def agent_models(workflow: Workflow) -> set[str]:
     return models
 
 
+#: The HTTP API's route that installs the local model runtime, for SDK users (nodestro-api).
+LOCAL_RUNTIME_ROUTE = "/api/local-models/runtime"
+
+
 def _provider_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
     """Every provider the workflow's agents and judges use must be configured; none replaces another."""
     providers: set[str] = set()
+    by_provider: dict[str, set[str]] = {}
     for model in agent_models(workflow):
         try:
-            providers.add(provider_of(model))
+            provider = provider_of(model)
         except NodestroError:
             continue  # reported by the agent's own check
+        providers.add(provider)
+        by_provider.setdefault(provider, set()).add(model)
     found: list[CheckIssue] = []
     configured = {item.id for item in nodestro.settings().providers if item.configured}
     for provider in sorted(providers):
@@ -355,9 +362,13 @@ def _provider_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue
             found.append(
                 _issue(
                     "check.local_runtime_missing",
-                    "Local models are not set up yet: install the local model runtime in the settings",
+                    "Local models are not set up yet: install the local model runtime under Settings → Local "
+                    f"models (or POST {LOCAL_RUNTIME_ROUTE}); the workflow needs "
+                    + ", ".join(sorted(by_provider.get(provider, ()))),
                     level="error",
                     provider=provider,
+                    models=sorted(by_provider.get(provider, ())),
+                    route=LOCAL_RUNTIME_ROUTE,
                 )
             )
             continue

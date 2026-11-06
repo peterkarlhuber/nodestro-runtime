@@ -170,9 +170,20 @@ class MissingApiKeyError(NodestroError):
     """The provider of an agent is not configured (no API key, no endpoint; for Bedrock: no region or sign-in).
 
     ``code``/``message`` replace the provider's default (e.g. ``provider.bedrock_not_available`` on a server whose
-    operator assigned no AWS role, or ``provider.region_missing`` in an exported project)."""
+    operator assigned no AWS role, or ``provider.region_missing`` in an exported project).
 
-    def __init__(self, provider: str, *, code: str | None = None, message: str | None = None) -> None:
+    ``where`` says where the key belongs (RT-057): ``settings`` in the studio, ``environment`` in an exported project,
+    which has no settings: the advice then names the environment variable and the ``.env`` file. The parameter
+    ``where`` lets an interface give the same advice in its own words; ``variables`` names the variables."""
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        code: str | None = None,
+        message: str | None = None,
+        where: Literal["settings", "environment"] = "settings",
+    ) -> None:
         info = PROVIDERS.get(provider)
         label = info.label if info is not None else provider
         if code is not None:
@@ -184,18 +195,38 @@ class MissingApiKeyError(NodestroError):
                 provider=provider,
             )
         elif info is not None and info.base_url and not info.needs_key:
-            super().__init__(
-                "provider.not_configured",
-                f"{label} is not configured: enter its base URL in the settings",
-                provider=provider,
-            )
+            if where == "environment":
+                variable = base_url_variable(provider)
+                super().__init__(
+                    "provider.not_configured",
+                    f"{label} is not configured: set {variable} in the environment or the .env file",
+                    provider=provider,
+                    where=where,
+                    variables=[variable],
+                )
+            else:
+                super().__init__(
+                    "provider.not_configured",
+                    f"{label} is not configured: enter its base URL in the settings",
+                    provider=provider,
+                )
         else:
-            variables = " or ".join(info.env_vars) if info is not None else ""
-            super().__init__(
-                "api_key_missing",
-                f"No API key for {label}: set {variables} or enter it in the settings",
-                provider=provider,
-            )
+            names = list(info.env_vars) if info is not None else []
+            variables = " or ".join(names)
+            if where == "environment":
+                super().__init__(
+                    "api_key_missing",
+                    f"No API key for {label}: set {variables} in the environment or the .env file",
+                    provider=provider,
+                    where=where,
+                    variables=names,
+                )
+            else:
+                super().__init__(
+                    "api_key_missing",
+                    f"No API key for {label}: set {variables} or enter it in the settings",
+                    provider=provider,
+                )
 
 
 # ---- model names ------------------------------------------------------------------------
@@ -538,7 +569,7 @@ def environment_connection(
     if info.base_url:
         base_url = env.get(base_url_variable(provider)) or (base_urls or {}).get(provider) or info.default_base_url
     if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
-        raise MissingApiKeyError(provider)
+        raise MissingApiKeyError(provider, where="environment")
     if client is None and provider == "ollama" and base_url:
         # An exported project's local model server gets the same time and retries as the studio's (RT-058/RT-068);
         # its hardware is not known here, so it gets the time a CPU needs.
