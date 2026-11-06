@@ -1214,6 +1214,10 @@ class RunManager:
             )
         context.loop = loop
         context.fence = fence
+        if run.status == "paused":
+            # It continues now (X-01): whoever reads it before its task starts (the caller of ``decide``, another
+            # process) sees that it goes on, as with queue execution, not the pause that just ended.
+            run.status = "queued"
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
         self._subscribers.setdefault(run.id, [])
