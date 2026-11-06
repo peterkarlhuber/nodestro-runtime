@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import contextlib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 import os
 import socket
 import threading
@@ -36,6 +36,7 @@ from orkexa import (
     ConfigurationError,
     GeminiOptions,
     ModelCapabilities,
+    ModelLimits,
     OpenAIOptions,
 )
 from orkexa.dynamic import ProviderSettings
@@ -71,6 +72,10 @@ CAPABILITY_NAMES: tuple[str, ...] = (
     "caching",
     "system_messages",
 )
+#: Token limits that can be declared for an endpoint's models (what Orkexa does not document for them).
+LIMIT_NAMES: tuple[str, ...] = ("max_output_tokens", "context_window")
+#: Bounds of a declared limit (a typo must not lift every output limit).
+DECLARED_LIMIT_RANGE = (256, 10_000_000)
 #: Retries of the SDK clients.
 MAX_RETRIES = 3
 
@@ -269,6 +274,15 @@ class Connection:
     #: Ollama: the CPU saving mode applies (the workspace's ``local_reasoning`` is ``auto`` and the server has no
     #: GPU): thinking models answer at effort ``medium`` without thinking (see ``agent_builder.reasoning_reduction``).
     reasoning_saving: bool = False
+    #: Token limits declared in the provider's settings (``max_output_tokens``, ``context_window``; endpoints only):
+    #: they fill what Orkexa does not document for a model, never replace a documented value.
+    limits: Mapping[str, int] = field(default_factory=dict)
+    #: Ollama: the context window the local model server gives every model (``None``: not known); asked only when the
+    #: limits are needed (it may ask the server).
+    window: Callable[[], int | None] | None = None
+    #: Ask for reasoning summaries where the provider sends them only on request (OpenAI ``reasoning_summary``,
+    #: Gemini ``include_thoughts``): the workspace setting ``reasoning_summaries`` (see :mod:`.reasoning`).
+    reasoning_summaries: bool = False
 
     def declared_for(self, model: str | None) -> dict[str, Any]:
         """The capability overrides for ``model``: reported by the server, then the declared ones on top."""
@@ -321,9 +335,9 @@ class Connection:
         if self.provider == "anthropic":
             return AnthropicOptions(request_options=extra)
         if self.provider == "openai":
-            return OpenAIOptions(request_options=extra)
+            return self.with_reasoning_summaries(OpenAIOptions(request_options=extra))
         if self.provider == "gemini":
-            return GeminiOptions(request_options=extra)
+            return self.with_reasoning_summaries(GeminiOptions(request_options=extra))
         if self.provider == "ollama":
             # Ollama takes the effort of a thinking model as reasoning_effort (only models whose server reports
             # ``thinking`` get one, see agent_builder._effort and local_service._overrides).
@@ -333,6 +347,19 @@ class Connection:
         if self.provider == "bedrock":
             return self._bedrock_options(extra)
         return None
+
+    def with_reasoning_summaries(self, options: Any) -> Any:
+        """``options`` asking for reasoning summaries when the workspace wants them (``reasoning_summaries``).
+
+        Only OpenAI's and Gemini's options have such a request; an explicit choice in the options is kept, and Orkexa
+        sends it only to models that reason. Summaries are display information: they never change the answer."""
+        if not self.reasoning_summaries:
+            return options
+        if isinstance(options, OpenAIOptions) and options.reasoning_summary is None:
+            return replace(options, reasoning_summary="auto")
+        if isinstance(options, GeminiOptions) and not options.include_thoughts:
+            return replace(options, include_thoughts=True)
+        return options
 
     def _tenant_client(self, service: str) -> Any:
         from .bedrock import tenant_client
@@ -405,8 +432,53 @@ class Connection:
         return adapter.capabilities(model_id(model)).merged(self.declared_for(model) or None)
 
     def effort(self, model: str, wanted: Any) -> Any:
-        """``wanted`` when the model supports a reasoning effort, else ``None`` (internal assistants)."""
-        return wanted if self.model_capabilities(model).supports("reasoning") else None
+        """``wanted`` when the model supports a reasoning effort, else ``None`` (internal assistants).
+
+        A model that documents its effort levels and lacks ``wanted`` gets the nearest lower level it accepts (the
+        highest one when none is lower), so an internal step never asks for a level the model refuses."""
+        if not self.model_capabilities(model).supports("reasoning"):
+            return None
+        efforts = self.model_limits(model).efforts
+        if wanted is None or efforts is None or wanted in efforts:
+            return wanted
+        if not efforts:
+            return None
+        from orkexa.core.capabilities import EFFORTS
+
+        rank = EFFORTS.index(wanted) if wanted in EFFORTS else len(EFFORTS)
+        lower = [effort for effort in efforts if EFFORTS.index(effort) <= rank]
+        return lower[-1] if lower else efforts[0]
+
+    def model_limits(self, model: str) -> ModelLimits:
+        """What Orkexa documents for ``model`` (token limits, efforts, thinking switch), with the provider's declared
+        limits and, for Ollama, the local server's context window filling the unknown values."""
+        info = PROVIDERS.get(self.provider)
+        if info is not None and info.auth == "aws":
+            return create_provider(self.provider, ProviderConfig(client=object())).limits(model_id(model))
+        default = info.default_base_url if info is not None else None
+        try:
+            adapter = create_provider(self.provider, ProviderConfig(base_url=self.base_url or default, client=object()))
+            limits = adapter.limits(model_id(model))
+        except (ConfigurationError, ValueError):
+            # An address the provider refuses (e.g. one with credentials, stored before they were refused) is
+            # reported where the agent is built; here the documented values are simply unknown.
+            limits = ModelLimits()
+        declared = {key: int(value) for key, value in self.limits.items() if key in LIMIT_NAMES and value}
+        if self.window is not None and "context_window" not in declared:
+            window = self.window()
+            if window:
+                declared["context_window"] = window
+        return limits.declared(**declared) if declared else limits
+
+    def reasoning_stream(self, model: str) -> Any:
+        """What ``model``'s stream transmits of its reasoning through this connection
+        (:class:`~nodestro_runtime.reasoning.ReasoningStreamInfo`)."""
+        from .reasoning import stream_info
+
+        info = PROVIDERS.get(self.provider)
+        default = info.default_base_url if info is not None else None
+        adapter = create_provider(self.provider, ProviderConfig(base_url=self.base_url or default, client=object()))
+        return stream_info(adapter, model_id(model), self.model_capabilities(model), summaries=self.reasoning_summaries)
 
 
 def env_key(provider: str, environ: Mapping[str, str] | None = None) -> tuple[str | None, str | None]:
@@ -525,6 +597,9 @@ class ProviderSettingsIn(BaseModel):
     base_url: str | None = None
     #: Declared capabilities of an OpenAI-compatible endpoint (replaces the stored ones).
     capabilities: dict[str, Literal["supported", "unsupported", "unknown"]] | None = None
+    #: Declared token limits of an endpoint's models (``max_output_tokens``, ``context_window``; replaces the stored
+    #: ones, an empty object removes them). Only where Orkexa documents none (OpenAI-compatible, Ollama, vLLM).
+    limits: dict[str, int] | None = None
     #: Bedrock: the AWS region (``eu-central-1``).
     region: str | None = None
     #: Bedrock: ``default_chain`` or ``profile`` (desktop), ``operator_role`` (server tenants).
@@ -557,6 +632,8 @@ class ProviderStatus(BaseModel):
     base_url: str | None = None
     base_url_default: str | None = None
     capabilities: dict[str, str] = Field(default_factory=dict)
+    #: Declared token limits of the endpoint's models (``max_output_tokens``, ``context_window``).
+    limits: dict[str, int] = Field(default_factory=dict)
     #: Ollama only: Nodestro provides the server itself (the managed one of the desktop, or the container of Nodestro
     #: Local Docker), so the provider is configured without a saved base URL.
     local_server: bool = False
@@ -730,6 +807,7 @@ def provider_status(
         base_url=redact(base_url) if base_url else None,
         base_url_default=info.default_base_url,
         capabilities=dict(stored.get("capabilities") or {}),
+        limits=dict(stored.get("limits") or {}),
     )
 
 
@@ -871,6 +949,37 @@ def interrupt_client(client: Any) -> bool:
     with contextlib.suppress(Exception):
         client.close()
     return True
+
+
+def check_limits(values: Mapping[str, Any]) -> dict[str, int]:
+    """Declared token limits of an endpoint: known names, whole numbers in :data:`DECLARED_LIMIT_RANGE`; 0 or an
+    empty value removes one."""
+    unknown = sorted(set(values) - set(LIMIT_NAMES))
+    if unknown:
+        raise NodestroError("provider.limit_unknown", f"Unknown limits: {', '.join(unknown)}", names=", ".join(unknown))
+    low, high = DECLARED_LIMIT_RANGE
+    result: dict[str, int] = {}
+    for name, value in values.items():
+        if value in (None, 0, ""):
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise NodestroError(
+                "provider.limit_invalid",
+                f"{name} must be a whole number from {low} to {high}",
+                name=name,
+                min=low,
+                max=high,
+            )
+        result[name] = value
+    if result.get("max_output_tokens", 0) > result.get("context_window", high + 1):
+        raise NodestroError(
+            "provider.limit_invalid",
+            "max_output_tokens cannot exceed the context window",
+            name="max_output_tokens",
+            min=low,
+            max=result["context_window"],
+        )
+    return result
 
 
 def check_capabilities(values: Mapping[str, str]) -> dict[str, str]:

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Fixed: an Ollama 400 "invalid message content type: <nil>" in multi-step agent runs with thinking models (cause and
+  fix in Orkexa). A provider that refuses the conversation now fails the step with `run.provider_rejected_messages`
+  (technical text ends with a content-free outline), a too-large conversation with `run.provider_context_exceeded`;
+  neither is retried.
+- Settings, attachments and providers (2026-11-06):
+  - Output limits of Nodestro's own AI steps are configurable (`output_limits`: setting, then built-in default,
+    then capped by the model and reported when lowered); run chat answers up to 4,000 tokens (was 1,500). Agent
+    options follow model capabilities instead of the provider name (`model_profile`, `config.option_unsupported`,
+    `config.native_tool_unsupported`, `config.max_tokens_above_model`); `AgentConfig.thinking_budget` (Gemini 2.5);
+    undocumented efforts are mapped with a warning (`config.effort_adjusted`, `config.effort_dropped`);
+    `check.orchestrator_model_unsupported` (RT-061).
+  - Live reasoning for every provider: run events `thinking` (with `reasoning_kind`) and `thinking_status`,
+    reasoning on agent test results and live run chat answers, workspace setting `reasoning_summaries`.
+  - Local model server setup is a job with named steps (`setup()`); downloads report rate and remaining time only
+    when reliable, resume where they stopped, survive a restart as `local.interrupted`, refuse a full disk first
+    (`local.disk_full`); container and external servers are only checked, never started or stopped.
+  - `local_readiness`: why a local model is not ready (cause, location, allowed actions, alternatives);
+    `pull(attach=True)` follows a running download; the unattended check reads the managed model folder; Ollama
+    404 becomes `run.local_model_missing`.
+  - Input files can belong to an assistant conversation; `deliver()` and `files_tool()` accept their own wording.
+  - `reports.REPORT_FORMATS`: one table of result file formats (extension, media type, inline view).
+
 - Strict offline mode: `Workspace.connection` and `connect_model` refuse every provider except Ollama with
   `check.offline_cloud_model` before any request. Assistants, architects, run chat answers and orchestrator decisions
   can no longer reach a cloud model; before, only runs were refused. OpenAI-compatible and vLLM endpoints count as

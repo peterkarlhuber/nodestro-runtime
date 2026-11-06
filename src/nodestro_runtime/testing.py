@@ -5,7 +5,7 @@ SDK tests) simulates models the same way. Nothing here is used outside tests.
 
 - :class:`ScriptedClient` replaces a provider's SDK client: each request is answered from the
   script entry whose key occurs in the request's system prompt (``Workspace(client_factory=...)``).
-- :func:`text`, :func:`tool_use`, :func:`parsed` build the answers.
+- :func:`text`, :func:`thinking`, :func:`tool_use`, :func:`parsed` build the answers.
 - :class:`AnswerAllClient` answers every request without a script (every example workflow runs with it).
 - :class:`FakeUv` replaces uv for tools with Python libraries (``Workspace(python_runner=...)``).
 - :class:`ContainerDouble` stands in for Docker in tests of flows that need an isolating sandbox.
@@ -18,6 +18,7 @@ from copy import deepcopy
 from pathlib import Path
 import re
 import threading
+import time
 import types
 from types import SimpleNamespace
 from typing import Any, Literal, Union, get_args, get_origin
@@ -54,6 +55,17 @@ def text(value: str, **kwargs: Any) -> Message:
     return message([{"type": "text", "text": value}], **kwargs)
 
 
+def thinking(thought: str | None, answer: str, **kwargs: Any) -> Message:
+    """A text answer after a thinking block, as Claude sends it: ``thought`` streams as summarized thinking;
+    ``None`` is a redacted block (the model reasoned, nothing to show)."""
+    block: dict[str, Any] = (
+        {"type": "redacted_thinking", "data": "ENCRYPTED"}
+        if thought is None
+        else {"type": "thinking", "thinking": thought, "signature": "sig"}
+    )
+    return message([block, {"type": "text", "text": answer}], **kwargs)
+
+
 def tool_use(name: str, payload: dict[str, Any], *, call_id: str = "toolu_1", **kwargs: Any) -> Message:
     return message(
         [{"type": "tool_use", "id": call_id, "name": name, "input": payload}], stop_reason="tool_use", **kwargs
@@ -81,6 +93,10 @@ def parsed(output_factory: Callable[[type[Any]], Any]) -> Callable[[dict[str, An
     return respond
 
 
+#: Seconds between the thinking deltas of a scripted stream; browser tests set it to watch reasoning arrive live.
+STREAM_DELAY = 0.0
+
+
 class _Stream:
     def __init__(self, response: Any) -> None:
         self.response = response
@@ -92,9 +108,18 @@ class _Stream:
         return None
 
     def __iter__(self) -> Iterator[SimpleNamespace]:
-        for block in self.response.content:
+        # The events of the SDK's stream helper that Orkexa reads, block by block in the answer's order.
+        for index, block in enumerate(getattr(self.response, "content", None) or []):
             if block.type == "text":
                 yield SimpleNamespace(type="text", text=block.text)
+            elif block.type in ("thinking", "redacted_thinking"):
+                yield SimpleNamespace(type="content_block_start", index=index, content_block=block)
+                thought = getattr(block, "thinking", "") or ""
+                for start in range(0, len(thought), 24):  # several deltas, as a real stream sends them
+                    if STREAM_DELAY:
+                        time.sleep(STREAM_DELAY)
+                    yield SimpleNamespace(type="thinking", thinking=thought[start : start + 24])
+                yield SimpleNamespace(type="content_block_stop", index=index)
 
     def get_final_message(self) -> Any:
         return self.response

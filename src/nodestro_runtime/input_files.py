@@ -20,10 +20,13 @@ Storage reuses what exists:
 
 Runs reference input files by id in their form values and ``file_ids``. A file stays as
 long as a run, test case, schedule or batch references it; a paused run therefore finds
-its files after a restart. :meth:`InputFiles.cleanup` removes files nobody references
-(after a grace period for files that were uploaded but never used) and, on request, the
-input files of finished runs older than a number of days. Files of queued, running or
-paused runs, of test cases and of schedules are never removed.
+its files after a restart. Files a user attaches to a Nodestro Assistant conversation
+(``origin="assistant"``) are input files too: the conversation references them, and they are
+removed with the conversation or when the user removes them from it.
+:meth:`InputFiles.cleanup` removes files nobody references (after a grace period for files
+that were uploaded but never used) and, on request, the input files of finished runs older
+than a number of days. Files of queued, running or
+paused runs, of test cases, of schedules and of assistant conversations are never removed.
 """
 
 from __future__ import annotations
@@ -67,12 +70,14 @@ PREFIX = "in_"
 INPUT_ID = re.compile(r"^in_[0-9a-f]{12}$")
 _REFERENCE = re.compile(r"in_[0-9a-f]{12}")
 #: Collections whose documents reference input files.
-_HOLDERS = ("runs", "benchmark_suites", "schedules", "batches")
+_HOLDERS = ("runs", "benchmark_suites", "schedules", "batches", "assistant_conversations")
+#: How a holding collection is named in :meth:`InputFiles.references` (runs and batches add their status).
+_HOLDER_NAMES = {"benchmark_suites": "suite", "schedules": "schedule", "assistant_conversations": "conversation"}
 #: Uploads that no run uses are kept this long (the run dialog may still be open).
 GRACE = timedelta(hours=24)
 _CACHE = 32
 
-Origin = Literal["studio", "api", "test", "schedule", "batch"]
+Origin = Literal["studio", "api", "test", "schedule", "batch", "assistant"]
 
 
 class FileStoreLike(Protocol):
@@ -387,13 +392,14 @@ class InputFiles:
     # ---- references and cleanup ---------------------------------------------------------
 
     def references(self) -> dict[str, set[str]]:
-        """Input file id -> what references it: ``run:<status>``, ``suite``, ``schedule``, ``batch:<status>``."""
+        """Input file id -> what references it: ``run:<status>``, ``suite``, ``schedule``, ``batch:<status>``,
+        ``conversation`` (a file attached to a Nodestro Assistant conversation)."""
         found: dict[str, set[str]] = {}
         for collection, raw in self.store.search_raw(_HOLDERS, "in_"):
             ids = set(_REFERENCE.findall(raw))
             if not ids:
                 continue
-            holder = {"benchmark_suites": "suite", "schedules": "schedule"}.get(collection, collection)
+            holder = _HOLDER_NAMES.get(collection, collection)
             if collection in ("runs", "batches"):
                 try:
                     status = json.loads(raw).get("status", "")
@@ -406,9 +412,10 @@ class InputFiles:
 
     @staticmethod
     def _protected(holders: set[str]) -> bool:
-        """Files of active runs and batches, test cases and schedules are never removed."""
+        """Files of active runs and batches, test cases, schedules and assistant conversations are never removed
+        (a conversation's files go when the user removes them or deletes the conversation)."""
         active = {"run:queued", "run:running", "run:paused", "batch:running", "batch:paused", "batch:interrupted"}
-        return bool(holders & (active | {"suite", "schedule"}))
+        return bool(holders & (active | {"suite", "schedule", "conversation"}))
 
     def storage(self) -> StorageInfo:
         references = self.references()

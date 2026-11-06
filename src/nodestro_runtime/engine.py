@@ -49,6 +49,7 @@ from orkexa import (
     DataResidencyError,
     EphemeralMemory,
     Evaluator,
+    InvalidRequestError,
     MemoryBackend,
     OrkexaError,
     ProviderConnectionError,
@@ -93,6 +94,7 @@ from .orchestrator import (
 from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, interrupt_client, model_id, provider_of
+from .reasoning import ReasoningKind, ReasoningTrace, reasoning_hook
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
@@ -3897,6 +3899,7 @@ class RunManager:
                 output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
                 effort=connection.effort(config.model, "medium"),
                 max_tool_rounds=0,
+                max_tokens=context.env.builder.output_limit("orchestrator", config.model, connection).value,
             )
             outcome = execute_agent(
                 context.env.builder,
@@ -4038,10 +4041,20 @@ class RunManager:
             state.text += delta
             self._emit(context, "text", node_id, delta=delta)
 
-        def on_thinking(delta: str) -> None:
+        trace = ReasoningTrace(text=state.thinking, phases=state.thinking_phases)
+
+        def on_thinking(delta: str, kind: ReasoningKind) -> None:
             context.check()
-            state.thinking += delta
-            self._emit(context, "thinking", node_id, delta=delta)
+            added = trace.delta(delta, kind)
+            state.thinking, state.thinking_kind = trace.text, trace.kind
+            state.thinking_phases = trace.phases
+            self._emit(context, "thinking", node_id, delta=added, reasoning_kind=kind)
+
+        def on_reasoning_status(phase: str, kind: str | None, redacted: bool) -> None:
+            context.check()
+            trace.status(phase, redacted)
+            state.thinking_phases, state.thinking_redacted = trace.phases, trace.redacted
+            self._emit(context, "thinking_status", node_id, state=phase, reasoning_kind=kind, redacted=redacted)
 
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
@@ -4103,8 +4116,9 @@ class RunManager:
             "after_tool": after_tool,
             "on_response": on_response,
         }
-        if config.thinking_display in ("summarized", "updates"):
-            hooks["on_thinking"] = on_thinking
+        # Whatever reasoning the provider transmits is passed on, for every provider; showing it is the interface's
+        # choice (Anthropic's thinking_display decides whether Claude sends text at all).
+        hooks["on_event"] = reasoning_hook(on_thinking, on_reasoning_status)
 
         extra: list[ContentBlock] = []
         extra_tools: list[Tool] = []
@@ -4360,6 +4374,7 @@ def execute_agent(
         evaluator = Evaluator(
             criteria,
             model=model_id(judge),
+            max_tokens=builder.output_limit("quality_judge", judge, judge_connection).value,
             options=judge_connection.options({"reasoning_effort": "none"} if judge_saves else None),
             usage_tracker=tracker,
             name=f"{name}:judge",
@@ -4591,6 +4606,10 @@ def node_problem(exc: BaseException) -> Problem:
 _OVERLOADED_STATUSES = frozenset({503, 529})
 
 
+#: The model an Ollama 404 names (``model "qwen3.5:9b" not found``, quotes possibly escaped in JSON).
+_OLLAMA_MISSING = re.compile(r"model\s+\\?[\"']?([\w.:/@-]+?)\\?[\"']?\s+not found")
+
+
 def provider_problem(exc: ProviderError, text: str) -> Problem:
     """A provider failure as a code the UI can act on (AD-01).
 
@@ -4603,6 +4622,14 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     - ``run.provider_rate_limited``: too many requests or tokens for the account.
     - ``run.provider_overloaded``: the provider is out of capacity (503/529, or an
       ``overloaded`` error inside a stream, which arrives without that status).
+    - ``run.local_model_missing``: the local model server (Ollama) does not have the model (404); ``params.model``.
+    - ``run.provider_rejected_messages``: the provider refused the conversation the agent sent
+      (a message's content, role or tool call/result pairing; Orkexa's
+      ``InvalidRequestError.reason == "messages"``). The technical text ends with the outline of
+      the refused conversation: roles and part kinds, never content. Retrying the same request
+      cannot help.
+    - ``run.provider_context_exceeded``: the conversation is larger than the model's context
+      window (``reason == "context_length"``).
     - ``run.api_error``: anything else (other 4xx/5xx), as before.
 
     ``params.provider`` names the provider; ``params.status`` is the HTTP status when the
@@ -4611,12 +4638,21 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     provider = exc.provider or ""
     status = exc.status_code
     known: dict[str, Any] = {"provider": provider} if status is None else {"provider": provider, "status": status}
+    if provider == "ollama" and status == 404:
+        # The local model server does not have the model (Ollama: 'model "x" not found, try pulling it first'): a
+        # missing prerequisite an authorized person fixes by downloading it, never a generic API error.
+        named = _OLLAMA_MISSING.search(text)
+        return problem("run.local_model_missing", text, provider=provider, model=named.group(1) if named else "")
     if isinstance(exc, AuthenticationError) or status in (401, 403):
         return problem("run.provider_auth", text, **known)
     if isinstance(exc, ProviderConnectionError):
         return problem("run.provider_unreachable", text, **known)
     if isinstance(exc, RateLimitError) or status == 429:
         return problem("run.provider_rate_limited", text, **known)
+    if isinstance(exc, InvalidRequestError) and exc.reason == "messages":
+        return problem("run.provider_rejected_messages", text, **known)
+    if isinstance(exc, InvalidRequestError) and exc.reason == "context_length":
+        return problem("run.provider_context_exceeded", text, **known)
     client_error = status is not None and 400 <= status < 500
     if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
         return problem("run.provider_overloaded", text, **known)

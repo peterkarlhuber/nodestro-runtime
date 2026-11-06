@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
+import json
 import logging
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ from orkexa.local import (
     ModelDetails,
     OllamaClient,
     OllamaError,
+    artifact_for,
     build_model,
     check_model_name,
     detect_ollama,
@@ -60,17 +62,36 @@ from .local_models import (
     detect_hardware,
     recommend,
 )
+from .local_progress import (
+    BUILD_STEPS,
+    PULL_STEPS,
+    SETUP_STEPS,
+    JobKind,
+    JobLayer,
+    JobState,
+    JobStep,
+    LocalJob,
+    PullProgress,
+    Tracker,
+    build_step,
+    retryable,
+)
 from .problems import NodestroError
 
 logger = logging.getLogger(__name__)
 
 Mode = Literal["managed", "container", "external", "unavailable"]
-JobKind = Literal["pull", "build", "install_runtime", "import_package", "import_gguf", "move_models", "benchmark"]
-JobState = Literal["running", "done", "failed", "cancelled"]
 
 #: Where the local model settings are stored (one document; the app settings stay untouched).
 SETTINGS_COLLECTION = "settings"
 SETTINGS_ID = "local_models"
+#: Where the recent jobs are kept, so their outcome survives a restart (a running one is then ``local.interrupted``).
+JOBS_COLLECTION = "local_jobs"
+JOBS_ID = "recent"
+#: How many finished jobs are kept (in memory and stored).
+_KEEP_JOBS = 30
+#: How often a running job's progress is stored at most (its steps and its end are stored at once).
+_STORE_EVERY = 5.0
 #: How long ``/api/show`` results are reused (they change only with a pull or delete, which clear the cache).
 _SHOW_TTL = 600.0
 #: The context window of the managed server and the Local Docker container (``NODESTRO_OLLAMA_CONTEXT_LENGTH``).
@@ -107,20 +128,6 @@ class InstalledModel(BaseModel):
     verified: bool = False
     #: The last measured speed on this computer (``None``: not measured yet).
     speed: ModelSpeed | None = None
-
-
-class LocalJob(BaseModel):
-    id: str
-    kind: JobKind
-    target: str
-    state: JobState = "running"
-    completed: int = 0
-    total: int | None = None
-    message: str = ""
-    error_code: str | None = None
-    error: str | None = None
-    started_at: datetime
-    finished_at: datetime | None = None
 
 
 class LocalStatus(BaseModel):
@@ -226,6 +233,12 @@ class LocalModelService:
         self._show: dict[str, tuple[float, dict[str, Any]]] = {}
         self._show_failed: dict[str, tuple[float, NodestroError]] = {}
         self._ps: tuple[float, list[dict[str, Any]]] | None = None
+        self._trackers: dict[str, Tracker] = {}
+        self._stored_at = 0.0
+        self._closing = False
+        #: Finds an Ollama the user runs on this computer (never started, stopped or changed by Nodestro).
+        self.detect_external: Callable[[], str | None] = detect_ollama
+        self._restore_jobs()
 
     # ---- settings ------------------------------------------------------------------------------------------
 
@@ -351,8 +364,16 @@ class LocalModelService:
                 logger.warning("The local model server did not start: %s", exc)
 
     def close(self) -> None:
-        for event in self._cancel.values():
-            event.set()
+        """Ends the application's use of the local models: running jobs stop and are recorded as interrupted (not
+        as canceled by the user) with what they had reached, so that they can be continued after the next start."""
+        self._closing = True
+        with self._lock:
+            for event in self._cancel.values():
+                event.set()
+            for job in self._jobs.values():
+                if job.state == "running":
+                    _interrupted(job)
+        self._store_jobs(force=True)
         self.stop()
 
     def client(self) -> OllamaClient:
@@ -685,12 +706,17 @@ class LocalModelService:
     # ---- jobs ----------------------------------------------------------------------------------------------
 
     def jobs(self) -> list[LocalJob]:
+        for tracker in list(self._trackers.values()):
+            tracker.tick()
         return sorted(self._jobs.values(), key=lambda job: job.started_at, reverse=True)
 
     def job(self, job_id: str) -> LocalJob:
         job = self._jobs.get(job_id)
         if job is None:
             raise NodestroError("local.job_missing", f"No local model job {job_id}", job=job_id)
+        tracker = self._trackers.get(job_id)
+        if tracker is not None:
+            tracker.tick()
         return job
 
     def cancel(self, job_id: str) -> LocalJob:
@@ -699,6 +725,42 @@ class LocalModelService:
         if event is not None:
             event.set()
         return job
+
+    def _restore_jobs(self) -> None:
+        """The jobs of the last run of the application: one that was still running was interrupted by the end of
+        that run (its thread is gone). A download continues where it stopped when it is started again."""
+        try:
+            stored = self.store.get_raw(JOBS_COLLECTION, JOBS_ID) or {}
+        except Exception:  # a store without the document, or an unreadable one: no history
+            logger.warning("The recent local model jobs could not be read", exc_info=True)
+            return
+        for value in stored.get("jobs") or []:
+            try:
+                job = LocalJob.model_validate(value)
+            except ValueError:
+                continue
+            if job.state == "running":
+                _interrupted(job)
+            self._jobs[job.id] = job
+
+    def _store_jobs(self, *, force: bool = False) -> None:
+        moment = time.monotonic()
+        if not force and moment - self._stored_at < _STORE_EVERY:
+            return
+        self._stored_at = moment
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda job: job.started_at, reverse=True)
+            finished = [job for job in jobs if job.state != "running"]
+            for job in finished[_KEEP_JOBS:]:
+                self._jobs.pop(job.id, None)
+            kept = [job.model_dump(mode="json") for job in jobs if job.id in self._jobs]
+        try:
+            self.store.put_raw(JOBS_COLLECTION, JOBS_ID, {"jobs": kept})
+        except Exception:  # the job itself goes on; only its record after a restart is missing
+            logger.warning("The local model jobs could not be stored", exc_info=True)
+
+    def _changed(self, job: LocalJob, important: bool) -> None:
+        self._store_jobs(force=important)
 
     def _refuse_offline(self, what: str) -> None:
         if self._offline():
@@ -712,13 +774,24 @@ class LocalModelService:
             if job.state == "running" and job.kind == kind and job.target == target:
                 raise NodestroError("local.job_running", f"{target} is already being processed", job=job.id)
 
-    def _run(self, kind: JobKind, target: str, work: Callable[[LocalJob, threading.Event], None]) -> LocalJob:
+    def _run(
+        self,
+        kind: JobKind,
+        target: str,
+        work: Callable[[LocalJob, threading.Event], None],
+        *,
+        steps: tuple[str, ...] = (),
+    ) -> LocalJob:
         with self._lock:
             self._busy(kind, target)
             job = LocalJob(id=uuid.uuid4().hex[:16], kind=kind, target=target, started_at=datetime.now(UTC))
+            job.updated_at = job.started_at
             cancel = threading.Event()
             self._jobs[job.id] = job
             self._cancel[job.id] = cancel
+            tracker = Tracker(job, steps, changed=self._changed)
+            self._trackers[job.id] = tracker
+        self._store_jobs(force=True)
 
         def body() -> None:
             try:
@@ -728,39 +801,95 @@ class LocalModelService:
                 job.state = "cancelled" if exc.code == "cancelled" or cancel.is_set() else "failed"
                 job.error_code, job.error = f"local.{exc.code}", str(exc)
             except NodestroError as exc:
-                job.state = "failed"
+                job.state = "cancelled" if exc.code == "local.cancelled" or cancel.is_set() else "failed"
                 job.error_code, job.error = exc.code, str(exc)
             except Exception as exc:  # reported on the job; never stops the application
                 logger.exception("Local model job %s failed", job.id)
                 job.state = "failed"
                 job.error_code, job.error = "local.job_failed", str(exc)
             finally:
-                job.finished_at = datetime.now(UTC)
+                if self._closing and job.state != "done":
+                    _interrupted(job)
+                elif job.state == "done":
+                    tracker.complete()
+                else:
+                    tracker.fail()
+                    tracker.log(f"{job.state}: {job.error_code or ''} {job.error or ''}".rstrip())
+                job.retryable = retryable(job)
+                job.finished_at = job.updated_at = datetime.now(UTC)
                 self._cancel.pop(job.id, None)
+                self._trackers.pop(job.id, None)
                 self._show.clear()
                 self._show_failed.clear()
+                self._store_jobs(force=True)
 
         threading.Thread(target=body, name=f"nodestro-local-{kind}", daemon=True).start()
         return job
 
-    def pull(self, name: str) -> LocalJob:
+    def running_download(self, name: str) -> LocalJob | None:
+        """The download (or build) of ``name`` that runs now, if any."""
+        name = _model_name(name)
+        with self._lock:
+            for job in self._jobs.values():
+                if job.state == "running" and job.kind in ("pull", "build") and job.target == name:
+                    return job
+        return None
+
+    def pull(self, name: str, *, attach: bool = False) -> LocalJob:
         """Download a model (needs the internet; refused in the strict offline mode).
 
-        A catalog model that is built from pinned upstream weights (``source="build"``) downloads those and is built."""
+        ``attach`` returns the download of the same model that runs already instead of refusing a second one
+        (``local.job_running``): a second click, another tab or another dialog follows the same job.
+
+        A catalog model that is built from pinned upstream weights (``source="build"``) downloads those and is built.
+        The job goes through Ollama's own steps (manifest, download, verify, finalize) with the bytes of all files
+        added up; a download that was interrupted continues where it stopped (Ollama keeps partial files)."""
         name = _model_name(name)
+        if attach:
+            running = self.running_download(name)
+            if running is not None:
+                return running
+            try:
+                return self.pull(name)
+            except NodestroError as exc:  # started by another request in between: follow that one
+                if exc.code == "local.job_running" and isinstance(exc.params.get("job"), str):
+                    return self.job(exc.params["job"])
+                raise
         entry = catalog_model(name)
         if entry is not None and entry.source == "build":
             return self.build(name, download=True)
         self._refuse_offline("downloading a model")
         client = self.client()
+        folder = self.models_dir() if self.mode in ("managed", "container") else None
 
         def work(job: LocalJob, cancel: threading.Event) -> None:
+            tracker = self._trackers[job.id]
+            tracker.enter("check")
+            present: dict[str, int] = {}
+            if folder is not None:
+                free = _free_bytes(folder)
+                present, partial = _present_bytes(folder)
+                needed = entry.download_bytes if entry is not None else None
+                detail = f"models folder {folder}; free {free} bytes" + (
+                    f"; download {needed} bytes; partial files {partial} bytes" if needed else ""
+                )
+                if needed and free is not None and free + partial < needed:
+                    tracker.log(f"check: {detail}")
+                    raise NodestroError(
+                        "local.disk_full",
+                        f"{folder} has {free} bytes free; {name} needs about {needed - partial} more",
+                        needed=needed - partial,
+                        free=free,
+                        path=str(folder),
+                    )
+                tracker.finish("check", detail=detail)
+            else:
+                tracker.skip("check", note="not_here")
+            progress = PullProgress(tracker, present)
             for item in client.pull(name, cancel=cancel):
-                job.message = item.status
-                if item.total:
-                    job.total, job.completed = item.total, item.completed or 0
+                progress.update(item.status, item.digest, item.total, item.completed)
 
-        return self._run("pull", name, work)
+        return self._run("pull", name, work, steps=PULL_STEPS)
 
     def build(
         self, name: str, *, weights: str | None = None, template: str | None = None, download: bool = False
@@ -788,8 +917,16 @@ class LocalModelService:
         self.home.mkdir(parents=True, exist_ok=True)
 
         def work(job: LocalJob, cancel: threading.Event) -> None:
+            tracker = self._trackers[job.id]
+
             def progress(text: str) -> None:
                 job.message = text
+                step = build_step(text)
+                if step is not None:
+                    tracker.enter(step)
+
+            def transferred(done: int, total: int) -> None:
+                tracker.progress(done, total)
 
             build_model(
                 client,
@@ -800,33 +937,200 @@ class LocalModelService:
                 work_dir=self.home,  # next to the models, not a small temporary file system
                 progress=progress,
                 cancel=cancel,
+                transferred=transferred,
             )
 
-        return self._run("build", name, work)
+        return self._run("build", name, work, steps=BUILD_STEPS)
 
     def install_runtime(self, *, archive: str | None = None, download: bool = False) -> LocalJob:
-        """Install the pinned runtime from a local release archive, or download it (desktop only)."""
+        """Install the pinned runtime from a local release archive, or download it (desktop only).
+
+        The same job as :meth:`setup`; the server starts afterwards only when it starts with the application."""
         if self.mode != "managed":
             raise NodestroError("local.not_managed", "Nodestro does not manage the local model server here")
         if archive is None and not download:
             raise NodestroError("local.archive_or_download", "Choose a runtime archive or allow the download")
         if download:
             self._refuse_offline("downloading the runtime")
+        return self.setup(archive=archive, download=download, start=self.autostart())
+
+    def setup(self, *, archive: str | None = None, download: bool = False, start: bool = True) -> LocalJob:
+        """Set up the local model server, step by step (one job, see :data:`SETUP_STEPS`).
+
+        Managed (desktop): check what is installed, the prerequisites (offline mode, folder, free space), download
+        and verify the pinned runtime if needed (a partial download continues), install it, configure and start the
+        server, check that it answers, detect the hardware. Steps that are not needed are skipped with the reason.
+        Local Docker and a saved address (the user's own server): only check that the server answers and, when it
+        runs on this computer, the hardware; such a server is never started, stopped or configured by Nodestro.
+
+        ``download`` allows the runtime download (refused in the strict offline mode); ``archive`` installs from a
+        release archive on this computer. Only one setup runs at a time."""
+        mode = self.mode
+        if mode == "unavailable":
+            raise NodestroError("local.unavailable", "No local model server is available here")
         source = Path(archive).expanduser() if archive else None
         if source is not None and not source.is_file():
             raise NodestroError("local.file_missing", f"{source} does not exist", path=str(source))
+        if mode == "managed" and source is None and self.runtime_binary() is None:
+            # Refused at once (not as a failed job): nothing to set up without the runtime or the right to fetch it.
+            if not download:
+                raise NodestroError("local.archive_or_download", "Choose a runtime archive or allow the download")
+            self._refuse_offline("downloading the runtime")
+        with self._lock:
+            for job in self._jobs.values():
+                if job.state == "running" and job.kind in ("setup", "install_runtime"):
+                    raise NodestroError(
+                        "local.job_running", "The local model server is already being set up", job=job.id
+                    )
 
-        def work(job: LocalJob, cancel: threading.Event) -> None:
+            def work(job: LocalJob, cancel: threading.Event) -> None:
+                self._setup(self._trackers[job.id], mode, source, download, start, cancel)
+
+            return self._run("setup", "server", work, steps=SETUP_STEPS)
+
+    def _setup(
+        self, steps: Tracker, mode: Mode, source: Path | None, download: bool, start: bool, cancel: threading.Event
+    ) -> None:
+        def stop_if_cancelled() -> None:
+            if cancel.is_set():
+                raise NodestroError("local.cancelled", "The setup was cancelled")
+
+        # 1. This system and what is installed already.
+        steps.enter("check")
+        binary = self.runtime_binary() if mode == "managed" else None
+        if mode == "managed":
+            external = self.detect_external()
+            if external:
+                steps.log(
+                    f"An Ollama {external} already runs on 127.0.0.1:11434; Nodestro runs its own server next to it "
+                    "and never stops or changes that one"
+                )
+            if binary is not None:
+                note = "bundled" if binary == self.bundled_binary else "installed"
+                steps.finish("check", note=note, detail=f"Ollama runtime {binary}")
+            else:
+                try:
+                    artifact = artifact_for()
+                except OllamaError as exc:
+                    raise _error(exc) from None
+                steps.finish(
+                    "check",
+                    note="external_found" if external else "missing",
+                    detail=f"Ollama {OLLAMA_VERSION} is not installed; archive {artifact.name}"
+                    + (f"; your own Ollama {external} runs on port 11434 and is left alone" if external else ""),
+                )
+        else:
+            url = self.ollama_url()
+            steps.finish("check", note=mode, detail=f"Ollama at {url}" if url else None)
+        stop_if_cancelled()
+
+        # 2.-5. Prerequisites, download, verify and install (managed, only without a runtime).
+        if mode == "managed" and binary is None:
+            steps.enter("prerequisites")
+            if source is None and not download:
+                raise NodestroError("local.archive_or_download", "Choose a runtime archive or allow the download")
+            if source is None:
+                self._refuse_offline("downloading the runtime")
+            try:
+                self.home.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise NodestroError(
+                    "local.models_dir", f"{self.home} cannot be used: {exc}", path=str(self.home)
+                ) from None
+            if not os.access(self.home, os.W_OK):
+                raise NodestroError("local.models_dir", f"{self.home} is not writable", path=str(self.home))
+            free = _free_bytes(self.home)
+            steps.finish("prerequisites", detail=f"folder {self.home}; free {free} bytes")
+            if source is not None:
+                steps.skip("download", note="archive", detail=str(source))
+
+            def phase(name: str) -> None:
+                steps.enter({"download": "download", "verify": "verify", "unpack": "install"}[name])
+
             def progress(done: int, total: int | None) -> None:
-                job.completed, job.total = done, total
+                downloading = steps.job.phase == "download"
+                if downloading and steps.job.progress_step != "download" and done:
+                    steps.job.resumed_bytes = done  # a partial download of an earlier attempt continues
+                    steps.log(f"download: continues after {done} bytes of an earlier attempt")
+                steps.progress(done, total, rate=downloading)
 
-            install_runtime(self.home, archive=source, download=download, progress=progress, cancel=cancel)
+            try:
+                binary = install_runtime(
+                    self.home, archive=source, download=source is None, progress=progress, cancel=cancel, phase=phase
+                )
+            except OllamaError as exc:
+                raise _error(exc) from None
+            steps.finish("install", detail=f"Ollama runtime {binary}")
             with self._lock:
                 self._managed = None  # the next start uses the new binary
-            if self.autostart():
-                self.start()
+        else:
+            note = {"managed": "installed", "container": "container", "external": "external"}.get(mode, mode)
+            if mode == "managed" and binary is not None and binary == self.bundled_binary:
+                note = "bundled"
+            for step in ("prerequisites", "download", "verify", "install"):
+                steps.skip(step, note=note)
+        stop_if_cancelled()
 
-        return self._run("install_runtime", OLLAMA_VERSION, work)
+        # 6.-7. Configure and start (only Nodestro's own server).
+        if mode == "managed":
+            steps.enter("configure")
+            folder = self.models_dir()
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise NodestroError(
+                    "local.models_dir", f"The folder {folder} cannot be used: {exc}", path=str(folder)
+                ) from None
+            if not os.access(folder, os.W_OK):
+                raise NodestroError("local.models_dir", f"The folder {folder} is not writable", path=str(folder))
+            steps.finish(
+                "configure",
+                detail=f"OLLAMA_MODELS={folder}; OLLAMA_CONTEXT_LENGTH={self.context_length}; OLLAMA_NO_CLOUD=1; "
+                f"loopback only; offline={self._offline()}",
+            )
+            if not start:
+                for step in ("start", "reachable"):
+                    steps.skip(step, note="autostart_off")
+            else:
+                running = self._managed is not None and self._managed.base_url is not None
+                steps.enter("start")
+                url = self.start()
+                steps.finish("start", note="already_running" if running else None, detail=url)
+        else:
+            steps.skip("configure", note="not_managed")
+            steps.skip("start", note="not_managed")
+        stop_if_cancelled()
+
+        # 8. Does it answer?
+        url = self.ollama_url()
+        if url is not None:
+            steps.enter("reachable", detail=url)
+            try:
+                version = self._client_factory(url).version()
+            except OllamaError as exc:
+                raise _error(exc) from None
+            differs = "version_differs" if mode != "external" and version != OLLAMA_VERSION else None
+            steps.finish("reachable", note=differs, detail=f"Ollama {version} at {url}")
+            self._show_failed.clear()
+            self._ps = None
+        elif start or mode != "managed":
+            raise NodestroError("local.not_running", "No local model server is running")
+
+        # 9. Hardware (only of this computer).
+        if self._here():
+            steps.enter("hardware")
+            hardware = self.hardware()
+            gpu_memory = f", {hardware.gpu_memory_bytes} bytes" if hardware.gpu_memory_bytes else ""
+            steps.finish(
+                "hardware",
+                note=f"gpu_{hardware.gpu}",
+                detail=f"{hardware.system}/{hardware.machine}; {hardware.cpus} CPU cores; "
+                f"memory {hardware.ram_bytes} bytes; GPU {hardware.gpu}{gpu_memory}",
+            )
+        else:
+            steps.skip("hardware", note="remote")
+        steps.enter("ready")
+        steps.finish("ready", note="ready" if url is not None else "installed")
 
     def import_package(self, path: str, names: list[str] | None = None) -> LocalJob:
         """Import an offline model package (checks every file's SHA-256; no network)."""
@@ -1026,6 +1330,55 @@ def _copy_store(source: Path, target: Path, job: LocalJob, cancel: threading.Eve
             shutil.copytree(source / layout, target / layout, symlinks=True, dirs_exist_ok=True)
 
 
+def _interrupted(job: LocalJob) -> None:
+    """A job that the end of the application stopped: failed with ``local.interrupted``, continued when retried."""
+    job.state = "failed"
+    job.error_code = "local.interrupted"
+    job.error = "Nodestro stopped while this job was running"
+    job.finished_at = job.finished_at or job.updated_at or job.started_at
+    for step in job.steps:
+        if step.state == "running":
+            step.state = "failed"
+    job.phase, job.rate, job.eta_seconds, job.eta_scope = None, None, None, None
+    job.stalled_seconds = None
+    job.retryable = retryable(job)
+
+
+def _present_bytes(folder: Path) -> tuple[dict[str, int], int]:
+    """What an Ollama model folder holds already, by digest (``sha256:<hex>``), and the bytes of partial downloads.
+
+    A complete file counts with its size. A partial download (``sha256-<hex>-partial``, which Ollama creates at the
+    file's full size) counts with the bytes Ollama recorded in its part files (``-partial-<n>``: JSON with
+    ``Completed``); Ollama continues it from there."""
+    blobs = folder / "blobs"
+    present: dict[str, int] = {}
+    partial = 0
+    try:
+        entries = list(blobs.iterdir())
+    except OSError:
+        return present, 0
+    for blob in entries:
+        name = blob.name
+        if not name.startswith("sha256-"):
+            continue
+        digest, _, rest = name.partition("-partial")
+        key = "sha256:" + digest.removeprefix("sha256-")
+        if not _:
+            with suppress(OSError):
+                present[key] = blob.stat().st_size
+            continue
+        if not rest.startswith("-"):
+            continue  # the preallocated file itself
+        try:
+            done = json.loads(blob.read_text(encoding="utf-8")).get("Completed")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(done, int) and done > 0:
+            present[key] = present.get(key, 0) + done
+            partial += done
+    return present, partial
+
+
 def _free_bytes(folder: Path) -> int | None:
     probe = folder
     while not probe.exists() and probe.parent != probe:
@@ -1058,7 +1411,11 @@ def _error(exc: OllamaError) -> NodestroError:
 
 __all__ = [
     "CATALOG",
+    "SETUP_STEPS",
     "InstalledModel",
+    "JobLayer",
+    "JobState",
+    "JobStep",
     "LocalJob",
     "LocalModelService",
     "LocalStatus",

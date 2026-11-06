@@ -12,8 +12,8 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 37 |
-| P4 Optional | 12 |
+| P3 Low | 40 |
+| P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
 every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
@@ -345,14 +345,17 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** On a change of `strict_offline`, restart the managed server with `offline` (orkexa
   `ManagedOllama.restart(offline=...)`) when no local request is running, or mark it for a restart; add a test.
 
-### RT-061 · The workflow check does not check an orchestrator's model capabilities
+### RT-067 · Small local thinking models loop on tool calls
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** product check 2026-11-05, RT-004 (fixed)
-- **What:** An orchestrator decision needs structured output. A model without it (an OpenAI-compatible endpoint
-  whose capabilities are not declared reports `unknown`) fails at the first decision with Orkexa's capability error;
-  the workflow check says nothing beforehand. The reasoning effort no longer causes this (RT-004).
-- **Next step:** Report a `check.orchestrator_model_unsupported` error when the orchestrator model's
-  `structured_output` is not `supported` through its connection; the studio needs its text in six languages.
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-5)
+- **What:** After the 400 fix, the production-downtime example on qwen3.5:2b (CPU) failed twice with `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). Every request was accepted.
+- **Next step:** Compare tool looping with and without reasoning sent back; consider a higher default `max_tool_rounds` for local thinking models.
+
+### RT-068 · Request timeout too short for local models on CPU
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-2)
+- **What:** On CPU the SDK's default 600 s timeout expired on a slow request; the retry that followed is safe but slow.
+- **Next step:** A timeout suited to CPU for local Ollama connections, taken from the hardware profile.
 
 ## Architecture and modularity
 
@@ -521,6 +524,30 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Let the message depend on the context: in serving mode name the environment variable and `.env`; in
   `check.local_runtime_missing` name the settings page and the API route and add `params.models`.
 
+### RT-062 · Capabilities of non-catalog local models are known only after the download
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (missing-model stream)
+- **What:** For a local model that is neither in the catalog nor installed, a missing capability (tools, vision, embeddings) is found only after the download.
+- **Next step:** Read the capabilities from the registry manifest before the download and report `capability_missing` up front.
+
+### RT-063 · Reasoning of the architect's CodingAgent and AgentArchitect sub-requests is not streamed
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (thinking stream, THINK-1)
+- **What:** The Workflow Architect streams its own reasoning; the sub-requests that write tools and agents show only an activity status.
+- **Next step:** Forward their reasoning events through the same `ReasoningStreamInfo` channel.
+
+### RT-064 · Overall pull ETA for local model downloads
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (local setup stream)
+- **What:** Progress and ETA are per file until Ollama verifies; the overall remaining time appears only once all files are known.
+- **Next step:** Compute an overall ETA as soon as Ollama reports the total size.
+
+### RT-065 · Native OpenAI and Gemini tools are not integrated
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (params stream)
+- **What:** Orkexa passes native web search and code execution through, but Nodestro shows them as `not_integrated` because their fees are not priced.
+- **Next step:** Price the fees in the pricing engine, then enable them through `model_profile` like Anthropic's server tools.
+
 ## Tests and quality assurance
 
 ### RT-056 · The test double cannot finish orchestrators
@@ -616,6 +643,12 @@ Items that need an independent or external review (an internal audit does not re
   run chat with real models), no load against PostgreSQL on server hardware, no multi-process test of every race fix.
 - **Next step:** Run the prepared Bedrock smoke test once credentials are approved; the PostgreSQL load test is
   tracked in nodestro-server SRV-013.
+
+### RT-066 · No live Ollama reasoning check in CI
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (thinking stream, THINK-4)
+- **What:** Ollama's reasoning stream was checked against a recorded fixture only, not against a live model server.
+- **Next step:** Check it live with a small reasoning model, then add an optional CI job (as for the local model tests).
 
 ## Documentation
 

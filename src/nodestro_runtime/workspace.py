@@ -41,13 +41,14 @@ import sys
 import threading
 from typing import Any, Literal
 
+from orkexa import ConfigurationError
 from orkexa.dynamic import Sandbox
 from orkexa.embeddings import OllamaEmbeddings
 from orkexa.local import OllamaError, check_model_name
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
-from . import docker_status, run_budget, sandbox_selection
+from . import docker_status, output_limits, run_budget, sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -83,6 +84,7 @@ from .providers import (
     check_base_url,
     check_capabilities,
     check_endpoint_allowed,
+    check_limits,
     check_model,
     endpoint_client,
     env_key,
@@ -148,6 +150,13 @@ LOCK_FILE = "nodestro.lock"
 #: The installation's own bookkeeping (never the user's settings): which default models it started with.
 INSTALLATION = "installation"
 MODEL_DEFAULTS = "model_defaults"
+
+
+def _retry_cap(value: Any) -> int:
+    """The stored ``architect_retry_max_tokens``, else the default (also for an invalid stored value)."""
+    if isinstance(value, int) and not isinstance(value, bool) and 1024 <= value <= 1_000_000:
+        return value
+    return output_limits.ARCHITECT_RETRY_DEFAULT
 
 
 def _retrieval_mode(value: Any) -> Any:
@@ -387,6 +396,7 @@ class Workspace:
         self.tools.mcp = self.mcp
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
+        self.builder.declared_limits = lambda provider: dict(self._providers().get(provider, {}).get("limits") or {})
         # Local models (Ollama): the managed server of the desktop, the container of Nodestro Local Docker, or the
         # operator's endpoint on a server. Nothing starts here (see local_service).
         self.local_models = LocalModelService(
@@ -399,6 +409,11 @@ class Workspace:
             environ={} if storage is not None else None,
         )
         self.builder.reported = self.local_models.capability_overrides
+        self.builder.local_window = self._local_window
+        self.builder.output_overrides = lambda: output_limits.stored_overrides(self._stored("output_limits"))
+        self.tools.generation_max_tokens = lambda model, connection: (
+            self.builder.output_limit("tool_generation", model, connection).value
+        )
         self._client_factory = client_factory
         self.runs = RunManager(
             self.store,
@@ -705,6 +720,10 @@ class Workspace:
             architect_max_repairs=int(values.get("architect_max_repairs") or 0)
             if values.get("architect_max_repairs") is not None
             else 2,
+            output_limits=output_limits.stored_overrides(values.get("output_limits")),
+            output_limit_defaults=dict(output_limits.OPERATIONS),
+            architect_retry_truncated=values.get("architect_retry_truncated") is not False,
+            architect_retry_max_tokens=_retry_cap(values.get("architect_retry_max_tokens")),
             ocr_enabled=bool(values.get("ocr_enabled")),
             ocr_available=self.knowledge.ocr_available(),
             price_mode="strict" if values.get("price_mode") == "strict" else "standard",
@@ -716,8 +735,16 @@ class Workspace:
             strict_offline=bool(values.get("strict_offline")),
             prefer_european_models=bool(values.get("prefer_european_models")),
             local_reasoning="full" if values.get("local_reasoning") == "full" else "auto",
+            reasoning_summaries=bool(values.get("reasoning_summaries")),
             model_defaults="local" if fallback_model == LOCAL_DEFAULT_MODEL else "kept",
         )
+
+    def output_limit(
+        self, operation: str, model: str, connection: Connection | None = None
+    ) -> output_limits.EffectiveLimit:
+        """The output limit one of Nodestro's own AI operations sends to ``model`` (setting, else built-in default,
+        capped by the model's maximum; see :mod:`nodestro_runtime.output_limits`)."""
+        return self.builder.output_limit(operation, model, connection)
 
     def _budget_policy(self) -> tuple[Decimal | None, int]:
         """The highest limit a budget decision may set (the tenant's and the operator's maximum) and the hours an
@@ -810,6 +837,19 @@ class Workspace:
                     entry.pop(key, None)
             if change.get("capabilities") is not None:
                 entry["capabilities"] = check_capabilities(change["capabilities"])
+            if change.get("limits") is not None:
+                if not PROVIDERS[name].declare_capabilities and change["limits"]:
+                    raise NodestroError(
+                        "provider.field_not_supported",
+                        f"The limits of {PROVIDERS[name].label} models come from Orkexa and cannot be declared",
+                        provider=name,
+                        field="limits",
+                    )
+                limits = check_limits(change["limits"])
+                if limits:
+                    entry["limits"] = limits
+                else:
+                    entry.pop("limits", None)
         values["providers"] = {name: entry for name, entry in providers.items() if entry}
         for key in ("default_model", "assistant_model"):
             if changes.get(key):
@@ -820,6 +860,11 @@ class Workspace:
             changes.get("embedding_model") or values.get("embedding_model")
         ):
             changes["embedding_model"] = LOCAL_EMBEDDING_MODEL
+        if "output_limits" in changes:
+            requested_limits = changes.pop("output_limits") or {}
+            merged: dict[str, Any] = dict(output_limits.stored_overrides(values.get("output_limits")))
+            merged.update(requested_limits)  # null or 0 removes an override (check_overrides drops it)
+            values["output_limits"] = output_limits.check_overrides(merged)
         if changes.pop("clear_max_run_budget", None):
             values.pop("max_run_budget_usd", None)
             changes.pop("max_run_budget_usd", None)
@@ -899,13 +944,14 @@ class Workspace:
                     provider="bedrock",
                     field=key,
                 )
-        if change.get("capabilities"):
-            raise NodestroError(
-                "provider.field_not_supported",
-                "Amazon Bedrock's capabilities come from Orkexa and cannot be declared",
-                provider="bedrock",
-                field="capabilities",
-            )
+        for field in ("capabilities", "limits"):
+            if change.get(field):
+                raise NodestroError(
+                    "provider.field_not_supported",
+                    f"Amazon Bedrock's {field} come from Orkexa and cannot be declared",
+                    provider="bedrock",
+                    field=field,
+                )
         server = self._server_tenant
         policy = self._bedrock_policy_for_tenant()
         if server and (policy is None or policy.role is None) and any(change.get(key) for key in _BEDROCK_FIELDS):
@@ -1321,9 +1367,20 @@ class Workspace:
                 client=client,
                 reported=reported,
                 reasoning_saving=provider == "ollama" and self.reasoning_saving(),
+                limits=dict(stored.get("limits") or {}),
+                window=self._local_window if provider == "ollama" else None,
+                reasoning_summaries=bool(self._stored("reasoning_summaries")),
             ),
             info.label,
         )
+
+    def _local_window(self) -> int | None:
+        """The context window of the local model server (configured, or read from a loaded chat model); ``None`` when
+        it is not known or the server does not answer (never starts the managed server)."""
+        try:
+            return self.local_models.context_window()
+        except (NodestroError, OSError, ConfigurationError):  # e.g. a stored address the client refuses
+            return None
 
     def _refuse_offline(self, connection: Connection, label: str) -> Connection:
         """``connection``, unless the strict offline mode is on and it is not the local model server (D12).

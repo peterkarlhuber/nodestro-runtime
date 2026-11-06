@@ -178,13 +178,21 @@ class ToolChoice(_Model):
     name: str | None = None
 
 
+#: The highest ``max_tokens`` a configuration may hold (a typo guard; the model's own maximum is checked separately).
+MAX_TOKENS_BOUND = 1_000_000
+
+
 class AgentConfig(_Model):
     """Everything about one agent node; mirrors the arguments of ``orkexa.Agent``.
 
     ``model`` names the provider and the model (``provider:model``). ``thinking``,
-    ``thinking_display``, ``cache_control``, ``cache_ttl``, ``fallbacks`` and ``server_tools``
-    are options of the Anthropic API (``orkexa.AnthropicOptions``); for other providers
-    they must keep their defaults (see :mod:`nodestro_runtime.agent_builder`).
+    ``thinking_display``, ``thinking_budget``, ``cache_control``, ``cache_ttl``, ``fallbacks`` and
+    ``server_tools`` depend on what the model supports (:mod:`nodestro_runtime.model_profile`); a model that
+    cannot use one refuses a value other than its default (see :mod:`nodestro_runtime.agent_builder`).
+
+    ``max_tokens`` is the most output tokens per model response (reasoning counts against it); it may not exceed
+    the model's documented or declared maximum (``GET /api/models/profile``). The upper bound here only catches
+    typos: no model accepts more.
     """
 
     name: str = "Agent"
@@ -210,7 +218,10 @@ class AgentConfig(_Model):
     tool_choice: ToolChoice = Field(default_factory=ToolChoice)
     cache_control: bool = True
     cache_ttl: Literal["5m", "1h"] = "5m"
-    max_tokens: int = Field(default=8000, ge=1, le=128_000)
+    max_tokens: int = Field(default=8000, ge=1, le=MAX_TOKENS_BOUND)
+    #: A thinking token budget for models that take one instead of an effort (Gemini 2.5); ``None``: the provider's
+    #: default. Sent as ``thinking_config.thinking_budget``.
+    thinking_budget: int | None = Field(default=None, ge=0, le=MAX_TOKENS_BOUND)
     max_tool_rounds: int = Field(default=8, ge=0, le=50)
     max_parallel_tools: int = Field(default=1, ge=1, le=16)
     raise_tool_errors: bool = False
@@ -728,7 +739,14 @@ class NodeRun(_Model):
     prompt: str | None = None
     output: Any = None
     text: str = ""
+    #: The reasoning text the provider transmitted while the step ran (never generated; see :mod:`.reasoning`).
     thinking: str = ""
+    #: ``thinking`` (the model's reasoning text) or ``summary`` (the provider's summary of it); ``None``: no text.
+    thinking_kind: Literal["thinking", "summary"] | None = None
+    #: Reasoning phases the provider's stream marked, with or without text (0: none seen).
+    thinking_phases: int = 0
+    #: A phase arrived only encrypted or omitted: the model reasoned, there is no text to show.
+    thinking_redacted: bool = False
     #: The technical error text (English) and its code/params, which the UI shows in its own language.
     error: str | None = None
     error_code: str | None = None
@@ -942,6 +960,13 @@ class SettingsIn(_Model):
     architect_budget_usd: float | None = Field(default=None, ge=0)
     #: How often the Workflow Architect may ask the AI to correct a configuration or a tool.
     architect_max_repairs: int | None = Field(default=None, ge=0, le=5)
+    #: Output token limits of Nodestro's own AI operations by operation (``nodestro_runtime.output_limits``); a value
+    #: replaces the stored one, ``null`` or ``0`` removes it (the built-in default applies again). Keys not sent stay.
+    output_limits: dict[str, int | None] | None = None
+    #: Whether the Workflow Architect asks once more with a higher output limit when an answer was cut off.
+    architect_retry_truncated: bool | None = None
+    #: The highest output limit such a retry may use (tokens; the model's maximum and the job's budget still apply).
+    architect_retry_max_tokens: int | None = Field(default=None, ge=1024, le=1_000_000)
     #: Recognise scanned PDFs with local OCR when they are uploaded.
     ocr_enabled: bool | None = None
     #: ``standard`` or ``strict``: whether requests without a known (or with a long unchecked) price are refused.
@@ -962,6 +987,9 @@ class SettingsIn(_Model):
     #: The CPU saving mode of local thinking models (``auto``: on a server without a GPU, effort ``medium`` answers
     #: without the thinking phase; ``full``: always as the agent's effort says).
     local_reasoning: Literal["auto", "full"] | None = None
+    #: Ask OpenAI and Gemini for reasoning summaries (they send them only on request), for agents and the built-in AI
+    #: functions; shown live where the interface's thinking display allows it.
+    reasoning_summaries: bool | None = None
 
 
 class BuiltinSandboxStatus(_Model):
@@ -1067,6 +1095,12 @@ class Settings(_Model):
     language: Language | None = None
     architect_budget_usd: float | None = 2.0
     architect_max_repairs: int = 2
+    #: Output token limits set for Nodestro's own AI operations (only the overridden ones) and the built-in defaults of
+    #: every operation; the model's maximum output caps both (``nodestro_runtime.output_limits``).
+    output_limits: dict[str, int] = Field(default_factory=dict)
+    output_limit_defaults: dict[str, int] = Field(default_factory=dict)
+    architect_retry_truncated: bool = True
+    architect_retry_max_tokens: int = 64_000
     ocr_enabled: bool = False
     #: Whether tesseract and pdftoppm are installed.
     ocr_available: bool = False
@@ -1088,5 +1122,9 @@ class Settings(_Model):
     #: The CPU saving mode of local thinking models: ``auto`` (default) lets effort ``medium`` answer without the
     #: thinking phase when the local model server has no GPU; effort ``high`` is never reduced. ``full`` turns it off.
     local_reasoning: Literal["auto", "full"] = "auto"
+    #: Whether OpenAI and Gemini are asked for reasoning summaries (off by default: OpenAI may require a verified
+    #: organization for them). Claude agents use their own ``thinking_display``; local models send their reasoning
+    #: without a request.
+    reasoning_summaries: bool = False
     #: Whether this installation started with local default models (``local``) or kept its cloud defaults (``kept``).
     model_defaults: Literal["local", "kept"] = "kept"

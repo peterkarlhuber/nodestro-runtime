@@ -23,6 +23,102 @@ capabilities they report in `/api/show`, recommendations, and jobs with progress
 `import_gguf` (a GGUF file and an optional vision projector), `set_models_dir` (use a folder as it is, or copy the
 models there, check them and switch; the old folder is kept).
 
+## Setup and download progress
+
+Every long operation is a job (`LocalModelService.jobs()`, `job(id)`, `cancel(id)`) with named steps. The steps
+mirror what the code really does, and each step is `pending`, `running`, `done`, `skipped` (with a note why) or
+`failed` (`local_progress.py`):
+
+| Job | Steps |
+|---|---|
+| `setup` (`setup(archive=None, download=False, start=True)`, also behind `install_runtime`) | `check`, `prerequisites`, `download`, `verify`, `install`, `configure`, `start`, `reachable`, `hardware`, `ready` |
+| `pull` | `check` (free space), `manifest`, `download`, `verify`, `finalize` |
+| `build` | `template`, `weights`, `convert`, `create`, `check`, `install` |
+
+What the setup does per mode: the managed mode installs (or uses the bundled or installed runtime and says so),
+configures (`OLLAMA_MODELS`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NO_CLOUD`, shown in the step's detail), starts the
+child process and checks it. In the container and the external mode it only checks the server and the hardware;
+the other steps are skipped with a note. An Ollama the user runs is reported in `check` and is never started,
+stopped or reconfigured; `POST /api/local-models/stop` refuses every mode but the managed one (`local.not_managed`).
+
+**Measured or not.** `completed`/`total` describe the running step only when it can be measured (a download, the
+SHA-256 check, a model build's conversion). Without a measure `total` is null and the interface shows an
+indeterminate bar. Nothing is estimated:
+
+- `rate` (bytes per second) is set only after 3 s of samples, over a 10 s window, and only for transfers (a checksum
+  has a percentage but no rate).
+- `eta_seconds` is set only once the rate is steady: at least 5 s of samples, and the last 3 s within 0.5 to 2 times
+  the window's rate. `eta_scope` is `job` when the total is final and `file` during a model download.
+- `stalled_seconds` is set once no new byte arrived for 5 s. Rate and ETA then fall back to null.
+- `resumed_bytes` gives what an earlier attempt left. For the runtime this is the partial archive. For a model it is
+  Ollama's own `-partial-N` records in the models folder, read before the pull starts, so the value is exact.
+
+**Model downloads (Ollama 0.40).** `/api/pull` names one file (layer) at a time and gives its size only when that
+file starts. So the overall total is not known up front. `PullProgress` sums the files seen so far with
+`total_final=False`, and lists each in `layers`. It sets `total_final=True` at `verifying sha256 digest`, when all
+files are known. The interface measures the current file until then, so the bar never jumps back.
+
+**Errors and retry.** Error codes are kept from the bottom up:
+
+- `local.network`: no connection, a proxy or DNS failure, or Ollama's "max retries exceeded" after about a minute of
+  its own retries.
+- `local.disk_full`: refused before the download when the free space is below the remaining bytes, or "no space left
+  on device" while writing.
+- `local.checksum_mismatch`, `local.model_missing`, `local.cancelled`, `local.interrupted`, `local.install_running`,
+  `local.job_running`.
+
+`retryable` says whether starting again makes sense. Codes that a retry cannot fix (strict offline mode,
+unsupported platform, a missing file, a server profile) are not retryable. A retry continues where the job stopped:
+the runtime archive with an HTTP `Range` request (`<home>/runtime/.downloads/`), a model through Ollama's partial
+files. A checksum failure deletes the partial archive.
+
+**One at a time.** The same model downloads once at a time (`local.job_running` with the running job's id). There
+is one setup at a time. Across processes, an advisory file lock guards the runtime install
+(`runtime/.install.lock`, `local.install_running`).
+
+**After a restart.** Jobs are kept in the store (collection `local_jobs`, document `recent`, the last 30 finished
+ones). They are written at most every 5 s, at once on a step change, and at the end. `close()` records running jobs
+as `local.interrupted` with the bytes they reached (not as canceled). A crash leaves them `running` in the store,
+and the next start turns them into `local.interrupted`. Both are retryable and continue from the partial files.
+
+The interface (`frontend/src/components/Progress.tsx`, `pages/LocalModelJobs.tsx`) polls the jobs every second while
+one runs and every 10 s otherwise. A job started elsewhere therefore appears without a reload.
+
+## Missing local models (`local_readiness`)
+
+`nodestro_runtime.local_readiness` answers one question for every caller: can this local model be used now, and if
+not, why and what may this person do? `diagnose(ws, model, action=, needs=, can_install=, switchable=)` returns
+`None` for a ready (or non-local) model, else a `ModelProblem`:
+
+- `cause`, never lumped together as "missing": `model_missing`, `runtime_missing`, `server_stopped`,
+  `server_unreachable`, `server_missing`, `model_name_invalid` (also Ollama cloud names), `disk_full` (catalog size
+  against the free space of the model folder, partial files counted), `capability_missing` (`ModelNeeds`: kind chat
+  or embedding, capabilities such as `tools` or `structured_output` from `/api/show`), `hardware_insufficient`.
+- `location` (`this_computer`, `container`, `remote` with `host`, `server` for the server profile) and `mode`.
+- `actions`, computed here and only here (`_offered`): `download`, `setup_server`, `retry`, `choose_model`,
+  `ask_admin`, `open_settings`. `blocked` says why no download is offered: `permission` (no install permission),
+  `operator` (server profile: the operator installs), `offline` (strict offline mode).
+- Facts for the dialog: catalog download and memory size, free and partial bytes, `fits`, and the running download
+  (`job`, followed instead of starting another) or the last stopped one (`previous_job`, resumable).
+
+`alternatives(ws, needs, exclude)` lists ready models that can do the step: installed local models and the allowed
+models of configured cloud providers (none in the strict offline mode; a cloud model whose capability is known to be
+`unsupported` is left out). `require_ready()` raises `NodestroError("model.local_unavailable", problem=...,
+alternatives=[...])`; `check_override()` accepts a per-action model only if it is among those alternatives
+(`model.choice_invalid`). Nothing here starts a download: with `start=False` and a stopped managed server the answer
+comes from the model folder (`scan_store`), so unattended paths never start the server either.
+
+An injected client (`client_factory` answering for `ollama`) means there is no local model server: `diagnose` returns
+`None` then, as the run does not need one.
+
+Unattended runs: `preflight._local_model_issues` reads the managed model folder when the server is not running, so a
+schedule, batch or published API start is refused with `check.local_model_missing` (`params.model`) before anything
+starts; nothing downloads. A run that still reaches a missing model (an external server lost it meanwhile) maps
+Ollama's 404 "model ... not found" to `run.local_model_missing` (`engine.provider_problem`) instead of an API error.
+
+`LocalModelService.pull(name, attach=True)` returns the running download of the same model (also when another
+request started it a moment earlier), so a second click, tab or dialog never starts a second download.
+
 ## Which model
 
 `local_models.CATALOG` holds the eleven suggested models with registry digest, download size, listed capabilities,
