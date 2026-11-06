@@ -582,17 +582,27 @@ class ToolLibrary:
 
     @property
     def registry(self) -> ToolRegistry:
-        """The tool registry, read again from disk whenever another process changed its files (F1).
+        """The tool registry, brought up to date whenever another process changed its files (F1).
 
         Several processes (the API and every worker of a server) share one tool directory; without this a process
-        would keep using the tools it read at its start until it restarts."""
+        would keep using the tools it read at its start until it restarts. A change is noticed by the files'
+        fingerprint and read with Orkexa's ``ToolRegistry.refresh()`` (ORK-002), which keeps the built-in tools
+        registered and a stored tool of the same name hidden behind them."""
         registry = self._registry
-        if registry.path is not None and _fingerprint(registry.path) != self._seen:
-            with self._lock:
-                if self._registry is registry:
-                    self._registry = self._load(registry.path, registry.sandbox)
-                registry = self._registry
+        if registry.path is not None:
+            seen = _fingerprint(registry.path)
+            if seen != self._seen:
+                with self._lock:
+                    if self._registry is registry and seen != self._seen:
+                        registry.refresh()
+                        self.shadowed = self._shadowed(registry.path)
+                        self._seen = seen
+                    registry = self._registry
         return registry
+
+    def _shadowed(self, path: Path) -> frozenset[str]:
+        """Built-in tool names that also have stored files under ``path`` (those files are not loaded)."""
+        return frozenset(name for name in self.builtin if any((path / name).glob("v*.json")))
 
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
