@@ -1063,6 +1063,18 @@ class ToolLibrary:
         if not result.ok:
             return result, None
         assert result.name is not None and result.description is not None and result.input_schema is not None
+        if result.name != function_name and (result.name in RESERVED_NAMES or result.name in self.builtin):
+            # The name the tool is stored under comes from the checked code; it is held to the reservation too
+            # (MCP L-1, RT-025), not only the function name the caller gave.
+            result.ok = False
+            result.errors.append(
+                problem(
+                    "tool.name_reserved",
+                    f"The name {result.name!r} is reserved; please choose another one",
+                    name=result.name,
+                )
+            )
+            return result, None
         existing = self.registry.versions(result.name)
         if any(record.kind == "trusted" for record in existing):
             result.ok = False

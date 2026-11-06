@@ -180,3 +180,21 @@ def test_without_memory_a_call_named_memory_is_gated(tmp_path: Path, monkeypatch
         assert call.is_error
     finally:
         workspace.close()
+
+
+def test_the_stored_name_is_held_to_the_reservation_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCP L-1 (RT-025): the name a tool is stored under comes from the checked code, not from the function name the
+    caller gave; a reserved stored name is refused even when the function name is free."""
+    from nodestro_runtime.tool_library import CheckResult
+
+    workspace = _workspace(tmp_path, {})
+    try:
+        checked = CheckResult(ok=True, name="memory", description="d", input_schema={"type": "object"})
+        monkeypatch.setattr(workspace.tools, "check", lambda *_args, **_kwargs: checked)
+        result, info = workspace.tools.save_custom(CODE, TESTS, "convert", trust="user-authored")
+        assert not result.ok and info is None
+        assert [e.code for e in result.errors] == ["tool.name_reserved"]
+        assert result.errors[0].params == {"name": "memory"}
+        assert "memory" not in workspace.tools
+    finally:
+        workspace.close()
