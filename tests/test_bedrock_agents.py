@@ -143,14 +143,13 @@ def test_request_options_cannot_change_the_connection(options: dict[str, Any], t
     "change",
     [
         {"thinking": "adaptive"},
-        {"cache_control": False},
-        {"cache_ttl": "1h"},
         {"fallbacks": ["bedrock:eu.anthropic.claude-opus-5-5"]},
         {"server_tools": ["web_search"]},
     ],
 )
 def test_anthropic_only_options_stay_refused_for_claude_on_bedrock(change: dict[str, Any], tmp_path: Path) -> None:
     # Converse has none of these options (by capability, not by provider name: model_profile.option_support).
+    # Prompt caching (cache_control, cache_ttl) is mapped to Bedrock's cache points: see the run tests below.
     workspace = Workspace(tmp_path / "ws", integrations=[])
     try:
         config = AgentConfig.model_validate({"model": CLAUDE, **change})
@@ -210,10 +209,29 @@ def test_agent_test_with_tool_calls_and_streaming(workspace: Workspace, runtime:
     assert [call.name for call in result.tool_calls] == ["calculator"]
     first, second = runtime.calls
     assert first["modelId"] == "eu.anthropic.claude-sonnet-5-5"
-    assert [tool["toolSpec"]["name"] for tool in first["toolConfig"]["tools"]] == ["calculator"]
+    # The tools, then the cache point that prompt caching (on by default) adds after them.
+    assert [tool["toolSpec"]["name"] for tool in first["toolConfig"]["tools"] if "toolSpec" in tool] == ["calculator"]
+    assert first["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default"}}
     results = [block["toolResult"] for block in second["messages"][-1]["content"] if "toolResult" in block]
     assert results and results[0]["toolUseId"] == "tool_1" and "5" in json.dumps(results[0]["content"])
     runtime.stubber.assert_no_pending_responses()  # no other operation was called
+
+
+def test_prompt_caching_sets_cache_points(workspace: Workspace, runtime: ScriptedRuntime) -> None:
+    """``cache_control`` (on by default, like Anthropic's) becomes Bedrock's cache points after the system prompt,
+    the tools and the conversation (Orkexa ``BedrockOptions.prompt_caching``); ``cache_ttl`` their lifetime."""
+    runtime.answers = [[{"text": "ok"}], [{"text": "ok"}], [{"text": "ok"}]]
+    agent = {"name": "C", "model": CLAUDE, "system_prompt": "Be brief.", "tools": ["calculator"]}
+    for change in ({}, {"cache_ttl": "1h"}, {"cache_control": False}):
+        config = AgentConfig.model_validate({**agent, **change})
+        result, _ = workspace.tester.run(AgentTestIn(agent=config, input="x"))
+        assert result.status == "succeeded", result.error
+    cached, hour, plain = runtime.calls
+    assert {"cachePoint": {"type": "default"}} in cached["system"]
+    assert {"cachePoint": {"type": "default"}} in cached["toolConfig"]["tools"]
+    assert {"cachePoint": {"type": "default", "ttl": "1h"}} in hour["system"]
+    assert not any("cachePoint" in block for block in plain["system"])
+    assert not any("cachePoint" in block for block in plain["toolConfig"]["tools"])
 
 
 def test_full_model_ids_reach_converse(workspace: Workspace, runtime: ScriptedRuntime) -> None:

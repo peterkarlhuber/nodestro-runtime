@@ -185,6 +185,76 @@ def test_names_are_checked(store: DocumentStore) -> None:
         store.list_page("runs", RunDoc, limit=-1)
 
 
+class FlowRun(BaseModel):
+    id: str
+    created_at: datetime
+    workflow_id: str = ""
+    parent_run_id: str | None = None
+
+
+def test_since_and_equals_filter_in_the_query(store: DocumentStore) -> None:
+    """RT-042: a page of one workflow's runs and of a period, also across pages; other runs never fill a page."""
+    runs = [
+        FlowRun(
+            id=f"r{index:02d}", created_at=T0 + timedelta(seconds=index), workflow_id="wf_a" if index % 3 else "wf_b"
+        )
+        for index in range(12)
+    ]
+    runs.append(FlowRun(id="child", created_at=T0 + timedelta(seconds=30), workflow_id="wf_a", parent_run_id="r01"))
+    for run in runs:
+        store.put("runs", run.id, run)
+    store.put_raw("runs", "number", {"id": "number", "created_at": T0.isoformat(), "workflow_id": 7})
+    expected = [
+        run.id for run in sorted(runs, key=lambda run: run.created_at, reverse=True) if run.workflow_id == "wf_a"
+    ]
+    pages: list[str] = []
+    before: tuple[datetime, str] | None = None
+    while True:
+        page, more = store.list_page("runs", FlowRun, limit=3, before=before, equals={"workflow_id": "wf_a"})
+        assert all(item.workflow_id == "wf_a" for item in page)
+        pages += [item.id for item in page]
+        if not more:
+            break
+        before = (page[-1].created_at, page[-1].id)
+    assert pages == expected
+    top, _ = store.list_page("runs", FlowRun, limit=100, top_level=True, equals={"workflow_id": "wf_a"})
+    assert [item.id for item in top] == [item for item in expected if item != "child"]
+    since, _ = store.list_page("runs", FlowRun, limit=100, since=T0 + timedelta(seconds=9))
+    assert [item.id for item in since] == ["child", "r11", "r10", "r09"]  # at or after the time
+    both, more = store.list_page(
+        "runs", FlowRun, limit=100, since=T0 + timedelta(seconds=6), equals={"workflow_id": "wf_b"}, top_level=True
+    )
+    assert [item.id for item in both] == ["r09", "r06"] and not more
+    assert store.list_page("runs", FlowRun, limit=10, equals={"workflow_id": "nothing"}) == ([], False)
+    with pytest.raises(ValueError):
+        store.list_page("runs", FlowRun, limit=1, equals={"workflow_id') OR ('1'='1": "x"})
+
+
+class Entry(BaseModel):
+    id: str
+    at: datetime
+
+
+def test_list_since_filters_any_collection_by_a_time_field(store: DocumentStore) -> None:
+    """RT-009: usage entries of a period are filtered by the store, newest first; damaged times are left out."""
+    for index in range(6):
+        moment = T0 + timedelta(hours=index)
+        if index == 4:
+            moment = moment.astimezone(timezone(timedelta(hours=-5)))  # another offset, the same moment
+        store.put("usage", f"e{index}", Entry(id=f"e{index}", at=moment))
+    store.put_raw("usage", "bad", {"id": "bad", "at": "yesterday"})
+    store.put_raw("usage", "missing", {"id": "missing"})
+    store.put("other", "x", Entry(id="x", at=T0 + timedelta(hours=10)))
+    found = store.list_since("usage", Entry, field="at", since=T0 + timedelta(hours=2))
+    assert [item.id for item in found] == ["e5", "e4", "e3", "e2"]
+    assert [item.id for item in store.list_since("usage", Entry, field="at", since=T0 - timedelta(days=1))] == [
+        f"e{index}" for index in reversed(range(6))
+    ]
+    assert store.list_since("usage", Entry, field="at", since=T0 + timedelta(days=1)) == []
+    with pytest.raises(ValueError):
+        store.list_since("usage", Entry, field="at') OR ('1'='1", since=T0)
+
+
 # ---- SQLite: schema version 2 -----------------------------------------------------------------------------------
 
 

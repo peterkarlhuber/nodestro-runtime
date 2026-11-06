@@ -582,17 +582,27 @@ class ToolLibrary:
 
     @property
     def registry(self) -> ToolRegistry:
-        """The tool registry, read again from disk whenever another process changed its files (F1).
+        """The tool registry, brought up to date whenever another process changed its files (F1).
 
         Several processes (the API and every worker of a server) share one tool directory; without this a process
-        would keep using the tools it read at its start until it restarts."""
+        would keep using the tools it read at its start until it restarts. A change is noticed by the files'
+        fingerprint and read with Orkexa's ``ToolRegistry.refresh()`` (ORK-002), which keeps the built-in tools
+        registered and a stored tool of the same name hidden behind them."""
         registry = self._registry
-        if registry.path is not None and _fingerprint(registry.path) != self._seen:
-            with self._lock:
-                if self._registry is registry:
-                    self._registry = self._load(registry.path, registry.sandbox)
-                registry = self._registry
+        if registry.path is not None:
+            seen = _fingerprint(registry.path)
+            if seen != self._seen:
+                with self._lock:
+                    if self._registry is registry and seen != self._seen:
+                        registry.refresh()
+                        self.shadowed = self._shadowed(registry.path)
+                        self._seen = seen
+                    registry = self._registry
         return registry
+
+    def _shadowed(self, path: Path) -> frozenset[str]:
+        """Built-in tool names that also have stored files under ``path`` (those files are not loaded)."""
+        return frozenset(name for name in self.builtin if any((path / name).glob("v*.json")))
 
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
@@ -1063,6 +1073,18 @@ class ToolLibrary:
         if not result.ok:
             return result, None
         assert result.name is not None and result.description is not None and result.input_schema is not None
+        if result.name != function_name and (result.name in RESERVED_NAMES or result.name in self.builtin):
+            # The name the tool is stored under comes from the checked code; it is held to the reservation too
+            # (MCP L-1, RT-025), not only the function name the caller gave.
+            result.ok = False
+            result.errors.append(
+                problem(
+                    "tool.name_reserved",
+                    f"The name {result.name!r} is reserved; please choose another one",
+                    name=result.name,
+                )
+            )
+            return result, None
         existing = self.registry.versions(result.name)
         if any(record.kind == "trusted" for record in existing):
             result.ok = False

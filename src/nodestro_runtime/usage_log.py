@@ -123,8 +123,8 @@ class UsageLog:
         return entries
 
     def entries(self, since: datetime | None = None) -> list[UsageEntry]:
-        """All entries (newest first), optionally only those at or after ``since``."""
-        found = self.store.list(_COLLECTION, UsageEntry)
+        """All entries (newest first), optionally only those at or after ``since`` (filtered by the store, RT-009)."""
         if since is not None:
-            found = [entry for entry in found if entry.at >= since]
+            return self.store.list_since(_COLLECTION, UsageEntry, field="at", since=since)
+        found = self.store.list(_COLLECTION, UsageEntry)
         return sorted(found, key=lambda entry: entry.at, reverse=True)

@@ -232,9 +232,39 @@ def _user_text(request: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+#: The start of an orchestrator's system prompt (:data:`nodestro_runtime.orchestrator.ORCHESTRATOR_PROMPT`).
+_ORCHESTRATOR = "You coordinate teams."
+_POOL_ID = re.compile(r"^- id: (\S+)", re.MULTILINE)
+
+
+def orchestrator_decision(model: type[BaseModel], request: dict[str, Any]) -> BaseModel | None:
+    """The decision of a careful orchestrator (RT-056): staff its team first when the configuration asks for it, then
+    delegate the task to the first team it may use, and finish once a team returned a result. ``None`` for any
+    request that is not an orchestrator's decision."""
+    if "action" not in model.model_fields or _ORCHESTRATOR not in str(request.get("system") or ""):
+        return None
+    prompt = _user_text(request)
+    pool = _POOL_ID.findall(prompt)
+    task = prompt.split("Task:", 1)[1].split("Pool", 1)[0].strip() if "Task:" in prompt else "the task"
+    team = re.search(r"^Team now: (.+?) \(at most (\d+) members", prompt, re.MULTILINE)
+    values: dict[str, Any] = {name: None for name in model.model_fields}
+    if "result:" in prompt or not pool:
+        values.update(action="finish", answer="Ergebnis des Agenten.", reason="The teams' results answer the task.")
+    elif team is not None and team.group(1).startswith("nobody"):
+        values.update(action="staff", add=pool[: int(team.group(2))], remove=[], reason="These teams are needed.")
+    else:
+        members = [item for item in pool if team is None or item in team.group(1)] or pool
+        values.update(action="delegate", member=members[0], task=task, reason="This team does that work.")
+    for name, field in model.model_fields.items():
+        if values[name] is None and field.is_required():
+            values[name] = sample_value(field.annotation, request)
+    return model.model_validate({name: value for name, value in values.items() if value is not None})
+
+
 class AnswerAll:
-    """Answers every request: text for text agents, a filled model for structured output, and every
-    quality check as passed (used to run every example workflow without a script)."""
+    """Answers every request: text for text agents, a filled model for structured output, every quality check as
+    passed, and orchestrators that delegate once and then finish (used to run every example workflow without a
+    script)."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -248,6 +278,9 @@ class AnswerAll:
             return computed
         model = request.get("output_format")
         if model is not None:
+            decision = orchestrator_decision(model, request)
+            if decision is not None:
+                return Parsed(text("{}"), decision)
             return Parsed(text("{}"), sample_instance(model, request))
         # Sample answers are test data; tests of other components assert this exact text.
         return text("Ergebnis des Agenten.")

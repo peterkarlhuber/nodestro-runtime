@@ -493,3 +493,94 @@ def test_a_local_server_gets_more_time_per_request_than_the_sdk_default(tmp_path
         assert connection.client is not None
         assert connection.client.timeout.read == LOCAL_REQUEST_TIMEOUT
         assert connection.client.timeout.connect == 10.0
+        # RT-058: no SDK retries for a local server (a timed-out request would only wait the whole time again).
+        assert connection.client.max_retries == 0
+
+
+def test_the_local_timeout_follows_the_hardware(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RT-068: a CPU (or unknown hardware) gets the long timeout, a GPU a shorter one; both above the SDK's 600 s."""
+    from nodestro_runtime.providers import LOCAL_GPU_REQUEST_TIMEOUT, LOCAL_REQUEST_TIMEOUT, local_request_timeout
+
+    assert local_request_timeout(False) == local_request_timeout(None) == LOCAL_REQUEST_TIMEOUT
+    assert 600 < local_request_timeout(True) == LOCAL_GPU_REQUEST_TIMEOUT < LOCAL_REQUEST_TIMEOUT
+    with Workspace(tmp_path / "data", integrations=[]) as workspace:
+        workspace.store.put_raw("settings", "app", {"providers": {"ollama": {"base_url": "http://127.0.0.1:11434/v1"}}})
+        asked: list[bool] = []
+
+        def accelerated(value: bool | None) -> Any:
+            def answer() -> bool | None:
+                asked.append(True)
+                return value
+
+            return answer
+
+        for value, expected in ((True, LOCAL_GPU_REQUEST_TIMEOUT), (False, LOCAL_REQUEST_TIMEOUT)):
+            asked.clear()
+            monkeypatch.setattr(workspace.local_models, "accelerated", accelerated(value))
+            connection = workspace.connection("ollama")
+            assert connection.client.timeout.read == expected
+            assert connection.reasoning_saving is (value is False)
+            assert len(asked) == 1  # one question to the server per connection, for the timeout and the saving mode
+
+
+def test_an_exported_project_gets_the_local_timeout_too() -> None:
+    from nodestro_runtime.providers import LOCAL_REQUEST_TIMEOUT, environment_connection
+
+    connection = environment_connection("ollama", environ={}, base_urls={"ollama": "http://127.0.0.1:11434/v1"})
+    assert connection.client is not None
+    assert connection.client.timeout.read == LOCAL_REQUEST_TIMEOUT and connection.client.max_retries == 0
+    # A client given by the caller (tests, a host) is kept.
+    given = object()
+    kept = environment_connection("ollama", environ={}, base_urls={"ollama": "http://x/v1"}, client=given)
+    assert kept.client is given
+
+
+def test_a_silent_local_server_is_asked_once_and_given_up_on() -> None:
+    """RT-058: a server that accepts the request and never answers is asked exactly once (no SDK retry), and the
+    request ends after the read timeout."""
+    import socket
+    import threading
+    import time
+
+    import openai
+
+    from nodestro_runtime.providers import LOCAL_MAX_RETRIES, endpoint_client
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.2)
+    accepted: list[socket.socket] = []
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            accepted.append(connection)  # read nothing, answer nothing
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        port = listener.getsockname()[1]
+        client = endpoint_client(f"http://127.0.0.1:{port}/v1", None, timeout=0.5, max_retries=LOCAL_MAX_RETRIES)
+        started = time.monotonic()
+        with pytest.raises(openai.APITimeoutError):
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "hi"}])
+        assert time.monotonic() - started < 5
+        time.sleep(0.3)
+        assert len(accepted) == 1
+        # For comparison: the SDK's default retries would have asked again.
+        retried = endpoint_client(f"http://127.0.0.1:{port}/v1", None, timeout=0.3, max_retries=1)
+        with pytest.raises(openai.APITimeoutError):
+            retried.chat.completions.create(model="m", messages=[{"role": "user", "content": "hi"}])
+        time.sleep(0.3)
+        assert len(accepted) == 3
+    finally:
+        stop.set()
+        thread.join(2)
+        for item in accepted:
+            item.close()
+        listener.close()

@@ -108,7 +108,6 @@ def test_profile_of_claude(workspace: Workspace) -> None:
     [
         ("openai:gpt-6.1-sol", "provider", "provider", "automatic"),
         ("gemini:gemini-3-pro", "provider", "model", "automatic"),
-        ("bedrock:eu.anthropic.claude-sonnet-5-5", "provider", "provider", "not_mapped"),
         ("ollama:qwen3.5:4b", "provider", "provider", "provider"),
     ],
 )
@@ -120,6 +119,15 @@ def test_other_providers_say_why_an_option_is_unavailable(
     assert (profile.options["thinking"].available, profile.options["thinking"].reason) == (False, thinking)
     assert profile.options["thinking_budget"].reason == budget
     assert profile.options["cache_control"].reason == cache
+
+
+def test_bedrock_claude_offers_prompt_caching(workspace: Workspace) -> None:
+    """Bedrock's cache points are mapped (Orkexa ``BedrockOptions.prompt_caching``) for models that support them."""
+    profile = workspace.builder.profile("bedrock:eu.anthropic.claude-sonnet-5-5")
+    assert profile.options["cache_control"].available and profile.options["cache_ttl"].available
+    assert profile.options["thinking"].reason == "provider"
+    nova = workspace.builder.profile("bedrock:eu.amazon.nova-pro-v1:0")
+    assert nova.options["cache_control"].available == (nova.capabilities.get("caching") == "supported")
 
 
 def test_gemini_2_5_offers_a_thinking_budget_and_no_effort(workspace: Workspace) -> None:

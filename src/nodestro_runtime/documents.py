@@ -26,6 +26,7 @@ import io
 from pathlib import Path
 import re
 from xml.etree import ElementTree
+from xml.parsers import expat
 import zipfile
 
 from .problems import NodestroError
@@ -68,13 +69,37 @@ def _open(data: bytes, name: str) -> zipfile.ZipFile:
     return archive
 
 
+class _Declared(Exception):
+    pass
+
+
+def _declared(*_args: object) -> None:
+    raise _Declared
+
+
+def _declares_dtd(raw: bytes) -> bool:
+    """Whether an XML part declares a document type or an entity anywhere (RT-044): the whole part, in any encoding
+    the XML declares (UTF-16 too), as the parser sees it, not only its first bytes. A part the parser cannot read is
+    left to the reader, which reports it as damaged."""
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = _declared
+    parser.EntityDeclHandler = _declared
+    try:
+        parser.Parse(raw, True)
+    except _Declared:
+        return True
+    except expat.ExpatError:
+        return False
+    return False
+
+
 def _xml(archive: zipfile.ZipFile, part: str, name: str) -> ElementTree.Element | None:
     try:
         raw = archive.read(part)
     except KeyError:
         return None
-    if b"<!DOCTYPE" in raw[:2000] or b"<!ENTITY" in raw[:4000]:
-        # Office files never declare entities; refusing them rules out entity expansion.
+    if _declares_dtd(raw):
+        # Office files never declare a document type or entities; refusing them rules out entity expansion.
         raise DocumentError("document.unreadable", f"{name} contains unsupported XML", name=name)
     try:
         return ElementTree.fromstring(raw)

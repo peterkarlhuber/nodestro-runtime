@@ -22,14 +22,14 @@ from decimal import Decimal
 import threading
 from typing import Any, Literal
 
-from orkexa import EphemeralMemory, MemoryBackend, ToolCall
+from orkexa import EphemeralMemory, MaxToolCallsError, MaxToolRoundsError, MemoryBackend, ToolCall
 from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
 from . import tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode
-from .engine import execute_agent, node_problem, render_task, usage_of
+from .engine import execute_agent, node_problem, render_task, tool_rounds_problem, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
@@ -220,6 +220,9 @@ class AgentTester:
             result.memory = outcome.memory
         except Exception as exc:  # API errors, budget, invalid configuration: shown in the inspector
             found: Problem = node_problem(exc)
+            if isinstance(exc, MaxToolRoundsError) and not isinstance(exc, MaxToolCallsError):
+                with lock:
+                    found = tool_rounds_problem(found, list(result.tool_calls), config)
             result.status = "failed"
             result.error, result.error_code, result.error_params = found.message, found.code, found.params
         finally:

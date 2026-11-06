@@ -542,10 +542,40 @@ class WorkflowIn(_Model):
         return _clean_tags(value)
 
 
+class WorkflowOrigin(_Model):
+    """Where a workflow came from when it was made as a copy (RT-055): today a copy of an example.
+
+    Set once by the code that makes the copy and kept by every later save (:func:`keep_origin`): it is history, not
+    something an editor or a client sends (``WorkflowIn`` has no such field). An interface uses it to mark a copy
+    whose integrations run on sample data, or to offer the example's newer version."""
+
+    kind: Literal["example"] = "example"
+    #: The example (template) id, e.g. ``offer-from-inquiry``.
+    example_id: str
+    #: The version of the examples package the copy was made from.
+    version: str
+    #: The language the copy was made in.
+    language: str
+    #: Integrations of the example that run in their offline mode on sample data in this copy.
+    offline: list[str] = Field(default_factory=list)
+    #: Integrations of the example that were connected to an MCP server.
+    connected: list[str] = Field(default_factory=list)
+    copied_at: datetime = Field(default_factory=now)
+
+
 class Workflow(WorkflowIn):
     id: str = Field(default_factory=lambda: new_id("wf"))
     created_at: datetime = Field(default_factory=now)
     updated_at: datetime = Field(default_factory=now)
+    #: Where the workflow came from (a copy of an example), read-only; ``None`` for workflows made otherwise.
+    origin: WorkflowOrigin | None = None
+
+
+def keep_origin(workflow: Workflow, previous: Workflow | None) -> Workflow:
+    """``workflow`` with the origin of the stored ``previous`` state: a save never drops or replaces it (RT-055)."""
+    if previous is None or previous.origin is None or workflow.origin == previous.origin:
+        return workflow
+    return workflow.model_copy(update={"origin": previous.origin})
 
 
 class WorkflowSummary(_Model):
@@ -645,6 +675,18 @@ class ToolCallRecord(_Model):
     #: The per-call approval rules' verdict (S-2); ``None`` when no rule applied (approvals off, or Nodestro's own
     #: run tools).
     approval: ToolCallApproval | None = None
+
+
+class RunCause(_Model):
+    """Why a failed run failed (AD-02): the step that failed first and its problem, so that a run list or a banner
+    can say "<step>: <reason>" without reading every step. Set together with ``error_code`` ``run.nodes_failed``;
+    ``code``/``params`` are the step's own (``run.budget_exceeded``, ``provider.rate_limited`` ...)."""
+
+    node_id: str
+    #: The step's label as the workflow shows it.
+    label: str
+    code: str
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunWarning(_Model):
@@ -855,6 +897,8 @@ class Run(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    #: With ``error_code`` ``run.nodes_failed``: the step that failed first and why (RT-012); ``None`` otherwise.
+    cause: RunCause | None = None
     #: What the run went without although it may have succeeded (AD-03): refused, expired or failed tool calls.
     warnings: list[RunWarning] = Field(default_factory=list)
     output: Any = None
@@ -914,6 +958,7 @@ class RunSummary(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    cause: RunCause | None = None
     warnings: list[RunWarning] = Field(default_factory=list)
     imported_at: datetime | None = None
     source_run_id: str | None = None

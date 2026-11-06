@@ -27,7 +27,7 @@ import concurrent.futures
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import functools
 import json
@@ -50,6 +50,8 @@ from orkexa import (
     EphemeralMemory,
     Evaluator,
     InvalidRequestError,
+    MaxToolCallsError,
+    MaxToolRoundsError,
     MemoryBackend,
     OrkexaError,
     ProviderConnectionError,
@@ -114,6 +116,7 @@ from .schemas import (
     OutputConfig,
     Run,
     RunBudget,
+    RunCause,
     RunEvent,
     RunIn,
     RunTrigger,
@@ -1214,6 +1217,10 @@ class RunManager:
             )
         context.loop = loop
         context.fence = fence
+        if run.status == "paused":
+            # It continues now (X-01): whoever reads it before its task starts (the caller of ``decide``, another
+            # process) sees that it goes on, as with queue execution, not the pause that just ended.
+            run.status = "queued"
         self._contexts[run.id] = context
         self._events.setdefault(run.id, [])
         self._subscribers.setdefault(run.id, [])
@@ -2198,6 +2205,7 @@ class RunManager:
         run.finished_at = None
         run.error = run.error_code = None
         run.error_params = {}
+        run.cause = None
         self._emit(context, "run_started", status=run.status)
         # Stored at once: other processes (the API of a server) read the run from the database, not this context.
         self._save(context)
@@ -2308,6 +2316,7 @@ class RunManager:
             error=run.error,
             error_code=run.error_code,
             error_params=run.error_params,
+            cause=run.cause.model_dump(mode="json") if run.cause is not None else None,
             output=run.output,
             usage=run.usage.model_dump(mode="json"),
         )
@@ -2394,6 +2403,7 @@ class RunManager:
                 if failed
                 else problem("run.incomplete", "Not all nodes ran"),
             )
+            run.cause = run_cause(run)
         else:
             run.status = "succeeded"
         run.output = self._run_output(run)
@@ -4207,7 +4217,11 @@ class RunManager:
                 _fail(state, problem("run.node_cancelled", "Cancelled"))
             else:
                 state.status = "failed"
-                _fail(state, node_problem(exc))
+                found = node_problem(exc)
+                if isinstance(exc, MaxToolRoundsError) and not isinstance(exc, MaxToolCallsError):
+                    with context.lock:
+                        found = tool_rounds_problem(found, list(state.tool_calls), config)
+                _fail(state, found)
         finally:
             if interruptible is not None:
                 interruptible.close()
@@ -4657,6 +4671,71 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
         return problem("run.provider_overloaded", text, **known)
     return problem("run.api_error", text, status=status or "", provider=provider)
+
+
+#: Calls of one tool with the same arguments, from which on a step that ran out of tool rounds counts as looping.
+TOOL_LOOP_REPEATS = 2
+
+
+def tool_rounds_problem(found: Problem, calls: list[ToolCallRecord], config: AgentConfig) -> Problem:
+    """The problem of a step whose model kept calling tools until ``max_tool_rounds`` ran out (RT-067), with what
+    the calls show: ``rounds`` (the limit), ``calls``, ``repeated`` (calls that repeated an earlier call of the same
+    tool with the same arguments), ``tool`` (the tool called most often) and ``looping`` (``repeated`` reached
+    :data:`TOOL_LOOP_REPEATS`: the model asked the same thing again instead of answering, as small local thinking
+    models sometimes do). The code stays ``run.agent.MaxToolRoundsError``; the text says what to change."""
+    seen: set[str] = set()
+    repeated = 0
+    counts: dict[str, int] = {}
+    for call in calls:
+        counts[call.name] = counts.get(call.name, 0) + 1
+        key = f"{call.name}\0{json.dumps(call.input, sort_keys=True, default=str)}"
+        if key in seen:
+            repeated += 1
+        seen.add(key)
+    tool = max(counts, key=lambda name: counts[name]) if counts else ""
+    looping = repeated >= TOOL_LOOP_REPEATS
+    local = provider_of(config.model) == "ollama" if config.model else False
+    if looping:
+        advice = (
+            f"The model repeated {repeated} of its {len(calls)} tool calls with the same arguments instead of "
+            "answering (a tool loop)."
+        )
+    else:
+        advice = f"The model made {len(calls)} tool calls without giving its answer."
+    hint = (
+        " Small local models sometimes loop like this: use a larger model, or tell the agent in its instructions to "
+        "answer as soon as it has the tool's result."
+        if local
+        else " If the task needs more calls, raise the maximum of tool rounds in the agent's advanced settings."
+    )
+    message = f"{found.message} (limit {config.max_tool_rounds} rounds). {advice}{hint}"
+    params = {
+        **found.params,
+        "rounds": config.max_tool_rounds,
+        "calls": len(calls),
+        "repeated": repeated,
+        "tool": tool,
+        "looping": looping,
+        "local": local,
+    }
+    return found.model_copy(update={"message": message, "params": params})
+
+
+def run_cause(run: Run) -> RunCause | None:
+    """The step of a failed run that failed first (the earliest end; steps without an end time after those with one,
+    in the workflow's order) with its problem code and parameters (RT-012); ``None`` when no step failed."""
+    order = {node.id: index for index, node in enumerate(run.workflow.nodes)}
+    failed = [
+        (node_id, state)
+        for node_id, state in run.nodes.items()
+        if state.status == "failed" and node_id in order and state.error_code
+    ]
+    if not failed:
+        return None
+    latest = datetime.max.replace(tzinfo=UTC)
+    node_id, state = min(failed, key=lambda item: (item[1].finished_at or latest, order[item[0]]))
+    node = run.workflow.nodes[order[node_id]]
+    return RunCause(node_id=node_id, label=node_label(node), code=state.error_code or "", params=state.error_params)
 
 
 def _fail(target: NodeRun | Run, found: Problem) -> None:

@@ -8,6 +8,7 @@ once, in the parent run.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,7 @@ from .schemas import ApprovalConfig, Run, RunSummary, RunTrigger, Usage
 
 if TYPE_CHECKING:
     from .engine import RunManager
+    from .storage import DocumentStore
     from .workspace import Workspace
 
 
@@ -170,3 +172,28 @@ def models_of_run(ctx: Workspace, run: Run, depth: int = 0) -> dict[str, Usage]:
                 for model, usage in models_of_run(ctx, team, depth + 1).items():
                     found[model] = add_usage(found.get(model, Usage()), usage)
     return found
+
+
+#: Runs read per store query by :func:`workflow_runs`.
+_PAGE = 100
+
+
+def workflow_runs(store: DocumentStore, workflow_id: str, *, top_level: bool = True) -> Iterator[RunSummary]:
+    """The runs of a workflow (only the top-level ones, or also its runs as a sub-workflow), newest first, page by
+    page from the store's creation index (RT-042): the caller stops reading when it has enough, however many runs of
+    other workflows are stored."""
+    before: tuple[datetime, str] | None = None
+    while True:
+        page, more = store.list_page(
+            "runs",
+            RunSummary,
+            limit=_PAGE,
+            before=before,
+            top_level=top_level,
+            summary=True,
+            equals={"workflow_id": workflow_id},
+        )
+        yield from page
+        if not more or not page:
+            return
+        before = (page[-1].created_at, page[-1].id)

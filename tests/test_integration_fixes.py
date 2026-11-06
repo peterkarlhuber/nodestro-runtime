@@ -411,3 +411,21 @@ def test_a_data_directory_is_used_by_one_workspace_at_a_time(tmp_path: Path) -> 
         first.close()
     # Closed: the directory is free again.
     Workspace(tmp_path / "data", integrations=[]).close()
+
+
+async def test_a_decision_answers_with_the_continuing_run_not_the_pause(make: Make) -> None:
+    """X-01: ``decide`` returns the run as it goes on (``queued``, as with queue execution), never ``paused``."""
+    workspace = make({"DRAFT": [text("draft text")]})
+    flow = approval_flow([{"id": "out", "type": "output"}], [edge("check", "out", "approved")])
+    saved = workspace.save_workflow(flow)
+    started = await workspace.run(saved, RunIn(input="Customer complaint"))
+    paused = await workspace.wait(started.id, timeout=20)
+    assert paused.status == "paused"
+    answer = workspace.decide(paused.id, "check", "approved", "")
+    assert answer.status == "queued"
+    assert answer.nodes["check"].approval is not None and answer.nodes["check"].approval.decision == "approved"
+    # Whoever reads the stored run before its task starts sees that it goes on too.
+    stored = workspace.store.get("runs", paused.id, type(answer))
+    assert stored is not None and stored.status in ("queued", "running", "succeeded")
+    done = await workspace.wait(paused.id, timeout=20)
+    assert done.status == "succeeded" and done.output == "draft text"

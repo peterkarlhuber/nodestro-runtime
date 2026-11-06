@@ -582,6 +582,10 @@ class FakeDaemon:
         self.inspected: dict[str, dict[str, Any]] = {
             IMAGE: {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": {"Labels": {gw.LOCK_LABEL: "1" * 64}}}
         }
+        #: What inspecting a created container answers (its effective settings), and how the daemon changes them.
+        self.effective: dict[str, dict[str, Any]] = {}
+        self.tamper: Callable[[dict[str, Any]], None] = lambda _found: None
+        self.inspectable = True
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -598,6 +602,16 @@ class FakeDaemon:
                 "Created": int(time.time()),
                 "State": "created",
             }
+            # What inspecting it answers: the settings as asked for, then changed as a daemon might (``tamper``).
+            asked = json.loads(request.body)
+            effective = {
+                "Id": container_id,
+                "Image": asked["Image"],
+                "Config": {"User": asked["User"], "Env": ["PATH=/usr/bin"]},
+                "HostConfig": {**copy.deepcopy(asked["HostConfig"]), "Binds": None, "Mounts": None, "Devices": None},
+            }
+            self.tamper(effective)
+            self.effective[container_id] = effective
             answer = json.dumps({"Id": container_id, "Warnings": []}).encode()
             writer.write(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n")
             writer.write(f"Content-Length: {len(answer)}\r\n\r\n".encode() + answer)
@@ -621,6 +635,11 @@ class FakeDaemon:
         elif path.endswith("/images/json"):
             answer = json.dumps(self.images).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
+        elif re.search(r"/containers/[0-9a-f]{64}/json$", path) and request.method == "GET":
+            found = self.effective.get(path.rsplit("/", 2)[1]) if self.inspectable else None
+            answer = json.dumps(found if found is not None else {"message": "No such container"}).encode()
+            status = b"200 OK" if found is not None else b"404 Not Found"
+            writer.write(b"HTTP/1.1 " + status + f"\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
         elif path.startswith("/containers/json") or path.endswith("/containers/json"):
             answer = json.dumps(list(self.containers.values())).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(answer)}\r\n\r\n".encode() + answer)
@@ -718,8 +737,10 @@ async def test_a_large_body_is_refused_before_it_is_read(gateway: tuple[FakeDaem
 class _KeepAliveDaemon(FakeDaemon):
     """A daemon that answers attach without switching protocols and then reads further requests (keep-alive)."""
 
+    keep_alive = False
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if not self.containers:
+        if not self.keep_alive:
             await super().handle(reader, writer)
             return
         while True:
@@ -741,6 +762,7 @@ async def test_client_bytes_pass_only_through_a_switched_attach(tmp_path: Path) 
     front = await asyncio.start_unix_server(instance.handle, path=listen)
     async with server, front:
         await _send(listen, _post("/containers/create?name=nodestro-sandbox-ka", body()))
+        daemon.keep_alive = True  # from now on (after the creation and its read-back)
         container_id = next(iter(daemon.containers))
         before = len(daemon.requests)
         attach = (
@@ -767,7 +789,8 @@ async def test_a_created_container_is_locked_down_and_usable(gateway: tuple[Fake
     daemon, listen, _ = gateway
     answer = await _send(listen, _post("/v1.51/containers/create?name=nodestro-sandbox-aaaa", body()))
     assert answer.startswith(b"HTTP/1.1 201")
-    _, target, forwarded = daemon.requests[-1]
+    _, target, forwarded = daemon.requests[-2]
+    assert daemon.requests[-1][:2] == ("GET", f"/containers/{next(iter(daemon.containers))}/json")  # read back
     created = json.loads(forwarded)
     assert target == "/v1.51/containers/create?name=nodestro-sandbox-aaaa"
     assert created["HostConfig"]["NetworkMode"] == "none" and created["Labels"] == {LABEL: "test"}
@@ -805,7 +828,7 @@ async def test_an_image_id_runs_only_when_it_is_a_nodestro_image(gateway: tuple[
     daemon.inspected[IMAGE_ID] = {"Id": IMAGE_ID, "RepoTags": [IMAGE], "Config": lock}
     answer = await _send(listen, _post("/v1.51/containers/create?name=orkexa-sandbox-aaaa", request))
     assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
-    created = json.loads(daemon.requests[-1][2])
+    created = json.loads(daemon.requests[-2][2])  # [-1]: the read-back of the created container
     assert created["Image"] == IMAGE_ID and created["Labels"]["org.orkexa.sandbox"] == "nodestro"
     answer = await _send(listen, f"GET /v1.51/images/{IMAGE_ID}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode())
     assert answer.startswith(b"HTTP/1.1 200")
@@ -844,6 +867,104 @@ async def test_at_most_max_containers_exist_at_once(gateway: tuple[FakeDaemon, s
     daemon.containers.pop(next(iter(daemon.containers)))
     assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
     assert len(instance.containers) == 2
+
+
+def _drop_memory(found: dict[str, Any]) -> None:
+    found["HostConfig"]["Memory"] = 0  # a daemon that silently dropped the memory limit
+
+
+def _swap(found: dict[str, Any]) -> None:
+    found["HostConfig"]["MemorySwap"] = -1
+
+
+def _bind(found: dict[str, Any]) -> None:
+    found["HostConfig"]["Binds"] = ["/:/host"]
+
+
+def _privileged(found: dict[str, Any]) -> None:
+    found["HostConfig"]["Privileged"] = True
+
+
+def _caps(found: dict[str, Any]) -> None:
+    found["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
+
+
+def _seccomp(found: dict[str, Any]) -> None:
+    found["HostConfig"]["SecurityOpt"] = ["no-new-privileges", "seccomp=unconfined"]
+
+
+def _tmpfs(found: dict[str, Any]) -> None:
+    found["HostConfig"]["Tmpfs"] = {"/tmp": "rw,exec"}
+
+
+def _ulimit(found: dict[str, Any]) -> None:
+    found["HostConfig"]["Ulimits"] = []
+
+
+def _network(found: dict[str, Any]) -> None:
+    found["HostConfig"]["NetworkMode"] = "bridge"
+
+
+def _pid_host(found: dict[str, Any]) -> None:
+    found["HostConfig"]["PidMode"] = "host"
+
+
+def _user(found: dict[str, Any]) -> None:
+    found["Config"]["User"] = "root"
+
+
+def _image(found: dict[str, Any]) -> None:
+    found["Image"] = "sha256:" + "e" * 64
+
+
+@pytest.mark.parametrize(
+    ("tamper", "named"),
+    [
+        (_drop_memory, "Memory"),
+        (_swap, "MemorySwap"),
+        (_bind, "Binds"),
+        (_privileged, "Privileged"),
+        (_caps, "capabilities"),
+        (_seccomp, "SecurityOpt"),
+        (_tmpfs, "Tmpfs"),
+        (_ulimit, "Ulimits"),
+        (_network, "NetworkMode"),
+        (_pid_host, "namespaces"),
+        (_user, "User"),
+        (_image, "Image"),
+    ],
+)
+async def test_a_container_created_with_other_settings_is_removed(
+    gateway: tuple[FakeDaemon, str, Gateway], tamper: Callable[[dict[str, Any]], None], named: str
+) -> None:
+    """RT-003 (K7): the effective settings of each created container are read back; one that differs from what the
+    gateway asked for is removed before it can be started, and the client learns why (503)."""
+    daemon, listen, instance = gateway
+    daemon.tamper = tamper
+    answer = await _send(listen, _post("/v1.51/containers/create?name=nodestro-sandbox-bbbb", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and named.encode() in answer
+    assert daemon.containers == {} and instance.containers == {}
+    assert daemon.requests[-1][0] == "DELETE" and daemon.requests[-1][1].endswith("?force=1")
+    # Nothing of it can be used afterwards.
+    container_id = f"{daemon.created:064x}"
+    answer = await _send(listen, f"POST /v1.51/containers/{container_id}/start HTTP/1.1\r\nHost: d\r\n\r\n".encode())
+    assert answer.startswith(b"HTTP/1.1 404")
+
+
+async def test_a_container_that_cannot_be_inspected_is_removed(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, instance = gateway
+    daemon.inspectable = False
+    answer = await _send(listen, _post("/v1.51/containers/create", body()))
+    assert answer.startswith(b"HTTP/1.1 503") and b"inspect" in answer
+    assert daemon.containers == {} and instance.containers == {}
+
+
+async def test_the_effective_settings_are_checked_for_every_container(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    daemon, listen, _ = gateway
+    for _ in range(2):
+        assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
+    inspected = [target for method, target, _ in daemon.requests if method == "GET" and "/containers/" in target]
+    assert len(inspected) == 2 and all(target.endswith("/json") for target in inspected)
 
 
 async def test_nothing_starts_when_the_daemon_cannot_enforce_limits(
@@ -896,7 +1017,7 @@ async def test_a_tagged_image_runs_only_when_it_is_a_nodestro_image_and_by_its_i
     answer = await _send(listen, _post("/v1.51/containers/create?name=nodestro-sandbox-aaaa", body()))
     assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
     # The container runs the image that was checked: a tag moved afterwards changes nothing.
-    assert json.loads(daemon.requests[-1][2])["Image"] == TAGGED_ID
+    assert json.loads(daemon.requests[-2][2])["Image"] == TAGGED_ID  # [-1]: the read-back
 
 
 async def test_the_daemon_s_limits_and_seccomp_are_checked_again_after_the_ttl(

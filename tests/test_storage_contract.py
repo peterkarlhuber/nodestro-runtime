@@ -679,6 +679,79 @@ def test_replace_if_has_one_winner_across_threads(store: DocumentStore) -> None:
     assert stored is not None and stored.by == wins[0]
 
 
+def test_put_raw_if_absent_reserves_a_key_once(store: DocumentStore) -> None:
+    """RT-045: an atomic insert-if-absent for raw records (the API's ``Idempotency-Key`` reservations)."""
+    assert store.put_raw_if_absent("idempotency", "k1", {"run_id": "r1", "nul": "a\u0000b"})
+    assert not store.put_raw_if_absent("idempotency", "k1", {"run_id": "r2"})
+    # The first record stays as it was; another key or collection is independent.
+    assert store.get_raw("idempotency", "k1") == {"run_id": "r1", "nul": "a\u0000b"}
+    assert store.put_raw_if_absent("idempotency", "k2", {"run_id": "r2"})
+    assert store.put_raw_if_absent("other", "k1", {"run_id": "r3"})
+    # Inside a transaction it is part of it: a rollback leaves the key free.
+    with pytest.raises(RuntimeError), store.transaction():
+        assert store.put_raw_if_absent("idempotency", "k3", {"run_id": "r4"})
+        raise RuntimeError("roll back")
+    assert store.get_raw("idempotency", "k3") is None
+    assert store.put_raw_if_absent("idempotency", "k3", {"run_id": "r5"})
+    # After a delete the key can be reserved again.
+    assert store.delete("idempotency", "k1")
+    assert store.put_raw_if_absent("idempotency", "k1", {"run_id": "r6"})
+    assert store.get_raw("idempotency", "k1") == {"run_id": "r6"}
+
+
+def test_put_raw_if_absent_has_one_winner_across_threads(store: DocumentStore) -> None:
+    wins: list[str] = []
+    barrier = threading.Barrier(8)
+
+    def reserve(who: str) -> None:
+        barrier.wait()
+        if store.put_raw_if_absent("idempotency", "key", {"by": who}):
+            wins.append(who)
+
+    threads = [threading.Thread(target=reserve, args=(f"p{i}",)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(wins) == 1
+    assert store.get_raw("idempotency", "key") == {"by": wins[0]}
+
+
+def test_put_raw_if_absent_has_one_winner_across_connections(tmp_path: Path) -> None:
+    """Two stores on one SQLite file stand for two processes: the second reservation of a key is refused."""
+    first, second = SQLiteStore(tmp_path / "shared.db"), SQLiteStore(tmp_path / "shared.db")
+    try:
+        assert first.put_raw_if_absent("idempotency", "key", {"by": "first"})
+        assert not second.put_raw_if_absent("idempotency", "key", {"by": "second"})
+        assert second.get_raw("idempotency", "key") == {"by": "first"}
+    finally:
+        first.close()
+        second.close()
+
+
+def test_put_raw_if_absent_is_per_tenant_and_connection_on_postgres() -> None:
+    from nodestro_runtime.storage_postgres import PostgresDatabase, PostgresStore
+
+    dsn = postgres_support.require_postgres()
+    schema = postgres_support.new_schema()
+    try:
+        one, two = PostgresDatabase(dsn, schema=schema), PostgresDatabase(dsn, schema=schema)
+        one.migrate()
+        try:
+            alpha, alpha_again = PostgresStore(one, "alpha"), PostgresStore(two, "alpha")
+            beta = PostgresStore(one, "beta")
+            assert alpha.put_raw_if_absent("idempotency", "key", {"by": "alpha"})
+            assert not alpha_again.put_raw_if_absent("idempotency", "key", {"by": "other connection"})
+            assert beta.put_raw_if_absent("idempotency", "key", {"by": "beta"})
+            assert alpha_again.get_raw("idempotency", "key") == {"by": "alpha"}
+            assert beta.get_raw("idempotency", "key") == {"by": "beta"}
+        finally:
+            one.close()
+            two.close()
+    finally:
+        postgres_support.drop_schema(schema)
+
+
 def test_the_api_imports_only_public_names() -> None:
     """D-14: the HTTP API uses these patterns; the private names stay as aliases for older callers."""
     from nodestro_runtime import engine, memory_spaces

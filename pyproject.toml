@@ -16,11 +16,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@566aa3c22ebef87b498ac3fa1145329a939b904e",
+    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@1b61fdace77e536c0887751cf71b71f3a56d5fa8",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",

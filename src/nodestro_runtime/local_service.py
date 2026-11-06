@@ -238,6 +238,9 @@ class LocalModelService:
         self._closing = False
         #: Finds an Ollama the user runs on this computer (never started, stopped or changed by Nodestro).
         self.detect_external: Callable[[], str | None] = detect_ollama
+        #: Whether no request may be using the managed server now (the workspace: no run executes), so that it can be
+        #: restarted for a changed strict offline mode (RT-059) without ending a request.
+        self.idle: Callable[[], bool] = lambda: True
         self._restore_jobs()
 
     # ---- settings ------------------------------------------------------------------------------------------
@@ -292,6 +295,33 @@ class LocalModelService:
                 )
             return self._managed
 
+    def sync_offline(self) -> bool:
+        """Give the managed server the current strict offline mode (RT-059); ``True`` when it has it now.
+
+        The mode is fixed when the server process starts (without the proxy variables when offline). A server that
+        is not running takes the mode at its next start. A running one is restarted with it, but only while nothing
+        uses it (:attr:`idle`, and no model job runs); otherwise the restart waits for the next call of this method
+        (the status, a new connection, the switch itself)."""
+        with self._lock:
+            managed = self._managed
+            if managed is None:
+                return True
+            wanted = self._offline()
+            if managed.offline == wanted:
+                return True
+            if managed.base_url is None:
+                managed.offline = wanted
+                return True
+            if any(job.state == "running" for job in self._jobs.values()) or not self.idle():
+                return False
+            self._ps = None
+            try:
+                managed.restart(offline=wanted)
+            except OllamaError as exc:
+                logger.warning("The local model server did not start again after the offline switch: %s", exc)
+                managed.offline = wanted  # a later start uses the mode
+            return True
+
     def ollama_url(self) -> str | None:
         """Ollama's address agents use now (``None``: no server; the managed one is not started here)."""
         mode = self.mode
@@ -314,6 +344,7 @@ class LocalModelService:
             return f"{self.container_url}/v1"
         if mode != "managed":
             return None
+        self.sync_offline()
         if self._managed is not None and self._managed.base_url:
             return f"{self._managed.base_url}/v1"
         if not start or self.runtime_binary() is None:
@@ -334,6 +365,7 @@ class LocalModelService:
                 "local.runtime_missing", "The local model runtime is not installed", version=OLLAMA_VERSION
             )
         server = self._managed_server()
+        self.sync_offline()
         server._binary = self.runtime_binary()
         self._show_failed.clear()
         self._ps = None
@@ -393,6 +425,7 @@ class LocalModelService:
         mode = self.mode
         status = LocalStatus(mode=mode, offline=self._offline(), autostart=self.autostart())
         if mode == "managed":
+            self.sync_offline()
             binary = self.runtime_binary()
             status.runtime_installed = binary is not None
             status.runtime_bundled = binary is not None and binary == self.bundled_binary

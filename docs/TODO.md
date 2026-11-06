@@ -3,7 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-05 against `master` at `53d7980` (quality round 3 close-out; TODO consolidated).
+> **Last full review:** 2026-11-06 against master at 085e94f (TODO abatement round)
 
 ## Summary
 
@@ -12,8 +12,8 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 40 |
-| P4 Optional | 15 |
+| P3 Low | 24 |
+| P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
 every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
@@ -59,21 +59,14 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Run the independent review on a current master state (review brief exists), then re-accept the
   pilot state; activation outside a pilot is a separate owner decision.
 
-### RT-002 · Prompt-injection hardening for retrieved content and tool results
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** internal backend audit 2026-11-01, B-04
-- **What:** Agent prompts do not yet mark knowledge content and tool results as untrusted data. This is a hardening
-  step, not a known bypass; the tool gate and sandbox policy do not rely on it.
-- **Next step:** Add a standard data-not-instructions framing in `agent_builder` and test it with the scripted client.
-
-### RT-003 · Additional sandbox gateway hardening
+### RT-003 · Optional gVisor runtime for tool containers
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** nodestro-local-docker `docs/SECURITY-REVIEW.md` K7, K9
-- **What:** The gateway checks the daemon's limit enforcement before create and build, but does not re-check the
-  effective limits of each created container. An optional enforced gVisor (`runsc`) runtime for tool containers is
-  named as the next hardening step. Neither is a known bypass.
-- **Next step:** Inspect each created container's limits and remove it on mismatch (`sandbox_gateway.py`); evaluate
-  `runsc` support with a CI job that has it installed.
+- **What:** The gateway checks the daemon's limit enforcement before create and build, and since the TODO abatement
+  round reads every created container back and removes it when its effective limits, isolation, mounts, user or image
+  differ from what was asked. An optional enforced gVisor (`runsc`) runtime for tool containers is named as the next
+  hardening step. It is not a known bypass.
+- **Next step:** Evaluate `runsc` support with a CI job that has it installed.
 
 ### RT-030 · Axentra migration follow-ups
 
@@ -298,13 +291,6 @@ Items that need an independent or external review (an internal audit does not re
   exists in all six languages.)
 - **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job.
 
-### RT-005 · Approval decision returns the run still as `paused` (X-01)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #70, backend audit X-01
-- **What:** `RunManager.decide` returns the run before the scheduled resume, so the response says `paused`. The
-  studio works around it.
-- **Next step:** Return the new state (or a reliable field) and test it; API and SDK follow.
-
 ### RT-006 · Waiting tool approvals hold worker threads and slots
 
 - **Priority:** P3 Low · **Status:** Blocked (M6b checkpoint activation decision, see RT-001) · **Refs:** S-2 pilot
@@ -316,46 +302,15 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Resolved by activating approval checkpoints; otherwise consider delaying claims of a worker with no
   free waiting slot (needs a separate go). Operators can raise `max_waiting` meanwhile.
 
-### RT-045 · No atomic insert-if-absent for raw store records
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit round 2 re-verification R2V-03
-- **What:** `DocumentStore` has `get_raw` and `put_raw` only, so callers that must reserve a key once across
-  processes (the API's `Idempotency-Key` records, nodestro-api API-043) can only lock within one process.
-- **Next step:** Add `put_raw_if_absent` (SQLite `INSERT ... ON CONFLICT DO NOTHING`, PostgreSQL the same) that
-  reports whether the record was created, with tests on both stores.
-
-### RT-058 · Waiting local model requests: long header timeout and SDK retries
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** internal backend audit round 3 (RT3-05, rest), #107,
-  `providers.endpoint_client`, `providers.LOCAL_REQUEST_TIMEOUT`
-- **What:** Since runtime #113 cancel and the run time limit end a request that waits for a local model server. Still
-  open: the clients for `ollama` connections wait up to `LOCAL_REQUEST_TIMEOUT` (3600 s) for the response headers,
-  and the OpenAI SDK's default retries repeat a timed-out request. Without a cancel (a run with no time limit, an
-  orchestrator decision outside a run) a silent server keeps the thread that long.
-- **Next step:** Apply the long timeout only between streamed chunks with a shorter header timeout, and set
-  `max_retries=0` for local endpoints; add a test with a silent socket server.
-
-### RT-059 · Switching the strict offline mode does not restart the managed Ollama
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** product check 2026-11-05, `local_service.LocalModelService._managed_server`
-- **What:** The managed server gets `offline` (no proxy variables) once, when its `ManagedOllama` object is made;
-  stopping and starting it in the settings reuses that object. Switching the strict offline mode on therefore leaves
-  a running managed server with its proxy route until Nodestro restarts. Model calls to cloud providers, downloads
-  and the price check are refused at once; only the local server's own network route lags behind.
-- **Next step:** On a change of `strict_offline`, restart the managed server with `offline` (orkexa
-  `ManagedOllama.restart(offline=...)`) when no local request is running, or mark it for a restart; add a test.
-
 ### RT-067 · Small local thinking models loop on tool calls
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-5)
-- **What:** After the 400 fix, the production-downtime example on qwen3.5:2b (CPU) failed twice with `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). Every request was accepted.
-- **Next step:** Compare tool looping with and without reasoning sent back; consider a higher default `max_tool_rounds` for local thinking models.
-
-### RT-068 · Request timeout too short for local models on CPU
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-2)
-- **What:** On CPU the SDK's default 600 s timeout expired on a slow request; the retry that followed is safe but slow.
-- **Next step:** A timeout suited to CPU for local Ollama connections, taken from the hardware profile.
+- **Priority:** P3 Low · **Status:** Open (needs a live local model) · **Refs:** settings/providers round 2026-11-06
+  (Ollama 400 fix, O400-5)
+- **What:** After the 400 fix, the production-downtime example on qwen3.5:2b (CPU) failed twice with
+  `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). The error now says what the calls show
+  (`rounds`, `calls`, `repeated`, `tool`, `looping`, `local`) with advice, so a loop is told apart from a long task.
+- **Next step:** Compare tool looping with and without reasoning sent back on a live local model; then decide on a
+  higher default `max_tool_rounds` for local thinking models.
 
 ## Architecture and modularity
 
@@ -399,22 +354,6 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Load test on target hardware (run in nodestro-server, SRV-013); then decide on parallel writes or a pool-free read path
   for single-process use.
 
-### RT-009 · Usage entries are filtered and sorted in Python
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-05 (partly fixed)
-- **What:** `UsageLog.entries(since=...)` loads the whole collection and filters in Python; `/api/usage` takes about
-  0.8 s (SQLite) / 1.4 s (PostgreSQL) at 5,000 runs and grows linearly.
-- **Next step:** A store-level time filter (or SQL aggregation) for usage entries and run costs; the API uses it.
-
-### RT-042 · Filtered run lists and the remaining 500-run windows still read whole collections
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit round 2 RT2-05 / API2-04, earlier C-15
-- **What:** `DocumentStore.list_page("runs", ...)` (keyset paging, SQLite schema 2, PostgreSQL migration 0009) is
-  used by the API's unfiltered `GET /api/runs` since nodestro-api #74. Filtered run lists, `launcher.py` (cost
-  estimate) and `preview.py` still use a fixed window of 500 runs. With 10,000 stored runs a full read takes about 9 s
-  on SQLite and 13.5 s on PostgreSQL.
-- **Next step:** Store-level filters for `list_page`; then replace the 500-run windows.
-
 ### RT-043 · Per-node overhead grows with workflow length
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** backend audit round 2 RT2-07
@@ -445,18 +384,6 @@ Items that need an independent or external review (an internal audit does not re
   without ever overwriting an unreadable value. Tested on PostgreSQL.
 - **Next step:** Servers that keep the v1 format still cannot rotate `NODESTRO_SECRET_KEY`; decide whether the
   keyring becomes the default for new servers (then v1 is read-only), and run the procedure on a staging copy.
-
-### RT-011 · Machine-readable catalog of error codes (X-03)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #71, backend audit X-03
-- **What:** No list of the codes the runtime raises; new codes reach the UI without translations.
-- **Next step:** A code registry plus a test that fails on unregistered codes; export it for the API.
-
-### RT-012 · Run-level cause of a failed run (AD-02)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #72, UX audit AD-02
-- **What:** A failed run only says `run.nodes_failed` with node names; the cause lives on the node.
-- **Next step:** Add the first failing node's code and params to `Run`; API, SDK and studio follow.
 
 ### RT-013 · Gaps in unattended tool-call warnings
 
@@ -506,35 +433,11 @@ Items that need an independent or external review (an internal audit does not re
   tools, unattended calls, stdio servers that are not Python packages).
 - **Next step:** Owner decision per topic; none is planned now.
 
-### RT-055 · Copies of examples do not remember their origin
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** UX round 3 handover B-1; examples EX-003, studio ST-007, ST-031
-- **What:** A workflow copied from an example does not store which example, language and offline connections it came
-  from, so the studio cannot mark the sample-data mode or offer an update of the copy.
-- **Next step:** Store the origin (example id, version, language, offline connections) on the copy; expose it read-only
-  in the API.
-
-### RT-057 · Setup advice in missing-key and local-runtime messages ignores the context
-
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** UX round 3 DX handovers B14 and B3 (runtime part)
-- **What:** A missing provider key always gets the studio's advice (settings), also when the runtime serves an exported
-  app, where the key belongs in the environment or `.env`. The preflight issue `check.local_runtime_missing`
-  (`preflight.py`) says only "install the local model runtime in the settings": it names neither the API route for
-  SDK users (`POST /api/local-models/runtime`) nor the models that are missing.
-- **Next step:** Let the message depend on the context: in serving mode name the environment variable and `.env`; in
-  `check.local_runtime_missing` name the settings page and the API route and add `params.models`.
-
 ### RT-062 · Capabilities of non-catalog local models are known only after the download
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (missing-model stream)
 - **What:** For a local model that is neither in the catalog nor installed, a missing capability (tools, vision, embeddings) is found only after the download.
 - **Next step:** Read the capabilities from the registry manifest before the download and report `capability_missing` up front.
-
-### RT-063 · Reasoning of the architect's CodingAgent and AgentArchitect sub-requests is not streamed
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (thinking stream, THINK-1)
-- **What:** The Workflow Architect streams its own reasoning; the sub-requests that write tools and agents show only an activity status.
-- **Next step:** Forward their reasoning events through the same `ReasoningStreamInfo` channel.
 
 ### RT-064 · Overall pull ETA for local model downloads
 
@@ -550,13 +453,14 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Tests and quality assurance
 
-### RT-056 · The test double cannot finish orchestrators
+### RT-056 · The test double answers in German in every language
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** UX round 3 handover B-3
-- **What:** The scripted test model never ends an orchestrator's loop and answers German placeholder text in every
-  language, so the three orchestrated examples cannot be verified end to end in the studio's browser tests.
-- **Next step:** Let the test double finish orchestrations (a final decision after the members ran) and answer in the
-  run's language.
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** UX round 3 handover B-3
+- **What:** The answering test double (`testing.AnswerAll`) finishes orchestrations since the TODO abatement round, but
+  its text answers are German placeholders ("Ergebnis des Agenten.", "Beispiel") in every language. Tests of other
+  repositories assert this exact text, and a run has no language field the double could follow.
+- **Next step:** Decide where the run's language comes from (a copied example now stores its language in
+  `Workflow.origin`, but other workflows have none); then answer in it and update the asserting tests together.
 
 ### RT-017 · Fixes that still need an independent or Docker-backed check
 
@@ -652,23 +556,9 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Documentation
 
-### RT-021 · README lags behind the code
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #74
-- **What:** The sandbox policy text still names only Docker, the PostgreSQL text says "owns one connection", and the
-  contents table and feature sections miss orchestration, live run chat, Bedrock, jobs, tool approvals and MCP modules.
-- **Next step:** Update those README sections (keep the quickstart block that `tests/test_readme.py` runs).
+None known.
 
 ## Technical debt
-
-### RT-022 · Python 3.14 untested
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** `pyproject.toml`, CI matrix 3.11/3.13
-- **What:** Python 3.11 is the minimum of all Nodestro repositories and orkexa since 2026-11-02 (3.10 reached end of
-  life in October 2026). 3.14 is not in the CI matrices or classifiers: every dependency installs on 3.14 (checked
-  2026-11-02), but orkexa's sandbox policy test fails there (ORK-007).
-- **Next step:** After ORK-007, add 3.14 to the matrices and classifiers of all Python repositories at once.
-- **Depends on:** orkexa ORK-007
 
 ### RT-023 · Reproducible Python dependencies
 
@@ -686,13 +576,6 @@ Items that need an independent or external review (an internal audit does not re
   ("Ausgabe", "Entscheidung", "Freigabe"); `schemas.py` "Neuer Workflow". They are kept on purpose for prompt
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
-
-### RT-044 · Office XML DTD guard scans only the start of each part
-
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** backend audit round 2 RT2-09
-- **What:** The DOCTYPE check reads the first 2/4 KB of an XML part. expat already refuses entity expansion, so this
-  is defence in depth only.
-- **Next step:** Scan the whole part (streaming) when the file is touched next.
 
 ### RT-046 · Semantic reindex runs in the API process
 
@@ -720,13 +603,6 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only for large tenants: an HNSW index per space (pgvector) once a model's dimensions are fixed.
 
 ## Accepted risks
-
-### RT-025 · Reserved tool name checked against the function name (MCP L-1)
-
-- **Priority:** P3 Low · **Status:** Accepted risk · **Refs:** #62
-- **What:** A tool can be stored under a reserved name; it is never run (lookups and calls refuse it). Accepted by the
-  owner as a low residual risk when the MCP project closed.
-- **Next step:** Check the final stored name too, when the backlog is picked up.
 
 ### RT-026 · PostgreSQL token search test misses encoded forms (MCP L-2)
 
@@ -756,22 +632,15 @@ Items that need an independent or external review (an internal audit does not re
 |---|---|---|---|
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
-| — | orkexa | ORK-002 (orkexa #24): `ToolRegistry.refresh()` | Afterwards the refreshing `ToolLibrary.registry` workaround from #57 can be dropped |
-| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Orkexa owns it; runtime's server path already refuses redirects |
-| RT-005 | nodestro-api, nodestro-sdk | API-018 (decision response model) | Follow the new run state |
-| RT-009 | nodestro-api | API-013 (`/api/usage` latency) | API uses the store-level filter |
+| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `1b61fda`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
-| RT-011 | nodestro-api, nodestro-studio | API-016 (X-03 combined code list), translations | Runtime provides its catalog |
-| RT-012 | nodestro-api, nodestro-studio | API-018, ST-003 (AD-02 run cause in lists and banners) | Runtime provides the field |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | RT-015 | nodestro-api | API-021 (region in usage views) | Runtime records the region first |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
 | RT-049 | orkexa, nodestro-desktop | ORK-030, DSK-022 (managed Ollama on macOS/Windows) | Orkexa owns the managed server; runtime reruns its local-model tests there |
-| RT-022 | orkexa | ORK-007 | Orkexa's sandbox review for 3.14 comes first |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
-| RT-045 | nodestro-api | API-043 (idempotent run starts across processes) | Store primitive first, then the API uses it |
 | — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
 
 ## CI access to private repositories

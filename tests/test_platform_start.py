@@ -105,7 +105,9 @@ def test_user_authored_code_runs_in_the_subprocess_sandbox() -> None:
 
 _SIMULATE = textwrap.dedent(
     """
-    import builtins, ctypes, json, sys
+    import builtins, ctypes, ctypes.util, json, sys
+    # ctypes.util is imported first: on Linux, Python 3.14's ctypes.util looks up dl_iterate_phdr in the real libc while
+    # it is imported (psycopg imports it), which is the standard library's Linux path, not Nodestro code.
     target = sys.argv[1]
     real_import = builtins.__import__
     blocked = {"resource", "fcntl"} if target == "win32" else set()
