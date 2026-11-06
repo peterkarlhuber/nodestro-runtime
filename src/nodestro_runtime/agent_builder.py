@@ -5,11 +5,12 @@ code path validates a configuration for the inspector (with a client that is
 never called) and builds the agent for a run.
 
 The agent's provider comes from its model (``provider:model``, see :mod:`nodestro_runtime.providers`).
-Settings every provider shares are Orkexa's generic arguments; Anthropic's own options
-(thinking, prompt caching, fallbacks, server tools) become ``orkexa.AnthropicOptions`` and
-are refused for other providers instead of being dropped. Orkexa checks before anything is
-sent that the model supports every feature the agent uses (tools, structured output,
-streaming, reasoning effort ...); such errors appear in the inspector.
+Settings every provider shares are Orkexa's generic arguments; options that depend on the model
+(thinking mode, thinking budget, prompt caching, fallbacks, provider-native tools) become the
+provider's Orkexa options where the model supports them (:mod:`nodestro_runtime.model_profile`)
+and are refused with a reason everywhere else instead of being dropped. Orkexa checks before
+anything is sent that the model supports every feature the agent uses (tools, structured output,
+streaming, reasoning effort, the documented maximum output ...); such errors appear in the inspector.
 """
 
 from __future__ import annotations
@@ -25,23 +26,43 @@ from orkexa import (
     AnthropicOptions,
     ContentBlock,
     EphemeralMemory,
+    GeminiOptions,
     MemoryBackend,
     Message,
     ModelCapabilities,
+    ModelLimits,
     Tool,
     UsageTracker,
 )
+from orkexa.core.capabilities import CAPABILITY_NAMES
 from orkexa.dynamic import Sandbox
 from orkexa.memory import MEMORY_TOOL_NAME
 from pydantic import BaseModel, Field, create_model
 
+from . import output_limits
 from .catalog import SERVER_TOOLS
 from .knowledge import KnowledgeBase
 from .mcp_access import check_unattended_mcp
 from .memory_spaces import MemorySpaces
+from .model_profile import (
+    ModelProfile,
+    OptionSupport,
+    limits_info,
+    native_tool_support,
+    option_support,
+    unavailable_options,
+)
+from .output_limits import EffectiveLimit
 from .problems import NodestroError, library_problem
-from .providers import MAX_RETRIES, Connection, check_model, check_request_options, model_id, provider_of
-from .schemas import AgentConfig, OutputConfig, OutputField
+from .providers import (
+    MAX_RETRIES,
+    Connection,
+    check_model,
+    check_request_options,
+    model_id,
+    provider_of,
+)
+from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField
 from .tool_library import ToolLibrary
 
 _FIELD_TYPES: dict[str, Any] = {
@@ -64,17 +85,6 @@ class ConfigIssue(BaseModel):
     code: str = "library"
     params: dict[str, Any] = Field(default_factory=dict)
     message: str
-
-
-#: Defaults of the Anthropic-only settings: other providers accept a configuration only with these.
-_ANTHROPIC_ONLY: dict[str, Any] = {
-    "thinking": None,
-    "thinking_display": None,
-    "cache_control": True,
-    "cache_ttl": "5m",
-    "fallbacks": [],
-    "server_tools": [],
-}
 
 
 @dataclass
@@ -126,11 +136,16 @@ def _tool_choice(config: AgentConfig) -> str | dict[str, str]:
 
 
 def _options(config: AgentConfig, provider: str, connection: Connection, model: str) -> Any:
-    """Orkexa's options for the provider; Anthropic-only settings of another provider are an error.
+    """Orkexa's options for the provider; an option the model cannot use is an error (never dropped silently).
 
-    Request options that would add tools or a provider-hosted MCP server are refused first
-    (:func:`~nodestro_runtime.providers.check_request_options`)."""
+    Which options a model can use comes from its capabilities and documented settings
+    (:func:`~nodestro_runtime.model_profile.option_support`). Request options that would add tools or a
+    provider-hosted MCP server are refused first (:func:`~nodestro_runtime.providers.check_request_options`)."""
     check_request_options(config.request_options)
+    support = option_support(provider, connection.model_capabilities(model), connection.model_limits(model))
+    for name, item in unavailable_options(config, support):
+        raise option_error(name, item, provider)
+    _check_native_tools(config, provider, connection.model_capabilities(model))
     if provider == "anthropic":
         for fallback in config.fallbacks:
             if provider_of(check_model(fallback)) != "anthropic":
@@ -148,17 +163,44 @@ def _options(config: AgentConfig, provider: str, connection: Connection, model: 
             fallbacks=[{"model": model_id(model)} for model in config.fallbacks] or None,
             request_options=dict(config.request_options),
         )
-    for name, default in _ANTHROPIC_ONLY.items():
-        if getattr(config, name) != default:
+    if provider == "gemini" and config.thinking_budget is not None:
+        if config.effort is not None:
             raise NodestroError(
-                "config.anthropic_only",
-                f"{name} is an option of Anthropic models and cannot be used with provider {provider}",
-                option=name,
-                provider=provider,
+                "config.thinking_budget_with_effort",
+                "A thinking budget replaces the effort: set the effort to none",
             )
+        return GeminiOptions(thinking_budget=config.thinking_budget, request_options=dict(config.request_options))
     if provider == "ollama" and _thinks_off(config, connection, model):
         return connection.options({**config.request_options, "reasoning_effort": "none"})
     return connection.options(config.request_options)
+
+
+def option_error(name: str, item: OptionSupport, provider: str) -> NodestroError:
+    """The error of an agent option the model cannot use (``config.option_unsupported`` with the reason)."""
+    accepted = f" (accepted: {', '.join(item.values)})" if item.values else ""
+    return NodestroError(
+        "config.option_unsupported",
+        f"{name} cannot be used with this {provider} model ({item.reason}){accepted}; reset it to its default",
+        option=name,
+        provider=provider,
+        reason=item.reason or "",
+        values=", ".join(item.values or []),
+    )
+
+
+def _check_native_tools(config: AgentConfig, provider: str, caps: ModelCapabilities) -> None:
+    """Provider-native tools only where the provider runs them (never replaced by another tool kind)."""
+    support = {item.key: item for item in native_tool_support(provider, caps)}
+    for key in dict.fromkeys(config.server_tools):
+        item = support.get(key)
+        if item is not None and not item.available:
+            raise NodestroError(
+                "config.native_tool_unsupported",
+                f"The provider-native tool {key!r} cannot be used with this {provider} model ({item.reason})",
+                name=key,
+                provider=provider,
+                reason=item.reason or "",
+            )
 
 
 def _thinks_off(config: AgentConfig, connection: Connection, model: str) -> bool:
@@ -228,16 +270,65 @@ class AgentBuilder:
         self.declared: Callable[[str], dict[str, Any]] = lambda _provider: {}
         #: The capabilities the local model server reports for a model (by model id; Ollama only).
         self.reported: Callable[[str], dict[str, Any]] = lambda _model: {}
+        #: The token limits declared in a provider's settings (endpoints: ``max_output_tokens``, ``context_window``).
+        self.declared_limits: Callable[[str], dict[str, Any]] = lambda _provider: {}
+        #: The context window of the local model server (``None``: unknown).
+        self.local_window: Callable[[], int | None] = lambda: None
+        #: The workspace's output limit settings of Nodestro's own AI operations (see :mod:`.output_limits`).
+        self.output_overrides: Callable[[], Mapping[str, int]] = lambda: {}
+
+    def output_limit(self, operation: str, model: str, connection: Connection | None = None) -> EffectiveLimit:
+        """The output limit one of Nodestro's own AI operations sends to ``model``: the workspace setting, else the
+        built-in default, capped by the model's maximum (:func:`nodestro_runtime.output_limits.effective`)."""
+        limits = connection.model_limits(model) if connection is not None else self.limits(model)
+        return output_limits.effective(operation, self.output_overrides(), limits)
+
+    def _provider_connection(self, provider: str, client: Any = None) -> Connection:
+        """A connection for questions about models only (capabilities, limits): no key, never called."""
+        return Connection(
+            provider=provider,
+            capabilities=self.declared(provider),
+            client=client,
+            reported=self.reported if provider == "ollama" else None,
+            limits=self.declared_limits(provider),
+            window=self.local_window if provider == "ollama" else None,
+        )
 
     def capabilities(self, model: str) -> ModelCapabilities:
         """What ``model`` supports (Orkexa's values plus declared ones); all unknown for invalid names."""
         try:
-            provider = provider_of(check_model(model))
-            reported = self.reported if provider == "ollama" else None
-            connection = Connection(provider=provider, capabilities=self.declared(provider), reported=reported)
-            return connection.model_capabilities(model)
+            return self._provider_connection(provider_of(check_model(model))).model_capabilities(model)
         except (NodestroError, ValueError):
             return ModelCapabilities()
+
+    def limits(self, model: str) -> ModelLimits:
+        """The documented or declared token limits and reasoning settings of ``model``; unknown for invalid names."""
+        try:
+            return self._provider_connection(provider_of(check_model(model))).model_limits(model)
+        except (NodestroError, ValueError):
+            return ModelLimits()
+
+    def profile(self, model: str) -> ModelProfile:
+        """Capabilities, limits and agent options of ``model`` as this workspace runs it (``GET
+        /api/models/profile``); an invalid id has an ``error`` and nothing available."""
+        try:
+            qualified = check_model(model)
+        except NodestroError as exc:
+            return ModelProfile(model=model, error=exc.code, max_tokens_limit=MAX_TOKENS_BOUND)
+        provider = provider_of(qualified)
+        connection = self._provider_connection(provider)
+        caps = connection.model_capabilities(qualified)
+        limits = connection.model_limits(qualified)
+        return ModelProfile(
+            model=qualified,
+            provider=provider,
+            capabilities={name: caps.support(name) for name in CAPABILITY_NAMES},
+            reasons=dict(caps.reasons),
+            limits=limits_info(limits),
+            max_tokens_limit=limits.max_output_tokens or MAX_TOKENS_BOUND,
+            options=option_support(provider, caps, limits),
+            native_tools=native_tool_support(provider, caps),
+        )
 
     def build(
         self,
@@ -378,7 +469,7 @@ class AgentBuilder:
         try:
             # Checked as for a run that asks before every call (gated): validation never runs a tool. Paths that
             # do not ask (agent test without a gate, tool test panel) refuse such tools when they build them.
-            self.build(config, connection=_validation_connection(self.declared, config, self.reported), gated=True)
+            self.build(config, connection=_validation_connection(self, config), gated=True)
         except NodestroError as exc:
             field = (
                 "tools"
@@ -392,6 +483,7 @@ class AgentBuilder:
         except (ValueError, TypeError) as exc:
             found = library_problem(exc)
             issue(found.code, found.message, **found.params)
+        issues.extend(self._limit_issues(config))
         web = {"web_search", "web_fetch"} & set(config.server_tools)
         if web and "code_execution" in config.server_tools:
             issue(
@@ -419,6 +511,44 @@ class AgentBuilder:
             )
         return issues
 
+    def _limit_issues(self, config: AgentConfig) -> list[ConfigIssue]:
+        """``max_tokens`` against the model's maximum output and context window; efforts the model does not accept.
+
+        The build refuses a documented violation already (Orkexa); these issues name the field and the values, so the
+        inspector can show them next to the setting, also for limits only declared in the provider settings."""
+        found: list[ConfigIssue] = []
+        try:
+            model = check_model(config.model)
+        except NodestroError:
+            return found
+        limits = self.limits(model)
+        if limits.max_output_tokens is not None and config.max_tokens > limits.max_output_tokens:
+            found.append(
+                ConfigIssue(
+                    field="max_tokens",
+                    code="config.max_tokens_above_model",
+                    params={
+                        "max_tokens": config.max_tokens,
+                        "maximum": limits.max_output_tokens,
+                        "source": limits.source,
+                    },
+                    message=f"The answer limit ({config.max_tokens} tokens) exceeds the model's maximum output "
+                    f"({limits.max_output_tokens} tokens); lower it",
+                )
+            )
+        elif limits.context_window is not None and config.max_tokens >= limits.context_window:
+            found.append(
+                ConfigIssue(
+                    level="warning",
+                    field="max_tokens",
+                    code="config.max_tokens_above_context",
+                    params={"max_tokens": config.max_tokens, "window": limits.context_window},
+                    message=f"The answer limit ({config.max_tokens} tokens) leaves no room for the prompt in the "
+                    f"model's context window ({limits.context_window} tokens)",
+                )
+            )
+        return found
+
 
 class _NeverCalled:
     """A client stand-in for validation; building an agent makes no request."""
@@ -438,23 +568,13 @@ def _effort(config: AgentConfig, connection: Connection, model: str) -> Any:
     return connection.effort(model, config.effort)
 
 
-def _validation_connection(
-    declared: Callable[[str], dict[str, Any]],
-    config: AgentConfig,
-    reported: Callable[[str], Mapping[str, Any]] | None = None,
-) -> Connection:
+def _validation_connection(builder: AgentBuilder, config: AgentConfig) -> Connection:
     """The agent's connection with a client that is never called: no key needed, no request made.
 
-    The declared capabilities of the provider's settings count, and for a local model what its server reports, so
-    the inspector shows what a run would refuse (and nothing a run would accept).
+    The declared capabilities and limits of the provider's settings count, and for a local model what its server
+    reports, so the inspector shows what a run would refuse (and nothing a run would accept).
     """
-    provider = provider_of(check_model(config.model))
-    return Connection(
-        provider=provider,
-        capabilities=declared(provider),
-        client=_NeverCalled(),
-        reported=reported if provider == "ollama" else None,
-    )
+    return builder._provider_connection(provider_of(check_model(config.model)), client=_NeverCalled())
 
 
 def _check_context(agent: Agent[Any], blocks: list[ContentBlock]) -> None:

@@ -3897,6 +3897,7 @@ class RunManager:
                 output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
                 effort=connection.effort(config.model, "medium"),
                 max_tool_rounds=0,
+                max_tokens=context.env.builder.output_limit("orchestrator", config.model, connection).value,
             )
             outcome = execute_agent(
                 context.env.builder,
@@ -4360,6 +4361,7 @@ def execute_agent(
         evaluator = Evaluator(
             criteria,
             model=model_id(judge),
+            max_tokens=builder.output_limit("quality_judge", judge, judge_connection).value,
             options=judge_connection.options({"reasoning_effort": "none"} if judge_saves else None),
             usage_tracker=tracker,
             name=f"{name}:judge",

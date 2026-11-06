@@ -946,7 +946,9 @@ def answer_question(
                 system_prompt=ANSWER_SYSTEM_PROMPT,
                 effort=connection.effort(model, "low"),
                 max_tool_rounds=0,
-                max_tokens=1500,
+                # The workspace setting ``output_limits.run_chat`` (default 4,000; formerly a fixed 1,500 that cut
+                # off longer answers about large runs), capped by the model's maximum.
+                max_tokens=manager.builder.output_limit("run_chat", model, connection).value,
             )
             outcome = execute_agent(
                 manager.builder,

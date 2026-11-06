@@ -430,6 +430,13 @@ class _Builder:
 
         return BuiltAgent(agent=object())
 
+    def output_limit(self, operation: str, model: str, connection: Any = None) -> Any:
+        from orkexa import ModelLimits
+
+        from nodestro_runtime.output_limits import effective
+
+        return effective(operation, {}, ModelLimits())
+
 
 def _judged(
     monkeypatch: pytest.MonkeyPatch, connection: Connection, effort: str = "high"

@@ -162,6 +162,10 @@ async def test_questions_and_instructions_while_parallel_teams_work(make: Make) 
     assert answer.usage is not None and answer.usage.requests == 1
     chat_call = next(c for c in workspace.fake.messages.calls if CHAT in str(c.get("system")))  # type: ignore[attr-defined]
     snapshot = str(chat_call["messages"])
+    # The answer's output limit: the built-in default of ``run_chat`` (formerly a fixed 1,500), sent as max_tokens.
+    assert chat_call["max_tokens"] == 4000
+    boss_calls = [c for c in workspace.fake.messages.calls if BOSS in str(c.get("system"))]  # type: ignore[attr-defined]
+    assert boss_calls and all(call["max_tokens"] == 8000 for call in boss_calls)  # ``orchestrator`` default
     assert "Research" in snapshot and "Legal" in snapshot and "its result is not known yet" in snapshot
     assert "Decision in progress" in snapshot and "independent" in snapshot
     assert not entered_a.is_set() or not release.is_set()  # nobody was interrupted
@@ -749,3 +753,31 @@ async def test_the_strict_offline_mode_refuses_a_cloud_answer_before_its_request
     assert result.status == "failed" and result.code == "check.offline_cloud_model"
     calls = workspace.fake.messages.calls  # type: ignore[attr-defined]
     assert not any(CHAT in str(call.get("system")) for call in calls)
+
+
+async def test_an_answer_uses_the_workspace_output_limit(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The setting ``output_limits.run_chat`` reaches the answer's agent (capped by the model's maximum)."""
+    from nodestro_runtime import engine
+    from nodestro_runtime.schemas import SettingsIn
+
+    ids: dict[str, str] = {}
+    workspace = make(_script(ids, text("never asked")))
+    workspace.update_settings(SettingsIn(output_limits={"run_chat": 200_000}))
+    started = await _paused_run(workspace, ids)
+    question = send(workspace, started, "question", "Where are we?")
+    seen: list[int] = []
+
+    def capture(_builder: Any, config: Any, _prompt: str, **_kwargs: Any) -> Any:
+        seen.append(config.max_tokens)
+        raise NodestroError("test.stop", "stop")
+
+    monkeypatch.setattr(engine, "execute_agent", capture)
+    await asyncio.to_thread(
+        answer_question,
+        workspace.runs,
+        workspace.runs.chat,
+        workspace.usage_log,
+        question,
+        model="anthropic:claude-opus-5-5",
+    )
+    assert seen == [128_000]  # 200,000 asked, lowered to Claude Opus 5.5's documented maximum
