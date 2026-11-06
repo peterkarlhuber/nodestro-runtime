@@ -589,6 +589,11 @@ class RunChat:
         with self._lock:
             return message_id in self._stopped
 
+    def answering(self) -> list[str]:
+        """The questions this process is writing an answer to now."""
+        with self._lock:
+            return list(self._answering)
+
     def cancel_answers(self, code: str) -> list[str]:
         """Stop every answer this process is writing (its tenant was suspended, security review SR-03a): each
         question fails with ``code`` at once, a model request not sent yet is not sent, and an answer that arrives
