@@ -644,6 +644,26 @@ def test_the_same_requirements_give_the_same_lock_in_every_process(tmp_path: Pat
             "run.api_error",
             {"provider": "openai", "status": 400},
         ),
+        (
+            orkexa.InvalidRequestError(
+                "ollama: BadRequestError: Error code: 400 - invalid message content type: <nil>",
+                provider="ollama",
+                status_code=400,
+                reason="messages",
+            ),
+            "run.provider_rejected_messages",
+            {"provider": "ollama", "status": 400},
+        ),
+        (
+            orkexa.InvalidRequestError(
+                "vllm: BadRequestError: maximum context length is 8192 tokens",
+                provider="vllm",
+                status_code=400,
+                reason="context_length",
+            ),
+            "run.provider_context_exceeded",
+            {"provider": "vllm", "status": 400},
+        ),
     ],
 )
 def test_provider_failures_get_distinct_codes(error: Exception, code: str, params: dict[str, object]) -> None:
