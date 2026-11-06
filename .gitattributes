@@ -1,0 +1,8 @@
+# Files compared byte for byte against a recorded SHA-256 (MUP-ONA A0): a checkout never converts their line
+# endings (core.autocrlf on Windows would change the bytes and fail the checksum tests).
+src/nodestro_runtime/migrations/postgres/*.sql -text
+tests/fixtures/migration_checksums.json -text
+tests/fixtures/legacy/*.gz -text
+tests/fixtures/legacy/*.sha256 -text
+tests/fixtures/ranking/FX-RANK-0.json -text
+tests/fixtures/ranking/*.sha256 -text

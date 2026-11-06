@@ -1,0 +1,17 @@
+{
+  "_comment": "SHA-256 of every file in src/nodestro_runtime/migrations/postgres (MUP-ONA A0, K1, T-MIG-1). An applied migration is never edited; a new migration file is added here in the PR that adds it.",
+  "algorithm": "sha256",
+  "directory": "src/nodestro_runtime/migrations/postgres",
+  "files": {
+    "0001_documents.sql": "aa3bf7c5b3a8cd52a59f5b09b15b47746263d977a2716038a42421b7c29d5f18",
+    "0002_knowledge_memory.sql": "2838b1ea2b91bf1d460e22e2c1373d2a73078dda79fc41f68b62fd941ad03409",
+    "0003_identity.sql": "bfe77a13b03b8823621a5258473d479eecd96e9359a87c52a90790547afb77a7",
+    "0004_jobs.sql": "6bc223ed073628a2198a278f0a04150b5560795de3a95d49955c569824dccba7",
+    "0005_find_indexes.sql": "ad75b8be04d242e435ea689cd0c58265e01f11a0a183b27c41fa6a43c343200b",
+    "0006_partial_find_indexes.sql": "f5481069398d91860897e1e164276217be2d91cdff75c2c1c8f364216743f592",
+    "0007_axentra_links.sql": "5cdbd4f63be6813a0ccd25c469e865aaaf3f73f5b5bece23402051fb6758b97e",
+    "0008_tenant_status.sql": "afd8f83c39c8d82e1b91b099e5d737843008ecd1055077b580c921a46f53b3a8",
+    "0009_created_order.sql": "bada36a3af623fb6b4a08e317c3e92cc4b275d8c56db6710c9bf6f2d4661e8ba",
+    "0010_knowledge_vectors.sql": "aadda58e1c14e6654bca42394e058ae85ad44309b2f017d9ec2f15409a6732f5"
+  }
+}

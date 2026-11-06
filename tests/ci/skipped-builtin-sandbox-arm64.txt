@@ -1,0 +1,23 @@
+# Skipped tests of the CI job builtin-sandbox-arm64 (MUP-ONA A0; checked by scripts/check_skips.py).
+# One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
+# The built-in sandbox is unavailable on AArch64 (reason platform), so every test that needs it is skipped.
+tests.test_builtin_sandbox::test_a_tool_error_is_reported_and_the_next_call_works  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_an_older_kernel_is_refused_before_the_code_runs  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[data-directory]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[environment-and-keys]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[files-outside-workdir]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[foreign-processes]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[kernel-interfaces]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[links-and-renames]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[network]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[odd-file-names]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_attack_is_refused[process-start]  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_generated_tools_run_in_the_builtin_sandbox_and_never_on_the_host  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_limits_timeout_cancel_and_cleanup  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_output_past_the_runner_is_bounded_in_the_host  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_repeated_and_parallel_calls  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_standard_library_modules_tools_use  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_start_up_overhead_is_measured  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_validation_with_tests_and_non_ascii_paths  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_builtin_sandbox::test_weakened_confinement_never_runs_tool_code  # the built-in sandbox is unavailable on AArch64 (docs/sandbox-arm64.md)
+tests.test_sandbox_arch::test_the_x86_64_numbers_match_the_kernel_headers  # no x86-64 kernel headers on an arm64 runner
