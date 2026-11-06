@@ -635,8 +635,8 @@ Items that need an independent or external review (an internal audit does not re
 ### RT-066 · No live Ollama reasoning check in CI
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (thinking stream, THINK-4)
-- **What:** Live reasoning from Ollama was verified locally with a real model; CI uses doubles.
-- **Next step:** Add an optional CI job with a small reasoning model (as for the local model tests).
+- **What:** Ollama's reasoning stream was checked against a recorded fixture only, not against a live model server.
+- **Next step:** Check it live with a small reasoning model, then add an optional CI job (as for the local model tests).
 
 ## Documentation
 
