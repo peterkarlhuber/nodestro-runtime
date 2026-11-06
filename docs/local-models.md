@@ -248,7 +248,11 @@ every agent whose `KnowledgeConfig.retrieval` is `default`. The semantic index e
 (`KnowledgeBase.start_reindex`); it belongs to one embedding model identity (model, digest, dimensions,
 instructions). Choosing another model shows `reindex_required`; searches keep using the complete current vectors
 until the reindex to the new model finished and switched in one transaction. A reindex can be cancelled and
-continues where it stopped. Files uploaded while the model server is down are indexed for full text and reported as
+continues where it stopped. On the desktop it runs in a thread of the process that started it; on a server with a
+job queue the API process only queues it (`jobs.QueuedReindex`, job kind `reindex`, at most one per tenant on the
+whole server) and a worker process runs it with a lease (`jobs.ReindexWorker`), reporting its progress in the job;
+every API process reads the same job, and a worker that dies leaves it `failed` with
+`knowledge.reindex_interrupted` (started again, it continues). A suspended tenant's reindex does not start, or stops. Files uploaded while the model server is down are indexed for full text and reported as
 `incomplete` until the next reindex embeds them. Vector and hybrid search never fall back to full text: a missing
 index is a preflight error. The index state is `unavailable` only when the storage cannot hold vectors (`detail` says
 why): a SQLite installation without sqlite-vec (no wheel for Windows on ARM), where a reindex is refused with

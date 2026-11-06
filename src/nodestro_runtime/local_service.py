@@ -859,6 +859,11 @@ class LocalModelService:
         threading.Thread(target=body, name=f"nodestro-local-{kind}", daemon=True).start()
         return job
 
+    def running_jobs(self) -> list[str]:
+        """The jobs (downloads, builds, imports, installs) this process runs now."""
+        with self._lock:
+            return [job.id for job in self._jobs.values() if job.state == "running"]
+
     def running_download(self, name: str) -> LocalJob | None:
         """The download (or build) of ``name`` that runs now, if any."""
         name = _model_name(name)

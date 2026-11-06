@@ -1335,6 +1335,15 @@ class ToolLibrary:
                 except Exception:  # recording usage must never break the job
                     logger.exception("Recording the usage of tool job %s failed", job.id)
 
+    def active_jobs(self) -> list[str]:
+        """The jobs of this process that have not ended (running, or waiting for dependencies or a decision)."""
+        with self._lock:
+            return [
+                job_id
+                for job_id, job in self.jobs.items()
+                if job.status in ("running", "awaiting_dependencies", "awaiting_approval")
+            ]
+
     def cancel_jobs(self, code: str) -> list[str]:
         """Stop every job that has not ended (its tenant was suspended, security review NF-1).
 

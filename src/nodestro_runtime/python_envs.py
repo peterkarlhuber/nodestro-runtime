@@ -1178,6 +1178,11 @@ class PythonEnvironments:
         threading.Thread(target=self._install, args=(scope, list(modules), None, resolved), daemon=True).start()
         return env
 
+    def installing(self) -> list[str]:
+        """The scopes this process is installing now."""
+        with self._lock:
+            return sorted(self._installing)
+
     def cancel_installs(self, code: str) -> list[str]:
         """Stop every installation this process started (its tenant was suspended, security review SR-03a): one that
         waits does not start, a running one stops before its next step (a ``uv`` or ``docker build`` command that
