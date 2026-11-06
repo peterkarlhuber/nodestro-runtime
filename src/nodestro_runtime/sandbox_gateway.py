@@ -1134,10 +1134,60 @@ class Gateway:
                 container_id = str(json.loads(payload)["Id"])
             except (ValueError, KeyError, TypeError):
                 container_id = ""
-            if _CONTAINER_ID.fullmatch(container_id):
-                self.containers[container_id] = name
+            if not _CONTAINER_ID.fullmatch(container_id):
+                raise Refused("The Docker daemon answered the container creation without a container id", 502)
+            # The daemon confirmed that it enforces limits (require_limits), but it may still drop or change a
+            # setting of this one container (a plugin, a changed configuration): its effective settings are read
+            # back, and a container that differs is removed before anybody can start it (RT-003).
+            differences = await self.effective_differences(container_id, json.loads(body))
+            if differences:
+                await self.call("DELETE", f"/containers/{container_id}?force=1")
+                raise Refused(
+                    "The Docker daemon created the sandbox container with other settings than requested "
+                    f"({', '.join(differences)}), so it was removed and no tool code is run",
+                    503,
+                )
+            self.containers[container_id] = name
         writer.write(raw)
         await writer.drain()
+
+    async def effective_differences(self, container_id: str, created: dict[str, Any]) -> list[str]:
+        """The settings in which the created container differs from what the gateway asked for (``created``, the
+        body of :func:`plan_create`), as read back from the daemon; ``["inspect"]`` when it cannot be read."""
+        status, found = await self.call("GET", f"/containers/{container_id}/json")
+        if status != 200 or not isinstance(found, dict) or not isinstance(found.get("HostConfig"), dict):
+            return ["inspect"]
+        host, wanted = found["HostConfig"], created["HostConfig"]
+        found_config = found.get("Config")
+        config: dict[str, Any] = found_config if isinstance(found_config, dict) else {}
+        differences = [
+            key
+            for key in ("Memory", "MemorySwap", "NanoCpus", "PidsLimit", "ShmSize", "NetworkMode", "IpcMode")
+            if host.get(key) != wanted[key]
+        ]
+        if host.get("ReadonlyRootfs") is not True:
+            differences.append("ReadonlyRootfs")
+        if host.get("Privileged") is not False:
+            differences.append("Privileged")
+        if {str(item).upper() for item in host.get("CapDrop") or []} != {"ALL"} or host.get("CapAdd"):
+            differences.append("capabilities")
+        if list(host.get("SecurityOpt") or []) != ["no-new-privileges"]:
+            differences.append("SecurityOpt")
+        if dict(host.get("Tmpfs") or {}) != wanted["Tmpfs"]:
+            differences.append("Tmpfs")
+        for key in ("Binds", "Mounts", "Devices", "VolumesFrom", "DeviceRequests"):
+            if host.get(key):
+                differences.append(key)
+        ulimits = {(str(item.get("Name")), item.get("Soft"), item.get("Hard")) for item in host.get("Ulimits") or []}
+        if ulimits != {(item["Name"], item["Soft"], item["Hard"]) for item in wanted["Ulimits"]}:
+            differences.append("Ulimits")
+        if any(host.get(key) not in (None, "") for key in ("PidMode", "UTSMode", "UsernsMode")):
+            differences.append("namespaces")
+        if config.get("User") != created["User"]:
+            differences.append("User")
+        if found.get("Image") != created["Image"]:
+            differences.append("Image")
+        return differences
 
     async def _forward(
         self,
