@@ -77,7 +77,7 @@ as not available with a reason code (`model_profile.OptionSupport.reason`), neve
 | Effort | real (documented levels) | real (gpt-6: all five, classic: none) | real (3/4: low–high) | real | declared only | real for thinking models (no grades) |
 | Thinking switch | real (modes per model) | unavailable (`provider`) | unavailable (`provider`) | unavailable (`provider`) | unavailable | unavailable |
 | Thinking budget | unavailable (`provider`) | unavailable | real on 2.5 (`model` elsewhere) | unavailable | unavailable | unavailable |
-| Prompt caching option | real | provider automatic (`automatic`) | provider automatic (`automatic`) | unavailable (`not_mapped`) | unavailable | unavailable |
+| Prompt caching option | real | provider automatic (`automatic`) | provider automatic (`automatic`) | real (cache points after system prompt, tools and conversation; models with `caching`) | unavailable | unavailable |
 | Fallback models | real | unavailable | unavailable | unavailable | unavailable | unavailable |
 | Provider-native tools (web search, fetch, code execution) | real (priced) | unavailable (`not_integrated`: fees not priced) | unavailable (`not_integrated`) | unavailable (`provider`) | unavailable | unavailable |
 | Tool calling | real | real | real | real | per capability | per model (server reports) |

@@ -126,12 +126,11 @@ def option_support(provider: str, caps: ModelCapabilities, limits: ModelLimits) 
         budget = OptionSupport(
             available=False, reason="model" if provider == "gemini" and limits.thinking_budget is False else "provider"
         )
-    if provider == "anthropic":
+    if provider in ("anthropic", "bedrock"):
+        # Bedrock: cache points, mapped by Orkexa (BedrockOptions.prompt_caching) for the models that support them.
         cache = OptionSupport(available=caps.supports("caching"), reason=None if caps.supports("caching") else "model")
     elif provider in ("openai", "gemini"):
         cache = OptionSupport(available=False, reason="automatic")
-    elif provider == "bedrock" and caps.supports("caching"):
-        cache = OptionSupport(available=False, reason="not_mapped")
     else:
         cache = OptionSupport(available=False, reason="provider")
     fallbacks = (

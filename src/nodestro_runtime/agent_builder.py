@@ -16,7 +16,7 @@ streaming, reasoning effort, the documented maximum output ...); such errors app
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import keyword
 import re
 from typing import Any
@@ -180,6 +180,13 @@ def _options(config: AgentConfig, provider: str, connection: Connection, model: 
                 "A thinking budget replaces the effort: set the effort to none",
             )
         return GeminiOptions(thinking_budget=config.thinking_budget, request_options=dict(config.request_options))
+    if provider == "bedrock":
+        options = connection.options(config.request_options)
+        if config.cache_control and support["cache_control"].available:
+            # Bedrock's prompt caching (cache points after the system prompt, the tools and the conversation), the
+            # same option as Anthropic's cache_control; Orkexa maps it (BedrockOptions.prompt_caching).
+            options = replace(options, prompt_caching=True, cache_ttl=config.cache_ttl)
+        return options
     if provider == "ollama" and _thinks_off(config, connection, model):
         return connection.options({**config.request_options, "reasoning_effort": "none"})
     return connection.options(config.request_options)
