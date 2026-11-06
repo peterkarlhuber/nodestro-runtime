@@ -12,6 +12,10 @@ small converter (headings, paragraphs, lists, tables, code, emphasis), the PDF w
 lays out the same blocks on A4 pages with the PDF base fonts (Helvetica, Courier) in
 the Windows-1252 character set; characters outside it are replaced by ``?``.
 
+:data:`REPORT_FORMATS` is the one table of the formats (id, extension, media type, whether a browser may show the
+file inline); the ids are stored in workflows and runs and never change. The studio mirrors the table in
+``frontend/src/lib/resultFormats.ts`` (its tests compare both).
+
 A file can be sanitized like a trace export (:mod:`nodestro_runtime.sanitize`): credentials and,
 optionally, personal data are replaced by placeholders before the file is written.
 A file that cannot be written is stored as a file with an error code, so the run shows
@@ -23,6 +27,7 @@ from __future__ import annotations
 import base64
 import builtins
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 import html
 import io
@@ -40,15 +45,38 @@ from .sanitize import Sanitizer
 from .schemas import ReportFormat, ResultFileSpec, Run, new_id, now
 from .storage import DocumentStore
 
-MEDIA_TYPES: dict[str, str] = {
-    "md": "text/markdown; charset=utf-8",
-    "json": "application/json",
-    "csv": "text/csv; charset=utf-8",
-    "html": "text/html; charset=utf-8",
-    "pdf": "application/pdf",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+@dataclass(frozen=True)
+class ReportFormatInfo:
+    """What a result file format is: the one place that names its extension, media type and preview."""
+
+    id: ReportFormat
+    #: The file name extension (without dot).
+    extension: str
+    #: The ``Content-Type`` of a download.
+    media_type: str
+    #: Whether a browser may show the file in the page (``?inline=true``); everything else is only downloaded.
+    inline: bool = False
+
+
+#: Every result file format, in the order the interface offers them. The ids are stored in workflows
+#: (``ResultFileSpec.format``) and runs (``ResultFile.format``) and never change; the studio mirrors this table
+#: (frontend/src/lib/resultFormats.ts, checked against it by its tests).
+REPORT_FORMATS: dict[ReportFormat, ReportFormatInfo] = {
+    info.id: info
+    for info in (
+        ReportFormatInfo("md", "md", "text/markdown; charset=utf-8", inline=True),
+        ReportFormatInfo("json", "json", "application/json"),
+        ReportFormatInfo("csv", "csv", "text/csv; charset=utf-8"),
+        ReportFormatInfo("html", "html", "text/html; charset=utf-8", inline=True),
+        ReportFormatInfo("pdf", "pdf", "application/pdf", inline=True),
+        ReportFormatInfo("docx", "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ReportFormatInfo("xlsx", "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    )
 }
+MEDIA_TYPES: dict[str, str] = {key: info.media_type for key, info in REPORT_FORMATS.items()}
+#: The formats a browser may show inline (Markdown as text, HTML without scripts, PDF).
+INLINE_FORMATS: frozenset[str] = frozenset(key for key, info in REPORT_FORMATS.items() if info.inline)
 MAX_BYTES = 10 * 1024 * 1024
 FILES = "result_files"
 DATA = "result_file_data"
@@ -617,12 +645,13 @@ class ResultFiles:
         if run.imported_at is not None and source == "output":
             raise ReportError("report.imported", "Imported runs do not write files")
         taken = {entry.name for entry in self.list(run.id)}
-        name = _unique(file_name(request.name, run.workflow_name, request.format), taken)
+        info = REPORT_FORMATS[request.format]
+        name = _unique(file_name(request.name, run.workflow_name, info.extension), taken)
         entry = ResultFile(
             run_id=run.id,
             name=name,
             format=request.format,
-            media_type=MEDIA_TYPES[request.format],
+            media_type=info.media_type,
             source=source,
             node_id=request.node_id,
             sanitized=request.sanitize,
