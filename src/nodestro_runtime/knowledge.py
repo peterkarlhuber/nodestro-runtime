@@ -126,6 +126,16 @@ class KnowledgeIndexStatus(BaseModel):
     detail: str = ""
 
 
+class ReindexQueue(Protocol):
+    """Where a server queues reindex jobs (:class:`nodestro_runtime.jobs.QueuedReindex`)."""
+
+    def start(self, model: str) -> None: ...
+
+    def cancel(self) -> None: ...
+
+    def current(self) -> ReindexJob | None: ...
+
+
 class ReindexJob(BaseModel):
     state: Literal["running", "done", "failed", "cancelled"] = "running"
     model: str
@@ -257,6 +267,9 @@ class KnowledgeBase:
         self.embedding_model: Callable[[str], EmbeddingModel] | None = None
         self._job: ReindexJob | None = None
         self._job_cancel: threading.Event | None = None
+        #: On a server's API process: where reindex jobs are queued for a worker (:class:`ReindexQueue`, RT-046);
+        #: ``None``: a reindex runs in a thread of this process (desktop, Local Docker, tests).
+        self.reindex_queue: ReindexQueue | None = None
 
     def ocr_available(self) -> bool:
         return self.runner() is not None
@@ -436,7 +449,7 @@ class KnowledgeBase:
 
     def index_status(self) -> KnowledgeIndexStatus:
         mode, model = self.retrieval()
-        status = KnowledgeIndexStatus(mode=mode, embedding_model=model, job=self._job)
+        status = KnowledgeIndexStatus(mode=mode, embedding_model=model, job=self._current_job())
         pgvector = getattr(self.index, "pgvector", None)
         try:
             vectors = self._vectors()
@@ -473,11 +486,8 @@ class KnowledgeBase:
         except (OllamaError, NodestroError, ValueError, KeyError, TypeError):
             return False
 
-    def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
-        """Build (or complete, or switch) the semantic index with an embedding model, in the background.
-
-        Searches keep using the current vectors until every chunk has a vector of the new model; then the index
-        switches in one transaction. Cancelled or interrupted, starting it again continues where it stopped."""
+    def _reindex_model(self, model_name: str | None) -> tuple[str, EmbeddingModel]:
+        """The embedding model a reindex uses (``model_name`` or the setting's), checked before anything starts."""
         name = model_name or self.retrieval()[1]
         if not name:
             raise NodestroError("knowledge.embedding_model_missing", "Choose an embedding model first")
@@ -486,51 +496,110 @@ class KnowledgeBase:
         model = self._model(name)
         if model is None:
             raise NodestroError("knowledge.embedding_model_missing", "No embedding model is available")
+        return name, model
+
+    def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
+        """Build (or complete, or switch) the semantic index with an embedding model, in the background.
+
+        Searches keep using the current vectors until every chunk has a vector of the new model; then the index
+        switches in one transaction. Cancelled or interrupted, starting it again continues where it stopped.
+
+        With a :attr:`reindex_queue` (a server's API process, RT-046) the reindex is queued for a worker process
+        instead of running in a thread here: at most one per tenant on the whole server, and its state comes from
+        the queue (``knowledge.reindex_running`` while one is queued or running)."""
+        name, model = self._reindex_model(model_name)
+        if self.reindex_queue is not None:
+            self.reindex_queue.start(name)
+            return self.index_status()
         with self._lock:
             if self._job is not None and self._job.state == "running":
                 raise NodestroError("knowledge.reindex_running", "The semantic index is already being built")
             job = ReindexJob(model=name)
             cancel = threading.Event()
             self._job, self._job_cancel = job, cancel
-        reindex = self.index.reindex  # type: ignore[attr-defined]
-
-        def progress(done: int, total: int) -> None:
-            job.completed, job.total = done, total
-
-        def body() -> None:
-            try:
-                for _attempt in range(3):  # chunks added meanwhile: embed them too
-                    try:
-                        reindex(model, progress=progress, cancel=cancel)
-                        break
-                    except RetrievalError as exc:
-                        if exc.code != "vector_incomplete":
-                            raise
-                job.state = "done"
-            except RetrievalError as exc:
-                job.state = "cancelled" if exc.code == "cancelled" else "failed"
-                job.error_code, job.error = f"knowledge.{exc.code}", str(exc)
-            except OllamaError as exc:
-                job.state = "failed"
-                job.error_code, job.error = f"local.{exc.code}", str(exc)
-            except Exception as exc:  # reported on the job
-                logger.exception("Building the semantic index failed")
-                job.state = "failed"
-                job.error_code, job.error = "knowledge.reindex_failed", str(exc)
-            finally:
-                job.finished_at = datetime.now(UTC)
-
-        threading.Thread(target=body, name="nodestro-reindex", daemon=True).start()
+        threading.Thread(
+            target=self._build, args=(job, model, cancel, None), name="nodestro-reindex", daemon=True
+        ).start()
         return self.index_status()
 
+    def execute_reindex(
+        self,
+        model_name: str,
+        *,
+        cancel: threading.Event,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> ReindexJob:
+        """Run a reindex to its end in the calling thread and return its outcome (a server worker's job, RT-046);
+        never raises for the reindex's own problems: they are the outcome's ``error_code`` and ``error``."""
+        job = ReindexJob(model=model_name)
+        try:
+            _, model = self._reindex_model(model_name)
+        except NodestroError as exc:
+            job.state, job.error_code, job.error = "failed", exc.code, str(exc)
+            job.finished_at = datetime.now(UTC)
+            return job
+        self._build(job, model, cancel, progress)
+        return job
+
+    def _build(
+        self,
+        job: ReindexJob,
+        model: EmbeddingModel,
+        cancel: threading.Event,
+        progress: Callable[[int, int], None] | None,
+    ) -> None:
+        """The reindex itself; its outcome is written to ``job``."""
+        reindex = self.index.reindex  # type: ignore[attr-defined]
+
+        def report(done: int, total: int) -> None:
+            job.completed, job.total = done, total
+            if progress is not None:
+                progress(done, total)
+
+        try:
+            for _attempt in range(3):  # chunks added meanwhile: embed them too
+                try:
+                    reindex(model, progress=report, cancel=cancel)
+                    break
+                except RetrievalError as exc:
+                    if exc.code != "vector_incomplete":
+                        raise
+            job.state = "done"
+        except RetrievalError as exc:
+            job.state = "cancelled" if exc.code == "cancelled" else "failed"
+            job.error_code, job.error = f"knowledge.{exc.code}", str(exc)
+        except OllamaError as exc:
+            job.state = "failed"
+            job.error_code, job.error = f"local.{exc.code}", str(exc)
+        except Exception as exc:  # reported on the job
+            logger.exception("Building the semantic index failed")
+            job.state = "failed"
+            job.error_code, job.error = "knowledge.reindex_failed", str(exc)
+        finally:
+            job.finished_at = datetime.now(UTC)
+
+    def _current_job(self) -> ReindexJob | None:
+        """The latest reindex: the queue's on a server's API process, else this process's thread's."""
+        if self.reindex_queue is not None:
+            return self.reindex_queue.current()
+        return self._job
+
+    def reindexing(self) -> bool:
+        """Whether this process builds the semantic index now (in its own thread)."""
+        job = self._job
+        return job is not None and job.state == "running"
+
     def cancel_reindex(self) -> KnowledgeIndexStatus:
-        if self._job_cancel is not None:
+        if self.reindex_queue is not None:
+            self.reindex_queue.cancel()
+        elif self._job_cancel is not None:
             self._job_cancel.set()
         return self.index_status()
 
     def drop_vectors(self) -> KnowledgeIndexStatus:
         """Remove the semantic index (full-text search stays)."""
-        if self._job is not None and self._job.state == "running":
+        job = self._current_job()
+        if job is not None and job.state == "running":
             raise NodestroError("knowledge.reindex_running", "Stop building the semantic index first")
         drop = getattr(self.index, "drop_vectors", None)
         if drop is not None:

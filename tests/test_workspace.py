@@ -408,3 +408,51 @@ async def test_waiting_for_an_approval_does_not_count_against_the_time_limit(mak
     done = await workspace.wait(paused.id, timeout=20)
     assert done.status == "succeeded", done.error
     assert done.active_seconds < 0.5
+
+
+async def test_background_work_names_what_runs_in_this_process(make: Make) -> None:
+    """API-001: a server closes an idle tenant's workspace only while ``background_work`` is empty; it lists every
+    kind of work that lives in the process (runs, tool jobs, run chat answers, installs, local model jobs, reindex)."""
+    from datetime import UTC, datetime
+
+    from nodestro_runtime.knowledge import ReindexJob
+    from nodestro_runtime.local_service import LocalJob
+    from nodestro_runtime.tool_library import ToolJob
+
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking(_request: dict[str, Any]) -> Any:
+        entered.set()
+        release.wait(20)
+        return text("done")
+
+    workspace = make({"SLOW": [blocking]})
+    assert workspace.background_work() == []
+    saved = workspace.save_workflow(
+        workflow([{"id": "start", "type": "start"}, agent("a", "SLOW")], [edge("start", "a")])
+    )
+    started = await workspace.run(saved, RunIn(input="x"))
+    assert await asyncio.to_thread(entered.wait, 20)
+    assert workspace.background_work() == [f"run:{started.id}"]
+    release.set()
+    await workspace.wait(started.id, timeout=20)
+    assert workspace.background_work() == []
+
+    job = ToolJob(requirement="add numbers")
+    workspace.tools.jobs[job.id] = job
+    workspace.runs.chat._answering["msg_q"] = None  # type: ignore[assignment]
+    workspace.python._installing.add("tool:x")
+    local = LocalJob(id="lj1", kind="pull", target="m", started_at=datetime.now(UTC))
+    workspace.local_models._jobs[local.id] = local
+    workspace.knowledge._job = ReindexJob(model="m")
+    assert workspace.background_work() == [
+        f"tool_job:{job.id}",
+        "run_chat:msg_q",
+        "python_install:tool:x",
+        "local_model_job:lj1",
+        "reindex:knowledge",
+    ]
+    job.status, local.state, workspace.knowledge._job.state = "failed", "done", "done"
+    workspace.runs.chat._answering.clear()
+    workspace.python._installing.clear()
+    assert workspace.background_work() == []

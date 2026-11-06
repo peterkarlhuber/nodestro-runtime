@@ -25,8 +25,13 @@ processes (:class:`RunWorker`) claim jobs and execute them.
 - Exactly one process fires schedules (:class:`LeaderLock`), and every schedule slot fires at most once
   (:class:`ScheduleFirings`), also when a leader dies while firing.
 
-Only runs are executed through the queue so far; the other long-running work of the desktop (batches, test series,
-assistant drafts, Python environment installations) still runs in the process that started it.
+- A **semantic reindex** of a tenant's knowledge base is a job too (:data:`REINDEX_JOB`, RT-046): the API process
+  queues it (:class:`QueuedReindex`), a worker runs it (:class:`ReindexWorker`) with a lease, reports its progress in
+  the job's payload and stops it when a person cancels it, the tenant is suspended or the lease is lost. A reindex
+  that stopped continues where it stopped when started again; the reaper marks it interrupted, like a run.
+
+Runs and reindex jobs are executed through the queue; the other long-running work of the desktop (batches, test
+series, assistant drafts, Python environment installations) still runs in the process that started it.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
+import contextlib
 from datetime import datetime, timedelta
 import json
 import logging
@@ -46,6 +52,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from .knowledge import ReindexJob
 from .problems import NodestroError
 from .schemas import Run, RunEvent
 from .storage_postgres import PostgresDatabase
@@ -54,8 +61,12 @@ from .tool_approvals import WaitingSlots
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "done", "failed", "cancelled", "interrupted"]
-#: The job kind of a run (the only kind executed through the queue so far).
+#: The job kind of a run.
 RUN_JOB = "run"
+#: The job kind of a semantic reindex of a tenant's knowledge base (RT-046); its ref is always :data:`REINDEX_REF`,
+#: so a tenant has at most one queued or running reindex on the whole server.
+REINDEX_JOB = "reindex"
+REINDEX_REF = "knowledge"
 #: Runs a worker holds at the same time (executing or waiting for a tool approval), and how many of them may wait.
 DEFAULT_MAX_RUNS = 2
 DEFAULT_MAX_WAITING = 1
@@ -193,6 +204,26 @@ class JobQueue:
         )
         return [_job(row) for row in rows]
 
+    def report(self, job: Job, worker: str, progress: Mapping[str, Any]) -> Job | None:
+        """Merge ``progress`` into the payload of a job ``worker`` runs and renew its lease (one statement); ``None``
+        when the job is no longer its own (lease lost)."""
+        rows = self.database._query(
+            "UPDATE nodestro_jobs SET payload = payload || %s::jsonb, lease_until = clock_timestamp() + %s"
+            " WHERE tenant_id = %s AND id = %s AND worker = %s AND status = 'running'"
+            f" RETURNING {_COLUMNS}",
+            (json.dumps(dict(progress)), self.lease, job.tenant_id, job.id, worker),
+        )
+        return _job(rows[0]) if rows else None
+
+    def latest(self, tenant_id: str, kind: str, ref: str) -> Job | None:
+        """The newest job of a piece of work (active or ended), if any."""
+        rows = self.database._query(
+            f"SELECT {_COLUMNS} FROM nodestro_jobs WHERE tenant_id = %s AND kind = %s AND ref = %s"
+            " ORDER BY id DESC LIMIT 1",
+            (tenant_id, kind, ref),
+        )
+        return _job(rows[0]) if rows else None
+
     def get(self, job_id: int) -> Job | None:
         rows = self.database._query(f"SELECT {_COLUMNS} FROM nodestro_jobs WHERE id = %s", (job_id,))
         return _job(rows[0]) if rows else None
@@ -319,6 +350,170 @@ class QueuedRuns:
             # Withdrawn before any worker took it: nobody else will store its end.
             self.runs.cancel_unclaimed(run.id)
         return True
+
+
+def reindex_job(job: Job) -> ReindexJob:
+    """A reindex job of the queue as the knowledge base's :class:`~nodestro_runtime.knowledge.ReindexJob`: queued
+    and running are ``running``; a reaped job is ``failed`` with ``knowledge.reindex_interrupted`` (start it again to
+    continue where it stopped). The error is stored as ``code: message``."""
+    state: Literal["running", "done", "failed", "cancelled"]
+    code: str | None = None
+    message: str | None = None
+    if job.status in ("queued", "running"):
+        state = "running"
+    elif job.status == "interrupted":
+        state, code = "failed", "knowledge.reindex_interrupted"
+        message = "The worker building the semantic index stopped; start it again to continue"
+    else:
+        state = cast(Literal["done", "failed", "cancelled"], job.status)
+    if job.error and code is None:
+        code, _, message = job.error.partition(": ")
+        if not message:
+            code, message = "knowledge.reindex_failed", job.error
+    return ReindexJob(
+        state=state,
+        model=str(job.payload.get("model", "")),
+        completed=int(job.payload.get("completed", 0) or 0),
+        total=int(job.payload.get("total", 0) or 0),
+        error_code=code if state in ("failed", "cancelled") else None,
+        error=message if state in ("failed", "cancelled") else None,
+        started_at=job.started_at or job.created_at,
+        finished_at=job.finished_at,
+    )
+
+
+class QueuedReindex:
+    """Connects one tenant's :class:`~nodestro_runtime.knowledge.KnowledgeBase` to the job queue (API processes,
+    RT-046): after :meth:`attach` a reindex is queued for a worker instead of running in a thread of this process,
+    and its state and cancellation go through the queue, so every API process sees the same job."""
+
+    def __init__(self, queue: JobQueue, tenant_id: str, knowledge: Any) -> None:
+        self.queue = queue
+        self.tenant_id = tenant_id
+        self.knowledge = knowledge
+
+    def attach(self) -> None:
+        self.knowledge.reindex_queue = self
+
+    def start(self, model: str) -> None:
+        if self.queue.enqueue(self.tenant_id, REINDEX_JOB, REINDEX_REF, {"model": model}) is None:
+            raise NodestroError("knowledge.reindex_running", "The semantic index is already being built")
+
+    def cancel(self) -> None:
+        self.queue.request_cancel(self.tenant_id, REINDEX_JOB, REINDEX_REF)
+
+    def current(self) -> ReindexJob | None:
+        job = self.queue.latest(self.tenant_id, REINDEX_JOB, REINDEX_REF)
+        return reindex_job(job) if job is not None else None
+
+
+class ReindexWorker:
+    """Claims reindex jobs and runs them in this process, one at a time, renewing their leases (a worker process,
+    RT-046).
+
+    ``workspaces(tenant_id)`` returns the tenant's workspace (an object with ``knowledge``). While the reindex runs in
+    a thread, the worker reports its progress (which renews the lease) every ``heartbeat`` seconds; it stops the
+    reindex (which continues where it stopped when started again) when a person cancels it, the tenant is suspended
+    (``tenant_active``), the lease is lost or the worker stops."""
+
+    def __init__(
+        self,
+        queue: JobQueue,
+        workspaces: WorkspaceOf,
+        *,
+        name: str | None = None,
+        heartbeat: float | None = None,
+        poll: float = 1.0,
+        tenant_active: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.queue = queue
+        self.workspaces = workspaces
+        self.name = name or worker_name()
+        self.heartbeat_seconds = heartbeat if heartbeat is not None else queue.lease.total_seconds() / 3
+        self.poll = poll
+        self.tenant_active = tenant_active
+
+    async def run_once(self, stop: asyncio.Event | None = None) -> Job | None:
+        """Claim one reindex job and run it to its end; ``None`` when none was queued."""
+        job: Job | None = await asyncio.to_thread(self.queue.claim, self.name, (REINDEX_JOB,))
+        if job is None:
+            return None
+        await self._execute(job, stop or asyncio.Event())
+        return job
+
+    async def _execute(self, job: Job, stop: asyncio.Event) -> None:
+        if self.tenant_active is not None and not await asyncio.to_thread(self.tenant_active, job.tenant_id):
+            await asyncio.to_thread(
+                self.queue.finish, job.id, self.name, "failed", "identity.tenant_suspended: the tenant is suspended"
+            )
+            return
+        try:
+            knowledge = self.workspaces(job.tenant_id).knowledge
+        except Exception as exc:
+            logger.exception("Opening tenant %s for reindex job %s failed", job.tenant_id, job.id)
+            code = exc.code if isinstance(exc, NodestroError) else "knowledge.reindex_failed"
+            await asyncio.to_thread(self.queue.finish, job.id, self.name, "failed", f"{code}: {exc}")
+            return
+        cancel = threading.Event()
+        progress: dict[str, int] = {}
+
+        def note(done: int, total: int) -> None:
+            progress["completed"], progress["total"] = done, total
+
+        running = asyncio.ensure_future(
+            asyncio.to_thread(
+                knowledge.execute_reindex, str(job.payload.get("model", "")), cancel=cancel, progress=note
+            )
+        )
+        lost = False
+        stopped_by: str | None = None
+        while not running.done():
+            await asyncio.wait({running}, timeout=self.heartbeat_seconds)
+            if running.done() or lost:
+                continue
+            beat = await asyncio.to_thread(self.queue.report, job, self.name, dict(progress))
+            if beat is None:
+                lost = True
+                cancel.set()
+                logger.error("Reindex job %s lost its lease; stopping it", job.id)
+            elif beat.cancel_requested and not cancel.is_set():
+                cancel.set()
+            elif stop.is_set() and not cancel.is_set():
+                stopped_by = "the worker stopped"
+                cancel.set()
+            elif self.tenant_active is not None and not cancel.is_set():
+                try:
+                    active = await asyncio.to_thread(self.tenant_active, job.tenant_id)
+                except Exception:  # unknown: stop, as for a run (SR-03)
+                    active = False
+                if not active:
+                    stopped_by = "identity.tenant_suspended"
+                    cancel.set()
+        outcome = running.result()
+        if lost:
+            return
+        if progress:
+            await asyncio.to_thread(self.queue.report, job, self.name, dict(progress))
+        status: JobStatus = outcome.state if outcome.state in ("done", "failed", "cancelled") else "failed"
+        error = f"{outcome.error_code}: {outcome.error}" if outcome.error_code else None
+        if stopped_by == "identity.tenant_suspended" and status == "cancelled":
+            status, error = "failed", "identity.tenant_suspended: the tenant was suspended; start it again to continue"
+        elif stopped_by is not None and status == "cancelled":
+            error = f"knowledge.cancelled: {stopped_by}; start it again to continue"
+        if not await asyncio.to_thread(self.queue.finish, job.id, self.name, status, error):
+            logger.warning("Reindex job %s was no longer this worker's when it ended", job.id)
+
+    async def serve(self, stop: asyncio.Event) -> None:
+        """Run reindex jobs until ``stop`` is set (a running one is stopped then; started again it continues)."""
+        while not stop.is_set():
+            try:
+                job = await self.run_once(stop)
+            except Exception:
+                logger.exception("The reindex worker loop failed; retrying")
+                job = None
+            if job is None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=self.poll)
 
 
 #: The workspace (or anything with ``runs``) of a tenant, opened by the worker on demand.

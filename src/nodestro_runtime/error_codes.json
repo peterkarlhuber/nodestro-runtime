@@ -258,6 +258,7 @@
   "knowledge.embedding_model_missing": [],
   "knowledge.index_building": ["mode"],
   "knowledge.reindex_failed": [],
+  "knowledge.reindex_interrupted": [],
   "knowledge.reindex_required": [],
   "knowledge.reindex_running": [],
   "knowledge.vectors_missing": ["mode"],
