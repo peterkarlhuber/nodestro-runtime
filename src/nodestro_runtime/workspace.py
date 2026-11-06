@@ -571,6 +571,21 @@ class Workspace:
             return None
         return self.knowledge.runner()
 
+    def background_work(self) -> list[str]:
+        """What this workspace does in this process beyond a request right now (``kind:id`` entries; empty: idle).
+
+        A server closes a tenant's idle workspace only while this is empty (nodestro-api API-001): executing runs,
+        tool generation jobs, live run chat answers, Python environment installations, local model jobs and a
+        semantic reindex all live in this process and would be lost."""
+        found = [f"run:{run.id}" for run in self.runs.live_runs()]
+        found += [f"tool_job:{item}" for item in self.tools.active_jobs()]
+        found += [f"run_chat:{item}" for item in self.runs.chat.answering()]
+        found += [f"python_install:{item}" for item in self.python.installing()]
+        found += [f"local_model_job:{item}" for item in self.local_models.running_jobs()]
+        if self.knowledge.reindexing():
+            found.append("reindex:knowledge")
+        return found
+
     def close(self) -> None:
         """Release the database connections; closing twice is harmless.
 
