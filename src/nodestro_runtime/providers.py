@@ -539,6 +539,10 @@ def environment_connection(
         base_url = env.get(base_url_variable(provider)) or (base_urls or {}).get(provider) or info.default_base_url
     if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
         raise MissingApiKeyError(provider)
+    if client is None and provider == "ollama" and base_url:
+        # An exported project's local model server gets the same time and retries as the studio's (RT-058/RT-068);
+        # its hardware is not known here, so it gets the time a CPU needs.
+        client = endpoint_client(base_url, key, timeout=local_request_timeout(None), max_retries=LOCAL_MAX_RETRIES)
     return Connection(
         provider=provider,
         api_key=key,
@@ -871,21 +875,45 @@ _NO_KEY = "nodestro-no-api-key"
 #: answer comes in one piece. The SDK's default of 600 seconds failed such requests although the server was working
 #: (RT-050). The run's own limits (its duration, budget, cancellation) still apply.
 LOCAL_REQUEST_TIMEOUT = 3600.0
+#: The same for a local model server known to run its models on a GPU (RT-068): it answers many times faster, so a
+#: silent server is given up on sooner. Still above the SDK's default of 600 seconds, which a large model on a GPU
+#: that waits for another request to finish can need.
+LOCAL_GPU_REQUEST_TIMEOUT = 1200.0
+#: SDK retries of a request to a local model server (RT-058): none. A timed-out request would only wait the whole
+#: timeout again (the server is busy or stuck), and a refused connection is reported at once instead of after the
+#: SDK's back-off. Cloud providers keep :data:`MAX_RETRIES`.
+LOCAL_MAX_RETRIES = 0
 
 
-def endpoint_client(base_url: str, api_key: str | None, *, timeout: float | None = None) -> Any:
+def local_request_timeout(accelerated: bool | None) -> float:
+    """Seconds a request to a local model server may wait for an answer, or between two parts of a streamed one,
+    taken from the hardware (``accelerated``: whether the models run on a GPU; ``None``: not known, as on CPU).
+
+    The limit applies to every read of the connection (httpx's read timeout): a streamed answer that keeps sending
+    is never cut off, while a server that stops sending is. The wait for the first byte is deliberately not
+    shorter: the server answers one request at a time and processes the whole prompt before its first token, which
+    on a CPU takes minutes. Cancel and the run's time limit end such a request earlier (runtime #113)."""
+    return LOCAL_GPU_REQUEST_TIMEOUT if accelerated else LOCAL_REQUEST_TIMEOUT
+
+
+def endpoint_client(
+    base_url: str, api_key: str | None, *, timeout: float | None = None, max_retries: int | None = None
+) -> Any:
     """An OpenAI SDK client for an allow-listed endpoint (``compatible``, ``ollama``, ``vllm``) that never follows
     redirects.
 
     :func:`check_endpoint_allowed` checks only the configured base URL; an endpoint that answers with a redirect would
     otherwise send the request (the prompt) on to any address, also one the operator did not allow. A redirect is
-    reported as the endpoint's error instead. ``timeout``: seconds per request (default: the SDK's)."""
+    reported as the endpoint's error instead. ``timeout``: seconds per request (default: the SDK's); ``max_retries``:
+    the SDK's retries (default: the SDK's)."""
     import httpx
     import openai
 
     extra: dict[str, Any] = {}
     if timeout is not None:
         extra["timeout"] = httpx.Timeout(timeout, connect=10.0)
+    if max_retries is not None:
+        extra["max_retries"] = max_retries
     http_client = openai.DefaultHttpxClient(follow_redirects=False)
     client = openai.OpenAI(api_key=api_key or _NO_KEY, base_url=base_url, http_client=http_client, **extra)
     _OWNED_CLIENTS[client] = _track_sockets(http_client)

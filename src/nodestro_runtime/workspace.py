@@ -75,7 +75,7 @@ from .pricing import PricingService
 from .problems import NodestroError
 from .profile import RuntimeProfile
 from .providers import (
-    LOCAL_REQUEST_TIMEOUT,
+    LOCAL_MAX_RETRIES,
     PROVIDERS,
     Connection,
     MissingApiKeyError,
@@ -88,6 +88,7 @@ from .providers import (
     check_model,
     endpoint_client,
     env_key,
+    local_request_timeout,
     provider_of,
     provider_status,
     qualify,
@@ -926,12 +927,15 @@ class Workspace:
         """What the local model selection prefers: European models when the setting is on (D13)."""
         return SelectionPreferences(region="eu" if self._stored("prefer_european_models") else None)
 
-    def reasoning_saving(self) -> bool:
+    def reasoning_saving(self, accelerated: bool | Literal["ask"] | None = "ask") -> bool:
         """Whether the CPU saving mode applies now: the setting ``local_reasoning`` is ``auto`` (the default) and the
-        local model server has no GPU (see ``agent_builder.reasoning_reduction``). An unknown server never saves."""
+        local model server has no GPU (see ``agent_builder.reasoning_reduction``). An unknown server never saves.
+        ``accelerated``: what :meth:`LocalModelService.accelerated` already said (asked again by default)."""
         if self._stored("local_reasoning") == "full":
             return False
-        return self.local_models.accelerated() is False
+        if accelerated == "ask":
+            accelerated = self.local_models.accelerated()
+        return accelerated is False
 
     def _update_bedrock(self, entry: dict[str, Any], change: Mapping[str, Any]) -> None:
         """Check and store a change of the Bedrock settings (region, sign-in, profile name, residency)."""
@@ -1335,6 +1339,14 @@ class Workspace:
         key = env_key(provider, self._environ)[0] or stored.get("api_key") or None
         base_url = stored.get("base_url") or None
         reported = None
+        known: list[bool | None] = []
+
+        def accelerated() -> bool | None:
+            """Whether the local models run on a GPU, asked once per connection (it may ask the server)."""
+            if not known:
+                known.append(self.local_models.accelerated())
+            return known[0]
+
         if provider == "ollama":
             reported = self.local_models.capability_overrides
             if base_url is None and self._client_factory is None:
@@ -1354,8 +1366,15 @@ class Workspace:
         client = self._client_factory(provider) if self._client_factory is not None else None
         if client is None and base_url and info.base_url and (self._endpoints is not None or provider == "ollama"):
             # A server: the endpoint was checked against the allowlist, and a redirect must not lead elsewhere.
-            # A local model server gets more time per request than the SDK's default (LOCAL_REQUEST_TIMEOUT).
-            client = endpoint_client(base_url, key, timeout=LOCAL_REQUEST_TIMEOUT if provider == "ollama" else None)
+            # A local model server gets more time per request than the SDK's default, taken from its hardware, and
+            # no SDK retries (RT-058/RT-068; local_request_timeout).
+            local = provider == "ollama"
+            client = endpoint_client(
+                base_url,
+                key,
+                timeout=local_request_timeout(accelerated()) if local else None,
+                max_retries=LOCAL_MAX_RETRIES if local else None,
+            )
         if client is None and ((info.needs_key and not key) or (info.base_url and not base_url)):
             raise MissingApiKeyError(provider)
         return self._refuse_offline(
@@ -1366,7 +1385,7 @@ class Workspace:
                 capabilities=dict(stored.get("capabilities") or {}),
                 client=client,
                 reported=reported,
-                reasoning_saving=provider == "ollama" and self.reasoning_saving(),
+                reasoning_saving=provider == "ollama" and self.reasoning_saving(accelerated()),
                 limits=dict(stored.get("limits") or {}),
                 window=self._local_window if provider == "ollama" else None,
                 reasoning_summaries=bool(self._stored("reasoning_summaries")),
