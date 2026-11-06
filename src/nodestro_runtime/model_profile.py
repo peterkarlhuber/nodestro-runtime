@@ -168,16 +168,11 @@ def native_tool_support(provider: str, caps: ModelCapabilities) -> list[NativeTo
 
 
 def unavailable_options(config: Any, support: dict[str, OptionSupport]) -> list[tuple[str, OptionSupport]]:
-    """The options ``config`` (an ``AgentConfig``) sets although the model cannot use them; a value outside the
-    model's accepted ``thinking`` modes counts too."""
+    """The options ``config`` (an ``AgentConfig``) sets although the model cannot use them at all. A value the model
+    does not accept (e.g. ``thinking="disabled"`` on Claude Opus 5.5) is left to Orkexa, whose checks name the exact
+    rule (``config.thinking_not_disableable``, ``config.between_tools_model``)."""
     found: list[tuple[str, OptionSupport]] = []
     for name, default in OPTION_DEFAULTS.items():
-        value = getattr(config, name)
-        if value == default:
-            continue
-        item = support[name]
-        if not item.available:
-            found.append((name, item))
-        elif item.values is not None and value not in item.values:
-            found.append((name, OptionSupport(available=False, reason="model", values=item.values)))
+        if getattr(config, name) != default and not support[name].available:
+            found.append((name, support[name]))
     return found

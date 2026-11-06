@@ -41,6 +41,7 @@ import sys
 import threading
 from typing import Any, Literal
 
+from orkexa import ConfigurationError
 from orkexa.dynamic import Sandbox
 from orkexa.embeddings import OllamaEmbeddings
 from orkexa.local import OllamaError, check_model_name
@@ -1376,7 +1377,7 @@ class Workspace:
         it is not known or the server does not answer (never starts the managed server)."""
         try:
             return self.local_models.context_window()
-        except (NodestroError, OSError):
+        except (NodestroError, OSError, ConfigurationError):  # e.g. a stored address the client refuses
             return None
 
     def _refuse_offline(self, connection: Connection, label: str) -> Connection:

@@ -160,10 +160,19 @@ def test_switching_the_model_flags_options_it_cannot_use(workspace: Workspace) -
     """A model switch never leaves an invalid parameter unnoticed: the inspector and the workflow check name it."""
     config = {"thinking": "between_tools", "effort": "high"}
     assert codes(workspace, model="anthropic:claude-sonnet-5-5", **config) == set()
-    assert "config.option_unsupported" in codes(workspace, model="anthropic:claude-opus-5-5", **config)
+    # A value the model does not take: Orkexa's own rule names it.
+    assert "config.between_tools_model" in codes(workspace, model="anthropic:claude-opus-5-5", **config)
+    # An option the provider does not have at all.
     assert "config.option_unsupported" in codes(workspace, model="openai:gpt-6.1-sol", **config)
-    effort = codes(workspace, model="anthropic:claude-sonnet-4-6", effort="xhigh")
-    assert effort & {"config.capability_unsupported", "library"}
+    # An effort level the model does not take: sent as the nearest lower level, with a warning (agents saved before
+    # the levels were documented keep running).
+    assert "config.effort_adjusted" in codes(workspace, model="anthropic:claude-sonnet-4-6", effort="xhigh")
+    assert "config.effort_dropped" in codes(workspace, model="anthropic:claude-haiku-4-5", effort="medium")
+    built = workspace.builder.build(
+        AgentConfig(model="anthropic:claude-sonnet-4-6", effort="xhigh"),
+        connection=Connection(provider="anthropic", client=object()),
+    )
+    assert built.agent.effort == "high"
 
 
 def test_server_tools_follow_the_provider_native_tools(workspace: Workspace) -> None:

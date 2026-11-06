@@ -440,8 +440,13 @@ class Connection:
         if info is not None and info.auth == "aws":
             return create_provider(self.provider, ProviderConfig(client=object())).limits(model_id(model))
         default = info.default_base_url if info is not None else None
-        adapter = create_provider(self.provider, ProviderConfig(base_url=self.base_url or default, client=object()))
-        limits = adapter.limits(model_id(model))
+        try:
+            adapter = create_provider(self.provider, ProviderConfig(base_url=self.base_url or default, client=object()))
+            limits = adapter.limits(model_id(model))
+        except (ConfigurationError, ValueError):
+            # An address the provider refuses (e.g. one with credentials, stored before they were refused) is
+            # reported where the agent is built; here the documented values are simply unknown.
+            limits = ModelLimits()
         declared = {key: int(value) for key, value in self.limits.items() if key in LIMIT_NAMES and value}
         if self.window is not None and "context_window" not in declared:
             window = self.window()

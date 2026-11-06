@@ -547,6 +547,24 @@ class AgentBuilder:
                     f"model's context window ({limits.context_window} tokens)",
                 )
             )
+        reasons = config.effort is not None and self.capabilities(model).supports("reasoning")
+        if config.effort is not None and reasons and provider_of(model) != "ollama":
+            used = _documented_effort(config.effort, limits)
+            if used != config.effort:
+                found.append(
+                    ConfigIssue(
+                        level="warning",
+                        field="effort",
+                        code="config.effort_adjusted" if used else "config.effort_dropped",
+                        params={
+                            "effort": config.effort,
+                            "used": used or "",
+                            "efforts": ", ".join(limits.efforts or ()),
+                        },
+                        message=f"{model} does not take the effort {config.effort!r}; "
+                        + (f"{used!r} is sent instead" if used else "no effort is sent"),
+                    )
+                )
         return found
 
 
@@ -561,11 +579,31 @@ def _effort(config: AgentConfig, connection: Connection, model: str) -> Any:
     """The agent's reasoning effort. A local model that cannot reason (its server reports no ``thinking``) has no
     effort to set, so the setting (by default ``medium``) is left out instead of refusing the agent; a local model
     that thinks gets it as ``reasoning_effort``; at ``low`` it does not think at all (see :func:`_thinks_off`)."""
-    if config.effort is None or provider_of(model) != "ollama":
-        return config.effort
+    if config.effort is None:
+        return None
+    if provider_of(model) != "ollama":
+        if not connection.model_capabilities(model).supports("reasoning"):
+            return config.effort  # refused by Orkexa with its reason, as before
+        return _documented_effort(config.effort, connection.model_limits(model))
     if _thinks_off(config, connection, model):
         return None  # sent as reasoning_effort "none" (see _options)
     return connection.effort(model, config.effort)
+
+
+def _documented_effort(wanted: str, limits: ModelLimits) -> str | None:
+    """The effort sent for ``wanted`` where the model documents its levels: none at all for a model without effort
+    levels (Claude Haiku 4.5), else the nearest lower accepted level (the lowest when none is lower). Agents saved
+    before the levels were documented keep running; the validation names the change (``config.effort_adjusted``)."""
+    efforts = limits.efforts
+    if efforts is None or wanted in efforts:
+        return wanted
+    if not efforts:
+        return None
+    from orkexa.core.capabilities import EFFORTS
+
+    rank = EFFORTS.index(wanted) if wanted in EFFORTS else len(EFFORTS)
+    lower = [effort for effort in efforts if EFFORTS.index(effort) <= rank]
+    return lower[-1] if lower else efforts[0]
 
 
 def _validation_connection(builder: AgentBuilder, config: AgentConfig) -> Connection:
