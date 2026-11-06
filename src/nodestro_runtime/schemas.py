@@ -647,6 +647,18 @@ class ToolCallRecord(_Model):
     approval: ToolCallApproval | None = None
 
 
+class RunCause(_Model):
+    """Why a failed run failed (AD-02): the step that failed first and its problem, so that a run list or a banner
+    can say "<step>: <reason>" without reading every step. Set together with ``error_code`` ``run.nodes_failed``;
+    ``code``/``params`` are the step's own (``run.budget_exceeded``, ``provider.rate_limited`` ...)."""
+
+    node_id: str
+    #: The step's label as the workflow shows it.
+    label: str
+    code: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunWarning(_Model):
     """Something a run that ended went without (AD-03): e.g. a tool call that was refused, timed out or failed.
 
@@ -855,6 +867,8 @@ class Run(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    #: With ``error_code`` ``run.nodes_failed``: the step that failed first and why (RT-012); ``None`` otherwise.
+    cause: RunCause | None = None
     #: What the run went without although it may have succeeded (AD-03): refused, expired or failed tool calls.
     warnings: list[RunWarning] = Field(default_factory=list)
     output: Any = None
@@ -914,6 +928,7 @@ class RunSummary(_Model):
     error: str | None = None
     error_code: str | None = None
     error_params: dict[str, Any] = Field(default_factory=dict)
+    cause: RunCause | None = None
     warnings: list[RunWarning] = Field(default_factory=list)
     imported_at: datetime | None = None
     source_run_id: str | None = None

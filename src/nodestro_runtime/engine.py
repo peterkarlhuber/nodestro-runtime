@@ -27,7 +27,7 @@ import concurrent.futures
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import functools
 import json
@@ -116,6 +116,7 @@ from .schemas import (
     OutputConfig,
     Run,
     RunBudget,
+    RunCause,
     RunEvent,
     RunIn,
     RunTrigger,
@@ -2204,6 +2205,7 @@ class RunManager:
         run.finished_at = None
         run.error = run.error_code = None
         run.error_params = {}
+        run.cause = None
         self._emit(context, "run_started", status=run.status)
         # Stored at once: other processes (the API of a server) read the run from the database, not this context.
         self._save(context)
@@ -2314,6 +2316,7 @@ class RunManager:
             error=run.error,
             error_code=run.error_code,
             error_params=run.error_params,
+            cause=run.cause.model_dump(mode="json") if run.cause is not None else None,
             output=run.output,
             usage=run.usage.model_dump(mode="json"),
         )
@@ -2400,6 +2403,7 @@ class RunManager:
                 if failed
                 else problem("run.incomplete", "Not all nodes ran"),
             )
+            run.cause = run_cause(run)
         else:
             run.status = "succeeded"
         run.output = self._run_output(run)
@@ -4715,6 +4719,23 @@ def tool_rounds_problem(found: Problem, calls: list[ToolCallRecord], config: Age
         "local": local,
     }
     return found.model_copy(update={"message": message, "params": params})
+
+
+def run_cause(run: Run) -> RunCause | None:
+    """The step of a failed run that failed first (the earliest end; steps without an end time after those with one,
+    in the workflow's order) with its problem code and parameters (RT-012); ``None`` when no step failed."""
+    order = {node.id: index for index, node in enumerate(run.workflow.nodes)}
+    failed = [
+        (node_id, state)
+        for node_id, state in run.nodes.items()
+        if state.status == "failed" and node_id in order and state.error_code
+    ]
+    if not failed:
+        return None
+    latest = datetime.max.replace(tzinfo=UTC)
+    node_id, state = min(failed, key=lambda item: (item[1].finished_at or latest, order[item[0]]))
+    node = run.workflow.nodes[order[node_id]]
+    return RunCause(node_id=node_id, label=node_label(node), code=state.error_code or "", params=state.error_params)
 
 
 def _fail(target: NodeRun | Run, found: Problem) -> None:
