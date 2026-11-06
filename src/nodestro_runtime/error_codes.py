@@ -68,10 +68,15 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _code_of(node: ast.Call) -> str | None:
-    candidates = [*node.args[:1], *(keyword.value for keyword in node.keywords if keyword.arg == "code")]
+def _code_of(node: ast.Call, pattern: re.Pattern[str]) -> str | None:
+    """The code of a problem-building call: its first argument, or its second after a status that is not a string
+    (``ApiError(404, "run.not_found", ...)``), or ``code=``."""
+    candidates = list(node.args[:1])
+    if node.args and not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+        candidates += node.args[1:2]
+    candidates += [keyword.value for keyword in node.keywords if keyword.arg == "code"]
     for value in candidates:
-        if isinstance(value, ast.Constant) and isinstance(value.value, str) and CODE.fullmatch(value.value):
+        if isinstance(value, ast.Constant) and isinstance(value.value, str) and pattern.fullmatch(value.value):
             return value.value
     return None
 
@@ -80,22 +85,32 @@ def _python_files(root: Path) -> Iterable[Path]:
     return sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
 
 
-def scan(root: Path = _PACKAGE, *, exclude: Iterable[str] = NOT_CODES) -> dict[str, set[str]]:
-    """The codes in the Python source under ``root`` with the parameter names seen with them (see the module)."""
+def scan(
+    root: Path = _PACKAGE,
+    *,
+    exclude: Iterable[str] = NOT_CODES,
+    builders: re.Pattern[str] = _BUILDERS,
+    pattern: re.Pattern[str] = CODE,
+) -> dict[str, set[str]]:
+    """The codes in the Python source under ``root`` with the parameter names seen with them (see the module).
+
+    ``builders`` matches the names of the calls that build a problem and ``pattern`` the codes they take (the HTTP
+    API also has codes without a namespace, such as ``not_found``); other constants count only with a namespace that
+    such a call uses."""
     excluded = set(exclude)
     found: dict[str, set[str]] = {}
     trees = [ast.parse(path.read_text(encoding="utf-8"), filename=str(path)) for path in _python_files(root)]
     for tree in trees:
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and _BUILDERS.search(_call_name(node)):
-                code = _code_of(node)
+            if isinstance(node, ast.Call) and builders.search(_call_name(node)):
+                code = _code_of(node, pattern)
                 if code is not None and code not in excluded:
                     params = found.setdefault(code, set())
                     params.update(
                         keyword.arg for keyword in node.keywords if keyword.arg and keyword.arg not in _NOT_PARAMS
                     )
                     params.discard("code")
-    spaces = {code.split(".", 1)[0] for code in found}
+    spaces = {code.split(".", 1)[0] for code in found if "." in code}
     for tree in trees:
         for node in ast.walk(tree):
             if (
@@ -110,7 +125,7 @@ def scan(root: Path = _PACKAGE, *, exclude: Iterable[str] = NOT_CODES) -> dict[s
     return found
 
 
-def _orkexa_errors() -> list[str]:
+def orkexa_errors() -> list[str]:
     """The names of Orkexa's error classes (subclasses of ``OrkexaError``), read from its source, so the result does
     not depend on which of its modules happen to be imported."""
     import orkexa
@@ -146,7 +161,7 @@ def dynamic_codes() -> dict[str, set[str]]:
     ``resume.was_<step status>`` (``graph``: the reason a step runs again)."""
     from .schemas import NodeStatus
 
-    found: dict[str, set[str]] = {f"run.agent.{name}": {"type"} for name in _orkexa_errors()}
+    found: dict[str, set[str]] = {f"run.agent.{name}": {"type"} for name in orkexa_errors()}
     found.update({f"local.{code}": {"status"} for code in _ollama_codes()})
     found.update(
         {f"resume.was_{status}": set() for status in get_args(NodeStatus) if status not in ("succeeded", "skipped")}

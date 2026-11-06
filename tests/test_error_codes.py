@@ -45,6 +45,9 @@ def test_the_scan_finds_codes_in_calls_and_tables(tmp_path: Path) -> None:
                     raise NodestroError("demo.too_large", "Too large", limit=3, message_kind="x")
                 return problem("demo.empty", "Empty", level="warning", field="name")
 
+            def answer(name):
+                raise ApiError(404, "demo.not_found", "Unknown", id=name)
+
             def prefix(kind):
                 return f"demo.was_{kind}", "demo.was_"
             """
@@ -55,4 +58,18 @@ def test_the_scan_finds_codes_in_calls_and_tables(tmp_path: Path) -> None:
         "demo.too_large": {"limit", "message_kind"},
         "demo.empty": set(),  # level and field describe the issue, they are not parameters
         "demo.rejected": set(),
+        "demo.not_found": {"id"},  # the code after an HTTP status
     }
+    # The HTTP API's own builders and its codes without a namespace.
+    (tmp_path / "api.py").write_text(
+        'def route():\n    return _error(400, "bad_request", "Bad", field="x", name="y")\n'
+    )
+    import re
+
+    loose = scan(
+        tmp_path,
+        exclude={"demo.json"},
+        builders=re.compile(r"(?:Error|_error)$"),
+        pattern=re.compile(r"[a-z_]+(?:\.[A-Za-z_]+)*"),
+    )
+    assert loose["bad_request"] == {"name"} and "demo.not_found" in loose
