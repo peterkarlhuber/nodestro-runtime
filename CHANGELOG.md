@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- TODO abatement round (2026-11-06):
+  - Agents that read content they did not write (tools, server tools, memory, files, knowledge) are told in their
+    system prompt that it is data, not instructions; background material is introduced as reference data (RT-002).
+  - An approval decision answers the run as it goes on (`queued`), not the ended pause (RT-005).
+  - `DocumentStore.put_raw_if_absent`: an atomic insert-if-absent on SQLite and PostgreSQL (RT-045).
+  - Local model requests: no SDK retries, and a read timeout from the hardware (60 minutes on a CPU or unknown
+    hardware, 20 minutes on a GPU), also in exported projects (RT-058, RT-068).
+  - Switching the strict offline mode restarts an idle managed Ollama with the matching proxy settings (RT-059).
+  - `run.agent.MaxToolRoundsError` says what the calls show (`rounds`, `calls`, `repeated`, `tool`, `looping`,
+    `local`) with advice (RT-067).
+  - The sandbox gateway reads each created container back and removes it when its effective limits, isolation,
+    mounts, user or image differ from the request (`503`) (RT-003).
+  - `list_page(since=..., equals=...)` and `list_since` filter in the store; usage entries, the cost estimate and the
+    latest run of a workflow no longer read whole collections (RT-009, RT-042).
+  - `Run.cause` / `RunSummary.cause` (`RunCause`: step, label, code, params): why a run failed, set with
+    `run.nodes_failed` and in the `run_finished` event (RT-012).
+  - `nodestro_runtime.error_codes` and `error_codes.json`: the catalog of every problem code with its parameters;
+    a test fails while it is out of date (`python -m nodestro_runtime.error_codes --write`) (RT-011).
+  - The Office XML guard checks the whole part with the XML parser, also UTF-16 parts (RT-044).
+  - Setup advice fits the context: exported projects name the environment variable and `.env` (`where`,
+    `variables`); `check.local_runtime_missing` names the models and the API route (`models`, `route`) (RT-057).
+  - A tool is refused when the name it would be stored under is reserved, not only its function name (RT-025).
+  - `testing.AnswerAll` finishes orchestrations (staff, delegate once, finish) (RT-056, part).
+  - README: contents table and sandbox, PostgreSQL texts brought up to the code (RT-021).
 - Fixed: an Ollama 400 "invalid message content type: <nil>" in multi-step agent runs with thinking models (cause and
   fix in Orkexa). A provider that refuses the conversation now fails the step with `run.provider_rejected_messages`
   (technical text ends with a content-free outline), a too-large conversation with `run.provider_context_exceeded`;
