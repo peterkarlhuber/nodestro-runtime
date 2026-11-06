@@ -141,9 +141,14 @@ class DocumentStore(Protocol):
       (``id`` ``""``: everything older than the time), with ``top_level`` only those without ``parent_run_id``;
       at most ``limit`` of them and whether more follow. The order compares creation times at the store's
       precision (SQLite: milliseconds, PostgreSQL: microseconds), so a page continues exactly where the cursor of
-      the previous one points. ``summary`` reads only the top-level fields ``model`` declares (PostgreSQL returns a
+      the previous one points. ``since`` keeps only documents created at or after that time; ``equals`` only those
+      whose top-level fields have these string values (``{"workflow_id": ...}``), both in the query (RT-042).
+      ``summary`` reads only the top-level fields ``model`` declares (PostgreSQL returns a
       document it keeps as exact text, one with a NUL character, whole). Only the collections of
       :data:`PAGED_COLLECTIONS` (``runs``) are served; ``list`` stays as it is.
+    - ``list_since`` returns the documents of any collection whose top-level time ``field`` is at or after ``since``,
+      newest first (ties: higher id first), filtered in the query and not in Python (RT-009; no index: for
+      collections such as ``usage_log`` that are read by period).
     - ``list`` returns the most recently updated first (ties in id order); ``find``, in update order, the
       documents whose top-level field has one of the values; ``items``, ``list_prefix`` in id order.
       ``list_prefix``/``delete_prefix`` treat the prefix literally (``%`` and ``_`` are ordinary characters).
@@ -198,7 +203,13 @@ class DocumentStore(Protocol):
         before: tuple[datetime, str] | None = None,
         top_level: bool = False,
         summary: bool = False,
+        since: datetime | None = None,
+        equals: Mapping[str, str] | None = None,
     ) -> tuple[builtins.list[ModelT], bool]: ...
+
+    def list_since(
+        self, collection: str, model: type[ModelT], *, field: str, since: datetime
+    ) -> builtins.list[ModelT]: ...
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]: ...
 
@@ -433,6 +444,8 @@ class SQLiteStore:
         before: tuple[datetime, str] | None = None,
         top_level: bool = False,
         summary: bool = False,
+        since: datetime | None = None,
+        equals: Mapping[str, str] | None = None,
     ) -> tuple[builtins.list[ModelT], bool]:
         """One keyset page of a collection of :data:`PAGED_COLLECTIONS` by creation, newest first (see
         :class:`DocumentStore`); indexed by schema version 2, so a page costs ``limit + 1`` index entries, not the
@@ -446,6 +459,14 @@ class SQLiteStore:
         params: builtins.list[Any] = []
         if top_level:
             where.append("json_extract(data, '$.parent_run_id') IS NULL")
+        if since is not None:
+            where.append(f"{CREATED_ORDER} >= strftime('%Y-%m-%dT%H:%M:%f', ?)")
+            params.append(cursor_time(since))
+        for name, value in (equals or {}).items():
+            if not _FIELD.fullmatch(name):
+                raise ValueError(f"Invalid field name {name!r}")
+            where.append(f"json_type(data, '$.{name}') = 'text' AND json_extract(data, '$.{name}') = ?")
+            params.append(value)
         if before is not None:
             moment, after = before
             text = cursor_time(moment)
@@ -470,6 +491,21 @@ class SQLiteStore:
             rows = self._connection.execute(query, (*params, limit + 1)).fetchall()
         more = len(rows) > limit
         return [item for _key, item in self.damaged.parse(collection, rows[:limit], model)], more
+
+    def list_since(self, collection: str, model: type[ModelT], *, field: str, since: datetime) -> builtins.list[ModelT]:
+        if not _FIELD.fullmatch(field):
+            raise ValueError(f"Invalid field name {field!r}")
+        moment = (
+            f"CASE WHEN json_extract(data, '$.{field}') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+            f" THEN strftime('%Y-%m-%dT%H:%M:%f', json_extract(data, '$.{field}')) END"
+        )
+        query = (
+            f"SELECT id, data FROM nodestro_documents WHERE collection = ? AND json_valid(data)"
+            f" AND {moment} >= strftime('%Y-%m-%dT%H:%M:%f', ?) ORDER BY {moment} DESC, id DESC"
+        )
+        with self._lock:
+            rows = self._connection.execute(query, (collection, cursor_time(since))).fetchall()
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def items(self, collection: str, model: type[ModelT]) -> builtins.list[tuple[str, ModelT]]:
         """``(id, document)`` pairs of a collection, in id order."""

@@ -8,6 +8,7 @@ hands the run to the engine. There is one engine and one way in.
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -16,7 +17,8 @@ from .engine import WorkflowError, node_label
 from .preflight import PROVIDER_CHECKS, agent_models, preflight
 from .problems import NodestroError
 from .python_tools import state_problem
-from .schemas import NodeRun, Run, RunIn, RunSummary, RunTrigger, Workflow
+from .run_views import workflow_runs
+from .schemas import NodeRun, Run, RunIn, RunTrigger, Workflow
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -128,16 +130,19 @@ class CostEstimate(BaseModel):
     based_on: int = 0
 
 
+#: The most recent successful runs a cost estimate learns from.
+ESTIMATE_RUNS = 20
+
+
 def estimate_cost(ctx: Workspace, workflow_id: str, runs: int) -> CostEstimate:
-    summaries = [
+    learned = (
         summary
-        for summary in ctx.store.list("runs", RunSummary, limit=500)
-        if summary.workflow_id == workflow_id
-        and summary.status == "succeeded"
-        and summary.parent_run_id is None
+        for summary in workflow_runs(ctx.store, workflow_id)
+        if summary.status == "succeeded"
         and summary.imported_at is None
         and summary.usage.estimated_cost_usd is not None
-    ][:20]
+    )
+    summaries = list(itertools.islice(learned, ESTIMATE_RUNS))  # stops reading once it has enough
     estimate = CostEstimate(runs=runs, based_on=len(summaries))
     if summaries:
         average = sum(summary.usage.estimated_cost_usd or 0.0 for summary in summaries) / len(summaries)

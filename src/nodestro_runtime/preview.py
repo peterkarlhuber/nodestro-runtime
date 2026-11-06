@@ -19,8 +19,9 @@ from .file_delivery import collect, plan
 from .forms import check_values, prompt_values
 from .graph import comment_sources, data_sources
 from .problems import NodestroError
+from .run_views import workflow_runs
 from .sanitize import redact_secrets
-from .schemas import ExampleMessage, OutputConfig, Run, RunSummary, Workflow, WorkflowIn
+from .schemas import ExampleMessage, OutputConfig, Run, Workflow, WorkflowIn
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -116,10 +117,9 @@ def _sentinel(key: str) -> str:
 
 
 def latest_run(nodestro: Workspace, workflow_id: str) -> Run | None:
-    """The newest finished, own (not imported) run of a workflow."""
-    summaries = nodestro.store.list("runs", RunSummary, limit=500)
-    for summary in sorted(summaries, key=lambda item: item.created_at, reverse=True):
-        if summary.workflow_id == workflow_id and summary.imported_at is None and summary.finished_at is not None:
+    """The newest finished, own (not imported) run of a workflow, however many runs are stored (RT-042)."""
+    for summary in workflow_runs(nodestro.store, workflow_id, top_level=False):
+        if summary.imported_at is None and summary.finished_at is not None:
             return nodestro.store.get("runs", summary.id, Run)
     return None
 

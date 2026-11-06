@@ -961,6 +961,8 @@ class PostgresStore:
         before: tuple[datetime, str] | None = None,
         top_level: bool = False,
         summary: bool = False,
+        since: datetime | None = None,
+        equals: Mapping[str, str] | None = None,
     ) -> tuple[builtins.list[ModelT], bool]:
         """One keyset page of the tenant's documents by creation, newest first (see
         :class:`~nodestro_runtime.storage.DocumentStore`); indexed for ``runs`` (migration 0009), so a page costs
@@ -976,6 +978,15 @@ class PostgresStore:
         params: builtins.list[Any] = [self.tenant_id]
         if top_level:
             where += " AND (data ->> 'parent_run_id') IS NULL"
+        if since is not None:
+            where += " AND " + _CREATED_ORDER + " >= %s::timestamptz"
+            params.append(cursor_time(since))
+        if equals:
+            if not all(_FIELD.fullmatch(name) for name in equals):
+                raise ValueError(f"Invalid field names {sorted(equals)!r}")
+            # Containment of {"field": "text"} holds exactly for a top-level string field with that value.
+            where += " AND data @> %s::jsonb"
+            params.append(json.dumps({name: str(value) for name, value in equals.items()}))
         if before is not None:
             moment, after = before
             where += " AND (" + _CREATED_ORDER + ", id) < (%s::timestamptz, %s)"
@@ -993,6 +1004,19 @@ class PostgresStore:
         )
         more = len(rows) > limit
         return [item for _key, item in self.damaged.parse(collection, rows[:limit], model)], more
+
+    def list_since(self, collection: str, model: type[ModelT], *, field: str, since: datetime) -> builtins.list[ModelT]:
+        """Documents whose top-level time ``field`` is at or after ``since``, newest first (no index)."""
+        if not _FIELD.fullmatch(field):
+            raise ValueError(f"Invalid field name {field!r}")
+        self._check()
+        rows = self.database._query(
+            "SELECT id, " + _JSON + " FROM nodestro_documents WHERE tenant_id = %s AND collection = %s"
+            " AND nodestro_created_order(data ->> %s) >= %s::timestamptz"
+            " ORDER BY nodestro_created_order(data ->> %s) DESC, id DESC",
+            (self.tenant_id, collection, field, cursor_time(since), field),
+        )
+        return [item for _key, item in self.damaged.parse(collection, rows, model)]
 
     def find(self, collection: str, field: str, values: Iterable[str], model: type[ModelT]) -> builtins.list[ModelT]:
         """Documents whose top-level ``field`` has one of ``values``, in update order."""
