@@ -33,6 +33,7 @@ from .engine import execute_agent, node_problem, render_task, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
+from .reasoning import ReasoningTrace, trace_hook
 from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
 from .tool_approvals import CallBinding, ToolGate, bind_call, tool_facts
 
@@ -68,6 +69,8 @@ class AgentTestResult(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     #: ``cpu_saving`` when the local model answered without thinking in the CPU saving mode (as a run's step).
     reasoning_reduced: str | None = None
+    #: The reasoning the provider transmitted during the test (text only where the provider sends it).
+    reasoning: ReasoningTrace = Field(default_factory=ReasoningTrace)
     evaluation: EvaluationRecord | None = None
     memory: dict[str, str] | None = None
     #: True when the agent worked on a copy of its persistent memory space.
@@ -193,6 +196,7 @@ class AgentTester:
             "on_request": on_request,
             "before_tool": before_tool,
             "after_tool": after_tool,
+            "on_event": trace_hook(result.reasoning),
         }
         try:
             built_config, run_memory, isolated = self._memory(config)
@@ -219,6 +223,7 @@ class AgentTester:
             result.status = "failed"
             result.error, result.error_code, result.error_params = found.message, found.code, found.params
         finally:
+            result.reasoning.active = False
             result.usage = usage_of(tracker.usage, tracker.records, stale_requests=tracker.stale_requests())
             result.finished_at = now()
         return result, tracker
