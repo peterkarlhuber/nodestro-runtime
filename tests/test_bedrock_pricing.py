@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -343,7 +344,12 @@ BEDROCK_MAP: dict[str, Any] = {
 
 def _litellm(document: Mapping[str, Any]) -> LiteLLMSource:
     body = json.dumps(document).encode()
-    return LiteLLMSource(fetch_bytes=lambda _url, _settings: body, sleep=lambda _s: None, http=HttpSettings(attempts=1))
+    return LiteLLMSource(
+        fetch_bytes=lambda _url, _settings: body,
+        sleep=lambda _s: None,
+        http=HttpSettings(attempts=1),
+        sha256=hashlib.sha256(body).hexdigest(),
+    )
 
 
 def test_only_regional_litellm_entries_become_bedrock_prices() -> None:
