@@ -221,9 +221,18 @@ def _describe(item: RunFile) -> str:
 
 
 def deliver(
-    files: list[RunFile], capabilities: ModelCapabilities, inputs: InputFiles | None, knowledge: KnowledgeBase
+    files: list[RunFile],
+    capabilities: ModelCapabilities,
+    inputs: InputFiles | None,
+    knowledge: KnowledgeBase,
+    *,
+    intro: str = INTRO,
+    subject: str = "this run",
 ) -> Delivery:
-    """The context blocks and the files tool for an agent whose model has ``capabilities``."""
+    """The context blocks and the files tool for an agent whose model has ``capabilities``.
+
+    ``intro`` opens the catalog of the uploaded files and ``subject`` names what they were given to in the files
+    tool's description; the Nodestro Assistant passes its own (files of a conversation, not of a run)."""
     provided = plan(files, capabilities)
     if not files:
         return Delivery([], [], None)
@@ -232,7 +241,7 @@ def deliver(
     blocks: list[ContentBlock] = []
     if uploads:
         catalog = "\n".join(f"- {item.id}: {_describe(item)}" for item in uploads)
-        blocks.append({"type": "text", "text": f"{INTRO}\n\nInput files:\n{catalog}"})
+        blocks.append({"type": "text", "text": f"{intro}\n\nInput files:\n{catalog}"})
     for record in provided:
         item = by_id[record.file_id]
         if item.source == "knowledge":
@@ -283,7 +292,7 @@ def deliver(
                     "Read parts with the input_files tool.",
                 }
             )
-    tool = files_tool(uploads, capabilities, inputs) if uploads and inputs is not None else None
+    tool = files_tool(uploads, capabilities, inputs, subject=subject) if uploads and inputs is not None else None
     return Delivery(blocks=blocks, provided=provided, tool=tool)
 
 
@@ -310,8 +319,11 @@ def _limit(text: str) -> str:
     return text[:TOOL_MAX_CHARS] + "\n… (cut; read a smaller part with start and count)"
 
 
-def files_tool(files: list[RunFile], capabilities: ModelCapabilities, inputs: InputFiles) -> Tool:
-    """The ``input_files`` tool over the uploaded files of one run (read-only)."""
+def files_tool(
+    files: list[RunFile], capabilities: ModelCapabilities, inputs: InputFiles, *, subject: str = "this run"
+) -> Tool:
+    """The ``input_files`` tool over the uploaded files of one run (read-only); ``subject`` names what the files
+    were given to in the description the model reads (``this conversation`` for the Nodestro Assistant)."""
     known = {item.id: item for item in files}
 
     def _file(file_id: str) -> RunFile:
@@ -452,4 +464,7 @@ def files_tool(files: list[RunFile], capabilities: ModelCapabilities, inputs: In
         except KeyError:
             raise ToolResultError("Error: the file is no longer available") from None
 
-    return Tool(input_files, name=TOOL_NAME)
+    tool = Tool(input_files, name=TOOL_NAME)
+    if subject != "this run" and tool.description:
+        tool.description = tool.description.replace("this run", subject)
+    return tool
