@@ -615,14 +615,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** After orkexa's `pdf_pages_isolated`: both paths use it, with the limits configurable
   (`NODESTRO_PDF_TIMEOUT_SECONDS`, `NODESTRO_PDF_MAX_PAGES`, ...).
 
-### RT-MUP-A7 · Price sync integrity (MUP-ONA MP-A7, VB-1)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** `pricing_sync.py` follows redirects and imports the LiteLLM price file from `main` without an integrity
-  check.
-- **Next step:** No redirects; a pinned source or a configured SHA-256; a mismatch imports nothing and warns.
-
 ### RT-MUP-A8 · Shared security test vectors (MUP-ONA MP-A8)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**
