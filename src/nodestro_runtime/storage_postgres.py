@@ -763,13 +763,13 @@ class _Writes:
 
 
 class DatabaseSource:
-    """A :class:`PostgresDatabase` as the ``ConnectionSource`` of the generic PostgreSQL classes
-    (:mod:`nodestro_runtime.pg_generic.connection`, MUP-ONA B4).
+    """A :class:`PostgresDatabase` as the ``ConnectionSource`` of Orkexa's PostgreSQL backends
+    (:mod:`orkexa.backends.postgres.connection`; MUP-ONA B4, B6).
 
     The modes run as the database ran the same statements before: ``read`` as :meth:`PostgresDatabase._query` (no
     lock, retried on a lost connection), ``write`` as :meth:`PostgresDatabase._write` (autocommit under the process
     lock), ``transaction`` as :meth:`PostgresDatabase.transaction` (``BEGIN``/``COMMIT`` under the process lock). Inside
-    a transaction of the calling thread every mode joins it, so the generic classes and the document store of the same
+    a transaction of the calling thread every mode joins it, so Orkexa's stores and the document store of the same
     database share one transaction.
 
     ``tenant_setting`` is the hook for row-level security on Nodestro's tables (MUP-ONA A9, not used yet): with a name
@@ -785,8 +785,8 @@ class DatabaseSource:
 
     @property
     def lock(self) -> threading.RLock:
-        """The lock that serializes the database's transactions and writes in this process; the generic classes hold
-        it for every command, so a command never waits for it while holding a lock of its own."""
+        """The lock that serializes the database's transactions and writes in this process; Orkexa's stores hold it
+        for every command (their ``lock``), so a command never waits for it while holding a lock of its own."""
         return self.database._lock
 
     @contextmanager

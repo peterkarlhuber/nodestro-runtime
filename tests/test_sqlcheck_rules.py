@@ -1,10 +1,12 @@
-"""The rule engine of the tenant SQL check (:mod:`nodestro_runtime.sqlcheck_rules`, MUP-ONA B4).
+"""The rule engine of the tenant SQL check (:mod:`orkexa.testing.sqlcheck`; MUP-ONA B4, B6).
 
-Nodestro's source code check (``tests/test_tenant_filters.py``) runs the engine with ``tenant_id`` and Nodestro's
-tables; the cases here run it on its own. T-SQLC-1 proves that it is generic: with a foreign partition column
-(``org_id``) and foreign tables (``t_docs``, ``t_notes``) the same rules hold, and Nodestro's column and tables mean
-nothing to it. The engine is to be taken over into orkexa as ``orkexa.testing.sqlcheck`` (MUP-ONA B5), so it may
-import nothing but ``pglast`` and the standard library and holds no Nodestro constant.
+B4 separated the engine from Nodestro's check as ``nodestro_runtime.sqlcheck_rules``, B5 took it over into orkexa
+unchanged, and B6 removed Nodestro's copy: the check (:mod:`nodestro_runtime.tenant_sql_check`) now calls Orkexa's
+engine. Nodestro's source code check (``tests/test_tenant_filters.py``) runs the engine with ``tenant_id`` and
+Nodestro's tables; the cases here run it on its own, against the engine at the pinned orkexa commit. T-SQLC-1 proves
+that it is generic: with a foreign partition column (``org_id``) and foreign tables (``t_docs``, ``t_notes``) the same
+rules hold, and Nodestro's column and tables mean nothing to it. It imports nothing but ``pglast`` and the standard
+library and holds no Nodestro constant.
 """
 
 from __future__ import annotations
@@ -16,12 +18,11 @@ import re
 import subprocess
 import sys
 
+from orkexa.testing import sqlcheck
+from orkexa.testing.sqlcheck import KINDS, Finding, check_statement
 import pytest
 
-from nodestro_runtime import sqlcheck_rules
-from nodestro_runtime.sqlcheck_rules import KINDS, Finding, check_statement
-
-ENGINE = Path(sqlcheck_rules.__file__)
+ENGINE = Path(sqlcheck.__file__)
 BASELINE = Path(__file__).parent / "fixtures" / "sql_parity_before.json"
 
 #: The foreign set of T-SQLC-1.
@@ -128,7 +129,7 @@ def test_any_binds_only_with_allow_any() -> None:
     sql = "SELECT body FROM t_docs WHERE org_id = ANY(%s)"
     findings = check_statement(sql, tenant_tables=TABLES, column=COLUMN)
     assert [f.kind for f in findings] == ["leak", "leak"]
-    assert findings[1].message == sqlcheck_rules.ANY_REFUSED
+    assert findings[1].message == sqlcheck.ANY_REFUSED
     assert check_statement(sql, tenant_tables=TABLES, column=COLUMN, allow_any=True) == []
     # ANY on another column never binds.
     assert _kinds("SELECT body FROM t_docs WHERE id = ANY(%s)", allow_any=True) == ["leak"]
@@ -182,7 +183,7 @@ def test_postgres_placeholders() -> None:
 
 
 def test_to_postgres_params() -> None:
-    assert sqlcheck_rules.to_postgres_params("a = %s AND b = %(x)s AND c = %(x)s AND d LIKE '5%%' %b %t") == (
+    assert sqlcheck.to_postgres_params("a = %s AND b = %(x)s AND c = %(x)s AND d LIKE '5%%' %b %t") == (
         "a = $1 AND b = $2 AND c = $2 AND d LIKE '5%' $3 $4"
     )
 
@@ -242,6 +243,6 @@ def test_the_engine_holds_no_nodestro_constant() -> None:
 
 
 def test_importing_the_engine_does_not_import_the_parser() -> None:
-    code = "import sys, nodestro_runtime.sqlcheck_rules; print('pglast' in sys.modules)"
+    code = "import sys, orkexa.testing.sqlcheck; print('pglast' in sys.modules)"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120)
     assert result.stdout.strip() == "False"

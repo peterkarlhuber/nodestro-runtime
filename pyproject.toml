@@ -20,7 +20,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
+    # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags). Every orkexa requirement
+    # in this file names the same commit; move them together.
     "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
@@ -40,11 +41,16 @@ dependencies = [
 # Axentra is not a base dependency, and without it the server profile works and switching it on is refused.
 # Every Axentra requirement below names the same commit (MUP-ONA B0); move them together.
 postgres = [
+    # Orkexa's PostgreSQL backends (orkexa.backends.postgres, MUP-ONA B6) under the knowledge base and memory.
+    "orkexa[postgres] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
 ]
 dev = [
+    # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's
+    # own parser pglast; tests/test_tenant_filters.py, tests/test_sql_catalog.py).
+    "orkexa[postgres,sqlcheck] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
@@ -53,8 +59,6 @@ dev = [
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",
-    # PostgreSQL's own parser, for the static tenant-isolation check (tests/test_tenant_filters.py).
-    "pglast>=7,<9",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5",
@@ -98,15 +102,15 @@ root_package = "nodestro_runtime"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-# MUP-ONA B4: the rule engine is taken over unchanged into orkexa (orkexa.testing.sqlcheck, B5). It imports only
-# pglast (late, by name) and the standard library. import-linter does not report an import of the package root
-# (`import nodestro_runtime`); tests/test_sqlcheck_rules.py checks that every import is the standard library or pglast.
-name = "The SQL rule engine imports nothing of Nodestro and no third-party package"
+# MUP-ONA B6: the tenant SQL check is a test-time tool (nodestro-api's tenant-sql job runs it on the api's source). It
+# reads the migrations, the allowlist and the source it scans as files and uses orkexa's rule engine
+# (orkexa.testing.sqlcheck, pglast late), so it imports no other Nodestro module and no driver. The rule engine itself
+# and Orkexa's PostgreSQL backends keep their own contracts in orkexa (MUP-ONA B5).
+name = "The tenant SQL check imports nothing of Nodestro"
 type = "forbidden"
-source_modules = ["nodestro_runtime.sqlcheck_rules"]
+source_modules = ["nodestro_runtime.tenant_sql_check"]
 forbidden_modules = [
     "nodestro_runtime.**",
-    "orkexa",
     "axentra",
     "psycopg",
     "psycopg_pool",
@@ -116,16 +120,6 @@ forbidden_modules = [
     "sqlite_vec",
     "packaging",
 ]
-
-[[tool.importlinter.contracts]]
-# MUP-ONA B4: the generic PostgreSQL part (ConnectionSource, statement catalog, executor, index, file store, memory) is
-# taken over unchanged into orkexa (orkexa.backends.postgres, B5). It may import orkexa (it implements orkexa's
-# interfaces), psycopg (late) and the standard library, but nothing of Nodestro except itself. As above, an import of
-# the package root is not reported; tests/test_sql_catalog.py checks every import of the package.
-name = "The generic PostgreSQL part imports nothing of Nodestro"
-type = "forbidden"
-source_modules = ["nodestro_runtime.pg_generic"]
-forbidden_modules = ["nodestro_runtime.**", "axentra", "mcp", "cryptography", "sqlite_vec", "packaging", "pglast"]
 
 [tool.mypy]
 python_version = "3.11"

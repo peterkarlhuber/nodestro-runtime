@@ -5,14 +5,14 @@ filters on (or writes) ``tenant_id`` (``docs/AXENTRA.md``, "Row-level security o
 the control that keeps it so. It is used by the test suites of nodestro-runtime and nodestro-api; nothing imports it at
 run time, and its parser (``pglast``, PostgreSQL's own grammar) is a test dependency only.
 
-Architecture (MUP-ONA B4): the check has two parts. This module is Nodestro's part: it finds the tenant tables in the
-migrations, rebuilds the statements from Python source (and decides which texts are candidates at all), applies the
-allowlist and the skipped modules, and reports ``dynamic`` and ``stale`` findings. Whether one rebuilt statement is
-bound to one tenant is decided by the rule engine :mod:`nodestro_runtime.sqlcheck_rules`, which knows no Nodestro
-constant, no allowlist and no source code (the partition column, the tenant tables and the placeholder style are its
-parameters; it imports only ``pglast`` and the standard library, enforced by import-linter) and is to be taken over
-into orkexa as ``orkexa.testing.sqlcheck`` (MUP-ONA B5). The engine's ``leak``, ``unparsed`` and ``unsupported``
-findings become this module's findings of the same kind, with the module and line of the statement.
+Architecture (MUP-ONA B4, B6): the check has two parts. This module is Nodestro's part: it finds the tenant tables in
+the migrations, rebuilds the statements from Python source (and decides which texts are candidates at all), applies
+the allowlist and the skipped modules, and reports ``dynamic`` and ``stale`` findings. Whether one rebuilt statement is
+bound to one tenant is decided by Orkexa's rule engine :mod:`orkexa.testing.sqlcheck` (extra ``orkexa[sqlcheck]``;
+B4 separated it from this module as ``nodestro_runtime.sqlcheck_rules``, B5 took it over into orkexa unchanged and B6
+removed Nodestro's copy). The engine knows no Nodestro constant, no allowlist and no source code (the partition
+column, the tenant tables and the placeholder style are its parameters). Its ``leak``, ``unparsed`` and
+``unsupported`` findings become this module's findings of the same kind, with the module and line of the statement.
 
 How it works:
 
@@ -51,7 +51,7 @@ How it works:
   ``LIMIT``, ``ORDER BY``, an operator such as ``IS NOT NULL`` ... and holds SQL) is a candidate too. A candidate with
   an unresolved part is reported as ``dynamic``; one that the PostgreSQL parser rejects is reported as ``unparsed``.
   Neither passes silently: such a text passes only when it is fixed or through an allowlist entry with its reason.
-- A parsed candidate is checked by the rule engine :func:`nodestro_runtime.sqlcheck_rules.check_statement` with
+- A parsed candidate is checked by the rule engine :func:`orkexa.testing.sqlcheck.check_statement` with
   Nodestro's partition column ``tenant_id``, psycopg's placeholders and the tenant tables above. It passes when every
   reference to a tenant table (its name in any case) -- in ``FROM``, joins, ``USING``, the target of
   ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level ``AND`` conjunct of its
@@ -79,7 +79,7 @@ callers that pass a literal text), a text made only of unknown parts whose fragm
 lower-case keyword without a SQL shape after an unknown part (``{BASE} or deleted``), text other than space,
 parentheses and comments in front of an unknown part (``f"tag {BASE} OR true"``), a changing method whose text and
 arguments are both unknown (``base().replace(old, new)`` with parameters), ``getattr``/``eval``. The rule engine adds
-its own blind spots (:mod:`nodestro_runtime.sqlcheck_rules`): views, functions, triggers and rules on the server that
+its own blind spots (:mod:`orkexa.testing.sqlcheck`): views, functions, triggers and rules on the server that
 reach a tenant table under another name, and a ``search_path`` that resolves an unlisted name to a tenant table.
 """
 
@@ -95,8 +95,8 @@ import re
 import string
 from typing import Any
 
-from nodestro_runtime import sqlcheck_rules
-from nodestro_runtime.sqlcheck_rules import to_postgres_params as to_postgres_params
+from orkexa.testing import sqlcheck
+from orkexa.testing.sqlcheck import to_postgres_params as to_postgres_params
 
 #: At most this many variants of one expression are checked; more is reported as ``dynamic``.
 MAX_VARIANTS = 256
@@ -1322,15 +1322,15 @@ _ANY_REFUSED = (
 )
 
 
-def _detail(finding: sqlcheck_rules.Finding) -> str:
+def _detail(finding: sqlcheck.Finding) -> str:
     """The text of an engine finding as this check reports it."""
-    return _ANY_REFUSED if finding.message == sqlcheck_rules.ANY_REFUSED else finding.message
+    return _ANY_REFUSED if finding.message == sqlcheck.ANY_REFUSED else finding.message
 
 
-def _check(text: str, tables: frozenset[str], *, allow_any: bool) -> list[sqlcheck_rules.Finding]:
+def _check(text: str, tables: frozenset[str], *, allow_any: bool) -> list[sqlcheck.Finding]:
     """The engine's findings for one rebuilt statement: Nodestro's partition column ``tenant_id``, psycopg's
     placeholders."""
-    return sqlcheck_rules.check_statement(
+    return sqlcheck.check_statement(
         text, tenant_tables=tables, column="tenant_id", placeholder="psycopg", allow_any=allow_any
     )
 
@@ -1339,7 +1339,7 @@ def check_sql(text: str, tables: frozenset[str], *, allow_any: bool = False) -> 
     """Why ``text`` (one or more PostgreSQL statements with psycopg placeholders) may read or change another tenant's
     rows; empty when every reference to a tenant table is bound to one tenant. ``allow_any``: ``tenant_id =
     ANY(<param>)`` binds too (off by default). Raises ``pglast.parser.ParseError``. The rules are those of
-    :func:`nodestro_runtime.sqlcheck_rules.check_statement`."""
+    :func:`orkexa.testing.sqlcheck.check_statement`."""
     findings = _check(text, tables, allow_any=allow_any)
     if any(f.kind == "unparsed" for f in findings):
         _pglast("").parse_sql(to_postgres_params(text))  # raises the parser's own error, as before the engine
