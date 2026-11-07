@@ -12,6 +12,8 @@ Nodestro's tables :data:`LAYOUT` and Nodestro's rule for tenant ids), and adds w
 interfaces: chunk counts per source, pointing a source's chunks to its file, a source's indexed text, and the memory
 totals of a tenant. Their SQL stays here, where the tenant SQL check reads it from the source; Orkexa's SQL is its
 statement catalog, which the check renders with Nodestro's prefix (``tests/test_sql_catalog.py``).
+:func:`require_knowledge_schema` is the read-only start check of these tables (``verify_schema``); Nodestro's own
+migration runner (:meth:`~nodestro_runtime.storage_postgres.PostgresDatabase.migrate`) still creates them.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ from orkexa.backends.postgres import (
     MAX_SOURCES,
     PostgresLayout,
     PostgresVectorStatus,
+    SchemaReport,
     search_words,
+    verify_schema,
 )
 from orkexa.embeddings import EmbeddingModel
 from orkexa.retrieval import LEXICAL_WEIGHT, HybridFusion, RetrievalMode
@@ -32,6 +36,7 @@ from orkexa.retrieval import LEXICAL_WEIGHT, HybridFusion, RetrievalMode
 from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
 from .memory_spaces import BrowsableMemory
+from .problems import NodestroError
 from .storage_postgres import TENANT_ID, DatabaseSource, PostgresDatabase
 
 if TYPE_CHECKING:
@@ -220,6 +225,27 @@ def tenant_storage(
     )
 
 
+def require_knowledge_schema(database: PostgresDatabase) -> SchemaReport:
+    """The start check of the knowledge and memory tables (MUP-ONA B6): Orkexa's read-only
+    :func:`~orkexa.backends.postgres.verify_schema` with :data:`LAYOUT`.
+
+    A server calls it after :meth:`~nodestro_runtime.storage_postgres.PostgresDatabase.require_current_schema` and
+    before it serves a tenant. It changes nothing and needs no DDL privilege (the runtime role is enough). Returns the
+    report (whether pgvector is installed, the schema that holds the tables); raises ``storage.schema_mismatch`` with
+    every difference (``problems``) when the tables are not the ones Orkexa's backends read, e.g. a missing index or a
+    changed column type: then the server must not start, and nothing was changed."""
+    report = verify_schema(DatabaseSource(database), LAYOUT)
+    if not report.ok:
+        raise NodestroError(
+            "storage.schema_mismatch",
+            "The knowledge and memory tables of the PostgreSQL database are not the ones this release reads:\n"
+            + report.summary()
+            + "\nNothing was changed. Restore the tables of migrations 0001-0010 (see the server RUNBOOK)",
+            problems=[str(problem) for problem in report.problems],
+        )
+    return report
+
+
 def memory_totals(database: PostgresDatabase, tenant_id: str, prefix: str) -> builtins.list[tuple[str, int, int]]:
     """``(namespace, files, bytes)`` of every memory namespace of the tenant starting with ``prefix``."""
     _check(tenant_id, "-")
@@ -243,6 +269,7 @@ __all__ = [
     "PostgresVectorStatus",
     "knowledge_tables",
     "memory_totals",
+    "require_knowledge_schema",
     "search_words",
     "tenant_storage",
 ]

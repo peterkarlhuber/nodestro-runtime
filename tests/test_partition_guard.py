@@ -303,3 +303,16 @@ def test_the_tenant_setting_is_off_by_default_and_transaction_local(database: An
         assert connection.execute(probe).fetchall() in ([(None,)], [("",)])
     with pytest.raises(ValueError):
         DatabaseSource(database, tenant_setting="x'; DROP")
+
+
+# MUP-ONA T-SCH-1
+def test_the_start_check_accepts_the_migrated_schema_read_only(database: Any) -> None:
+    """``require_knowledge_schema`` (Orkexa's ``verify_schema`` with Nodestro's layout) on the tables of migrations
+    0001-0010, as the role the suite runs as (the restricted runtime role in the ``*-runtime-role`` jobs): usable,
+    the column ``embedding`` is ``real[]`` (K5), and it reports where it found the tables."""
+    from nodestro_runtime.postgres_tables import require_knowledge_schema
+
+    report = require_knowledge_schema(database)
+    assert report.ok, report.summary()
+    assert report.prefix == "nodestro_" and report.schema == database.schema
+    assert report.version is None  # Nodestro runs its own migrations; orkexa's version table does not exist
