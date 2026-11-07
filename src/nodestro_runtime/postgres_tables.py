@@ -61,9 +61,13 @@ if TYPE_CHECKING:
 _WORD = re.compile(r"[^\W_]+")
 #: The rank that reciprocal-rank fusion adds to (as in ``orkexa.SQLiteIndex``).
 _RRF_K = 60
-#: Stored vectors a search may use: vectors stored before vectors were checked can hold NaN or infinity, which no
-#: ranking can use (pgvector refuses to cast them), so searches leave them out; the rows stay as they are.
-_USABLE = "NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[])"
+#: Stored vectors a search may use. A zero vector has no direction, so no cosine: it is stored (its chunk counts as
+#: embedded, as in ``orkexa.SQLiteIndex``) but never ranked. Vectors stored before vectors were checked can also hold
+#: NaN or infinity, which no ranking can use (pgvector refuses to cast them). Searches leave both out; the rows stay.
+_USABLE = (
+    "NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[])"
+    " AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)])"
+)
 
 
 def _check(tenant_id: str, namespace: str) -> None:
@@ -501,8 +505,10 @@ class PostgresIndex(Index):
         if stored.key != model.identity().key:
             raise RetrievalError("reindex_required", f"The vectors belong to {stored.model}; reindex first")
         vector = [float(x) for x in model.embed_query(query)]
-        # NaN or infinity: vector.invalid; another length than the stored vectors: vector.dimension (drift 2).
-        validate_vector(vector, stored)
+        # NaN or infinity: vector.invalid; another length than the stored vectors: vector.dimension (drift 2). A zero
+        # query vector has no direction: it finds nothing (drift 3).
+        if validate_vector(vector, stored) is None:
+            return []
         scope = " AND c.source = ANY(%s)" if sources is not None else ""
         base: tuple[Any, ...] = (self.tenant_id, space, self.tenant_id, self.namespace)
         if sources is not None:

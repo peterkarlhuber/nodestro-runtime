@@ -112,3 +112,22 @@ def test_stored_non_finite_vectors_are_left_out_and_kept(make: Callable[..., Any
         "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s", (index.tenant_id,)
     )
     assert rows == [(3,)]
+
+
+# ---- drift 3: zero vectors -------------------------------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_zero_vectors_are_stored_but_never_ranked(make: Callable[..., Any]) -> None:
+    index = make(embeddings=KeywordEmbeddings())
+    index.add("A chunk about alpha.", source="a.md")
+    index.add("The zerovector chunk about alpha gardens.", source="zero.md")
+    status = index.vector_status()
+    assert (status.chunks, status.embedded) == (2, 2)  # stored: the chunk is not missing a vector
+    for mode in ("vector", "hybrid"):
+        hits = index.retrieve("alpha", 10, mode=mode)
+        assert [hit.source for hit in hits if "vector" in hit.ranks] == ["a.md"], (mode, hits)
+    assert index.retrieve("zerovector", 10, mode="vector") == []  # a zero query vector finds nothing
+    hybrid = index.retrieve("zerovector gardens", 10, mode="hybrid")
+    assert [hit.source for hit in hybrid] == ["zero.md"] and hybrid[0].ranks == {"fts": 1}
+    assert all(hit.score == hit.score for hit in hybrid)  # never NaN

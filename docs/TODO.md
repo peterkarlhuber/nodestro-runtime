@@ -632,15 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-3 · Zero vectors are stored and ranked (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** A zero document vector is stored and returned as a vector hit; a zero query vector returns hits (score NaN
-  with pgvector, 0 in the runtime). Strict expected failure `MUP-DRIFT-3`: `vector.zero_document_is_never_a_hit`,
-  `vector.zero_query_finds_nothing`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-DRIFT-4 · The runtime ranks vectors by dot product (MUP-ONA MP-B3)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**
