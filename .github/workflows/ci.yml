@@ -17,9 +17,11 @@ jobs:
       matrix:
         python: ["3.11", "3.13", "3.14"]
     # PostgreSQL storage (ADR-0002) runs the storage contract against a real server; a missing database fails.
+    # The image is pinned by digest (MUP-ONA O8); the jobs pg-a and pg-b below run the PostgreSQL tests again, also
+    # as the restricted runtime role and with pgvector.
     services:
       postgres:
-        image: postgres:17
+        image: postgres@sha256:748a18a54d3842d43bc156f0840d78029b8d349e0feca98c12b9c4ce3404a6b3 # postgres:17
         env:
           POSTGRES_PASSWORD: nodestro-ci
         ports:
@@ -51,16 +53,6 @@ jobs:
       - run: pytest --junitxml=junit-test.xml
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-test.xml tests/ci/skipped-test.txt
-      # The PostgreSQL tests again as a production server runs: a restricted runtime role (no DDL, no BYPASSRLS, owns
-      # nothing) for every database the tests open; the CI user stays the owner that migrates (tests/postgres_support.py).
-      - name: PostgreSQL tests as the restricted runtime role
-        if: matrix.python == '3.13'
-        env:
-          NODESTRO_TEST_RUNTIME_ROLE: "1"
-        run: pytest --junitxml=junit-test-runtime-role.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
-      - name: Skipped tests as expected (restricted runtime role)
-        if: matrix.python == '3.13'
-        run: python scripts/check_skips.py junit-test-runtime-role.xml tests/ci/skipped-test-runtime-role.txt
       # Known vulnerabilities in the installed dependencies (as orkexa's CI checks them). Blocking: an advisory that
       # was reviewed and cannot be fixed yet goes into PIP_AUDIT_IGNORE (space-separated IDs, with the reason here).
       - name: Dependency audit
@@ -71,6 +63,121 @@ jobs:
           pip install pip-audit==2.10.1
           args=(); for id in $PIP_AUDIT_IGNORE; do args+=(--ignore-vuln "$id"); done
           pip-audit --skip-editable --progress-spinner off "${args[@]}"
+
+
+  # The PostgreSQL tests (every test file that uses tests/postgres_support.py or names a test server) on PostgreSQL
+  # without pgvector (pg-a: the runtime ranks vectors) and with it (pg-b: pgvector ranks them), on every Python of the
+  # matrix (MUP-ONA MP-B3). Each runs twice: as the superuser that migrates, then as a production server runs, with
+  # the restricted runtime role (no DDL, no BYPASSRLS, owns nothing) for every database the tests open; the CI user
+  # stays the owner that migrates (tests/postgres_support.py). Both images are pinned by digest (O8).
+  pg-a:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13", "3.14"]
+    services:
+      postgres:
+        image: postgres@sha256:748a18a54d3842d43bc156f0840d78029b8d349e0feca98c12b9c4ce3404a6b3 # postgres:17
+        env:
+          POSTGRES_PASSWORD: nodestro-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      NODESTRO_TEST_POSTGRES: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
+      NODESTRO_REQUIRE_POSTGRES: "1"
+      NODESTRO_CONFORMANCE_REPORTS: reports/conformance
+      NODESTRO_RANKING_REPORTS: reports/ranking
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+      - name: PostgreSQL tests (superuser)
+        run: pytest --junitxml=junit-pg-a.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-pg-a.xml tests/ci/skipped-pg-a.txt
+      - name: PostgreSQL tests as the restricted runtime role (pg-a-restricted)
+        env:
+          NODESTRO_TEST_RUNTIME_ROLE: "1"
+        run: >-
+          pytest --junitxml=junit-pg-a-runtime-role.xml
+          $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+      - name: Skipped tests as expected (restricted runtime role)
+        run: python scripts/check_skips.py junit-pg-a-runtime-role.xml tests/ci/skipped-pg-a-runtime-role.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: pg-a-reports-${{ matrix.python }}
+          path: reports/
+          if-no-files-found: ignore
+
+  pg-b:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13", "3.14"]
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8 # pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: nodestro-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      NODESTRO_TEST_POSTGRES: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
+      NODESTRO_TEST_PGVECTOR: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
+      NODESTRO_REQUIRE_POSTGRES: "1"
+      # A test that needs pgvector fails here instead of skipping (MUP-ONA T-PG-2).
+      NODESTRO_REQUIRE_PGVECTOR: "1"
+      NODESTRO_CONFORMANCE_REPORTS: reports/conformance
+      NODESTRO_RANKING_REPORTS: reports/ranking
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+      - name: PostgreSQL tests with pgvector (superuser)
+        run: pytest --junitxml=junit-pg-b.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py)
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-pg-b.xml tests/ci/skipped-pg-b.txt
+      - name: PostgreSQL tests with pgvector as the restricted runtime role (pg-b-restricted)
+        env:
+          NODESTRO_TEST_RUNTIME_ROLE: "1"
+        run: >-
+          pytest --junitxml=junit-pg-b-runtime-role.xml
+          $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py)
+      - name: Skipped tests as expected (restricted runtime role)
+        run: python scripts/check_skips.py junit-pg-b-runtime-role.xml tests/ci/skipped-pg-b-runtime-role.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: pg-b-reports-${{ matrix.python }}
+          path: reports/
+          if-no-files-found: ignore
 
   tenant-sql-api:
     # The tenant SQL check (tenant_sql_check.py) of this commit scans nodestro-api's source (MUP-ONA A11): an early

@@ -53,27 +53,9 @@ TARGETS: dict[str, tuple[tuple[Case, ...], frozenset[str]]] = {
 
 #: The documented drifts of the PostgreSQL index (plan annex A, fixed by MP-B3): case -> drift number, per way of
 #: ranking vectors (``pgvector``: the database ranks; ``runtime``: the runtime ranks, a server without pgvector).
-#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported.
-_SHARED_DRIFTS = {
-    "reindex.identity_is_refreshed_before_writing": 1,
-    "vector.non_finite_document_refused": 2,
-    "vector.non_finite_query_refused": 2,
-    "vector.wrong_dimension_document_refused": 2,
-    "vector.wrong_dimension_query_refused": 2,
-    "vector.zero_document_is_never_a_hit": 3,
-    "vector.zero_query_finds_nothing": 3,
-    "index.full_text_score_is_the_reciprocal_rank": 5,
-    "index.default_mode_is_hybrid_with_embeddings": 6,
-    "index.too_many_sources_are_refused": 7,
-    "index.query_words_follow_tokenize": 8,
-    "reindex.chunk_deleted_during_embedding_gets_no_vector": 9,
-}
-DRIFTS: dict[str, dict[str, int]] = {
-    # pgvector computes the cosine (drift 4 is the runtime's dot product) but does not round it (drift 5).
-    "pgvector": {**_SHARED_DRIFTS, "vector.scores_are_rounded_to_6_digits": 5},
-    # The dot product of the suite's vectors is a whole number, so only the cosine case shows drift 4.
-    "runtime": {**_SHARED_DRIFTS, "vector.score_is_the_cosine": 4},
-}
+#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported. MP-B3 fixed all ten
+#: drifts: no case is an expected failure any more (MUP-ONA T-PG-1); a new entry needs a drift of plan annex A.
+DRIFTS: dict[str, dict[str, int]] = {"pgvector": {}, "runtime": {}}
 
 
 def _database() -> Any:
@@ -192,7 +174,6 @@ def test_drift_marks_name_index_cases_only() -> None:
 
 
 # MUP-ONA T-PG-3
-@pytest.mark.xfail(strict=True, reason="MUP-DRIFT-10")
 def test_legacy_vectors_are_reported() -> None:
     """FX-PG-0 holds one zero vector per tenant, stored before vectors were checked: ``vector_status`` marks such a
     space ``legacy`` (drift 10; the suite cannot write such vectors, so this runs on the legacy fixture)."""
@@ -204,6 +185,6 @@ def test_legacy_vectors_are_reported() -> None:
         try:
             for tenant in ("tenant-a", "tenant-b"):
                 status = PostgresIndex(database, tenant, namespace="nodestro").vector_status()
-                assert status.legacy, f"{tenant}: {status}"
+                assert status.legacy and status.excluded == 1, f"{tenant}: {status}"
         finally:
             database.close()

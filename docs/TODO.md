@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 21 |
+| P3 Low | 20 |
 | P4 Optional | 13 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -559,20 +559,6 @@ None known.
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
 
-### RT-048 · pgvector installed after migration 0010
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #99, `migrations/postgres/0010_knowledge_vectors.sql`
-- **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
-  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema. Done 2026-11-07 in
-  this repository: `storage_postgres.pgvector_status(database)` reports `active`, `installable`, `other_schema` or
-  `unavailable` with the SQL to run and an English message (tested against a real pgvector server,
-  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`).
-- **Next step:** `nodestro-server check` (nodestro-api `server.check`) warns with that status, and the nodestro-server
-  RUNBOOK names the commands.
-- **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
-
-## Later optimizations
-
 ### RT-047 · Exact vector search only
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** #99, orkexa ORK-032
@@ -605,102 +591,6 @@ Packages of the MUP-ONA plan
 ([MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)) that
 change this repository. Each entry is removed in the
 PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
-
-### RT-MUP-B3 · PostgreSQL drift and pgvector in CI (MUP-ONA MP-B3)
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** Ten documented differences between `PostgresIndex` and `SQLiteIndex`; pgvector is not tested in a required
-  job.
-- **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
-  tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
-
-### RT-MUP-DRIFT-1 · The PostgreSQL index never refreshes the embedding identity (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** `PostgresIndex` writes and reindexes under the identity the model cached, never calling
-  `refresh_identity()`, so an updated model can be filed under its old identity. Strict expected failure `MUP-DRIFT-1`:
-  `reindex.identity_is_refreshed_before_writing`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-2 · NaN, infinity and wrong dimensions are not refused as vector errors (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Document and query vectors with NaN or infinity are stored or compared unchecked (pgvector refuses them with
-  a database error), and a wrong dimension is a plain `ValueError` or a database error instead of `vector.dimension`.
-  Strict expected failure `MUP-DRIFT-2`: `vector.non_finite_document_refused`, `vector.non_finite_query_refused`,
-  `vector.wrong_dimension_document_refused`, `vector.wrong_dimension_query_refused`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-3 · Zero vectors are stored and ranked (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** A zero document vector is stored and returned as a vector hit; a zero query vector returns hits (score NaN
-  with pgvector, 0 in the runtime). Strict expected failure `MUP-DRIFT-3`: `vector.zero_document_is_never_a_hit`,
-  `vector.zero_query_finds_nothing`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-4 · The runtime ranks vectors by dot product (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Without pgvector the runtime ranks by the dot product, which is the cosine only for unit vectors;
-  `EmbeddingIdentity.normalized` is ignored. pgvector computes the cosine. Strict expected failure `MUP-DRIFT-4`:
-  `vector.score_is_the_cosine` (runtime ranking).
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-5 · Scores are not the contract's (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Full-text scores are raw `ts_rank` values instead of `1 / (60 + rank)`, and pgvector scores are not rounded
-  to 6 digits. Strict expected failure `MUP-DRIFT-5`: `index.full_text_score_is_the_reciprocal_rank`,
-  `vector.scores_are_rounded_to_6_digits` (pgvector ranking).
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-6 · The default mode is full text even with an embedding model (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** `search()` and `retrieve()` without a mode rank `fts` although the index has an embedding model; the
-  contract says `hybrid`. Strict expected failure `MUP-DRIFT-6`: `index.default_mode_is_hybrid_with_embeddings`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-7 · No limit on the sources of one search (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** `retrieve(sources=...)` accepts any number of sources; SQLite refuses more than 50,000. Strict expected
-  failure `MUP-DRIFT-7`: `index.too_many_sources_are_refused`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-8 · Query words differ from `orkexa.retrieval.tokenize` (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Query words are `[^\W_]+` runs with diacritics removed, so `omega_psi` is two words instead of one. Strict
-  expected failure `MUP-DRIFT-8`: `index.query_words_follow_tokenize`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-9 · A reindex does not check for chunks deleted while it embeds (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** A chunk deleted while its batch is embedded makes the reindex fail with a foreign key violation. Strict
-  expected failure `MUP-DRIFT-9`: `reindex.chunk_deleted_during_embedding_gets_no_vector`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
-### RT-MUP-DRIFT-10 · `VectorStatus.legacy` is never set (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Vectors stored before vectors were checked (the zero vectors of FX-PG-0) are not reported in
-  `vector_status()`. Strict expected failure `MUP-DRIFT-10`: `test_legacy_vectors_are_reported` (FX-PG-0; no generic
-  case).
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
 
 ### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
 

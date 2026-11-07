@@ -80,6 +80,9 @@ def test_a_server_without_pgvector(plain: PostgresDatabase) -> None:
 def server_with_pgvector() -> Iterator[str]:
     """A fresh database on a server that has pgvector, dropped afterwards."""
     if not PGVECTOR_DSN:
+        # MUP-ONA T-PG-2: the pg-b job sets it and NODESTRO_REQUIRE_PGVECTOR=1, which turns this skip into a failure
+        if os.environ.get("NODESTRO_REQUIRE_PGVECTOR") == "1":
+            pytest.fail("NODESTRO_REQUIRE_PGVECTOR=1 but NODESTRO_TEST_PGVECTOR names no server")
         pytest.skip("NODESTRO_TEST_PGVECTOR is not set (a PostgreSQL server with pgvector)")
     import psycopg
     from psycopg import sql

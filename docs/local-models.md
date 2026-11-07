@@ -286,8 +286,29 @@ pgvector, this database does not use it: run `CREATE EXTENSION vector SCHEMA "<s
 runs with `NODESTRO_DATABASE_SCHEMA`: `ALTER EXTENSION vector SET SCHEMA "<schema>";`, unless other applications of
 that database use it there) or `unavailable` (install the pgvector package on the PostgreSQL server first). It
 returns the `command` and an English `message`. Each knowledge index checks pgvector once, so the API and worker
-processes rank with it after their next restart. The vectors themselves need no reindex: they are stored as `real[]`
-either way.
+processes rank with it after their next restart (`PostgresIndex.refresh()` makes an open index check again; the
+API does not call it yet).
+The vectors themselves need no reindex: they are stored as `real[]` either way.
+
+**Scores and query words (the same on SQLite and PostgreSQL).** Both backends meet orkexa's index contract
+(`orkexa.testing.conformance`, run against the PostgreSQL classes by `tests/test_orkexa_conformance.py`):
+
+- `vector`: the score is the cosine similarity rounded to 6 digits, with or without pgvector and whether or not
+  the model's vectors are normalized; equal scores go to the lower chunk id. `fts`: the score is `1 / (60 + rank)`
+  (the full-text engine only orders the hits). `hybrid`: the index's fusion of both (`weighted` or `rrf`).
+- A model that returns NaN, infinity or a vector of another length is refused (`VectorError`: `vector.invalid`,
+  `vector.dimension`); nothing is stored. A zero vector has no direction: it is stored but never ranked, and a zero
+  query vector finds nothing.
+- Vectors that searches leave out (NaN or infinity stored by older releases, zero vectors) stay in the database;
+  PostgreSQL's `vector_status()` counts them (`excluded`) and marks such a space `legacy` until a reindex replaces
+  them.
+- Query words are runs of letters, digits and `_`, matched as prefixes in lower case; a word with `_` finds its
+  parts in sequence (`order_id` finds "order id", not "order" alone). Diacritics are folded for documents and
+  queries alike (`Café` finds "cafe"). A query over 1000 characters or 64 distinct words is refused
+  (`query.too_long`); a search limited to sources accepts at most 50,000.
+- An index with an embedding model searches `hybrid` when no mode is given (the knowledge base always passes the
+  workspace's or the agent's mode).
+- A chunk deleted while a reindex embeds its batch gets no vector; the reindex completes.
 
 ## Offline
 

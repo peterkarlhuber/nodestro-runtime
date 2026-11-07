@@ -1,0 +1,22 @@
+# Skipped tests of the CI job pg-a, step 'PostgreSQL tests as the restricted runtime role' (Python 3.11, 3.13, 3.14: the same list) (MUP-ONA B3; checked by scripts/check_skips.py).
+# One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
+tests.test_knowledge_memory_backends::test_postgres_memory_refuses_nul_characters[sqlite]  # a PostgreSQL-only check (the SQLite parametrization)
+tests.test_knowledge_memory_backends::test_tenants_have_separate_knowledge[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
+tests.test_knowledge_memory_backends::test_tenants_have_separate_memory[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
+tests.test_knowledge_retrieval::test_a_failed_or_cancelled_reindex_keeps_the_current_vectors[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_a_rebuilt_embedding_model_needs_a_reindex_but_uploads_keep_working[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_a_weak_full_text_hit_no_longer_outranks_the_vector_hit[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_an_agent_view_follows_its_retrieval_mode[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_another_embedding_model_needs_a_reindex[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_full_text_stays_the_default_and_vectors_need_the_index[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_hybrid_keeps_exact_codes_that_vectors_cannot_tell_apart[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_semantic_search_with_a_real_embedding_model  # needs a real Ollama server (NODESTRO_TEST_OLLAMA_URL), not in CI
+tests.test_knowledge_retrieval::test_tenants_never_see_each_others_vectors[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_tenants_never_see_each_others_vectors[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
+tests.test_knowledge_retrieval::test_the_semantic_index_finds_meaning_and_scopes_before_ranking[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_knowledge_retrieval::test_uploads_work_while_the_model_server_is_down[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_legacy_fixtures::test_restored_fixture_passes_the_migration_check_and_keeps_its_data[FX-PG-0v.sql.gz]  # FX-PG-0v needs a server with pgvector; the pg-a service is postgres:17 (runs in pg-b)
+tests.test_pg_drift::test_refresh_detects_pgvector_again  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_pgvector_status::test_states_on_a_real_server  # needs a PostgreSQL server with pgvector (NODESTRO_TEST_PGVECTOR); the pg-a service postgres:17 has none (runs in pg-b)
+tests.test_upgrade_scenarios::test_u2_upgrade_with_pgvector_ranks_alike_in_both_paths  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_upgrade_scenarios::test_u4_pgvector_installed_later_is_used_after_refresh  # the pg-a service postgres:17 has no pgvector (runs in pg-b)

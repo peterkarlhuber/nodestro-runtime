@@ -585,12 +585,13 @@ class KnowledgeBase:
                 progress(done, total)
 
         try:
-            for _attempt in range(3):  # chunks added meanwhile: embed them too
+            for attempt in range(3):  # chunks added meanwhile: embed them too
                 try:
                     reindex(model, progress=report, cancel=cancel)
                     break
                 except RetrievalError as exc:
-                    if exc.code != "vector_incomplete":
+                    # The last attempt's vector_incomplete fails the job: it has not switched (before, it said done).
+                    if exc.code != "vector_incomplete" or attempt == 2:
                         raise
             job.state = "done"
         except RetrievalError as exc:
