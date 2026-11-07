@@ -190,6 +190,8 @@ def test_a_bad_prefix_is_refused(prefix: Any) -> None:
 
 @pytest.mark.parametrize("prefix", ["nodestro_", "t_", "a_", "a1_b_", "a" * 31 + "_"])
 def test_a_good_prefix_names_the_tables(prefix: str) -> None:
+    # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
+    pytest.importorskip("psycopg")
     text = render("vectors_store", prefix).as_string(None)
     assert f'"{prefix}chunk_vectors"' in text and f'"{prefix}chunks"' in text
 

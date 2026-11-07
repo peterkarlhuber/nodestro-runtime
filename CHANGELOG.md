@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Tests (MUP-ONA B4): the catalog, guard and parity tests that render SQL with `psycopg.sql` skip without the
+  postgres extra, like the other PostgreSQL tests, so the desktop profile's component run (studio `platform.yml`) passes.
+
 - MUP-ONA B4 (PR 2 of 2): the generic part of the PostgreSQL index, file store and memory moved into the new package
   `nodestro_runtime.pg_generic` (`connection`, `_sql`, `_vector`, `index`, `files`, `memory`), shaped to be taken
   over into orkexa as `orkexa.backends.postgres` (B5); it imports nothing of Nodestro (second import-linter

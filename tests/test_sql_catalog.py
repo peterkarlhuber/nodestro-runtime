@@ -106,6 +106,8 @@ def _findings(text: str) -> list[str]:
 # MUP-ONA T-CAT-1
 @pytest.mark.parametrize("name", sorted(CATALOG))
 def test_every_rendered_entry_is_bound_to_one_tenant(name: str) -> None:
+    # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
+    pytest.importorskip("psycopg")
     rendered = render(name, PREFIX).as_string(None)
     assert check_statement(rendered, tenant_tables=TENANT_TABLES) == []
     # Rendering only quotes the table names: the text is the template with Nodestro's tables.
