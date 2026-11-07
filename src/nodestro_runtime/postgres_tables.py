@@ -64,6 +64,9 @@ if TYPE_CHECKING:
 _WORD = re.compile(r"[^\W_]+")
 #: Unlocked rounds of a reindex before it switches (PostgresIndex.reindex).
 _REINDEX_ROUNDS = 5
+#: At most this many chunks (or one batch, if larger) are embedded at the switch, while writes to the namespace wait.
+#: The unlocked rounds leave about what writers add during one round; more than this means writes outpace the model.
+_REINDEX_SWITCH_CHUNKS = 256
 #: Chunks of a namespace without a vector in a space (params: tenant, namespace, tenant, space).
 _MISSING = (
     "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
@@ -468,7 +471,8 @@ class PostgresIndex(Index):
             )
         total = len(self)
         # Unlocked rounds: embed what exists at the start of each round (high-water mark), so writers that keep
-        # adding chunks cannot keep a round from ending. Stop once at most one batch is left (or after a few rounds).
+        # adding chunks cannot keep a round from ending. Stop once at most one batch is left (or after a few
+        # rounds); the switch below embeds the rest.
         for _round in range(_REINDEX_ROUNDS):
             high = self.database._query(
                 "SELECT coalesce(max(id), 0) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
@@ -500,16 +504,22 @@ class PostgresIndex(Index):
                 " FOR UPDATE",
                 (self.tenant_id, self.namespace),
             )
+            limit = max(batch_size, _REINDEX_SWITCH_CHUNKS)
             rows = db.execute(
                 f"{_MISSING} ORDER BY c.id LIMIT %s",
-                (self.tenant_id, self.namespace, self.tenant_id, space, batch_size + 1),
+                (self.tenant_id, self.namespace, self.tenant_id, space, limit + 1),
             ).fetchall()
-            if len(rows) > batch_size:
+            if len(rows) > limit:
                 # Writes outpace the model: embedding more while every write waits would stall them; try later.
                 missing = self._count_missing(space)
                 raise RetrievalError("vector_incomplete", f"{missing} chunks were added during the reindex")
-            if rows:  # at most one batch, embedded while writes wait
-                self._store_batch(db, space, rows, self._embed_batch(model, identity, rows))
+            # What the last round left (what writers added meanwhile), embedded while writes wait. One batch was not
+            # enough: under load writers add more than a batch during a round, and every attempt failed (T-PART-CC).
+            for start in range(0, len(rows), batch_size):
+                if cancel is not None and cancel.is_set():
+                    raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
+                part = rows[start : start + batch_size]
+                self._store_batch(db, space, part, self._embed_batch(model, identity, part))
             _refresh_identity(model)
             changed = model.identity().key != identity.key
             if not changed:
