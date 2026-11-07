@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- TODO abatement round 4 (2026-11-07):
+  - Bedrock usage carries its region: `UsageEntry.region` (one ledger entry per model and region) and
+    `Usage.regions` for runs, steps, orchestrator decisions, agent tests and run chat; `PricedTracker` takes it from
+    the region the agent's client was built for, else the priced region, else the connection's (RT-015).
+  - `local_registry`: before a download of a model outside the catalog, the readiness check reads the Ollama
+    registry's manifest, config and template (never the weights; not offline, not on a server) and reports missing
+    tool calling as `capability_missing` with `ModelProblem.from_registry` (RT-062). A pull reads the file sizes from
+    the manifest, so its total is final and `eta_scope` is `job` from the first file on (RT-064).
+  - `storage_postgres.pgvector_status`: whether pgvector ranks the knowledge vectors (`active`, `installable`,
+    `other_schema`, `unavailable`) with the SQL an operator runs (RT-048).
+  - Checked key figures count only computing tools of the step and the steps that feed it (never lookups or parallel
+    branches); `check.value_source_no_tool` asks for a computing tool; the agent test lists unbacked figures in
+    `AgentTestResult.value_warnings` (RT-054).
+  - The sandbox gateway inspects or removes a `nodestro-env` tag only when the image carries the lock label (RT-037);
+    the built-in sandbox also denies `quotactl_fd`, `statmount`, `listmount` and `lsm_set_self_attr` (RT-018, A6).
+  - When the sandbox gateway refuses the runtime image's build (429) because another build runs, the Docker backend
+    stays `checking` and its self-test is tried again by itself after 5, 10, 20, 40, then every 60 seconds (for at
+    most 35 minutes) instead of reporting `docker-image` for 5 minutes; a real build failure is still `docker-image`
+    (`container_images.build_busy`, `docker_status.IMAGE_BUSY`; nodestro-local-docker LD-020).
+  - Tests: the container reapers of two installations on a real daemon (RT-034); the MCP token search looks for
+    encoded forms and raw `bytea` values and never skips silently (RT-026, issue #63).
 - TODO abatement round 3 (2026-11-06):
   - `KnowledgeBase.reindex_queue` (`ReindexQueue`): with a queue attached, `start_reindex`, `cancel_reindex` and
     `drop_vectors` go through the server's job queue; `execute_reindex` builds the index for a worker and reports
