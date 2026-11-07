@@ -3,7 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-06 against master at 802fa8f (TODO abatement round)
+> **Last full review:** 2026-11-06 against master at 1e9f7b2 (TODO abatement round)
 
 ## Summary
 
@@ -11,9 +11,9 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 7 |
-| P3 Low | 23 |
-| P4 Optional | 14 |
+| P2 Medium | 6 |
+| P3 Low | 21 |
+| P4 Optional | 13 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
 every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
@@ -97,22 +97,6 @@ Items that need an independent or external review (an internal audit does not re
   row-level security on `nodestro_*` tables (M10): the reasons and measurements are in the doc.
 - **Next step:** The external security sign-off, then the staging rehearsal. No switch is activated in production by
   this work.
-
-### RT-032 · Source builds of Python packages only in a container: pin the resolver image
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:** Docker-first plan R4, `container_images.UV_IMAGE`,
-  `ContainerImages.compile_in_container`
-- **What:** uv never builds a package on the host any more (`--no-build` for compile and sync). On the desktop, a
-  plan a person asked for that hits `deps.build_required` is resolved again in a locked-down container (network only for that step, no
-  bind mounts, proxy variables only and without credentials, no capabilities, `nobody`, read-only with a tmpfs,
-  limits, owner and deadline labels, gated by preflight and self-test, input on stdin, lock on stdout; see RT-038). `UV_IMAGE` is pinned to the multi-arch index digest of `ghcr.io/astral-sh/uv:0.9.5-python3.13-bookworm-slim`
-  (linux/amd64 and linux/arm64, checked 2026-11-02); an unpinned or placeholder image is refused. Without Docker such
-  packages report `deps.build_required` (reason `sandbox.unavailable`). It cannot run through the sandbox gateway
-  (which refuses containers with network and foreign images); outside the desktop source builds are off
-  (`deps.source_build_disabled`, RT-038).
-- **Next step:** The real-Docker test of the resolve container exists (`tests/test_resolve_real_engine.py`, CI
-  `docker` job) and passes there, approved path included (master `53d7980`). The gateway offers a resolve container
-  only together with a proven filtered build network (RT-040).
 
 ### RT-038 · Containers that run package code: hardened shape, residual network risk of the resolver
 
@@ -259,7 +243,11 @@ Items that need an independent or external review (an internal audit does not re
   start (they have a deadline; a server on the same daemon removes them once expired, otherwise `docker rm`); a copy of
   a data directory (with its `python/installation-id`) at the same path on the same daemon, e.g. a second Nodestro
   Local Docker container on a copied volume, shares the owner.
-- **Next step:** A real-daemon test of the reaper (two owners on one daemon) in the CI `docker` job.
+- **Tested on a real daemon (2026-11-07):** `test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon`
+  (`tests/test_container_images.py`, CI `docker` job): two installations' owners on one daemon, each reaper removes
+  only its own expired containers (all of them at a desktop's start), never the other's or the MCP containers.
+- **Next step:** None needed in code for the reaper itself; the open points above are limits of the gateway and of
+  copied data directories. Decide whether a desktop should also remove legacy `nodestro` containers at its start.
 
 ### RT-037 · Local MCP containers and the sandbox gateway: residual risks (DS-4, DS-11)
 
@@ -272,10 +260,13 @@ Items that need an independent or external review (an internal audit does not re
   creates it by id, and confirms the daemon's limits and seccomp profile again after 5 s. Open: a server's processes
   share `nodestro-mcp` and reap only expired MCP containers (deadline 15 minutes: per-operation connections of at most 2 × 300 s); through the sandbox gateway containers
   cannot be listed, so its own reconcile (`max_lifetime`, 600 s by default) also ends MCP connections older than that;
-  a daemon reconfigured between the preflight and a container start is noticed only at the next start; the gateway
-  still inspects and removes `nodestro-env:*` tags without the lock-label check.
-- **Next step:** Real-daemon test of the MCP proof and reaper in the CI `docker` job; decide whether the gateway
-  should exempt MCP containers from `max_lifetime` or give them their own limit.
+  a daemon reconfigured between the preflight and a container start is noticed only at the next start. Done
+  2026-11-07: the gateway inspects or removes a `nodestro-env:*` tag only when the image carries the lock label
+  (`test_a_tagged_image_without_the_lock_label_is_neither_inspected_nor_removed`), and the MCP reaper is tested on a
+  real daemon (see RT-034).
+- **Next step:** A real-daemon test of the MCP proof (Orkexa's self-test of the MCP image) in the CI `docker` job;
+  it needs a daemon that passes the self-test (cgroup v2), which the development machines of this round lacked.
+  Decide whether the gateway should exempt MCP containers from `max_lifetime` or give them their own limit.
 
 ## Bugs and reliability
 
@@ -394,37 +385,28 @@ Items that need an independent or external review (an internal audit does not re
 
 ### RT-014 · Configurable retention (C-12)
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #73, backend audit C-12
+- **Priority:** P3 Low · **Status:** Needs decision · **Refs:** #73, backend audit C-12, nodestro-api API-009
 - **What:** Runs, usage entries, workflow versions and local backup files (`before-restore-*`, `pre-migration-*`)
   grow without limit.
-- **Next step:** Retention setting per collection (default unchanged) with deletion in runtime, called by the API.
+- **Next step:** The retention policy (defaults, per tenant on the server) is the owner decision of nodestro-api
+  API-009; then a retention setting per collection (default unchanged) with deletion in runtime, called by the API.
 
-### RT-015 · Region in Bedrock usage entries
+### RT-054 · Checked key figures: what the check cannot prove
 
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** Bedrock final report section 7
-- **What:** `UsageEntry` has no region, so usage views cannot show Bedrock costs by region.
-- **Next step:** Add an optional region field when a Bedrock request is recorded.
-
-### RT-054 · Checked key figures: agent tests and the inputs of a tool call
-
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** `value_checks`, `OutputField.source`, CHANGELOG (checked
-  key figures)
-- **What:** A key figure with `source="tool"` is checked in workflow runs only. The agent test in the inspector shows
-  the value without the check, because a step that copies a figure computed by an earlier step (a reality check, a
-  plausibility check) has no earlier steps there. The check proves that a value is a tool result, and for
-  `table_totals` that no input row was left out; it does not prove that the agent passed the right column or reference
-  total, and it does not look at figures in free text. A small local model sometimes reports a correct figure it did
-  not compute: in the live household-budget runs with `qwen3.5:4b` (2026-11-04) one of two runs failed with
-  `run.value_unverified` after its correction, the other computed the surplus with the calculator and passed. The step
-  then fails safely (no decision on the figure), but the run has to be repeated. Since audit round 3 (RT3-01) numbers
-  echoed from a tool's input and changed tables no longer count, and the correction pass only computes (RT3-03). The
-  check still proves provenance only: a calculation written out from made-up numbers, `table_totals` over a table the
-  step's input does not contain, or another tool whose result contains the number (input files, knowledge search)
-  still back a value; calls of every node of the run count, also parallel branches.
-- **Next step:** Count only computing tools and the calls of the step and its ancestors. Show an unbacked key figure in the agent test as a warning (not a failure); consider letting a field
-  name the tool and argument it must come from when a workflow needs more than provenance; measure the failure rate of
-  small local models over more runs before deciding on a second correction.
-
+- **Priority:** P4 Optional · **Status:** Needs decision · **Refs:** `value_checks`, `OutputField.source`,
+  CHANGELOG (checked key figures)
+- **What:** A key figure with `source="tool"` is backed only by a computing tool's call (calculator, `table_totals`,
+  `days_between`, `text_statistics`, the agent's own library tools) of the step or of a step that feeds it (done
+  2026-11-07: lookups such as input files, knowledge search, memory, the date, MCP and provider server tools, and
+  parallel branches no longer count; the agent test lists unbacked figures in `AgentTestResult.value_warnings` instead
+  of checking them). The check still proves provenance only: a calculation written out from made-up numbers,
+  `table_totals` over a table the step's input does not contain, or a library tool that only looks a number up still
+  back a value, and figures in free text are not checked. A small local model sometimes reports a correct figure it
+  did not compute (live household-budget runs with `qwen3.5:4b`, 2026-11-04: one of two runs failed with
+  `run.value_unverified` after its correction); the step then fails safely, but the run has to be repeated.
+- **Next step:** Owner decision whether a field may name the tool and argument it must come from (more than
+  provenance); measure the failure rate of small local models over more live runs before deciding on a second
+  correction. The Studio shows `value_warnings` once nodestro-studio words them.
 ### RT-016 · Deferred scope decisions
 
 - **Priority:** P4 Optional · **Status:** Needs decision · **Refs:** AO M6b, D10, MCP closing decision
@@ -433,18 +415,17 @@ Items that need an independent or external review (an internal audit does not re
   tools, unattended calls, stdio servers that are not Python packages).
 - **Next step:** Owner decision per topic; none is planned now.
 
-### RT-062 · Capabilities of non-catalog local models are known only after the download
+### RT-062 · Capabilities of non-catalog local models before the download: only tools are known
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (missing-model stream)
-- **What:** For a local model that is neither in the catalog nor installed, a missing capability (tools, vision, embeddings) is found only after the download.
-- **Next step:** Read the capabilities from the registry manifest before the download and report `capability_missing` up front.
-
-### RT-064 · Overall pull ETA for local model downloads
-
-- **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (local setup stream)
-- **What:** Progress and ETA are per file until Ollama verifies; the overall remaining time appears only once all files are known.
-- **Next step:** Compute an overall ETA as soon as Ollama reports the total size.
-
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (missing-model stream),
+  `local_registry`
+- **What:** Done 2026-11-07: for a model outside the catalog that is not installed, the readiness check reads the
+  Ollama registry's manifest, config and template (never the weights) and reports missing tool calling up front
+  (`capability_missing` with `from_registry`). Vision, thinking, completion and embedding cannot be proven from them
+  (they need the model file's GGUF metadata or Ollama's built-in parsers), so a model lacking those is still found
+  only after the download. Models of other hosts (`hf.co/...`) are not read.
+- **Next step:** Only if it matters: read the GGUF header of the model layer with an HTTP range request (its metadata
+  can be megabytes before the needed keys) to learn the embedding and vision capabilities.
 ### RT-065 · Native OpenAI and Gemini tools are not integrated
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** settings/providers round 2026-11-06 (params stream)
@@ -482,11 +463,12 @@ Items that need an independent or external review (an internal audit does not re
   ([sandbox-arm64.md](sandbox-arm64.md)): the seccomp filter and the probes use x86-64 system call numbers, so the
   sandbox is deliberately unavailable there; host check, confinement check and the filter's `arch` check each fail
   closed, tested by `tests/test_sandbox_arch.py` and the CI job `builtin-sandbox-arm64` on `ubuntu-24.04-arm`. The
-  probes refuse to run on non-x86-64 machines. The filter is a deny list: calls newer than the list (`quotactl_fd`,
-  `statmount`, `listmount`) are allowed on x86-64 (finding A6, low).
+  probes refuse to run on non-x86-64 machines. The filter is a deny list (finding A6, low): since 2026-11-07 it also
+  refuses `quotactl_fd`, `statmount`, `listmount` and `lsm_set_self_attr` (numbers checked against the kernel
+  headers); calls newer than the CI runners' headers (e.g. `open_tree_attr`, Linux 6.15) are still allowed.
 - **Next step:** Add further systems to the probe matrix when they are to be supported. aarch64 support, if needed
-  again (macOS VM guest, paused), follows the checklist in the decision of sandbox-arm64.md; review the deny list
-  against current kernels (A6).
+  again (macOS VM guest, paused), follows the checklist in the decision of sandbox-arm64.md; add newer calls to the
+  deny list once the runners' kernel headers name them (A6).
 
 ### RT-049 · Managed Ollama untested on macOS and Windows
 
@@ -581,8 +563,12 @@ None known.
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** #99, `migrations/postgres/0010_knowledge_vectors.sql`
 - **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
-  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema.
-- **Next step:** A `nodestro-server` check that reports it, and the command in the operator documentation.
+  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema. Done 2026-11-07 in
+  this repository: `storage_postgres.pgvector_status(database)` reports `active`, `installable`, `other_schema` or
+  `unavailable` with the SQL to run and an English message (tested against a real pgvector server,
+  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`).
+- **Next step:** `nodestro-server check` (nodestro-api `server.check`) warns with that status, and the nodestro-server
+  RUNBOOK names the commands.
 - **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
 
 ## Later optimizations
@@ -597,13 +583,6 @@ None known.
 - **Plan:** MUP-ONA MP-B7 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
 
 ## Accepted risks
-
-### RT-026 · PostgreSQL token search test misses encoded forms (MCP L-2)
-
-- **Priority:** P3 Low · **Status:** Accepted risk · **Refs:** #63
-- **What:** Test coverage gap only (bytea columns, encoded token forms, silent skip); no secret was found. Accepted as
-  low residual risk.
-- **Next step:** Extend `tests/test_mcp_secret_search.py` as described in the issue.
 
 ### RT-027 · Limits of local process execution
 
@@ -696,13 +675,12 @@ PR that completes its package. They are tracked by the plan's execution status a
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `1b61fda`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
-| RT-015 | nodestro-api | API-021 (region in usage views) | Runtime records the region first |
+| — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |
 | RT-049 | orkexa, nodestro-desktop | ORK-030, DSK-022 (managed Ollama on macOS/Windows) | Orkexa owns the managed server; runtime reruns its local-model tests there |
 | RT-023 | nodestro-studio, nodestro-server | ST-028, SRV-014 (D-05) | One shared locking decision |
-| — | nodestro-integrations | INT-001: cap on parallel OCR documents | Decide whether the cap lives in the integration or where the runtime calls OCR |
 
 ## CI access to private repositories
 

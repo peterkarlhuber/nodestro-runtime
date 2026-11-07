@@ -148,6 +148,94 @@ def test_a_failed_self_test_is_retried_later_or_on_request() -> None:
     assert checked.check().approved and sandbox.self_tests == 2
 
 
+BUSY = SandboxProbe("docker", False, "image-busy", "Nodestro sandbox gateway: Another image build is running")
+
+
+def test_a_gateway_busy_with_another_build_keeps_checking_with_a_bounded_backoff() -> None:
+    """LD-020: the first sandbox image build of a restarted Studio meets the build of the previous one."""
+    sandbox, clock = FakeSandbox(BUSY), Clock()
+    checked = monitor(sandbox, clock=clock)
+    waits = []
+    for _ in range(7):
+        status = checked.check()
+        assert (status.state, status.reason) == ("checking", "docker-checking")
+        assert status.checks[-1].name == "image" and not status.checks[-1].ok
+        assert not status.backend().available and status.backend().state == "checking"
+        assert checked.check().state == "checking"  # before the next try: no new self-test
+        wait = checked._busy_retry_at - clock.now
+        waits.append(wait)
+        clock.now += wait
+    assert waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0] and sandbox.self_tests == 7
+    assert not docker_status.daemon_proven(DOCKER, {"PATH": "/usr/bin"})
+    sandbox.probe = SandboxProbe("docker", True, facts=(("image_id", "sha256:" + "ab" * 32),))
+    assert checked.check().approved and sandbox.self_tests == 8
+    assert checked._busy_since is None and checked._busy_count == 0  # the next refusal starts at 5 s again
+
+
+def test_a_real_image_failure_after_a_busy_gateway_is_docker_image() -> None:
+    sandbox, clock = FakeSandbox(BUSY), Clock()
+    checked = monitor(sandbox, clock=clock)
+    assert checked.check().state == "checking"
+    clock.now += docker_status.BUSY_RETRY_FIRST
+    sandbox.probe = SandboxProbe("docker", False, "image", "Building the container image failed: exit code 1")
+    status = checked.check()
+    assert (status.state, status.reason) == ("unavailable", "docker-image") and "exit code 1" in status.detail
+    clock.now += docker_status.BUSY_RETRY_MAX  # a real failure waits for the usual retry again
+    assert checked.check().reason == "docker-image" and sandbox.self_tests == 2
+
+
+def test_a_gateway_that_stays_busy_is_reported_as_an_image_problem_in_the_end() -> None:
+    sandbox, clock = FakeSandbox(BUSY), Clock()
+    checked = monitor(sandbox, clock=clock)
+    assert checked.check().state == "checking"
+    clock.now += docker_status.BUSY_LIMIT
+    status = checked.check()
+    assert (status.state, status.reason) == ("unavailable", "docker-image") and "Another image build" in status.detail
+    assert sandbox.self_tests == 2  # tried once more (still busy), then given up on
+    clock.now += docker_status.BUSY_RETRY_MAX
+    assert checked.check().reason == "docker-image" and sandbox.self_tests == 2  # now the usual retry interval
+    clock.now += docker_status.RETRY_FAILED
+    assert checked.check().reason == "docker-image" and sandbox.self_tests == 3
+
+
+def test_a_busy_gateway_schedules_the_next_check_by_itself() -> None:
+    scheduled: list[tuple[float, Callable[[], object]]] = []
+    clock = Clock()
+    checked = DockerMonitor(
+        lambda: FakeSandbox(BUSY),  # type: ignore[arg-type,return-value]
+        docker=DOCKER,
+        environ={"PATH": "/usr/bin"},
+        inspect=lambda docker, env=None: HOST,
+        clock=clock,
+        schedule=lambda seconds, function: scheduled.append((seconds, function)),
+    )
+    checked.status()
+    assert checked.wait(10).state == "checking"
+    assert [seconds for seconds, _ in scheduled] == [docker_status.BUSY_RETRY_FIRST]
+    assert scheduled[0][1] == checked.status
+    clock.now += docker_status.BUSY_RETRY_FIRST
+    scheduled[0][1]()  # the timer fires: the next check runs and schedules the one after
+    assert checked.wait(10).state == "checking" and [seconds for seconds, _ in scheduled] == [5.0, 10.0]
+    approved = DockerMonitor(
+        lambda: FakeSandbox(),  # type: ignore[arg-type,return-value]
+        docker=DOCKER,
+        environ={"PATH": "/usr/bin"},
+        inspect=lambda docker, env=None: HOST,
+        clock=Clock(),
+        schedule=lambda seconds, function: scheduled.append((seconds, function)),
+    )
+    approved.status()
+    assert approved.wait(10).approved and len(scheduled) == 2  # nothing to wait for: nothing scheduled
+
+
+def test_a_busy_gateway_never_revokes_a_daemon_s_proof() -> None:
+    environ = {"PATH": "/usr/bin"}
+    docker_status.record_proof(DOCKER, environ, SandboxProbe("docker", True))
+    docker_status.record_proof(DOCKER, environ, BUSY)
+    assert docker_status.daemon_proven(DOCKER, environ)
+    assert docker_status.reason_of("image-busy") == "docker-checking"
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     [

@@ -18,7 +18,7 @@ from orkexa.local import OllamaError
 from orkexa.local.client import PullProgress as Line
 import pytest
 
-from nodestro_runtime import local_service
+from nodestro_runtime import local_registry, local_service
 from nodestro_runtime.local_models import Hardware
 from nodestro_runtime.local_progress import (
     PULL_STEPS,
@@ -30,8 +30,21 @@ from nodestro_runtime.local_progress import (
     Tracker,
     now,
 )
+from nodestro_runtime.local_registry import RegistryError
 from nodestro_runtime.local_service import LocalModelService
 from nodestro_runtime.problems import NodestroError
+
+
+@pytest.fixture(autouse=True)
+def _no_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reaches the Ollama registry, which downloads and readiness checks read (RT-062, RT-064)."""
+
+    def refuse(url: str, accept: str, limit: int) -> bytes:
+        raise RegistryError("the tests do not reach the registry")
+
+    monkeypatch.setattr(local_registry, "get", refuse)
+    local_registry.clear_cache()
+
 
 MB = 1_000_000
 
@@ -164,6 +177,49 @@ def test_a_model_download_gives_the_remaining_time_of_the_current_file() -> None
     assert job.layers == [JobLayer(digest=digest, total=100 * MB, completed=70 * MB)]
 
 
+BIG, SMALL, CONFIG = "sha256:" + "a" * 64, "sha256:" + "b" * 64, "sha256:" + "d" * 64
+#: What the registry manifest says about the download of :func:`_ollama_pull` (two files and the config).
+MANIFEST_SIZES = {BIG: 600 * MB, SMALL: 2 * MB, CONFIG: 500}
+
+
+def test_with_the_manifest_sizes_the_remaining_time_covers_the_whole_download() -> None:
+    clock = Clock()
+    job = _job()
+    tracker = Tracker(job, PULL_STEPS, clock=clock)
+    progress = PullProgress(tracker, {SMALL: 2 * MB}, expected=MANIFEST_SIZES)  # one file is already there
+    progress.update("pulling manifest")
+    for second in range(8):
+        progress.update("pulling aaaa", BIG, 600 * MB, second * 10 * MB)
+        clock.at += 1
+    assert job.total == 602 * MB + 500 and job.total_final is True
+    # Done: 70 MB of the big file plus the small file that is already there; left: 530 MB + 500 bytes at 10 MB/s.
+    assert job.completed == 72 * MB
+    assert job.eta_scope == "job" and job.eta_seconds == 53
+    progress.update("pulling bbbb", SMALL, 2 * MB, 2 * MB)  # Ollama names the present file: nothing counted twice
+    assert job.completed == 72 * MB and job.total == 602 * MB + 500
+    for line in ("verifying sha256 digest", "writing manifest", "success"):
+        progress.update(line)
+    assert job.state == "running" and job.phase is None  # the service ends the job; the steps are complete
+
+
+@pytest.mark.parametrize(
+    ("digest", "size"),
+    [("sha256:" + "e" * 64, 600 * MB), (BIG, 601 * MB)],
+    ids=["unknown-file", "other-size"],
+)
+def test_a_download_that_differs_from_the_manifest_falls_back_to_the_current_file(digest: str, size: int) -> None:
+    clock = Clock()
+    job = _job()
+    tracker = Tracker(job, PULL_STEPS, clock=clock)
+    progress = PullProgress(tracker, expected=MANIFEST_SIZES)
+    for second in range(8):
+        progress.update("pulling eeee", digest, size, second * 10 * MB)
+        clock.at += 1
+    assert progress.expected is None and job.total_final is False
+    assert job.total == size and job.eta_scope == "file"
+    assert any("not in the registry manifest" in line for line in job.log)
+
+
 # ---- the service ------------------------------------------------------------------------------------------------
 
 
@@ -268,6 +324,27 @@ def test_a_cancelled_download_can_be_started_again(tmp_path: Path) -> None:
     (blobs / ("sha256-" + "a" * 64 + "-partial-0")).write_text(json.dumps({"N": 0, "Completed": 123}))
     again = _wait(service, service.pull("qwen3.5:4b"))
     assert again.state == "done" and again.resumed_bytes == 123
+
+
+def test_a_download_reads_its_sizes_from_the_registry_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[str] = []
+
+    def sizes(name: str) -> dict[str, int]:
+        asked.append(name)
+        return {BIG: 600 * MB, SMALL: 2 * MB}
+
+    monkeypatch.setattr(local_registry, "download_sizes", sizes)
+    service = _service(tmp_path, NODESTRO_OLLAMA_URL="http://127.0.0.1:9", NODESTRO_OLLAMA_MODELS_DIR=str(tmp_path))
+    job = _wait(service, service.pull("qwen3.5:4b"))
+    assert job.state == "done" and asked == ["qwen3.5:4b"]
+    assert any("manifest: 2 files, 602000000 bytes (registry)" in line for line in job.log)
+
+
+def test_a_download_without_the_registry_still_runs(tmp_path: Path) -> None:
+    service = _service(tmp_path, NODESTRO_OLLAMA_URL="http://127.0.0.1:9", NODESTRO_OLLAMA_MODELS_DIR=str(tmp_path))
+    job = _wait(service, service.pull("qwen3.5:4b"))  # the autouse fixture refuses every registry read
+    assert job.state == "done" and job.completed == job.total == 602 * MB
+    assert any("the registry did not give the download size" in line for line in job.log)
 
 
 @pytest.mark.parametrize(

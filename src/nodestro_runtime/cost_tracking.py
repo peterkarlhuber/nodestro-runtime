@@ -13,6 +13,7 @@ alter them.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextvars import ContextVar
 from decimal import Decimal
 import threading
@@ -78,12 +79,26 @@ class PricedTracker(BudgetTracker):
         #: Request conditions fixed when an agent was built (Bedrock: the region its client was made for), by agent
         #: name; they win over the workspace's current settings, which may change while the agent runs.
         self._agent_conditions: dict[str, dict[str, str]] = {}
+        #: The region each agent's client was built for (Bedrock), by agent name as this tracker's records name it;
+        #: passed on to the parent trackers under their names, so every ledger can record it (RT-015).
+        self._agent_regions: dict[str, str] = {}
+        #: The region of each recorded request of a regional provider, by ``id(record)`` (see :meth:`region_of`).
+        self._regions: dict[int, str] = {}
 
     def pin_conditions(self, agent: str, options: Any) -> None:
         """Remember the conditions of an agent's requests from its options (Bedrock: ``region_name``)."""
         region = getattr(options, "region_name", None) if getattr(options, "provider", None) == "bedrock" else None
         if isinstance(region, str) and region:
             self._agent_conditions[agent] = {"aws_region": region}
+            self._pin_region(agent, region)
+
+    def _pin_region(self, agent: str, region: str) -> None:
+        tracker: Any = self
+        while isinstance(tracker, PricedTracker):
+            with tracker._stale_lock:
+                tracker._agent_regions[agent] = region
+            agent = tracker._upstream(agent)
+            tracker = tracker.parent
 
     def _status(self, provider: str, model: str) -> tuple[str, str]:
         """(status, staleness) of a model's price, looked up once per tracker (one operation)."""
@@ -169,8 +184,28 @@ class PricedTracker(BudgetTracker):
             return  # recorded costs never end an attended run: its next request waits for a decision instead
         super().check()
 
+    def _request_region(self, record: UsageRecord) -> str | None:
+        """The region ``record``'s request went to, for a provider priced per region (Bedrock); ``None`` otherwise or
+        when it is not known. The region the agent's client was built for wins, then the region its price was
+        chosen for, then the region of the workspace's connection (what the strict price check uses too)."""
+        dimension = REGIONAL_PROVIDERS.get(record.provider or "")
+        if dimension is None:
+            return None
+        found = self._agent_regions.get(record.agent) or dict(record.pricing_conditions).get(dimension)
+        if not found and self.pricing is not None:
+            found = self.pricing.request_conditions(record.provider or "").get(dimension)
+        return found if isinstance(found, str) and found else None
+
+    def region_of(self, record: UsageRecord) -> str | None:
+        """The region recorded for ``record`` (one of this tracker's records) by :meth:`add`; ``None`` if none."""
+        return self._regions.get(id(record))
+
     def note(self, record: UsageRecord) -> None:
-        """Remember whether ``record`` was priced with a stale price."""
+        """Remember the region of ``record``'s request and whether it was priced with a stale price."""
+        region = self._request_region(record)
+        if region is not None:
+            with self._stale_lock:
+                self._regions[id(record)] = region
         if self.pricing is None or record.pricing_source is None or not record.provider:
             return
         status, _ = self._status(record.provider, record.model)
@@ -198,4 +233,14 @@ def stale_requests(tracker: object, records: tuple[UsageRecord, ...] | list[Usag
     return tracker.stale_requests(records) if isinstance(tracker, PricedTracker) else 0
 
 
-__all__ = ["PRICE_MODES", "PriceMode", "PricedTracker", "stale_requests"]
+def request_region(tracker: object, record: UsageRecord) -> str | None:
+    """The provider region of one of ``tracker``'s records (Bedrock); ``None`` when unknown or not regional."""
+    return tracker.region_of(record) if isinstance(tracker, PricedTracker) else None
+
+
+def request_regions(tracker: object, records: Iterable[UsageRecord]) -> list[str]:
+    """The provider regions (Bedrock) of ``records``, sorted and without repeats; empty when none is known."""
+    return sorted({region for record in records if (region := request_region(tracker, record)) is not None})
+
+
+__all__ = ["PRICE_MODES", "PriceMode", "PricedTracker", "request_region", "request_regions", "stale_requests"]

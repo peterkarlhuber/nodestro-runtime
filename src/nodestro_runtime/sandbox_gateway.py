@@ -28,8 +28,8 @@ form:
   lock file whose every package is pinned with hashes (no options such as other indexes), with a copy of the very
   Orkexa package the gateway runs, and under exactly the tag the runtime computes for that lock. The build downloads
   wheels (no package code runs: ``--only-binary``), installs them without network access to an index and runs no
-  other command. Only ``nodestro-env:<key>`` images can be inspected or removed (and inspected by id when the image is
-  one of them).
+  other command. Only ``nodestro-env:<key>`` images that carry Nodestro's lock label can be inspected or removed, by
+  tag or (inspected) by id.
 - **Everything else** (other images, volumes, networks, exec, the daemon's events, swarm, plugins, BuildKit sessions,
   registry credentials) is refused.
 
@@ -70,7 +70,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import uuid
 
-from .image_limits import GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGES_GB, GIB, IMAGE_REPOSITORY, LOCK_LABEL
+from .image_limits import BUILD_BUSY, GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGES_GB, GIB, IMAGE_REPOSITORY, LOCK_LABEL
 
 logger = logging.getLogger("nodestro.sandbox_gateway")
 
@@ -1032,7 +1032,7 @@ class Gateway:
         kind, ref = route(request.method, request.path)
         bare, prefix = _split(request.path)
         if kind == "build" and self._builds.locked():
-            raise Refused("Another image build is running; try again when it is done", 429)
+            raise Refused(BUILD_BUSY, 429)
         try:
             await asyncio.wait_for(
                 read_body(reader, request, limit=_BUILD_LIMIT if kind == "build" else _JSON_LIMIT),
@@ -1076,7 +1076,7 @@ class Gateway:
             request.headers.append(("Content-Type", "application/x-tar"))
             await self.require_limits()
             if self._builds.locked():
-                raise Refused("Another image build is running; try again when it is done", 429)
+                raise Refused(BUILD_BUSY, 429)
             async with self._builds:
                 await self.require_image_space(tag=query["t"])
                 await self._forward(request, target, body, reader, writer)
@@ -1110,8 +1110,9 @@ class Gateway:
             query = request.query
             if query and not set(query) <= {"force", "noprune"}:
                 raise Refused("These parameters are not allowed")
-            if IMAGE_ID.fullmatch(ref):
-                await self.require_nodestro_image(ref)
+            # By id or by tag: only an environment image Nodestro built (its lock label), never another image that
+            # was given a nodestro-env tag (RT-037).
+            await self.require_nodestro_image(ref)
             path = f"{prefix}/images/{quote(ref, safe=':')}" + ("/json" if kind == "image:inspect" else "")
             target = path + (f"?{urlencode(query)}" if query else "")
             await self._forward(request, target, b"", reader, writer)

@@ -14,6 +14,7 @@ import time
 from orkexa.pricing import pricing_basis
 import pytest
 
+from nodestro_runtime import local_registry
 from nodestro_runtime.catalog import models
 from nodestro_runtime.local_models import (
     CATALOG,
@@ -24,11 +25,24 @@ from nodestro_runtime.local_models import (
     catalog_model,
     recommend,
 )
+from nodestro_runtime.local_registry import RegistryError
 from nodestro_runtime.local_service import InstalledModel
 from nodestro_runtime.preflight import preflight
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.schemas import DEFAULT_AGENT_MODEL, SettingsIn, Workflow
 from nodestro_runtime.workspace import DATABASE, Workspace
+
+
+@pytest.fixture(autouse=True)
+def _no_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reaches the Ollama registry, which downloads and readiness checks read (RT-062, RT-064)."""
+
+    def refuse(url: str, accept: str, limit: int) -> bytes:
+        raise RegistryError("the tests do not reach the registry")
+
+    monkeypatch.setattr(local_registry, "get", refuse)
+    local_registry.clear_cache()
+
 
 GB = 1_000_000_000
 

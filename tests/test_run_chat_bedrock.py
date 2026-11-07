@@ -143,5 +143,9 @@ async def test_a_bedrock_team_leader_takes_guidance_and_a_bedrock_model_answers(
     assert stored is not None and stored.status == "considered" and stored.step == 1
     chat_entries = [entry for entry in workspace.usage_log.entries() if entry.source == "run_chat"]
     assert len(chat_entries) == 1 and chat_entries[0].model == CLAUDE
+    assert chat_entries[0].region == "eu-central-1"  # RT-015
     assert done.usage.requests == 3  # two decisions and the team; the chat answer is not part of the run
+    assert done.usage.regions == ["eu-central-1"]
+    lead_state = done.nodes["lead"]
+    assert lead_state.decision_usage is not None and lead_state.decision_usage.regions == ["eu-central-1"]
     runtime.stubber.assert_no_pending_responses()

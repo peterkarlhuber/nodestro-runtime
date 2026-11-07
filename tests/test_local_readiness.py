@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from test_local_models import FAKE_OLLAMA
 
+from nodestro_runtime import local_registry
 from nodestro_runtime.engine import provider_problem
 from nodestro_runtime.local_readiness import (
     UNAVAILABLE,
@@ -22,11 +23,23 @@ from nodestro_runtime.local_readiness import (
     readiness,
     require_ready,
 )
+from nodestro_runtime.local_registry import RegistryError
 from nodestro_runtime.local_service import InstalledModel
 from nodestro_runtime.preflight import preflight
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.schemas import SettingsIn, Workflow
 from nodestro_runtime.workspace import Workspace
+
+
+@pytest.fixture(autouse=True)
+def _no_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reaches the Ollama registry, which downloads and readiness checks read (RT-062, RT-064)."""
+
+    def refuse(url: str, accept: str, limit: int) -> bytes:
+        raise RegistryError("the tests do not reach the registry")
+
+    monkeypatch.setattr(local_registry, "get", refuse)
+    local_registry.clear_cache()
 
 
 @pytest.fixture
@@ -50,7 +63,10 @@ def managed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Workspa
 
 
 def _plenty(monkeypatch: pytest.MonkeyPatch, free: int | None = 10**12) -> None:
+    """``free`` bytes in the models folder for the readiness check and for a download's own disk check, whatever
+    the disk of the test machine has free."""
     monkeypatch.setattr("nodestro_runtime.local_readiness._free_bytes", lambda folder: free)
+    monkeypatch.setattr("nodestro_runtime.local_service._free_bytes", lambda folder: free)
 
 
 def test_an_installed_model_is_ready_and_a_cloud_model_is_not_checked(managed: Workspace) -> None:
