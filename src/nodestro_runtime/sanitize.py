@@ -4,8 +4,10 @@ Used for the privacy-friendly trace export. It works on a JSON copy of the run; 
 stored run is never touched. Detection is pattern-based and cannot be complete:
 
 - **Credentials** (always): API keys and tokens of common services, bearer tokens,
-  private keys, ``password=...``-style assignments, and the values of JSON keys that
-  name a secret (``api_key``, ``authorization``, ``password``, ...).
+  ``Authorization: Basic`` credentials, ``Cookie``/``Set-Cookie`` header values, passwords
+  in URLs (``postgresql://user:password@host``), private keys, ``password=...``-style
+  assignments, and the values of JSON keys that name a secret (``api_key``,
+  ``authorization``, ``password``, ...).
 - **Personal data** (optional): e-mail addresses, phone numbers, IBANs, payment card
   numbers (Luhn-checked) and IP addresses. Equal values get the same placeholder
   (``[EMAIL_1]``), so a trace stays readable.
@@ -45,6 +47,15 @@ _SECRETS: list[tuple[str, re.Pattern[str]]] = [
     ("api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("token", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
     ("token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{16,}=*")),
+]
+# Credentials after a visible prefix (group 1 stays, group 2 goes), as Axentra's redaction has them (MUP-ONA VB-7):
+_PREFIXED: list[re.Pattern[str]] = [
+    # "Authorization: Basic <base64>", also "Proxy-Authorization" and a header dict "'Authorization': 'Basic ...'".
+    re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?basic\s+)([A-Za-z0-9+/=._~-]+)"),
+    # A cookie header carries session cookies: everything after "Cookie:" / "Set-Cookie:" up to the line end.
+    re.compile(r"(?i)((?<![a-z0-9_-])(?:set-)?cookie\s*:\s*)([^\r\n]+)"),
+    # The password of a URL's user information: "postgresql://app:<password>@db", "redis://:<password>@cache".
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]*:)([^\s@/]+)(?=@)"),
 ]
 # "password: hunter2", "api_key=abc", "Passwort = geheim": the name stays, the value goes.
 _ASSIGNMENT = re.compile(
@@ -106,6 +117,15 @@ class Sanitizer:
                 return self._placeholder(kind, match.group(0))
 
             value = pattern.sub(secret, value)
+
+        def prefixed(match: re.Match[str]) -> str:
+            prefix, secret = match.groups()
+            if re.fullmatch(r"\[[A-Z_]+_\d+\]", secret.strip()):
+                return match.group(0)  # already replaced
+            return prefix + self._placeholder("secret", secret)
+
+        for pattern in _PREFIXED:
+            value = pattern.sub(prefixed, value)
 
         def assignment(match: re.Match[str]) -> str:
             name_quote, name, separator, quote, secret = match.groups()

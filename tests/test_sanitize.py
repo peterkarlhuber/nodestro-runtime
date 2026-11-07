@@ -25,6 +25,37 @@ def test_sanitizer_finds_secrets_and_personal_data(raw: str, hidden: str) -> Non
     assert hidden not in Sanitizer().text(raw)
 
 
+# MUP-ONA T-VEC-1: credential shapes Axentra's redaction removed and this one did not (shared security test vectors).
+@pytest.mark.parametrize(
+    ("raw", "hidden", "kept"),
+    [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA", "Authorization: Basic ["),
+        ("{'Authorization': 'Basic dXNlcjpwYXNz'}", "dXNlcjpwYXNz", "'Authorization': 'Basic ["),
+        ("Proxy-Authorization: basic dXNlcjpwYXNz", "dXNlcjpwYXNz", "Proxy-Authorization: basic ["),
+        ("Cookie: session=s3ss10n-v4lue; theme=dark\nnext", "s3ss10n-v4lue", "\nnext"),
+        ("Set-Cookie: sid=l0g1n-v4lue; Path=/; HttpOnly", "l0g1n-v4lue", "Set-Cookie: ["),
+        ("postgresql://app:s3cr3t-db-pw@db.internal:5432/app", "s3cr3t-db-pw", "postgresql://app:["),
+        ("redis://:c4che-pw@cache:6379/0", "c4che-pw", "@cache:6379/0"),
+    ],
+)
+def test_sanitizer_finds_basic_credentials_cookies_and_url_passwords(raw: str, hidden: str, kept: str) -> None:
+    out = Sanitizer(personal_data=False).text(raw)
+    assert hidden not in out
+    assert kept in out
+
+
+# MUP-ONA T-VEC-1
+def test_basic_cookie_and_url_words_in_ordinary_text_stay() -> None:
+    sanitizer = Sanitizer(personal_data=False)
+    for value in (
+        "basic information about the cookie policy",
+        "authorization failed: missing permission",
+        "see https://example.com:8443/a:b and mailto:team@example.com",
+        "cookie banner shown",
+    ):
+        assert sanitizer.text(value) == value
+
+
 def test_sanitizer_keeps_ordinary_text_and_numbers() -> None:
     sanitizer = Sanitizer()
     for value in ("Umsatz 2026: 1.234.567 Euro", "Version 1.2.3", "am 2026-10-27T21:40:43Z", "Bestellnummer 12345"):
