@@ -1007,6 +1007,19 @@ class ContainerImages:
         print("DEBUG MM argv", [*shaped, *command])
         print("DEBUG MM code", code, "stdout", repr(output.stdout[-3000:]), "stderr", repr(output.stderr[-3000:]))
         print("DEBUG MM environ", {k: v for k, v in sandbox.environ.items() if "DOCKER" in k})
+        import os as _os  # DEBUG
+        for _i in range(3):
+            _n = f"nodestro-sandbox-verify-{uuid.uuid4().hex[:12]}"
+            _args = [_n if a == name else a for a in [*shaped, *command]]
+            _r = _sp.run(_args, input=b"", capture_output=True, env=sandbox.environ, timeout=120)
+            print("DEBUG MM gateway retry", _i, _r.returncode, _r.stdout[-300:], _r.stderr[-1500:])
+        for _variant, _extra in (("direct-shape", []), ("direct-no-i", ["-i"])):
+            _args = [a for a in [*shaped, *command] if a not in _extra]
+            _n = f"nodestro-sandbox-verify-{uuid.uuid4().hex[:12]}"
+            _args = [_n if a == name else a for a in _args]
+            _env = {k: v for k, v in _os.environ.items() if k not in ("DOCKER_HOST",)}
+            _r = _sp.run(_args, input=b"", capture_output=True, env=_env, timeout=120)
+            print("DEBUG MM", _variant, _r.returncode, _r.stdout[-300:], _r.stderr[-1500:])
         if code != 0:
             stderr = output.stderr.decode("utf-8", "replace")
             raise NodestroError(
