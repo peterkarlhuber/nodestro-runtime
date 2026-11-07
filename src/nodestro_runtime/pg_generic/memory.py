@@ -59,25 +59,25 @@ class PostgresMemory(MemoryBackend):
             yield
 
     def _read(self, key: str) -> str | None:
-        rows = self._sql.execute("memory.read", self._key(path=key)).rows
+        rows = self._sql.execute("memory_read", self._key(path=key)).rows
         return str(rows[0][0]) if rows else None
 
     def _write(self, key: str, text: str) -> None:
         if "\x00" in text or "\x00" in key:
             raise MemoryToolError("Error: memory files cannot contain the character U+0000")
-        self._sql.execute("memory.write", self._key(path=key, content=text))
+        self._sql.execute("memory_write", self._key(path=key, content=text))
 
     def _files(self, prefix: str) -> dict[str, int]:
         start = f"{prefix}/" if prefix else ""
-        rows = self._sql.execute("memory.files", self._key(start=start)).rows
+        rows = self._sql.execute("memory_files", self._key(start=start)).rows
         return {str(path): int(size) for path, size in rows}
 
     def _delete(self, key: str) -> None:
-        self._sql.execute("memory.delete", self._key(path=key, under=key + "/"))
+        self._sql.execute("memory_delete", self._key(path=key, under=key + "/"))
 
     def _rename(self, old: str, new: str) -> None:
-        self._sql.execute("memory.rename", self._key(new=new, cut=len(old) + 1, old=old, under=old + "/"))
+        self._sql.execute("memory_rename", self._key(new=new, cut=len(old) + 1, old=old, under=old + "/"))
 
     def clear(self) -> None:
         """Delete every file of this memory."""
-        self._sql.execute("memory.clear", self._key())
+        self._sql.execute("memory_clear", self._key())

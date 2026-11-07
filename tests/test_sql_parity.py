@@ -89,7 +89,7 @@ def test_the_baseline_splits_into_catalog_and_nodestro_source() -> None:
         for entry in json.loads(BASELINE.read_text(encoding="utf-8"))["statements"]
     }
     catalog = {normalized(render(name, "nodestro_").as_string(None)): name for name in CATALOG}
-    assert set(catalog) - baseline == {normalized(render("vectors.pgvector", "nodestro_").as_string(None))}
+    assert set(catalog) - baseline == {normalized(render("vectors_pgvector", "nodestro_").as_string(None))}
     source = PACKAGE / "postgres_tables.py"
     kept = {normalized(s.text) for s in statements_of(source.read_text(encoding="utf-8"), "postgres_tables.py", TABLES)}
     assert len(kept) == 4

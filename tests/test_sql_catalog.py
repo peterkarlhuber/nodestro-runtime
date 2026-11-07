@@ -41,49 +41,49 @@ PREFIX = "nodestro_"
 #: T-CAT-3: every statement of the catalog and whether it is partitioned by tenant. An unpartitioned entry names no
 #: table (it says why here).
 EXPECTED: dict[str, bool] = {
-    "files.update_entry": True,
-    "files.upsert": True,
-    "files.entry": True,
-    "files.data": True,
-    "files.entries": True,
-    "files.delete": True,
-    "chunks.count": True,
-    "chunks.sources": True,
-    "chunks.insert": True,
-    "chunks.delete_source": True,
-    "chunks.max_id": True,
-    "chunks.missing_up_to": True,
-    "chunks.missing": True,
-    "chunks.count_missing": True,
-    "spaces.lock_shared": True,
-    "spaces.lock_exclusive": True,
-    "spaces.by_state": True,
-    "spaces.insert_active": True,
-    "spaces.insert_building": True,
-    "spaces.activate": True,
-    "spaces.delete": True,
-    "spaces.delete_others": True,
-    "spaces.delete_all": True,
-    "vectors.insert": True,
-    "vectors.store": True,
-    "vectors.count": True,
-    "vectors.count_excluded": True,
-    "vectors.pgvector": False,  # whether pgvector is installed: to_regtype('vector'), no table
-    "search.fts": True,
-    "search.fts_sources": True,
-    "search.pgvector": True,
-    "search.pgvector_sources": True,
-    "search.candidates": True,
-    "search.candidates_sources": True,
-    "search.hits": True,
-    "search.word_counts": True,
-    "search.word_hits": True,
-    "memory.read": True,
-    "memory.write": True,
-    "memory.files": True,
-    "memory.delete": True,
-    "memory.rename": True,
-    "memory.clear": True,
+    "files_update_entry": True,
+    "files_upsert": True,
+    "files_entry": True,
+    "files_data": True,
+    "files_entries": True,
+    "files_delete": True,
+    "chunks_count": True,
+    "chunks_sources": True,
+    "chunks_insert": True,
+    "chunks_delete_source": True,
+    "chunks_max_id": True,
+    "chunks_missing_up_to": True,
+    "chunks_missing": True,
+    "chunks_count_missing": True,
+    "spaces_lock_shared": True,
+    "spaces_lock_exclusive": True,
+    "spaces_by_state": True,
+    "spaces_insert_active": True,
+    "spaces_insert_building": True,
+    "spaces_activate": True,
+    "spaces_delete": True,
+    "spaces_delete_others": True,
+    "spaces_delete_all": True,
+    "vectors_insert": True,
+    "vectors_store": True,
+    "vectors_count": True,
+    "vectors_count_excluded": True,
+    "vectors_pgvector": False,  # whether pgvector is installed: to_regtype('vector'), no table
+    "search_fts": True,
+    "search_fts_sources": True,
+    "search_pgvector": True,
+    "search_pgvector_sources": True,
+    "search_candidates": True,
+    "search_candidates_sources": True,
+    "search_hits": True,
+    "search_word_counts": True,
+    "search_word_hits": True,
+    "memory_read": True,
+    "memory_write": True,
+    "memory_files": True,
+    "memory_delete": True,
+    "memory_rename": True,
+    "memory_clear": True,
 }
 PARTITIONED = sorted(name for name, partitioned in EXPECTED.items() if partitioned)
 
@@ -208,7 +208,7 @@ def test_the_catalog_is_the_checked_in_list() -> None:
 
 def test_a_new_entry_without_its_partition_case_is_caught() -> None:
     """What T-CAT-3 compares: an entry missing from :data:`EXPECTED` makes the comparison unequal."""
-    extra = Statement("files.extra", "SELECT 1 FROM {files} WHERE tenant_id = %(tenant_id)s", (PARTITION,), "read")
+    extra = Statement("files_extra", "SELECT 1 FROM {files} WHERE tenant_id = %(tenant_id)s", (PARTITION,), "read")
     grown = {**CATALOG, extra.name: extra}
     assert {name: entry.partitioned for name, entry in grown.items()} != EXPECTED
 
@@ -227,7 +227,7 @@ def test_a_new_entry_without_its_partition_case_is_caught() -> None:
 )
 def test_an_inconsistent_entry_is_refused(template: str, params: tuple[str, ...], partitioned: bool) -> None:
     with pytest.raises(ValueError):
-        Statement("x.y", template, params, "read", partitioned=partitioned)
+        Statement("x_y", template, params, "read", partitioned=partitioned)
 
 
 def test_every_entry_binds_its_values() -> None:

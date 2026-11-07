@@ -92,7 +92,7 @@ def test_the_guard_also_holds_inside_a_transaction() -> None:
     spy = SpySource()
     executor = Executor(spy, prefix="nodestro_", tenant_id=TENANT)
     with executor.transaction(), pytest.raises(RetrievalError):
-        executor.execute("chunks.count", _params("chunks.count", tenant_id="tenant-b"))
+        executor.execute("chunks_count", _params("chunks_count", tenant_id="tenant-b"))
     assert spy.opened == [("transaction", TENANT)]  # the block's own transaction; the statement never ran
 
 
@@ -110,11 +110,11 @@ def test_only_catalog_names_with_their_parameters_run() -> None:
     with pytest.raises(ValueError, match="Unknown statement"):
         executor.execute("SELECT * FROM nodestro_chunks", {"tenant_id": TENANT})
     with pytest.raises(ValueError, match="parameters"):
-        executor.execute("files.entry", _params("files.entry", extra=1))
-    params = _params("files.entry")
+        executor.execute("files_entry", _params("files_entry", extra=1))
+    params = _params("files_entry")
     del params["id"]
     with pytest.raises(ValueError, match="parameters"):
-        executor.execute("files.entry", params)
+        executor.execute("files_entry", params)
     with pytest.raises(ValueError, match="Unknown statement"):
         render("nope", "nodestro_")
     assert spy.opened == []
@@ -179,7 +179,7 @@ def test_a_bad_prefix_is_refused(prefix: Any) -> None:
     with pytest.raises(ValueError, match="prefix"):
         check_prefix(prefix)
     with pytest.raises(ValueError, match="prefix"):
-        render("chunks.count", prefix)
+        render("chunks_count", prefix)
     with pytest.raises(ValueError, match="prefix"):
         Executor(spy, prefix=prefix, tenant_id=TENANT)
     for kind in (PostgresIndex, PostgresFileStore, PostgresMemory):
@@ -190,7 +190,7 @@ def test_a_bad_prefix_is_refused(prefix: Any) -> None:
 
 @pytest.mark.parametrize("prefix", ["nodestro_", "t_", "a_", "a1_b_", "a" * 31 + "_"])
 def test_a_good_prefix_names_the_tables(prefix: str) -> None:
-    text = render("vectors.store", prefix).as_string(None)
+    text = render("vectors_store", prefix).as_string(None)
     assert f'"{prefix}chunk_vectors"' in text and f'"{prefix}chunks"' in text
 
 
@@ -230,18 +230,18 @@ def test_the_adapter_runs_each_mode_as_the_database_did(database: Any) -> None:
     assert source.lock is database._lock
     executor = Executor(source, prefix="nodestro_", tenant_id=TENANT)
     key = {"tenant_id": TENANT, "namespace": "n"}
-    assert executor.execute("memory.write", {**key, "path": "a", "content": "x"}).rowcount == 1
+    assert executor.execute("memory_write", {**key, "path": "a", "content": "x"}).rowcount == 1
     with executor.transaction():
         assert database.in_transaction
-        executor.execute("memory.write", {**key, "path": "b", "content": "y"})
-        assert executor.execute("memory.files", {**key, "start": ""}).rows == [("a", 1), ("b", 1)]
+        executor.execute("memory_write", {**key, "path": "b", "content": "y"})
+        assert executor.execute("memory_files", {**key, "start": ""}).rows == [("a", 1), ("b", 1)]
     with pytest.raises(RuntimeError), executor.transaction():
-        executor.execute("memory.clear", key)
+        executor.execute("memory_clear", key)
         raise RuntimeError("roll back")
-    assert len(executor.execute("memory.files", {**key, "start": ""}).rows) == 2
+    assert len(executor.execute("memory_files", {**key, "start": ""}).rows) == 2
     with database.transaction():  # a transaction of the database: the executor joins it
-        executor.execute("memory.clear", key)
-        assert executor.execute("memory.files", {**key, "start": ""}).rows == []
+        executor.execute("memory_clear", key)
+        assert executor.execute("memory_files", {**key, "start": ""}).rows == []
     with pytest.raises(ValueError), source.transaction("bulk"):  # type: ignore[arg-type]
         pass
 

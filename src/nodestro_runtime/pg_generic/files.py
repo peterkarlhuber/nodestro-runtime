@@ -55,23 +55,23 @@ class PostgresFileStore(FileStore):
 
     def _save(self, entry: StoredFile, data: bytes | None) -> None:
         if data is None:
-            self._sql.execute("files.update_entry", self._key(entry=jsonb_text(entry.model_dump_json()), id=entry.id))
+            self._sql.execute("files_update_entry", self._key(entry=jsonb_text(entry.model_dump_json()), id=entry.id))
         else:
             self._sql.execute(
-                "files.upsert", self._key(id=entry.id, entry=jsonb_text(entry.model_dump_json()), data=data)
+                "files_upsert", self._key(id=entry.id, entry=jsonb_text(entry.model_dump_json()), data=data)
             )
 
     def _entry(self, file_id: str) -> StoredFile | None:
-        rows = self._sql.execute("files.entry", self._key(id=file_id)).rows
+        rows = self._sql.execute("files_entry", self._key(id=file_id)).rows
         return StoredFile.model_validate_json(rows[0][0]) if rows else None
 
     def _data(self, file_id: str) -> bytes | None:
-        rows = self._sql.execute("files.data", self._key(id=file_id)).rows
+        rows = self._sql.execute("files_data", self._key(id=file_id)).rows
         return bytes(rows[0][0]) if rows else None
 
     def _entries(self) -> builtins.list[StoredFile]:
-        rows = self._sql.execute("files.entries", self._key()).rows
+        rows = self._sql.execute("files_entries", self._key()).rows
         return [StoredFile.model_validate_json(row[0]) for row in rows]
 
     def _remove(self, file_id: str) -> None:
-        self._sql.execute("files.delete", self._key(id=file_id))
+        self._sql.execute("files_delete", self._key(id=file_id))

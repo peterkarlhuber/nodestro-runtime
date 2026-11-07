@@ -166,10 +166,10 @@ class PostgresIndex(Index):
         """Nothing to do: the connections belong to the source."""
 
     def __len__(self) -> int:
-        return int(self._rows("chunks.count")[0][0])
+        return int(self._rows("chunks_count")[0][0])
 
     def sources(self) -> builtins.list[str]:
-        return [str(row[0]) for row in self._rows("chunks.sources")]
+        return [str(row[0]) for row in self._rows("chunks_sources")]
 
     def add_chunks(self, chunks: Iterable[Chunk]) -> builtins.list[int]:
         kept = [chunk for chunk in chunks if chunk.text.strip()]
@@ -189,11 +189,11 @@ class PostgresIndex(Index):
                 validate_vector(vector, identity)
         with self._sql.transaction():
             # The lock a reindex's switch waits for (FOR UPDATE): no chunk is added while it embeds the last ones.
-            self._rows("spaces.lock_shared")
+            self._rows("spaces_lock_shared")
             space = self._active_for(identity) if identity is not None else None
             for position, chunk in enumerate(kept):
                 row = self._rows(
-                    "chunks.insert",
+                    "chunks_insert",
                     source=_text(chunk.source),
                     title=None if chunk.title is None else _text(chunk.title),
                     file_id=chunk.file_id,
@@ -204,12 +204,12 @@ class PostgresIndex(Index):
                 ids.append(int(row[0]))
                 if vectors is not None and space is not None:
                     self._sql.execute(
-                        "vectors.insert", self._key(space=space, chunk_id=int(row[0]), embedding=vectors[position])
+                        "vectors_insert", self._key(space=space, chunk_id=int(row[0]), embedding=vectors[position])
                     )
         return ids
 
     def delete(self, source: str) -> int:
-        return self._sql.execute("chunks.delete_source", self._key(source=source)).rowcount
+        return self._sql.execute("chunks_delete_source", self._key(source=source)).rowcount
 
     def search(self, query: str, k: int = 5) -> builtins.list[Hit]:
         """:meth:`retrieve` in the index's default mode: ``hybrid`` with an embedding model, else ``fts``."""
@@ -218,7 +218,7 @@ class PostgresIndex(Index):
     # ---- vectors ------------------------------------------------------------------------------------------------
 
     def _space(self, state: str) -> tuple[str, EmbeddingIdentity] | None:
-        rows = self._rows("spaces.by_state", state=state)
+        rows = self._rows("spaces_by_state", state=state)
         return (str(rows[0][0]), EmbeddingIdentity.from_dict(json.loads(rows[0][1]))) if rows else None
 
     def _active_for(self, identity: EmbeddingIdentity) -> str:
@@ -240,19 +240,19 @@ class PostgresIndex(Index):
         if len(self):
             raise RetrievalError("reindex_required", "The index holds chunks without vectors; reindex first")
         self._sql.execute(
-            "spaces.insert_active",
+            "spaces_insert_active",
             self._key(space=space, identity=json.dumps(identity.to_dict()), dimensions=identity.dimensions),
         )
         return space
 
     def _count_vectors(self, space: str) -> int:
-        return int(self._rows("vectors.count", space=space)[0][0])
+        return int(self._rows("vectors_count", space=space)[0][0])
 
     def pgvector(self) -> bool:
         """Whether the database ranks vectors itself (pgvector is installed). Detected once; :meth:`refresh` detects
         it again."""
         if self._pgvector is None:
-            rows = self._sql.execute("vectors.pgvector", {}).rows
+            rows = self._sql.execute("vectors_pgvector", {}).rows
             self._pgvector = bool(rows and rows[0][0])
         return self._pgvector
 
@@ -278,10 +278,10 @@ class PostgresIndex(Index):
 
     def _count_excluded(self, space: str) -> int:
         """Vectors of ``space`` that searches leave out (NaN, infinity, all zeros)."""
-        return int(self._rows("vectors.count_excluded", space=space)[0][0])
+        return int(self._rows("vectors_count_excluded", space=space)[0][0])
 
     def _discard(self, space: str) -> None:
-        self._sql.execute("spaces.delete", self._key(space=space))
+        self._sql.execute("spaces_delete", self._key(space=space))
 
     def discard_reindex(self) -> None:
         building = self._space("building")
@@ -290,7 +290,7 @@ class PostgresIndex(Index):
 
     def drop_vectors(self) -> int:
         status = self.vector_status()
-        self._sql.execute("spaces.delete_all", self._key())
+        self._sql.execute("spaces_delete_all", self._key())
         return status.embedded + status.building_embedded
 
     def reindex(
@@ -317,7 +317,7 @@ class PostgresIndex(Index):
             if building is not None and building[0] != space:
                 self._discard(building[0])
             self._sql.execute(
-                "spaces.insert_building",
+                "spaces_insert_building",
                 self._key(space=space, identity=json.dumps(identity.to_dict()), dimensions=identity.dimensions),
             )
         total = len(self)
@@ -325,11 +325,11 @@ class PostgresIndex(Index):
         # adding chunks cannot keep a round from ending. Stop once at most one batch is left (or after a few
         # rounds); the switch below embeds the rest.
         for _round in range(_REINDEX_ROUNDS):
-            high = self._rows("chunks.max_id")[0][0]
+            high = self._rows("chunks_max_id")[0][0]
             while True:
                 if cancel is not None and cancel.is_set():
                     raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
-                rows = self._rows("chunks.missing_up_to", space=space, high=int(high), limit=batch_size)
+                rows = self._rows("chunks_missing_up_to", space=space, high=int(high), limit=batch_size)
                 if not rows:
                     break
                 vectors = embed_batch(model, identity, rows)
@@ -344,9 +344,9 @@ class PostgresIndex(Index):
         # made the switch fail (vector_incomplete) and a reindex under steady writes could fail every time.
         changed = False
         with self._sql.transaction():
-            self._rows("spaces.lock_exclusive")
+            self._rows("spaces_lock_exclusive")
             limit = max(batch_size, _REINDEX_SWITCH_CHUNKS)
-            rows = self._rows("chunks.missing", space=space, limit=limit + 1)
+            rows = self._rows("chunks_missing", space=space, limit=limit + 1)
             if len(rows) > limit:
                 # Writes outpace the model: embedding more while every write waits would stall them; try later.
                 missing = self._count_missing(space)
@@ -361,8 +361,8 @@ class PostgresIndex(Index):
             refresh_identity(model)
             changed = model.identity().key != identity.key
             if not changed:
-                self._sql.execute("spaces.delete_others", self._key(space=space))
-                self._sql.execute("spaces.activate", self._key(space=space))
+                self._sql.execute("spaces_delete_others", self._key(space=space))
+                self._sql.execute("spaces_activate", self._key(space=space))
         if changed:
             # The model changed on its server while it embedded: the new space may mix two builds.
             self._discard(space)
@@ -376,7 +376,7 @@ class PostgresIndex(Index):
         return self.vector_status()
 
     def _count_missing(self, space: str) -> int:
-        return int(self._rows("chunks.count_missing", space=space)[0][0])
+        return int(self._rows("chunks_count_missing", space=space)[0][0])
 
     def _store_batch(
         self, space: str, rows: builtins.list[tuple[Any, ...]], vectors: builtins.list[builtins.list[float]]
@@ -385,7 +385,7 @@ class PostgresIndex(Index):
         for (chunk_id, _), vector in zip(rows, vectors, strict=True):
             # Only while the chunk still exists: one deleted while its batch was embedded gets no vector (no foreign
             # key error that ends the reindex, drift 9).
-            self._sql.execute("vectors.store", self._key(space=space, embedding=vector, chunk_id=int(chunk_id)))
+            self._sql.execute("vectors_store", self._key(space=space, embedding=vector, chunk_id=int(chunk_id)))
 
     def _hits(self, rows: Iterable[tuple[Any, ...]]) -> builtins.list[Hit]:
         return [
@@ -406,9 +406,9 @@ class PostgresIndex(Index):
         if not expression:
             return []
         if sources is None:
-            rows = self._rows("search.fts", query=expression, limit=k)
+            rows = self._rows("search_fts", query=expression, limit=k)
         else:
-            rows = self._rows("search.fts_sources", query=expression, sources=sources, limit=k)
+            rows = self._rows("search_fts_sources", query=expression, sources=sources, limit=k)
         # ts_rank only orders the hits; the score is the contract's reciprocal rank 1 / (60 + rank) (drift 5).
         scores = dict(fuse_rrf([[int(row[0]) for row in rows]]))
         return self._hits((*row, scores[int(row[0])]) for row in rows)
@@ -429,14 +429,14 @@ class PostgresIndex(Index):
         if self.pgvector():
             literal = pgvector_literal(vector)
             if sources is None:
-                rows = self._rows("search.pgvector", vector=literal, space=space, limit=k)
+                rows = self._rows("search_pgvector", vector=literal, space=space, limit=k)
             else:
-                rows = self._rows("search.pgvector_sources", vector=literal, space=space, sources=sources, limit=k)
+                rows = self._rows("search_pgvector_sources", vector=literal, space=space, sources=sources, limit=k)
             return self._hits(rows)
         if sources is None:
-            candidates = self._rows("search.candidates", space=space)
+            candidates = self._rows("search_candidates", space=space)
         else:
-            candidates = self._rows("search.candidates_sources", space=space, sources=sources)
+            candidates = self._rows("search_candidates_sources", space=space, sources=sources)
         # The cosine similarity, as pgvector's <=> gives it, whatever the length of the vectors: a model whose
         # identity is not ``normalized`` returns vectors of any length, where the dot product is no cosine (drift 4).
         # math.fsum is exactly rounded, so the result is the same on every Python version.
@@ -449,7 +449,7 @@ class PostgresIndex(Index):
         scored = sorted(similarity, key=lambda item: (-item[0], item[1]))[:k]
         if not scored:
             return []
-        rows = self._rows("search.hits", ids=[chunk_id for _, chunk_id in scored])
+        rows = self._rows("search_hits", ids=[chunk_id for _, chunk_id in scored])
         by_id = {int(row[0]): row for row in rows}
         return self._hits((*by_id[chunk_id], score) for score, chunk_id in scored if chunk_id in by_id)
 
@@ -524,11 +524,11 @@ class PostgresIndex(Index):
         found: dict[int, builtins.list[str]] = {chunk_id: [] for chunk_id in chunk_ids}
         if not words:
             return lexical_evidence({}, found)
-        counts = self._rows("search.word_counts", words=words, queries=expressions)
+        counts = self._rows("search_word_counts", words=words, queries=expressions)
         total = len(self)
         weights = {str(word): word_weight(int(count), total) for word, count in counts}
         if chunk_ids:
-            rows = self._rows("search.word_hits", words=words, queries=expressions, ids=chunk_ids)
+            rows = self._rows("search_word_hits", words=words, queries=expressions, ids=chunk_ids)
             for chunk_id, word in rows:
                 found[int(chunk_id)].append(str(word))
         return lexical_evidence(weights, found)

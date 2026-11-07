@@ -67,6 +67,8 @@ PARTITION = "tenant_id"
 
 #: What a statement does: reads rows, writes (inserts or updates) rows, or deletes rows.
 Kind = Literal["read", "write", "delete"]
+#: A statement name: ``<group>_<what>`` in snake case (no dot, so it never looks like a problem code).
+_NAME = re.compile(r"[a-z][a-z0-9]*_[a-z0-9_]+")
 _PARAM = re.compile(r"%\((\w+)\)s")
 _POSITIONAL = re.compile(r"%[sbt]")
 
@@ -121,6 +123,8 @@ class Statement:
     rows: bool = False
 
     def __post_init__(self) -> None:
+        if not _NAME.fullmatch(self.name):
+            raise ValueError(f"Invalid statement name {self.name!r}")
         used = _PARAM.findall(self.template)
         if set(used) != set(self.params) or len(set(self.params)) != len(self.params):
             raise ValueError(
@@ -156,14 +160,14 @@ def _p(*names: str) -> tuple[str, ...]:
 _ENTRIES = (
     # ---- file store (files) -------------------------------------------------------------------------------------
     Statement(
-        "files.update_entry",
+        "files_update_entry",
         "UPDATE {files} SET entry = %(entry)s::jsonb"
         " WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND id = %(id)s",
         _p("entry", "id"),
         "write",
     ),
     Statement(
-        "files.upsert",
+        "files_upsert",
         "INSERT INTO {files} (tenant_id, namespace, id, entry, data)"
         " VALUES (%(tenant_id)s, %(namespace)s, %(id)s, %(entry)s::jsonb, %(data)s)"
         " ON CONFLICT (tenant_id, namespace, id) DO UPDATE SET entry = excluded.entry, data = excluded.data",
@@ -171,45 +175,45 @@ _ENTRIES = (
         "write",
     ),
     Statement(
-        "files.entry",
+        "files_entry",
         "SELECT entry::text FROM {files} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND id = %(id)s",
         _p("id"),
         "read",
     ),
     Statement(
-        "files.data",
+        "files_data",
         "SELECT data FROM {files} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND id = %(id)s",
         _p("id"),
         "read",
     ),
     Statement(
-        "files.entries",
+        "files_entries",
         "SELECT entry::text FROM {files} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s",
         _p(),
         "read",
     ),
     Statement(
-        "files.delete",
+        "files_delete",
         "DELETE FROM {files} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND id = %(id)s",
         _p("id"),
         "delete",
     ),
     # ---- index: chunks ------------------------------------------------------------------------------------------
     Statement(
-        "chunks.count",
+        "chunks_count",
         "SELECT count(*) FROM {chunks} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s",
         _p(),
         "read",
     ),
     Statement(
-        "chunks.sources",
+        "chunks_sources",
         "SELECT DISTINCT source FROM {chunks} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " ORDER BY source",
         _p(),
         "read",
     ),
     Statement(
-        "chunks.insert",
+        "chunks_insert",
         "INSERT INTO {chunks} (tenant_id, namespace, source, title, file_id, metadata, text, search_text)"
         " VALUES (%(tenant_id)s, %(namespace)s, %(source)s, %(title)s, %(file_id)s, %(metadata)s::jsonb, %(text)s,"
         " %(search_text)s) RETURNING id",
@@ -218,26 +222,26 @@ _ENTRIES = (
         rows=True,
     ),
     Statement(
-        "chunks.delete_source",
+        "chunks_delete_source",
         "DELETE FROM {chunks} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND source = %(source)s",
         _p("source"),
         "delete",
     ),
     Statement(
-        "chunks.max_id",
+        "chunks_max_id",
         "SELECT coalesce(max(id), 0) FROM {chunks} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s",
         _p(),
         "read",
     ),
     Statement(
-        "chunks.missing_up_to",
+        "chunks_missing_up_to",
         _MISSING + " AND c.id <= %(high)s ORDER BY c.id LIMIT %(limit)s",
         _p("space", "high", "limit"),
         "read",
     ),
-    Statement("chunks.missing", _MISSING + " ORDER BY c.id LIMIT %(limit)s", _p("space", "limit"), "read"),
+    Statement("chunks_missing", _MISSING + " ORDER BY c.id LIMIT %(limit)s", _p("space", "limit"), "read"),
     Statement(
-        "chunks.count_missing",
+        "chunks_count_missing",
         "SELECT count(*) FROM {chunks} c WHERE c.tenant_id = %(tenant_id)s AND c.namespace = %(namespace)s AND NOT"
         " EXISTS (SELECT 1 FROM {vectors} v WHERE v.tenant_id = %(tenant_id)s AND v.space = %(space)s"
         " AND v.chunk_id = c.id)",
@@ -246,73 +250,73 @@ _ENTRIES = (
     ),
     # ---- index: vector spaces -----------------------------------------------------------------------------------
     Statement(
-        "spaces.lock_shared",
+        "spaces_lock_shared",
         "SELECT space FROM {spaces} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s ORDER BY space"
         " FOR SHARE",
         _p(),
         "read",
     ),
     Statement(
-        "spaces.lock_exclusive",
+        "spaces_lock_exclusive",
         "SELECT space FROM {spaces} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s ORDER BY space"
         " FOR UPDATE",
         _p(),
         "read",
     ),
     Statement(
-        "spaces.by_state",
+        "spaces_by_state",
         "SELECT space, identity::text FROM {spaces}"
         " WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND state = %(state)s",
         _p("state"),
         "read",
     ),
     Statement(
-        "spaces.insert_active",
+        "spaces_insert_active",
         _SPACE_ROW + "'active')",
         _p("space", "identity", "dimensions"),
         "write",
     ),
     Statement(
-        "spaces.insert_building",
+        "spaces_insert_building",
         _SPACE_ROW + "'building') ON CONFLICT (tenant_id, namespace, space) DO NOTHING",
         _p("space", "identity", "dimensions"),
         "write",
     ),
     Statement(
-        "spaces.activate",
+        "spaces_activate",
         "UPDATE {spaces} SET state = 'active' WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND space = %(space)s",
         _p("space"),
         "write",
     ),
     Statement(
-        "spaces.delete",
+        "spaces_delete",
         "DELETE FROM {spaces} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND space = %(space)s",
         _p("space"),
         "delete",
     ),
     Statement(
-        "spaces.delete_others",
+        "spaces_delete_others",
         "DELETE FROM {spaces} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND space <> %(space)s",
         _p("space"),
         "delete",
     ),
     Statement(
-        "spaces.delete_all",
+        "spaces_delete_all",
         "DELETE FROM {spaces} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s",
         _p(),
         "delete",
     ),
     # ---- index: vectors -----------------------------------------------------------------------------------------
     Statement(
-        "vectors.insert",
+        "vectors_insert",
         "INSERT INTO {vectors} (tenant_id, namespace, space, chunk_id, embedding)"
         " VALUES (%(tenant_id)s, %(namespace)s, %(space)s, %(chunk_id)s, %(embedding)s)",
         _p("space", "chunk_id", "embedding"),
         "write",
     ),
     Statement(
-        "vectors.store",
+        "vectors_store",
         "INSERT INTO {vectors} (tenant_id, namespace, space, chunk_id, embedding)"
         " SELECT c.tenant_id, c.namespace, %(space)s, c.id, %(embedding)s FROM {chunks} c"
         " WHERE c.tenant_id = %(tenant_id)s AND c.namespace = %(namespace)s AND c.id = %(chunk_id)s"
@@ -321,68 +325,68 @@ _ENTRIES = (
         "write",
     ),
     Statement(
-        "vectors.count",
+        "vectors_count",
         "SELECT count(*) FROM {vectors} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND space = %(space)s",
         _p("space"),
         "read",
     ),
     Statement(
-        "vectors.count_excluded",
+        "vectors_count_excluded",
         "SELECT count(*) FROM {vectors} v WHERE v.tenant_id = %(tenant_id)s AND v.namespace = %(namespace)s"
         " AND v.space = %(space)s AND NOT (" + _USABLE + ")",
         _p("space"),
         "read",
     ),
-    Statement("vectors.pgvector", "SELECT to_regtype('vector') IS NOT NULL", (), "read", partitioned=False),
+    Statement("vectors_pgvector", "SELECT to_regtype('vector') IS NOT NULL", (), "read", partitioned=False),
     # ---- index: searches ----------------------------------------------------------------------------------------
     Statement(
-        "search.fts",
+        "search_fts",
         _FTS + " ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %(limit)s",
         _p("query", "limit"),
         "read",
     ),
     Statement(
-        "search.fts_sources",
+        "search_fts_sources",
         _FTS + " AND source = ANY(%(sources)s) ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %(limit)s",
         _p("query", "sources", "limit"),
         "read",
     ),
     Statement(
-        "search.pgvector",
+        "search_pgvector",
         _PGVECTOR + " AND " + _USABLE + " ORDER BY score DESC, c.id LIMIT %(limit)s",
         _p("vector", "space", "limit"),
         "read",
     ),
     Statement(
-        "search.pgvector_sources",
+        "search_pgvector_sources",
         _PGVECTOR + " AND c.source = ANY(%(sources)s) AND " + _USABLE + " ORDER BY score DESC, c.id LIMIT %(limit)s",
         _p("vector", "space", "sources", "limit"),
         "read",
     ),
-    Statement("search.candidates", _CANDIDATES + " AND " + _USABLE, _p("space"), "read"),
+    Statement("search_candidates", _CANDIDATES + " AND " + _USABLE, _p("space"), "read"),
     Statement(
-        "search.candidates_sources",
+        "search_candidates_sources",
         _CANDIDATES + " AND c.source = ANY(%(sources)s) AND " + _USABLE,
         _p("space", "sources"),
         "read",
     ),
     Statement(
-        "search.hits",
+        "search_hits",
         "SELECT id, source, title, file_id, metadata::text, text FROM {chunks}"
         " WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND id = ANY(%(ids)s)",
         _p("ids"),
         "read",
     ),
     Statement(
-        "search.word_counts",
+        "search_word_counts",
         "SELECT t.w, (SELECT count(*) FROM {chunks} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND search @@ to_tsquery('simple', t.q)) FROM unnest(%(words)s::text[], %(queries)s::text[]) AS t(w, q)",
         _p("words", "queries"),
         "read",
     ),
     Statement(
-        "search.word_hits",
+        "search_word_hits",
         "SELECT c.id, t.w FROM {chunks} c, unnest(%(words)s::text[], %(queries)s::text[]) AS t(w, q)"
         " WHERE c.tenant_id = %(tenant_id)s AND c.namespace = %(namespace)s AND c.id = ANY(%(ids)s)"
         " AND c.search @@ to_tsquery('simple', t.q)",
@@ -391,14 +395,14 @@ _ENTRIES = (
     ),
     # ---- memory (memory) ----------------------------------------------------------------------------------------
     Statement(
-        "memory.read",
+        "memory_read",
         "SELECT content FROM {memory} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND path = %(path)s",
         _p("path"),
         "read",
     ),
     Statement(
-        "memory.write",
+        "memory_write",
         "INSERT INTO {memory} (tenant_id, namespace, path, content)"
         " VALUES (%(tenant_id)s, %(namespace)s, %(path)s, %(content)s)"
         " ON CONFLICT (tenant_id, namespace, path) DO UPDATE SET content = excluded.content,"
@@ -407,21 +411,21 @@ _ENTRIES = (
         "write",
     ),
     Statement(
-        "memory.files",
+        "memory_files",
         "SELECT path, octet_length(content) FROM {memory}"
         " WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s AND starts_with(path, %(start)s)",
         _p("start"),
         "read",
     ),
     Statement(
-        "memory.delete",
+        "memory_delete",
         "DELETE FROM {memory} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND (path = %(path)s OR starts_with(path, %(under)s))",
         _p("path", "under"),
         "delete",
     ),
     Statement(
-        "memory.rename",
+        "memory_rename",
         "UPDATE {memory} SET path = %(new)s || substr(path, %(cut)s), updated_at = clock_timestamp()"
         " WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s"
         " AND (path = %(old)s OR starts_with(path, %(under)s))",
@@ -429,7 +433,7 @@ _ENTRIES = (
         "write",
     ),
     Statement(
-        "memory.clear",
+        "memory_clear",
         "DELETE FROM {memory} WHERE tenant_id = %(tenant_id)s AND namespace = %(namespace)s",
         _p(),
         "delete",
