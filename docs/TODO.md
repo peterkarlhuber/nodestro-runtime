@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 7 |
-| P3 Low | 24 |
+| P2 Medium | 6 |
+| P3 Low | 22 |
 | P4 Optional | 13 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -570,20 +570,6 @@ None known.
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
 
-### RT-048 · pgvector installed after migration 0010
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #99, `migrations/postgres/0010_knowledge_vectors.sql`
-- **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
-  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema. Done 2026-11-07 in
-  this repository: `storage_postgres.pgvector_status(database)` reports `active`, `installable`, `other_schema` or
-  `unavailable` with the SQL to run and an English message (tested against a real pgvector server,
-  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`).
-- **Next step:** `nodestro-server check` (nodestro-api `server.check`) warns with that status, and the nodestro-server
-  RUNBOOK names the commands.
-- **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
-
-## Later optimizations
-
 ### RT-047 · Exact vector search only
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** #99, orkexa ORK-032
@@ -616,23 +602,6 @@ Packages of the MUP-ONA plan
 ([MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)) that
 change this repository. Each entry is removed in the
 PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
-
-### RT-MUP-B1 · Backend conformance suite against Nodestro's classes (MUP-ONA MP-B1)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** `PostgresIndex`, `PostgresFileStore` and `PostgresMemory` are not measured against a shared contract suite.
-- **Next step:** Run orkexa's public conformance suite (T-CONF) against them once it exists; documented drifts as strict
-  xfails.
-
-### RT-MUP-B3 · PostgreSQL drift and pgvector in CI (MUP-ONA MP-B3)
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** Ten documented differences between `PostgresIndex` and `SQLiteIndex`; pgvector is not tested in a required
-  job.
-- **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
-  tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
 ### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
 
