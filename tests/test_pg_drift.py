@@ -172,3 +172,19 @@ def test_scores_follow_the_contract_in_every_mode(make: Callable[..., Any]) -> N
         [hit.id for hit in index.retrieve("alpha beta", 20, mode="vector")],
     ]
     assert [(hit.id, hit.score) for hit in hybrid] == fuse_rrf(rankings)[:4]
+
+
+# ---- drift 6: the default mode --------------------------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_the_default_mode_follows_the_embedding_model(make: Callable[..., Any]) -> None:
+    index = make(embeddings=KeywordEmbeddings())
+    index.add("A chunk about alpha.", source="a.md")
+    index.add("Another chunk about the first topic.", source="b.md")
+    assert {name for hit in index.search("alpha", 2) for name in hit.ranks} == {"fts", "vector"}
+    assert index.search("alpha", 2) == index.retrieve("alpha", 2, mode="hybrid")
+    plain = make(tenant="drift-plain")
+    plain.add("A chunk about alpha.", source="a.md")
+    assert [hit.ranks for hit in plain.search("alpha")] == [{"fts": 1}]
+    assert make(embeddings=KeywordEmbeddings(), mode="fts").search("alpha") == index.retrieve("alpha", 5, mode="fts")

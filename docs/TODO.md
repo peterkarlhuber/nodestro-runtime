@@ -632,14 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-6 · The default mode is full text even with an embedding model (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** `search()` and `retrieve()` without a mode rank `fts` although the index has an embedding model; the
-  contract says `hybrid`. Strict expected failure `MUP-DRIFT-6`: `index.default_mode_is_hybrid_with_embeddings`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-DRIFT-7 · No limit on the sources of one search (MUP-ONA MP-B3)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**

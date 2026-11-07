@@ -61,8 +61,6 @@ if TYPE_CHECKING:
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
 _WORD = re.compile(r"[^\W_]+")
-#: The rank that reciprocal-rank fusion adds to (as in ``orkexa.SQLiteIndex``).
-_RRF_K = 60
 #: Stored vectors a search may use. A zero vector has no direction, so no cosine: it is stored (its chunk counts as
 #: embedded, as in ``orkexa.SQLiteIndex``) but never ranked. Vectors stored before vectors were checked can also hold
 #: NaN or infinity, which no ranking can use (pgvector refuses to cast them). Searches leave both out; the rows stay.
@@ -284,30 +282,8 @@ class PostgresIndex(Index):
         )
 
     def search(self, query: str, k: int = 5) -> builtins.list[Hit]:
-        if k < 1:
-            raise ValueError("k must be positive")
-        expression = _tsquery(query)
-        if not expression:
-            return []
-        rows = self.database._query(
-            "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks,"
-            " to_tsquery('simple', %s) AS query"
-            " WHERE tenant_id = %s AND namespace = %s AND search @@ query"
-            " ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
-            (expression, self.tenant_id, self.namespace, k),
-        )
-        return [
-            Hit(
-                id=int(chunk_id),
-                score=1.0 / (_RRF_K + rank + 1),
-                source=source,
-                title=title,
-                file_id=file_id,
-                metadata=json.loads(metadata),
-                text=text,
-            )
-            for rank, (chunk_id, source, title, file_id, metadata, text) in enumerate(rows)
-        ]
+        """:meth:`retrieve` in the index's default mode: ``hybrid`` with an embedding model, else ``fts``."""
+        return self.retrieve(query, k)
 
     # ---- vectors (migration 0010) -----------------------------------------------------------------------------
 
@@ -567,12 +543,14 @@ class PostgresIndex(Index):
         mode: RetrievalMode | None = None,
         sources: Iterable[str] | None = None,
     ) -> builtins.list[Hit]:
-        """The ``k`` best chunks by full text, vectors or both, limited to ``sources`` before ranking. ``vector`` and
+        """The ``k`` best chunks by full text, vectors or both, limited to ``sources`` before ranking. Without ``mode``
+        (and no ``mode`` of the index) ``hybrid`` with an embedding model, else ``fts``. ``vector`` and
         ``hybrid`` never fall back to full text. ``hybrid`` fuses ``max(4 * k, 20)`` candidates of each ranking by
         :func:`orkexa.retrieval.fuse_hybrid` (scores in [0, 1]), or by reciprocal rank fusion with ``fusion="rrf"``."""
         if k < 1:
             raise ValueError("k must be positive")
-        chosen = check_mode(mode or self.mode or "fts")
+        # The contract's default (drift 6): hybrid with an embedding model, full text without one.
+        chosen = check_mode(mode or self.mode or ("hybrid" if self.embeddings is not None else "fts"))
         allowed = None if sources is None else builtins.list(dict.fromkeys(sources))
         if allowed is not None and not allowed:
             return []
