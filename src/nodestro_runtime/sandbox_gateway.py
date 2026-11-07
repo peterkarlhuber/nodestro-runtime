@@ -817,16 +817,12 @@ def parse_response(raw: bytes) -> tuple[int, bytes]:
     return status, body
 
 
-async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tag: str = "") -> None:
-    total = 0
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         while True:
             chunk = await reader.read(65536)
             if not chunk:
-                logger.info("DEBUG PIPE %s EOF after %d bytes", tag, total)
                 break
-            total += len(chunk)
-            logger.info("DEBUG PIPE %s %d bytes %r", tag, len(chunk), chunk[:120])
             writer.write(chunk)
             await writer.drain()
         if writer.can_write_eof():
@@ -859,6 +855,10 @@ class Gateway:
         self._limits_enforced: float | None = None
         self._clock = time.monotonic
         self._connections = 0
+        #: The tasks serving connections. asyncio keeps a task, and a stream's reader, only weakly: once a client has
+        #: half-closed an attached stream, nothing else keeps its task (and the daemon side of the stream) alive, and a
+        #: garbage collection would close the stream before the container's output arrived.
+        self._serving: set[asyncio.Task[Any]] = set()
 
     # -- daemon access --
 
@@ -1000,6 +1000,10 @@ class Gateway:
     # -- requests --
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._serving.add(task)
+            task.add_done_callback(self._serving.discard)
         if self._connections >= self.config.max_connections:
             with contextlib.suppress(ConnectionError, OSError):
                 writer.write(refusal(503, f"At most {self.config.max_connections} connections at once"))
@@ -1033,7 +1037,6 @@ class Gateway:
             raise Refused("The request head took too long", 408) from None
         if request is None:
             return
-        logger.info("DEBUG REQ %s %s", request.method, request.path)
         kind, ref = route(request.method, request.path)
         bare, prefix = _split(request.path)
         if kind == "build" and self._builds.locked():
@@ -1221,7 +1224,7 @@ class Gateway:
                     with contextlib.suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(_pipe(daemon_reader, writer), timeout=10)
                     return
-                await asyncio.gather(_pipe(daemon_reader, writer, "daemon->client " + target), _pipe(reader, daemon_writer, "client->daemon " + target))
+                await asyncio.gather(_pipe(daemon_reader, writer), _pipe(reader, daemon_writer))
             else:
                 await _pipe(daemon_reader, writer)
         finally:
