@@ -8,14 +8,17 @@ they are skipped, unless ``NODESTRO_REQUIRE_DOCKER=1`` turns that into a failure
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
+import uuid
 
 from orkexa.dynamic import BoundedOutput, DockerSandbox, SandboxError, SandboxProbe, SubprocessSandbox
 from orkexa.dynamic.docker import (
@@ -37,6 +40,7 @@ from nodestro_runtime.container_images import (
     StreamedSandbox,
     lock_has_hashes,
 )
+from nodestro_runtime.image_limits import IMAGE_REPOSITORY, MAX_IMAGE_GB_VARIABLE
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import parse_lock
 from nodestro_runtime.testing import FakeUv
@@ -1462,69 +1466,436 @@ def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
     assert len(removed) == 1 and removed[0][3].startswith("orkexa-sandbox-")
 
 
-# ---- the reaper on a real daemon (RT-034, RT-037) --------------------------------------------------------------------
+# ---- real daemon, scoped to what each test makes (RT-031, RT-034, RT-037) ------------------------------------------
+#
+# These tests share the daemon with whatever else runs on it: the image tests above in CI, a developer's own images and
+# containers elsewhere. Each test labels everything it makes with its own run label, builds its own tiny images
+# (FROM scratch, no network) or images of a lock no one else uses, and removes only those again. Nodestro's collection
+# lists every lock-labelled ``nodestro-env`` image of the daemon (a desktop owns its daemon), and the product has no
+# setting that narrows it, so the tests hand it a docker CLI (``ContainerImages(docker=...)``) that narrows the listing
+# to the test's run label and refuses to build or remove any image the test does not own, or any other command.
 
-#: A small image every CI runner can pull; the containers are only created, never started.
-REAPER_IMAGE = "python:3.13-slim"
+KIB = 1024
+RUN_LABEL = "org.nodestro.test-run"
+
+#: The guarded docker CLI of :class:`RealDaemon`; it logs every call and passes the allowed ones to the real CLI.
+_GUARD = '''#!{python}
+"""The docker CLI of one real-daemon test (tests/test_container_images.py, RealDaemon): its own images only."""
+import json
+import os
+import sys
+
+with open({config!r}, encoding="utf-8") as file:
+    config = json.load(file)
+args = sys.argv[1:]
 
 
-def test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon(tmp_path: Path) -> None:
-    """Two installations on one daemon: each reaper removes only its own containers, the tool reaper never touches
-    the local MCP servers' containers, and the MCP reaper removes only the expired ones. Needs no preflight."""
+def note(entry):
+    with open(config["log"], "a", encoding="utf-8") as log:
+        log.write(json.dumps(entry) + "\\n")
+
+
+def refuse(reason):
+    note(["refused", reason, *args])
+    sys.stderr.write("refused by the test's docker guard: " + reason + "\\n")
+    sys.exit(1)
+
+
+note(args)
+if args[:1] == ["build"]:
+    tags = [args[index + 1] for index, arg in enumerate(args[:-1]) if arg in ("-t", "--tag")]
+    if not tags or set(tags) - set(config["own"]):
+        refuse("building an image the test does not own")
+    args = ["build", "--label", config["label"], *args[1:]]
+elif args[:2] == ["image", "inspect"]:
+    pass
+elif args[:2] == ["image", "ls"]:
+    if config["list_refused"]:
+        refuse("listing images")
+    args = ["image", "ls", "--filter", "label=" + config["label"], *args[2:]]
+elif args[:2] == ["image", "rm"]:
+    targets = args[2:]
+    if not targets or any(target.startswith("-") or target not in config["own"] for target in targets):
+        refuse("removing an image the test does not own")
+else:
+    refuse("a command the test does not expect")
+os.execv(config["docker"], [config["docker"], *args])
+'''
+
+
+def _require_daemon() -> None:
+    """Like :func:`_require_docker`, without Orkexa's preflight: for tests that only build, list, create and remove
+    images and containers and never run tool code (so a daemon the self-test refuses still runs them)."""
     if not DOCKER_TESTS:
         _require_docker()  # skips (or fails under NODESTRO_REQUIRE_DOCKER)
-    import subprocess
-    import time
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.fail("NODESTRO_DOCKER_TESTS=1 but there is no docker CLI")
+    reached = subprocess.run([docker, "version", "--format", "{{.Server.Version}}"], capture_output=True, timeout=60)
+    if reached.returncode != 0:
+        pytest.fail("NODESTRO_DOCKER_TESTS=1 but the Docker daemon cannot be reached")
 
-    from orkexa.dynamic.docker import DEADLINE_LABEL, OWNER_LABEL
 
-    from nodestro_runtime.docker_status import DockerMonitor, installation_owner, mcp_owner
+class RealDaemon:
+    """One test's share of the real daemon: its run label, the images and containers it made, and a guarded CLI for
+    the product code (:data:`_GUARD`). :meth:`cleanup` removes exactly what the test made."""
 
-    if subprocess.run(["docker", "image", "inspect", REAPER_IMAGE], capture_output=True).returncode != 0:
-        subprocess.run(["docker", "pull", "-q", REAPER_IMAGE], check=True, capture_output=True, timeout=600)
-    first = installation_owner(tmp_path / "a", "installation-a")
-    second = installation_owner(tmp_path / "b", "installation-b")
-    first_mcp = mcp_owner(first)
-    past, future = time.time() - 60, time.time() + 3600
-    created: dict[str, str] = {}
+    def __init__(self, directory: Path) -> None:
+        self.run = uuid.uuid4().hex
+        self.label = f"{RUN_LABEL}={self.run}"
+        self.directory = directory
+        self.real = shutil.which("docker") or "docker"
+        self.images: set[str] = set()
+        self.containers: list[str] = []
+        self.list_refused = False
+        self.log = directory / "docker-calls.jsonl"
+        self.config = directory / "docker-guard.json"
+        self._write_config()
+        self.cli = directory / "docker-guarded"
+        self.cli.write_text(_GUARD.format(python=sys.executable, config=str(self.config)), encoding="utf-8")
+        self.cli.chmod(0o755)
 
-    def create(name: str, owner: str, deadline: float | None) -> None:
-        labels = ["--label", f"{OWNER_LABEL}={owner}"]
+    def _write_config(self) -> None:
+        config = {
+            "docker": self.real,
+            "label": self.label,
+            "log": str(self.log),
+            "own": sorted(self.images),
+            "list_refused": self.list_refused,
+        }
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+
+    def own(self, tag: str) -> str:
+        """Let the guarded CLI build and remove ``tag``, and remove it at the end (an image this test makes)."""
+        self.images.add(tag)
+        self._write_config()
+        return tag
+
+    def refuse_listing(self) -> None:
+        """Make the guarded CLI refuse to list images, like the sandbox gateway."""
+        self.list_refused = True
+        self._write_config()
+
+    def docker(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([self.real, *args], capture_output=True, text=True, check=check, timeout=300)
+
+    def image(self, tag: str, *, size: int = KIB, labels: dict[str, str] | None = None) -> str:
+        """Build a tiny image ``tag`` FROM scratch that holds ``size`` random bytes (no network needed)."""
+        self.own(tag)
+        context = self.directory / f"context-{uuid.uuid4().hex[:12]}"
+        context.mkdir()
+        (context / "blob").write_bytes(os.urandom(size))
+        (context / "Dockerfile").write_text("FROM scratch\nCOPY blob /blob\n", encoding="utf-8")
+        options = [
+            option
+            for key, value in {RUN_LABEL: self.run, **(labels or {})}.items()
+            for option in ("--label", f"{key}={value}")
+        ]
+        self.docker("build", "-q", *options, "-t", tag, str(context))
+        return tag
+
+    def exists(self, tag: str) -> bool:
+        return self.docker("image", "inspect", "--format", "{{.Id}}", tag, check=False).returncode == 0
+
+    def remaining(self) -> set[str]:
+        """The test's own images that are still on the daemon."""
+        return {tag for tag in self.images if self.exists(tag)}
+
+    def size(self, tag: str) -> int:
+        return int(self.docker("image", "inspect", "--format", "{{.Size}}", tag).stdout.strip())
+
+    def container(self, image: str, *, owner: str | None = None, deadline: str | None = None) -> str:
+        """Create (never start) a container of ``image`` with the run label and the given sandbox labels."""
+        labels = ["--label", self.label]
+        if owner is not None:
+            labels += ["--label", f"{OWNER_LABEL}={owner}"]
         if deadline is not None:
             labels += ["--label", f"{DEADLINE_LABEL}={deadline}"]
-        done = subprocess.run(
-            ["docker", "create", *labels, "--network", "none", REAPER_IMAGE, "true"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        created[name] = done.stdout.strip()
+        container = self.docker("create", *labels, "--network", "none", image, "true").stdout.strip()
+        self.containers.append(container)
+        return container
+
+    def present(self) -> set[str]:
+        """The ids of this test's containers that are still on the daemon."""
+        listed = self.docker("ps", "-aq", "--no-trunc", "--filter", f"label={self.label}").stdout.split()
+        return set(listed) & set(self.containers)
+
+    def calls(self) -> list[list[str]]:
+        """Every call of the guarded CLI (a refused one as ``["refused", reason, *args]``)."""
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines() if line]
+
+    def refused(self) -> list[str]:
+        return [call[1] for call in self.calls() if call[:1] == ["refused"]]
+
+    def builds(self) -> int:
+        return len([call for call in self.calls() if call[:1] == ["build"]])
+
+    def cleanup(self) -> None:
+        if self.containers:
+            self.docker("rm", "-f", *self.containers, check=False)
+        for tag in sorted(self.images):
+            self.docker("image", "rm", tag, check=False)
+
+
+@pytest.fixture
+def real_daemon(tmp_path: Path) -> Iterator[RealDaemon]:
+    _require_daemon()
+    daemon = RealDaemon(tmp_path)
+    try:
+        yield daemon
+    finally:
+        daemon.cleanup()
+
+
+def _env_tag() -> str:
+    """A tag in Nodestro's repository that no other run uses."""
+    return f"{IMAGE_REPOSITORY}:{uuid.uuid4().hex}"
+
+
+def _real_images(daemon: RealDaemon, tmp_path: Path, **environ: str) -> ContainerImages:
+    base = {key: value for key, value in os.environ.items() if key != MAX_IMAGE_GB_VARIABLE}
+    return ContainerImages(
+        docker=str(daemon.cli), environ={**base, **environ}, usage_file=tmp_path / "image-usage.json"
+    )
+
+
+def test_the_real_daemon_guard_passes_only_the_test_s_own_images(tmp_path: Path) -> None:
+    """The guarded CLI that keeps the real-daemon tests below to their own images (runs without Docker)."""
+    daemon = RealDaemon(tmp_path)
+    passed = tmp_path / "passed.jsonl"
+    real = tmp_path / "docker-real"
+    real.write_text(
+        f"#!{sys.executable}\nimport json, sys\nopen({str(passed)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    real.chmod(0o755)
+    daemon.real = str(real)
+    own = daemon.own(_env_tag())
+    foreign = _env_tag()
+
+    def call(*args: str) -> int:
+        return subprocess.run([str(daemon.cli), *args], capture_output=True, timeout=60).returncode
+
+    assert call("image", "inspect", foreign) == 0
+    assert call("image", "ls", "--format", "{{.ID}}") == 0
+    assert call("build", "-t", own, ".") == 0
+    assert call("image", "rm", own) == 0
+    for refused in (
+        ("image", "rm", foreign),
+        ("image", "rm", own, foreign),
+        ("image", "rm", "-f", own),
+        ("rmi", own),
+        ("build", "-t", foreign, "."),
+        ("image", "prune", "-af"),
+        ("system", "prune", "-af"),
+        ("rm", "-f", "abc"),
+    ):
+        assert call(*refused) == 1, refused
+    daemon.refuse_listing()
+    assert call("image", "ls") == 1
+    forwarded = [json.loads(line) for line in passed.read_text(encoding="utf-8").splitlines()]
+    assert forwarded == [
+        ["image", "inspect", foreign],
+        ["image", "ls", "--filter", f"label={daemon.label}", "--format", "{{.ID}}"],
+        ["build", "--label", daemon.label, "-t", own, "."],
+        ["image", "rm", own],
+    ]
+    assert len(daemon.refused()) == 9 and daemon.refused()[-1] == "listing images"
+
+
+# ---- environment image caps and collection on a real daemon (RT-031) -------------------------------------------------
+
+
+def test_gc_collects_only_its_own_least_recently_used_images_on_a_real_daemon(
+    real_daemon: RealDaemon, tmp_path: Path
+) -> None:
+    """The least recently used lock-labelled images go first (one the usage record lacks counts as the oldest);
+    a kept image, an image without the lock label and an image a container uses stay; a record entry whose image
+    is gone is dropped. Needs no preflight and no network."""
+    lock = {LOCK_LABEL: "a" * 64}
+    unrecorded, used, oldest, kept, newer = (
+        real_daemon.image(_env_tag(), size=64 * KIB, labels=lock) for _ in range(5)
+    )
+    foreign = real_daemon.image(_env_tag(), size=64 * KIB)  # Nodestro's repository, but not built by Nodestro
+    using = real_daemon.container(used)  # the daemon refuses to remove an image a container uses: gc goes on
+    gone = _env_tag()  # recorded, but no such image any more
+    built = _real_images(real_daemon, tmp_path)
+    assert built.usage_file is not None
+    record = {foreign: 0.0, gone: 0.0, used: 1.0, oldest: 2.0, kept: 3.0, newer: 4.0, "evil:1": 0.0}
+    built.usage_file.write_text(json.dumps(record), encoding="utf-8")
+
+    assert built.gc(max_images=2, keep={kept}) == [unrecorded, oldest, newer]
+    assert real_daemon.remaining() == {used, kept, foreign}
+    assert set(json.loads(built.usage_file.read_text(encoding="utf-8"))) == {foreign, used, kept}
+
+    # The size cap alone: once its container is gone, the used image is collected too; the kept one never is.
+    real_daemon.docker("rm", "-f", using)
+    assert built.gc(max_bytes=real_daemon.size(kept), keep={kept}) == [used]
+    assert real_daemon.remaining() == {kept, foreign}
+    assert built.gc(max_images=0, max_bytes=0, keep={kept}) == []
+
+    # Only the test's own images were ever removed, nothing else was asked of the daemon, and nothing was refused.
+    assert real_daemon.refused() == []
+    removed = {call[2] for call in real_daemon.calls() if call[:2] == ["image", "rm"]}
+    assert removed == {unrecorded, used, oldest, newer}
+    assert not [call for call in real_daemon.calls() if "evil:1" in call]
+
+
+def test_gc_without_a_listing_collects_only_recorded_images_on_a_real_daemon(
+    real_daemon: RealDaemon, tmp_path: Path
+) -> None:
+    """Where images cannot be listed (the sandbox gateway), the collection sees only the images of the usage
+    record; an image the record lacks stays (a known limit, RT-031). Needs no preflight and no network."""
+    lock = {LOCK_LABEL: "b" * 64}
+    first, second, third, unrecorded = (real_daemon.image(_env_tag(), labels=lock) for _ in range(4))
+    real_daemon.refuse_listing()
+    built = _real_images(real_daemon, tmp_path)
+    assert built.usage_file is not None
+    built.usage_file.write_text(json.dumps({first: 1.0, second: 2.0, third: 3.0}), encoding="utf-8")
+
+    assert built.gc(max_images=1) == [first, second]
+    assert real_daemon.remaining() == {third, unrecorded}
+    assert set(json.loads(built.usage_file.read_text(encoding="utf-8"))) == {third}
+    assert real_daemon.refused() == ["listing images"]
+
+
+def test_an_image_above_the_size_cap_is_removed_and_refused_on_a_real_daemon(
+    real_daemon: RealDaemon, tmp_path: Path
+) -> None:
+    """A real build above ``NODESTRO_MAX_IMAGE_GB`` is removed again and refused; an invalid limit fails before
+    docker builds anything; within the limit the image is kept, recorded and found again without a second build.
+    Needs network for PyPI (like the image tests above), no preflight."""
+    lock = HASHED + f"# nodestro test run {real_daemon.run}\n"  # a lock of its own: a tag no other run uses
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    capped = _real_images(real_daemon, tmp_path, NODESTRO_MAX_IMAGE_GB="0.001")
+    assert capped.usage_file is not None
+    tag = real_daemon.own(capped.tag(lock, version))
+    assert not real_daemon.exists(tag)
+
+    with pytest.raises(NodestroError) as caught:
+        capped.build(lock, version)
+    assert caught.value.code == "deps.image_too_large"
+    assert float(caught.value.params["limit_gb"]) == pytest.approx(0.001, rel=0.01) and caught.value.params["size_gb"]
+    assert real_daemon.builds() == 1
+    assert not real_daemon.exists(tag)  # never left behind for a sandbox
+    assert not capped.usage_file.exists()
+
+    for invalid in ("0", "-1", "lots"):
+        with pytest.raises(NodestroError) as caught:
+            _real_images(real_daemon, tmp_path, NODESTRO_MAX_IMAGE_GB=invalid).build(lock, version)
+        assert caught.value.code == "deps.image_failed"
+    assert real_daemon.builds() == 1
+
+    within = _real_images(real_daemon, tmp_path)  # the default limit of 8 GB
+    assert within.build(lock, version) == tag
+    assert within.lock_of(tag) == hashlib.sha256(lock.encode("utf-8")).hexdigest()
+    assert tag in json.loads(capped.usage_file.read_text(encoding="utf-8"))
+    assert within.build(lock, version) == tag  # found by its lock label
+    assert real_daemon.builds() == 2
+    assert real_daemon.refused() == []
+    assert real_daemon.remaining() == {tag}
+
+
+# ---- the reaper on a real daemon (RT-034, RT-037) --------------------------------------------------------------------
+
+
+def test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon(
+    real_daemon: RealDaemon, tmp_path: Path
+) -> None:
+    """Two installations on one daemon: each reaper removes only its own containers, the tool reaper never touches
+    the local MCP servers' containers, and the MCP reaper removes only the expired ones. Needs no preflight and no
+    network (the containers are only created, never started, from a tiny image of the test's own)."""
+    from nodestro_runtime.docker_status import DockerMonitor, installation_owner, mcp_owner
+
+    image = real_daemon.image(f"nodestro-test-reaper:{real_daemon.run}")
+    first = installation_owner(tmp_path / "a", f"installation-a-{real_daemon.run}")
+    second = installation_owner(tmp_path / "b", f"installation-b-{real_daemon.run}")
+    first_mcp = mcp_owner(first)
+    past, future = str(time.time() - 60), str(time.time() + 3600)
+    names: dict[str, str] = {}
+
+    def create(name: str, owner: str, deadline: str | None) -> None:
+        names[real_daemon.container(image, owner=owner, deadline=deadline)] = name
 
     def present() -> set[str]:
-        listed = subprocess.run(
-            ["docker", "ps", "-aq", "--no-trunc"], check=True, capture_output=True, text=True, timeout=60
-        ).stdout.split()
-        return {name for name, container in created.items() if container in listed}
+        return {names[container] for container in real_daemon.present()}
 
+    create("first-expired", first, past)
+    create("first-running", first, future)
+    create("first-no-deadline", first, None)
+    create("second-expired", second, past)
+    create("mcp-expired", first_mcp, past)
+    create("mcp-running", first_mcp, future)
+    monitor = DockerMonitor(lambda: None, owner=first)  # type: ignore[arg-type,return-value]
+    assert monitor.reap_once() == 2  # expired, and one without a valid deadline
+    assert present() == {"first-running", "second-expired", "mcp-expired", "mcp-running"}
+    assert monitor.reap_mcp_once() == 1
+    assert present() == {"first-running", "second-expired", "mcp-running"}
+    assert monitor.reap_once(remove_all=True) == 1  # a desktop's start: all of its own tool containers
+    assert present() == {"second-expired", "mcp-running"}
+    other = DockerMonitor(lambda: None, owner=second)  # type: ignore[arg-type,return-value]
+    assert other.reap_mcp_once() == 0  # the other installation has no MCP containers
+    assert other.reap_once() == 1
+    assert present() == {"mcp-running"}
+
+
+def test_a_desktop_start_reaps_only_its_own_containers_and_a_lost_daemon_nothing_on_a_real_daemon(
+    real_daemon: RealDaemon, tmp_path: Path
+) -> None:
+    """A desktop's reaper thread (``start_reaper(remove_all_first=True)``) removes all of its own tool containers and
+    the MCP containers started before it, but not an MCP container started later, another installation's container
+    or a legacy one with the shared owner ``nodestro``. Invalid deadlines count as expired. Without a reachable daemon
+    or docker CLI the reaper removes nothing and raises nothing. Needs no preflight and no network."""
+    from nodestro_runtime.docker_status import MCP_LIFETIME, OWNER, DockerMonitor, installation_owner, mcp_owner
+
+    image = real_daemon.image(f"nodestro-test-reaper:{real_daemon.run}")
+    own = installation_owner(tmp_path / "desktop", f"desktop-{real_daemon.run}")
+    other = installation_owner(tmp_path / "other", f"other-{real_daemon.run}")
+    now = time.time()
+    names: dict[str, str] = {}
+
+    def create(name: str, owner: str, deadline: str) -> None:
+        names[real_daemon.container(image, owner=owner, deadline=deadline)] = name
+
+    def present() -> set[str]:
+        return {names[container] for container in real_daemon.present()}
+
+    create("bad-deadline", own, "soon")
+    create("endless", own, "inf")
+    create("running", own, str(now + 3600))
+    create("other-expired", other, str(now - 60))
+    create("legacy", OWNER, str(now + 3600))  # an earlier release's owner: never removed at a desktop's start
+    create("mcp-orphan", mcp_owner(own), str(now + 60))  # started before the reaper
+    create("mcp-later", mcp_owner(own), str(now + MCP_LIFETIME + 600))  # started after it
+    everything = present()
+    assert len(everything) == 7
+
+    # No daemon behind DOCKER_HOST, or no docker CLI: nothing removed, nothing raised.
+    unreachable = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "DOCKER_HOST": f"unix://{tmp_path / 'no-daemon.sock'}",
+    }
+    lost = DockerMonitor(lambda: None, owner=own, environ=unreachable)  # type: ignore[arg-type,return-value]
+    assert lost.reap_once(remove_all=True) == 0
+    assert lost.reap_mcp_once(started_before=time.time()) == 0
+    missing = DockerMonitor(lambda: None, docker=str(tmp_path / "no-docker"), owner=own)  # type: ignore[arg-type,return-value]
+    assert missing.reap_once(remove_all=True) == 0 and missing.reap_mcp_once() == 0
+    assert present() == everything
+
+    desktop = DockerMonitor(lambda: None, owner=own, reap_interval=3600)  # type: ignore[arg-type,return-value]
+    assert desktop.reap_once() == 2  # "soon" and "inf" are no valid deadlines
+    assert present() == everything - {"bad-deadline", "endless"}
+    expected = {"other-expired", "legacy", "mcp-later"}
     try:
-        create("first-expired", first, past)
-        create("first-running", first, future)
-        create("first-no-deadline", first, None)
-        create("second-expired", second, past)
-        create("mcp-expired", first_mcp, past)
-        create("mcp-running", first_mcp, future)
-        monitor = DockerMonitor(lambda: None, owner=first)  # type: ignore[arg-type,return-value]
-        assert monitor.reap_once() == 2  # expired, and one without a valid deadline
-        assert present() == {"first-running", "second-expired", "mcp-expired", "mcp-running"}
-        assert monitor.reap_mcp_once() == 1
-        assert present() == {"first-running", "second-expired", "mcp-running"}
-        assert monitor.reap_once(remove_all=True) == 1  # a desktop's start: all of its own tool containers
-        assert present() == {"second-expired", "mcp-running"}
-        other = DockerMonitor(lambda: None, owner=second)  # type: ignore[arg-type,return-value]
-        assert other.reap_mcp_once() == 0  # the other installation has no MCP containers
-        assert other.reap_once() == 1
-        assert present() == {"mcp-running"}
+        desktop.start_reaper(remove_all_first=True)
+        waited = time.monotonic() + 120
+        while present() != expected and time.monotonic() < waited:
+            time.sleep(0.5)
     finally:
-        if created:
-            subprocess.run(["docker", "rm", "-f", *created.values()], capture_output=True, timeout=120)
+        desktop.close()
+        if desktop._reaper is not None:
+            desktop._reaper.join(60)  # its first pass is over: nothing else is removed later
+    assert present() == expected

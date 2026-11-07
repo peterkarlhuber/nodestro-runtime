@@ -19,9 +19,13 @@ tests.test_builtin_sandbox::test_standard_library_modules_tools_use  # built-in 
 tests.test_builtin_sandbox::test_start_up_overhead_is_measured  # built-in sandbox reports untested-system on the ubuntu-latest runner (Ubuntu 26.04); covered by the builtin-sandbox job
 tests.test_builtin_sandbox::test_validation_with_tests_and_non_ascii_paths  # built-in sandbox reports untested-system on the ubuntu-latest runner (Ubuntu 26.04); covered by the builtin-sandbox job
 tests.test_builtin_sandbox::test_weakened_confinement_never_runs_tool_code  # built-in sandbox reports untested-system on the ubuntu-latest runner (Ubuntu 26.04); covered by the builtin-sandbox job
+tests.test_container_images::test_a_desktop_start_reaps_only_its_own_containers_and_a_lost_daemon_nothing_on_a_real_daemon  # real Docker containers run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_container_images::test_a_missing_image_fails_closed  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_container_images::test_a_server_runs_plain_tools_in_its_runtime_image  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_container_images::test_a_tool_with_a_library_runs_in_its_image_without_network  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
+tests.test_container_images::test_an_image_above_the_size_cap_is_removed_and_refused_on_a_real_daemon  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
+tests.test_container_images::test_gc_collects_only_its_own_least_recently_used_images_on_a_real_daemon  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
+tests.test_container_images::test_gc_without_a_listing_collects_only_recorded_images_on_a_real_daemon  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_container_images::test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon  # real Docker containers run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_knowledge_memory_backends::test_postgres_memory_refuses_nul_characters[sqlite]  # a PostgreSQL-only check (the SQLite parametrization)
 tests.test_knowledge_memory_backends::test_tenants_have_separate_knowledge[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
