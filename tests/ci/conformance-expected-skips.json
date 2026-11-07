@@ -1,0 +1,11 @@
+{
+ "description": "Conformance cases (orkexa.testing.conformance) that may be skipped per CI job and target, with the reason (tests/test_orkexa_conformance.py). Every target reports every capability, so none is skipped.",
+ "jobs": {
+  "test": {
+   "pg-index": {},
+   "pg-index-runtime": {},
+   "pg-file-store": {},
+   "pg-memory": {}
+  }
+ }
+}

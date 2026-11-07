@@ -501,6 +501,7 @@
   "run.agent.UnpricedModelError": ["type"],
   "run.agent.UnreliablePriceError": ["type"],
   "run.agent.UnsupportedCapabilityError": ["type"],
+  "run.agent.VectorError": ["type"],
   "run.agents_invalid": ["agents"],
   "run.already_queued": ["run"],
   "run.api_error": ["provider", "status"],

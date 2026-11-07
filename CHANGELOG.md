@@ -1922,6 +1922,15 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     brings A10: SQLite integrity checks, the FTS5 race fix and search limits).
   - B0: one Axentra commit for every extra. The `postgres` and `dev` extras pin Axentra `273e675` (Axentra A4, A6,
     A7 and B0; it includes axentra #42, IP and request id on login and setup audit events). No runtime code change.
+  - B1 (runtime part): `PostgresIndex`, `PostgresFileStore` and `PostgresMemory` report `capabilities` (orkexa's
+    storage contracts: `partitioned` and `concurrent_writers`; the index adds `vectors` and `reindex` with an
+    embedding model), and `tests/test_orkexa_conformance.py` runs orkexa's public conformance suite
+    (`orkexa.testing.conformance`) against them, with the index ranking vectors in the database (pgvector) and in
+    the runtime. The ten documented PostgreSQL drifts are strict expected failures (`MUP-DRIFT-1` to `-10`, fixed by
+    MP-B3); every partition case passes. Through orkexa's `Index` contract the PostgreSQL index now refuses a query
+    over 1000 characters or 64 distinct words with `RetrievalError` `query.too_long`, as SQLite does since A10.
+    New catalog code `run.agent.VectorError` (orkexa's vector check). Orkexa pinned to `b3d6fae` (orkexa #63, the B1
+    conformance suite).
 
 ## 0.2.0 (2026-10-29)
 
