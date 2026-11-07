@@ -7,8 +7,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
+import re
 import threading
 from typing import Any, ClassVar
 
@@ -91,16 +93,21 @@ class Clock:
         return self.now
 
 
+def _sha256(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest()
+
+
 def _source(document: Any = None, *, fail: int = 0) -> LiteLLMSource:
     calls = {"n": 0}
+    body = json.dumps(COST_MAP if document is None else document).encode()
 
     def fetch(url: str, settings: HttpSettings) -> bytes:
         calls["n"] += 1
         if calls["n"] <= fail:
             raise SourceError("connection reset")
-        return json.dumps(COST_MAP if document is None else document).encode()
+        return body
 
-    return LiteLLMSource(fetch_bytes=fetch, sleep=lambda _s: None)
+    return LiteLLMSource(fetch_bytes=fetch, sleep=lambda _s: None, sha256=_sha256(body))
 
 
 @pytest.fixture
@@ -161,7 +168,7 @@ def test_the_litellm_source_builds_one_snapshot() -> None:
 
 @pytest.mark.parametrize("body", [b"not json", b"[1, 2]", json.dumps({"x": {"mode": "chat"}}).encode()])
 def test_broken_cost_maps_are_refused(body: bytes) -> None:
-    source = LiteLLMSource(fetch_bytes=lambda _u, _s: body, sleep=lambda _s: None)
+    source = LiteLLMSource(fetch_bytes=lambda _u, _s: body, sleep=lambda _s: None, sha256=_sha256(body))
     with pytest.raises(SourceError):
         source.fetch(T0)
 
@@ -224,9 +231,76 @@ def test_downloads_are_limited_in_size(monkeypatch: pytest.MonkeyPatch) -> None:
         def read(self, limit: int) -> bytes:
             return b"x" * limit
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: Response())
+    monkeypatch.setattr("nodestro_runtime.pricing_sync._open", lambda *_a, **_k: Response())
     with pytest.raises(SourceError, match="larger"):
         https_get("https://raw.githubusercontent.com/x", HttpSettings(max_bytes=10))
+
+
+# MUP-ONA T-A7-1
+def test_a_redirect_is_refused_and_its_target_never_fetched(monkeypatch: pytest.MonkeyPatch) -> None:
+    import email.message
+    import io
+    import urllib.request
+    import urllib.response
+
+    from nodestro_runtime import pricing_sync
+
+    requested: list[str] = []
+
+    class Redirecting(urllib.request.BaseHandler):
+        handler_order = 100  # before the real HTTPS handler: no network
+
+        def https_open(self, request: urllib.request.Request) -> urllib.response.addinfourl:
+            requested.append(request.full_url)
+            headers = email.message.Message()
+            headers["Location"] = "https://raw.githubusercontent.com/elsewhere.json"
+            response = urllib.response.addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+            response.msg = "Found"  # type: ignore[attr-defined]
+            return response
+
+    # The real opener's redirect handler, with a fake transport in place of the network.
+    assert any(isinstance(h, pricing_sync._NoRedirects) for h in pricing_sync._OPENER.handlers)
+    opener = urllib.request.build_opener(pricing_sync._NoRedirects, Redirecting)
+    monkeypatch.setattr(pricing_sync, "_OPENER", opener)
+    with pytest.raises(SourceError, match="redirects are not followed"):
+        https_get("https://raw.githubusercontent.com/x.json", HttpSettings())
+    assert requested == ["https://raw.githubusercontent.com/x.json"]
+
+
+# MUP-ONA T-A7-1
+def test_the_litellm_source_is_pinned_to_a_commit_and_a_checksum() -> None:
+    from nodestro_runtime.pricing_sync import LITELLM_COMMIT, LITELLM_SHA256, LITELLM_URL
+
+    assert re.fullmatch(r"[0-9a-f]{40}", LITELLM_COMMIT) and f"/{LITELLM_COMMIT}/" in LITELLM_URL
+    assert "/main/" not in LITELLM_URL and re.fullmatch(r"[0-9a-f]{64}", LITELLM_SHA256)
+    source = LiteLLMSource()
+    assert (source.url, source.sha256) == (LITELLM_URL, LITELLM_SHA256)
+    with pytest.raises(ValueError, match="its own sha256"):
+        LiteLLMSource(url="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")
+    with pytest.raises(ValueError, match="hex"):
+        LiteLLMSource(sha256="not-a-checksum")
+
+
+# MUP-ONA T-A7-1
+def test_a_cost_map_with_a_wrong_checksum_is_not_imported(
+    pricing: PricingService, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    PricingSyncService(pricing, [_source()], clock=clock).sync()
+    active = pricing.reference_snapshot().version
+    entry = pricing.entry("openai", "gpt-test")
+    changed = dict(COST_MAP, **{"gpt-test": dict(COST_MAP["gpt-test"], input_cost_per_token=9e-06)})
+    body = json.dumps(changed).encode()
+    tampered = LiteLLMSource(fetch_bytes=lambda _u, _s: body, sleep=lambda _s: None, sha256=_sha256(b"other"))
+    with pytest.raises(SourceError, match="SHA-256"):
+        tampered.fetch(T0)
+    clock.now = T0 + timedelta(days=3)
+    with caplog.at_level("WARNING", logger="nodestro_runtime.pricing_sync"):
+        report = PricingSyncService(pricing, [tampered], clock=clock).sync(force=True)
+    assert report.ran and not report.sources[0].ok and "SHA-256" in (report.sources[0].error or "")
+    assert any("not imported" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+    assert pricing.reference_snapshot().version == active
+    after = pricing.entry("openai", "gpt-test")
+    assert after is not None and entry is not None and after.input_usd_per_mtok == entry.input_usd_per_mtok
 
 
 # ---- sources from files --------------------------------------------------------------------------------
@@ -368,7 +442,7 @@ def test_the_background_loop_makes_no_request_while_paused(pricing: PricingServi
         fetched.append(url)
         return json.dumps(COST_MAP).encode()
 
-    source = LiteLLMSource(fetch_bytes=fetch, sleep=lambda _s: None)
+    source = LiteLLMSource(fetch_bytes=fetch, sleep=lambda _s: None, sha256=_sha256(json.dumps(COST_MAP).encode()))
     sync = PricingSyncService(pricing, [source], clock=clock)
     offline = [True]
 

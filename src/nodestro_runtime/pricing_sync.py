@@ -18,8 +18,12 @@ The official price pages of OpenAI, Anthropic and Google are HTML pages without 
 interface; Nodestro does not scrape them. Their prices reach Nodestro through Orkexa's built-in snapshot
 (Anthropic) or a reviewed snapshot file.
 
-Downloads are HTTPS only, from an allowed host, with timeouts, a size limit and a bounded number of retries with
-exponential backoff. A failed source changes nothing: the last valid prices stay active. Syncs never run on the
+Downloads are HTTPS only, from an allowed host, never follow a redirect, with timeouts, a size limit and a bounded
+number of retries with exponential backoff. The LiteLLM map is read at a fixed commit (:data:`LITELLM_COMMIT`) and
+must have the SHA-256 shipped with this release (:data:`LITELLM_SHA256`); a different file is not imported and a
+warning is logged (MUP-ONA A7, VB-1). A new runtime release moves the pin, as a new Orkexa pin brings new built-in
+prices; an operator who needs newer prices sooner supplies a reviewed snapshot file. A failed source changes nothing:
+the last valid prices stay active. Syncs never run on the
 path of a model request; the desktop runs :meth:`PricingSyncService.run` in the background, a server runs it in
 its worker under a lock shared by its processes.
 """
@@ -32,6 +36,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext, supp
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -60,8 +65,13 @@ from .schemas import now
 
 logger = logging.getLogger(__name__)
 
-#: LiteLLM's model cost map (MIT license), the file LiteLLM itself loads.
-LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+#: The commit of LiteLLM's repository whose cost map is imported (``main`` on 2026-11-06). Content at a commit never
+#: changes, so its checksum below stays valid; moving the pin is a reviewed change of both values.
+LITELLM_COMMIT = "ab3b12b951e4b7008a8fa677e601de20ff94b66d"
+#: LiteLLM's model cost map (MIT license), the file LiteLLM itself loads, at :data:`LITELLM_COMMIT`.
+LITELLM_URL = f"https://raw.githubusercontent.com/BerriAI/litellm/{LITELLM_COMMIT}/model_prices_and_context_window.json"
+#: The SHA-256 of the file at :data:`LITELLM_URL`; a download with another checksum is not imported.
+LITELLM_SHA256 = "83d9837c4a0f0e8466c2541647fcd16ab3c3b47ded4e57064c108a2cb7e72ee8"
 LITELLM_SOURCE = "litellm"
 #: The largest download accepted (the map is about 3 MB in October 2026).
 MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
@@ -88,13 +98,28 @@ class HttpSettings:
 Fetcher = Callable[[str, HttpSettings], bytes]
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect: the 3xx response reaches the caller as an ``HTTPError``."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
+def _open(request: urllib.request.Request, timeout: float) -> Any:
+    """Open ``request`` without following redirects."""
+    return _OPENER.open(request, timeout=timeout)
+
+
 def https_get(url: str, settings: HttpSettings) -> bytes:
-    """Download ``url`` once: HTTPS only, ``settings.timeout``, at most ``settings.max_bytes``."""
+    """Download ``url`` once: HTTPS only, no redirects, ``settings.timeout``, at most ``settings.max_bytes``."""
     if urllib.parse.urlsplit(url).scheme != "https":
         raise SourceError(f"Only HTTPS downloads are allowed: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "Nodestro price sync", "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=settings.timeout) as response:
+        with _open(request, settings.timeout) as response:
             final = urllib.parse.urlsplit(response.geturl())
             if final.scheme != "https":
                 raise SourceError(f"Redirected to a non-HTTPS URL: {response.geturl()}")
@@ -103,6 +128,8 @@ def https_get(url: str, settings: HttpSettings) -> bytes:
                 raise SourceError(f"The download is larger than {settings.max_bytes} bytes")
             data: bytes = response.read(settings.max_bytes + 1)
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise SourceError(f"HTTP {exc.code} from {url}: redirects are not followed") from None
         raise SourceError(f"HTTP {exc.code} from {url}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise SourceError(f"Download of {url} failed: {exc}") from None
@@ -356,9 +383,13 @@ def bedrock_prices(
 
 @dataclass
 class LiteLLMSource:
-    """LiteLLM's model cost map: OpenAI, Anthropic and Gemini text models, and regional Amazon Bedrock prices."""
+    """LiteLLM's model cost map: OpenAI, Anthropic and Gemini text models, and regional Amazon Bedrock prices.
+
+    ``url`` and ``sha256`` belong together: the downloaded file must have this SHA-256, else nothing is imported
+    (a warning is logged and the source reports an error). Another ``url`` needs its own ``sha256``."""
 
     url: str = LITELLM_URL
+    sha256: str = LITELLM_SHA256
     http: HttpSettings = field(default_factory=HttpSettings)
     fetch_bytes: Fetcher = https_get
     sleep: Callable[[float], None] = time.sleep
@@ -370,10 +401,22 @@ class LiteLLMSource:
     #: was listed twice with different rates; their costs stay unknown until an override covers them.
     bedrock_unmapped: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("sha256 must be 64 lower-case hex digits")
+        if self.url != LITELLM_URL and self.sha256 == LITELLM_SHA256:
+            raise ValueError("A LiteLLM url other than the pinned one needs its own sha256")
+
     def fetch(self, at: datetime) -> PriceSnapshot:
         data = fetch_with_retries(
             self.url, self.http, fetch=self.fetch_bytes, sleep=self.sleep, allowed_hosts=self.allowed_hosts
         )
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != self.sha256:
+            logger.warning(
+                "The LiteLLM cost map from %s has SHA-256 %s, expected %s: not imported", self.url, digest, self.sha256
+            )
+            raise SourceError(f"The LiteLLM cost map has SHA-256 {digest}, expected {self.sha256}: not imported")
         try:
             document = json.loads(data, parse_float=Decimal)
         except ValueError as exc:
@@ -583,7 +626,9 @@ class PricingSyncService:
 
 __all__ = [
     "LITELLM_BEDROCK_PROVIDERS",
+    "LITELLM_COMMIT",
     "LITELLM_PROVIDERS",
+    "LITELLM_SHA256",
     "LITELLM_SOURCE",
     "LITELLM_URL",
     "BedrockRegionalRate",
