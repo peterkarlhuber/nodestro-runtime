@@ -1,9 +1,12 @@
-"""The partition guard and the table prefix of the generic PostgreSQL part (MUP-ONA B4: T-GUARD-1, T-GUARD-2).
+"""The partition guard and the table prefix of Orkexa's PostgreSQL backends as Nodestro uses them (MUP-ONA B4:
+T-GUARD-1, T-GUARD-2; B6: the same cases against ``orkexa.backends.postgres`` at the pinned commit, with Nodestro's
+layout ``nodestro_``).
 
-* **T-GUARD-1** the executor (:class:`nodestro_runtime.pg_generic._sql.Executor`) refuses a partitioned statement whose
-  ``tenant_id`` is missing, ``None``, empty, whitespace, not a string, 10,000 characters long or another tenant with
-  ``RetrievalError("partition.missing")`` -- for every partitioned catalog entry, and through the index, file store and
-  memory -- and a spy source proves that no transaction was opened (no database access).
+* **T-GUARD-1** the executor (``orkexa.backends.postgres._sql.Executor``) refuses a partitioned statement whose
+  ``tenant_id`` is missing, ``None``, empty, whitespace, not a string, 10,000 characters long, holds U+0000 or is
+  another tenant with ``RetrievalError("partition.missing")`` -- for every partitioned catalog entry, and through the
+  index, file store and memory -- and a spy source proves that no transaction was opened (no database access).
+  Nodestro's own classes (:mod:`nodestro_runtime.postgres_tables`) refuse such a tenant when they are built.
 * **T-GUARD-2** a table prefix must match ``^[a-z][a-z0-9_]{0,30}_$``; anything else is refused before a statement is
   rendered or a store is built.
 
@@ -18,12 +21,22 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from orkexa.backends.postgres import (
+    CATALOG,
+    ConnectionSource,
+    PostgresFileStore,
+    PostgresIndex,
+    PostgresLayout,
+    PostgresMemory,
+    render,
+)
+from orkexa.backends.postgres._sql import MAX_TENANT_CHARS, Executor, check_prefix, jsonb_text
 from orkexa.retrieval import RetrievalError
 import postgres_support
 import pytest
 
-from nodestro_runtime.pg_generic import PostgresFileStore, PostgresIndex, PostgresMemory
-from nodestro_runtime.pg_generic._sql import CATALOG, MAX_TENANT_CHARS, Executor, check_prefix, jsonb_text, render
+from nodestro_runtime import postgres_tables
+from nodestro_runtime.postgres_tables import LAYOUT
 
 TENANT = "tenant-a"
 PARTITIONED = sorted(name for name, entry in CATALOG.items() if entry.partitioned)
@@ -62,6 +75,8 @@ REFUSED: dict[str, Any] = {
     "padded own tenant": f" {TENANT}",
     "number": 1,
     "list": [TENANT],
+    # PostgreSQL text cannot hold U+0000 (orkexa B5 refuses it in the guard; it used to reach the server as an error).
+    "NUL": f"{TENANT}\x00",
 }
 
 
@@ -70,7 +85,7 @@ REFUSED: dict[str, Any] = {
 @pytest.mark.parametrize("name", PARTITIONED)
 def test_the_guard_refuses_an_unbound_tenant_before_any_database_access(name: str, value: Any) -> None:
     spy = SpySource()
-    executor = Executor(spy, prefix="nodestro_", tenant_id=TENANT)
+    executor = Executor(spy, layout=LAYOUT, tenant_id=TENANT)
     with pytest.raises(RetrievalError) as raised:
         executor.execute(name, _params(name, tenant_id=value))
     assert raised.value.code == "partition.missing"
@@ -83,14 +98,14 @@ def test_the_guard_refuses_a_missing_tenant(name: str) -> None:
     params = _params(name)
     del params["tenant_id"]
     with pytest.raises(RetrievalError) as raised:
-        Executor(spy, prefix="nodestro_", tenant_id=TENANT).execute(name, params)
+        Executor(spy, layout=LAYOUT, tenant_id=TENANT).execute(name, params)
     assert raised.value.code == "partition.missing"
     assert spy.opened == []
 
 
 def test_the_guard_also_holds_inside_a_transaction() -> None:
     spy = SpySource()
-    executor = Executor(spy, prefix="nodestro_", tenant_id=TENANT)
+    executor = Executor(spy, layout=LAYOUT, tenant_id=TENANT)
     with executor.transaction(), pytest.raises(RetrievalError):
         executor.execute("chunks_count", _params("chunks_count", tenant_id="tenant-b"))
     assert spy.opened == [("transaction", TENANT)]  # the block's own transaction; the statement never ran
@@ -101,12 +116,12 @@ def test_the_instance_tenant_must_pass_the_guard_too() -> None:
         if value in ("tenant-b", f" {TENANT}"):
             continue  # valid tenants of their own
         with pytest.raises(ValueError):
-            Executor(SpySource(), prefix="nodestro_", tenant_id=value)
+            Executor(SpySource(), layout=LAYOUT, tenant_id=value)
 
 
 def test_only_catalog_names_with_their_parameters_run() -> None:
     spy = SpySource()
-    executor = Executor(spy, prefix="nodestro_", tenant_id=TENANT)
+    executor = Executor(spy, layout=LAYOUT, tenant_id=TENANT)
     with pytest.raises(ValueError, match="Unknown statement"):
         executor.execute("SELECT * FROM nodestro_chunks", {"tenant_id": TENANT})
     with pytest.raises(ValueError, match="parameters"):
@@ -122,13 +137,13 @@ def test_only_catalog_names_with_their_parameters_run() -> None:
 
 def _stores(source: Any) -> list[Any]:
     return [
-        PostgresIndex(source, TENANT, prefix="nodestro_", namespace="n"),
-        PostgresFileStore(source, TENANT, prefix="nodestro_", namespace="n"),
-        PostgresMemory(source, TENANT, prefix="nodestro_", namespace="n"),
+        PostgresIndex(source, TENANT, layout=LAYOUT, namespace="n"),
+        PostgresFileStore(source, TENANT, layout=LAYOUT, namespace="n"),
+        PostgresMemory(source, TENANT, layout=LAYOUT, namespace="n"),
     ]
 
 
-@pytest.mark.parametrize("value", ["tenant-b", "", None, " ", "a" * 10_000])
+@pytest.mark.parametrize("value", ["tenant-b", "", None, " ", "a" * 10_000, f"{TENANT}\x00"])
 def test_a_store_whose_tenant_was_changed_reaches_no_row(value: Any) -> None:
     """The stores bind ``self.tenant_id``; the executor keeps the tenant they were built for. Changing the attribute
     afterwards (a bug, or an attack on the object) is caught by the guard, not sent to the database."""
@@ -151,6 +166,32 @@ def test_a_store_whose_tenant_was_changed_reaches_no_row(value: Any) -> None:
             call()
         assert raised.value.code == "partition.missing"
     assert spy.opened == []
+
+
+class _NoDatabase:
+    """Stands in for a ``PostgresDatabase``: any use fails the test."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"the database was used: {name}")
+
+
+@pytest.mark.parametrize(
+    "value", ["", " ", "Tenant-A", "a" * 64, f"{TENANT}\x00", "\x00", "tenant a", "tenant'a"], ids=repr
+)
+def test_nodestro_refuses_a_bad_tenant_before_it_builds_a_store(value: str) -> None:
+    """Nodestro's rule for tenant ids (``storage_postgres.TENANT_ID``) is stricter than Orkexa's guard; it refuses a
+    tenant id with U+0000 (the case orkexa B5 added to its guard) and every other bad value before Orkexa's class or
+    the database is reached."""
+    database: Any = _NoDatabase()
+    for build in (
+        lambda: postgres_tables.PostgresIndex(database, value),
+        lambda: postgres_tables.PostgresFileStore(database, value),
+        lambda: postgres_tables.PostgresMemory(database, value),
+        lambda: postgres_tables.PostgresMemoryTables(database, value),
+        lambda: postgres_tables.memory_totals(database, value, "nodestro:"),
+    ):
+        with pytest.raises(ValueError, match="Invalid tenant id"):
+            build()
 
 
 # ---- T-GUARD-2: the table prefix ------------------------------------------------------------------------------------
@@ -181,10 +222,10 @@ def test_a_bad_prefix_is_refused(prefix: Any) -> None:
     with pytest.raises(ValueError, match="prefix"):
         render("chunks_count", prefix)
     with pytest.raises(ValueError, match="prefix"):
-        Executor(spy, prefix=prefix, tenant_id=TENANT)
-    for kind in (PostgresIndex, PostgresFileStore, PostgresMemory):
-        with pytest.raises(ValueError, match="prefix"):
-            kind(spy, TENANT, prefix=prefix)
+        PostgresLayout(prefix)
+    for kind in (Executor, PostgresIndex, PostgresFileStore, PostgresMemory):
+        with pytest.raises(TypeError, match="PostgresLayout"):
+            kind(spy, tenant_id=TENANT, layout=prefix)  # a prefix string is not a layout
     assert spy.opened == []
 
 
@@ -192,12 +233,13 @@ def test_a_bad_prefix_is_refused(prefix: Any) -> None:
 def test_a_good_prefix_names_the_tables(prefix: str) -> None:
     # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
     pytest.importorskip("psycopg")
+    assert PostgresLayout(prefix).table("chunks") == f"{prefix}chunks"
     text = render("vectors_store", prefix).as_string(None)
     assert f'"{prefix}chunk_vectors"' in text and f'"{prefix}chunks"' in text
 
 
 def test_jsonb_text_is_the_document_stores_encoding() -> None:
-    """The generic part keeps its own copy of ``storage_postgres._encode`` (it imports nothing of Nodestro)."""
+    """Orkexa's backends keep their own copy of ``storage_postgres._encode`` (taken over from Nodestro in B5)."""
     pytest.importorskip("psycopg")
     from nodestro_runtime.storage_postgres import _encode
 
@@ -224,13 +266,12 @@ def database() -> Iterator[Any]:
 
 
 def test_the_adapter_runs_each_mode_as_the_database_did(database: Any) -> None:
-    from nodestro_runtime.pg_generic import ConnectionSource
     from nodestro_runtime.storage_postgres import DatabaseSource
 
     source = DatabaseSource(database)
     assert isinstance(source, ConnectionSource)
     assert source.lock is database._lock
-    executor = Executor(source, prefix="nodestro_", tenant_id=TENANT)
+    executor = Executor(source, layout=LAYOUT, tenant_id=TENANT)
     key = {"tenant_id": TENANT, "namespace": "n"}
     assert executor.execute("memory_write", {**key, "path": "a", "content": "x"}).rowcount == 1
     with executor.transaction():
@@ -262,3 +303,16 @@ def test_the_tenant_setting_is_off_by_default_and_transaction_local(database: An
         assert connection.execute(probe).fetchall() in ([(None,)], [("",)])
     with pytest.raises(ValueError):
         DatabaseSource(database, tenant_setting="x'; DROP")
+
+
+# MUP-ONA T-SCH-1
+def test_the_start_check_accepts_the_migrated_schema_read_only(database: Any) -> None:
+    """``require_knowledge_schema`` (Orkexa's ``verify_schema`` with Nodestro's layout) on the tables of migrations
+    0001-0010, as the role the suite runs as (the restricted runtime role in the ``*-runtime-role`` jobs): usable,
+    the column ``embedding`` is ``real[]`` (K5), and it reports where it found the tables."""
+    from nodestro_runtime.postgres_tables import require_knowledge_schema
+
+    report = require_knowledge_schema(database)
+    assert report.ok, report.summary()
+    assert report.prefix == "nodestro_" and report.schema == database.schema
+    assert report.version is None  # Nodestro runs its own migrations; orkexa's version table does not exist

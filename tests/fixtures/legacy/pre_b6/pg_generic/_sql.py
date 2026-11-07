@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/_sql.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """The statement catalog of the generic PostgreSQL part, its executor and the partition guard (MUP-ONA B4).
 
 Every SQL text of the index, the file store and the memory is a named :class:`Statement` of :data:`CATALOG`: its

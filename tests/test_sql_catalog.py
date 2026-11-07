@@ -1,41 +1,49 @@
-"""The statement catalog of the generic PostgreSQL part (:mod:`nodestro_runtime.pg_generic._sql`, MUP-ONA B4).
+"""Orkexa's statement catalog, checked with Nodestro's tables and rules (MUP-ONA B4: T-CAT-1..4; B6: T-CAT-5, T-PKG-3).
 
-The tenant SQL check reads Nodestro's SQL from the source (``tests/test_tenant_filters.py``); the generic part's SQL is
-its catalog, whose templates name the tables only as ``{chunks}`` ... So the catalog is checked here, rendered:
+The tenant SQL check reads Nodestro's SQL from the source (``tests/test_tenant_filters.py``). Since MUP-ONA B6 the SQL
+of the knowledge index, file store and memory is the statement catalog of Orkexa's PostgreSQL backends
+(``orkexa.backends.postgres``, at the pinned orkexa commit), whose templates name the tables only as ``{chunks}`` ...
+So the catalog is checked here, rendered with Nodestro's prefix ``nodestro_`` and judged with **Nodestro's** tenant
+tables from **Nodestro's** migrations (T-CAT-5); Orkexa's own catalog tests (prefix ``t_``) do not replace this:
 
-* **T-CAT-1** every entry rendered with Nodestro's prefix ``nodestro_`` is bound to one tenant by the rule engine
-  (:func:`nodestro_runtime.sqlcheck_rules.check_statement` with Nodestro's tenant tables from the migrations); no
-  ``leak``, ``unparsed`` or ``unsupported``.
-* **T-CAT-2** mutation probe: for every partitioned entry, each ``tenant_id`` predicate removed, each ``AND`` next to
-  it turned into ``OR``, and (``INSERT ... VALUES``) the ``tenant_id`` column dropped, is a ``leak``. With
+* **T-CAT-1/T-CAT-5** every entry rendered with ``nodestro_`` is bound to one tenant by the rule engine
+  (:func:`orkexa.testing.sqlcheck.check_statement` with Nodestro's tenant tables); no ``leak``, ``unparsed`` or
+  ``unsupported``.
+* **T-CAT-2/T-CAT-5** mutation probe: for every partitioned entry, each ``tenant_id`` predicate removed, each ``AND``
+  next to it turned into ``OR``, and (``INSERT ... VALUES``) the ``tenant_id`` column dropped, is a ``leak``. With
   ``NODESTRO_CATALOG_REPORTS`` set, the probe's outcome is written to ``<dir>/mutation-probe.json`` (a CI artifact).
-* **T-CAT-3** completeness: the catalog's names are exactly :data:`EXPECTED` (with their partition flag); a new entry
-  fails until it is listed here, and every partitioned entry gets the mutation probe and the guard cases of
-  ``tests/test_partition_guard.py`` by parametrization.
-* **T-CAT-4** AST checks: outside ``_sql.py`` no module of the package calls ``.execute``; no ``sql.Literal`` and no
-  private API of Nodestro's ``PostgresDatabase``; the package imports nothing of Nodestro.
+* **T-CAT-3** completeness: the catalog's names are exactly :data:`EXPECTED` (with their partition flag), the list
+  Nodestro reviewed; an orkexa pin whose catalog has a new entry fails until it is listed here, and every partitioned
+  entry gets the mutation probe and the guard cases of ``tests/test_partition_guard.py`` by parametrization.
+* **T-CAT-4** (B6 form) Nodestro holds no generic PostgreSQL code any more: no ``pg_generic`` package, no
+  ``sqlcheck_rules`` module, no class of Nodestro implements an Orkexa storage interface on PostgreSQL except as a
+  subclass of Orkexa's backend, and no module of Nodestro imports a private module of ``orkexa.backends.postgres``.
+* **T-PKG-3** the desktop profile (no psycopg, no pglast) imports the runtime and its storage modules, and none of
+  them imports Orkexa's PostgreSQL backends or psycopg.
 """
 
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any
 
+from orkexa.backends.postgres import CATALOG, Statement, render
+from orkexa.backends.postgres._sql import PARTITION, TABLES
+from orkexa.testing.sqlcheck import check_statement
 import pytest
 
 import nodestro_runtime
-from nodestro_runtime import pg_generic
-from nodestro_runtime.pg_generic._sql import CATALOG, PARTITION, TABLES, Statement, render
-from nodestro_runtime.sqlcheck_rules import check_statement
 from nodestro_runtime.tenant_sql_check import tenant_tables
 
-PACKAGE = Path(pg_generic.__file__).parent
-TENANT_TABLES = frozenset(tenant_tables(Path(nodestro_runtime.__file__).parent / "migrations" / "postgres"))
+PACKAGE = Path(nodestro_runtime.__file__).parent
+TENANT_TABLES = frozenset(tenant_tables(PACKAGE / "migrations" / "postgres"))
 PREFIX = "nodestro_"
 
 #: T-CAT-3: every statement of the catalog and whether it is partitioned by tenant. An unpartitioned entry names no
@@ -104,6 +112,7 @@ def _findings(text: str) -> list[str]:
 
 
 # MUP-ONA T-CAT-1
+# MUP-ONA T-CAT-5
 @pytest.mark.parametrize("name", sorted(CATALOG))
 def test_every_rendered_entry_is_bound_to_one_tenant(name: str) -> None:
     # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
@@ -158,6 +167,7 @@ _PROBE: dict[str, list[dict[str, Any]]] = {}
 
 
 # MUP-ONA T-CAT-2
+# MUP-ONA T-CAT-5
 @pytest.mark.parametrize("name", PARTITIONED)
 def test_every_mutation_of_a_partitioned_entry_leaks(name: str) -> None:
     probe = mutations(CATALOG[name])
@@ -179,7 +189,7 @@ def _write_probe() -> None:
     path = Path(target) / "mutation-probe.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     report = {
-        "test": "T-CAT-2 (tests/test_sql_catalog.py)",
+        "test": "T-CAT-2/T-CAT-5 (tests/test_sql_catalog.py, orkexa's catalog with Nodestro's rules)",
         "prefix": PREFIX,
         "entries": len(_PROBE),
         "mutations": sum(len(found) for found in _PROBE.values()),
@@ -241,87 +251,113 @@ def test_every_entry_binds_its_values() -> None:
         assert words in expected, name
 
 
-# ---- T-CAT-4: no free execute, no literal, no Nodestro ----------------------------------------------------------
+# ---- T-CAT-4 (B6): no generic PostgreSQL code in Nodestro ------------------------------------------------------
+
+#: Orkexa's storage interfaces: a Nodestro class may implement one on PostgreSQL only through Orkexa's backend.
+_INTERFACES = {"Index", "ReindexableIndex", "FileStore", "MemoryBackend"}
 
 
 def _modules() -> list[Path]:
-    found = sorted(PACKAGE.glob("*.py"))
-    assert {path.name for path in found} >= {"__init__.py", "_sql.py", "connection.py", "index.py", "files.py"}
+    found = sorted(PACKAGE.rglob("*.py"))
+    assert PACKAGE / "postgres_tables.py" in found
     return found
 
 
 # MUP-ONA T-CAT-4
-def test_no_module_outside_the_catalog_runs_sql() -> None:
-    """Outside ``_sql.py`` the only ``execute`` is the executor's, with a catalog name as a constant (so every
-    statement that runs is one T-CAT-1/2 check), and every catalog entry is used."""
+def test_the_generic_part_and_the_rule_engine_are_gone_from_nodestro() -> None:
+    """B6 deleted ``nodestro_runtime.pg_generic`` and ``nodestro_runtime.sqlcheck_rules`` (taken over into orkexa in
+    B5); a copy that comes back would be checked by nobody."""
+    assert importlib.util.find_spec("nodestro_runtime.pg_generic") is None
+    assert importlib.util.find_spec("nodestro_runtime.sqlcheck_rules") is None
+    assert not (PACKAGE / "pg_generic").exists()
+
+
+def test_no_class_of_nodestro_implements_a_storage_interface_on_postgres_itself() -> None:
+    """The grep evidence of the plan (no ``class PostgresIndex(Index)`` outside orkexa), as an AST check: every class
+    of Nodestro named ``Postgres*`` that derives from an Orkexa storage interface does so through
+    ``orkexa.backends.postgres``."""
     offenders = []
-    used: set[str] = set()
     for path in _modules():
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Attribute) and node.attr in {"executemany", "copy", "cursor", "stream"}:
-                offenders.append(f"{path.name}:{node.lineno} .{node.attr}")
-            if path.name == "_sql.py" or not isinstance(node, ast.Call):
+            if not isinstance(node, ast.ClassDef):
                 continue
-            function = node.func
-            if isinstance(function, ast.Attribute) and function.attr in {"execute", "_rows"}:
-                first = node.args[0] if node.args else None
-                if isinstance(first, ast.Name) and (path.name, first.id, function.attr) == (
-                    "index.py",
-                    "name",
-                    "execute",
-                ):
-                    continue  # PostgresIndex._rows(name, ...), whose callers pass constants (checked here)
-                if not (isinstance(first, ast.Constant) and first.value in CATALOG):
-                    offenders.append(f"{path.name}:{node.lineno} .{function.attr} without a catalog name")
-                elif function.attr == "execute" and ast.unparse(function.value) != "self._sql":
-                    offenders.append(f"{path.name}:{node.lineno} .execute outside the executor")
-                else:
-                    used.add(first.value)
+            bases = [ast.unparse(base) for base in node.bases]
+            direct = any(
+                base.split(".")[-1] in _INTERFACES and not base.startswith("orkexa_postgres.") for base in bases
+            )
+            postgres = "Postgres" in node.name or path.name in {"postgres_tables.py", "storage_postgres.py"}
+            if direct and postgres:
+                offenders.append(f"{path.relative_to(PACKAGE)}:{node.lineno} class {node.name}({', '.join(bases)})")
     assert offenders == []
-    assert used == set(CATALOG)
+    from nodestro_runtime import postgres_tables
+
+    for name in ("PostgresIndex", "PostgresFileStore", "PostgresMemory"):
+        subclass = getattr(postgres_tables, name)
+        assert subclass.__mro__[1].__module__.startswith("orkexa.backends.postgres."), (name, subclass.__mro__)
 
 
-def test_the_generic_part_binds_values_and_uses_no_private_database_api() -> None:
+def test_nodestro_uses_only_the_public_package_of_the_postgres_backend() -> None:
+    """``orkexa.backends.postgres._sql`` and ``._vector`` are private to orkexa (they may change in any release); the
+    runtime imports the package (or its public modules) only. Tests may look inside."""
     offenders = []
     for path in _modules():
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Attribute):
-                if node.attr in {"Literal", "_query", "_write", "_encode", "_connection", "_pool"}:
-                    offenders.append(f"{path.name}:{node.lineno} .{node.attr}")
-                if node.attr in {"_lock", "_transaction"} and not (
-                    isinstance(node.value, ast.Name) and node.value.id == "self"
-                ):
-                    offenders.append(f"{path.name}:{node.lineno} .{node.attr} of another object")
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("psycopg"):
-                offenders.extend(f"{path.name}:{node.lineno} {a.name}" for a in node.names if a.name == "Literal")
-    assert offenders == []
-
-
-def test_the_generic_part_imports_nothing_of_nodestro() -> None:
-    """import-linter (pyproject.toml) does not see an import of the package root; this does."""
-    allowed = set(sys.stdlib_module_names) | {"__future__", "orkexa", "psycopg"}
-    for path in _modules():
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names: list[str] = []
             if isinstance(node, ast.Import):
-                tops = {alias.name.split(".")[0] for alias in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                if node.level:  # relative: only within the package
-                    assert node.level == 1, f"{path.name}:{node.lineno}"
-                    continue
-                tops = {(node.module or "").split(".")[0]}
-            else:
-                continue
-            assert tops <= allowed, f"{path.name}:{node.lineno} imports {tops - allowed}"
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module or ""]
+                if node.module == "orkexa.backends.postgres":
+                    names += [f"{node.module}.{alias.name}" for alias in node.names]
+            for name in names:
+                if name.startswith("orkexa.backends.postgres.") and name.split(".")[3].startswith("_"):
+                    offenders.append(f"{path.relative_to(PACKAGE)}:{node.lineno} {name}")
+    assert offenders == []
 
 
-def test_psycopg_is_imported_only_to_render() -> None:
-    """The generic part imports without psycopg (a host without the driver gets a clear error only on use)."""
-    import subprocess
+# ---- T-PKG-3: the desktop profile -------------------------------------------------------------------------------
 
+#: What the desktop imports for its storage: the package and the modules of the SQLite knowledge base, memory and
+#: workspace.
+DESKTOP_MODULES = (
+    "nodestro_runtime",
+    "nodestro_runtime.engine",
+    "nodestro_runtime.knowledge",
+    "nodestro_runtime.memory_spaces",
+    "nodestro_runtime.sqlite_tables",
+    "nodestro_runtime.storage",
+    "nodestro_runtime.workspace",
+)
+
+
+# MUP-ONA T-PKG-3
+def test_the_desktop_profile_imports_without_psycopg_and_pglast() -> None:
+    """Without the postgres extra (psycopg, psycopg_pool) and the dev parser (pglast) the runtime imports, and none of
+    the desktop's modules pulls in Orkexa's PostgreSQL backends, Nodestro's PostgreSQL modules or a driver."""
     code = (
-        "import sys; sys.modules['psycopg'] = None\n"
-        "import nodestro_runtime.pg_generic as g\n"
-        "print(sorted(m for m in sys.modules if m.startswith('psycopg') and sys.modules[m] is not None))"
+        "import sys\n"
+        "for name in ('psycopg', 'psycopg_pool', 'pglast'):\n"
+        "    sys.modules[name] = None\n"
+        f"for name in {DESKTOP_MODULES!r}:\n"
+        "    __import__(name)\n"
+        "prefixes = ('orkexa.backends.postgres', 'psycopg', 'pglast', 'nodestro_runtime.postgres',\n"
+        "            'nodestro_runtime.storage_postgres')\n"
+        "loaded = sorted(m for m in sys.modules if sys.modules[m] is not None and m.startswith(prefixes))\n"
+        "print(loaded)\n"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120)
-    assert result.stdout.strip() == "[]"
+    assert result.stdout.strip() == "[]", result.stdout
+
+
+def test_the_server_modules_import_without_psycopg_and_fail_only_on_use() -> None:
+    """Orkexa's backends import psycopg late (orkexa T-PKG-2): even Nodestro's PostgreSQL wiring imports without the
+    driver, so an installation without the extra fails with a clear error on use, not on import."""
+    code = (
+        "import sys\n"
+        "sys.modules['psycopg'] = None\n"
+        "import nodestro_runtime.postgres_tables as t\n"
+        "drivers = sorted(m for m in sys.modules if m.startswith('psycopg') and sys.modules[m] is not None)\n"
+        "print(t.LAYOUT.prefix, drivers)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120)
+    assert result.stdout.strip() == "nodestro_ []"

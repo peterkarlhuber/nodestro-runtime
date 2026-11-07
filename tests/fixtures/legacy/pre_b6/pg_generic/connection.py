@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/connection.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """Where the generic PostgreSQL classes get their connections: the :class:`ConnectionSource` protocol (MUP-ONA B4).
 
 The generic part (:mod:`nodestro_runtime.pg_generic`) never opens, pools or locks a connection itself. A host passes

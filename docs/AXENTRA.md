@@ -156,9 +156,10 @@ Instead, a static check keeps every statement bound to one tenant (security revi
 unsound: a substring test for `tenant_id` on five tables of the runtime only). `nodestro_runtime/tenant_sql_check.py`,
 run by `tests/test_tenant_filters.py` of the runtime and of the API. Since MUP-ONA B4 it has two parts: the source
 side (tables from the migrations, rebuilding statements from Python source, allowlist) stays in `tenant_sql_check.py`;
-whether one statement is bound to one tenant is decided by the rule engine `sqlcheck_rules.py`
-(`check_statement(sql, *, tenant_tables, column, placeholder, allow_any)`), which holds no Nodestro constant and
-imports only `pglast` (import-linter contract), so orkexa can take it over (B5). The rules are:
+whether one statement is bound to one tenant is decided by the rule engine (`check_statement(sql, *, tenant_tables,
+column, placeholder, allow_any)`), which holds no Nodestro constant and imports only `pglast`. B4 separated it as
+`sqlcheck_rules.py`, B5 took it over into orkexa unchanged as `orkexa.testing.sqlcheck` (extra `orkexa[sqlcheck]`), and
+since B6 the check calls Orkexa's engine at the pinned orkexa commit (Nodestro's copy is deleted). The rules are:
 
 - tenant tables are every `nodestro_*` table with a `tenant_id` column in the migrations (read at test time, so a new
   table is covered at once): documents, files, chunks, memory files, jobs, run events, schedule firings, sessions,
@@ -225,41 +226,50 @@ that needs it passes only through an allowlist entry whose reason (more than 30 
 exactly one tenant. At the time of this rule neither the runtime nor the API had such a statement, so no entry was
 added.
 
-**Rule for checker changes.** A runtime PR that changes `tenant_sql_check.py`, `sqlcheck_rules.py`,
-`tenant_sql_allowlist.py` or a migration is ready to merge only when a nodestro-api PR with a temporary integration
+**Rule for checker changes.** A runtime PR that changes `tenant_sql_check.py`, the orkexa pin (rule engine and
+statement catalog), `tenant_sql_allowlist.py` or a migration is ready to merge only when a nodestro-api PR with a temporary integration
 pin on that runtime commit shows a green `tenant-sql` job; both PRs are linked to each other (see `CONTRIBUTING.md`).
 
-**M10 evidence: catalog + engine + parity (MUP-ONA B4, decision O5).** Since B4 the SQL of the knowledge index, the
-file store and the memory is no longer written in the methods that run it. The generic part of those classes lives in
-`nodestro_runtime/pg_generic/` (taken over into orkexa as `orkexa.backends.postgres` in B5) and runs SQL only through
-its statement catalog `pg_generic/_sql.py`: 43 named statements whose templates name the tables as `{chunks}`,
-`{vectors}`, `{spaces}`, `{files}`, `{memory}` and bind every value by name (`%(tenant_id)s`); the tables are rendered
-with `psycopg.sql.Identifier(prefix + table)` for a prefix that matches `^[a-z][a-z0-9_]{0,30}_$` (Nodestro:
-`nodestro_`), never with a value in the text (no `sql.Literal`). The generic part gets its connections only through
-the `ConnectionSource` protocol (`pg_generic/connection.py`; Nodestro's adapter `storage_postgres.DatabaseSource`
-runs reads, writes and transactions exactly as `PostgresDatabase` did) and imports nothing of Nodestro (import-linter
-contract). The source check above cannot see a template's tables, so the catalog is checked rendered, and four kinds
-of evidence keep the coverage:
+**M10 evidence: catalog + engine + parity (MUP-ONA B4, decision O5; Orkexa's backend since B6).** The SQL of the
+knowledge index, the file store and the memory is not written in the methods that run it. B4 separated the generic
+part of those classes, B5 took it over into orkexa, and since B6 Nodestro uses `orkexa.backends.postgres` at the pinned
+orkexa commit: `postgres_tables.py` holds only subclasses with Nodestro's wiring (`PostgresLayout("nodestro_")`, the
+`ConnectionSource` adapter `storage_postgres.DatabaseSource`, which runs reads, writes and transactions exactly as
+`PostgresDatabase` did, and the database's process lock) and four statements of its own (chunk counts, attaching a
+file, a source's text, memory totals), which the source check reads. Orkexa's backend runs SQL only through its
+statement catalog: 43 named statements whose templates name the tables as `{chunks}`, `{vectors}`, `{spaces}`,
+`{files}`, `{memory}` and bind every value by name (`%(tenant_id)s`); the tables are rendered with
+`psycopg.sql.Identifier(prefix + table)` for a prefix that matches `^[a-z][a-z0-9_]{0,30}_$`, never with a value in the
+text (no `sql.Literal`). Orkexa's own tests check its catalog with its own prefix; Nodestro checks it again with its
+prefix, its tenant tables and its engine configuration, so the evidence does not depend on Orkexa's tests:
 
-- **engine** (`tests/test_sqlcheck_rules.py`, T-SQLC-1): the rule engine is generic (foreign column and tables);
-- **catalog** (`tests/test_sql_catalog.py`): every entry rendered with `nodestro_` is bound by the engine with
-  Nodestro's tenant tables (T-CAT-1); a mutation probe removes each `tenant_id` predicate, turns each `AND` next to one
-  into `OR` and drops the `tenant_id` column of each `INSERT ... VALUES`, and every one of the 92 mutations of the 42
-  partitioned entries must leak (T-CAT-2; the CI `test` job uploads the outcome as the artifact
-  `sql-catalog-mutation-probe-<python>`); the catalog's names and partition flags equal a checked-in list (T-CAT-3);
-  and no module of the package runs SQL except the executor with a catalog name as a constant (T-CAT-4);
-- **runtime guard** (`tests/test_partition_guard.py`): the executor refuses a partitioned statement unless
-  `tenant_id` is bound to a non-empty string of at most 128 characters that is the instance's own tenant
-  (`RetrievalError("partition.missing")`, raised before any database access; T-GUARD-1), and a bad prefix is refused
-  before anything is rendered (T-GUARD-2);
-- **parity** (`tests/test_sql_parity.py`, T-PAR-1): the 46 statements the check found in `postgres_tables.py` before
-  B4 (`tests/fixtures/sql_parity_before.json`) are all found again, normalized by PostgreSQL's grammar, in the source
-  the check reads now (the four Nodestro statements that stayed in `postgres_tables.py`: chunk counts, attaching a
-  file, a source's text, memory totals) or in the rendered catalog (the other 42), with no new finding. The source
-  scan reports no `dynamic` finding for the package, and no allowlist entry was added.
+- **engine** (`tests/test_sqlcheck_rules.py`, T-SQLC-1): the rule engine at the pinned commit is generic (foreign
+  column and tables);
+- **catalog** (`tests/test_sql_catalog.py`, T-CAT-5): every entry of Orkexa's catalog rendered with `nodestro_` is
+  bound by the engine with Nodestro's tenant tables from Nodestro's migrations (T-CAT-1); a mutation probe removes each
+  `tenant_id` predicate, turns each `AND` next to one into `OR` and drops the `tenant_id` column of each `INSERT ...
+  VALUES`, and every one of the 92 mutations of the 42 partitioned entries must leak (T-CAT-2; the CI `test` job
+  uploads the outcome as the artifact `sql-catalog-mutation-probe-<python>`); the catalog's names and partition flags
+  equal a checked-in list, so an orkexa pin with a new statement fails until it is reviewed here (T-CAT-3); Nodestro
+  holds no generic PostgreSQL code (no `pg_generic`, no `sqlcheck_rules`, no class that implements an Orkexa storage
+  interface on PostgreSQL except through Orkexa's backend) and imports no private module of it (T-CAT-4);
+- **runtime guard** (`tests/test_partition_guard.py`): Orkexa's executor refuses a partitioned statement unless
+  `tenant_id` is bound to a non-empty string of at most 128 characters without U+0000 that is the instance's own
+  tenant (`RetrievalError("partition.missing")`, raised before any database access; T-GUARD-1), a bad prefix is refused
+  before anything is rendered (T-GUARD-2), and Nodestro's classes refuse every tenant id outside its own rule
+  (`TENANT_ID`) before Orkexa's class is built;
+- **parity** (`tests/test_sql_parity.py`, T-PAR-1/T-PAR-3): the 46 statements the check found in `postgres_tables.py`
+  before B4 (`tests/fixtures/sql_parity_before.json`) are all found again, normalized by PostgreSQL's grammar, in the
+  source the check reads now (the four statements above) or in Orkexa's rendered catalog (the other 42), with no new
+  finding. The source scan reports no `dynamic` finding, and no allowlist entry was added.
 
-The partition suites (T-PART-1..9, conformance, ranking T-RANK-1) run unchanged against the new classes on `pg-a` and
-`pg-b`, as superuser and as the restricted runtime role. The `ConnectionSource` has the hook for a transaction-local
+The partition suites (T-PART-1..9, conformance, ranking T-RANK-1) run unchanged against Nodestro's classes on `pg-a` and
+`pg-b`, as superuser and as the restricted runtime role. **Start check (B6):** a server calls
+`postgres_tables.require_knowledge_schema(database)` after the migration check: Orkexa's read-only `verify_schema` with
+Nodestro's layout (tables, columns with type, nullability, collation and default, indexes; whether pgvector is
+installed). A deviation, e.g. a dropped index or a changed column type that the migration checksums cannot see, stops
+the start with `storage.schema_mismatch` listing every problem; nothing is changed (T-UPG-7). Nodestro keeps its own
+migration runner; Orkexa's `migrate` is never called. The `ConnectionSource` has the hook for a transaction-local
 `set_config('app.tenant_id', ..., true)` (`DatabaseSource(..., tenant_setting="app.tenant_id")`), off until row-level
 security is enabled (A9).
 

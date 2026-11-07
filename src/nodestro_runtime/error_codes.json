@@ -371,7 +371,6 @@
   "memory.space_name": ["name"],
   "model.choice_invalid": ["configured", "model"],
   "model.local_unavailable": [],
-  "partition.missing": [],
   "preview.not_agent": [],
   "pricing.cache_read_above_input": [],
   "pricing.currency": [],

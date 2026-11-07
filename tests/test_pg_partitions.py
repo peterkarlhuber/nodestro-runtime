@@ -294,7 +294,8 @@ def test_the_switch_embeds_what_the_last_round_left(
     never get below one batch. Before, the switch embedded at most one batch and failed every attempt with
     ``vector_incomplete`` (T-PART-CC under CI load). Now it embeds the rest while writes wait, up to
     ``_REINDEX_SWITCH_CHUNKS``; above that, writes outpace the model and the reindex still says so."""
-    from nodestro_runtime.pg_generic import index as pg_index
+    from orkexa.backends.postgres import index as pg_index
+
     from nodestro_runtime.postgres_tables import PostgresIndex
 
     if ranking == "database" and not PostgresIndex(database, TENANTS[0], namespace="probe").pgvector():

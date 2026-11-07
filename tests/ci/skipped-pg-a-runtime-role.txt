@@ -18,5 +18,7 @@ tests.test_knowledge_retrieval::test_uploads_work_while_the_model_server_is_down
 tests.test_legacy_fixtures::test_restored_fixture_passes_the_migration_check_and_keeps_its_data[FX-PG-0v.sql.gz]  # FX-PG-0v needs a server with pgvector; the pg-a service is postgres:17 (runs in pg-b)
 tests.test_pg_drift::test_refresh_detects_pgvector_again  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
 tests.test_pgvector_status::test_states_on_a_real_server  # needs a PostgreSQL server with pgvector (NODESTRO_TEST_PGVECTOR); the pg-a service postgres:17 has none (runs in pg-b)
+tests.test_upgrade_legacy::test_u2_upgrade_with_pgvector_starts_with_the_schema_check  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
+tests.test_upgrade_legacy::test_u4_the_schema_check_reports_pgvector_installed_later  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
 tests.test_upgrade_scenarios::test_u2_upgrade_with_pgvector_ranks_alike_in_both_paths  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
 tests.test_upgrade_scenarios::test_u4_pgvector_installed_later_is_used_after_refresh  # the pg-a service postgres:17 has no pgvector (runs in pg-b)

@@ -1,19 +1,19 @@
 """Knowledge files, their search index and memory spaces on PostgreSQL (ADR-0002, server profile).
 
 The Orkexa backends Nodestro uses on the desktop (``SQLiteFileStore``, ``SQLiteIndex``, ``SQLiteMemory``) keep
-their data in SQLite tables. These classes implement the same Orkexa interfaces (``FileStore``, ``Index``,
-``MemoryBackend``) on the tables of migrations ``0002`` and ``0010`` for one tenant and one Orkexa namespace, on the
-connection pool and lock of a :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Every query filters on
-``tenant_id``.
+their data in SQLite tables. On a server Nodestro uses Orkexa's PostgreSQL backends
+(:mod:`orkexa.backends.postgres`: ``PostgresIndex``, ``PostgresFileStore``, ``PostgresMemory``) on the tables of
+migrations ``0002`` and ``0010`` for one tenant and one Orkexa namespace. Every statement binds ``tenant_id``.
 
-Since MUP-ONA B4 the implementation is the generic PostgreSQL part :mod:`nodestro_runtime.pg_generic` (taken over into
-orkexa as ``orkexa.backends.postgres`` in B5): this module is Nodestro's part. It wires the generic classes to a
-:class:`~nodestro_runtime.storage_postgres.PostgresDatabase` (through its ``ConnectionSource`` adapter
-:class:`~nodestro_runtime.storage_postgres.DatabaseSource`, with the table prefix ``nodestro_`` and Nodestro's rule for
-tenant ids), and adds what Nodestro reads beside the Orkexa interfaces: chunk counts per source, pointing a source's
-chunks to its file, a source's indexed text, and the memory totals of a tenant. Their SQL stays here, where the tenant
-SQL check reads it from the source; the generic part's SQL is its statement catalog, which the check renders
-(``tests/test_sql_catalog.py``). Search, hybrid fusion and vectors: :mod:`nodestro_runtime.pg_generic.index`.
+Since MUP-ONA B6 this module is only Nodestro's part (B4 separated the generic part, B5 moved it into orkexa): it
+wires Orkexa's classes to a :class:`~nodestro_runtime.storage_postgres.PostgresDatabase` (through its
+``ConnectionSource`` adapter :class:`~nodestro_runtime.storage_postgres.DatabaseSource` and its process lock, with
+Nodestro's tables :data:`LAYOUT` and Nodestro's rule for tenant ids), and adds what Nodestro reads beside the Orkexa
+interfaces: chunk counts per source, pointing a source's chunks to its file, a source's indexed text, and the memory
+totals of a tenant. Their SQL stays here, where the tenant SQL check reads it from the source; Orkexa's SQL is its
+statement catalog, which the check renders with Nodestro's prefix (``tests/test_sql_catalog.py``).
+:func:`require_knowledge_schema` is the read-only start check of these tables (``verify_schema``); Nodestro's own
+migration runner (:meth:`~nodestro_runtime.storage_postgres.PostgresDatabase.migrate`) still creates them.
 """
 
 from __future__ import annotations
@@ -21,14 +21,22 @@ from __future__ import annotations
 import builtins
 from typing import TYPE_CHECKING, Any
 
+from orkexa.backends import postgres as orkexa_postgres
+from orkexa.backends.postgres import (
+    MAX_SOURCES,
+    PostgresLayout,
+    PostgresVectorStatus,
+    SchemaReport,
+    search_words,
+    verify_schema,
+)
 from orkexa.embeddings import EmbeddingModel
 from orkexa.retrieval import LEXICAL_WEIGHT, HybridFusion, RetrievalMode
 
-from . import pg_generic
 from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
 from .memory_spaces import BrowsableMemory
-from .pg_generic import MAX_SOURCES, PostgresVectorStatus, search_words
+from .problems import NodestroError
 from .storage_postgres import TENANT_ID, DatabaseSource, PostgresDatabase
 
 if TYPE_CHECKING:
@@ -37,6 +45,8 @@ if TYPE_CHECKING:
 
 #: The prefix of Nodestro's tables (``nodestro_chunks`` ...; migrations ``0002`` and ``0010``).
 TABLE_PREFIX = "nodestro_"
+#: Nodestro's tables as Orkexa names them (``orkexa.backends.postgres.PostgresLayout``).
+LAYOUT = PostgresLayout(TABLE_PREFIX)
 
 
 def _check(tenant_id: str, namespace: str) -> None:
@@ -46,7 +56,7 @@ def _check(tenant_id: str, namespace: str) -> None:
         raise ValueError("namespace must not be empty")
 
 
-class PostgresFileStore(pg_generic.PostgresFileStore):
+class PostgresFileStore(orkexa_postgres.PostgresFileStore):
     """An Orkexa :class:`~orkexa.FileStore` of one tenant and namespace (table ``nodestro_files``)."""
 
     def __init__(
@@ -64,7 +74,7 @@ class PostgresFileStore(pg_generic.PostgresFileStore):
         super().__init__(
             source,
             tenant_id,
-            prefix=TABLE_PREFIX,
+            layout=LAYOUT,
             namespace=namespace,
             lock=source.lock,  # one lock for every user of the database
             files_api=files_api,
@@ -74,7 +84,7 @@ class PostgresFileStore(pg_generic.PostgresFileStore):
         self.database = database
 
 
-class PostgresIndex(pg_generic.PostgresIndex):
+class PostgresIndex(orkexa_postgres.PostgresIndex):
     """An Orkexa :class:`~orkexa.Index` of one tenant and namespace with full-text search (``nodestro_chunks``).
 
     Also gives what Nodestro reads beside the Orkexa interface (``KnowledgeChunks`` on SQLite): chunk counts per
@@ -98,7 +108,7 @@ class PostgresIndex(pg_generic.PostgresIndex):
         super().__init__(
             source,
             tenant_id,
-            prefix=TABLE_PREFIX,
+            layout=LAYOUT,
             namespace=namespace,
             lock=source.lock,
             max_chars=max_chars,
@@ -136,7 +146,7 @@ class PostgresIndex(pg_generic.PostgresIndex):
         return "\n".join(str(row[0]) for row in rows)
 
 
-class PostgresMemory(pg_generic.PostgresMemory):
+class PostgresMemory(orkexa_postgres.PostgresMemory):
     """An Orkexa memory (``/memories``) of one tenant and namespace (table ``nodestro_memory_files``).
 
     Every command runs in one transaction, as with ``SQLiteMemory``."""
@@ -155,7 +165,7 @@ class PostgresMemory(pg_generic.PostgresMemory):
         super().__init__(
             source,
             tenant_id,
-            prefix=TABLE_PREFIX,
+            layout=LAYOUT,
             namespace=namespace,
             lock=source.lock,
             max_file_chars=max_file_chars,
@@ -215,6 +225,27 @@ def tenant_storage(
     )
 
 
+def require_knowledge_schema(database: PostgresDatabase) -> SchemaReport:
+    """The start check of the knowledge and memory tables (MUP-ONA B6): Orkexa's read-only
+    :func:`~orkexa.backends.postgres.verify_schema` with :data:`LAYOUT`.
+
+    A server calls it after :meth:`~nodestro_runtime.storage_postgres.PostgresDatabase.require_current_schema` and
+    before it serves a tenant. It changes nothing and needs no DDL privilege (the runtime role is enough). Returns the
+    report (whether pgvector is installed, the schema that holds the tables); raises ``storage.schema_mismatch`` with
+    every difference (``problems``) when the tables are not the ones Orkexa's backends read, e.g. a missing index or a
+    changed column type: then the server must not start, and nothing was changed."""
+    report = verify_schema(DatabaseSource(database), LAYOUT)
+    if not report.ok:
+        raise NodestroError(
+            "storage.schema_mismatch",
+            "The knowledge and memory tables of the PostgreSQL database are not the ones this release reads:\n"
+            + report.summary()
+            + "\nNothing was changed. Restore the tables of migrations 0001-0010 (see the server RUNBOOK)",
+            problems=[str(problem) for problem in report.problems],
+        )
+    return report
+
+
 def memory_totals(database: PostgresDatabase, tenant_id: str, prefix: str) -> builtins.list[tuple[str, int, int]]:
     """``(namespace, files, bytes)`` of every memory namespace of the tenant starting with ``prefix``."""
     _check(tenant_id, "-")
@@ -227,6 +258,7 @@ def memory_totals(database: PostgresDatabase, tenant_id: str, prefix: str) -> bu
 
 
 __all__ = [
+    "LAYOUT",
     "MAX_SOURCES",
     "TABLE_PREFIX",
     "PostgresFileStore",
@@ -237,6 +269,7 @@ __all__ = [
     "PostgresVectorStatus",
     "knowledge_tables",
     "memory_totals",
+    "require_knowledge_schema",
     "search_words",
     "tenant_storage",
 ]

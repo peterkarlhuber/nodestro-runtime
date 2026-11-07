@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/_vector.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """Vector helpers of the generic PostgreSQL index: embedding batches and ranking in Python (MUP-ONA B4).
 
 Without pgvector the index ranks the stored vectors itself (:func:`cosine`), with the same result as pgvector's

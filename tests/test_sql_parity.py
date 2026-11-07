@@ -1,13 +1,14 @@
-"""SQL parity before and after the statement catalog (MUP-ONA B4, T-PAR-1).
+"""SQL parity before and after the statement catalog (MUP-ONA B4: T-PAR-1; B6: T-PAR-3).
 
 ``tests/fixtures/sql_parity_before.json`` lists every statement the tenant SQL check found in ``postgres_tables.py``
 before B4 changed code (written by ``tests/fixtures/make_sql_parity.py`` at that commit, never regenerated). B4 moved
-most of them into the catalog of :mod:`nodestro_runtime.pg_generic._sql`, which the check sees only rendered
-(``tests/test_sql_catalog.py``). T-PAR-1 proves that no statement dropped out of the check: every statement of the
-baseline is found again -- in the source the check reads now (``postgres_tables.py`` and the generic package), or in
-the catalog rendered with ``nodestro_`` -- compared normalized (PostgreSQL's grammar prints both back, placeholders
-as ``$?``: B4 changed positional placeholders into named ones and nothing else), and with no finding the baseline did
-not have.
+most of them into a statement catalog, B5 took the catalog over into orkexa (``orkexa.backends.postgres``) and B6
+switched Nodestro to it and deleted Nodestro's copy; the check sees the catalog only rendered
+(``tests/test_sql_catalog.py``). T-PAR-1/T-PAR-3 prove the coverage sum: no statement dropped out of the check. Every
+statement of the baseline is found again -- in the source the check reads now (``postgres_tables.py``), or in
+Orkexa's catalog rendered with ``nodestro_`` -- compared normalized (PostgreSQL's grammar prints both back,
+placeholders as ``$?``: B4 changed positional placeholders into named ones and nothing else), and with no finding the
+baseline did not have.
 """
 
 from __future__ import annotations
@@ -16,22 +17,20 @@ import json
 from pathlib import Path
 import re
 
+from orkexa.backends.postgres import CATALOG, render
+from orkexa.testing.sqlcheck import check_statement
 import pytest
 
 import nodestro_runtime
 from nodestro_runtime import tenant_sql_allowlist
-from nodestro_runtime.pg_generic._sql import CATALOG, render
-from nodestro_runtime.sqlcheck_rules import check_statement
 from nodestro_runtime.tenant_sql_check import statements_of, tenant_tables, to_postgres_params
 
 BASELINE = Path(__file__).parent / "fixtures" / "sql_parity_before.json"
 PACKAGE = Path(nodestro_runtime.__file__).parent
 TABLES = frozenset(tenant_tables(PACKAGE / "migrations" / "postgres"))
-#: The modules whose source the check reads after B4 (relative to the package's parent, as the check names them).
-AFTER_MODULES = (
-    "nodestro_runtime/postgres_tables.py",
-    *sorted(f"nodestro_runtime/pg_generic/{path.name}" for path in (PACKAGE / "pg_generic").glob("*.py")),
-)
+#: The modules whose source the check reads after B6 (relative to the package's parent, as the check names them): the
+#: generic package of B4 is gone (its SQL is Orkexa's catalog).
+AFTER_MODULES = ("nodestro_runtime/postgres_tables.py",)
 
 
 def normalized(text: str) -> str:
@@ -48,7 +47,7 @@ def _kinds(text: str) -> set[str]:
 
 
 def after() -> dict[str, tuple[str, set[str]]]:
-    """Normalized text -> (where, finding kinds) of every statement the check sees after B4."""
+    """Normalized text -> (where, finding kinds) of every statement the check sees after B6."""
     found: dict[str, tuple[str, set[str]]] = {}
     for module in AFTER_MODULES:
         source = (PACKAGE.parent / module).read_text(encoding="utf-8")
@@ -63,6 +62,7 @@ def after() -> dict[str, tuple[str, set[str]]]:
 
 
 # MUP-ONA T-PAR-1
+# MUP-ONA T-PAR-3
 def test_every_statement_of_the_baseline_is_still_checked() -> None:
     # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
     pytest.importorskip("psycopg")

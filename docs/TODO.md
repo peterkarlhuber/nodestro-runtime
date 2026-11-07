@@ -614,28 +614,17 @@ Packages of the MUP-ONA plan
 change this repository. Each entry is removed in the
 PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
 
-### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
+### RT-MUP-B6 · Switch to orkexa's PostgreSQL backend (MUP-ONA MP-B6)
 
 - **Priority:** P3 Low · **Status:** In progress · **Refs:**
   [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md),
-  `sqlcheck_rules.py`, `pg_generic/`, `tests/fixtures/sql_parity_before.json`
-- **What:** The generic PostgreSQL index, file store and memory code is mixed with product code; its SQL is not a
-  catalog.
-- **Done (PR 1, `mup/b4-sqlcheck-engine`):** parity baseline checked in before any change; the rule engine of the
-  tenant SQL check separated as `sqlcheck_rules.py` (parameterized, import-linter contract, T-SQLC-1).
-- **Done (PR 2, `mup/b4-pg-catalog`):** `pg_generic` package (`ConnectionSource` + `DatabaseSource` adapter,
-  statement catalog, executor with partition guard, index/files/memory), import-linter contract, T-CAT-1..4,
-  T-GUARD-1/2, T-PAR-1 (`docs/AXENTRA.md`, "M10 evidence: catalog + engine + parity").
-- **Next step:** merge PR 2 and the pin cascade (runtime -> examples + integrations -> api -> sdk -> studio ->
-  server/local-docker); then MP-B5 takes `pg_generic` and `sqlcheck_rules` over into orkexa.
-
-### RT-MUP-B6 · Switch to orkexa's PostgreSQL backend (MUP-ONA MP-B6)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** Nodestro keeps its own copy of the generic PostgreSQL backend.
-- **Next step:** Use `orkexa.backends.postgres`, remove the copy, and prove upgrade and rollback on FX-PG-0 (U1-U8).
-  Needs gate G1.
+  `postgres_tables.py`, `tests/test_upgrade_legacy.py`
+- **What:** Nodestro kept its own copy of the generic PostgreSQL backend and of the SQL rule engine.
+- **Done (`mup/b6-orkexa-postgres`):** `postgres_tables` on `orkexa.backends.postgres` (`PostgresLayout("nodestro_")`),
+  `pg_generic/` and `sqlcheck_rules.py` deleted, the tenant SQL check on `orkexa.testing.sqlcheck`, start check
+  `require_knowledge_schema`, T-CAT-5, T-PAR-3, T-PKG-3, T-UPG-1..8.
+- **Next step:** nodestro-api's start check and the pin cascade
+  (examples, integrations, api, sdk, studio, server, local-docker); image smoke and desktop run; gate G2.
 
 ## Cross-repository dependencies
 

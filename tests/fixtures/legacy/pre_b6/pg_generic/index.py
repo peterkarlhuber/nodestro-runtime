@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/index.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """An Orkexa :class:`~orkexa.Index` of one tenant and namespace on PostgreSQL, with full text and vectors (MUP-ONA B4).
 
 Tables (for a prefix ``p_``): ``p_chunks`` (chunks and their search words), ``p_vector_spaces`` and

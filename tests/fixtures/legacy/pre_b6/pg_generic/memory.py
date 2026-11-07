@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/memory.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """An Orkexa memory (``/memories``) of one tenant and namespace on PostgreSQL (table ``<prefix>memory_files``)."""
 
 from __future__ import annotations

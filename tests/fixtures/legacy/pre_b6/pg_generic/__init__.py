@@ -1,3 +1,6 @@
+# nodestro-runtime git 76f9cb2, src/nodestro_runtime/pg_generic/__init__.py: the generic PostgreSQL part
+# before MUP-ONA MP-B6, unchanged below this header. Part of the "old state" of the rollback scenario U3 after B6
+# (tests/test_upgrade_legacy.py, T-UPG-3), loaded only in a subprocess as nodestro_runtime.pg_generic. Never edit.
 """The generic PostgreSQL part of Nodestro's knowledge index, file store and memory (MUP-ONA B4).
 
 Everything here is meant to be taken over into orkexa unchanged (``orkexa.backends.postgres``, MUP-ONA B5): it imports
