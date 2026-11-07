@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Orkexa pinned to `028faa1` (orkexa #64, MUP-ONA B2): the SQLite backends moved to `orkexa.backends.sqlite`; every
+  old import path returns the same class, behavior unchanged. No code change here; RT-069 records the private
+  attributes Nodestro still uses.
 - Axentra pinned to `60d83b3` (axentra #57, MUP-ONA A8: an ID token whose key does not fit its algorithm is refused,
   quoted password and client secret values are redacted). The pin also brings the Axentra commits merged since
   `273e675` (notify send limits and inbox routes, migration lock polling and timeouts, search cost limits, identity
