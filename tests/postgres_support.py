@@ -197,6 +197,12 @@ def restored_database(dump: str) -> Iterator[str]:
             admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
+def require_pgvector() -> None:
+    """Fail under ``NODESTRO_REQUIRE_PGVECTOR=1`` (the CI job ``pg-b``): the test schema must have pgvector there."""
+    if os.environ.get("NODESTRO_REQUIRE_PGVECTOR") == "1":
+        pytest.fail("NODESTRO_REQUIRE_PGVECTOR=1 but the test schema has no pgvector")
+
+
 def require_pgvector_or_skip(reason: str) -> None:
     """Skip a test that needs pgvector, or fail it under ``NODESTRO_REQUIRE_PGVECTOR=1`` (the CI job ``pg-b``)."""
     if os.environ.get("NODESTRO_REQUIRE_PGVECTOR") == "1":

@@ -227,6 +227,7 @@ class PostgresIndex(Index):
         identity = None
         vectors: builtins.list[builtins.list[float]] | None = None
         if self.embeddings is not None:
+            self.embeddings.refresh_identity()  # the model's current build, not a cached one (MUP-ONA drift 1)
             identity = self.embeddings.identity()
             vectors = [[float(x) for x in vector] for vector in self.embeddings.embed_documents([c.text for c in kept])]
             if len(vectors) != len(kept):
@@ -379,10 +380,14 @@ class PostgresIndex(Index):
         progress: Any = None,
         cancel: Any = None,
     ) -> VectorStatus:
-        """Embed every chunk into the space of ``embeddings`` and switch to it (as ``orkexa.SQLiteIndex.reindex``)."""
+        """Embed every chunk into the space of ``embeddings`` and switch to it (as ``orkexa.SQLiteIndex.reindex``).
+
+        The model's identity is read again (``refresh_identity``) before and after embedding: a model updated on its
+        server is never filed under its old identity, and one updated meanwhile discards the new space."""
         model = embeddings or self.embeddings
         if model is None:
             raise RetrievalError("vector_unavailable", "reindex() needs an embedding model")
+        model.refresh_identity()  # the model's current build, not a cached one (MUP-ONA drift 1)
         identity = model.identity()
         space = f"{self.namespace}:{identity.key}"
         active = self._space("active")
@@ -422,6 +427,14 @@ class PostgresIndex(Index):
                     )
             if progress is not None:
                 progress(self._count_vectors(space), total)
+        model.refresh_identity()
+        if model.identity().key != identity.key:
+            # The model changed on its server while it embedded: the new space may mix two builds.
+            self._discard(space)
+            raise RetrievalError(
+                "reindex_required",
+                f"{identity.model} changed during the reindex; its new vectors were discarded, start it again",
+            )
         with self.database._transaction() as db:
             missing = db.execute(
                 "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
