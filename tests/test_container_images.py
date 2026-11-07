@@ -265,6 +265,24 @@ def test_build_failures_are_explained(docker: FakeDocker, output: str, code: str
     assert caught.value.code == code
 
 
+def test_a_build_the_sandbox_gateway_refused_while_another_runs_is_busy_not_broken(docker: FakeDocker) -> None:
+    """LD-020: the docker CLI prints the gateway's 429 as an error response; it is told apart from a real failure."""
+    from nodestro_runtime.container_images import build_busy
+    from nodestro_runtime.image_limits import BUILD_BUSY
+
+    docker.build_fails = True
+    docker.build_output = f"Error response from daemon: Nodestro sandbox gateway: {BUILD_BUSY}"
+    with pytest.raises(NodestroError) as caught:
+        images(docker).build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_failed" and caught.value.params == {"busy": True}
+    assert build_busy(docker.build_output)
+    docker.build_output = "ERROR: failed to solve: process did not complete successfully: exit code: 1"
+    with pytest.raises(NodestroError) as caught:
+        images(docker).build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_failed" and "busy" not in caught.value.params
+    assert not build_busy(docker.build_output)
+
+
 def test_the_sandbox_of_an_image_is_a_docker_sandbox(docker: FakeDocker) -> None:
     sandbox = images(docker).sandbox("nodestro-env:abc")
     assert isinstance(sandbox, DockerSandbox) and sandbox.image == "nodestro-env:abc"
@@ -1291,6 +1309,25 @@ def test_a_runtime_image_that_cannot_be_built_fails_the_call(docker: FakeDocker)
     with pytest.raises(ToolExecutionError) as raised:
         sandbox.call("def f(x: int) -> int:\n    return x\n", "f", {"x": 1})
     assert "Docker is not running" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (NodestroError("deps.image_failed", "The sandbox gateway builds another image now", busy=True), "image-busy"),
+        (NodestroError("deps.image_failed", "Building the container image failed: exit code 1"), "image"),
+        (NodestroError("deps.image_failed", "odd", busy="yes"), "image"),
+        (NodestroError("sandbox.unavailable", "Docker is not running"), "image"),
+    ],
+)
+def test_the_runtime_image_self_test_tells_a_busy_gateway_from_a_broken_one(error: NodestroError, reason: str) -> None:
+    from nodestro_runtime.container_images import RuntimeImageSandbox
+
+    def refuse() -> str:
+        raise error
+
+    probe = RuntimeImageSandbox(refuse).self_test()
+    assert not probe.available and probe.reason == reason and str(error) in probe.detail
 
 
 PLAIN_TOOL = '''def double(value: int) -> int:

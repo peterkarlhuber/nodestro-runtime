@@ -1266,6 +1266,11 @@ async def test_a_second_build_is_refused_not_queued(gateway: tuple[FakeDaemon, s
         head = b"POST /build?t=x HTTP/1.1\r\nHost: d\r\nContent-Length: 50000000\r\n\r\n"
         answer = await _send(listen, head)  # refused on the head: the 50 MB body is never read
     assert answer.startswith(b"HTTP/1.1 429") and daemon.requests == []
+    # The runtime recognizes this refusal in the docker CLI's output and waits instead of failing (LD-020).
+    from nodestro_runtime.container_images import build_busy
+
+    message = json.loads(answer.split(b"\r\n\r\n", 1)[1])["message"]
+    assert build_busy(f"Error response from daemon: {message}")
 
 
 async def test_builds_stop_at_the_image_limits(gateway: tuple[FakeDaemon, str, Gateway]) -> None:

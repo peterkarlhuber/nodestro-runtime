@@ -73,8 +73,9 @@ from orkexa.dynamic.docker import (
 from orkexa.providers.base import redact
 
 from . import docker_status
-from .docker_status import OWNER, mcp_owner
+from .docker_status import IMAGE_BUSY, OWNER, mcp_owner
 from .image_limits import (
+    BUILD_BUSY,
     GC_MAX_GB,
     GC_MAX_IMAGES,
     GIB,
@@ -598,6 +599,12 @@ class ContainerImages:
             try:
                 self._docker([*args, str(context)], timeout=_BUILD_TIMEOUT, log=log)
             except _DockerFailed as exc:
+                if build_busy(exc.output):
+                    raise NodestroError(
+                        "deps.image_failed",
+                        f"The sandbox gateway builds another image now; try again when it is done ({BUILD_BUSY})",
+                        busy=True,
+                    ) from None
                 raise NodestroError(*_explain(exc.output)) from None
         found = self._inspect(tag)
         size = found[0] if found is not None else 0
@@ -1168,11 +1175,16 @@ class RuntimeImageSandbox(StreamedSandbox):
         return self.image
 
     def self_test(self, *, image: str | None = None) -> SandboxProbe:
+        """The self-test of the resolved image. An image that cannot be built fails with reason ``image``; one whose
+        build the sandbox gateway refused because another build runs (:func:`build_busy`) with ``image-busy``, which
+        the Docker monitor reports as ``checking`` and tries again soon (:mod:`nodestro_runtime.docker_status`)."""
         if image is None:
             try:
                 self._resolved()
             except SandboxError as exc:
-                return SandboxProbe("docker", False, "image", str(exc))
+                cause = exc.__cause__
+                busy = isinstance(cause, NodestroError) and cause.params.get("busy") is True
+                return SandboxProbe("docker", False, IMAGE_BUSY if busy else "image", str(exc))
         return super().self_test(image=image)
 
     def command(self, workdir: Path, container_name: str, *, image: str | None = None) -> list[str]:
@@ -1242,6 +1254,12 @@ def _repository(name: str) -> str:
     return name
 
 
+def build_busy(output: str) -> bool:
+    """Whether a failed ``docker build``'s ``output`` is the sandbox gateway's refusal (429) because another image build
+    runs (:data:`~nodestro_runtime.image_limits.BUILD_BUSY`): nothing is wrong with this build, it was not started."""
+    return BUILD_BUSY.lower() in output.lower()
+
+
 def _daemon_unreachable(output: str) -> bool:
     """Whether the docker client's ``output`` says it could not reach a daemon (old and new CLI wording)."""
     lowered = output.lower()
@@ -1283,6 +1301,7 @@ __all__ = [
     "RuntimeImageSandbox",
     "StreamedSandbox",
     "bounded_run",
+    "build_busy",
     "check_shape",
     "default_base",
     "lock_has_hashes",

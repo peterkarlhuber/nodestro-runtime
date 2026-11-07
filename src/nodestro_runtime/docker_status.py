@@ -9,7 +9,9 @@ know whether the daemon behind the ``docker`` CLI really enforces the sandbox. T
 * the **self-test** (:meth:`orkexa.dynamic.DockerSandbox.self_test`): one container of exactly the sandbox's shape in
   Nodestro's runtime image shows what the daemon applied. It runs once per daemon (its
   :func:`~orkexa.dynamic.docker.host_fingerprint`); a changed daemon or setting runs it again, a failed one is retried
-  after :data:`RETRY_FAILED` seconds or on request.
+  after :data:`RETRY_FAILED` seconds or on request. While the sandbox gateway refuses the runtime image's build
+  because another build runs (:data:`IMAGE_BUSY`, e.g. the first build of a Studio that was restarted meanwhile), the
+  state stays ``checking`` and the self-test is tried again by itself with a bounded backoff (LD-020).
 
 Both run in a background thread (:class:`DockerMonitor`), never in the caller's: reading the settings never waits for
 ``docker info`` (a daemon that does not answer takes up to 10 s). Until the first check finished, the state is
@@ -78,6 +80,16 @@ _OWNER_RULE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 PREFLIGHT_TTL = 5.0
 #: Seconds before a failed self-test is tried again by itself (a passed one is kept per daemon fingerprint).
 RETRY_FAILED = 300.0
+#: The self-test reason of a runtime image whose build the sandbox gateway refused (429) because another image build
+#: runs (:func:`nodestro_runtime.container_images.build_busy`); not one of Orkexa's reasons. The image is not broken:
+#: the status stays ``checking`` and the self-test is tried again after :data:`BUSY_RETRY_FIRST` seconds, doubled per
+#: refusal up to :data:`BUSY_RETRY_MAX`, for at most :data:`BUSY_LIMIT` seconds (then ``docker-image``).
+IMAGE_BUSY = "image-busy"
+BUSY_RETRY_FIRST = 5.0
+BUSY_RETRY_MAX = 60.0
+#: Longer than a build may run (``container_images._BUILD_TIMEOUT``, 30 minutes), so only a gateway that never ends
+#: its build is reported as an image problem.
+BUSY_LIMIT = 35 * 60.0
 #: Seconds between two runs of the reaper (containers past their deadline).
 REAP_INTERVAL = 60.0
 #: Seconds a passed check counts for :func:`daemon_proven` without being confirmed again.
@@ -100,9 +112,10 @@ REASONS: dict[str, str] = {
     "os-type": "docker-os-type",
     "image": "docker-image",
     "self-test": "docker-selftest",
+    IMAGE_BUSY: "docker-checking",
 }
 #: Every reason the Docker backend can report (with state ``checking``: ``docker-checking``).
-DOCKER_REASONS = (*dict.fromkeys(REASONS.values()), "docker-checking")
+DOCKER_REASONS = tuple(dict.fromkeys((*REASONS.values(), "docker-checking")))
 
 #: Shown with a rootful daemon on Linux: who may use its socket is root on this computer.
 ROOTFUL_NOTE = (
@@ -231,7 +244,7 @@ def daemon_key(docker: str, environ: Mapping[str, str] | None) -> _DaemonKey:
 
 #: Orkexa reasons that are about one image, not the daemon: they never revoke a daemon's proof (the call of that image
 #: is refused by Orkexa anyway).
-_IMAGE_REASONS = frozenset({"image", "self-test"})
+_IMAGE_REASONS = frozenset({"image", "self-test", IMAGE_BUSY})
 
 
 def record_proof(docker: str, environ: Mapping[str, str] | None, probe: SandboxProbe) -> None:
@@ -303,6 +316,8 @@ class DockerMonitor:
         reap_interval: float = REAP_INTERVAL,
         inspect: Callable[..., DockerHost] = inspect_host,
         clock: Callable[[], float] = time.monotonic,
+        busy_limit: float = BUSY_LIMIT,
+        schedule: Callable[[float, Callable[[], object]], None] | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.docker = docker
@@ -313,6 +328,13 @@ class DockerMonitor:
         self.reap_interval = reap_interval
         self._inspect = inspect
         self._clock = clock
+        self.busy_limit = busy_limit
+        #: Runs a function after some seconds (a daemon timer; tests replace it): the re-check after a busy build.
+        self._schedule = schedule or _timer
+        #: While the gateway refuses the image build because another one runs: since when, how often, next try.
+        self._busy_since: float | None = None
+        self._busy_count = 0
+        self._busy_retry_at = 0.0
         self._lock = threading.Lock()
         self._status: DockerStatus = CHECKING
         self._checked_at: float | None = None
@@ -360,7 +382,12 @@ class DockerMonitor:
         with self._lock:
             self._status = found
             self._checked_at = self._clock()
+            waiting = found.state == "checking"
+            retry = max(self._busy_retry_at - self._checked_at, self.preflight_ttl) if waiting else None
         self._done.set()
+        if retry is not None and not self._stop.is_set():
+            # Another image build ran in the sandbox gateway: check again by itself, not only on the next status read.
+            self._schedule(retry, self.status)
 
     def check(self) -> DockerStatus:
         """One check in the calling thread: preflight, then the self-test unless this daemon passed it already."""
@@ -388,11 +415,7 @@ class DockerMonitor:
             remembered = self._self_tests.get(fingerprint)
             force = self._force_self_test
             self._force_self_test = False
-        if (
-            remembered is None
-            or force
-            or (not remembered[1].available and self._clock() - remembered[0] >= self.retry_failed)
-        ):
+        if remembered is None or force or self._self_test_due(remembered[0], remembered[1]):
             try:
                 probe = self.sandbox().self_test()
             except SandboxError as exc:
@@ -400,10 +423,20 @@ class DockerMonitor:
             remembered = (self._clock(), probe, datetime.now(UTC))
             with self._lock:
                 self._self_tests = {fingerprint: remembered}  # only the current daemon matters
+                self._note_busy(remembered[0], probe)
         _, probe, tested_at = remembered
         image = dict(probe.facts).get("image_id", "")
+        if not probe.available and probe.reason == IMAGE_BUSY and self._still_waiting():
+            checks.append(SandboxCheck(name="image", ok=False, detail=probe.detail))
+            with self._lock:
+                wait = max(self._busy_retry_at - self._clock(), 0.0)
+            detail = (
+                "The sandbox gateway builds another image now; the sandbox image is built and its self-test runs when "
+                f"that build is done (next try in {wait:.0f} s)"
+            )
+            return DockerStatus("checking", "docker-checking", detail, host, tuple(checks), None, fingerprint, notes)
         if not probe.available:
-            stage = "image" if probe.reason in ("image", "missing") else "self-test"
+            stage = "image" if probe.reason in ("image", "missing", IMAGE_BUSY) else "self-test"
             checks.append(SandboxCheck(name=stage, ok=False, detail=probe.detail))
             reason = "docker-image" if stage == "image" else reason_of(probe.reason)
             return replace(self._refused(reason, probe.detail, checks, host, notes, fingerprint), tested_at=tested_at)
@@ -417,6 +450,32 @@ class DockerMonitor:
         if ROOTFUL_NOTE in notes:
             detail += f". {ROOTFUL_NOTE}"
         return DockerStatus("approved", "", detail, host, tuple(checks), tested_at, fingerprint, notes)
+
+    def _self_test_due(self, tested: float, probe: SandboxProbe) -> bool:
+        """Whether a failed self-test is tried again now: after :attr:`retry_failed` seconds, or while the gateway was
+        busy with another build (and :attr:`busy_limit` is not reached) at the backoff's next try."""
+        if probe.available:
+            return False
+        if probe.reason == IMAGE_BUSY and self._still_waiting():
+            with self._lock:
+                return self._clock() >= self._busy_retry_at
+        return self._clock() - tested >= self.retry_failed
+
+    def _note_busy(self, now: float, probe: SandboxProbe) -> None:
+        """Count a refusal because another build runs (the backoff doubles up to :data:`BUSY_RETRY_MAX`); any other
+        result ends the wait. Called with the lock held."""
+        if probe.available or probe.reason != IMAGE_BUSY:
+            self._busy_since, self._busy_count, self._busy_retry_at = None, 0, 0.0
+            return
+        if self._busy_since is None:
+            self._busy_since = now
+        self._busy_retry_at = now + min(BUSY_RETRY_FIRST * 2**self._busy_count, BUSY_RETRY_MAX)
+        self._busy_count += 1
+
+    def _still_waiting(self) -> bool:
+        """Whether a busy gateway is still waited for (``checking``), not yet reported as ``docker-image``."""
+        with self._lock:
+            return self._busy_since is not None and self._clock() - self._busy_since < self.busy_limit
 
     def _refused(
         self,
@@ -537,6 +596,12 @@ class DockerMonitor:
                 self._reaper.join(1)
 
 
+def _timer(seconds: float, function: Callable[[], object]) -> None:
+    timer = threading.Timer(seconds, function)
+    timer.daemon = True
+    timer.start()
+
+
 class DockerMonitorLike(Protocol):
     """What a workspace needs of a monitor (:class:`DockerMonitor`, or a test's stand-in)."""
 
@@ -580,8 +645,12 @@ def reset_monitors() -> None:
 
 
 __all__ = [
+    "BUSY_LIMIT",
+    "BUSY_RETRY_FIRST",
+    "BUSY_RETRY_MAX",
     "CHECKING",
     "DOCKER_REASONS",
+    "IMAGE_BUSY",
     "MCP_LIFETIME",
     "OWNER",
     "PREFLIGHT_TTL",
