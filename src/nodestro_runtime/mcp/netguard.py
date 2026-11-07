@@ -81,6 +81,9 @@ def address_problem(address: IPAddress, *, allow_loopback: bool = False) -> str 
         return "multicast"
     if address.is_link_local:
         return "link_local"
+    if isinstance(address, ipaddress.IPv6Address) and address.is_site_local:
+        # Deprecated site-local fec0::/10 (RFC 3879): internal by definition, but ``is_global`` calls it global.
+        return "site_local"
     if address.is_private:
         return "private"
     if isinstance(address, ipaddress.IPv4Address) and address in ipaddress.ip_network("100.64.0.0/10"):
