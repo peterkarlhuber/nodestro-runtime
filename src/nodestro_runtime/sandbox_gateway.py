@@ -855,6 +855,10 @@ class Gateway:
         self._limits_enforced: float | None = None
         self._clock = time.monotonic
         self._connections = 0
+        #: The tasks serving connections. asyncio keeps a task, and a stream's reader, only weakly: once a client has
+        #: half-closed an attached stream, nothing else keeps its task (and the daemon side of the stream) alive, and a
+        #: garbage collection would close the stream before the container's output arrived.
+        self._serving: set[asyncio.Task[Any]] = set()
 
     # -- daemon access --
 
@@ -996,6 +1000,10 @@ class Gateway:
     # -- requests --
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._serving.add(task)
+            task.add_done_callback(self._serving.discard)
         if self._connections >= self.config.max_connections:
             with contextlib.suppress(ConnectionError, OSError):
                 writer.write(refusal(503, f"At most {self.config.max_connections} connections at once"))
