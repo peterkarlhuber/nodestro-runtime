@@ -30,7 +30,13 @@ from orkexa.dynamic.docker import (
 from orkexa.errors import ToolExecutionError
 import pytest
 
-from nodestro_runtime.container_images import LOCK_LABEL, ContainerImages, StreamedSandbox, lock_has_hashes
+from nodestro_runtime.container_images import (
+    LOCK_LABEL,
+    ContainerImages,
+    ImageBuildBusy,
+    StreamedSandbox,
+    lock_has_hashes,
+)
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import parse_lock
 from nodestro_runtime.testing import FakeUv
@@ -274,12 +280,13 @@ def test_a_build_the_sandbox_gateway_refused_while_another_runs_is_busy_not_brok
     docker.build_output = f"Error response from daemon: Nodestro sandbox gateway: {BUILD_BUSY}"
     with pytest.raises(NodestroError) as caught:
         images(docker).build(HASHED, "3.13")
-    assert caught.value.code == "deps.image_failed" and caught.value.params == {"busy": True}
+    assert isinstance(caught.value, ImageBuildBusy)
+    assert caught.value.code == "deps.image_failed" and caught.value.params == {}  # no new text for a user interface
     assert build_busy(docker.build_output)
     docker.build_output = "ERROR: failed to solve: process did not complete successfully: exit code: 1"
     with pytest.raises(NodestroError) as caught:
         images(docker).build(HASHED, "3.13")
-    assert caught.value.code == "deps.image_failed" and "busy" not in caught.value.params
+    assert caught.value.code == "deps.image_failed" and not isinstance(caught.value, ImageBuildBusy)
     assert not build_busy(docker.build_output)
 
 
@@ -1314,9 +1321,8 @@ def test_a_runtime_image_that_cannot_be_built_fails_the_call(docker: FakeDocker)
 @pytest.mark.parametrize(
     ("error", "reason"),
     [
-        (NodestroError("deps.image_failed", "The sandbox gateway builds another image now", busy=True), "image-busy"),
+        (ImageBuildBusy(), "image-busy"),
         (NodestroError("deps.image_failed", "Building the container image failed: exit code 1"), "image"),
-        (NodestroError("deps.image_failed", "odd", busy="yes"), "image"),
         (NodestroError("sandbox.unavailable", "Docker is not running"), "image"),
     ],
 )

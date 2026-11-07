@@ -600,11 +600,7 @@ class ContainerImages:
                 self._docker([*args, str(context)], timeout=_BUILD_TIMEOUT, log=log)
             except _DockerFailed as exc:
                 if build_busy(exc.output):
-                    raise NodestroError(
-                        "deps.image_failed",
-                        f"The sandbox gateway builds another image now; try again when it is done ({BUILD_BUSY})",
-                        busy=True,
-                    ) from None
+                    raise ImageBuildBusy() from None
                 raise NodestroError(*_explain(exc.output)) from None
         found = self._inspect(tag)
         size = found[0] if found is not None else 0
@@ -1182,8 +1178,7 @@ class RuntimeImageSandbox(StreamedSandbox):
             try:
                 self._resolved()
             except SandboxError as exc:
-                cause = exc.__cause__
-                busy = isinstance(cause, NodestroError) and cause.params.get("busy") is True
+                busy = isinstance(exc.__cause__, ImageBuildBusy)
                 return SandboxProbe("docker", False, IMAGE_BUSY if busy else "image", str(exc))
         return super().self_test(image=image)
 
@@ -1229,6 +1224,18 @@ class ResolveError(Exception):
     def __init__(self, output: str) -> None:
         super().__init__(output)
         self.output = output
+
+
+class ImageBuildBusy(NodestroError):
+    """``deps.image_failed`` because the sandbox gateway refused the build while another one runs (:func:`build_busy`):
+    the build was not started and nothing is wrong with it. Same code and parameters as any failed build, so a user
+    interface needs no new text; the Docker monitor tells it apart by its class."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "deps.image_failed",
+            f"The sandbox gateway builds another image now; try again when it is done ({BUILD_BUSY})",
+        )
 
 
 class _DockerFailed(Exception):
@@ -1295,6 +1302,7 @@ __all__ = [
     "OWNER",
     "UV_IMAGE",
     "ContainerImages",
+    "ImageBuildBusy",
     "LocalImageSandbox",
     "OutputLimitExceeded",
     "ResolveError",
