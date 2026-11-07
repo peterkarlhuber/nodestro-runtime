@@ -45,8 +45,10 @@ How it works:
 - A parsed candidate passes when every reference to a tenant table (its name in any case) -- in ``FROM``, joins,
   ``USING``, the target of ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level
   ``AND`` conjunct of its statement's ``WHERE`` (or of an inner join's ``ON``) of the form ``<ref>.tenant_id =
-  <param>`` or ``<ref>.tenant_id = ANY(<param>)``, or by ``<ref>.tenant_id = <other>.tenant_id`` with ``<other>``
-  bound (in the same statement or an enclosing one; a name of the statement's own ``FROM`` hides an outer one).
+  <param>``, or by ``<ref>.tenant_id = <other>.tenant_id`` with ``<other>`` bound (in the same statement or an
+  enclosing one; a name of the statement's own ``FROM`` hides an outer one). ``<ref>.tenant_id = ANY(<param>)`` may
+  hold several tenants: it binds only with ``allow_any=True``; by default (MUP-ONA A11, decision O12) it is a
+  ``leak`` that passes only through an allowlist entry whose reason says why the array holds one tenant.
   ``INSERT`` into a tenant table must list ``tenant_id`` with a parameter (or a bound ``tenant_id`` of its
   ``SELECT``) as the value; an upsert that updates must have ``tenant_id`` in its conflict target; ``UPDATE`` (and
   an upsert, except ``tenant_id = excluded.tenant_id``) must not set ``tenant_id``. A string literal or code body
@@ -1355,6 +1357,8 @@ class _Ref:
     name: str  # alias or table name, as columns qualify it
     table: str
     bound: bool = False
+    #: Only a refused ``tenant_id = ANY(<param>)`` names it (``allow_any`` off): reported with that reason.
+    any_refused: bool = False
 
 
 def _children(node: Any) -> Iterator[Any]:
@@ -1412,9 +1416,18 @@ def _tenant_column(expr: Any) -> tuple[str, ...] | None:
     return tuple(str(n) for n in names[:-1])
 
 
+#: Why a reference named only by a tenant id array parameter is reported (``allow_any`` off; MUP-ONA A11, O12).
+_ANY_REFUSED = (
+    "an array of tenant ids may hold several tenants: such a statement passes only through an allowlist entry that "
+    "says why the array holds exactly one tenant (MUP-ONA A11)"
+)
+
+
 class _Checker:
-    def __init__(self, tables: frozenset[str]) -> None:
+    def __init__(self, tables: frozenset[str], *, allow_any: bool = False) -> None:
         self.tables = tables
+        #: Whether ``tenant_id = ANY(<param>)`` binds a reference (off by default: the array may hold several tenants).
+        self.allow_any = allow_any
         self.problems: list[str] = []
 
     def _from_refs(self, items: Any, ctes: set[str]) -> tuple[list[_Ref], list[tuple[Any, list[_Ref]]], set[str]]:
@@ -1463,9 +1476,9 @@ class _Checker:
         outer: list[tuple[set[str], list[_Ref]]],
         names: set[str],
     ) -> None:
-        """Mark refs bound by ``tenant_id = param``/``= ANY(param)`` or by equality with a bound ref. A qualifier means
-        the nearest name: this statement's own (which hides an outer one of the same name), then the enclosing
-        statements' from the inside out."""
+        """Mark refs bound by ``tenant_id = param`` (``= ANY(param)`` only with ``allow_any``) or by equality with a
+        bound ref. A qualifier means the nearest name: this statement's own (which hides an outer one of the same
+        name), then the enclosing statements' from the inside out."""
         pg = _pglast("ast")
         A_Expr_Kind = _pglast("enums").A_Expr_Kind
 
@@ -1499,6 +1512,12 @@ class _Checker:
                     sides = [(conjunct.lexpr, conjunct.rexpr), (conjunct.rexpr, conjunct.lexpr)]
                     if conjunct.kind == A_Expr_Kind.AEXPR_OP_ANY:
                         sides = sides[:1]  # tenant_id = ANY(param)
+                        if not self.allow_any:
+                            qualifier = _tenant_column(conjunct.lexpr)
+                            ref = None if qualifier is None else lookup(qualifier, applies)
+                            if ref is not None and _is_param(conjunct.rexpr):
+                                ref.any_refused = True
+                            continue
                     for column, other in sides:
                         qualifier = _tenant_column(column)
                         if qualifier is None:
@@ -1594,6 +1613,8 @@ class _Checker:
                     + (f" (as {ref.name})" if ref.name != ref.table else "")
                     + " is not bound to one tenant by a top-level `tenant_id = <param>` conjunct"
                 )
+                if ref.any_refused and _ANY_REFUSED not in self.problems:
+                    self.problems.append(_ANY_REFUSED)
         for child in _children(node):
             self.check(child, [*outer, (names, own)], ctes)
 
@@ -1602,9 +1623,10 @@ class _Checker:
 _IDENTIFIER = re.compile(r"[\w$]+(?:\.[\w$]+)*")
 
 
-def check_sql(text: str, tables: frozenset[str]) -> list[str]:
+def check_sql(text: str, tables: frozenset[str], *, allow_any: bool = False) -> list[str]:
     """Why ``text`` (one or more PostgreSQL statements with psycopg placeholders) may read or change another tenant's
-    rows; empty when every reference to a tenant table is bound to one tenant. Raises ``pglast.parser.ParseError``."""
+    rows; empty when every reference to a tenant table is bound to one tenant. ``allow_any``: ``tenant_id =
+    ANY(<param>)`` binds too (off by default). Raises ``pglast.parser.ParseError``."""
     parse_sql = _pglast("").parse_sql
 
     problems: list[str] = []
@@ -1617,7 +1639,7 @@ def check_sql(text: str, tables: frozenset[str]) -> list[str]:
             if isinstance(value, str) and _words(value) & tables and not _IDENTIFIER.fullmatch(value):
                 problems.append(f"a string that names a tenant table ({value[:80]!r}) is not supported by the check")
         if kind in _DATA_STATEMENTS or kind == "ExplainStmt":
-            checker = _Checker(tables)
+            checker = _Checker(tables, allow_any=allow_any)
             checker.check(stmt, [], set())
             problems.extend(checker.problems)
             continue
@@ -1668,10 +1690,13 @@ def scan_package(
     tables: frozenset[str],
     allowlist: Mapping[tuple[str, str], str],
     skip_modules: Mapping[str, str] | None = None,
+    *,
+    allow_any: bool = False,
 ) -> Report:
     """Check every ``.py`` file under ``root`` (a package directory). Modules are named relative to ``root``'s parent
     (``nodestro_runtime/jobs.py``); ``allowlist`` maps ``(module, normalized text)`` to its reason; ``skip_modules``
-    maps a module that holds no PostgreSQL statements (the desktop's SQLite store) to the reason."""
+    maps a module that holds no PostgreSQL statements (the desktop's SQLite store) to the reason. ``allow_any``: see
+    :func:`check_sql` (off by default; an allowlisted statement is not checked at all)."""
     from pglast.parser import ParseError
 
     skip_modules = skip_modules or {}
@@ -1711,7 +1736,7 @@ def scan_package(
                 report.findings.append(Finding(module, statement.line, "dynamic", statement.text, detail))
                 continue
             try:
-                problems = check_sql(statement.text, tables)
+                problems = check_sql(statement.text, tables, allow_any=allow_any)
             except ParseError as exc:
                 report.findings.append(Finding(module, statement.line, "unparsed", statement.text, str(exc)))
                 continue
