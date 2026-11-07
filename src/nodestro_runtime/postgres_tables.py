@@ -430,11 +430,14 @@ class PostgresIndex(Index):
                     if len(vector) != identity.dimensions:
                         raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
                     validate_vector(vector)  # NaN or infinity: vector.invalid (drift 2)
+                    # Only while the chunk still exists: one deleted while its batch was embedded gets no vector
+                    # (no foreign key error that ends the reindex, drift 9).
                     db.execute(
                         "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
-                        " VALUES (%s, %s, %s, %s, %s) ON CONFLICT (tenant_id, space, chunk_id)"
-                        " DO UPDATE SET embedding = excluded.embedding",
-                        (self.tenant_id, self.namespace, space, int(chunk_id), [float(x) for x in vector]),
+                        " SELECT c.tenant_id, c.namespace, %s, c.id, %s FROM nodestro_chunks c"
+                        " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = %s"
+                        " ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
+                        (space, [float(x) for x in vector], self.tenant_id, self.namespace, int(chunk_id)),
                     )
             if progress is not None:
                 progress(self._count_vectors(space), total)

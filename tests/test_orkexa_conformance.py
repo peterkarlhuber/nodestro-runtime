@@ -53,11 +53,9 @@ TARGETS: dict[str, tuple[tuple[Case, ...], frozenset[str]]] = {
 
 #: The documented drifts of the PostgreSQL index (plan annex A, fixed by MP-B3): case -> drift number, per way of
 #: ranking vectors (``pgvector``: the database ranks; ``runtime``: the runtime ranks, a server without pgvector).
-#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported.
-_SHARED_DRIFTS = {
-    "reindex.chunk_deleted_during_embedding_gets_no_vector": 9,
-}
-DRIFTS: dict[str, dict[str, int]] = {"pgvector": _SHARED_DRIFTS, "runtime": _SHARED_DRIFTS}
+#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported. MP-B3 fixed drifts
+#: 1-9: no case is an expected failure any more (MUP-ONA T-PG-1); a new entry needs a drift of plan annex A.
+DRIFTS: dict[str, dict[str, int]] = {"pgvector": {}, "runtime": {}}
 
 
 def _database() -> Any:

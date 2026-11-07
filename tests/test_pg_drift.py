@@ -223,3 +223,29 @@ def test_query_words_are_contract_words_with_folded_diacritics(make: Callable[..
     assert index.retrieve("_ __", 5, mode="fts") == []
     for hostile in ("omega & !psi", "omega:* | psi", "'omega' <-> psi", "omega\\ psi"):
         assert {hit.source for hit in index.retrieve(hostile, 5, mode="fts")} == {"menu.md", "apart.md"}, hostile
+
+
+# ---- drift 9: a chunk deleted during a reindex ----------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_chunks_deleted_while_a_batch_is_embedded_get_no_vector(make: Callable[..., Any]) -> None:
+    index = make()
+    for number in range(6):
+        index.add(f"Chunk {number} about alpha.", source=f"c{number}.md")
+    model = KeywordEmbeddings("drift-delete")
+    deleted: list[int] = []
+
+    def delete_two(texts: Any) -> None:  # deletes one chunk of the batch at hand and one of a later batch
+        if not deleted:
+            deleted.extend((index.delete("c1.md"), index.delete("c4.md")))
+
+    model.on_embed = delete_two
+    status = index.reindex(model, batch_size=3)
+    assert deleted == [1, 1]
+    assert (status.chunks, status.embedded, status.building, status.complete) == (4, 4, None, True)
+    rows = postgres_support.owner_of(index.database)._query(
+        "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s", (index.tenant_id,)
+    )
+    assert rows == [(4,)]
+    assert {hit.source for hit in index.retrieve("alpha", 10, mode="vector")} == {"c0.md", "c2.md", "c3.md", "c5.md"}
