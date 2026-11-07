@@ -13,7 +13,7 @@
 | P1 High | 1 |
 | P2 Medium | 6 |
 | P3 Low | 22 |
-| P4 Optional | 13 |
+| P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
 every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
@@ -324,6 +324,17 @@ Items that need an independent or external review (an internal audit does not re
   change.
 - **Next step:** Extract one clearly bounded part (tool approvals, persistence or resume) with the next functional
   change to it; no big-bang refactor.
+
+### RT-069 · Private attributes of Orkexa's SQLite backends
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** MUP-ONA MP-B2 (orkexa #64), `sqlite_tables.py`,
+  `memory_spaces.py`
+- **What:** Nodestro reaches into Orkexa's SQLite classes: `SQLiteIndex._connection` and `._lock` for its own tables
+  in the index file, and `SQLiteMemory` internals (`_save`, `_read`, `_files`) in the memory-space subclass. Since
+  MP-B2 the classes live in `orkexa.backends.sqlite`; Orkexa keeps these attributes "preserved for compatibility"
+  and tests them (T-SQL-11), but they are not public API.
+- **Next step:** Propose public hooks in Orkexa (a transaction helper on the index, extension points on the memory
+  store), then move Nodestro to them and let Orkexa drop the compatibility note.
 
 ### RT-039 · Axentra contract step (M12): remove the legacy paths
 
