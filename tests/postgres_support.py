@@ -163,10 +163,12 @@ def restore_dump(conninfo: str, dump: str) -> None:
 
 
 def has_pgvector() -> bool:
-    """Whether the test server can install pgvector (``pgvector/pgvector:pg17``)."""
+    """Whether the test server can install pgvector (``pgvector/pgvector:pg17``). Skips without a test server, before
+    psycopg is imported (a plain install has none)."""
+    dsn = require_postgres()
     import psycopg
 
-    with psycopg.connect(require_postgres(), autocommit=True) as admin:
+    with psycopg.connect(dsn, autocommit=True) as admin:
         row = admin.execute("SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')").fetchone()
     return bool(row and row[0])
 
@@ -175,12 +177,12 @@ def has_pgvector() -> bool:
 def restored_database(dump: str) -> Iterator[str]:
     """A new database on the test server with the legacy dump ``dump`` restored into it (its connection string, as
     the owner); dropped afterwards. FX-PG-0v is skipped on a server without pgvector (a failure under
-    ``NODESTRO_REQUIRE_PGVECTOR=1``)."""
+    ``NODESTRO_REQUIRE_PGVECTOR=1``). Skips without a test server before psycopg is imported."""
+    dsn = require_postgres()
     import psycopg
     from psycopg import sql
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-    dsn = require_postgres()
     if dump == "FX-PG-0v.sql.gz" and not has_pgvector():
         require_pgvector_or_skip("FX-PG-0v needs pgvector/pgvector:pg17")
     name = f"nodestro_fx_{uuid.uuid4().hex[:12]}"
