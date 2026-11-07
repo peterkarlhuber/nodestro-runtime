@@ -45,6 +45,7 @@ from orkexa.retrieval import (
     VectorStatus,
     check_mode,
     fuse_hybrid,
+    fuse_rrf,
     lexical_evidence,
     word_weight,
 )
@@ -495,13 +496,15 @@ class PostgresIndex(Index):
         if sources is not None:
             params += (sources,)
         rows = self.database._query(
-            "SELECT id, source, title, file_id, metadata::text, text, ts_rank(search, query, 1) FROM nodestro_chunks,"
+            "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks,"
             " to_tsquery('simple', %s) AS query"
             f" WHERE tenant_id = %s AND namespace = %s AND search @@ query{scope}"
             " ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
             (*params, k),
         )
-        return self._hits(rows)
+        # ts_rank only orders the hits; the score is the contract's reciprocal rank 1 / (60 + rank) (drift 5).
+        scores = dict(fuse_rrf([[int(row[0]) for row in rows]]))
+        return self._hits((*row, scores[int(row[0])]) for row in rows)
 
     def _vector(self, query: str, k: int, sources: builtins.list[str] | None) -> builtins.list[Hit]:
         model = self.embeddings
@@ -524,11 +527,11 @@ class PostgresIndex(Index):
             literal = "[" + ",".join(repr(x) for x in vector) + "]"
             rows = self.database._query(
                 "SELECT c.id, c.source, c.title, c.file_id, c.metadata::text, c.text,"
-                " 1 - (v.embedding::vector <=> %s::vector) FROM nodestro_chunk_vectors v"
-                " JOIN nodestro_chunks c ON c.id = v.chunk_id"
+                " round((1 - (v.embedding::vector <=> %s::vector))::numeric, 6)::float8 AS score"
+                " FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id"
                 f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}"
-                f" AND {_USABLE} ORDER BY v.embedding::vector <=> %s::vector, c.id LIMIT %s",
-                (literal, *base, literal, k),
+                f" AND {_USABLE} ORDER BY score DESC, c.id LIMIT %s",
+                (literal, *base, k),
             )
             return self._hits(rows)
         candidates = self.database._query(
@@ -540,8 +543,9 @@ class PostgresIndex(Index):
         # identity is not ``normalized`` returns vectors of any length, where the dot product is no cosine (drift 4).
         # math.fsum is exactly rounded, so the result is the same on every Python version.
         query_norm = math.sqrt(math.fsum(x * x for x in vector))
+        # Rounded to 6 digits as the contract says (drift 5); equal scores go to the lower chunk id, as in the SQL.
         similarity = [
-            (_cosine(vector, query_norm, [float(x) for x in embedding]), int(chunk_id))
+            (round(_cosine(vector, query_norm, [float(x) for x in embedding]), 6), int(chunk_id))
             for chunk_id, embedding in candidates
         ]
         scored = sorted(similarity, key=lambda item: (-item[0], item[1]))[:k]
@@ -600,17 +604,17 @@ class PostgresIndex(Index):
                 hit.ranks = positions[chunk_id]
                 result.append(hit)
             return result
-        fused: dict[int, tuple[float, Hit, dict[str, int]]] = {}
+        found = {}
+        positions = {}
         for name, ranked in rankings:
             for rank, hit in enumerate(ranked):
-                score, kept, ranks = fused.get(hit.id, (0.0, hit, {}))
-                ranks[name] = rank + 1
-                fused[hit.id] = (score + 1.0 / (_RRF_K + rank + 1), kept, ranks)
-        ordered = sorted(fused.values(), key=lambda item: (-item[0], item[1].id))[:k]
+                found.setdefault(hit.id, hit)
+                positions.setdefault(hit.id, {})[name] = rank + 1
         result = []
-        for score, hit, ranks in ordered:
+        for chunk_id, score in fuse_rrf([[hit.id for hit in ranked] for _, ranked in rankings])[:k]:
+            hit = found[chunk_id]
             hit.score = score
-            hit.ranks = ranks
+            hit.ranks = positions[chunk_id]
             result.append(hit)
         return result
 

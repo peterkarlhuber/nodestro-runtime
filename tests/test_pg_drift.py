@@ -150,3 +150,25 @@ def test_both_paths_score_the_cosine(make: Callable[..., Any], normalized: bool)
     assert [hit.source for hit in hits] == ["loud.md", "two.md", "three.md"]
     for hit in hits:
         assert abs(hit.score - cosine(model.vector("alpha"), model.vector(texts[hit.source]))) <= 1e-6, hit
+
+
+# ---- drift 5: the contract's scores --------------------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_scores_follow_the_contract_in_every_mode(make: Callable[..., Any]) -> None:
+    from orkexa.retrieval import fuse_rrf
+
+    index = make(embeddings=KeywordEmbeddings(), fusion="rrf")
+    for number, words in enumerate(("alpha", "alpha beta", "alpha beta gamma", "beta gamma delta")):
+        index.add(f"Chunk {number}: {words} policy.", source=f"c{number}.md")
+    fts = index.retrieve("policy alpha", 4, mode="fts")
+    assert [hit.score for hit in fts] == [1 / (60 + rank) for rank in range(1, len(fts) + 1)]
+    vector = index.retrieve("alpha beta", 4, mode="vector")
+    assert all(hit.score == round(hit.score, 6) for hit in vector)
+    hybrid = index.retrieve("alpha beta", 4, mode="hybrid")
+    rankings = [
+        [hit.id for hit in index.retrieve("alpha beta", 20, mode="fts")],
+        [hit.id for hit in index.retrieve("alpha beta", 20, mode="vector")],
+    ]
+    assert [(hit.id, hit.score) for hit in hybrid] == fuse_rrf(rankings)[:4]
