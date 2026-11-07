@@ -55,10 +55,6 @@ TARGETS: dict[str, tuple[tuple[Case, ...], frozenset[str]]] = {
 #: ranking vectors (``pgvector``: the database ranks; ``runtime``: the runtime ranks, a server without pgvector).
 #: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported.
 _SHARED_DRIFTS = {
-    "vector.non_finite_document_refused": 2,
-    "vector.non_finite_query_refused": 2,
-    "vector.wrong_dimension_document_refused": 2,
-    "vector.wrong_dimension_query_refused": 2,
     "vector.zero_document_is_never_a_hit": 3,
     "vector.zero_query_finds_nothing": 3,
     "index.full_text_score_is_the_reciprocal_rank": 5,

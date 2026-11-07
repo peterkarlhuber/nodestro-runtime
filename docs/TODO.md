@@ -632,16 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-2 · NaN, infinity and wrong dimensions are not refused as vector errors (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Document and query vectors with NaN or infinity are stored or compared unchecked (pgvector refuses them with
-  a database error), and a wrong dimension is a plain `ValueError` or a database error instead of `vector.dimension`.
-  Strict expected failure `MUP-DRIFT-2`: `vector.non_finite_document_refused`, `vector.non_finite_query_refused`,
-  `vector.wrong_dimension_document_refused`, `vector.wrong_dimension_query_refused`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-DRIFT-3 · Zero vectors are stored and ranked (MUP-ONA MP-B3)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**

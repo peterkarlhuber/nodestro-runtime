@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 import unicodedata
 
 from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
-from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
+from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel, validate_vector
 from orkexa.memory import MemoryBackend
 from orkexa.retrieval import (
     HYBRID_FUSIONS,
@@ -61,6 +61,9 @@ if TYPE_CHECKING:
 _WORD = re.compile(r"[^\W_]+")
 #: The rank that reciprocal-rank fusion adds to (as in ``orkexa.SQLiteIndex``).
 _RRF_K = 60
+#: Stored vectors a search may use: vectors stored before vectors were checked can hold NaN or infinity, which no
+#: ranking can use (pgvector refuses to cast them), so searches leave them out; the rows stay as they are.
+_USABLE = "NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[])"
 
 
 def _check(tenant_id: str, namespace: str) -> None:
@@ -232,6 +235,9 @@ class PostgresIndex(Index):
             vectors = [[float(x) for x in vector] for vector in self.embeddings.embed_documents([c.text for c in kept])]
             if len(vectors) != len(kept):
                 raise ValueError("The embedding model must return one vector per text")
+            for vector in vectors:
+                # NaN or infinity: vector.invalid; another length than the model's: vector.dimension (drift 2).
+                validate_vector(vector, identity)
         with self.database._transaction() as db:
             space = self._active_for(identity) if identity is not None else None
             for position, chunk in enumerate(kept):
@@ -251,9 +257,7 @@ class PostgresIndex(Index):
                     ),
                 ).fetchone()
                 ids.append(int(row[0]))
-                if vectors is not None and space is not None and identity is not None:
-                    if len(vectors[position]) != identity.dimensions:
-                        raise ValueError("The embedding model returned a vector of another size")
+                if vectors is not None and space is not None:
                     db.execute(
                         "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
                         " VALUES (%s, %s, %s, %s, %s)",
@@ -419,6 +423,7 @@ class PostgresIndex(Index):
                 for (chunk_id, _), vector in zip(rows, vectors, strict=True):
                     if len(vector) != identity.dimensions:
                         raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
+                    validate_vector(vector)  # NaN or infinity: vector.invalid (drift 2)
                     db.execute(
                         "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
                         " VALUES (%s, %s, %s, %s, %s) ON CONFLICT (tenant_id, space, chunk_id)"
@@ -496,6 +501,8 @@ class PostgresIndex(Index):
         if stored.key != model.identity().key:
             raise RetrievalError("reindex_required", f"The vectors belong to {stored.model}; reindex first")
         vector = [float(x) for x in model.embed_query(query)]
+        # NaN or infinity: vector.invalid; another length than the stored vectors: vector.dimension (drift 2).
+        validate_vector(vector, stored)
         scope = " AND c.source = ANY(%s)" if sources is not None else ""
         base: tuple[Any, ...] = (self.tenant_id, space, self.tenant_id, self.namespace)
         if sources is not None:
@@ -507,13 +514,13 @@ class PostgresIndex(Index):
                 " 1 - (v.embedding::vector <=> %s::vector) FROM nodestro_chunk_vectors v"
                 " JOIN nodestro_chunks c ON c.id = v.chunk_id"
                 f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}"
-                " ORDER BY v.embedding::vector <=> %s::vector, c.id LIMIT %s",
+                f" AND {_USABLE} ORDER BY v.embedding::vector <=> %s::vector, c.id LIMIT %s",
                 (literal, *base, literal, k),
             )
             return self._hits(rows)
         candidates = self.database._query(
             "SELECT c.id, v.embedding FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id"
-            f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}",
+            f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope} AND {_USABLE}",
             base,
         )
         # The stored vectors are normalized: the dot product is the cosine similarity.

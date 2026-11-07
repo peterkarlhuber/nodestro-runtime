@@ -75,3 +75,40 @@ def test_a_model_updated_during_a_reindex_discards_the_new_space(make: Callable[
     new.on_embed = None
     status = index.reindex(new)
     assert status.active is not None and status.active["digest"] == "v2" and status.complete
+
+
+# ---- drift 2: NaN, infinity and wrong lengths ------------------------------------------------------------------
+
+
+def _set_vector(index: Any, source: str, values: str) -> None:
+    """Write a vector by SQL, as older code could store it (``values``: a ``real[]`` literal)."""
+    postgres_support.owner_of(index.database)._write(
+        "UPDATE nodestro_chunk_vectors SET embedding = %s::real[] WHERE tenant_id = %s AND chunk_id IN"
+        " (SELECT id FROM nodestro_chunks WHERE tenant_id = %s AND source = %s)",
+        (values, index.tenant_id, index.tenant_id, source),
+    )
+
+
+# MUP-ONA T-PG-1
+def test_stored_non_finite_vectors_are_left_out_and_kept(make: Callable[..., Any]) -> None:
+    index = make(embeddings=KeywordEmbeddings())
+    for source, word in (("a.md", "alpha"), ("nan.md", "alpha beta"), ("inf.md", "alpha gamma")):
+        index.add(f"A chunk about {word}.", source=source)
+    _set_vector(index, "nan.md", "{NaN,1,0,0,0,0,0,0}")
+    _set_vector(index, "inf.md", "{-Infinity,1,0,0,0,0,0,0}")
+    for mode in ("vector", "hybrid"):
+        hits = index.retrieve("alpha", 10, mode=mode)
+        assert hits and hits[0].source == "a.md", (mode, hits)
+        found = {hit.source for hit in hits if "vector" in hit.ranks}
+        assert found == {"a.md"}, (mode, hits)
+    stored = postgres_support.owner_of(index.database)._query(
+        "SELECT c.source, v.embedding[1]::text FROM nodestro_chunk_vectors v"
+        " JOIN nodestro_chunks c ON c.id = v.chunk_id"
+        " WHERE v.tenant_id = %s AND c.tenant_id = %s AND c.source <> 'a.md' ORDER BY c.source",
+        (index.tenant_id, index.tenant_id),
+    )
+    assert stored == [("inf.md", "-Infinity"), ("nan.md", "NaN")]  # left out, not rewritten
+    rows = postgres_support.owner_of(index.database)._query(
+        "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s", (index.tenant_id,)
+    )
+    assert rows == [(3,)]
