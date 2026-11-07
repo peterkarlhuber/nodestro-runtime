@@ -102,7 +102,8 @@ def make(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Callable[[s
             if request.param == "postgres-runtime":
                 knowledge.index._pgvector = False  # type: ignore[attr-defined]
             elif not knowledge.index.pgvector():  # type: ignore[attr-defined]
-                pytest.skip("pgvector is not installed in the test database")
+                # MUP-ONA T-PG-2: a skip in pg-a; a failure in pg-b (NODESTRO_REQUIRE_PGVECTOR=1)
+                postgres_support.require_pgvector_or_skip("pgvector is not installed in the test database")
             return knowledge
 
         yield open_tenant
