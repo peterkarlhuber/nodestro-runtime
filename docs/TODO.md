@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 21 |
+| P3 Low | 20 |
 | P4 Optional | 13 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -558,22 +558,6 @@ None known.
   ("Ausgabe", "Entscheidung", "Freigabe"); `schemas.py` "Neuer Workflow". They are kept on purpose for prompt
   stability, but conflict with the English-only rule.
 - **Next step:** Decide; a change needs coordinated updates of API tests and the OpenAPI snapshot.
-
-### RT-048 · pgvector installed after migration 0010
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:** #99, `migrations/postgres/0010_knowledge_vectors.sql`
-- **What:** Migration 0010 installs pgvector only when it is available at that moment. Installed later, the runtime
-  keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema. Done 2026-11-07 in
-  this repository: `storage_postgres.pgvector_status(database)` reports `active`, `installable`, `other_schema` or
-  `unavailable` with the SQL to run and an English message (tested against a real pgvector server,
-  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`). MUP-ONA MP-B3: an open `PostgresIndex` checks
-  again after `refresh()` (T-PG-4, U4; nothing in the API calls it yet, so processes still need a restart), and the CI job `pg-b` runs every
-  PostgreSQL test on `pgvector/pgvector:pg17` with `NODESTRO_REQUIRE_PGVECTOR=1`.
-- **Next step:** `nodestro-server check` (nodestro-api `server.check`) warns with that status, and the nodestro-server
-  RUNBOOK names the commands.
-- **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
-
-## Later optimizations
 
 ### RT-047 · Exact vector search only
 
