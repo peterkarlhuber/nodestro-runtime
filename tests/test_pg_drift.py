@@ -205,3 +205,21 @@ def test_a_search_names_at_most_50000_sources(make: Callable[..., Any]) -> None:
             index.retrieve("alpha", 3, mode=mode, sources=[*many, "a.md"])
         hits = index.retrieve("alpha", 3, mode=mode, sources=[*many[:-1], "a.md"])
         assert [hit.source for hit in hits] == ["a.md"], mode
+
+
+# ---- drift 8: the query words of the contract -----------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_query_words_are_contract_words_with_folded_diacritics(make: Callable[..., Any]) -> None:
+    index = make()
+    index.add("The café_menu lists omega psi drinks.", source="menu.md")
+    index.add("Omega alone, then psi alone.", source="apart.md")
+    index.add("A Cafe with a menu.", source="cafe.md")
+    assert [hit.source for hit in index.retrieve("omega_ps", 5, mode="fts")] == ["menu.md"]  # parts in sequence
+    assert [hit.source for hit in index.retrieve("cafe_menu", 5, mode="fts")] == ["menu.md"]
+    # diacritics are folded on both sides, as SQLite's unicode61 remove_diacritics 2 does (a documented deviation)
+    assert {hit.source for hit in index.retrieve("CAFÉ", 5, mode="fts")} == {"menu.md", "cafe.md"}
+    assert index.retrieve("_ __", 5, mode="fts") == []
+    for hostile in ("omega & !psi", "omega:* | psi", "'omega' <-> psi", "omega\\ psi"):
+        assert {hit.source for hit in index.retrieve(hostile, 5, mode="fts")} == {"menu.md", "apart.md"}, hostile

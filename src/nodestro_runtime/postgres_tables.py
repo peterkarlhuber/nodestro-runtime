@@ -47,6 +47,7 @@ from orkexa.retrieval import (
     fuse_hybrid,
     fuse_rrf,
     lexical_evidence,
+    query_words,
     word_weight,
 )
 
@@ -96,10 +97,25 @@ def _text(value: str) -> str:
     return value.replace("\x00", "\ufffd")
 
 
+def _word_queries(query: str) -> dict[str, str]:
+    """``tsquery`` text per query word of ``query`` (:func:`orkexa.retrieval.query_words`), as SQLite matches it.
+
+    A query word is matched as a prefix (``refund`` finds ``refunds``). The search column holds
+    :func:`search_words`, which split a word at an underscore and drop diacritics (as SQLite's ``unicode61
+    remove_diacritics 2`` tokenizer does for documents and queries alike), so ``omega_psi`` finds ``omega psi`` in
+    sequence (``'omega' <-> 'psi':*``), never ``omega`` or ``psi`` alone. A word without letters or digits
+    (``_``) matches nothing."""
+    queries: dict[str, str] = {}
+    for word in query_words(query):
+        parts = search_words(word)
+        if parts:
+            queries[word] = " <-> ".join(f"'{part}'" for part in parts) + ":*"
+    return queries
+
+
 def _tsquery(query: str) -> str:
-    """Any word or word prefix of ``query`` (``refund`` finds ``refunds``); empty: nothing to search for."""
-    words = dict.fromkeys(search_words(query))
-    return " | ".join(f"'{word}':*" for word in words)
+    """Any query word of ``query`` (:func:`_word_queries`); empty: nothing to search for."""
+    return " | ".join(f"({expression})" for expression in _word_queries(query).values())
 
 
 class PostgresFileStore(FileStore):
@@ -602,25 +618,25 @@ class PostgresIndex(Index):
 
     def _lexical_evidence(self, query: str, chunk_ids: builtins.list[int]) -> dict[int, float]:
         """:func:`orkexa.retrieval.lexical_evidence` of ``chunk_ids``: which query words (as prefixes, like
-        :func:`_tsquery`) each contains, weighted by how many chunks of this namespace contain them."""
-        words = builtins.list(dict.fromkeys(search_words(query)))
+        :func:`_word_queries`) each contains, weighted by how many chunks of this namespace contain them."""
+        queries = _word_queries(query)
+        words, expressions = builtins.list(queries), builtins.list(queries.values())
         found: dict[int, builtins.list[str]] = {chunk_id: [] for chunk_id in chunk_ids}
         if not words:
             return lexical_evidence({}, found)
-        word_query = "to_tsquery('simple', quote_literal(w) || ':*')"
         counts = self.database._query(
-            f"SELECT w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s"
-            f" AND search @@ {word_query}) FROM unnest(%s::text[]) AS w",
-            (self.tenant_id, self.namespace, words),
+            "SELECT t.w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s"
+            " AND search @@ to_tsquery('simple', t.q)) FROM unnest(%s::text[], %s::text[]) AS t(w, q)",
+            (self.tenant_id, self.namespace, words, expressions),
         )
         total = len(self)
         weights = {str(word): word_weight(int(count), total) for word, count in counts}
         if chunk_ids:
             rows = self.database._query(
-                "SELECT c.id, w FROM nodestro_chunks c, unnest(%s::text[]) AS w"
+                "SELECT c.id, t.w FROM nodestro_chunks c, unnest(%s::text[], %s::text[]) AS t(w, q)"
                 " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = ANY(%s)"
-                f" AND c.search @@ {word_query}",
-                (words, self.tenant_id, self.namespace, chunk_ids),
+                " AND c.search @@ to_tsquery('simple', t.q)",
+                (words, expressions, self.tenant_id, self.namespace, chunk_ids),
             )
             for chunk_id, word in rows:
                 found[int(chunk_id)].append(str(word))
