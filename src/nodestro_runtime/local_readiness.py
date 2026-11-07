@@ -11,7 +11,9 @@ from the facts only the backend knows:
 - whether the person may install anything (the permission ``install``; never a server's tenants),
 - the strict offline mode (no downloads at all),
 - the free space of the model folder, the catalog's download size and whether the model fits this computer,
-- a download of the same model that already runs (shown and followed instead of starting a second one).
+- a download of the same model that already runs (shown and followed instead of starting a second one),
+- for a model outside the catalog that is not installed: a capability its registry manifest proves it lacks
+  (:mod:`.local_registry`), so the download is not offered for nothing.
 
 :func:`alternatives` lists models that are ready now and can do what the action needs (tool calling, structured
 output, image input, embeddings), for the person to choose; nothing here switches a model by itself.
@@ -34,6 +36,7 @@ from orkexa.local import OllamaError, check_model_name, scan_store
 from pydantic import BaseModel, Field
 
 from .local_models import Hardware, catalog_model, fits
+from .local_registry import registry_facts
 from .local_service import InstalledModel, LocalJob, _free_bytes, _loopback, _present_bytes
 from .problems import NodestroError
 from .providers import provider_of
@@ -125,6 +128,9 @@ class ModelProblem(BaseModel):
     fits: bool | None = None
     #: Capabilities the action needs that the model lacks.
     missing_capabilities: list[str] = Field(default_factory=list)
+    #: ``missing_capabilities`` were read from the Ollama registry before a download (a model outside the catalog
+    #: that is not installed, RT-062), not from the installed model or the catalog.
+    from_registry: bool = False
     #: A download or setup of this model (or of the server) that runs now: follow it instead of starting another.
     job: LocalJob | None = None
     #: The newest earlier download of the model that stopped (cancelled, failed, interrupted): starting it again
@@ -203,6 +209,10 @@ def _jobs_of(ws: Workspace, name: str) -> tuple[LocalJob | None, LocalJob | None
     return running, stopped
 
 
+#: Orkexa's capability names and Ollama's.
+_OLLAMA_NAMES = {"tools": "tools", "image_input": "vision", "reasoning": "thinking"}
+
+
 def _lacking(needs: ModelNeeds, capabilities: Iterable[str], *, kind: str) -> list[str]:
     """Needed capabilities an Ollama model lacks (Ollama's names: ``tools``, ``vision``, ``completion``)."""
     have = set(capabilities)
@@ -210,8 +220,7 @@ def _lacking(needs: ModelNeeds, capabilities: Iterable[str], *, kind: str) -> li
         return [] if kind == "embedding" or "embedding" in have else ["embedding"]
     if kind == "embedding":
         return ["completion"]
-    ollama = {"tools": "tools", "image_input": "vision", "reasoning": "thinking"}
-    return [name for name in needs.capabilities if name in ollama and ollama[name] not in have]
+    return [name for name in needs.capabilities if name in _OLLAMA_NAMES and _OLLAMA_NAMES[name] not in have]
 
 
 def _offered(
@@ -261,7 +270,9 @@ def diagnose(
     """Why ``model`` cannot be used for ``action`` now (``None``: it can, or it is not a local model).
 
     ``start`` lets the check start the managed server of the desktop, as the action itself would; the server is
-    never started for unattended checks. Nothing is ever downloaded here."""
+    never started for unattended checks. Nothing is ever downloaded here; for a model that is neither installed nor in
+    the catalog the registry's manifest, config and template (a few kilobytes, :mod:`.local_registry`) are read when
+    the action needs a capability, except in the strict offline mode and on a server."""
     if not is_local(model) or _injected(ws):
         return None
     needs = needs or ModelNeeds()
@@ -321,6 +332,13 @@ def diagnose(
         listed = _lacking(needs, entry.listed_capabilities, kind=entry.kind)
         if listed:
             return found("capability_missing", missing_capabilities=listed, **facts)
+    elif needs.kind == "chat" and needs.capabilities and not offline and location != "server":
+        # Not in the catalog: what the registry manifest proves the model lacks, before gigabytes are downloaded.
+        known = registry_facts(raw)
+        if known is not None:
+            ahead = [name for name in needs.capabilities if _OLLAMA_NAMES.get(name) in known.absent]
+            if ahead:
+                return found("capability_missing", missing_capabilities=ahead, from_registry=True, **facts)
     pull = running if running is not None and running.kind in ("pull", "build") else None
     folder = service.models_dir() if mode in ("managed", "container") else None
     if folder is not None:

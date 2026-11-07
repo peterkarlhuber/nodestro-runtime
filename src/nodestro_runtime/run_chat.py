@@ -1044,8 +1044,13 @@ def _usage(tracker: Any, usage_of: Any) -> Usage | None:
         return None
     from orkexa.usage import summarize_usage
 
-    from .cost_tracking import stale_requests
+    from .cost_tracking import request_regions, stale_requests
 
     records = list(tracker.records)
-    found: Usage = usage_of(summarize_usage(records), records, stale_requests=stale_requests(tracker, records))
+    found: Usage = usage_of(
+        summarize_usage(records),
+        records,
+        stale_requests=stale_requests(tracker, records),
+        regions=request_regions(tracker, records),
+    )
     return found

@@ -77,11 +77,11 @@ from . import contracts, flow_driver, graph, run_budget, sandbox_cancel, tool_ch
 from .agent_builder import AgentBuilder, BuiltAgent, run_own_tool
 from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
-from .cost_tracking import PricedTracker, PriceMode, stale_requests
+from .cost_tracking import PricedTracker, PriceMode, request_regions, stale_requests
 from .file_delivery import TOOL_NAME as FILES_TOOL_NAME
 from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
-from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
+from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
 from .orchestrator import (
@@ -144,7 +144,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
-from .value_checks import Unverified, checked_fields, correction_prompt, unverified_fields
+from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
 
@@ -265,9 +265,15 @@ def _merged(*lists: Iterable[str]) -> list[str]:
 
 
 def usage_of(
-    summary: UsageSummary, records: Iterable[UsageRecord] = (), *, stale_requests: int = 0, uncapped: int = 0
+    summary: UsageSummary,
+    records: Iterable[UsageRecord] = (),
+    *,
+    stale_requests: int = 0,
+    uncapped: int = 0,
+    regions: Iterable[str] = (),
 ) -> Usage:
-    """Nodestro's usage of an Orkexa summary; ``records`` (the summarized requests) add the price references."""
+    """Nodestro's usage of an Orkexa summary; ``records`` (the summarized requests) add the price references,
+    ``regions`` the provider regions of the requests (:func:`~.cost_tracking.request_regions`)."""
     cost = summary.estimated_cost_usd
     used = list(records)
     return Usage(
@@ -290,6 +296,7 @@ def usage_of(
         pricing_sources=_merged([record.pricing_source for record in used if record.pricing_source]),
         pricing_quality=_lowest_quality(*(record.pricing_quality for record in used)),
         uncapped_requests=uncapped,
+        regions=sorted(set(regions)),
     )
 
 
@@ -359,6 +366,7 @@ def add_usage(first: Usage, second: Usage) -> Usage:
         pricing_versions=_merged(first.pricing_versions, second.pricing_versions),
         pricing_sources=_merged(first.pricing_sources, second.pricing_sources),
         pricing_quality=_lowest_quality(first.pricing_quality, second.pricing_quality),
+        regions=sorted({*first.regions, *second.regions}),
     )
 
 
@@ -2239,6 +2247,7 @@ class RunManager:
                     context.tracker.records,
                     stale_requests=stale_requests(context.tracker),
                     uncapped=uncapped_requests(context.tracker),
+                    regions=request_regions(context.tracker, context.tracker.records),
                 ),
             )
             run.budget_hard_maximum = _hard_maximum(run)
@@ -3754,7 +3763,12 @@ class RunManager:
         finally:
             state.usage = node_usage()
             own = [record for record in context.tracker.records if record.agent == node.id]
-            decisions = usage_of(summarize_usage(own), own, stale_requests=stale_requests(context.tracker, own))
+            decisions = usage_of(
+                summarize_usage(own),
+                own,
+                stale_requests=stale_requests(context.tracker, own),
+                regions=request_regions(context.tracker, own),
+            )
             state.decision_usage = (
                 add_usage(state.decision_usage, decisions)
                 if prior is not None and state.decision_usage is not None
@@ -3945,12 +3959,28 @@ class RunManager:
         outcome: AgentOutcome,
         ask: Callable[..., AgentOutcome],
     ) -> AgentOutcome:
-        """Key figures (``source="tool"``) must come from a tool result: one correction, then the step fails."""
+        """Key figures (``source="tool"``) must come from a tool result: one correction, then the step fails.
+
+        Only calls of computing tools count (:func:`~.value_checks.computing_call`), of this step and of the steps
+        that feed it (:func:`~.graph.feeding_nodes`), never of a parallel branch (RT-054)."""
         source_text = "\n\n".join([prompt, *(block["text"] for block in extra if block.get("type") == "text")])
+        nodes = {node.id: node for node in context.run.workflow.nodes}
+        feeding = {*feeding_nodes(context.run.workflow, node_id), node_id}
+        own: dict[str, set[str]] = {node_id: set(config.tools)}
+        for found in feeding - {node_id}:
+            step_node = nodes.get(found)
+            if step_node is not None and step_node.agent is not None:
+                own[found] = set(step_node.agent.tools)
 
         def failed_of(result: Any) -> list[Unverified]:
             with context.lock:
-                calls = [call for node in context.run.nodes.values() for call in node.tool_calls]
+                calls = [
+                    call
+                    for found in feeding
+                    if (step := context.run.nodes.get(found)) is not None
+                    for call in step.tool_calls
+                    if computing_call(call, own.get(found, ()))
+                ]
             return unverified_fields(config.output, result, calls, source_text)
 
         failed = failed_of(outcome.output)
@@ -4261,7 +4291,12 @@ class RunManager:
         records: list[UsageRecord] = [
             record for record in context.tracker.records if record.agent in names or record.agent.startswith(prefix)
         ]
-        return usage_of(summarize_usage(records), records, stale_requests=stale_requests(context.tracker, records))
+        return usage_of(
+            summarize_usage(records),
+            records,
+            stale_requests=stale_requests(context.tracker, records),
+            regions=request_regions(context.tracker, records),
+        )
 
 
 def _proposal_text(value: Any) -> str:

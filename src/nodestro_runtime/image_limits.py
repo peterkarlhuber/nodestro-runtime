@@ -25,8 +25,12 @@ GATEWAY_MAX_IMAGES_GB = 20.0
 #: the build fails (``deps.image_too_large``).
 MAX_IMAGE_GB = 8.0
 MAX_IMAGE_GB_VARIABLE = "NODESTRO_MAX_IMAGE_GB"
+#: The sandbox gateway's refusal (429) of a build while another one runs. A build that fails with it is not broken: the
+#: Docker sandbox's self-test waits for the other build and tries again (:mod:`nodestro_runtime.docker_status`).
+BUILD_BUSY = "Another image build is running; try again when it is done"
 
 __all__ = [
+    "BUILD_BUSY",
     "GATEWAY_MAX_IMAGES",
     "GATEWAY_MAX_IMAGES_GB",
     "GC_MAX_GB",

@@ -30,7 +30,13 @@ from orkexa.dynamic.docker import (
 from orkexa.errors import ToolExecutionError
 import pytest
 
-from nodestro_runtime.container_images import LOCK_LABEL, ContainerImages, StreamedSandbox, lock_has_hashes
+from nodestro_runtime.container_images import (
+    LOCK_LABEL,
+    ContainerImages,
+    ImageBuildBusy,
+    StreamedSandbox,
+    lock_has_hashes,
+)
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.python_envs import parse_lock
 from nodestro_runtime.testing import FakeUv
@@ -263,6 +269,25 @@ def test_build_failures_are_explained(docker: FakeDocker, output: str, code: str
     with pytest.raises(NodestroError) as caught:
         images(docker).build(HASHED, "3.13")
     assert caught.value.code == code
+
+
+def test_a_build_the_sandbox_gateway_refused_while_another_runs_is_busy_not_broken(docker: FakeDocker) -> None:
+    """LD-020: the docker CLI prints the gateway's 429 as an error response; it is told apart from a real failure."""
+    from nodestro_runtime.container_images import build_busy
+    from nodestro_runtime.image_limits import BUILD_BUSY
+
+    docker.build_fails = True
+    docker.build_output = f"Error response from daemon: Nodestro sandbox gateway: {BUILD_BUSY}"
+    with pytest.raises(NodestroError) as caught:
+        images(docker).build(HASHED, "3.13")
+    assert isinstance(caught.value, ImageBuildBusy)
+    assert caught.value.code == "deps.image_failed" and caught.value.params == {}  # no new text for a user interface
+    assert build_busy(docker.build_output)
+    docker.build_output = "ERROR: failed to solve: process did not complete successfully: exit code: 1"
+    with pytest.raises(NodestroError) as caught:
+        images(docker).build(HASHED, "3.13")
+    assert caught.value.code == "deps.image_failed" and not isinstance(caught.value, ImageBuildBusy)
+    assert not build_busy(docker.build_output)
 
 
 def test_the_sandbox_of_an_image_is_a_docker_sandbox(docker: FakeDocker) -> None:
@@ -1293,6 +1318,24 @@ def test_a_runtime_image_that_cannot_be_built_fails_the_call(docker: FakeDocker)
     assert "Docker is not running" in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (ImageBuildBusy(), "image-busy"),
+        (NodestroError("deps.image_failed", "Building the container image failed: exit code 1"), "image"),
+        (NodestroError("sandbox.unavailable", "Docker is not running"), "image"),
+    ],
+)
+def test_the_runtime_image_self_test_tells_a_busy_gateway_from_a_broken_one(error: NodestroError, reason: str) -> None:
+    from nodestro_runtime.container_images import RuntimeImageSandbox
+
+    def refuse() -> str:
+        raise error
+
+    probe = RuntimeImageSandbox(refuse).self_test()
+    assert not probe.available and probe.reason == reason and str(error) in probe.detail
+
+
 PLAIN_TOOL = '''def double(value: int) -> int:
     """Double a number.
 
@@ -1417,3 +1460,71 @@ def test_a_streamed_sandbox_bounds_what_the_host_reads(tmp_path: Path) -> None:
         with pytest.raises(ToolExecutionError, match="more than 1048696 bytes of output"):
             sandbox.call("def f() -> str:\n    return 'x'\n", "f", {})
     assert len(removed) == 1 and removed[0][3].startswith("orkexa-sandbox-")
+
+
+# ---- the reaper on a real daemon (RT-034, RT-037) --------------------------------------------------------------------
+
+#: A small image every CI runner can pull; the containers are only created, never started.
+REAPER_IMAGE = "python:3.13-slim"
+
+
+def test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon(tmp_path: Path) -> None:
+    """Two installations on one daemon: each reaper removes only its own containers, the tool reaper never touches
+    the local MCP servers' containers, and the MCP reaper removes only the expired ones. Needs no preflight."""
+    if not DOCKER_TESTS:
+        _require_docker()  # skips (or fails under NODESTRO_REQUIRE_DOCKER)
+    import subprocess
+    import time
+
+    from orkexa.dynamic.docker import DEADLINE_LABEL, OWNER_LABEL
+
+    from nodestro_runtime.docker_status import DockerMonitor, installation_owner, mcp_owner
+
+    if subprocess.run(["docker", "image", "inspect", REAPER_IMAGE], capture_output=True).returncode != 0:
+        subprocess.run(["docker", "pull", "-q", REAPER_IMAGE], check=True, capture_output=True, timeout=600)
+    first = installation_owner(tmp_path / "a", "installation-a")
+    second = installation_owner(tmp_path / "b", "installation-b")
+    first_mcp = mcp_owner(first)
+    past, future = time.time() - 60, time.time() + 3600
+    created: dict[str, str] = {}
+
+    def create(name: str, owner: str, deadline: float | None) -> None:
+        labels = ["--label", f"{OWNER_LABEL}={owner}"]
+        if deadline is not None:
+            labels += ["--label", f"{DEADLINE_LABEL}={deadline}"]
+        done = subprocess.run(
+            ["docker", "create", *labels, "--network", "none", REAPER_IMAGE, "true"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        created[name] = done.stdout.strip()
+
+    def present() -> set[str]:
+        listed = subprocess.run(
+            ["docker", "ps", "-aq", "--no-trunc"], check=True, capture_output=True, text=True, timeout=60
+        ).stdout.split()
+        return {name for name, container in created.items() if container in listed}
+
+    try:
+        create("first-expired", first, past)
+        create("first-running", first, future)
+        create("first-no-deadline", first, None)
+        create("second-expired", second, past)
+        create("mcp-expired", first_mcp, past)
+        create("mcp-running", first_mcp, future)
+        monitor = DockerMonitor(lambda: None, owner=first)  # type: ignore[arg-type,return-value]
+        assert monitor.reap_once() == 2  # expired, and one without a valid deadline
+        assert present() == {"first-running", "second-expired", "mcp-expired", "mcp-running"}
+        assert monitor.reap_mcp_once() == 1
+        assert present() == {"first-running", "second-expired", "mcp-running"}
+        assert monitor.reap_once(remove_all=True) == 1  # a desktop's start: all of its own tool containers
+        assert present() == {"second-expired", "mcp-running"}
+        other = DockerMonitor(lambda: None, owner=second)  # type: ignore[arg-type,return-value]
+        assert other.reap_mcp_once() == 0  # the other installation has no MCP containers
+        assert other.reap_once() == 1
+        assert present() == {"mcp-running"}
+    finally:
+        if created:
+            subprocess.run(["docker", "rm", "-f", *created.values()], capture_output=True, timeout=120)

@@ -206,6 +206,7 @@ def test_agent_test_with_tool_calls_and_streaming(workspace: Workspace, runtime:
     )
     assert result.status == "succeeded", result.error
     assert result.text == "The answer is 5." and result.model == CLAUDE
+    assert result.usage.regions == ["eu-central-1"]  # the connection's region (RT-015)
     assert [call.name for call in result.tool_calls] == ["calculator"]
     first, second = runtime.calls
     assert first["modelId"] == "eu.anthropic.claude-sonnet-5-5"

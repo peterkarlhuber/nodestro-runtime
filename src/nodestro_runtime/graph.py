@@ -179,6 +179,25 @@ def ancestors(workflow: Workflow | WorkflowIn, node_id: str) -> set[str]:
     return seen
 
 
+def feeding_nodes(workflow: Workflow | WorkflowIn, node_id: str) -> set[str]:
+    """Every node whose output can reach ``node_id``: its ancestors over every connection, loop connections included
+    (a later step of a loop body feeds the next round's earlier ones). A parallel branch is not among them."""
+    ids = {node.id for node in workflow.nodes}
+    incoming: dict[str, list[str]] = {}
+    for edge in workflow.edges:
+        if edge.source in ids and edge.target in ids and edge.source != edge.target:
+            incoming.setdefault(edge.target, []).append(edge.source)
+    seen: set[str] = set()
+    todo = [node_id]
+    while todo:
+        for source in incoming.get(todo.pop(), []):
+            if source not in seen:
+                seen.add(source)
+                todo.append(source)
+    seen.discard(node_id)
+    return seen
+
+
 def opened_ports(node: Node, state: NodeRun) -> list[str] | None:
     """The opened ports of a settled branching node; ``None`` for nodes with one output."""
     if node.type == "condition":

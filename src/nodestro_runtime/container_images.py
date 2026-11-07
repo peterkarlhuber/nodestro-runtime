@@ -73,8 +73,9 @@ from orkexa.dynamic.docker import (
 from orkexa.providers.base import redact
 
 from . import docker_status
-from .docker_status import OWNER, mcp_owner
+from .docker_status import IMAGE_BUSY, OWNER, mcp_owner
 from .image_limits import (
+    BUILD_BUSY,
     GC_MAX_GB,
     GC_MAX_IMAGES,
     GIB,
@@ -598,6 +599,8 @@ class ContainerImages:
             try:
                 self._docker([*args, str(context)], timeout=_BUILD_TIMEOUT, log=log)
             except _DockerFailed as exc:
+                if build_busy(exc.output):
+                    raise ImageBuildBusy() from None
                 raise NodestroError(*_explain(exc.output)) from None
         found = self._inspect(tag)
         size = found[0] if found is not None else 0
@@ -1168,11 +1171,15 @@ class RuntimeImageSandbox(StreamedSandbox):
         return self.image
 
     def self_test(self, *, image: str | None = None) -> SandboxProbe:
+        """The self-test of the resolved image. An image that cannot be built fails with reason ``image``; one whose
+        build the sandbox gateway refused because another build runs (:func:`build_busy`) with ``image-busy``, which
+        the Docker monitor reports as ``checking`` and tries again soon (:mod:`nodestro_runtime.docker_status`)."""
         if image is None:
             try:
                 self._resolved()
             except SandboxError as exc:
-                return SandboxProbe("docker", False, "image", str(exc))
+                busy = isinstance(exc.__cause__, ImageBuildBusy)
+                return SandboxProbe("docker", False, IMAGE_BUSY if busy else "image", str(exc))
         return super().self_test(image=image)
 
     def command(self, workdir: Path, container_name: str, *, image: str | None = None) -> list[str]:
@@ -1219,6 +1226,18 @@ class ResolveError(Exception):
         self.output = output
 
 
+class ImageBuildBusy(NodestroError):
+    """``deps.image_failed`` because the sandbox gateway refused the build while another one runs (:func:`build_busy`):
+    the build was not started and nothing is wrong with it. Same code and parameters as any failed build, so a user
+    interface needs no new text; the Docker monitor tells it apart by its class."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "deps.image_failed",
+            f"The sandbox gateway builds another image now; try again when it is done ({BUILD_BUSY})",
+        )
+
+
 class _DockerFailed(Exception):
     def __init__(self, output: str) -> None:
         super().__init__(output)
@@ -1240,6 +1259,12 @@ def _repository(name: str) -> str:
         if name.startswith(prefix):
             return name[len(prefix) :]
     return name
+
+
+def build_busy(output: str) -> bool:
+    """Whether a failed ``docker build``'s ``output`` is the sandbox gateway's refusal (429) because another image build
+    runs (:data:`~nodestro_runtime.image_limits.BUILD_BUSY`): nothing is wrong with this build, it was not started."""
+    return BUILD_BUSY.lower() in output.lower()
 
 
 def _daemon_unreachable(output: str) -> bool:
@@ -1277,12 +1302,14 @@ __all__ = [
     "OWNER",
     "UV_IMAGE",
     "ContainerImages",
+    "ImageBuildBusy",
     "LocalImageSandbox",
     "OutputLimitExceeded",
     "ResolveError",
     "RuntimeImageSandbox",
     "StreamedSandbox",
     "bounded_run",
+    "build_busy",
     "check_shape",
     "default_base",
     "lock_has_hashes",

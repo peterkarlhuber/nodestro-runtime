@@ -11,7 +11,8 @@ optional AI guide of a published API (``api_docs``: the guide in ``ref``) and th
 (``run_chat``: the run in ``ref``, the question in ``request``). One entry per
 operation and model, so the usage
 dashboard can show tokens, cost, model and time of every request without
-counting a run twice.
+counting a run twice. A request to a provider billed per region (Amazon Bedrock) records its region,
+one entry per model and region (RT-015).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from orkexa import UsageRecord
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel, Field
 
-from .cost_tracking import stale_requests
+from .cost_tracking import request_region, stale_requests
 from .engine import usage_of
 from .platform_events import platform_events
 from .schemas import Usage, new_id, now
@@ -71,6 +72,9 @@ class UsageEntry(BaseModel):
     request: str | None = None
     #: Part of the tokens are estimated (a cancelled answer whose usage the API never reported).
     estimated: bool = False
+    #: The provider region the requests went to, for providers billed per region (Amazon Bedrock); ``None`` for
+    #: other providers, when the region is not known, and for entries recorded before RT-015.
+    region: str | None = None
 
 
 class UsageLog:
@@ -91,30 +95,37 @@ class UsageLog:
         estimated: bool = False,
         tracker: object | None = None,
     ) -> list[UsageEntry]:
-        """Store the requests of one operation, one entry per model (``provider:model``); nothing for no requests.
+        """Store the requests of one operation, one entry per model (``provider:model``) and provider region (Bedrock;
+        see :func:`~.cost_tracking.request_region`); nothing for no requests.
 
         Each entry keeps the cost Orkexa calculated when the request ended and its price references (snapshot
         versions, sources, quality); ``tracker`` (the operation's :class:`~.cost_tracking.PricedTracker`) adds
         which requests were priced with a stale price.
         """
-        by_model: dict[str, list[UsageRecord]] = {}
+        by_model: dict[tuple[str, str | None], list[UsageRecord]] = {}
         for record in records:
             model = f"{record.provider}:{record.model}" if record.provider else record.model
-            by_model.setdefault(model, []).append(record)
+            by_model.setdefault((model, request_region(tracker, record)), []).append(record)
         entries = []
         sink = platform_events(self.store)
         tenant = str(getattr(self.store, "tenant_id", ""))
         with self.store.transaction():  # one operation: all of its entries or none
-            for model, group in by_model.items():
+            for (model, region), group in by_model.items():
                 entry = UsageEntry(
                     source=source,
                     label=label[:120],
                     model=model,
+                    region=region,
                     ref=ref,
                     detail=detail,
                     request=request,
                     estimated=estimated,
-                    usage=usage_of(summarize_usage(group), group, stale_requests=stale_requests(tracker, group)),
+                    usage=usage_of(
+                        summarize_usage(group),
+                        group,
+                        stale_requests=stale_requests(tracker, group),
+                        regions=[region] if region else [],
+                    ),
                 )
                 self.store.put(_COLLECTION, entry.id, entry)
                 if sink is not None:  # the mirror commits with the entry (see .platform_events)

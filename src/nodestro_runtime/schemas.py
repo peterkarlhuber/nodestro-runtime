@@ -638,6 +638,9 @@ class Usage(_Model):
     #: Requests a budget admitted without capping their cost (AO-12): no upper bound (no price, native tools,
     #: images, binary documents) or one larger than the rest of the budget, admitted alone.
     uncapped_requests: int = 0
+    #: The provider regions the requests went to, for providers billed per region (Amazon Bedrock: ``eu-central-1``);
+    #: empty when there were none or the region is not known (usage recorded before RT-015).
+    regions: list[str] = Field(default_factory=list)
 
 
 class ToolCallApproval(_Model):

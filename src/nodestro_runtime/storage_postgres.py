@@ -821,6 +821,70 @@ def inspect_role(database: PostgresDatabase, role: str) -> dict[str, Any]:
     }
 
 
+def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
+    """Whether pgvector ranks the knowledge vectors of ``database``'s schema, and what an operator does if not (RT-048).
+
+    Migration ``0010`` installs pgvector only when it is available at that moment and the migrating role may install
+    it; one installed later, or in a schema this database's ``search_path`` does not include, leaves the runtime
+    ranking the vectors itself. Read-only; ``state`` is one of:
+
+    - ``active``: the type ``vector`` is usable here; pgvector ranks the vectors.
+    - ``other_schema``: the extension is installed in ``extension_schema``, which this connection does not see (a
+      server with ``NODESTRO_DATABASE_SCHEMA`` sets its ``search_path`` to that schema only).
+    - ``installable``: the server has pgvector (``available_version``) but this database does not use it.
+    - ``unavailable``: the PostgreSQL server has no pgvector; it has to be installed on the server first.
+
+    ``command`` is the SQL that fixes it (run by a superuser, or a role that may create the extension: pgvector is
+    not a trusted extension), ``None`` when nothing is to be done or the package must be installed first; ``message``
+    says it in English for operator output. Processes that already run keep ranking themselves until they restart
+    (each knowledge index checks pgvector once)."""
+    rows = database._query(
+        "SELECT to_regtype('vector') IS NOT NULL, current_schema()::text,"
+        " (SELECT e.extversion::text FROM pg_extension e WHERE e.extname = 'vector'),"
+        " (SELECT n.nspname::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace"
+        "   WHERE e.extname = 'vector'),"
+        " (SELECT a.default_version::text FROM pg_available_extensions a WHERE a.name = 'vector')"
+    )
+    usable, schema, version, extension_schema, available = rows[0] if rows else (False, None, None, None, None)
+    target = '"' + str(schema or "public").replace('"', '""') + '"'
+    command: str | None = None
+    if usable:
+        state = "active"
+        message = (
+            f"pgvector {version} ranks the knowledge vectors" if version else "pgvector ranks the knowledge vectors"
+        )
+    elif version is not None:
+        state = "other_schema"
+        command = f"ALTER EXTENSION vector SET SCHEMA {target};"
+        message = (
+            f"pgvector {version} is installed in schema {extension_schema!r}, which this database's search_path "
+            f"({schema!r}) does not include: the runtime ranks the vectors itself. Move it ({command}), unless other "
+            "applications of this database use it there, then restart the API and worker processes"
+        )
+    elif available is not None:
+        state = "installable"
+        command = f"CREATE EXTENSION vector SCHEMA {target};"
+        message = (
+            f"pgvector {available} is available on the PostgreSQL server but not installed in this database: the "
+            f"runtime ranks the vectors itself. As a superuser run {command} then restart the API and worker processes"
+        )
+    else:
+        state = "unavailable"
+        message = (
+            "The PostgreSQL server has no pgvector: the runtime ranks the vectors itself (semantic search works, but "
+            "reads every candidate vector). Install the pgvector package on the server, then check again"
+        )
+    return {
+        "state": state,
+        "version": version,
+        "available_version": available,
+        "extension_schema": extension_schema,
+        "schema": schema,
+        "command": command,
+        "message": message,
+    }
+
+
 class PostgresStore:
     """The JSON documents of one tenant in PostgreSQL (a :class:`~nodestro_runtime.storage.DocumentStore`).
 

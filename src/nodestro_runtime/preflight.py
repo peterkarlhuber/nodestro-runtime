@@ -29,6 +29,7 @@ from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
+from .value_checks import computes
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -1102,14 +1103,16 @@ def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
                     )
                 )
                 continue
-            earlier = {node.id} | graph.ancestors(workflow, node.id)
+            earlier = {node.id} | graph.feeding_nodes(workflow, node.id)
             if not any(
-                other.agent is not None and other.agent.tools for other in workflow.nodes if other.id in earlier
+                other.agent is not None and computes(other.agent.tools)
+                for other in workflow.nodes
+                if other.id in earlier
             ):
                 found.append(
                     _issue(
                         "check.value_source_no_tool",
-                        f"{item.name} must come from a tool, but neither this agent nor one before it has a tool",
+                        f"{item.name} must come from a tool, but no agent up to this one has a tool that computes",
                         node_id=node.id,
                         field=item.name,
                     )
