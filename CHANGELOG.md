@@ -3,19 +3,19 @@
 ## Unreleased
 
 - MUP-ONA B6: the PostgreSQL knowledge index, file store and memory are Orkexa's backends (`orkexa.backends.postgres`,
-  orkexa pinned to the B5 commit). `postgres_tables.PostgresIndex`, `PostgresFileStore` and `PostgresMemory` subclass
-  them with `PostgresLayout("nodestro_")` (`postgres_tables.LAYOUT`), the `storage_postgres.DatabaseSource` adapter
-  and the database's process lock; their constructors, `counts`, `attach_file`, `text`, `memory_totals` and
-  `tenant_storage` are unchanged. The generic copy `nodestro_runtime.pg_generic` and the rule engine
-  `nodestro_runtime.sqlcheck_rules` are deleted; the tenant SQL check calls `orkexa.testing.sqlcheck`. Behavior from
-  orkexa B5: a vector store whose chunk is deleted meanwhile is retried (up to 5 attempts) instead of failing a
-  reindex, and the partition guard refuses tenant ids with U+0000 (Nodestro's own tenant id rule already did). New
-  start check `postgres_tables.require_knowledge_schema(database)` (Orkexa's read-only `verify_schema`):
-  `storage.schema_mismatch` with every problem when the tables deviate, nothing changed. Extras: `postgres` adds
-  `orkexa[postgres]`, `dev` adds `orkexa[postgres,sqlcheck]` (pglast comes from it). The problem code
-  `partition.missing` left `error_codes.json` (orkexa raises it now). Tests: T-CAT-5, T-CAT-4 (B6 form), T-PAR-3,
-  T-PKG-3, T-SCH-1, T-UPG-1..8 (`tests/test_upgrade_legacy.py`; U3 rolls back to the runtime of 76f9cb2, vendored in
-  `tests/fixtures/legacy/pre_b6`). No migration changed.
+  orkexa pinned to 792a041, the merge of orkexa #66, B5). `postgres_tables.PostgresIndex`, `PostgresFileStore` and
+  `PostgresMemory` subclass them with `PostgresLayout("nodestro_")` (`postgres_tables.LAYOUT`), the
+  `storage_postgres.DatabaseSource` adapter and the database's process lock; their constructors, `counts`,
+  `attach_file`, `text`, `memory_totals` and `tenant_storage` are unchanged. The generic copy
+  `nodestro_runtime.pg_generic` and the rule engine `nodestro_runtime.sqlcheck_rules` are deleted; the tenant SQL
+  check calls `orkexa.testing.sqlcheck`. Behavior from orkexa B5: a vector store whose chunk is deleted meanwhile is
+  retried (up to 5 attempts) instead of failing a reindex, and the partition guard refuses tenant ids with U+0000
+  (Nodestro's own tenant id rule already did). New start check `postgres_tables.require_knowledge_schema(database)`
+  (Orkexa's read-only `verify_schema`): `storage.schema_mismatch` with every problem when the tables deviate, nothing
+  changed. Extras: `postgres` adds `orkexa[postgres]`, `dev` adds `orkexa[postgres,sqlcheck]` (pglast comes from it).
+  The problem code `partition.missing` left `error_codes.json` (orkexa raises it now). Tests: T-CAT-5, T-CAT-4 (B6
+  form), T-PAR-3, T-PKG-3, T-SCH-1, T-UPG-1..8 (`tests/test_upgrade_legacy.py`; U3 rolls back to the runtime of
+  76f9cb2, vendored in `tests/fixtures/legacy/pre_b6`). No migration changed.
 
 - Tests (MUP-ONA B4): the catalog, guard and parity tests that render SQL with `psycopg.sql` skip without the
   postgres extra, like the other PostgreSQL tests, so the desktop profile's component run (studio `platform.yml`) passes.

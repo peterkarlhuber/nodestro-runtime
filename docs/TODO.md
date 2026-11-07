@@ -623,7 +623,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Done (`mup/b6-orkexa-postgres`):** `postgres_tables` on `orkexa.backends.postgres` (`PostgresLayout("nodestro_")`),
   `pg_generic/` and `sqlcheck_rules.py` deleted, the tenant SQL check on `orkexa.testing.sqlcheck`, start check
   `require_knowledge_schema`, T-CAT-5, T-PAR-3, T-PKG-3, T-UPG-1..8.
-- **Next step:** pin orkexa to the merge commit of orkexa #66 (B5); nodestro-api's start check and the pin cascade
+- **Next step:** nodestro-api's start check and the pin cascade
   (examples, integrations, api, sdk, studio, server, local-docker); image smoke and desktop run; gate G2.
 
 ## Cross-repository dependencies
