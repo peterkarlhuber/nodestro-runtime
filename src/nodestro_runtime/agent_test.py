@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from . import tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
-from .cost_tracking import PricedTracker, PriceMode
+from .cost_tracking import PricedTracker, PriceMode, request_regions
 from .engine import execute_agent, node_problem, render_task, tool_rounds_problem, usage_of
 from .pricing import PricingService
 from .problems import Problem
@@ -227,6 +227,11 @@ class AgentTester:
             result.error, result.error_code, result.error_params = found.message, found.code, found.params
         finally:
             result.reasoning.active = False
-            result.usage = usage_of(tracker.usage, tracker.records, stale_requests=tracker.stale_requests())
+            result.usage = usage_of(
+                tracker.usage,
+                tracker.records,
+                stale_requests=tracker.stale_requests(),
+                regions=request_regions(tracker, tracker.records),
+            )
             result.finished_at = now()
         return result, tracker
