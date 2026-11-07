@@ -25,7 +25,7 @@ package; the runtime itself depends on neither.
 | MCP | `mcp` (client hub, OAuth, stdio servers in containers, network guard), `mcp_access` |
 | Knowledge, memory, files | `knowledge`, `memory_spaces`, `documents`, `input_files`, `file_formats`, `file_delivery`, `office`, `reports`, `adoption`, `sanitize`, `preview` |
 | Assembly | `workspace` (`Workspace`: every service of one data directory), `storage` (`DocumentStore`, `SQLiteStore`), `sqlite_tables`, `profile` (desktop or server) |
-| Server | `storage_postgres`, `postgres_tables`, `postgres_import`, `jobs` (run queue, workers, leases, schedules), `server_settings`, `identity_store`, `axentra_*` (Axentra platform), `platform_events`, `tenant_sql_check` (with its rule engine `sqlcheck_rules`) |
+| Server | `storage_postgres`, `postgres_tables` (on the generic part `pg_generic`: `ConnectionSource`, statement catalog, partition guard), `postgres_import`, `jobs` (run queue, workers, leases, schedules), `server_settings`, `identity_store`, `axentra_*` (Axentra platform), `platform_events`, `tenant_sql_check` (with its rule engine `sqlcheck_rules`) |
 | Extensions | `extensions` (contract for integrations, entry point group `nodestro.integrations`) |
 | Testing | `testing` (simulated provider clients and uv; never a real request) |
 

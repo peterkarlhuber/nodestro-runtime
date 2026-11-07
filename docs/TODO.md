@@ -618,13 +618,16 @@ PR that completes its package. They are tracked by the plan's execution status a
 
 - **Priority:** P3 Low · **Status:** In progress · **Refs:**
   [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md),
-  `sqlcheck_rules.py`, `tests/fixtures/sql_parity_before.json`
+  `sqlcheck_rules.py`, `pg_generic/`, `tests/fixtures/sql_parity_before.json`
 - **What:** The generic PostgreSQL index, file store and memory code is mixed with product code; its SQL is not a
   catalog.
 - **Done (PR 1, `mup/b4-sqlcheck-engine`):** parity baseline checked in before any change; the rule engine of the
   tenant SQL check separated as `sqlcheck_rules.py` (parameterized, import-linter contract, T-SQLC-1).
-- **Next step:** PR 2 (`mup/b4-pg-catalog`): `ConnectionSource`, statement catalog, executor with partition guard,
-  T-CAT-1..4, T-GUARD-1/2 and the parity test T-PAR-1 against the baseline. Gate G1 is granted.
+- **Done (PR 2, `mup/b4-pg-catalog`):** `pg_generic` package (`ConnectionSource` + `DatabaseSource` adapter,
+  statement catalog, executor with partition guard, index/files/memory), import-linter contract, T-CAT-1..4,
+  T-GUARD-1/2, T-PAR-1 (`docs/AXENTRA.md`, "M10 evidence: catalog + engine + parity").
+- **Next step:** merge PR 2 and the pin cascade (runtime -> examples + integrations -> api -> sdk -> studio ->
+  server/local-docker); then MP-B5 takes `pg_generic` and `sqlcheck_rules` over into orkexa.
 
 ### RT-MUP-B6 · Switch to orkexa's PostgreSQL backend (MUP-ONA MP-B6)
 

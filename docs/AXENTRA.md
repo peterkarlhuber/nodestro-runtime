@@ -229,6 +229,40 @@ added.
 `tenant_sql_allowlist.py` or a migration is ready to merge only when a nodestro-api PR with a temporary integration
 pin on that runtime commit shows a green `tenant-sql` job; both PRs are linked to each other (see `CONTRIBUTING.md`).
 
+**M10 evidence: catalog + engine + parity (MUP-ONA B4, decision O5).** Since B4 the SQL of the knowledge index, the
+file store and the memory is no longer written in the methods that run it. The generic part of those classes lives in
+`nodestro_runtime/pg_generic/` (taken over into orkexa as `orkexa.backends.postgres` in B5) and runs SQL only through
+its statement catalog `pg_generic/_sql.py`: 43 named statements whose templates name the tables as `{chunks}`,
+`{vectors}`, `{spaces}`, `{files}`, `{memory}` and bind every value by name (`%(tenant_id)s`); the tables are rendered
+with `psycopg.sql.Identifier(prefix + table)` for a prefix that matches `^[a-z][a-z0-9_]{0,30}_$` (Nodestro:
+`nodestro_`), never with a value in the text (no `sql.Literal`). The generic part gets its connections only through
+the `ConnectionSource` protocol (`pg_generic/connection.py`; Nodestro's adapter `storage_postgres.DatabaseSource`
+runs reads, writes and transactions exactly as `PostgresDatabase` did) and imports nothing of Nodestro (import-linter
+contract). The source check above cannot see a template's tables, so the catalog is checked rendered, and four kinds
+of evidence keep the coverage:
+
+- **engine** (`tests/test_sqlcheck_rules.py`, T-SQLC-1): the rule engine is generic (foreign column and tables);
+- **catalog** (`tests/test_sql_catalog.py`): every entry rendered with `nodestro_` is bound by the engine with
+  Nodestro's tenant tables (T-CAT-1); a mutation probe removes each `tenant_id` predicate, turns each `AND` next to one
+  into `OR` and drops the `tenant_id` column of each `INSERT ... VALUES`, and every one of the 92 mutations of the 42
+  partitioned entries must leak (T-CAT-2; the CI `test` job uploads the outcome as the artifact
+  `sql-catalog-mutation-probe-<python>`); the catalog's names and partition flags equal a checked-in list (T-CAT-3);
+  and no module of the package runs SQL except the executor with a catalog name as a constant (T-CAT-4);
+- **runtime guard** (`tests/test_partition_guard.py`): the executor refuses a partitioned statement unless
+  `tenant_id` is bound to a non-empty string of at most 128 characters that is the instance's own tenant
+  (`RetrievalError("partition.missing")`, raised before any database access; T-GUARD-1), and a bad prefix is refused
+  before anything is rendered (T-GUARD-2);
+- **parity** (`tests/test_sql_parity.py`, T-PAR-1): the 46 statements the check found in `postgres_tables.py` before
+  B4 (`tests/fixtures/sql_parity_before.json`) are all found again, normalized by PostgreSQL's grammar, in the source
+  the check reads now (the four Nodestro statements that stayed in `postgres_tables.py`: chunk counts, attaching a
+  file, a source's text, memory totals) or in the rendered catalog (the other 42), with no new finding. The source
+  scan reports no `dynamic` finding for the package, and no allowlist entry was added.
+
+The partition suites (T-PART-1..9, conformance, ranking T-RANK-1) run unchanged against the new classes on `pg-a` and
+`pg-b`, as superuser and as the restricted runtime role. The `ConnectionSource` has the hook for a transaction-local
+`set_config('app.tenant_id', ..., true)` (`DatabaseSource(..., tenant_setting="app.tenant_id")`), off until row-level
+security is enabled (A9).
+
 **Remaining isolation risk.** Without row-level security, PostgreSQL itself does not stop a statement that reads or
 changes another tenant's rows in `nodestro_*` tables; the check is a test-time review of source code. What can still
 slip through it:

@@ -34,6 +34,8 @@ jobs:
     env:
       NODESTRO_TEST_POSTGRES: host=127.0.0.1 port=5432 user=postgres password=nodestro-ci dbname=postgres
       NODESTRO_REQUIRE_POSTGRES: "1"
+      # The mutation probe of the statement catalog (T-CAT-2, tests/test_sql_catalog.py) writes its outcome here.
+      NODESTRO_CATALOG_REPORTS: reports/sql-catalog
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,6 +57,12 @@ jobs:
       - run: pytest --junitxml=junit-test.xml
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-test.xml tests/ci/skipped-test.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sql-catalog-mutation-probe-${{ matrix.python }}
+          path: reports/sql-catalog/
+          if-no-files-found: error
       # Known vulnerabilities in the installed dependencies (as orkexa's CI checks them). Blocking: an advisory that
       # was reviewed and cannot be fixed yet goes into PIP_AUDIT_IGNORE (space-separated IDs, with the reason here).
       - name: Dependency audit

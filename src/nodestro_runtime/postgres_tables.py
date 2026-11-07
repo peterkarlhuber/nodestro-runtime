@@ -2,89 +2,41 @@
 
 The Orkexa backends Nodestro uses on the desktop (``SQLiteFileStore``, ``SQLiteIndex``, ``SQLiteMemory``) keep
 their data in SQLite tables. These classes implement the same Orkexa interfaces (``FileStore``, ``Index``,
-``MemoryBackend``) on the tables of migration ``0002`` for one tenant and one Orkexa namespace, on the connection
-and lock of a :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Every query filters on ``tenant_id``.
+``MemoryBackend``) on the tables of migrations ``0002`` and ``0010`` for one tenant and one Orkexa namespace, on the
+connection pool and lock of a :class:`~nodestro_runtime.storage_postgres.PostgresDatabase`. Every query filters on
+``tenant_id``.
 
-Search: the words of a chunk's title and text (letters and digits; lower case, diacritics removed, as SQLite's
-``unicode61 remove_diacritics 2`` tokenizer does) are kept in ``search_text`` and indexed as a ``tsvector``. A query
-matches any of its words or word prefixes, like :class:`orkexa.SQLiteIndex`; results are ranked by ``ts_rank``
-instead of BM25, so the order of equally good hits can differ from the desktop.
-
-Hybrid search fuses both rankings as :class:`orkexa.SQLiteIndex` does (:func:`orkexa.retrieval.fuse_hybrid`): the
-min-max normalized cosine similarity plus the full-text evidence of each candidate, the squared IDF-weighted share of
-the query's words it contains (word weights count the chunks of the tenant's namespace). ``ts_rank`` only picks the
-full-text candidates, so the fused order does not depend on it. ``fusion="rrf"`` keeps the earlier reciprocal rank
-fusion.
-
-Vectors (migration ``0010``): like :class:`orkexa.SQLiteIndex`, each namespace keeps its vectors in a *space* bound to
-one embedding model identity (``nodestro_vector_spaces``, ``nodestro_chunk_vectors``). With pgvector installed the
-database ranks them (an exact cosine distance); without it the runtime does, over the same rows. Searches are
-limited to the allowed sources before ranking.
+Since MUP-ONA B4 the implementation is the generic PostgreSQL part :mod:`nodestro_runtime.pg_generic` (taken over into
+orkexa as ``orkexa.backends.postgres`` in B5): this module is Nodestro's part. It wires the generic classes to a
+:class:`~nodestro_runtime.storage_postgres.PostgresDatabase` (through its ``ConnectionSource`` adapter
+:class:`~nodestro_runtime.storage_postgres.DatabaseSource`, with the table prefix ``nodestro_`` and Nodestro's rule for
+tenant ids), and adds what Nodestro reads beside the Orkexa interfaces: chunk counts per source, pointing a source's
+chunks to its file, a source's indexed text, and the memory totals of a tenant. Their SQL stays here, where the tenant
+SQL check reads it from the source; the generic part's SQL is its statement catalog, which the check renders
+(``tests/test_sql_catalog.py``). Search, hybrid fusion and vectors: :mod:`nodestro_runtime.pg_generic.index`.
 """
 
 from __future__ import annotations
 
 import builtins
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
-import json
-import math
-import re
 from typing import TYPE_CHECKING, Any
-import unicodedata
 
-from orkexa import Chunk, FileStore, Hit, Index, MemoryToolError, StoredFile
-from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel, validate_vector
-from orkexa.memory import MemoryBackend
-from orkexa.retrieval import (
-    HYBRID_FUSIONS,
-    LEXICAL_WEIGHT,
-    HybridFusion,
-    RetrievalError,
-    RetrievalMode,
-    VectorStatus,
-    check_mode,
-    fuse_hybrid,
-    fuse_rrf,
-    lexical_evidence,
-    query_words,
-    word_weight,
-)
+from orkexa.embeddings import EmbeddingModel
+from orkexa.retrieval import LEXICAL_WEIGHT, HybridFusion, RetrievalMode
 
+from . import pg_generic
 from .bedrock import BedrockOperatorConfig
 from .knowledge import KnowledgeTables
 from .memory_spaces import BrowsableMemory
-from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
+from .pg_generic import MAX_SOURCES, PostgresVectorStatus, search_words
+from .storage_postgres import TENANT_ID, DatabaseSource, PostgresDatabase
 
 if TYPE_CHECKING:
     from .server_settings import TenantSecrets
     from .workspace import WorkspaceStorage
 
-#: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
-_WORD = re.compile(r"[^\W_]+")
-#: Unlocked rounds of a reindex before it switches (PostgresIndex.reindex).
-_REINDEX_ROUNDS = 5
-#: At most this many chunks (or one batch, if larger) are embedded at the switch, while writes to the namespace wait.
-#: The unlocked rounds leave about what writers add during one round; more than this means writes outpace the model.
-_REINDEX_SWITCH_CHUNKS = 256
-#: Chunks of a namespace without a vector in a space (params: tenant, namespace, tenant, space).
-_MISSING = (
-    "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
-    " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id)"
-)
-_COUNT_MISSING = (
-    "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
-    " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id)"
-)
-#: Most sources one search may be limited to (``retrieve(sources=...)``), as in ``orkexa.SQLiteIndex``.
-MAX_SOURCES = 50_000
-#: Stored vectors a search may use. A zero vector has no direction, so no cosine: it is stored (its chunk counts as
-#: embedded, as in ``orkexa.SQLiteIndex``) but never ranked. Vectors stored before vectors were checked can also hold
-#: NaN or infinity, which no ranking can use (pgvector refuses to cast them). Searches leave both out; the rows stay.
-_USABLE = (
-    "NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[])"
-    " AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)])"
-)
+#: The prefix of Nodestro's tables (``nodestro_chunks`` ...; migrations ``0002`` and ``0010``).
+TABLE_PREFIX = "nodestro_"
 
 
 def _check(tenant_id: str, namespace: str) -> None:
@@ -94,53 +46,7 @@ def _check(tenant_id: str, namespace: str) -> None:
         raise ValueError("namespace must not be empty")
 
 
-def search_words(text: str) -> builtins.list[str]:
-    """The words of ``text`` for the search index: lower case, without diacritics."""
-    folded = "".join(char for char in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(char))
-    return _WORD.findall(folded)
-
-
-def _refresh_identity(model: EmbeddingModel) -> None:
-    """``model.refresh_identity()``; a model that only has the methods of the protocol (no ``refresh_identity``, e.g.
-    a test double that does not subclass :class:`~orkexa.embeddings.EmbeddingModel`) caches nothing to forget."""
-    refresh = getattr(model, "refresh_identity", None)
-    if refresh is not None:
-        refresh()
-
-
-def _cosine(query: builtins.list[float], query_norm: float, stored: builtins.list[float]) -> float:
-    """The cosine similarity of a query vector (with its length) and a stored vector (neither is all zeros)."""
-    dot = math.fsum(a * b for a, b in zip(query, stored, strict=True))
-    return dot / (query_norm * math.sqrt(math.fsum(x * x for x in stored)))
-
-
-def _text(value: str) -> str:
-    """PostgreSQL text cannot hold U+0000; the index keeps U+FFFD in its place."""
-    return value.replace("\x00", "\ufffd")
-
-
-def _word_queries(query: str) -> dict[str, str]:
-    """``tsquery`` text per query word of ``query`` (:func:`orkexa.retrieval.query_words`), as SQLite matches it.
-
-    A query word is matched as a prefix (``refund`` finds ``refunds``). The search column holds
-    :func:`search_words`, which split a word at an underscore and drop diacritics (as SQLite's ``unicode61
-    remove_diacritics 2`` tokenizer does for documents and queries alike), so ``omega_psi`` finds ``omega psi`` in
-    sequence (``'omega' <-> 'psi':*``), never ``omega`` or ``psi`` alone. A word without letters or digits
-    (``_``) matches nothing."""
-    queries: dict[str, str] = {}
-    for word in query_words(query):
-        parts = search_words(word)
-        if parts:
-            queries[word] = " <-> ".join(f"'{part}'" for part in parts) + ":*"
-    return queries
-
-
-def _tsquery(query: str) -> str:
-    """Any query word of ``query`` (:func:`_word_queries`); empty: nothing to search for."""
-    return " | ".join(f"({expression})" for expression in _word_queries(query).values())
-
-
-class PostgresFileStore(FileStore):
+class PostgresFileStore(pg_generic.PostgresFileStore):
     """An Orkexa :class:`~orkexa.FileStore` of one tenant and namespace (table ``nodestro_files``)."""
 
     def __init__(
@@ -153,75 +59,22 @@ class PostgresFileStore(FileStore):
         max_image_bytes: int = 5_000_000,
         max_document_bytes: int = 20_000_000,
     ) -> None:
-        super().__init__(files_api=files_api, max_image_bytes=max_image_bytes, max_document_bytes=max_document_bytes)
         _check(tenant_id, namespace)
+        source = DatabaseSource(database)
+        super().__init__(
+            source,
+            tenant_id,
+            prefix=TABLE_PREFIX,
+            namespace=namespace,
+            lock=source.lock,  # one lock for every user of the database
+            files_api=files_api,
+            max_image_bytes=max_image_bytes,
+            max_document_bytes=max_document_bytes,
+        )
         self.database = database
-        self.tenant_id = tenant_id
-        self.namespace = namespace
-        self._lock = database._lock  # one lock for every user of the connection
-
-    @property
-    def capabilities(self) -> frozenset[str]:
-        """``partitioned`` (by tenant) and ``concurrent_writers`` (:attr:`orkexa.FileStore.capabilities`)."""
-        return frozenset({"partitioned", "concurrent_writers"})
-
-    def close(self) -> None:
-        """Nothing to do: the connection belongs to the database."""
-
-    def _save(self, entry: StoredFile, data: bytes | None) -> None:
-        if data is None:
-            self.database._write(
-                "UPDATE nodestro_files SET entry = %s::jsonb WHERE tenant_id = %s AND namespace = %s AND id = %s",
-                (_encode(entry.model_dump_json())[0], self.tenant_id, self.namespace, entry.id),
-            )
-        else:
-            self.database._write(
-                "INSERT INTO nodestro_files (tenant_id, namespace, id, entry, data) VALUES (%s, %s, %s, %s::jsonb, %s)"
-                " ON CONFLICT (tenant_id, namespace, id) DO UPDATE SET entry = excluded.entry, data = excluded.data",
-                (self.tenant_id, self.namespace, entry.id, _encode(entry.model_dump_json())[0], data),
-            )
-
-    def _entry(self, file_id: str) -> StoredFile | None:
-        rows = self.database._query(
-            "SELECT entry::text FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
-            (self.tenant_id, self.namespace, file_id),
-        )
-        return StoredFile.model_validate_json(rows[0][0]) if rows else None
-
-    def _data(self, file_id: str) -> bytes | None:
-        rows = self.database._query(
-            "SELECT data FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
-            (self.tenant_id, self.namespace, file_id),
-        )
-        return bytes(rows[0][0]) if rows else None
-
-    def _entries(self) -> builtins.list[StoredFile]:
-        rows = self.database._query(
-            "SELECT entry::text FROM nodestro_files WHERE tenant_id = %s AND namespace = %s",
-            (self.tenant_id, self.namespace),
-        )
-        return [StoredFile.model_validate_json(row[0]) for row in rows]
-
-    def _remove(self, file_id: str) -> None:
-        self.database._write(
-            "DELETE FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
-            (self.tenant_id, self.namespace, file_id),
-        )
 
 
-class PostgresVectorStatus(VectorStatus):
-    """:class:`orkexa.retrieval.VectorStatus` of a :class:`PostgresIndex`, with the vectors searches leave out.
-
-    ``excluded`` counts the vectors of the active space that no search ranks: NaN or infinity (stored before vectors
-    were checked) and zero vectors (no direction, no cosine). They stay stored; their chunks count as ``embedded``.
-    ``legacy`` is set while there is any (vectors stored before the checks of MUP-ONA MP-B3, or zero vectors a model
-    returned); a reindex with a model that returns usable vectors replaces them. Orkexa's ``SQLiteIndex`` uses
-    ``legacy`` for the vectors of an ``embedder=`` callable, which a PostgreSQL index never holds."""
-
-    excluded: int = 0
-
-
-class PostgresIndex(Index):
+class PostgresIndex(pg_generic.PostgresIndex):
     """An Orkexa :class:`~orkexa.Index` of one tenant and namespace with full-text search (``nodestro_chunks``).
 
     Also gives what Nodestro reads beside the Orkexa interface (``KnowledgeChunks`` on SQLite): chunk counts per
@@ -240,516 +93,22 @@ class PostgresIndex(Index):
         fusion: HybridFusion = "evidence",
         lexical_weight: float = LEXICAL_WEIGHT,
     ) -> None:
-        super().__init__(max_chars=max_chars, overlap=overlap)
         _check(tenant_id, namespace)
-        if fusion not in HYBRID_FUSIONS:
-            raise ValueError(f"fusion must be one of {', '.join(HYBRID_FUSIONS)}, not {fusion!r}")
-        if not 0.0 <= lexical_weight <= 1.0:
-            raise ValueError("lexical_weight must be between 0 and 1")
-        #: How ``hybrid`` combines full text and vectors (``evidence`` or ``rrf``), and the full-text share.
-        self.fusion: HybridFusion = fusion
-        self.lexical_weight = lexical_weight
+        source = DatabaseSource(database)
+        super().__init__(
+            source,
+            tenant_id,
+            prefix=TABLE_PREFIX,
+            namespace=namespace,
+            lock=source.lock,
+            max_chars=max_chars,
+            overlap=overlap,
+            embeddings=embeddings,
+            mode=mode,
+            fusion=fusion,
+            lexical_weight=lexical_weight,
+        )
         self.database = database
-        self.tenant_id = tenant_id
-        self.namespace = namespace
-        self._lock = database._lock
-        #: The embedding model new chunks are embedded with (``None``: full-text only).
-        self.embeddings = embeddings
-        self.mode = check_mode(mode) if mode is not None else None
-        self._pgvector: bool | None = None
-
-    @property
-    def capabilities(self) -> frozenset[str]:
-        """``partitioned`` (by tenant) and ``concurrent_writers`` always; ``vectors`` and ``reindex`` with an
-        embedding model, as :class:`orkexa.SQLiteIndex` (:attr:`orkexa.Index.capabilities`)."""
-        found = {"partitioned", "concurrent_writers"}
-        if self.embeddings is not None:
-            found |= {"vectors", "reindex"}
-        return frozenset(found)
-
-    def close(self) -> None:
-        """Nothing to do: the connection belongs to the database."""
-
-    def __len__(self) -> int:
-        rows = self.database._query(
-            "SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
-            (self.tenant_id, self.namespace),
-        )
-        return int(rows[0][0])
-
-    def sources(self) -> builtins.list[str]:
-        rows = self.database._query(
-            "SELECT DISTINCT source FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s ORDER BY source",
-            (self.tenant_id, self.namespace),
-        )
-        return [str(row[0]) for row in rows]
-
-    def add_chunks(self, chunks: Iterable[Chunk]) -> builtins.list[int]:
-        kept = [chunk for chunk in chunks if chunk.text.strip()]
-        ids: builtins.list[int] = []
-        if not kept:
-            return ids
-        identity = None
-        vectors: builtins.list[builtins.list[float]] | None = None
-        if self.embeddings is not None:
-            _refresh_identity(self.embeddings)  # the model's current build, not a cached one (MUP-ONA drift 1)
-            identity = self.embeddings.identity()
-            vectors = [[float(x) for x in vector] for vector in self.embeddings.embed_documents([c.text for c in kept])]
-            if len(vectors) != len(kept):
-                raise ValueError("The embedding model must return one vector per text")
-            for vector in vectors:
-                # NaN or infinity: vector.invalid; another length than the model's: vector.dimension (drift 2).
-                validate_vector(vector, identity)
-        with self.database._transaction() as db:
-            # The lock a reindex's switch waits for (FOR UPDATE): no chunk is added while it embeds the last ones.
-            db.execute(
-                "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space"
-                " FOR SHARE",
-                (self.tenant_id, self.namespace),
-            )
-            space = self._active_for(identity) if identity is not None else None
-            for position, chunk in enumerate(kept):
-                row = db.execute(
-                    "INSERT INTO nodestro_chunks"
-                    " (tenant_id, namespace, source, title, file_id, metadata, text, search_text)"
-                    " VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id",
-                    (
-                        self.tenant_id,
-                        self.namespace,
-                        _text(chunk.source),
-                        None if chunk.title is None else _text(chunk.title),
-                        chunk.file_id,
-                        _encode(json.dumps(chunk.metadata))[0],
-                        _text(chunk.text),
-                        " ".join(search_words(f"{chunk.text} {chunk.title or ''}")),
-                    ),
-                ).fetchone()
-                ids.append(int(row[0]))
-                if vectors is not None and space is not None:
-                    db.execute(
-                        "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
-                        " VALUES (%s, %s, %s, %s, %s)",
-                        (self.tenant_id, self.namespace, space, int(row[0]), vectors[position]),
-                    )
-        return ids
-
-    def delete(self, source: str) -> int:
-        return self.database._write(
-            "DELETE FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s AND source = %s",
-            (self.tenant_id, self.namespace, source),
-        )
-
-    def search(self, query: str, k: int = 5) -> builtins.list[Hit]:
-        """:meth:`retrieve` in the index's default mode: ``hybrid`` with an embedding model, else ``fts``."""
-        return self.retrieve(query, k)
-
-    # ---- vectors (migration 0010) -----------------------------------------------------------------------------
-
-    def _space(self, state: str) -> tuple[str, EmbeddingIdentity] | None:
-        rows = self.database._query(
-            "SELECT space, identity::text FROM nodestro_vector_spaces"
-            " WHERE tenant_id = %s AND namespace = %s AND state = %s",
-            (self.tenant_id, self.namespace, state),
-        )
-        return (str(rows[0][0]), EmbeddingIdentity.from_dict(json.loads(rows[0][1]))) if rows else None
-
-    def _active_for(self, identity: EmbeddingIdentity) -> str:
-        """The active space for ``identity``, created when there is none and no chunk lacks a vector."""
-        space = f"{self.namespace}:{identity.key}"
-        current = self._space("active")
-        if current is not None:
-            if current[1].key != identity.key:
-                raise RetrievalError(
-                    "reindex_required",
-                    f"The vectors belong to {current[1].model}, not to {identity.model}; reindex first",
-                )
-            return current[0]
-        building = self._space("building")
-        if building is not None:
-            if building[0] == space:
-                return space
-            raise RetrievalError("reindex_required", "A reindex for another embedding model is running")
-        if len(self):
-            raise RetrievalError("reindex_required", "The index holds chunks without vectors; reindex first")
-        self.database._write(
-            "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state)"
-            " VALUES (%s, %s, %s, %s::jsonb, %s, 'active')",
-            (self.tenant_id, self.namespace, space, json.dumps(identity.to_dict()), identity.dimensions),
-        )
-        return space
-
-    def _count_vectors(self, space: str) -> int:
-        rows = self.database._query(
-            "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s AND namespace = %s AND space = %s",
-            (self.tenant_id, self.namespace, space),
-        )
-        return int(rows[0][0])
-
-    def pgvector(self) -> bool:
-        """Whether the database ranks vectors itself (pgvector is installed). Detected once; :meth:`refresh` detects
-        it again."""
-        if self._pgvector is None:
-            rows = self.database._query("SELECT to_regtype('vector') IS NOT NULL")
-            self._pgvector = bool(rows and rows[0][0])
-        return self._pgvector
-
-    def refresh(self) -> None:
-        """Forget what was detected about the database (pgvector), so the next search detects it again: after an
-        administrator installs (``CREATE EXTENSION vector``) or removes pgvector while the server runs."""
-        self._pgvector = None
-
-    def vector_status(self) -> PostgresVectorStatus:
-        """The vector state of this namespace, with the active space's vectors searches leave out (drift 10)."""
-        active = self._space("active")
-        building = self._space("building")
-        excluded = self._count_excluded(active[0]) if active else 0
-        return PostgresVectorStatus(
-            chunks=len(self),
-            active=active[1].to_dict() if active else None,
-            embedded=self._count_vectors(active[0]) if active else 0,
-            building=building[1].to_dict() if building else None,
-            building_embedded=self._count_vectors(building[0]) if building else 0,
-            legacy=excluded > 0,
-            excluded=excluded,
-        )
-
-    def _count_excluded(self, space: str) -> int:
-        """Vectors of ``space`` that searches leave out (not ``_USABLE``: NaN, infinity, all zeros)."""
-        rows = self.database._query(
-            "SELECT count(*) FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.namespace = %s"
-            f" AND v.space = %s AND NOT ({_USABLE})",
-            (self.tenant_id, self.namespace, space),
-        )
-        return int(rows[0][0])
-
-    def _discard(self, space: str) -> None:
-        self.database._write(
-            "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space = %s",
-            (self.tenant_id, self.namespace, space),
-        )
-
-    def discard_reindex(self) -> None:
-        building = self._space("building")
-        if building is not None:
-            self._discard(building[0])
-
-    def drop_vectors(self) -> int:
-        status = self.vector_status()
-        self.database._write(
-            "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s",
-            (self.tenant_id, self.namespace),
-        )
-        return status.embedded + status.building_embedded
-
-    def reindex(
-        self,
-        embeddings: EmbeddingModel | None = None,
-        *,
-        batch_size: int = 32,
-        progress: Any = None,
-        cancel: Any = None,
-    ) -> VectorStatus:
-        """Embed every chunk into the space of ``embeddings`` and switch to it (as ``orkexa.SQLiteIndex.reindex``).
-
-        The model's identity is read again (``refresh_identity``) before and after embedding: a model updated on its
-        server is never filed under its old identity, and one updated meanwhile discards the new space."""
-        model = embeddings or self.embeddings
-        if model is None:
-            raise RetrievalError("vector_unavailable", "reindex() needs an embedding model")
-        _refresh_identity(model)  # the model's current build, not a cached one (MUP-ONA drift 1)
-        identity = model.identity()
-        space = f"{self.namespace}:{identity.key}"
-        active = self._space("active")
-        if active is None or active[0] != space:
-            building = self._space("building")
-            if building is not None and building[0] != space:
-                self._discard(building[0])
-            self.database._write(
-                "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state)"
-                " VALUES (%s, %s, %s, %s::jsonb, %s, 'building') ON CONFLICT (tenant_id, namespace, space) DO NOTHING",
-                (self.tenant_id, self.namespace, space, json.dumps(identity.to_dict()), identity.dimensions),
-            )
-        total = len(self)
-        # Unlocked rounds: embed what exists at the start of each round (high-water mark), so writers that keep
-        # adding chunks cannot keep a round from ending. Stop once at most one batch is left (or after a few
-        # rounds); the switch below embeds the rest.
-        for _round in range(_REINDEX_ROUNDS):
-            high = self.database._query(
-                "SELECT coalesce(max(id), 0) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
-                (self.tenant_id, self.namespace),
-            )[0][0]
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
-                rows = self.database._query(
-                    f"{_MISSING} AND c.id <= %s ORDER BY c.id LIMIT %s",
-                    (self.tenant_id, self.namespace, self.tenant_id, space, int(high), batch_size),
-                )
-                if not rows:
-                    break
-                vectors = self._embed_batch(model, identity, rows)
-                with self.database._transaction() as db:
-                    self._store_batch(db, space, rows, vectors)
-                if progress is not None:
-                    progress(self._count_vectors(space), total)
-            if self._count_missing(space) <= batch_size:
-                break
-        # The switch: under a lock on the namespace's spaces that every write takes too (add_chunks, FOR SHARE), so no
-        # chunk can be added between embedding the last ones and switching. Before, a chunk written in that moment
-        # made the switch fail (vector_incomplete) and a reindex under steady writes could fail every time.
-        changed = False
-        with self.database._transaction() as db:
-            db.execute(
-                "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space"
-                " FOR UPDATE",
-                (self.tenant_id, self.namespace),
-            )
-            limit = max(batch_size, _REINDEX_SWITCH_CHUNKS)
-            rows = db.execute(
-                f"{_MISSING} ORDER BY c.id LIMIT %s",
-                (self.tenant_id, self.namespace, self.tenant_id, space, limit + 1),
-            ).fetchall()
-            if len(rows) > limit:
-                # Writes outpace the model: embedding more while every write waits would stall them; try later.
-                missing = self._count_missing(space)
-                raise RetrievalError("vector_incomplete", f"{missing} chunks were added during the reindex")
-            # What the last round left (what writers added meanwhile), embedded while writes wait. One batch was not
-            # enough: under load writers add more than a batch during a round, and every attempt failed (T-PART-CC).
-            for start in range(0, len(rows), batch_size):
-                if cancel is not None and cancel.is_set():
-                    raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
-                part = rows[start : start + batch_size]
-                self._store_batch(db, space, part, self._embed_batch(model, identity, part))
-            _refresh_identity(model)
-            changed = model.identity().key != identity.key
-            if not changed:
-                db.execute(
-                    "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space <> %s",
-                    (self.tenant_id, self.namespace, space),
-                )
-                db.execute(
-                    "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = %s AND namespace = %s"
-                    " AND space = %s",
-                    (self.tenant_id, self.namespace, space),
-                )
-        if changed:
-            # The model changed on its server while it embedded: the new space may mix two builds.
-            self._discard(space)
-            raise RetrievalError(
-                "reindex_required",
-                f"{identity.model} changed during the reindex; its new vectors were discarded, start it again",
-            )
-        if progress is not None:
-            progress(self._count_vectors(space), total)
-        self.embeddings = model
-        return self.vector_status()
-
-    def _count_missing(self, space: str) -> int:
-        rows = self.database._query(_COUNT_MISSING, (self.tenant_id, self.namespace, self.tenant_id, space))
-        return int(rows[0][0])
-
-    @staticmethod
-    def _embed_batch(
-        model: EmbeddingModel, identity: EmbeddingIdentity, rows: builtins.list[tuple[Any, ...]]
-    ) -> builtins.list[builtins.list[float]]:
-        """The checked vectors of a batch of ``(chunk id, text)`` rows."""
-        vectors = [[float(x) for x in vector] for vector in model.embed_documents([str(row[1]) for row in rows])]
-        if len(vectors) != len(rows):
-            raise RetrievalError("vector_unavailable", "The embedding model returned a wrong number of vectors")
-        for vector in vectors:
-            if len(vector) != identity.dimensions:
-                raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
-            validate_vector(vector)  # NaN or infinity: vector.invalid (drift 2)
-        return vectors
-
-    def _store_batch(
-        self, db: Any, space: str, rows: builtins.list[tuple[Any, ...]], vectors: builtins.list[builtins.list[float]]
-    ) -> None:
-        for (chunk_id, _), vector in zip(rows, vectors, strict=True):
-            # Only while the chunk still exists: one deleted while its batch was embedded gets no vector (no foreign
-            # key error that ends the reindex, drift 9).
-            db.execute(
-                "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
-                " SELECT c.tenant_id, c.namespace, %s, c.id, %s FROM nodestro_chunks c"
-                " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = %s"
-                " ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
-                (space, vector, self.tenant_id, self.namespace, int(chunk_id)),
-            )
-
-    def _hits(self, rows: Iterable[tuple[Any, ...]]) -> builtins.list[Hit]:
-        return [
-            Hit(
-                id=int(chunk_id),
-                score=float(score),
-                source=source,
-                title=title,
-                file_id=file_id,
-                metadata=json.loads(metadata),
-                text=text,
-            )
-            for chunk_id, source, title, file_id, metadata, text, score in rows
-        ]
-
-    def _fts(self, query: str, k: int, sources: builtins.list[str] | None) -> builtins.list[Hit]:
-        expression = _tsquery(query)
-        if not expression:
-            return []
-        scope = " AND source = ANY(%s)" if sources is not None else ""
-        params: tuple[Any, ...] = (expression, self.tenant_id, self.namespace)
-        if sources is not None:
-            params += (sources,)
-        rows = self.database._query(
-            "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks,"
-            " to_tsquery('simple', %s) AS query"
-            f" WHERE tenant_id = %s AND namespace = %s AND search @@ query{scope}"
-            " ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
-            (*params, k),
-        )
-        # ts_rank only orders the hits; the score is the contract's reciprocal rank 1 / (60 + rank) (drift 5).
-        scores = dict(fuse_rrf([[int(row[0]) for row in rows]]))
-        return self._hits((*row, scores[int(row[0])]) for row in rows)
-
-    def _vector(self, query: str, k: int, sources: builtins.list[str] | None) -> builtins.list[Hit]:
-        model = self.embeddings
-        active = self._space("active")
-        if model is None or active is None:
-            raise RetrievalError("vector_unavailable", "This knowledge base has no semantic index yet")
-        space, stored = active
-        if stored.key != model.identity().key:
-            raise RetrievalError("reindex_required", f"The vectors belong to {stored.model}; reindex first")
-        vector = [float(x) for x in model.embed_query(query)]
-        # NaN or infinity: vector.invalid; another length than the stored vectors: vector.dimension (drift 2). A zero
-        # query vector has no direction: it finds nothing (drift 3).
-        if validate_vector(vector, stored) is None:
-            return []
-        scope = " AND c.source = ANY(%s)" if sources is not None else ""
-        base: tuple[Any, ...] = (self.tenant_id, space, self.tenant_id, self.namespace)
-        if sources is not None:
-            base += (sources,)
-        if self.pgvector():
-            literal = "[" + ",".join(repr(x) for x in vector) + "]"
-            rows = self.database._query(
-                "SELECT c.id, c.source, c.title, c.file_id, c.metadata::text, c.text,"
-                " round((1 - (v.embedding::vector <=> %s::vector))::numeric, 6)::float8 AS score"
-                " FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id"
-                f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope}"
-                f" AND {_USABLE} ORDER BY score DESC, c.id LIMIT %s",
-                (literal, *base, k),
-            )
-            return self._hits(rows)
-        candidates = self.database._query(
-            "SELECT c.id, v.embedding FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id"
-            f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope} AND {_USABLE}",
-            base,
-        )
-        # The cosine similarity, as pgvector's <=> gives it, whatever the length of the vectors: a model whose
-        # identity is not ``normalized`` returns vectors of any length, where the dot product is no cosine (drift 4).
-        # math.fsum is exactly rounded, so the result is the same on every Python version.
-        query_norm = math.sqrt(math.fsum(x * x for x in vector))
-        # Rounded to 6 digits as the contract says (drift 5); equal scores go to the lower chunk id, as in the SQL.
-        similarity = [
-            (round(_cosine(vector, query_norm, [float(x) for x in embedding]), 6), int(chunk_id))
-            for chunk_id, embedding in candidates
-        ]
-        scored = sorted(similarity, key=lambda item: (-item[0], item[1]))[:k]
-        if not scored:
-            return []
-        rows = self.database._query(
-            "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks"
-            " WHERE tenant_id = %s AND namespace = %s AND id = ANY(%s)",
-            (self.tenant_id, self.namespace, [chunk_id for _, chunk_id in scored]),
-        )
-        by_id = {int(row[0]): row for row in rows}
-        return self._hits((*by_id[chunk_id], score) for score, chunk_id in scored if chunk_id in by_id)
-
-    def retrieve(
-        self,
-        query: str,
-        k: int = 5,
-        *,
-        mode: RetrievalMode | None = None,
-        sources: Iterable[str] | None = None,
-    ) -> builtins.list[Hit]:
-        """The ``k`` best chunks by full text, vectors or both, limited to ``sources`` before ranking. Without ``mode``
-        (and no ``mode`` of the index) ``hybrid`` with an embedding model, else ``fts``. ``vector`` and
-        ``hybrid`` never fall back to full text. ``hybrid`` fuses ``max(4 * k, 20)`` candidates of each ranking by
-        :func:`orkexa.retrieval.fuse_hybrid` (scores in [0, 1]), or by reciprocal rank fusion with ``fusion="rrf"``."""
-        if k < 1:
-            raise ValueError("k must be positive")
-        # The contract's default (drift 6): hybrid with an embedding model, full text without one.
-        chosen = check_mode(mode or self.mode or ("hybrid" if self.embeddings is not None else "fts"))
-        allowed = None if sources is None else builtins.list(dict.fromkeys(sources))
-        if allowed is not None and not allowed:
-            return []
-        if allowed is not None and len(allowed) > MAX_SOURCES:
-            raise ValueError(f"At most {MAX_SOURCES} sources per search")  # as orkexa.SQLiteIndex (drift 7)
-        if chosen == "fts":
-            hits = self._fts(query, k, allowed)
-            for rank, hit in enumerate(hits):
-                hit.ranks = {"fts": rank + 1}
-            return hits
-        if chosen == "vector":
-            hits = self._vector(query, k, allowed)
-            for rank, hit in enumerate(hits):
-                hit.ranks = {"vector": rank + 1}
-            return hits
-        depth = max(k * 4, 20)
-        rankings = (("fts", self._fts(query, depth, allowed)), ("vector", self._vector(query, depth, allowed)))
-        if self.fusion == "evidence":
-            found: dict[int, Hit] = {}
-            positions: dict[int, dict[str, int]] = {}
-            for name, ranked in rankings:
-                for rank, hit in enumerate(ranked):
-                    found.setdefault(hit.id, hit)
-                    positions.setdefault(hit.id, {})[name] = rank + 1
-            vector = [(hit.id, hit.score) for hit in rankings[1][1]]
-            lexical = self._lexical_evidence(query, builtins.list(found))
-            result = []
-            for chunk_id, score in fuse_hybrid(vector, lexical, lexical_weight=self.lexical_weight)[:k]:
-                hit = found[chunk_id]
-                hit.score = score
-                hit.ranks = positions[chunk_id]
-                result.append(hit)
-            return result
-        found = {}
-        positions = {}
-        for name, ranked in rankings:
-            for rank, hit in enumerate(ranked):
-                found.setdefault(hit.id, hit)
-                positions.setdefault(hit.id, {})[name] = rank + 1
-        result = []
-        for chunk_id, score in fuse_rrf([[hit.id for hit in ranked] for _, ranked in rankings])[:k]:
-            hit = found[chunk_id]
-            hit.score = score
-            hit.ranks = positions[chunk_id]
-            result.append(hit)
-        return result
-
-    def _lexical_evidence(self, query: str, chunk_ids: builtins.list[int]) -> dict[int, float]:
-        """:func:`orkexa.retrieval.lexical_evidence` of ``chunk_ids``: which query words (as prefixes, like
-        :func:`_word_queries`) each contains, weighted by how many chunks of this namespace contain them."""
-        queries = _word_queries(query)
-        words, expressions = builtins.list(queries), builtins.list(queries.values())
-        found: dict[int, builtins.list[str]] = {chunk_id: [] for chunk_id in chunk_ids}
-        if not words:
-            return lexical_evidence({}, found)
-        counts = self.database._query(
-            "SELECT t.w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s"
-            " AND search @@ to_tsquery('simple', t.q)) FROM unnest(%s::text[], %s::text[]) AS t(w, q)",
-            (self.tenant_id, self.namespace, words, expressions),
-        )
-        total = len(self)
-        weights = {str(word): word_weight(int(count), total) for word, count in counts}
-        if chunk_ids:
-            rows = self.database._query(
-                "SELECT c.id, t.w FROM nodestro_chunks c, unnest(%s::text[], %s::text[]) AS t(w, q)"
-                " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = ANY(%s)"
-                " AND c.search @@ to_tsquery('simple', t.q)",
-                (words, expressions, self.tenant_id, self.namespace, chunk_ids),
-            )
-            for chunk_id, word in rows:
-                found[int(chunk_id)].append(str(word))
-        return lexical_evidence(weights, found)
 
     # ---- what KnowledgeChunks does on SQLite -------------------------------------------------------
 
@@ -777,7 +136,7 @@ class PostgresIndex(Index):
         return "\n".join(str(row[0]) for row in rows)
 
 
-class PostgresMemory(MemoryBackend):
+class PostgresMemory(pg_generic.PostgresMemory):
     """An Orkexa memory (``/memories``) of one tenant and namespace (table ``nodestro_memory_files``).
 
     Every command runs in one transaction, as with ``SQLiteMemory``."""
@@ -791,73 +150,18 @@ class PostgresMemory(MemoryBackend):
         max_file_chars: int = 100_000,
         max_view_chars: int = 16_000,
     ) -> None:
-        super().__init__(max_file_chars=max_file_chars, max_view_chars=max_view_chars)
         _check(tenant_id, namespace)
+        source = DatabaseSource(database)
+        super().__init__(
+            source,
+            tenant_id,
+            prefix=TABLE_PREFIX,
+            namespace=namespace,
+            lock=source.lock,
+            max_file_chars=max_file_chars,
+            max_view_chars=max_view_chars,
+        )
         self.database = database
-        self.tenant_id = tenant_id
-        self.namespace = namespace
-        self._lock = database._lock
-
-    @property
-    def capabilities(self) -> frozenset[str]:
-        """``partitioned`` (by tenant) and ``concurrent_writers`` (:attr:`orkexa.memory.MemoryBackend.capabilities`):
-        the commands of one process are serialized on the database's lock."""
-        return frozenset({"partitioned", "concurrent_writers"})
-
-    def close(self) -> None:
-        """Nothing to do: the connection belongs to the database."""
-
-    @contextmanager
-    def _transaction(self) -> Iterator[None]:
-        with self.database._transaction():
-            yield
-
-    def _read(self, key: str) -> str | None:
-        rows = self.database._query(
-            "SELECT content FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s AND path = %s",
-            (self.tenant_id, self.namespace, key),
-        )
-        return str(rows[0][0]) if rows else None
-
-    def _write(self, key: str, text: str) -> None:
-        if "\x00" in text or "\x00" in key:
-            raise MemoryToolError("Error: memory files cannot contain the character U+0000")
-        self.database._write(
-            "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content) VALUES (%s, %s, %s, %s)"
-            " ON CONFLICT (tenant_id, namespace, path) DO UPDATE SET content = excluded.content,"
-            " updated_at = clock_timestamp()",
-            (self.tenant_id, self.namespace, key, text),
-        )
-
-    def _files(self, prefix: str) -> dict[str, int]:
-        start = f"{prefix}/" if prefix else ""
-        rows = self.database._query(
-            "SELECT path, octet_length(content) FROM nodestro_memory_files"
-            " WHERE tenant_id = %s AND namespace = %s AND starts_with(path, %s)",
-            (self.tenant_id, self.namespace, start),
-        )
-        return {str(path): int(size) for path, size in rows}
-
-    def _delete(self, key: str) -> None:
-        self.database._write(
-            "DELETE FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s"
-            " AND (path = %s OR starts_with(path, %s))",
-            (self.tenant_id, self.namespace, key, key + "/"),
-        )
-
-    def _rename(self, old: str, new: str) -> None:
-        self.database._write(
-            "UPDATE nodestro_memory_files SET path = %s || substr(path, %s), updated_at = clock_timestamp()"
-            " WHERE tenant_id = %s AND namespace = %s AND (path = %s OR starts_with(path, %s))",
-            (new, len(old) + 1, self.tenant_id, self.namespace, old, old + "/"),
-        )
-
-    def clear(self) -> None:
-        """Delete every file of this memory."""
-        self.database._write(
-            "DELETE FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s",
-            (self.tenant_id, self.namespace),
-        )
 
 
 class PostgresMemorySpace(PostgresMemory, BrowsableMemory):
@@ -923,6 +227,8 @@ def memory_totals(database: PostgresDatabase, tenant_id: str, prefix: str) -> bu
 
 
 __all__ = [
+    "MAX_SOURCES",
+    "TABLE_PREFIX",
     "PostgresFileStore",
     "PostgresIndex",
     "PostgresMemory",

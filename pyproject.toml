@@ -117,6 +117,16 @@ forbidden_modules = [
     "packaging",
 ]
 
+[[tool.importlinter.contracts]]
+# MUP-ONA B4: the generic PostgreSQL part (ConnectionSource, statement catalog, executor, index, file store, memory) is
+# taken over unchanged into orkexa (orkexa.backends.postgres, B5). It may import orkexa (it implements orkexa's
+# interfaces), psycopg (late) and the standard library, but nothing of Nodestro except itself. As above, an import of
+# the package root is not reported; tests/test_sql_catalog.py checks every import of the package.
+name = "The generic PostgreSQL part imports nothing of Nodestro"
+type = "forbidden"
+source_modules = ["nodestro_runtime.pg_generic"]
+forbidden_modules = ["nodestro_runtime.**", "axentra", "mcp", "cryptography", "sqlite_vec", "packaging", "pglast"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
