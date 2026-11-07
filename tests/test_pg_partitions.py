@@ -294,12 +294,12 @@ def test_the_switch_embeds_what_the_last_round_left(
     never get below one batch. Before, the switch embedded at most one batch and failed every attempt with
     ``vector_incomplete`` (T-PART-CC under CI load). Now it embeds the rest while writes wait, up to
     ``_REINDEX_SWITCH_CHUNKS``; above that, writes outpace the model and the reindex still says so."""
-    from nodestro_runtime import postgres_tables
+    from nodestro_runtime.pg_generic import index as pg_index
     from nodestro_runtime.postgres_tables import PostgresIndex
 
     if ranking == "database" and not PostgresIndex(database, TENANTS[0], namespace="probe").pgvector():
         postgres_support.require_pgvector()
-    monkeypatch.setattr(postgres_tables, "_REINDEX_SWITCH_CHUNKS", switch_chunks)
+    monkeypatch.setattr(pg_index, "_REINDEX_SWITCH_CHUNKS", switch_chunks)
     old, new = KeywordEmbeddings("burst-old"), KeywordEmbeddings("burst-new")
 
     def make(model: KeywordEmbeddings | None) -> PostgresIndex:
