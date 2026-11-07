@@ -1141,6 +1141,12 @@ def test_tools_run_through_the_gateway_and_escapes_are_refused(real_gateway: dic
     images = ContainerImages(environ=real_gateway)
     tag = images.build(lock, PYTHON)
     try:
+        import subprocess as _sp
+        print("DEBUG LOCK", lock)
+        print("DEBUG TAG", tag)
+        for cmd in (["docker", "image", "inspect", tag], ["docker", "run", "--rm", "--user", "65534:65534", tag, "python", "-I", "-c", "import sys, os, importlib.util; print(sys.version, sys.path, importlib.util.find_spec('six')); print(sorted(os.listdir(sys.path[-1])))"], ["docker", "history", "--no-trunc", tag]):
+            r = _sp.run(cmd, capture_output=True, text=True)
+            print("DEBUG", cmd[:2], r.returncode, r.stdout[-6000:], r.stderr[-2000:])
         assert images.missing_modules(tag, ["six", "not_a_module"]) == ["not_a_module"]
         sandbox = images.sandbox(tag, timeout=60)
         code = (
