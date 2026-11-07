@@ -1871,6 +1871,8 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     refused with the new code `document.too_complex` (`name`, `reason`) and nothing is stored; a PDF with text only
     after page 20 is no longer marked as a scan. Orkexa pinned to `f89102c` (orkexa PR #59, MUP-ONA A1, which also
     brings A10: SQLite integrity checks, the FTS5 race fix and search limits).
+  - B0: one Axentra commit for every extra. The `postgres` and `dev` extras pin Axentra `273e675` (Axentra A4, A6,
+    A7 and B0; it includes axentra #42, IP and request id on login and setup audit events). No runtime code change.
 
 ## 0.2.0 (2026-10-29)
 

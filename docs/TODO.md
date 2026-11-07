@@ -691,7 +691,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
-| — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |

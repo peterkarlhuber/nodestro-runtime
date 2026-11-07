@@ -38,15 +38,16 @@ dependencies = [
 # The server profile: PostgreSQL, encryption of tenant secrets (server_settings.SecretBox) and the Axentra platform
 # services (axentra_platform, off unless NODESTRO_AXENTRA=on). The desktop and Local Docker never install this extra:
 # Axentra is not a base dependency, and without it the server profile works and switching it on is refused.
+# Every Axentra requirement below names the same commit (MUP-ONA B0); move them together.
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",
