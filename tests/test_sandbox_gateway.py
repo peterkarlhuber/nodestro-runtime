@@ -719,6 +719,7 @@ async def test_forwarded_targets_are_rebuilt_from_what_was_checked(gateway: tupl
     await _send(listen, b"GET /v1.51/_ping?anything=1&x=%2F..%2Fcontainers HTTP/1.1\r\nHost: d\r\n\r\n")
     assert daemon.requests[-1][1] == "/v1.51/_ping"
     image = "nodestro-env:" + "a" * 32
+    daemon.inspected[image] = {"Id": TAGGED_ID, "RepoTags": [image], "Config": {"Labels": {gw.LOCK_LABEL: "2" * 64}}}
     await _send(listen, f"GET /v1.51/images/{image.replace(':', '%3A')}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode())
     assert daemon.requests[-1][1] == f"/v1.51/images/{image}/json"
     await _send(listen, f"DELETE /images/{image}?force=1 HTTP/1.1\r\nHost: d\r\n\r\n".encode())
@@ -1018,6 +1019,24 @@ async def test_a_tagged_image_runs_only_when_it_is_a_nodestro_image_and_by_its_i
     assert answer.startswith(b"HTTP/1.1 201") and daemon.created == 1
     # The container runs the image that was checked: a tag moved afterwards changes nothing.
     assert json.loads(daemon.requests[-2][2])["Image"] == TAGGED_ID  # [-1]: the read-back
+
+
+async def test_a_tagged_image_without_the_lock_label_is_neither_inspected_nor_removed(
+    gateway: tuple[FakeDaemon, str, Gateway],
+) -> None:
+    """RT-037: a nodestro-env tag on an image Nodestro did not build (no lock label) is not Nodestro's to inspect or
+    remove; the request never reaches the daemon beyond the check."""
+    daemon, listen, _ = gateway
+    daemon.inspected[IMAGE] = {"Id": TAGGED_ID, "RepoTags": [IMAGE], "Config": {"Labels": {}}}
+    inspect = f"GET /v1.51/images/{IMAGE}/json HTTP/1.1\r\nHost: d\r\n\r\n".encode()
+    delete = f"DELETE /v1.51/images/{IMAGE}?force=1 HTTP/1.1\r\nHost: d\r\n\r\n".encode()
+    for raw in (inspect, delete):
+        answer = await _send(listen, raw)
+        assert answer.startswith(b"HTTP/1.1 404") and b"not one of Nodestro's sandbox images" in answer
+    assert not any(method == "DELETE" for method, *_ in daemon.requests)
+    daemon.inspected[IMAGE]["Config"] = {"Labels": {gw.LOCK_LABEL: "3" * 64}}
+    assert (await _send(listen, delete)).split(b"\r\n", 1)[0] != b"HTTP/1.1 404 Not Found"
+    assert daemon.requests[-1][:2] == ("DELETE", f"/v1.51/images/{IMAGE}?force=1")
 
 
 async def test_the_daemon_s_limits_and_seccomp_are_checked_again_after_the_ttl(

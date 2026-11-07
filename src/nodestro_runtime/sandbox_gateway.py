@@ -28,8 +28,8 @@ form:
   lock file whose every package is pinned with hashes (no options such as other indexes), with a copy of the very
   Orkexa package the gateway runs, and under exactly the tag the runtime computes for that lock. The build downloads
   wheels (no package code runs: ``--only-binary``), installs them without network access to an index and runs no
-  other command. Only ``nodestro-env:<key>`` images can be inspected or removed (and inspected by id when the image is
-  one of them).
+  other command. Only ``nodestro-env:<key>`` images that carry Nodestro's lock label can be inspected or removed, by
+  tag or (inspected) by id.
 - **Everything else** (other images, volumes, networks, exec, the daemon's events, swarm, plugins, BuildKit sessions,
   registry credentials) is refused.
 
@@ -1110,8 +1110,9 @@ class Gateway:
             query = request.query
             if query and not set(query) <= {"force", "noprune"}:
                 raise Refused("These parameters are not allowed")
-            if IMAGE_ID.fullmatch(ref):
-                await self.require_nodestro_image(ref)
+            # By id or by tag: only an environment image Nodestro built (its lock label), never another image that
+            # was given a nodestro-env tag (RT-037).
+            await self.require_nodestro_image(ref)
             path = f"{prefix}/images/{quote(ref, safe=':')}" + ("/json" if kind == "image:inspect" else "")
             target = path + (f"?{urlencode(query)}" if query else "")
             await self._forward(request, target, b"", reader, writer)
