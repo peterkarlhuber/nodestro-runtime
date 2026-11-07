@@ -1891,6 +1891,9 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     read `NODESTRO_API_SRC`; `NODESTRO_REQUIRE_API_SCAN=1` fails instead of skipping. The new job
     `tenant-sql-api` scans a public checkout of nodestro-api with this commit's checker, including a planted
     leak. `CONTRIBUTING.md`: a checker or migration change needs a green nodestro-api `tenant-sql` run.
+  - Security (A8, VB-7): the MCP egress check refuses deprecated IPv6 site-local addresses (`fec0::/10`, reason
+    `site_local`), which `ipaddress` counts as global; Axentra's webhook check already refused them (found by the
+    shared security test vectors).
 
 ## 0.2.0 (2026-10-29)
 
