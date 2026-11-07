@@ -632,14 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-7 · No limit on the sources of one search (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** `retrieve(sources=...)` accepts any number of sources; SQLite refuses more than 50,000. Strict expected
-  failure `MUP-DRIFT-7`: `index.too_many_sources_are_refused`.
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-DRIFT-8 · Query words differ from `orkexa.retrieval.tokenize` (MUP-ONA MP-B3)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**

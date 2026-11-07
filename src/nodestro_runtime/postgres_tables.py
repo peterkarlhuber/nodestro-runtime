@@ -61,6 +61,8 @@ if TYPE_CHECKING:
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
 _WORD = re.compile(r"[^\W_]+")
+#: Most sources one search may be limited to (``retrieve(sources=...)``), as in ``orkexa.SQLiteIndex``.
+MAX_SOURCES = 50_000
 #: Stored vectors a search may use. A zero vector has no direction, so no cosine: it is stored (its chunk counts as
 #: embedded, as in ``orkexa.SQLiteIndex``) but never ranked. Vectors stored before vectors were checked can also hold
 #: NaN or infinity, which no ranking can use (pgvector refuses to cast them). Searches leave both out; the rows stay.
@@ -554,6 +556,8 @@ class PostgresIndex(Index):
         allowed = None if sources is None else builtins.list(dict.fromkeys(sources))
         if allowed is not None and not allowed:
             return []
+        if allowed is not None and len(allowed) > MAX_SOURCES:
+            raise ValueError(f"At most {MAX_SOURCES} sources per search")  # as orkexa.SQLiteIndex (drift 7)
         if chosen == "fts":
             hits = self._fts(query, k, allowed)
             for rank, hit in enumerate(hits):

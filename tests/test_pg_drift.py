@@ -188,3 +188,20 @@ def test_the_default_mode_follows_the_embedding_model(make: Callable[..., Any]) 
     plain.add("A chunk about alpha.", source="a.md")
     assert [hit.ranks for hit in plain.search("alpha")] == [{"fts": 1}]
     assert make(embeddings=KeywordEmbeddings(), mode="fts").search("alpha") == index.retrieve("alpha", 5, mode="fts")
+
+
+# ---- drift 7: the source limit ---------------------------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+def test_a_search_names_at_most_50000_sources(make: Callable[..., Any]) -> None:
+    from nodestro_runtime.postgres_tables import MAX_SOURCES
+
+    index = make(embeddings=KeywordEmbeddings())
+    index.add("A chunk about alpha.", source="a.md")
+    many = [f"s{number}.md" for number in range(MAX_SOURCES)]
+    for mode in ("fts", "vector", "hybrid"):
+        with pytest.raises(ValueError):
+            index.retrieve("alpha", 3, mode=mode, sources=[*many, "a.md"])
+        hits = index.retrieve("alpha", 3, mode=mode, sources=[*many[:-1], "a.md"])
+        assert [hit.source for hit in hits] == ["a.md"], mode
