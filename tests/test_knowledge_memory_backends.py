@@ -67,6 +67,21 @@ def backends(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Backend
 # ---- knowledge ----------------------------------------------------------------------------------
 
 
+def test_overlong_queries_are_refused_alike(backends: Backends) -> None:
+    # MUP-ONA T-CONF-2: orkexa's query limits (Index.check_query, 1000 characters, 64 distinct words) apply to the
+    # PostgreSQL index through the contract as they do to SQLite: the same code, before any SQL.
+    from orkexa.retrieval import MAX_QUERY_CHARS, MAX_QUERY_WORDS, RetrievalError
+
+    knowledge = backends.knowledge("alpha")
+    knowledge.add(b"Refunds are paid within 30 days.", name="refunds.md")
+    for query in ("refunds " + "x" * MAX_QUERY_CHARS, " ".join(f"w{n}" for n in range(MAX_QUERY_WORDS + 1))):
+        with pytest.raises(RetrievalError) as refused:
+            knowledge.search(query)
+        assert refused.value.code == "query.too_long"
+    assert len(knowledge.search("refunds " + "x" * (MAX_QUERY_CHARS - 8))) == 1  # exactly at the limit
+    assert len(knowledge.search(" ".join(["refunds"] * 100))) == 1
+
+
 def test_files_are_stored_indexed_and_found(backends: Backends) -> None:
     knowledge = backends.knowledge("alpha")
     entry = knowledge.add(b"# Vertrag\n\nDie Haftung ist auf 10.000 EUR begrenzt.", name="vertrag.md")

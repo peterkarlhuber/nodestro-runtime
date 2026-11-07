@@ -11,7 +11,6 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
-import uuid
 
 import postgres_support
 import pytest
@@ -35,64 +34,11 @@ def test_dump_matches_its_checksum(name: str) -> None:
     assert "PostgreSQL database dump complete" in text
 
 
-def _restore(conninfo: str, dump: str) -> None:
-    """Run a plain pg_dump script with psycopg (no psql needed): statements as they are, COPY blocks through
-    ``copy``; psql meta-commands (``\\restrict``/``\\unrestrict`` of pg_dump 17.6+) are not SQL and are left out."""
-    import psycopg
-
-    lines = gzip.decompress((LEGACY / dump).read_bytes()).decode("utf-8").splitlines(keepends=True)
-    with psycopg.connect(conninfo, autocommit=True) as connection:
-        pending: list[str] = []
-        position = 0
-        while position < len(lines):
-            line = lines[position]
-            position += 1
-            if line.startswith("\\"):
-                continue
-            if line.startswith("COPY ") and line.rstrip().endswith("FROM stdin;"):
-                if "".join(pending).strip():
-                    connection.execute("".join(pending))
-                pending = []
-                rows: list[str] = []
-                while lines[position].rstrip("\n") != "\\.":
-                    rows.append(lines[position])
-                    position += 1
-                position += 1
-                with connection.cursor() as cursor, cursor.copy(line.rstrip().rstrip(";")) as copy:
-                    copy.write("".join(rows))
-                continue
-            pending.append(line)
-        if "".join(pending).strip():
-            connection.execute("".join(pending))
-
-
 @pytest.fixture
 def restored(request: pytest.FixtureRequest) -> Iterator[str]:
     """A new database with ``request.param`` restored into it; dropped afterwards."""
-    import psycopg
-    from psycopg import sql
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-    dsn = postgres_support.require_postgres()
-    name = f"nodestro_fx_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(dsn, autocommit=True) as admin:
-        if (
-            request.param == "FX-PG-0v.sql.gz"
-            and not admin.execute(
-                "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')"
-            ).fetchone()[0]
-        ):
-            pytest.skip("the server has no pgvector; FX-PG-0v needs pgvector/pgvector:pg17")
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    parts = conninfo_to_dict(dsn)
-    parts["dbname"] = name
-    conninfo = make_conninfo("", **parts)
-    try:
-        _restore(conninfo, request.param)
+    with postgres_support.restored_database(request.param) as conninfo:
         yield conninfo
-    finally:
-        with psycopg.connect(dsn, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
 # MUP-ONA T-FX-1

@@ -107,6 +107,11 @@ class PostgresFileStore(FileStore):
         self.namespace = namespace
         self._lock = database._lock  # one lock for every user of the connection
 
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """``partitioned`` (by tenant) and ``concurrent_writers`` (:attr:`orkexa.FileStore.capabilities`)."""
+        return frozenset({"partitioned", "concurrent_writers"})
+
     def close(self) -> None:
         """Nothing to do: the connection belongs to the database."""
 
@@ -187,6 +192,15 @@ class PostgresIndex(Index):
         self.embeddings = embeddings
         self.mode = check_mode(mode) if mode is not None else None
         self._pgvector: bool | None = None
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """``partitioned`` (by tenant) and ``concurrent_writers`` always; ``vectors`` and ``reindex`` with an
+        embedding model, as :class:`orkexa.SQLiteIndex` (:attr:`orkexa.Index.capabilities`)."""
+        found = {"partitioned", "concurrent_writers"}
+        if self.embeddings is not None:
+            found |= {"vectors", "reindex"}
+        return frozenset(found)
 
     def close(self) -> None:
         """Nothing to do: the connection belongs to the database."""
@@ -636,6 +650,12 @@ class PostgresMemory(MemoryBackend):
         self.tenant_id = tenant_id
         self.namespace = namespace
         self._lock = database._lock
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """``partitioned`` (by tenant) and ``concurrent_writers`` (:attr:`orkexa.memory.MemoryBackend.capabilities`):
+        the commands of one process are serialized on the database's lock."""
+        return frozenset({"partitioned", "concurrent_writers"})
 
     def close(self) -> None:
         """Nothing to do: the connection belongs to the database."""

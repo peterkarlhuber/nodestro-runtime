@@ -13,7 +13,11 @@ to work without DDL rights and under Axentra's row-level security (see :func:`in
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+import gzip
 import os
+from pathlib import Path
 import threading
 from typing import Any
 import uuid
@@ -25,6 +29,8 @@ REQUIRED = os.environ.get("NODESTRO_REQUIRE_POSTGRES") == "1"
 RUNTIME_ROLE_MODE = os.environ.get("NODESTRO_TEST_RUNTIME_ROLE") == "1"
 RUNTIME_ROLE = "nodestro_test_runtime"
 RUNTIME_PASSWORD = "nodestro-test-runtime-pw"
+#: The legacy PostgreSQL dumps FX-PG-0 and FX-PG-0v (MUP-ONA A0, ``tests/fixtures/legacy/README.md``).
+LEGACY = Path(__file__).resolve().parent / "fixtures" / "legacy"
 
 
 def require_postgres() -> str:
@@ -122,3 +128,77 @@ def owner_of(database: Any) -> Any:
     do (DDL, reading Axentra's rows without a scope). Without ``NODESTRO_TEST_RUNTIME_ROLE`` it is ``database``."""
     found = getattr(database, "_test_owner_of", None)
     return database if found is None else found()
+
+
+def restore_dump(conninfo: str, dump: str) -> None:
+    """Run the plain pg_dump script ``LEGACY / dump`` with psycopg (no psql needed): statements as they are, COPY
+    blocks through ``copy``; psql meta-commands (``\\restrict``/``\\unrestrict`` of pg_dump 17.6+) are not SQL and are
+    left out."""
+    import psycopg
+
+    lines = gzip.decompress((LEGACY / dump).read_bytes()).decode("utf-8").splitlines(keepends=True)
+    with psycopg.connect(conninfo, autocommit=True) as connection:
+        pending: list[str] = []
+        position = 0
+        while position < len(lines):
+            line = lines[position]
+            position += 1
+            if line.startswith("\\"):
+                continue
+            if line.startswith("COPY ") and line.rstrip().endswith("FROM stdin;"):
+                if "".join(pending).strip():
+                    connection.execute("".join(pending))
+                pending = []
+                rows: list[str] = []
+                while lines[position].rstrip("\n") != "\\.":
+                    rows.append(lines[position])
+                    position += 1
+                position += 1
+                with connection.cursor() as cursor, cursor.copy(line.rstrip().rstrip(";")) as copy:
+                    copy.write("".join(rows))
+                continue
+            pending.append(line)
+        if "".join(pending).strip():
+            connection.execute("".join(pending))
+
+
+def has_pgvector() -> bool:
+    """Whether the test server can install pgvector (``pgvector/pgvector:pg17``)."""
+    import psycopg
+
+    with psycopg.connect(require_postgres(), autocommit=True) as admin:
+        row = admin.execute("SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')").fetchone()
+    return bool(row and row[0])
+
+
+@contextmanager
+def restored_database(dump: str) -> Iterator[str]:
+    """A new database on the test server with the legacy dump ``dump`` restored into it (its connection string, as
+    the owner); dropped afterwards. FX-PG-0v is skipped on a server without pgvector (a failure under
+    ``NODESTRO_REQUIRE_PGVECTOR=1``)."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    dsn = require_postgres()
+    if dump == "FX-PG-0v.sql.gz" and not has_pgvector():
+        require_pgvector_or_skip("FX-PG-0v needs pgvector/pgvector:pg17")
+    name = f"nodestro_fx_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    parts = conninfo_to_dict(dsn)
+    parts["dbname"] = name
+    conninfo = make_conninfo("", **parts)
+    try:
+        restore_dump(conninfo, dump)
+        yield conninfo
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
+def require_pgvector_or_skip(reason: str) -> None:
+    """Skip a test that needs pgvector, or fail it under ``NODESTRO_REQUIRE_PGVECTOR=1`` (the CI job ``pg-b``)."""
+    if os.environ.get("NODESTRO_REQUIRE_PGVECTOR") == "1":
+        pytest.fail(f"NODESTRO_REQUIRE_PGVECTOR=1 but the test server has no pgvector: {reason}")
+    pytest.skip(f"the test server has no pgvector: {reason}")
