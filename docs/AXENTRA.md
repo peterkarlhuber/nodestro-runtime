@@ -175,9 +175,9 @@ run by `tests/test_tenant_filters.py` of the runtime and of the API:
   reported as dynamic. `+=` on an attribute, an item or a class attribute (`self.q`, `Q["a"]`) is checked as an
   unknown part followed by its value (SR-01a);
 - each reference to a tenant table (`FROM`, joins, `USING`, `UPDATE`/`DELETE` targets, subqueries, CTEs, set
-  operations) must be bound by a top-level `AND` conjunct `tenant_id = <param>` or `tenant_id = ANY(<param>)` (or
-  equal to the `tenant_id` of a bound or enclosing reference, where an inner alias hides an outer one of the same
-  name); `INSERT` must list `tenant_id` with a parameter (or a bound `tenant_id` of its `SELECT`) as the value; an
+  operations) must be bound by a top-level `AND` conjunct `tenant_id = <param>` (or equal to the `tenant_id` of a
+  bound or enclosing reference, where an inner alias hides an outer one of the same name); `tenant_id = ANY(<param>)`
+  binds only through an allowlist entry (see below); `INSERT` must list `tenant_id` with a parameter (or a bound `tenant_id` of its `SELECT`) as the value; an
   upsert that updates must have `tenant_id` in its conflict target; no `UPDATE` may set `tenant_id`; SQL inside a
   string (`DO $$ ... $$`, `query_to_xml('...')`), `TRUNCATE`, `COPY`, `MERGE` are refused;
 - a statement with a part that cannot be resolved is reported as dynamic, one the parser rejects as unparsed; neither
@@ -196,6 +196,34 @@ a tenant table, as far as its parts are written in that source, is proven bound 
 allowlisted with a reason. Each bypass found by the security review (rounds 1 to 4) is a regression test in
 `tests/test_tenant_filters.py`. What it does not guarantee: that the bound parameter is the caller's tenant (the store
 object bound to one tenant passes it), and the cases below.
+
+**CI anchoring (MUP-ONA A11).** The check cannot drop out of CI silently:
+
+- the runtime's own source is scanned in every `pytest` run of the `test` job, as before;
+- the API scan in `tests/test_tenant_filters.py` carries the marker `tenant_api_scan`. It reads the API from
+  `NODESTRO_API_SRC` (the `src` directory of a nodestro-api checkout), else from a checkout next to this one or the
+  installed package. In the `test` job there is none, so it is skipped with the fixed reason "API covered by
+  nodestro-api job tenant-sql (MUP-ONA A11)", which `tests/ci/skipped-test.txt` lists (any other skip fails the job);
+- the job `tenant-sql-api` checks out nodestro-api anonymously (it is public; `contents: read`,
+  `persist-credentials: false`, no secret) and runs the API scan with this commit's checker under
+  `NODESTRO_REQUIRE_API_SCAN=1`: a missing or wrong `NODESTRO_API_SRC` fails the test instead of skipping it, a scan
+  that finds almost no statements fails, and a leak planted in a copy of the API's source must be reported (T-CHK-1).
+  Nothing may be skipped there (`tests/ci/skipped-tenant-sql-api.txt` is empty). If nodestro-api becomes private, the
+  job is removed by a PR with its reason; it is never switched to the `NODESTRO_READ` secret;
+- nodestro-api's job `tenant-sql` scans the API with the pinned runtime checker and with the checker of runtime
+  `master` (also on a daily schedule), so a rule change reaches the API without a new API PR.
+
+Locally: `NODESTRO_API_SRC=../nodestro-api/src pytest -m tenant_api_scan tests/test_tenant_filters.py`.
+
+**`tenant_id = ANY(<param>)` (decision O12).** An array parameter may hold several tenants, so this conjunct does not
+bind a reference by default (`check_sql(..., allow_any=False)`, `scan_package(..., allow_any=False)`). A statement
+that needs it passes only through an allowlist entry whose reason (more than 30 characters) says why the array holds
+exactly one tenant. At the time of this rule neither the runtime nor the API had such a statement, so no entry was
+added.
+
+**Rule for checker changes.** A runtime PR that changes `tenant_sql_check.py`, `tenant_sql_allowlist.py` or a
+migration is ready to merge only when a nodestro-api PR with a temporary integration pin on that runtime commit shows
+a green `tenant-sql` job; both PRs are linked to each other (see `CONTRIBUTING.md`).
 
 **Remaining isolation risk.** Without row-level security, PostgreSQL itself does not stop a statement that reads or
 changes another tenant's rows in `nodestro_*` tables; the check is a test-time review of source code. What can still
