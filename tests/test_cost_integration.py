@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from orkexa import UsageRecord
-from orkexa.pricing import BUILTIN_VERSION, ModelPrice, PriceSnapshot, TokenRates
+from orkexa.pricing import BUILTIN_SNAPSHOT, BUILTIN_VERSION, ModelPrice, PriceSnapshot, TokenRates
 import pytest
 
 from nodestro_runtime.agent_test import AgentTestIn
@@ -272,6 +272,9 @@ async def test_without_a_budget_there_is_no_maximum_to_report(make: Make) -> Non
 
 async def test_strict_mode_refuses_a_request_that_could_exceed_the_budget(make: Make) -> None:
     workspace = make({"A": [text("ok")]})
+    # The built-in prices carry a fixed check date; keep the price clock within the 7 days strict mode accepts.
+    checked = max(price.checked_at for price in BUILTIN_SNAPSHOT.prices if price.checked_at is not None)
+    workspace.pricing._clock = lambda: checked + timedelta(days=1)
     workspace.update_settings(SettingsIn(price_mode="strict"))
     # 16,000 output tokens could cost far more than one cent, so the request is not sent.
     # Unattended: refused and failed as before (an attended run waits for a budget decision instead).

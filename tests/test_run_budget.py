@@ -17,6 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from orkexa.pricing import BUILTIN_SNAPSHOT
 import pytest
 
 from nodestro_runtime import run_budget, tool_checkpoints
@@ -91,6 +92,9 @@ async def decide(
     request = pending(workspace, run)
     workspace.runs.decide_budget(run.id, request.id, action=action, by="local", limit_usd=limit, **kwargs)  # type: ignore[arg-type]
     return await workspace.wait(run.id, timeout=20)
+
+
+_BUILTIN_CHECKED = max(price.checked_at for price in BUILTIN_SNAPSHOT.prices if price.checked_at is not None)
 
 
 def single(budget: float | None = 0.05) -> WorkflowIn:
@@ -301,6 +305,9 @@ async def test_an_overdue_decision_fails_the_run(make: Make) -> None:
 @pytest.mark.parametrize("trigger", ["schedule", "batch", "benchmark"])
 async def test_unattended_runs_fail_as_before(make: Make, trigger: str) -> None:
     workspace = make({"A": [text("ok", usage={"input_tokens": 1_000_000, "output_tokens": 0}), text("b")]})
+    # Strict mode also refuses prices whose last check is older than 7 days; the built-in prices carry a fixed check
+    # date, so the price clock stays one day after it (otherwise this test turns into a staleness test 7 days later).
+    workspace.pricing._clock = lambda: _BUILTIN_CHECKED + timedelta(days=1)
     workspace.update_settings(SettingsIn(price_mode="strict"))
     done = await start(workspace, single(0.01), trigger=trigger)
     assert done.status == "failed" and done.nodes["a"].error_code == "run.budget_exceeded"
