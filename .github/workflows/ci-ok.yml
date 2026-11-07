@@ -1,0 +1,73 @@
+name: ci-ok
+
+# CI-FAST W1: one check that says whether every mandatory pull-request check listed in .github/ci-manifest.json ran
+# on the PR head SHA and succeeded. REPORT-ONLY for now: the job stays green when the verdict is NOT OK (it prints a
+# warning and a table in the job summary) and it is not a required check. Setting CI_OK_ENFORCE: "1" below turns the
+# verdict into the exit code, after the independent review of a later wave. Design note (nodestro-studio):
+# docs/architecture/ci-fast/ci-ok.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# A new push to the PR supersedes the old wait; ci-ok only ever judges the current head.
+concurrency:
+  group: ci-ok-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    # Above the script's own 90-minute wait, so that the script, not the runner, reports the timeout.
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      # Reading workflow runs and jobs of the PR head SHA.
+      actions: read
+    steps:
+      # The script and the manifest come from the PR's BASE commit, so that a PR cannot weaken its own gate.
+      - name: Check out the base commit's .github
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          sparse-checkout: .github
+          persist-credentials: false
+      # The PR's own .github, only for the drift self-check (does the PR keep manifest and workflows in step?) and
+      # for the bootstrap PR that adds ci-ok, whose base has no script yet.
+      - name: Check out the pull request's .github
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pr
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Pick the script (the base commit's copy; the PR's copy only while the base has none)
+        id: script
+        run: |
+          if [ -f base/.github/scripts/ci_ok.py ]; then
+            echo "dir=base/.github/scripts" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=ci-ok::The base commit has no ci_ok.py yet; using the pull request's copy (bootstrap)."
+            echo "dir=pr/.github/scripts" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Unit tests of the script
+        env:
+          SCRIPTS: ${{ steps.script.outputs.dir }}
+        run: python3 -I -m unittest discover -s "$SCRIPTS" -p test_ci_ok.py
+      - name: The pull request's manifest matches its workflow files (self-check, warnings only)
+        env:
+          SCRIPTS: ${{ steps.script.outputs.dir }}
+        run: python3 -I "$SCRIPTS/ci_ok.py" --self-check --root pr
+      - name: Wait for the mandatory checks and report
+        env:
+          SCRIPTS: ${{ steps.script.outputs.dir }}
+          GH_TOKEN: ${{ github.token }}
+          CI_OK_TIMEOUT_MINUTES: "90"
+          CI_OK_POLL_SECONDS: "60"
+          # Report-only: unset. "1" makes a NOT OK verdict fail this job (a later wave, after review).
+          CI_OK_ENFORCE: ""
+        run: python3 -I "$SCRIPTS/ci_ok.py"

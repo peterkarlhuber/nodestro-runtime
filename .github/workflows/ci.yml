@@ -10,9 +10,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # CI-FAST AP1: a new push to a pull request cancels the older run of that pull request. Every other run (master
+  # push, schedule, dispatch, and the nightly's workflow_call, where github.workflow is "Nightly") gets its own group
+  # from github.run_id, so it is never cancelled and never waits behind another run.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25 # CI-FAST AP1: p99 10.6 min, slowest entry 3.13 (successful runs 2026-11-01..07)
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +91,7 @@ jobs:
   # stays the owner that migrates (tests/postgres_support.py). Both images are pinned by digest (O8).
   pg-a:
     runs-on: ubuntu-latest
+    timeout-minutes: 25 # CI-FAST AP1: p99 11.5 min, all three entries alike (successful runs 2026-11-01..07)
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +145,7 @@ jobs:
 
   pg-b:
     runs-on: ubuntu-latest
+    timeout-minutes: 25 # CI-FAST AP1: p99 12.8 min, slowest entry 3.14 (successful runs 2026-11-01..07)
     strategy:
       fail-fast: false
       matrix:
@@ -198,6 +208,7 @@ jobs:
     # no test of the check may be skipped (tests/ci/skipped-tenant-sql-api.txt is empty). If nodestro-api becomes
     # private, this job is removed by a PR with its reason; it never uses NODESTRO_READ.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # CI-FAST AP1: p99 1.2 min (successful runs 2026-11-01..07)
     permissions:
       contents: read
     env:
@@ -235,6 +246,7 @@ jobs:
     # and no test of the comparison may be skipped (tests/ci/skipped-security-vectors-sync.txt is empty). A change of
     # the corpus merges in axentra first (tests/vectors/README.md). It never uses NODESTRO_READ.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # CI-FAST AP1: p99 1.1 min (successful runs 2026-11-01..07)
     permissions:
       contents: read
     env:
@@ -270,6 +282,7 @@ jobs:
     # from a hashed lock file and a tool or a stdio MCP server runs in it without network. A missing Docker fails this
     # job instead of skipping the tests.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # CI-FAST AP1: p99 3.0 min (successful runs 2026-11-01..07)
     env:
       NODESTRO_DOCKER_TESTS: "1"
       NODESTRO_REQUIRE_DOCKER: "1"
@@ -303,6 +316,7 @@ jobs:
     # job instead of skipping the tests. The real target systems (Ubuntu 24.04 and Debian 13 with their own kernels)
     # are tested with the packaged desktop in nodestro-desktop's "Sandbox systems" workflow.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15 # CI-FAST AP1: p99 2.3 min (successful runs 2026-11-01..07)
     env:
       NODESTRO_REQUIRE_SANDBOX: "1"
     steps:
@@ -338,6 +352,7 @@ jobs:
     # (docs/sandbox-arm64.md). Untrusted code then needs Docker. The job fails if the sandbox ever becomes available
     # on this architecture without its own evidence.
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15 # CI-FAST AP1: p99 2.0 min (successful runs 2026-11-01..07)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -373,6 +388,7 @@ jobs:
   package:
     # The wheel installs on its own and contains what the package needs at run time.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # CI-FAST AP1: p99 0.9 min (successful runs 2026-11-01..07)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
