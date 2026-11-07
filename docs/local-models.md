@@ -278,6 +278,17 @@ An agent's view (`ScopedIndex`) limits the candidates to the agent's files *befo
 other files never take their places. On PostgreSQL every query is tenant-scoped; pgvector ranks the vectors where
 installed (migration `0010` installs it when available), the runtime ranks the same rows otherwise.
 
+**pgvector installed later.** Migration `0010` installs pgvector only if the PostgreSQL server has it at that moment
+and the migrating role may create it (pgvector is not a trusted extension). `storage_postgres.pgvector_status(database)`
+tells an operator where a database stands (read-only): `active` (pgvector ranks), `installable` (the server has
+pgvector, this database does not use it: run `CREATE EXTENSION vector SCHEMA "<schema>";` as a superuser),
+`other_schema` (installed in a schema the connection's `search_path` does not include, e.g. `public` while the server
+runs with `NODESTRO_DATABASE_SCHEMA`: `ALTER EXTENSION vector SET SCHEMA "<schema>";`, unless other applications of
+that database use it there) or `unavailable` (install the pgvector package on the PostgreSQL server first). It
+returns the `command` and an English `message`. Each knowledge index checks pgvector once, so the API and worker
+processes rank with it after their next restart. The vectors themselves need no reindex: they are stored as `real[]`
+either way.
+
 ## Offline
 
 The strict offline mode (`Settings.strict_offline`) makes preflight refuse cloud models (also fallbacks, judges,
