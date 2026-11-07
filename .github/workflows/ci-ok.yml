@@ -1,0 +1,60 @@
+name: ci-ok
+
+# CI-FAST W1 (v2): one report that says whether every mandatory pull-request check listed in .github/ci-manifest.json
+# ran on the PR head SHA and succeeded. REPORT-ONLY: the job stays green whatever the verdict (also on API errors) and
+# it is not a required check; the verdict is the job summary of the latest completed ci-ok run for that head SHA.
+# Design note (nodestro-studio): docs/architecture/ci-fast/ci-ok.md.
+#
+# Why workflow_run and not pull_request: GitHub always runs a workflow_run workflow from the DEFAULT branch, so a pull
+# request cannot change this file, the script or the manifest that judge it (review F1, F2). Each completion of a
+# listed workflow starts one evaluation of seconds instead of a job that waits for CI and holds one of the account's
+# 20 concurrent job slots (F3), and a re-run re-evaluates (F4). It only starts once this file is on the default branch.
+
+run-name: ci-ok for ${{ github.event.workflow_run.head_sha }} after ${{ github.event.workflow_run.name }}
+
+on:
+  workflow_run:
+    # The `name:` of every workflow in the manifest's pull_request section (path-filtered ones included: when they
+    # run, their completion re-evaluates; when they do not, the other workflows' completions do). Not Nightly: it
+    # never runs on pull_request. `ci_ok.py --self-check` fails when this list and the manifest differ.
+    workflows: [CI, Platforms]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  ci-ok:
+    name: ci-ok
+    # Only pull_request runs are judged; completions of push, schedule or dispatch runs skip the job (no runner).
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    # The script gives up on the API after 180 s and reports NOT OK (api error) itself.
+    timeout-minutes: 10
+    # One evaluation per head SHA at a time. cancel-in-progress false: a running evaluation finishes, and GitHub keeps
+    # only the newest pending one (an older pending one is replaced), so the last evaluation to finish always started
+    # after the last completion. At job level, behind the `if:`, so that skipped non-PR completions on the same SHA
+    # never replace a pending PR evaluation.
+    concurrency:
+      group: ci-ok-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # Reading workflow runs and jobs of the PR head SHA.
+      actions: read
+    steps:
+      # The default branch's commit that this workflow_run event runs on (github.sha); never the pull request's code.
+      - name: Check out the default branch's .github
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: default
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Evaluate the mandatory checks once and report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Report-only: unset. "1" makes a NOT OK verdict fail this job (a later wave, after review).
+          CI_OK_ENFORCE: ""
+        # The manifest comes from the same checkout; the script also runs --self-check on it and reports any problem
+        # as NOT OK (F8).
+        run: python3 -I default/.github/scripts/ci_ok.py --root default

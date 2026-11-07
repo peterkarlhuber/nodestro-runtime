@@ -1,0 +1,8 @@
+# CI-FAST ci-ok: ci_ok.py and test_ci_ok.py are byte-identical in every repository, while the repositories' own ruff
+# settings differ (line length 110 or 120). Ruff uses the nearest configuration for each file, so this file keeps lint
+# and format results the same everywhere (the rule set most of the repositories use).
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]

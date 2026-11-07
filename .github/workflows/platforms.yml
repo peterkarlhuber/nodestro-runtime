@@ -8,14 +8,23 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
+
+concurrency:
+  # CI-FAST AP1: a new push to a pull request cancels the older run of that pull request. Every other run (master
+  # push, schedule, dispatch, and the nightly's workflow_call, where github.workflow is "Nightly") gets its own group
+  # from github.run_id, so it is never cancelled and never waits behind another run.
+  group: platforms-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   start:
     name: start (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15 # CI-FAST AP1: p99 3.2 min, slowest entry macos-15-intel (successful runs 2026-11-01..07)
     strategy:
       fail-fast: false
       matrix:
