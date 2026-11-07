@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: the sandbox gateway keeps each connection's task alive until it ends. asyncio holds tasks and stream readers only
+  weakly, so after `docker run -i` half-closed an attached stream a garbage collection could destroy the task before
+  the container's output arrived; the client then saw exit code 0 with no output (seen as a module check reporting
+  installed packages as missing). New test `test_an_attached_stream_outlives_a_garbage_collection`.
 - TODO abatement round 4 (2026-11-07):
   - Bedrock usage carries its region: `UsageEntry.region` (one ledger entry per model and region) and
     `Usage.regions` for runs, steps, orchestrator decisions, agent tests and run chat; `PricedTracker` takes it from
