@@ -304,3 +304,28 @@ def test_refresh_detects_pgvector_again(database: Any) -> None:
     index.refresh()
     assert index.pgvector() is True
     assert [(hit.source, hit.score) for hit in index.retrieve("alpha", 2, mode="vector")] == expected
+
+
+# MUP-ONA T-PG-1
+def test_a_model_without_refresh_identity_still_writes_and_reindexes(make: Callable[..., Any]) -> None:
+    """A model with only ``embed_documents``, ``embed_query`` and ``identity`` (a duck-typed test double, as in
+    nodestro-api's worker tests) caches no identity: writes and reindexes work without ``refresh_identity``."""
+    keywords = KeywordEmbeddings("drift-duck")
+
+    class Duck:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            return [keywords.vector(text) for text in texts]
+
+        def embed_query(self, text: str) -> list[float]:
+            return keywords.vector(text)
+
+        def identity(self) -> Any:
+            return keywords.identity()
+
+    index = make()
+    index.add("A chunk about alpha.", source="a.md")
+    status = index.reindex(Duck())
+    assert status.complete
+    index.embeddings = Duck()
+    index.add("A chunk about beta.", source="b.md")
+    assert [hit.source for hit in index.retrieve("beta", 1, mode="vector")] == ["b.md"]

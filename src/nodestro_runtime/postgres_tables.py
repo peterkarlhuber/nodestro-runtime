@@ -86,6 +86,14 @@ def search_words(text: str) -> builtins.list[str]:
     return _WORD.findall(folded)
 
 
+def _refresh_identity(model: EmbeddingModel) -> None:
+    """``model.refresh_identity()``; a model that only has the methods of the protocol (no ``refresh_identity``, e.g.
+    a test double that does not subclass :class:`~orkexa.embeddings.EmbeddingModel`) caches nothing to forget."""
+    refresh = getattr(model, "refresh_identity", None)
+    if refresh is not None:
+        refresh()
+
+
 def _cosine(query: builtins.list[float], query_norm: float, stored: builtins.list[float]) -> float:
     """The cosine similarity of a query vector (with its length) and a stored vector (neither is all zeros)."""
     dot = math.fsum(a * b for a, b in zip(query, stored, strict=True))
@@ -270,7 +278,7 @@ class PostgresIndex(Index):
         identity = None
         vectors: builtins.list[builtins.list[float]] | None = None
         if self.embeddings is not None:
-            self.embeddings.refresh_identity()  # the model's current build, not a cached one (MUP-ONA drift 1)
+            _refresh_identity(self.embeddings)  # the model's current build, not a cached one (MUP-ONA drift 1)
             identity = self.embeddings.identity()
             vectors = [[float(x) for x in vector] for vector in self.embeddings.embed_documents([c.text for c in kept])]
             if len(vectors) != len(kept):
@@ -428,7 +436,7 @@ class PostgresIndex(Index):
         model = embeddings or self.embeddings
         if model is None:
             raise RetrievalError("vector_unavailable", "reindex() needs an embedding model")
-        model.refresh_identity()  # the model's current build, not a cached one (MUP-ONA drift 1)
+        _refresh_identity(model)  # the model's current build, not a cached one (MUP-ONA drift 1)
         identity = model.identity()
         space = f"{self.namespace}:{identity.key}"
         active = self._space("active")
@@ -472,7 +480,7 @@ class PostgresIndex(Index):
                     )
             if progress is not None:
                 progress(self._count_vectors(space), total)
-        model.refresh_identity()
+        _refresh_identity(model)
         if model.identity().key != identity.key:
             # The model changed on its server while it embedded: the new space may mix two builds.
             self._discard(space)
