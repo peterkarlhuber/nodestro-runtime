@@ -1894,6 +1894,11 @@ runs, settings and memory stay compatible, and the public Python API is unchange
   - Security (A8, VB-7): the MCP egress check refuses deprecated IPv6 site-local addresses (`fec0::/10`, reason
     `site_local`), which `ipaddress` counts as global; Axentra's webhook check already refused them (found by the
     shared security test vectors).
+  - Security (A8, VB-7): credential redaction (`sanitize`: trace exports, `redact_secrets`) also removes
+    `Authorization: Basic` credentials (also `Proxy-Authorization` and header dicts), `Cookie:` / `Set-Cookie:`
+    header values up to the line end, and the password in a URL's user information
+    (`postgresql://app:<password>@db`); the prefix stays readable. Axentra's redaction already removed them (found by
+    the shared security test vectors).
 
 ## 0.2.0 (2026-10-29)
 
