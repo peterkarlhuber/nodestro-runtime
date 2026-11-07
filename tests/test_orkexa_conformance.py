@@ -53,8 +53,8 @@ TARGETS: dict[str, tuple[tuple[Case, ...], frozenset[str]]] = {
 
 #: The documented drifts of the PostgreSQL index (plan annex A, fixed by MP-B3): case -> drift number, per way of
 #: ranking vectors (``pgvector``: the database ranks; ``runtime``: the runtime ranks, a server without pgvector).
-#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported. MP-B3 fixed drifts
-#: 1-9: no case is an expected failure any more (MUP-ONA T-PG-1); a new entry needs a drift of plan annex A.
+#: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported. MP-B3 fixed all ten
+#: drifts: no case is an expected failure any more (MUP-ONA T-PG-1); a new entry needs a drift of plan annex A.
 DRIFTS: dict[str, dict[str, int]] = {"pgvector": {}, "runtime": {}}
 
 
@@ -174,7 +174,6 @@ def test_drift_marks_name_index_cases_only() -> None:
 
 
 # MUP-ONA T-PG-3
-@pytest.mark.xfail(strict=True, reason="MUP-DRIFT-10")
 def test_legacy_vectors_are_reported() -> None:
     """FX-PG-0 holds one zero vector per tenant, stored before vectors were checked: ``vector_status`` marks such a
     space ``legacy`` (drift 10; the suite cannot write such vectors, so this runs on the legacy fixture)."""
@@ -186,6 +185,6 @@ def test_legacy_vectors_are_reported() -> None:
         try:
             for tenant in ("tenant-a", "tenant-b"):
                 status = PostgresIndex(database, tenant, namespace="nodestro").vector_status()
-                assert status.legacy, f"{tenant}: {status}"
+                assert status.legacy and status.excluded == 1, f"{tenant}: {status}"
         finally:
             database.close()

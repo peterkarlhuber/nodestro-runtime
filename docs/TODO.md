@@ -632,15 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-10 · `VectorStatus.legacy` is never set (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Vectors stored before vectors were checked (the zero vectors of FX-PG-0) are not reported in
-  `vector_status()`. Strict expected failure `MUP-DRIFT-10`: `test_legacy_vectors_are_reported` (FX-PG-0; no generic
-  case).
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**

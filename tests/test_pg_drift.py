@@ -249,3 +249,27 @@ def test_chunks_deleted_while_a_batch_is_embedded_get_no_vector(make: Callable[.
     )
     assert rows == [(4,)]
     assert {hit.source for hit in index.retrieve("alpha", 10, mode="vector")} == {"c0.md", "c2.md", "c3.md", "c5.md"}
+
+
+# ---- drift 10: vectors searches leave out are reported --------------------------------------------------------
+
+
+# MUP-ONA T-PG-3
+def test_vectors_left_out_are_counted_until_a_reindex_replaces_them(make: Callable[..., Any]) -> None:
+    index = make(embeddings=KeywordEmbeddings())
+    for source, word in (("a.md", "alpha"), ("nan.md", "beta"), ("inf.md", "gamma"), ("zero.md", "delta")):
+        index.add(f"A chunk about {word}.", source=source)
+    status = index.vector_status()
+    assert (status.legacy, status.excluded) == (False, 0)
+    _set_vector(index, "nan.md", "{NaN,1,0,0,0,0,0,0}")
+    _set_vector(index, "inf.md", "{1,Infinity,0,0,0,0,0,0}")
+    _set_vector(index, "zero.md", "{0,0,0,0,0,0,0,0}")
+    status = index.vector_status()
+    assert (status.legacy, status.excluded, status.embedded, status.chunks) == (True, 3, 4, 4)
+    assert status.model_dump()["excluded"] == 3
+    other = make(tenant="drift-other", embeddings=KeywordEmbeddings())  # another tenant counts its own vectors
+    other.add("A chunk about alpha.", source="a.md")
+    assert (other.vector_status().legacy, other.vector_status().excluded) == (False, 0)
+    status = index.reindex(KeywordEmbeddings("drift-replacement"))
+    assert (status.legacy, status.excluded, status.complete) == (False, 0, True)
+    assert {hit.source for hit in index.retrieve("beta gamma delta", 10, mode="vector")} >= {"nan.md", "inf.md"}

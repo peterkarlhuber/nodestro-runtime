@@ -187,6 +187,18 @@ class PostgresFileStore(FileStore):
         )
 
 
+class PostgresVectorStatus(VectorStatus):
+    """:class:`orkexa.retrieval.VectorStatus` of a :class:`PostgresIndex`, with the vectors searches leave out.
+
+    ``excluded`` counts the vectors of the active space that no search ranks: NaN or infinity (stored before vectors
+    were checked) and zero vectors (no direction, no cosine). They stay stored; their chunks count as ``embedded``.
+    ``legacy`` is set while there is any (vectors stored before the checks of MUP-ONA MP-B3, or zero vectors a model
+    returned); a reindex with a model that returns usable vectors replaces them. Orkexa's ``SQLiteIndex`` uses
+    ``legacy`` for the vectors of an ``embedder=`` callable, which a PostgreSQL index never holds."""
+
+    excluded: int = 0
+
+
 class PostgresIndex(Index):
     """An Orkexa :class:`~orkexa.Index` of one tenant and namespace with full-text search (``nodestro_chunks``).
 
@@ -352,16 +364,29 @@ class PostgresIndex(Index):
             self._pgvector = bool(rows and rows[0][0])
         return self._pgvector
 
-    def vector_status(self) -> VectorStatus:
+    def vector_status(self) -> PostgresVectorStatus:
+        """The vector state of this namespace, with the active space's vectors searches leave out (drift 10)."""
         active = self._space("active")
         building = self._space("building")
-        return VectorStatus(
+        excluded = self._count_excluded(active[0]) if active else 0
+        return PostgresVectorStatus(
             chunks=len(self),
             active=active[1].to_dict() if active else None,
             embedded=self._count_vectors(active[0]) if active else 0,
             building=building[1].to_dict() if building else None,
             building_embedded=self._count_vectors(building[0]) if building else 0,
+            legacy=excluded > 0,
+            excluded=excluded,
         )
+
+    def _count_excluded(self, space: str) -> int:
+        """Vectors of ``space`` that searches leave out (not ``_USABLE``: NaN, infinity, all zeros)."""
+        rows = self.database._query(
+            "SELECT count(*) FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.namespace = %s"
+            f" AND v.space = %s AND NOT ({_USABLE})",
+            (self.tenant_id, self.namespace, space),
+        )
+        return int(rows[0][0])
 
     def _discard(self, space: str) -> None:
         self.database._write(
@@ -822,6 +847,7 @@ __all__ = [
     "PostgresMemory",
     "PostgresMemorySpace",
     "PostgresMemoryTables",
+    "PostgresVectorStatus",
     "knowledge_tables",
     "memory_totals",
     "search_words",
