@@ -48,6 +48,7 @@ __all__ = [
     "COMPUTING_BUILTINS",
     "Unverified",
     "checked_fields",
+    "computes",
     "computing_call",
     "correction_prompt",
     "tool_numbers",
@@ -85,6 +86,11 @@ def computing_call(record: ToolCallRecord, own_tools: Iterable[str] = ()) -> boo
     if record.name in _LOOKUPS or record.name.startswith("mcp__") or record.provenance.get("source") == "mcp":
         return False
     return record.name in set(own_tools)
+
+
+def computes(tools: Iterable[str]) -> bool:
+    """Whether an agent configured with ``tools`` has a tool whose calls can back a key figure."""
+    return any(name not in _LOOKUPS and not name.startswith("mcp__") for name in tools)
 
 
 def checked_fields(output: OutputConfig) -> list[str]:

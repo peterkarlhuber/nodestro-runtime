@@ -223,6 +223,9 @@ def test_the_check_names_a_checked_value_without_any_tool(tmp_path: Path) -> Non
         check = preflight(workspace, Workflow.model_validate(saved.model_dump()))
         codes = {(item.code, item.node_id) for item in check.problems}
         assert ("check.value_source_no_tool", "a") in codes
+        saved = workspace.save_workflow(_flow(tools=["current_datetime"]))  # only looks the date up (RT-054)
+        check = preflight(workspace, Workflow.model_validate(saved.model_dump()))
+        assert ("check.value_source_no_tool", "a") in {(item.code, item.node_id) for item in check.problems}
         saved = workspace.save_workflow(_flow(tools=["table_totals"]))
         check = preflight(workspace, Workflow.model_validate(saved.model_dump()))
         assert "check.value_source_no_tool" not in {item.code for item in check.problems}

@@ -193,7 +193,7 @@ back to the agent once with the reason (event `values_unverified`); a second fai
 column of a Markdown or CSV table exactly (count, total, mean, min, max, groups in Pareto order, share of a reference
 total) and reads European number formats. The workflow check warns with `check.value_source_type` (the field is not a
 number of a structured result) and refuses with `check.value_source_no_tool` (neither the agent nor one before it has
-a tool). The agent test in the inspector does not correct or fail: it lists a figure its own computing calls do not
+a tool that computes). The agent test in the inspector does not correct or fail: it lists a figure its own computing calls do not
 back in `AgentTestResult.value_warnings` (a step that copies a figure from an earlier step has none there). A matching
 number proves where the value came from, not that the agent chose the right inputs for the tool;
 figures inside free text are not checked.
