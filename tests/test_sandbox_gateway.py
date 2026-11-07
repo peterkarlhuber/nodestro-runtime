@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
 import contextlib
 import copy
+import gc
 import gzip
 import io
 import json
@@ -586,6 +587,9 @@ class FakeDaemon:
         self.effective: dict[str, dict[str, Any]] = {}
         self.tamper: Callable[[dict[str, Any]], None] = lambda _found: None
         self.inspectable = True
+        #: When set, an attached container answers only once this event is set (after its stdin was closed).
+        self.output_gate: asyncio.Event | None = None
+        self.stdin_closed = asyncio.Event()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request = await gw.read_request(reader, limit=1 << 26)
@@ -624,6 +628,9 @@ class FakeDaemon:
         elif path.endswith("/attach"):
             writer.write(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
             data = await reader.read()  # until the client half-closes
+            self.stdin_closed.set()
+            if self.output_gate is not None:
+                await self.output_gate.wait()
             writer.write(data.upper())
             await writer.drain()
             writer.write_eof()
@@ -674,6 +681,32 @@ async def _send(socket_path: str, raw: bytes, *, half_close: bool = False) -> by
     data = await reader.read()
     writer.close()
     return data
+
+
+async def test_an_attached_stream_outlives_a_garbage_collection(gateway: tuple[FakeDaemon, str, Gateway]) -> None:
+    # After the client closed its stdin, nothing but the gateway's own reference keeps the connection's task (and the
+    # daemon side of the stream) alive: asyncio holds tasks and a stream's reader only weakly. A garbage collection
+    # before the container answered closed the stream without its output (``docker run`` then printed nothing).
+    daemon, listen, _ = gateway
+    assert (await _send(listen, _post("/v1.51/containers/create", body()))).startswith(b"HTTP/1.1 201")
+    container_id = next(iter(daemon.containers))
+    daemon.output_gate = asyncio.Event()
+    reader, writer = await asyncio.open_unix_connection(listen)
+    try:
+        writer.write(
+            f"POST /v1.51/containers/{container_id}/attach?stdin=1&stdout=1&stream=1 HTTP/1.1\r\nHost: docker\r\n"
+            "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\nhello".encode()
+        )
+        await writer.drain()
+        writer.write_eof()
+        await asyncio.wait_for(daemon.stdin_closed.wait(), timeout=5)
+        await asyncio.sleep(0.05)  # the gateway has seen the half-close as well
+        gc.collect()
+        daemon.output_gate.set()
+        answer = await asyncio.wait_for(reader.read(), timeout=5)
+    finally:
+        writer.close()
+    assert answer.startswith(b"HTTP/1.1 101") and answer.endswith(b"HELLO")
 
 
 # ---- adversarial requests (request smuggling, rewritten targets, non-upgraded attach) -----------------------------
