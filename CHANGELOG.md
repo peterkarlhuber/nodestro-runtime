@@ -1861,6 +1861,9 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     `make_legacy_pg.py` and a restore test (T-FX-1); the ranking corpus FX-RANK-0 with its PostgreSQL results
     (`tests/fixtures/ranking/`, T-RANK-0); every CI pytest job compares its skipped tests with
     `tests/ci/skipped-<job>.txt` (`scripts/check_skips.py`, T-SKIP-1).
+  - Price sync (A7, VB-1): LiteLLM's cost map is read at a fixed commit and must match the SHA-256 shipped with
+    the release (`LITELLM_COMMIT`, `LITELLM_SHA256`); another file is not imported and a warning is logged.
+    Price downloads no longer follow redirects. See `docs/pricing-sync.md`.
 
 ## 0.2.0 (2026-10-29)
 
