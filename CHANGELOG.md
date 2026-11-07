@@ -12,6 +12,16 @@
   weakly, so after `docker run -i` half-closed an attached stream a garbage collection could destroy the task before
   the container's output arrived; the client then saw exit code 0 with no output (seen as a module check reporting
   installed packages as missing). New test `test_an_attached_stream_outlives_a_garbage_collection`.
+- TODO abatement round 6 (2026-11-07):
+  - Tests: the environment image size cap and collection on a real daemon (RT-031): a real build above
+    `NODESTRO_MAX_IMAGE_GB` is removed and refused, an invalid limit fails before docker builds, and the collection
+    removes the least recently used lock-labelled images but never a kept, unlabelled or in-use one (where images
+    cannot be listed, only recorded ones). The reaper thread at a desktop's start on a real daemon (RT-034): all of
+    its own tool containers and earlier MCP containers go, a later MCP container, another installation's and a
+    legacy `nodestro` container stay; an unreachable daemon or missing CLI removes nothing. Each real-daemon test
+    labels what it makes, builds its own tiny images and reaches the product through a guarded docker CLI that never
+    lists, builds or removes another image, so the tests are safe on a shared daemon; the reaper tests no longer pull
+    `python:3.13-slim`.
 - TODO abatement round 4 (2026-11-07):
   - Bedrock usage carries its region: `UsageEntry.region` (one ledger entry per model and region) and
     `Usage.regions` for runs, steps, orchestrator decisions, agent tests and run chat; `PricedTracker` takes it from

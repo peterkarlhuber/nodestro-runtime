@@ -3,7 +3,7 @@
 > Open work for this repository: release blockers, known bugs, security follow-ups, technical debt and planned improvements.
 > GitHub issues are the source of truth for details; this file is the entry point and summary.
 >
-> **Last full review:** 2026-11-06 against master at 1e9f7b2 (TODO abatement round)
+> **Last full review:** 2026-11-07 against master at de56875 (TODO abatement round 6)
 
 ## Summary
 
@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 20 |
+| P3 Low | 22 |
 | P4 Optional | 13 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -230,8 +230,8 @@ Items that need an independent or external review (an internal audit does not re
 
 ### RT-034 · Container reaper: follow-ups
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R2, `docker_status.DockerMonitor.start_reaper`,
-  `docker_status.installation_owner`
+- **Priority:** P3 Low · **Status:** Needs decision · **Refs:** Docker-first plan R2,
+  `docker_status.DockerMonitor.start_reaper`, `docker_status.installation_owner`
 - **What:** Tool containers carry `org.orkexa.sandbox=<owner>` and a deadline label. The owner of a desktop or
   Nodestro Local Docker is its own (`nodestro-<12 hex digits of SHA-256 of the resolved data directory and the
   installation id>`, done 2026-11-02): such an installation removes all of its own containers at the start
@@ -243,11 +243,15 @@ Items that need an independent or external review (an internal audit does not re
   start (they have a deadline; a server on the same daemon removes them once expired, otherwise `docker rm`); a copy of
   a data directory (with its `python/installation-id`) at the same path on the same daemon, e.g. a second Nodestro
   Local Docker container on a copied volume, shares the owner.
-- **Tested on a real daemon (2026-11-07):** `test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon`
-  (`tests/test_container_images.py`, CI `docker` job): two installations' owners on one daemon, each reaper removes
-  only its own expired containers (all of them at a desktop's start), never the other's or the MCP containers.
-- **Next step:** None needed in code for the reaper itself; the open points above are limits of the gateway and of
-  copied data directories. Decide whether a desktop should also remove legacy `nodestro` containers at its start.
+- **Tested on a real daemon (2026-11-07, CI `docker` job, `tests/test_container_images.py`):**
+  `test_the_reaper_removes_only_its_own_expired_containers_on_a_real_daemon` (two installations' owners on one
+  daemon: each reaper removes only its own expired containers, never the other's or the MCP containers) and
+  `test_a_desktop_start_reaps_only_its_own_containers_and_a_lost_daemon_nothing_on_a_real_daemon` (the reaper
+  thread at a desktop's start removes all of its own tool containers and the MCP containers started before it, but
+  not a later MCP container, another installation's or a legacy `nodestro` one; invalid deadlines count as expired;
+  an unreachable daemon or a missing CLI removes nothing). Each test labels and removes only what it creates.
+- **Next step:** No code work is left for the reaper; the open points above are limits of the gateway and of copied
+  data directories. Owner decision: should a desktop also remove legacy `nodestro` containers at its start?
 
 ### RT-037 · Local MCP containers and the sandbox gateway: residual risks (DS-4, DS-11)
 
@@ -272,15 +276,22 @@ Items that need an independent or external review (an internal audit does not re
 
 ### RT-031 · Environment image caps and collection: follow-ups
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** Docker-first plan R3, `container_images.py`, `image_limits.py`
+- **Priority:** P3 Low · **Status:** Needs decision · **Refs:** Docker-first plan R3, `container_images.py`,
+  `image_limits.py`
 - **What:** A built environment image above `NODESTRO_MAX_IMAGE_GB` (default 8) is removed and refused
   (`deps.image_too_large`), and every build collects the least recently used `nodestro-env` images (with the lock
   label) beyond 20 images or 20 GiB, never one an environment of the store names. Open: a server (shared daemon,
   `remove_images=False`) does not collect, so its operator still prunes; through the sandbox gateway images cannot be
-  listed, so collection there sees only images in the data directory's usage record (`python/image-usage.json`);
-  the size cap and collection were tested only with the fake docker CLI. (The Studio text for `deps.image_too_large`
-  exists in all six languages.)
-- **Next step:** A real-Docker test of the size cap and collection in the CI `docker` job.
+  listed, so collection there sees only images in the data directory's usage record (`python/image-usage.json`).
+  (The Studio text for `deps.image_too_large` exists in all six languages.)
+- **Tested on a real daemon (2026-11-07, CI `docker` job, `tests/test_container_images.py`):**
+  `test_an_image_above_the_size_cap_is_removed_and_refused_on_a_real_daemon`,
+  `test_gc_collects_only_its_own_least_recently_used_images_on_a_real_daemon` and
+  `test_gc_without_a_listing_collects_only_recorded_images_on_a_real_daemon`. The collection cannot be limited to
+  some images by configuration (it lists every lock-labelled `nodestro-env` image of the daemon), so the tests give
+  it a guarded docker CLI that lists only the test's own images and refuses to remove any other.
+- **Next step:** Owner decision: should a server collect too (one daemon for every tenant and worker, so it would
+  need the environments of all tenants as the images to keep), or does its operator keep pruning?
 
 ### RT-006 · Waiting tool approvals hold worker threads and slots
 
