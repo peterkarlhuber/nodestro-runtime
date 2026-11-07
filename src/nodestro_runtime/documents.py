@@ -10,6 +10,8 @@ No external account and no new Python library is needed.
 - **XLSX**: one section per sheet with a table of the used cells. A formula is never
   evaluated: the cell shows the value Excel saved with the file and, next to it, the
   formula as text (``=SUM(A1:A3)``), so readers can tell the two apart.
+- **PDF text**: read by orkexa's :func:`~orkexa.retrieval.pdf_pages_isolated` in a separate, limited process that
+  is stopped at the time budget (MUP-ONA A1); the limits come from the environment (:func:`pdf_limits`).
 - **Scanned PDF**: a PDF without a text layer. When OCR is available, the recognised
   text is indexed; words recognised with low confidence are marked ``[?word]`` and
   counted, so agents and users know the text is uncertain.
@@ -20,16 +22,22 @@ Markdown file named after the original); the size limits of the knowledge store 
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 import io
+import math
+import os
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING
 from xml.etree import ElementTree
 from xml.parsers import expat
 import zipfile
 
 from .problems import NodestroError
+
+if TYPE_CHECKING:
+    from orkexa.retrieval import PdfLimits
 
 #: Formats converted to Markdown before they are stored.
 CONVERTED = {".docx": "docx", ".xlsx": "xlsx"}
@@ -363,11 +371,113 @@ def rows_of_xlsx(data: bytes, name: str = "workbook.xlsx") -> list[dict[str, str
 # ---- scanned PDFs and OCR ------------------------------------------------------------
 
 
-def pdf_pages(data: bytes) -> list[str]:
-    """The text of each page of a PDF (the same extraction the knowledge index uses)."""
-    from orkexa.retrieval import _pdf_pages
+#: The PDF limits (MUP-ONA A1, decision O6): wall-clock seconds, pages, characters of text and the memory of the
+#: extracting process in MiB (enforced on Linux only).
+PDF_TIMEOUT_SECONDS = 30.0
+PDF_MAX_PAGES = 2000
+PDF_MAX_CHARS = 5_000_000
+PDF_MAX_MEMORY_MB = 512
+#: The environment variables that change them, by the field of :class:`orkexa.retrieval.PdfLimits` they set.
+PDF_LIMITS_ENV = {
+    "timeout": "NODESTRO_PDF_TIMEOUT_SECONDS",
+    "max_pages": "NODESTRO_PDF_MAX_PAGES",
+    "max_chars": "NODESTRO_PDF_MAX_CHARS",
+    "max_memory_mb": "NODESTRO_PDF_MAX_MEMORY_MB",
+}
+#: The smallest memory limit orkexa accepts (MiB); less cannot start the interpreter.
+_PDF_MIN_MEMORY_MB = 16
 
-    return _pdf_pages(data)
+
+def pdf_limits(environ: Mapping[str, str] | None = None) -> PdfLimits:
+    """The limits for reading one PDF: the defaults above, changed by the variables in :data:`PDF_LIMITS_ENV`.
+
+    An empty variable keeps its default. A value that is not a number, not finite, not above zero (the time budget,
+    pages, characters) or below 16 (the memory limit) raises :class:`DocumentError` ``document.limits_invalid`` with
+    the variable's name, instead of reading PDFs without the limit the operator meant to set.
+    """
+    from orkexa.retrieval import PdfLimits
+
+    environ = os.environ if environ is None else environ
+    values: dict[str, float | int] = {
+        "timeout": PDF_TIMEOUT_SECONDS,
+        "max_pages": PDF_MAX_PAGES,
+        "max_chars": PDF_MAX_CHARS,
+        "max_memory_mb": PDF_MAX_MEMORY_MB,
+    }
+    for name, variable in PDF_LIMITS_ENV.items():
+        raw = environ.get(variable, "").strip()
+        if not raw:
+            continue
+        value: float | int
+        try:
+            value = float(raw) if name == "timeout" else int(raw)
+        except ValueError:
+            raise DocumentError(
+                "document.limits_invalid", f"{variable} must be a number, not {raw[:40]!r}", variable=variable
+            ) from None
+        minimum = _PDF_MIN_MEMORY_MB if name == "max_memory_mb" else 0
+        if not math.isfinite(value) or value < minimum or value <= 0:
+            raise DocumentError(
+                "document.limits_invalid",
+                f"{variable} must be at least {minimum}" if minimum else f"{variable} must be greater than 0",
+                variable=variable,
+            )
+        values[name] = value
+    return PdfLimits(
+        timeout=float(values["timeout"]),
+        max_pages=int(values["max_pages"]),
+        max_chars=int(values["max_chars"]),
+        max_memory_mb=int(values["max_memory_mb"]),
+    )
+
+
+def pdf_pages(data: bytes, name: str, *, limits: PdfLimits | None = None) -> list[str]:
+    """The text of each page of a PDF, read within the PDF limits (``limits``, else :func:`pdf_limits`).
+
+    The text is extracted by orkexa's :func:`~orkexa.retrieval.pdf_pages_isolated` in a separate process with a
+    minimal environment, which is stopped when the time budget runs out, so no PDF can block or exhaust the calling
+    process. A PDF over a limit raises :class:`DocumentError` ``document.too_complex`` (parameters ``name`` and
+    ``reason``: ``pages``, ``chars``, ``timeout``, ``memory``, ``limit`` or ``crash``); a PDF that cannot be read
+    raises ``ValueError``.
+    """
+    from orkexa.retrieval import RetrievalError, pdf_pages_isolated
+
+    chosen = pdf_limits() if limits is None else limits
+    try:
+        return pdf_pages_isolated(
+            data,
+            timeout=chosen.timeout,
+            max_memory_mb=chosen.max_memory_mb,
+            max_pages=chosen.max_pages,
+            max_chars=chosen.max_chars,
+        )
+    except RetrievalError as exc:
+        if exc.code != "document.too_complex":
+            raise
+        raise DocumentError(
+            "document.too_complex", f"{name} is too complex to read: {exc}", name=name, reason=exc.reason or "crash"
+        ) from None
+
+
+def read_pdf(data: bytes, name: str) -> list[str] | None:
+    """The text of each page of a PDF that is about to be stored, read within the PDF limits (:func:`pdf_pages`).
+
+    Raises :class:`DocumentError`: ``document.too_complex`` over a limit, ``document.encrypted`` for a PDF protected
+    by a password, ``document.unreadable`` for a damaged, truncated or empty file or one without pages. ``None``: the
+    PDF opens and has pages, but its text cannot be extracted (it is stored without being searchable).
+    """
+    try:
+        pages = pdf_pages(data, name)
+    except DocumentError:
+        raise
+    except ValueError:
+        # Which refusal: the same checks as before a PDF was read in its own process. They only open the file and
+        # count its pages, work the limited process has already done without hitting a limit.
+        check_pdf(data, name)
+        return None
+    if not pages:
+        raise DocumentError("document.unreadable", f"{name} is not a readable PDF", name=name)
+    return pages
 
 
 def check_pdf(data: bytes, name: str) -> None:
@@ -389,20 +499,6 @@ def check_pdf(data: bytes, name: str) -> None:
         ) from None
     except Exception:  # pypdf raises many types for damaged files; all mean the same here
         raise DocumentError("document.unreadable", f"{name} is not a readable PDF", name=name) from None
-
-
-def pdf_has_text(data: bytes) -> bool:
-    """Whether a PDF has a text layer (a scan without OCR has none)."""
-    from pypdf import PdfReader
-
-    try:
-        reader = PdfReader(io.BytesIO(data))
-        for page in reader.pages[:20]:
-            if (page.extract_text() or "").strip():
-                return True
-    except Exception:
-        return False
-    return False
 
 
 @dataclass

@@ -31,14 +31,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
 from pathlib import Path
-import tempfile
 import threading
 from typing import Any, Literal, Protocol
 
 from orkexa import Chunk, FileStore, Hit, Index, SQLiteFileStore, SQLiteIndex, StoredFile
 from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
 from orkexa.local import OllamaError
-from orkexa.retrieval import RetrievalError, RetrievalMode
+from orkexa.retrieval import RetrievalError, RetrievalMode, split_text
 from pydantic import BaseModel, Field
 
 from . import documents
@@ -49,6 +48,19 @@ from .sqlite_tables import KnowledgeChunks
 
 logger = logging.getLogger(__name__)
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
+
+
+@dataclass(frozen=True)
+class _PdfText:
+    """The text of an uploaded PDF, read once (:func:`documents.read_pdf`): its pages, ``None`` when the PDF opens but
+    its text cannot be extracted."""
+
+    pages: list[str] | None
+
+    @property
+    def has_text(self) -> bool:
+        """Whether the PDF has a text layer (a scan without OCR has none)."""
+        return any(page.strip() for page in self.pages or [])
 
 
 def _is_pdf(name: str, media_type: str | None) -> bool:
@@ -352,8 +364,9 @@ class KnowledgeBase:
         if collection.strip():
             metadata["collection"] = collection.strip()[:120]
         converted = documents.convert(data, name)
-        if converted is None and _is_pdf(name, media_type):
-            documents.check_pdf(data, name)
+        # A PDF's text is read before anything is stored and outside the lock, in a separate process within the PDF
+        # limits (MUP-ONA A1): a PDF over a limit is refused (document.too_complex) and leaves nothing behind.
+        pdf = _PdfText(documents.read_pdf(data, name)) if converted is None and _is_pdf(name, media_type) else None
         if converted is not None:
             data = converted.text.encode("utf-8")
             media_type = "text/markdown"
@@ -362,30 +375,45 @@ class KnowledgeBase:
         with self._lock:
             entry = self.store.add(data, name=name, description=description, media_type=media_type, metadata=metadata)
             try:
-                self._index_with_fallback(lambda: self._index_new(entry, data, name, converted))
+                self._index_with_fallback(lambda: self._index_new(entry, data, name, converted, pdf))
             except BaseException:
                 # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
                 self.delete(entry.id)
                 raise
         return self.get(entry.id)
 
-    def _index_new(self, entry: StoredFile, data: bytes, name: str, converted: documents.Converted | None) -> None:
+    def _index_new(
+        self,
+        entry: StoredFile,
+        data: bytes,
+        name: str,
+        converted: documents.Converted | None,
+        pdf: _PdfText | None,
+    ) -> None:
         if converted is not None:
             self.index.delete(entry.id)
             self.index.add(converted.text, source=entry.id, title=name, file_id=entry.id)
         elif entry.media_type == "application/pdf":
-            with tempfile.TemporaryDirectory(prefix="nodestro-upload-") as directory:
-                path = Path(directory) / "upload.pdf"
-                path.write_bytes(data)
-                # A PDF without a text layer is stored but not searchable (see OCR).
-                with suppress(ValueError, ImportError):
-                    self.index.add_file(path, source=entry.id, title=name)
-                self._attach_file_id(entry.id)
+            if pdf is None:  # stored as a PDF although neither its name nor its declared type said so
+                pdf = _PdfText(documents.read_pdf(data, name))
+            # The chunks orkexa's Index.add_file makes of a PDF (one title and ``page`` per page), from the text read
+            # in the limited process instead of a second, unlimited extraction in this one. A PDF whose text cannot
+            # be extracted, or without a text layer, is stored but not searchable (see OCR).
+            chunks = [
+                Chunk(text=piece, source=entry.id, title=f"{name}, p. {number}", metadata={"page": str(number)})
+                for number, page in enumerate(pdf.pages or [], start=1)
+                if page.strip()
+                for piece in split_text(page, max_chars=self.index.max_chars, overlap=self.index.overlap)
+            ]
+            self.index.delete(entry.id)
+            if chunks:
+                self.index.add_chunks(chunks)
+            self._attach_file_id(entry.id)
         elif Path(name).suffix.lower() in _INDEXED_SUFFIXES or entry.media_type.startswith("text/"):
             with suppress(UnicodeDecodeError):
                 self.index.delete(entry.id)
                 self.index.add(data.decode("utf-8"), source=entry.id, title=name, file_id=entry.id)
-        if entry.media_type == "application/pdf" and not documents.pdf_has_text(data):
+        if entry.media_type == "application/pdf" and not (pdf is not None and pdf.has_text):
             self._mark(entry.id, scanned="yes")
             if self.ocr_enabled():
                 self.recognise(entry.id)

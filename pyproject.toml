@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags).
-    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@1b61fdace77e536c0887751cf71b71f3a56d5fa8",
+    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@f89102c4357d0a03dbc41dd68be147f0cbda3bd9",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
@@ -38,15 +38,16 @@ dependencies = [
 # The server profile: PostgreSQL, encryption of tenant secrets (server_settings.SecretBox) and the Axentra platform
 # services (axentra_platform, off unless NODESTRO_AXENTRA=on). The desktop and Local Docker never install this extra:
 # Axentra is not a base dependency, and without it the server profile works and switching it on is refused.
+# Every Axentra requirement below names the same commit (MUP-ONA B0); move them together.
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@0a1d1cc72f3312140ffb9dff73184af392e40626",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",

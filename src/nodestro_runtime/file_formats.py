@@ -527,7 +527,7 @@ def _extract_into(
         result.info["headings"] = len(headings)
         result.outline = "document" + (f" with the headings: {'; '.join(headings[:40])}" if headings else "")
     elif key == "pdf":
-        pages = documents.pdf_pages(data)
+        pages = documents.pdf_pages(data, name)
         result.info["pages"] = len(pages)
         if not any(page.strip() for page in pages):
             result.notes.append("input.pdf_scanned")

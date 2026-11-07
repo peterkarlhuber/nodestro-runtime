@@ -408,6 +408,17 @@ container ends a connection whose server writes a line over 8 MB, and the server
 - Workflows can contain approval nodes for human oversight; every decision is stored with the run, as are
   the prompts, tool calls, results and costs of every step, and each run records the workflow version it ran.
 - Sanitized exports (`sanitize`) replace credentials and personal data by placeholders.
+- PDF text (knowledge uploads, input files, adoption previews) is read only by orkexa's `pdf_pages_isolated`: a new
+  interpreter with a minimal environment (no keys, credentials, database addresses or proxies), no inherited file
+  descriptors and lowered resource limits, which is stopped when its time budget runs out (`documents.pdf_pages`).
+  The limits come from the environment: `NODESTRO_PDF_TIMEOUT_SECONDS` (default 30, wall clock per document),
+  `NODESTRO_PDF_MAX_PAGES` (2000), `NODESTRO_PDF_MAX_CHARS` (5,000,000 characters of text) and
+  `NODESTRO_PDF_MAX_MEMORY_MB` (512 MiB address space; enforced on Linux only, not on macOS or Windows). An empty
+  variable keeps the default; a value that is not a positive number (the memory limit: at least 16) refuses every PDF
+  with `document.limits_invalid` naming the variable. A PDF over a limit is refused with `document.too_complex`
+  (parameters `name` and `reason`: `pages`, `chars`, `timeout`, `memory`, `limit` for a limit of pypdf itself, or
+  `crash`) and nothing is stored. The child process runs as the same operating-system user; it is not a sandbox
+  against a code-execution flaw in pypdf.
 - MCP connections (threat model T7 in the studio repository): `https` only (loopback `http` only on the desktop and
   only with per-server consent); the connection step resolves the host name, checks every address and connects only
   to a checked one, so DNS rebinding cannot slip in between; private, loopback, link-local, shared, multicast,
