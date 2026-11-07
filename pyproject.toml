@@ -42,12 +42,12 @@ dependencies = [
 postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
 ]
 dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@273e67515f3fb004b3b3023fede226c59f70c618",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Axentra pinned to `60d83b3` (axentra #57, MUP-ONA A8: an ID token whose key does not fit its algorithm is refused,
+  quoted password and client secret values are redacted). The pin also brings the Axentra commits merged since
+  `273e675` (notify send limits and inbox routes, migration lock polling and timeouts, search cost limits, identity
+  API for users without email, CLI `axentra remote`, hash-pinned image dependencies). The `axentra` extra is off by
+  default (`NODESTRO_AXENTRA=on`); the runtime's Axentra tests pass unchanged.
 - Fix: a PostgreSQL reindex under steady writes switches again under CI load. The switch embedded at most one batch
   while writes wait, but writers add about what one unlocked round takes to embed, which under load is more than a
   batch, so every attempt failed with `vector_incomplete` (T-PART-CC on runtime #133). The switch now embeds what the
