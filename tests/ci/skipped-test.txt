@@ -61,6 +61,7 @@ tests.test_resolve_real_engine::test_the_resolver_image_is_pinned_by_digest_and_
 tests.test_sandbox_arch::test_the_real_machine_fails_closed  # runs only on a non-x86-64 machine (the builtin-sandbox-arm64 job)
 tests.test_sandbox_gateway::test_raw_requests_cannot_smuggle_past_the_gateway  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_sandbox_gateway::test_tools_run_through_the_gateway_and_escapes_are_refused  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
+tests.test_security_vectors_sync::test_the_axentra_copy_is_the_canonical_corpus  # axentra copy checked by the CI job security-vectors-sync (MUP-ONA A8)
 tests.test_tenant_filters::test_every_api_statement_on_tenant_data_is_bound_to_one_tenant  # API covered by nodestro-api job tenant-sql (MUP-ONA A11)
 tests.test_tenant_filters::test_the_review_sample_in_the_api_package_is_caught  # API covered by nodestro-api job tenant-sql (MUP-ONA A11)
 tests.test_upgrade_scenarios::test_u2_upgrade_with_pgvector_ranks_alike_in_both_paths  # the test job's service postgres:17 has no pgvector (runs in pg-b)

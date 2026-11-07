@@ -25,6 +25,7 @@ REFUSED = {
     "169.254.10.10": "link_local",
     "fe80::1": "link_local",
     "fc00::1": "private",
+    "fec0::1": "site_local",  # MUP-ONA T-VEC-1 (vector egress-v6-site-local)
     "100.64.0.1": "shared",
     "0.0.0.0": "unspecified",
     "::": "unspecified",

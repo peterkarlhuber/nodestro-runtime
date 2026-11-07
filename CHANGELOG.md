@@ -1891,6 +1891,21 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     read `NODESTRO_API_SRC`; `NODESTRO_REQUIRE_API_SCAN=1` fails instead of skipping. The new job
     `tenant-sql-api` scans a public checkout of nodestro-api with this commit's checker, including a planted
     leak. `CONTRIBUTING.md`: a checker or migration change needs a green nodestro-api `tenant-sql` run.
+  - Security (A8, VB-7): the MCP egress check refuses deprecated IPv6 site-local addresses (`fec0::/10`, reason
+    `site_local`), which `ipaddress` counts as global; Axentra's webhook check already refused them (found by the
+    shared security test vectors).
+  - Security (A8, VB-7): credential redaction (`sanitize`: trace exports, `redact_secrets`) also removes
+    `Authorization: Basic` credentials (also `Proxy-Authorization` and header dicts), `Cookie:` / `Set-Cookie:`
+    header values up to the line end, and the password in a URL's user information
+    (`postgresql://app:<password>@db`); the prefix stays readable. Axentra's redaction already removed them (found by
+    the shared security test vectors).
+  - tests/ci: shared security test vectors (A8, VB-7). `tests/vectors/security-vectors.json` (version 1) is the
+    canonical corpus of egress, ID token and redaction cases with the documented `known_differences` between
+    Nodestro and Axentra; `tests/test_security_vectors.py` runs the egress cases against `netguard` and the
+    redaction cases against `sanitize` (T-VEC-1). Axentra and nodestro-api keep checksummed copies. The new job
+    `security-vectors-sync` checks out axentra anonymously (no secret) and compares its copy and `SOURCE.md` with
+    the canonical file (T-VEC-4, `NODESTRO_AXENTRA_SRC`, `NODESTRO_REQUIRE_VECTOR_SYNC=1`); the main test matrix
+    lists the comparison as skipped with that reason. Maintenance: `tests/vectors/README.md`.
   - A1 (PS-1): PDF text is read with limits in a separate process. Knowledge uploads, input files
     (`file_formats.extract`) and adoption previews read PDFs through `documents.pdf_pages`, that is orkexa's
     `pdf_pages_isolated`; the runtime no longer imports orkexa's private `_pdf_pages`, and a knowledge upload no longer
