@@ -1,0 +1,258 @@
+run 0 today: fts=4208.3, vector=27815.3, hybrid=41765.1, insert_chunk=3710.4, memory_view=863.2, memory_write=1747.7, doc_get=280.5, doc_put=717.7
+run 0 hook_only: fts=4497.3, vector=32771.3, hybrid=46937.2, insert_chunk=2755.3, memory_view=840.7, memory_write=1984.7, doc_get=610.3, doc_put=997.0
+run 0 rls_hook: fts=2233.3, vector=28411.0, hybrid=43228.7, insert_chunk=1801.3, memory_view=804.8, memory_write=1675.3, doc_get=511.9, doc_put=906.6
+run 0 rls_policy_only: fts=1312.9, vector=26988.5, hybrid=32681.0, insert_chunk=1154.4, memory_view=450.5, memory_write=699.2, doc_get=136.4, doc_put=148.7
+run 1 today: fts=2969.3, vector=25712.8, hybrid=36673.5, insert_chunk=2384.0, memory_view=593.5, memory_write=1486.7, doc_get=162.6, doc_put=665.3
+run 1 hook_only: fts=3813.0, vector=26765.7, hybrid=45586.9, insert_chunk=3449.8, memory_view=875.6, memory_write=1775.6, doc_get=552.3, doc_put=1054.2
+run 1 rls_hook: fts=2339.6, vector=28066.3, hybrid=40981.7, insert_chunk=3052.4, memory_view=951.7, memory_write=1820.3, doc_get=587.1, doc_put=961.2
+run 1 rls_policy_only: fts=1499.1, vector=26254.1, hybrid=37124.8, insert_chunk=2071.7, memory_view=413.3, memory_write=709.6, doc_get=140.0, doc_put=157.0
+run 2 today: fts=3460.6, vector=27194.0, hybrid=36547.9, insert_chunk=3774.4, memory_view=665.6, memory_write=2005.4, doc_get=191.4, doc_put=687.3
+run 2 hook_only: fts=4684.8, vector=38160.3, hybrid=46449.9, insert_chunk=2814.5, memory_view=963.3, memory_write=1740.3, doc_get=614.2, doc_put=1069.8
+run 2 rls_hook: fts=2133.7, vector=29615.2, hybrid=42954.5, insert_chunk=2151.8, memory_view=868.4, memory_write=1740.9, doc_get=579.8, doc_put=839.6
+run 2 rls_policy_only: fts=1518.7, vector=27127.3, hybrid=36572.8, insert_chunk=1138.3, memory_view=749.2, memory_write=698.4, doc_get=146.7, doc_put=279.5
+run 3 today: fts=3461.2, vector=25214.2, hybrid=38826.2, insert_chunk=3555.5, memory_view=1039.4, memory_write=1422.7, doc_get=149.0, doc_put=699.4
+run 3 hook_only: fts=3880.5, vector=28566.6, hybrid=45760.0, insert_chunk=4180.6, memory_view=1071.2, memory_write=1871.7, doc_get=521.4, doc_put=1317.0
+run 3 rls_hook: fts=2054.9, vector=33438.2, hybrid=45645.2, insert_chunk=3262.7, memory_view=768.2, memory_write=1455.9, doc_get=501.8, doc_put=958.3
+run 3 rls_policy_only: fts=1287.3, vector=29186.2, hybrid=35601.3, insert_chunk=2422.6, memory_view=477.1, memory_write=1062.1, doc_get=227.7, doc_put=199.6
+run 4 today: fts=3309.5, vector=27914.0, hybrid=37669.0, insert_chunk=2710.0, memory_view=876.6, memory_write=1702.8, doc_get=157.5, doc_put=669.8
+run 4 hook_only: fts=4302.4, vector=30432.5, hybrid=45499.3, insert_chunk=3089.1, memory_view=947.6, memory_write=1602.5, doc_get=541.3, doc_put=1418.2
+run 4 rls_hook: fts=2036.6, vector=31452.1, hybrid=42407.7, insert_chunk=2596.2, memory_view=1083.2, memory_write=1793.0, doc_get=559.3, doc_put=1046.6
+run 4 rls_policy_only: fts=1395.8, vector=27160.9, hybrid=35132.3, insert_chunk=2139.5, memory_view=461.8, memory_write=898.5, doc_get=168.7, doc_put=174.3
+{
+ "summary": {
+  "fts": {
+   "today": {
+    "n": 1000,
+    "median_us": 3460.6,
+    "p95_us": 5515.1,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 1000,
+    "median_us": 4210.8,
+    "p95_us": 7074.0,
+    "x_today_median": 1.22
+   },
+   "rls_hook": {
+    "n": 1000,
+    "median_us": 2145.3,
+    "p95_us": 3350.9,
+    "x_today_median": 0.62
+   },
+   "rls_policy_only": {
+    "n": 1000,
+    "median_us": 1400.8,
+    "p95_us": 2006.7,
+    "x_today_median": 0.4
+   }
+  },
+  "vector": {
+   "today": {
+    "n": 500,
+    "median_us": 26420.2,
+    "p95_us": 34248.1,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 500,
+    "median_us": 30994.5,
+    "p95_us": 43641.9,
+    "x_today_median": 1.17
+   },
+   "rls_hook": {
+    "n": 500,
+    "median_us": 30078.7,
+    "p95_us": 38803.9,
+    "x_today_median": 1.14
+   },
+   "rls_policy_only": {
+    "n": 500,
+    "median_us": 27345.4,
+    "p95_us": 34948.1,
+    "x_today_median": 1.04
+   }
+  },
+  "hybrid": {
+   "today": {
+    "n": 500,
+    "median_us": 38028.9,
+    "p95_us": 51046.3,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 500,
+    "median_us": 45972.1,
+    "p95_us": 66723.1,
+    "x_today_median": 1.21
+   },
+   "rls_hook": {
+    "n": 500,
+    "median_us": 43123.6,
+    "p95_us": 54284.7,
+    "x_today_median": 1.13
+   },
+   "rls_policy_only": {
+    "n": 500,
+    "median_us": 35316.2,
+    "p95_us": 45764.1,
+    "x_today_median": 0.93
+   }
+  },
+  "insert_chunk": {
+   "today": {
+    "n": 500,
+    "median_us": 3140.2,
+    "p95_us": 4815.0,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 500,
+    "median_us": 3154.7,
+    "p95_us": 5210.7,
+    "x_today_median": 1.0
+   },
+   "rls_hook": {
+    "n": 500,
+    "median_us": 2440.1,
+    "p95_us": 4393.0,
+    "x_today_median": 0.78
+   },
+   "rls_policy_only": {
+    "n": 500,
+    "median_us": 1884.2,
+    "p95_us": 2826.3,
+    "x_today_median": 0.6
+   }
+  },
+  "memory_view": {
+   "today": {
+    "n": 1000,
+    "median_us": 797.0,
+    "p95_us": 1828.8,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 1000,
+    "median_us": 930.7,
+    "p95_us": 1613.6,
+    "x_today_median": 1.17
+   },
+   "rls_hook": {
+    "n": 1000,
+    "median_us": 880.5,
+    "p95_us": 2107.4,
+    "x_today_median": 1.1
+   },
+   "rls_policy_only": {
+    "n": 1000,
+    "median_us": 471.1,
+    "p95_us": 1126.4,
+    "x_today_median": 0.59
+   }
+  },
+  "memory_write": {
+   "today": {
+    "n": 1000,
+    "median_us": 1651.0,
+    "p95_us": 3194.4,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 1000,
+    "median_us": 1793.9,
+    "p95_us": 3274.3,
+    "x_today_median": 1.09
+   },
+   "rls_hook": {
+    "n": 1000,
+    "median_us": 1682.4,
+    "p95_us": 2974.1,
+    "x_today_median": 1.02
+   },
+   "rls_policy_only": {
+    "n": 1000,
+    "median_us": 791.3,
+    "p95_us": 1688.7,
+    "x_today_median": 0.48
+   }
+  },
+  "doc_get": {
+   "today": {
+    "n": 1000,
+    "median_us": 177.8,
+    "p95_us": 371.4,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 1000,
+    "median_us": 555.6,
+    "p95_us": 882.9,
+    "x_today_median": 3.12
+   },
+   "rls_hook": {
+    "n": 1000,
+    "median_us": 541.7,
+    "p95_us": 887.3,
+    "x_today_median": 3.05
+   },
+   "rls_policy_only": {
+    "n": 1000,
+    "median_us": 153.6,
+    "p95_us": 327.1,
+    "x_today_median": 0.86
+   }
+  },
+  "doc_put": {
+   "today": {
+    "n": 1000,
+    "median_us": 686.5,
+    "p95_us": 1123.8,
+    "x_today_median": 1.0
+   },
+   "hook_only": {
+    "n": 1000,
+    "median_us": 1105.2,
+    "p95_us": 2063.5,
+    "x_today_median": 1.61
+   },
+   "rls_hook": {
+    "n": 1000,
+    "median_us": 941.0,
+    "p95_us": 1509.1,
+    "x_today_median": 1.37
+   },
+   "rls_policy_only": {
+    "n": 1000,
+    "median_us": 178.0,
+    "p95_us": 352.9,
+    "x_today_median": 0.26
+   }
+  }
+ },
+ "throughput": {
+  "today": {
+   "threads": 8,
+   "seconds": 5.01,
+   "ops": 5727,
+   "ops_per_s": 1144.0
+  },
+  "hook_only": {
+   "threads": 8,
+   "seconds": 5.03,
+   "ops": 1038,
+   "ops_per_s": 206.2
+  },
+  "rls_hook": {
+   "threads": 8,
+   "seconds": 5.02,
+   "ops": 1965,
+   "ops_per_s": 391.2
+  },
+  "rls_psycopg_source": {
+   "threads": 8,
+   "seconds": 5.01,
+   "ops": 3323,
+   "ops_per_s": 663.9
+  }
+ }
+}

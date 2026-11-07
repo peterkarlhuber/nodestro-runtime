@@ -1,0 +1,87 @@
+{
+ "tenant_chunks": 200000,
+ "without_policies": {
+  "rare": {
+   "median_us": 5039.8,
+   "p95_us": 6555.3,
+   "plan": [
+    "Limit  (cost=8728.39..8728.41 rows=10 width=180) (actual time=0.421..0.423 rows=10 loops=1)",
+    "  ->  Sort  (cost=8728.39..8738.40 rows=4005 width=180) (actual time=0.420..0.421 rows=10 loops=1)",
+    "        Sort Key: (ts_rank(nodestro_chunks.search, '''quetzal'':*'::tsquery, 1)) DESC, nodestro_chunks.id",
+    "        Sort Method: top-N heapsort  Memory: 26kB",
+    "        ->  Bitmap Heap Scan on nodestro_chunks  (cost=56.85..8641.84 rows=4005 width=180) (actual time=0.084..0.354 rows=200 loops=1)",
+    "              Recheck Cond: (search @@ '''quetzal'':*'::tsquery)",
+    "              Filter: ((tenant_id = 'big'::text) AND (namespace = 'nodestro'::text))",
+    "              Heap Blocks: exact=200",
+    "              ->  Bitmap Index Scan on nodestro_chunks_search  (cost=0.00..55.85 rows=4400 width=0) (actual time=0.062..0.063 rows=200 loops=1)",
+    "                    Index Cond: (search @@ '''quetzal'':*'::tsquery)",
+    "Planning Time: 0.176 ms",
+    "Execution Time: 0.448 ms"
+   ]
+  },
+  "common": {
+   "median_us": 138176.1,
+   "p95_us": 159837.3,
+   "plan": [
+    "Limit  (cost=8728.39..8728.41 rows=10 width=180) (actual time=183.041..183.045 rows=10 loops=1)",
+    "  ->  Sort  (cost=8728.39..8738.40 rows=4005 width=180) (actual time=183.039..183.041 rows=10 loops=1)",
+    "        Sort Key: (ts_rank(nodestro_chunks.search, '''lorem'':*'::tsquery, 1)) DESC, nodestro_chunks.id",
+    "        Sort Method: top-N heapsort  Memory: 26kB",
+    "        ->  Bitmap Heap Scan on nodestro_chunks  (cost=56.85..8641.84 rows=4005 width=180) (actual time=16.246..129.423 rows=200000 loops=1)",
+    "              Recheck Cond: (search @@ '''lorem'':*'::tsquery)",
+    "              Filter: ((tenant_id = 'big'::text) AND (namespace = 'nodestro'::text))",
+    "              Heap Blocks: exact=10472",
+    "              ->  Bitmap Index Scan on nodestro_chunks_search  (cost=0.00..55.85 rows=4400 width=0) (actual time=14.862..14.863 rows=200000 loops=1)",
+    "                    Index Cond: (search @@ '''lorem'':*'::tsquery)",
+    "Planning Time: 0.142 ms",
+    "Execution Time: 183.118 ms"
+   ]
+  }
+ },
+ "with_policies": {
+  "rare": {
+   "median_us": 53035.6,
+   "p95_us": 73441.1,
+   "plan": [
+    "Limit  (cost=14105.87..14107.03 rows=10 width=180) (actual time=19.506..23.838 rows=10 loops=1)",
+    "  ->  Gather Merge  (cost=14105.87..14495.33 rows=3338 width=180) (actual time=19.505..23.835 rows=10 loops=1)",
+    "        Workers Planned: 2",
+    "        Workers Launched: 2",
+    "        ->  Sort  (cost=13105.84..13110.02 rows=1669 width=180) (actual time=17.320..17.322 rows=8 loops=3)",
+    "              Sort Key: (ts_rank(nodestro_chunks.search, '''quetzal'':*'::tsquery, 1)) DESC, nodestro_chunks.id",
+    "              Sort Method: top-N heapsort  Memory: 26kB",
+    "              Worker 0:  Sort Method: top-N heapsort  Memory: 26kB",
+    "              Worker 1:  Sort Method: top-N heapsort  Memory: 26kB",
+    "              ->  Result  (cost=0.01..13069.78 rows=1669 width=180) (actual time=3.141..17.241 rows=67 loops=3)",
+    "                    One-Time Filter: ((current_setting('app.tenant_id'::text, true))::text = 'big'::text COLLATE \"C\")",
+    "                    ->  Parallel Seq Scan on nodestro_chunks  (cost=0.01..13057.26 rows=1669 width=279) (actual time=3.121..17.168 rows=67 loops=3)",
+    "                          Filter: ((tenant_id = 'big'::text COLLATE \"C\") AND (namespace = 'nodestro'::text) AND (search @@ '''quetzal'':*'::tsquery))",
+    "                          Rows Removed by Filter: 73271",
+    "Planning Time: 0.135 ms",
+    "Execution Time: 23.871 ms"
+   ]
+  },
+  "common": {
+   "median_us": 141004.1,
+   "p95_us": 188930.5,
+   "plan": [
+    "Limit  (cost=14105.87..14107.03 rows=10 width=180) (actual time=61.710..65.144 rows=10 loops=1)",
+    "  ->  Gather Merge  (cost=14105.87..14495.33 rows=3338 width=180) (actual time=61.708..65.140 rows=10 loops=1)",
+    "        Workers Planned: 2",
+    "        Workers Launched: 2",
+    "        ->  Sort  (cost=13105.84..13110.02 rows=1669 width=180) (actual time=59.225..59.227 rows=10 loops=3)",
+    "              Sort Key: (ts_rank(nodestro_chunks.search, '''lorem'':*'::tsquery, 1)) DESC, nodestro_chunks.id",
+    "              Sort Method: top-N heapsort  Memory: 26kB",
+    "              Worker 0:  Sort Method: top-N heapsort  Memory: 26kB",
+    "              Worker 1:  Sort Method: top-N heapsort  Memory: 26kB",
+    "              ->  Result  (cost=0.01..13069.78 rows=1669 width=180) (actual time=0.046..42.954 rows=66667 loops=3)",
+    "                    One-Time Filter: ((current_setting('app.tenant_id'::text, true))::text = 'big'::text COLLATE \"C\")",
+    "                    ->  Parallel Seq Scan on nodestro_chunks  (cost=0.01..13057.26 rows=1669 width=279) (actual time=0.027..24.387 rows=66667 loops=3)",
+    "                          Filter: ((tenant_id = 'big'::text COLLATE \"C\") AND (namespace = 'nodestro'::text) AND (search @@ '''lorem'':*'::tsquery))",
+    "                          Rows Removed by Filter: 6671",
+    "Planning Time: 0.145 ms",
+    "Execution Time: 65.174 ms"
+   ]
+  }
+ }
+}

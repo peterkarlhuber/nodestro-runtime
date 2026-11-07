@@ -1,0 +1,136 @@
+== without_policies: search_fts (benchmark query 0)
+Limit  (cost=1665.40..1665.50 rows=40 width=436) (actual time=1.617..1.623 rows=40 loops=1)
+  Buffers: shared hit=155
+  ->  Sort  (cost=1665.40..1667.90 rows=1000 width=436) (actual time=1.615..1.618 rows=40 loops=1)
+        Sort Key: (ts_rank(nodestro_chunks.search, '''mmmm'':* | ''oooooooo'':*'::tsquery, 1)) DESC, nodestro_chunks.id
+        Sort Method: top-N heapsort  Memory: 61kB
+        Buffers: shared hit=155
+        ->  Index Scan using nodestro_chunks_source on nodestro_chunks  (cost=0.29..1633.79 rows=1000 width=436) (actual time=0.044..1.259 rows=1000 loops=1)
+              Index Cond: ((tenant_id = 't03'::text) AND (namespace = 'nodestro'::text))
+              Filter: (search @@ '''mmmm'':* | ''oooooooo'':*'::tsquery)
+              Buffers: shared hit=149
+Planning:
+  Buffers: shared hit=219
+Planning Time: 0.861 ms
+Execution Time: 1.651 ms
+
+== without_policies: search_fts (its rarer word only)
+Limit  (cost=1011.90..1012.00 rows=40 width=436) (actual time=2.119..2.125 rows=40 loops=1)
+  Buffers: shared hit=145
+  ->  Sort  (cost=1011.90..1012.66 rows=303 width=436) (actual time=2.117..2.120 rows=40 loops=1)
+        Sort Key: (ts_rank(nodestro_chunks.search, '''oooooooo'':*'::tsquery, 1)) DESC, nodestro_chunks.id
+        Sort Method: top-N heapsort  Memory: 50kB
+        Buffers: shared hit=145
+        ->  Bitmap Heap Scan on nodestro_chunks  (cost=111.55..1002.32 rows=303 width=436) (actual time=1.664..2.004 rows=303 loops=1)
+              Recheck Cond: ((tenant_id = 't03'::text) AND (namespace = 'nodestro'::text) AND (search @@ '''oooooooo'':*'::tsquery))
+              Heap Blocks: exact=134
+              Buffers: shared hit=145
+              ->  BitmapAnd  (cost=111.55..111.55 rows=303 width=0) (actual time=1.636..1.637 rows=0 loops=1)
+                    Buffers: shared hit=11
+                    ->  Bitmap Index Scan on nodestro_chunks_source  (cost=0.00..22.29 rows=1000 width=0) (actual time=0.030..0.030 rows=1000 loops=1)
+                          Index Cond: ((tenant_id = 't03'::text) AND (namespace = 'nodestro'::text))
+                          Buffers: shared hit=5
+                    ->  Bitmap Index Scan on nodestro_chunks_search  (cost=0.00..88.86 rows=6061 width=0) (actual time=1.570..1.570 rows=6053 loops=1)
+                          Index Cond: (search @@ '''oooooooo'':*'::tsquery)
+                          Buffers: shared hit=6
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.125 ms
+Execution Time: 2.171 ms
+
+== without_policies: search_pgvector
+error: type "vector" does not exist
+LINE 1: ....metadata::text, c.text, round((1 - (v.embedding::vector <=>...
+                                                             ^
+
+== without_policies: search_candidates
+Hash Join  (cost=1079.39..2705.52 rows=49 width=287) (actual time=1.303..1.673 rows=1000 loops=1)
+  Hash Cond: (c.id = v.chunk_id)
+  Buffers: shared hit=217
+  ->  Index Scan using nodestro_chunks_source on nodestro_chunks c  (cost=0.29..1623.79 rows=1000 width=8) (actual time=0.008..0.236 rows=1000 loops=1)
+        Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (namespace = 'nodestro'::text))
+        Buffers: shared hit=149
+  ->  Hash  (cost=1066.76..1066.76 rows=988 width=287) (actual time=1.290..1.291 rows=1000 loops=1)
+        Buckets: 1024  Batches: 1  Memory Usage: 321kB
+        Buffers: shared hit=68
+        ->  Bitmap Heap Scan on nodestro_chunk_vectors v  (cost=74.65..1066.76 rows=988 width=287) (actual time=0.073..1.099 rows=1000 loops=1)
+              Recheck Cond: ((tenant_id = 't03'::text COLLATE "C") AND (space = 'nodestro:4d3e35ae245db6dd14c7'::text))
+              Filter: ((NOT (embedding && '{NaN,Infinity,-Infinity}'::real[])) AND (embedding <> array_fill('0'::real, ARRAY[cardinality(embedding)])))
+              Heap Blocks: exact=47
+              Buffers: shared hit=68
+              ->  Bitmap Index Scan on nodestro_chunk_vectors_pkey  (cost=0.00..74.40 rows=999 width=0) (actual time=0.055..0.055 rows=1000 loops=1)
+                    Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (space = 'nodestro:4d3e35ae245db6dd14c7'::text))
+                    Buffers: shared hit=18
+Planning:
+  Buffers: shared hit=85
+Planning Time: 0.338 ms
+Execution Time: 1.724 ms
+
+== with_policies: search_fts (benchmark query 0)
+Limit  (cost=1665.40..1665.50 rows=40 width=436) (actual time=1.379..1.384 rows=40 loops=1)
+  Buffers: shared hit=155
+  ->  Sort  (cost=1665.40..1667.90 rows=1000 width=436) (actual time=1.377..1.379 rows=40 loops=1)
+        Sort Key: (ts_rank(nodestro_chunks.search, '''mmmm'':* | ''oooooooo'':*'::tsquery, 1)) DESC, nodestro_chunks.id
+        Sort Method: top-N heapsort  Memory: 61kB
+        Buffers: shared hit=155
+        ->  Result  (cost=0.29..1633.79 rows=1000 width=436) (actual time=0.039..1.021 rows=1000 loops=1)
+              One-Time Filter: ((current_setting('app.tenant_id'::text, true))::text = 't03'::text COLLATE "C")
+              Buffers: shared hit=149
+              ->  Index Scan using nodestro_chunks_source on nodestro_chunks  (cost=0.29..1626.29 rows=1000 width=701) (actual time=0.029..0.585 rows=1000 loops=1)
+                    Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (namespace = 'nodestro'::text))
+                    Filter: (search @@ '''mmmm'':* | ''oooooooo'':*'::tsquery)
+                    Buffers: shared hit=149
+Planning:
+  Buffers: shared hit=215
+Planning Time: 0.664 ms
+Execution Time: 1.414 ms
+
+== with_policies: search_fts (its rarer word only)
+Limit  (cost=1638.14..1638.24 rows=40 width=436) (actual time=0.748..0.753 rows=40 loops=1)
+  Buffers: shared hit=149
+  ->  Sort  (cost=1638.14..1638.90 rows=303 width=436) (actual time=0.747..0.749 rows=40 loops=1)
+        Sort Key: (ts_rank(nodestro_chunks.search, '''oooooooo'':*'::tsquery, 1)) DESC, nodestro_chunks.id
+        Sort Method: top-N heapsort  Memory: 50kB
+        Buffers: shared hit=149
+        ->  Result  (cost=0.29..1628.56 rows=303 width=436) (actual time=0.021..0.643 rows=303 loops=1)
+              One-Time Filter: ((current_setting('app.tenant_id'::text, true))::text = 't03'::text COLLATE "C")
+              Buffers: shared hit=149
+              ->  Index Scan using nodestro_chunks_source on nodestro_chunks  (cost=0.29..1626.29 rows=303 width=701) (actual time=0.016..0.541 rows=303 loops=1)
+                    Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (namespace = 'nodestro'::text))
+                    Filter: (search @@ '''oooooooo'':*'::tsquery)
+                    Rows Removed by Filter: 697
+                    Buffers: shared hit=149
+Planning Time: 0.150 ms
+Execution Time: 0.776 ms
+
+== with_policies: search_pgvector
+error: type "vector" does not exist
+LINE 1: ....metadata::text, c.text, round((1 - (v.embedding::vector <=>...
+                                                             ^
+
+== with_policies: search_candidates
+Result  (cost=1079.40..2705.53 rows=49 width=287) (actual time=1.710..2.148 rows=1000 loops=1)
+  One-Time Filter: ((current_setting('app.tenant_id'::text, true))::text = 't03'::text COLLATE "C")
+  Buffers: shared hit=217
+  ->  Hash Join  (cost=1079.40..2705.53 rows=49 width=287) (actual time=1.707..2.044 rows=1000 loops=1)
+        Hash Cond: (c.id = v.chunk_id)
+        Buffers: shared hit=217
+        ->  Index Scan using nodestro_chunks_source on nodestro_chunks c  (cost=0.29..1623.79 rows=1000 width=8) (actual time=0.006..0.174 rows=1000 loops=1)
+              Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (namespace = 'nodestro'::text))
+              Buffers: shared hit=149
+        ->  Hash  (cost=1066.76..1066.76 rows=988 width=287) (actual time=1.692..1.693 rows=1000 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 321kB
+              Buffers: shared hit=68
+              ->  Bitmap Heap Scan on nodestro_chunk_vectors v  (cost=74.65..1066.76 rows=988 width=287) (actual time=0.086..1.455 rows=1000 loops=1)
+                    Recheck Cond: ((tenant_id = 't03'::text COLLATE "C") AND (space = 'nodestro:4d3e35ae245db6dd14c7'::text))
+                    Filter: ((NOT (embedding && '{NaN,Infinity,-Infinity}'::real[])) AND (embedding <> array_fill('0'::real, ARRAY[cardinality(embedding)])))
+                    Heap Blocks: exact=47
+                    Buffers: shared hit=68
+                    ->  Bitmap Index Scan on nodestro_chunk_vectors_pkey  (cost=0.00..74.40 rows=999 width=0) (actual time=0.062..0.062 rows=1000 loops=1)
+                          Index Cond: ((tenant_id = 't03'::text COLLATE "C") AND (space = 'nodestro:4d3e35ae245db6dd14c7'::text))
+                          Buffers: shared hit=18
+Planning:
+  Buffers: shared hit=94
+Planning Time: 0.420 ms
+Execution Time: 2.208 ms
+
