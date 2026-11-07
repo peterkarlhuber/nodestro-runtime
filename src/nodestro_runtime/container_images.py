@@ -1002,6 +1002,11 @@ class ContainerImages:
         except SandboxError as exc:
             raise NodestroError("deps.image_failed", f"Checking the modules of {tag} stopped: {exc}") from None
         stdout = output.stdout.decode("utf-8", "replace")
+        import subprocess as _sp  # DEBUG
+        print("DEBUG MM image_id", image_id, "tag id", _sp.run([self.docker, "image", "inspect", "-f", "{{.Id}}", tag], capture_output=True, text=True, env=sandbox.environ).stdout.strip())
+        print("DEBUG MM argv", [*shaped, *command])
+        print("DEBUG MM code", code, "stdout", repr(output.stdout[-3000:]), "stderr", repr(output.stderr[-3000:]))
+        print("DEBUG MM environ", {k: v for k, v in sandbox.environ.items() if "DOCKER" in k})
         if code != 0:
             stderr = output.stderr.decode("utf-8", "replace")
             raise NodestroError(
