@@ -1,12 +1,13 @@
-"""Unit tests for ci_ok.py (CI-FAST W1). Standard library only, no network: the HTTP layer is a fake.
+"""Unit tests for ci_ok.py (CI-FAST W1, v2). Standard library only, no network: the HTTP layer is a fake.
 
-Run: python3 -m unittest discover -s .github/scripts -p test_ci_ok.py   (or: python3 .github/scripts/test_ci_ok.py).
+Run: python3 -I -m unittest discover -s .github/scripts -p test_ci_ok.py   (or: python3 .github/scripts/test_ci_ok.py).
 `python3 -m unittest .github/scripts/test_ci_ok.py` does not work: unittest turns the path into the module name
 ".github.scripts.test_ci_ok", and the leading dot is an empty package name.
 """
 
 from __future__ import annotations
 
+import email.message
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,7 +28,7 @@ BASE = "b" * 40
 
 
 class FakeApi:
-    """Answers GET paths from a dict; values may be callables (for answers that change between polls)."""
+    """Answers GET paths from a dict; values may be callables or ApiError instances (raised)."""
 
     def __init__(self, routes: dict):
         self.routes = routes
@@ -55,6 +57,7 @@ def run(
     event="pull_request",
     head=HEAD,
     updated="2026-11-07T10:30:00Z",
+    prs=(7,),
 ):
     return {
         "id": rid,
@@ -67,6 +70,7 @@ def run(
         "event": event,
         "head_sha": head,
         "html_url": f"https://x/runs/{rid}",
+        "pull_requests": [{"number": n} for n in prs],
     }
 
 
@@ -81,18 +85,16 @@ def job(jid, name, *, status="completed", conclusion="success", completed="2026-
     }
 
 
-def routes_for(runs: list, jobs_by_run: dict, files=("src/a.py",), base_manifest=None, head_manifest=None) -> dict:
+def routes_for(runs: list, jobs_by_run: dict, files=("src/a.py",)) -> dict:
     r = {
         f"/repos/{REPO}/actions/runs?head_sha={HEAD}": {"workflow_runs": runs},
         f"/repos/{REPO}/pulls/7/files": [{"filename": f} for f in files],
-        f"/repos/{REPO}/pulls/7": {"number": 7, "head": {"sha": HEAD}, "base": {"sha": BASE}},
+        f"/repos/{REPO}/pulls/8/files": [{"filename": f} for f in files],
+        f"/repos/{REPO}/pulls/7": {"number": 7, "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE}},
+        f"/repos/{REPO}/compare/master...{HEAD}": {"files": [{"filename": f} for f in files]},
     }
     for rid, jobs in jobs_by_run.items():
         r[f"/repos/{REPO}/actions/runs/{rid}/jobs"] = {"jobs": jobs}
-    if base_manifest is not None:
-        r[f"/repos/{REPO}/contents/{ci_ok.MANIFEST_PATH}?ref={BASE}"] = base_manifest
-    if head_manifest is not None:
-        r[f"/repos/{REPO}/contents/{ci_ok.MANIFEST_PATH}?ref={HEAD}"] = head_manifest
     return r
 
 
@@ -102,16 +104,15 @@ MANIFEST = {
     "path_filters": {"docker.yml": {"paths": ["docker/**", ".github/workflows/docker.yml"]}},
     "advisory": ["ci.yml/engines (webkit)"],
 }
+GREEN = [job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")]
 
 
-def snapshot(routes: dict) -> ci_ok.Snapshot:
-    return ci_ok.Collector(FakeApi(routes), REPO, HEAD).snapshot()
+def snapshot(routes: dict, pr=7) -> ci_ok.Snapshot:
+    return ci_ok.Collector(FakeApi(routes), REPO, HEAD, pr).snapshot()
 
 
-def evaluate(routes, manifest=MANIFEST, files=("src/a.py",), **kw):
-    kw.setdefault("grace_over", True)
-    kw.setdefault("final", False)
-    return ci_ok.evaluate(manifest, snapshot(routes), list(files), **kw)
+def evaluate(routes, manifest=MANIFEST, files=("src/a.py",), pr=7, problems=()):
+    return ci_ok.evaluate(manifest, snapshot(routes, pr), None if files is None else list(files), problems)
 
 
 def states(ev):
@@ -195,6 +196,30 @@ class YamlReader(unittest.TestCase):
         self.assertIsNone(ci_ok.read_pull_request_filters("on:\n  pull_request_target:\n"))
 
 
+class GateWorkflowReader(unittest.TestCase):
+    def test_workflow_run_list_block_and_flow(self):
+        flow = "name: ci-ok\non:\n  workflow_run:\n    workflows: [CI, macOS frontend]\n    types: [completed]\n"
+        self.assertEqual(ci_ok.read_workflow_run_workflows(flow), ["CI", "macOS frontend"])
+        block = 'on:\n  workflow_run:\n    types: [completed]\n    workflows:\n      - "CI"\n      - Docker  # x\n'
+        self.assertEqual(ci_ok.read_workflow_run_workflows(block), ["CI", "Docker"])
+        self.assertIsNone(ci_ok.read_workflow_run_workflows("on:\n  pull_request:\n"))
+
+    def test_has_trigger(self):
+        self.assertTrue(ci_ok.has_trigger("on: [push, pull_request_target]\n", "pull_request_target"))
+        self.assertFalse(ci_ok.has_trigger("on:\n  workflow_run:\n    workflows: [CI]\n", "pull_request"))
+
+    def test_workflow_name_defaults_to_the_path(self):
+        self.assertEqual(ci_ok.workflow_name('name: "macOS frontend"  # c\non: push\n', "m.yml"), "macOS frontend")
+        self.assertEqual(
+            ci_ok.workflow_name("on: push\njobs:\n  a:\n    name: x\n", "m.yml"), ".github/workflows/m.yml"
+        )
+
+    def test_gate_name_detection(self):
+        self.assertTrue(ci_ok.defines_gate_name("jobs:\n  ci-ok:\n    runs-on: x\n"))
+        self.assertTrue(ci_ok.defines_gate_name("jobs:\n  fake:\n    name: 'ci-ok'\n"))
+        self.assertFalse(ci_ok.defines_gate_name("jobs:\n  lint:\n    name: ci-ok-lint\n  # ci-ok:\n"))
+
+
 class Verdicts(unittest.TestCase):
     def base_routes(self, ci_jobs, ci_run=None, extra_runs=(), extra_jobs=None):
         runs = [ci_run or run(1, "ci.yml"), *extra_runs]
@@ -202,25 +227,23 @@ class Verdicts(unittest.TestCase):
         return routes_for(runs, jobs)
 
     def test_all_success_is_ok_and_docker_not_triggered(self):
-        ev = evaluate(self.base_routes([job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")]))
+        ev = evaluate(self.base_routes(GREEN))
         self.assertEqual(ev.verdict, "OK")
         self.assertEqual(states(ev)[("docker.yml", "docker")], "not triggered (paths)")
-        self.assertTrue(ev.decided)
 
     def test_path_filtered_workflow_that_should_have_run_is_missing(self):
-        routes = self.base_routes([job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")])
-        ev = evaluate(routes, files=["docker/Dockerfile"])
+        ev = evaluate(self.base_routes(GREEN), files=["docker/Dockerfile"])
         self.assertEqual(ev.verdict, "NOT OK")
         self.assertEqual(states(ev)[("docker.yml", "docker")], "missing")
-        # Before the grace period is over, the absent run is still pending.
-        ev = evaluate(routes, files=["docker/Dockerfile"], grace_over=False)
-        self.assertEqual(ev.verdict, "PENDING")
+
+    def test_path_filtered_workflow_with_unknown_files_fails_closed(self):
+        ev = evaluate(self.base_routes(GREEN), files=None)
+        self.assertEqual(states(ev)[("docker.yml", "docker")], "missing")
+        self.assertIn("changed files unknown", ev.rows[-1].note)
 
     def test_path_filtered_workflow_that_ran_anyway_is_judged(self):
         routes = self.base_routes(
-            [job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")],
-            extra_runs=[run(2, "docker.yml")],
-            extra_jobs={2: [job(9, "docker", conclusion="failure")]},
+            GREEN, extra_runs=[run(2, "docker.yml")], extra_jobs={2: [job(9, "docker", conclusion="failure")]}
         )
         ev = evaluate(routes)
         self.assertEqual(states(ev)[("docker.yml", "docker")], "failure")
@@ -234,6 +257,11 @@ class Verdicts(unittest.TestCase):
     def test_missing_job_in_a_cancelled_or_unapproved_run(self):
         ev = evaluate(self.base_routes([], ci_run=run(1, "ci.yml", conclusion="action_required")))
         self.assertEqual(states(ev)[("ci.yml", "lint")], "missing (run action_required)")
+        self.assertEqual(ev.verdict, "NOT OK")
+
+    def test_workflow_without_any_run_is_missing_at_once(self):
+        ev = evaluate(routes_for([], {}))
+        self.assertEqual(states(ev)[("ci.yml", "lint")], "missing")
         self.assertEqual(ev.verdict, "NOT OK")
 
     def test_skipped_cancelled_neutral_timed_out_are_not_ok(self):
@@ -266,8 +294,7 @@ class Verdicts(unittest.TestCase):
             [run(1, "ci.yml", head="x" * 40), run(2, "ci.yml", event="push")],
             {1: [job(1, "lint")], 2: [job(2, "lint")]},
         )
-        ev = evaluate(routes)
-        self.assertEqual(states(ev)[("ci.yml", "lint")], "missing")
+        self.assertEqual(states(evaluate(routes))[("ci.yml", "lint")], "missing")
 
     def test_advisory_failure_does_not_count(self):
         ev = evaluate(
@@ -279,26 +306,9 @@ class Verdicts(unittest.TestCase):
         self.assertFalse(row.ok)
 
     def test_unlisted_job_is_a_warning_not_a_failure(self):
-        ev = evaluate(
-            self.base_routes(
-                [
-                    job(1, "lint"),
-                    job(2, "test (3.11)"),
-                    job(3, "engines (webkit)"),
-                    job(4, "brand-new-job", conclusion="failure"),
-                ]
-            )
-        )
+        ev = evaluate(self.base_routes([*GREEN, job(4, "brand-new-job", conclusion="failure")]))
         self.assertEqual(ev.verdict, "OK")
         self.assertEqual([r.job for r in ev.unlisted], ["brand-new-job"])
-
-    def test_own_workflow_is_never_unlisted(self):
-        routes = self.base_routes(
-            [job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")],
-            extra_runs=[run(5, ci_ok.SELF_WORKFLOW, status="in_progress", conclusion=None)],
-            extra_jobs={5: [job(50, "ci-ok", status="in_progress", conclusion=None)]},
-        )
-        self.assertEqual(evaluate(routes).unlisted, [])
 
     def test_rerun_uses_the_latest_attempt(self):
         # The jobs endpoint is asked with filter=latest; it returns the re-run attempt's jobs.
@@ -306,66 +316,128 @@ class Verdicts(unittest.TestCase):
             [job(11, "lint"), job(12, "test (3.11)"), job(13, "engines (webkit)")], ci_run=run(1, "ci.yml", attempt=2)
         )
         api = FakeApi(routes)
-        snap = ci_ok.Collector(api, REPO, HEAD).snapshot()
+        snap = ci_ok.Collector(api, REPO, HEAD, 7).snapshot()
         self.assertTrue(any("filter=latest" in c for c in api.calls))
-        self.assertEqual(ci_ok.evaluate(MANIFEST, snap, ["a"], grace_over=True, final=False).verdict, "OK")
+        self.assertEqual(ci_ok.evaluate(MANIFEST, snap, ["a"]).verdict, "OK")
 
     def test_newest_run_of_a_workflow_supersedes_older_runs(self):
         routes = routes_for(
             [run(1, "ci.yml", created="2026-11-07T10:00:00Z"), run(2, "ci.yml", created="2026-11-07T11:00:00Z")],
-            {
-                1: [job(1, "lint", conclusion="failure")],
-                2: [job(2, "lint"), job(3, "test (3.11)"), job(4, "engines (webkit)")],
-            },
+            {1: [job(1, "lint", conclusion="failure")], 2: [job(2, "lint"), job(3, "test (3.11)")]},
         )
         self.assertEqual(evaluate(routes).verdict, "OK")
 
-    def test_pending_then_final(self):
+    def test_unfinished_is_pending_without_waiting(self):
         routes = self.base_routes(
             [job(1, "lint", status="in_progress", conclusion=None), job(2, "test (3.11)"), job(3, "engines (webkit)")],
             ci_run=run(1, "ci.yml", status="in_progress"),
         )
         ev = evaluate(routes)
         self.assertEqual(ev.verdict, "PENDING")
-        self.assertFalse(ev.decided)
-        ev = evaluate(routes, final=True)
-        self.assertEqual(ev.verdict, "NOT OK")
-        self.assertEqual(states(ev)[("ci.yml", "lint")], "timed out (ci-ok)")
+        self.assertEqual(states(ev)[("ci.yml", "lint")], "pending")
 
-    def test_fail_fast_decides_before_everything_finished(self):
+    def test_failure_beats_pending(self):
         routes = self.base_routes(
             [job(1, "lint", conclusion="failure"), job(2, "test (3.11)", status="queued", conclusion=None)],
             ci_run=run(1, "ci.yml", status="in_progress"),
         )
-        self.assertTrue(evaluate(routes).decided)
-        self.assertFalse(evaluate(routes, fail_fast=False).decided)
+        self.assertEqual(evaluate(routes).verdict, "NOT OK")
 
-    def test_path_filtered_without_filters_in_manifest(self):
-        manifest = {"pull_request": {}, "pull_request_path_filtered": {"upgrade.yml": ["upgrade"]}}
-        ev = evaluate(routes_for([], {}), manifest=manifest)
+    # F8: manifest states that used to fail open.
+    def test_path_filtered_without_filters_in_manifest_is_not_ok(self):
+        manifest = {"pull_request": {"ci.yml": ["lint"]}, "pull_request_path_filtered": {"upgrade.yml": ["upgrade"]}}
+        ev = evaluate(routes_for([run(1, "ci.yml")], {1: [job(1, "lint")]}), manifest=manifest)
+        self.assertEqual(ev.verdict, "NOT OK")
+        self.assertIn("no filter in manifest", states(ev)[("upgrade.yml", "upgrade")])
+
+    def test_empty_manifest_is_not_ok(self):
+        for manifest in ({"pull_request": {}}, {"pull_request": {"ci.yml": ["a"]}, "advisory": ["ci.yml/a"]}):
+            with self.subTest(manifest=manifest):
+                ev = evaluate(routes_for([run(1, "ci.yml")], {1: [job(1, "a")]}), manifest=manifest)
+                self.assertEqual(ev.verdict, "NOT OK")
+                self.assertIn("no mandatory jobs", [r.state for r in ev.rows])
+
+    def test_manifest_problems_are_not_ok(self):
+        ev = evaluate(self.base_routes(GREEN), problems=["ci.yml drifted"])
+        self.assertEqual(ev.verdict, "NOT OK")
+        self.assertEqual(states(ev)[(ci_ok.MANIFEST_PATH, "self-check")], "inconsistent")
+
+
+class DuplicateNames(unittest.TestCase):
+    """F6: several jobs with one name in the newest attempt must all succeed."""
+
+    def ev(self, lints):
+        return evaluate(routes_for([run(1, "ci.yml")], {1: [*lints, job(8, "test (3.11)")]}))
+
+    def test_one_failure_among_duplicates_is_not_ok(self):
+        ev = self.ev([job(1, "lint", conclusion="failure"), job(2, "lint")])
+        self.assertEqual(ev.verdict, "NOT OK")
+        row = next(r for r in ev.rows if r.job == "lint")
+        self.assertEqual(row.state, "failure")
+        self.assertIn("2 jobs share this name", row.note)
+        # The order of the ids does not matter.
+        self.assertEqual(self.ev([job(1, "lint"), job(2, "lint", conclusion="failure")]).verdict, "NOT OK")
+
+    def test_all_duplicates_green_is_ok_and_one_pending_is_pending(self):
+        self.assertEqual(self.ev([job(1, "lint"), job(2, "lint")]).verdict, "OK")
+        self.assertEqual(self.ev([job(1, "lint"), job(2, "lint", status="queued", conclusion=None)]).verdict, "PENDING")
+
+
+class Attribution(unittest.TestCase):
+    """F5: only runs of the evaluated PR decide when the PR number is known."""
+
+    def test_another_prs_run_on_the_same_sha_is_ignored(self):
+        routes = routes_for(
+            [
+                run(1, "ci.yml", prs=(7,), created="2026-11-07T10:00:00Z"),
+                run(2, "ci.yml", prs=(8,), created="2026-11-07T11:00:00Z"),
+            ],
+            {1: [job(1, "lint"), job(2, "test (3.11)")], 2: [job(3, "lint", conclusion="failure")]},
+        )
+        snap = snapshot(routes, pr=7)
+        self.assertEqual(snap.runs["ci.yml"]["id"], 1)
+        self.assertEqual(snap.ignored_runs, 1)
+        self.assertEqual(ci_ok.evaluate(MANIFEST, snap, ["a"]).verdict, "OK")
+        self.assertEqual(evaluate(routes, pr=8).verdict, "NOT OK")
+
+    def test_attributed_run_beats_a_newer_unattributed_run(self):
+        routes = routes_for(
+            [
+                run(1, "ci.yml", prs=(7,), created="2026-11-07T10:00:00Z"),
+                run(2, "ci.yml", prs=(), created="2026-11-07T11:00:00Z"),
+            ],
+            {1: [job(1, "lint"), job(2, "test (3.11)")], 2: [job(3, "lint", conclusion="failure")]},
+        )
+        self.assertEqual(evaluate(routes).verdict, "OK")
+
+    def test_unattributed_run_is_used_with_a_note_when_nothing_else_exists(self):
+        routes = routes_for([run(1, "ci.yml", prs=())], {1: [job(1, "lint"), job(2, "test (3.11)")]})
+        ev = evaluate(routes)
         self.assertEqual(ev.verdict, "OK")
-        self.assertIn("no filter in manifest", ev.rows[0].state)
+        self.assertIn("by head SHA only", next(r for r in ev.rows if r.job == "lint").note)
+
+    def test_without_a_pr_number_every_run_on_the_sha_counts(self):
+        routes = routes_for([run(1, "ci.yml", prs=(8,))], {1: [job(1, "lint"), job(2, "test (3.11)")]})
+        self.assertEqual(evaluate(routes, pr=None).verdict, "OK")
 
 
-class ManifestFromBase(unittest.TestCase):
-    def test_base_manifest_wins_and_change_is_noticed(self):
-        weak = {"pull_request": {"ci.yml": []}}
-        api = FakeApi(routes_for([], {}, base_manifest=MANIFEST, head_manifest=weak))
-        manifest, notices = ci_ok.load_base_manifest(api, REPO, BASE, HEAD, [ci_ok.MANIFEST_PATH])
-        self.assertEqual(manifest, MANIFEST)
-        self.assertTrue(any("changes .github/ci-manifest.json" in n for n in notices))
+class Impostors(unittest.TestCase):
+    """F1/F13: the real gate never runs on pull_request; a pull_request job named ci-ok is an impostor."""
 
-    def test_no_notice_when_unchanged(self):
-        api = FakeApi(routes_for([], {}, base_manifest=MANIFEST))
-        _, notices = ci_ok.load_base_manifest(api, REPO, BASE, HEAD, ["src/a.py"])
-        self.assertEqual(notices, [])
+    def test_impostor_job_in_any_workflow_is_not_ok(self):
+        for workflow in ("evil.yml", ci_ok.SELF_WORKFLOW):
+            with self.subTest(workflow=workflow):
+                routes = routes_for(
+                    [run(1, "ci.yml"), run(2, workflow)], {1: GREEN, 2: [job(9, "ci-ok"), job(10, "helper")]}
+                )
+                ev = evaluate(routes)
+                self.assertEqual(ev.verdict, "NOT OK")
+                self.assertEqual(states(ev)[(workflow, "ci-ok")], "impostor")
+                # F13: other jobs of the gate's own workflow file are no longer hidden.
+                self.assertIn((workflow, "helper"), [(r.workflow, r.job) for r in ev.unlisted])
 
-    def test_bootstrap_falls_back_to_head(self):
-        api = FakeApi(routes_for([], {}, head_manifest=MANIFEST))
-        manifest, notices = ci_ok.load_base_manifest(api, REPO, BASE, HEAD, [ci_ok.MANIFEST_PATH])
-        self.assertEqual(manifest, MANIFEST)
-        self.assertIn("bootstrap", notices[0])
 
+class ChangedFiles(unittest.TestCase):
     def test_changed_files_fall_back_to_compare(self):
         routes = routes_for([], {})
         routes[f"/repos/{REPO}/pulls/7/files"] = ci_ok.ApiError(403, "x")
@@ -380,106 +452,346 @@ class ManifestFromBase(unittest.TestCase):
         api.get = lambda path, raw=False: pages[int(path.rsplit("page=", 1)[1])]
         self.assertEqual(len(ci_ok.fetch_changed_files(api, REPO, 7, BASE, HEAD)), 101)
 
+    def test_without_pr_compare_default_branch_or_unknown(self):
+        self.assertEqual(
+            ci_ok.fetch_changed_files_without_pr(FakeApi(routes_for([], {})), REPO, "master", HEAD), ["src/a.py"]
+        )
+        self.assertIsNone(ci_ok.fetch_changed_files_without_pr(FakeApi({}), REPO, "master", HEAD))
+
+
+def http_error(code, headers=None, body=b"{}"):
+    msg = email.message.Message()
+    for k, v in (headers or {}).items():
+        msg[k] = v
+    return urllib.error.HTTPError("https://x", code, "err", msg, io.BytesIO(body))
+
+
+class ApiRetries(unittest.TestCase):
+    """F7: retries within a deadline, Retry-After honoured; the error propagates (and main reports it)."""
+
+    def api(self, answers, deadline=180.0):
+        sleeps: list[float] = []
+        clock = {"t": 0.0}
+
+        def opener(req, timeout):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return io.BytesIO(json.dumps(answer).encode())
+
+        def sleep(s):
+            sleeps.append(s)
+            clock["t"] += s
+
+        api = ci_ok.Api(
+            "t",
+            "https://api",
+            deadline_seconds=deadline,
+            opener=opener,
+            sleep=sleep,
+            clock=lambda: clock["t"],
+            now=lambda: 1000.0,
+        )
+        return api, sleeps
+
+    def test_retry_after_is_honoured(self):
+        api, sleeps = self.api([http_error(403, {"Retry-After": "7"}, b"secondary"), {"ok": 1}])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(api.get("/x"), {"ok": 1})
+        self.assertEqual(sleeps, [7.0])
+
+    def test_rate_limit_reset_and_429(self):
+        api, sleeps = self.api([http_error(429, {"x-ratelimit-reset": "1030"}), {"ok": 1}])
+        with redirect_stdout(io.StringIO()):
+            api.get("/x")
+        self.assertEqual(sleeps, [30.0])
+
+    def test_server_errors_retry_then_raise(self):
+        api, sleeps = self.api([http_error(502)] * 4)
+        with redirect_stdout(io.StringIO()), self.assertRaises(ci_ok.ApiError) as cm:
+            api.get("/x")
+        self.assertEqual(cm.exception.status, 502)
+        self.assertEqual(len(sleeps), 3)
+
+    def test_wait_beyond_the_deadline_raises_at_once(self):
+        api, sleeps = self.api([http_error(403, {"Retry-After": "600"}, b"secondary")], deadline=60)
+        with self.assertRaises(ci_ok.ApiError):
+            api.get("/x")
+        self.assertEqual(sleeps, [])
+
+    def test_client_errors_are_not_retried(self):
+        api, sleeps = self.api([http_error(404)])
+        with self.assertRaises(ci_ok.ApiError):
+            api.get("/x")
+        self.assertEqual(sleeps, [])
+
+    def test_network_error_is_an_api_error(self):
+        api, _ = self.api([urllib.error.URLError("down")] * 4)
+        with redirect_stdout(io.StringIO()), self.assertRaises(ci_ok.ApiError):
+            api.get("/x")
+
+
+# A consistent default-branch tree for MANIFEST.
+CI_WF = "name: CI\non:\n  push:\n  pull_request:\njobs:\n  engines:\n    continue-on-error: true\n"
+DOCKER_WF = (
+    'name: Docker\non:\n  pull_request:\n    paths:\n      - "docker/**"\n      - .github/workflows/docker.yml\n'
+)
+GATE_WF = (
+    "name: ci-ok\non:\n  workflow_run:\n    workflows: [CI, Docker]\n    types: [completed]\njobs:\n  ci-ok:\n"
+    "    name: ci-ok\n"
+)
+NIGHTLY_WF = "name: Nightly\non:\n  schedule:\n    - cron: '0 1 * * *'\n"
+
+
+def make_tree(test: unittest.TestCase, manifest, workflows: dict) -> str:
+    root = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, root)
+    os.makedirs(os.path.join(root, ".github", "workflows"))
+    if manifest is not None:
+        with open(os.path.join(root, ci_ok.MANIFEST_PATH), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh)
+    for name, text in workflows.items():
+        with open(os.path.join(root, ".github", "workflows", name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return root
+
+
+def good_tree(test, manifest=MANIFEST, **overrides):
+    workflows = {"ci.yml": CI_WF, "docker.yml": DOCKER_WF, "ci-ok.yml": GATE_WF, "nightly.yml": NIGHTLY_WF}
+    workflows.update(overrides)
+    return make_tree(test, manifest, {k: v for k, v in workflows.items() if v is not None})
+
+
+def workflow_run_event(prs=(7,), event="pull_request"):
+    return {
+        "workflow_run": {
+            "id": 99,
+            "name": "CI",
+            "run_attempt": 1,
+            "conclusion": "success",
+            "event": event,
+            "head_sha": HEAD,
+            "pull_requests": [{"number": n, "base": {"sha": BASE}, "head": {"sha": HEAD}} for n in prs],
+        },
+        "repository": {"default_branch": "master"},
+    }
+
 
 class Main(unittest.TestCase):
-    def main(self, routes, env=None, argv=("--repo", REPO, "--pr", "7")):
-        env = {"CI_OK_POLL_SECONDS": "1", "CI_OK_TIMEOUT_MINUTES": "1", "CI_OK_GRACE_MINUTES": "0", **(env or {})}
+    def main(self, routes, *, event=None, env=None, argv=None, root=None, api=None):
+        root = root or good_tree(self)
+        env = {"GITHUB_REPOSITORY": REPO, **(env or {})}
         with tempfile.TemporaryDirectory() as tmp:
             env["GITHUB_STEP_SUMMARY"] = os.path.join(tmp, "summary.md")
+            if event is not None:
+                env["GITHUB_EVENT_PATH"] = os.path.join(tmp, "event.json")
+                with open(env["GITHUB_EVENT_PATH"], "w", encoding="utf-8") as fh:
+                    json.dump(event, fh)
             out = io.StringIO()
-            clock = iter(range(0, 10_000, 30))
             with redirect_stdout(out):
-                code = ci_ok.main(
-                    list(argv), env=env, api=FakeApi(routes), sleep=lambda s: None, clock=lambda: next(clock)
-                )
-            with open(env["GITHUB_STEP_SUMMARY"], encoding="utf-8") as fh:
-                return code, out.getvalue(), fh.read()
+                code = ci_ok.main(["--root", root, *(argv or [])], env=env, api=api or FakeApi(routes))
+            summary = ""
+            if os.path.exists(env["GITHUB_STEP_SUMMARY"]):
+                with open(env["GITHUB_STEP_SUMMARY"], encoding="utf-8") as fh:
+                    summary = fh.read()
+            return code, out.getvalue(), summary
 
     def failing_routes(self):
-        return routes_for([run(1, "ci.yml")], {1: [job(1, "lint", conclusion="failure")]}, base_manifest=MANIFEST)
+        return routes_for([run(1, "ci.yml")], {1: [job(1, "lint", conclusion="failure")]})
 
-    def test_report_only_exits_zero_on_not_ok(self):
-        code, out, summary = self.main(self.failing_routes())
+    def green_routes(self):
+        return routes_for([run(1, "ci.yml")], {1: GREEN})
+
+    def test_workflow_run_event_ok_prints_one_notice(self):
+        code, out, summary = self.main(self.green_routes(), event=workflow_run_event())
         self.assertEqual(code, 0)
-        self.assertIn("::warning title=ci-ok::ci-ok: NOT OK", out)
+        self.assertIn("::notice title=ci-ok::ci-ok for PR #7 @ hhhhhhhhhhhh: OK", out)
+        self.assertNotIn("::warning", out)
         self.assertIn("| ci.yml | lint |", summary)
+        self.assertIn("triggered by 'CI' run 99", summary)
+
+    def test_report_only_exits_zero_on_not_ok_with_one_warning(self):
+        code, out, summary = self.main(self.failing_routes(), event=workflow_run_event())
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("::warning"), 1)
+        self.assertIn("::warning title=ci-ok::ci-ok for PR #7", out)
+        self.assertIn("NOT OK", summary)
 
     def test_enforce_exits_one_on_not_ok(self):
-        code, _, _ = self.main(self.failing_routes(), env={"CI_OK_ENFORCE": "1"})
+        code, _, _ = self.main(self.failing_routes(), event=workflow_run_event(), env={"CI_OK_ENFORCE": "1"})
         self.assertEqual(code, 1)
 
     def test_ok_exits_zero_even_when_enforced(self):
-        routes = routes_for([run(1, "ci.yml")], {1: [job(1, "lint"), job(2, "test (3.11)")]}, base_manifest=MANIFEST)
-        code, out, _ = self.main(routes, env={"CI_OK_ENFORCE": "1"})
+        code, _, _ = self.main(self.green_routes(), event=workflow_run_event(), env={"CI_OK_ENFORCE": "1"})
         self.assertEqual(code, 0)
-        self.assertIn("ci-ok: OK", out)
 
-    def test_waits_until_done_then_times_out(self):
-        routes = routes_for(
-            [run(1, "ci.yml", status="in_progress")],
-            {1: [job(1, "lint", status="in_progress", conclusion=None)]},
-            base_manifest=MANIFEST,
-        )
-        code, out, _ = self.main(routes)
+    def test_pending_is_a_notice(self):
+        routes = routes_for([run(1, "ci.yml", status="in_progress")], {1: [job(1, "lint", status="queued")]})
+        code, out, _ = self.main(routes, event=workflow_run_event())
         self.assertEqual(code, 0)
-        self.assertIn("waiting for", out)
-        self.assertIn("timed out (ci-ok)", out)
+        self.assertIn("::notice title=ci-ok::ci-ok for PR #7 @ hhhhhhhhhhhh: PENDING", out)
 
-    def test_event_payload_is_used(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "event.json")
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump({"pull_request": {"number": 7, "head": {"sha": HEAD}, "base": {"sha": BASE}}}, fh)
-            code, out, _ = self.main(
-                self.failing_routes(), argv=(), env={"GITHUB_EVENT_PATH": path, "GITHUB_REPOSITORY": REPO}
-            )
+    def test_non_pull_request_completion_is_skipped(self):
+        api = FakeApi({})
+        code, out, summary = self.main({}, event=workflow_run_event(event="push"), api=api)
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to evaluate", out)
+        self.assertEqual(api.calls, [])
+        self.assertEqual(summary, "")
+
+    def test_fork_pr_falls_back_to_the_head_sha(self):
+        api = FakeApi(routes_for([run(1, "ci.yml", prs=())], {1: GREEN}))
+        code, out, summary = self.main({}, event=workflow_run_event(prs=()), api=api)
+        self.assertEqual(code, 0)
+        self.assertIn("lists no pull request", summary)
+        self.assertIn("head SHA (no PR number)", summary)
+        self.assertIn(f"/repos/{REPO}/compare/master...{HEAD}", api.calls)
+        self.assertIn(": OK", out)
+
+    def test_several_prs_on_one_run_get_one_report_each(self):
+        routes = routes_for([run(1, "ci.yml", prs=(7, 8))], {1: GREEN})
+        _, out, summary = self.main(routes, event=workflow_run_event(prs=(7, 8)))
+        self.assertIn("PR #7", summary)
+        self.assertIn("PR #8", summary)
+        self.assertEqual(out.count("::notice title=ci-ok::"), 2)
+
+    def test_api_error_is_not_ok_and_exits_zero(self):
+        routes = self.green_routes()
+        routes[f"/repos/{REPO}/actions/runs?head_sha={HEAD}"] = ci_ok.ApiError(502, "runs")
+        code, out, summary = self.main(routes, event=workflow_run_event())
+        self.assertEqual(code, 0)
+        self.assertIn("api error", summary)
+        self.assertIn("::warning title=ci-ok::", out)
+        code, _, _ = self.main(routes, event=workflow_run_event(), env={"CI_OK_ENFORCE": "1"})
+        self.assertEqual(code, 1)
+
+    def test_unexpected_exception_is_not_ok_and_exits_zero(self):
+        routes = self.green_routes()
+        routes[f"/repos/{REPO}/actions/runs?head_sha={HEAD}"] = lambda: {"no workflow_runs key": 1}
+        code, _, summary = self.main(routes, event=workflow_run_event())
+        self.assertEqual(code, 0)
+        self.assertIn("api error", summary)
+
+    def test_missing_manifest_is_not_ok_and_exits_zero(self):
+        root = good_tree(self, manifest=None)
+        code, out, summary = self.main(self.green_routes(), event=workflow_run_event(), root=root)
+        self.assertEqual(code, 0)
+        self.assertIn("no manifest", summary)
+        self.assertIn("::warning", out)
+
+    def test_inconsistent_default_branch_manifest_is_not_ok(self):
+        root = good_tree(self, **{"ci-ok.yml": GATE_WF.replace("[CI, Docker]", "[CI]")})
+        _, _, summary = self.main(self.green_routes(), event=workflow_run_event(), root=root)
+        self.assertIn("inconsistent", summary)
+        self.assertIn("NOT OK", summary)
+
+    def test_change_to_the_gate_gets_a_notice(self):
+        routes = routes_for([run(1, "ci.yml")], {1: GREEN}, files=(ci_ok.MANIFEST_PATH, "src/a.py"))
+        _, _, summary = self.main(routes, event=workflow_run_event())
+        self.assertIn("This PR changes .github/ci-manifest.json", summary)
+
+    def test_no_repository_or_event_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as out:
+            code = ci_ok.main(["--root", tmp], env={"GITHUB_STEP_SUMMARY": os.path.join(tmp, "s.md")}, api=FakeApi({}))
+        self.assertEqual(code, 0)
+        self.assertIn("NOT OK", out.getvalue())
+
+    def test_dry_run_by_pr_number(self):
+        code, out, _ = self.main(self.green_routes(), argv=["--repo", REPO, "--pr", "7", "--once"])
         self.assertEqual(code, 0)
         self.assertIn("PR #7", out)
+        self.assertIn("local dry run", out)
+
+    def test_dry_run_of_a_closed_pr_attributes_by_head_sha(self):
+        # Live behavior seen on studio #152: a closed PR's runs list the branch's current open PR instead.
+        routes = routes_for([run(1, "ci.yml", prs=(155,))], {1: GREEN})
+        routes[f"/repos/{REPO}/pulls/7"] = {
+            "number": 7,
+            "state": "closed",
+            "head": {"sha": HEAD},
+            "base": {"sha": BASE},
+        }
+        _, out, summary = self.main(routes, argv=["--repo", REPO, "--pr", "7"])
+        self.assertIn(": OK", out)
+        self.assertIn("is closed", summary)
+        open_routes = routes_for([run(1, "ci.yml", prs=(155,))], {1: GREEN})
+        self.assertIn("NOT OK", self.main(open_routes, argv=["--repo", REPO, "--pr", "7"])[1])
+
+    def test_json_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.json")
+            self.main(self.failing_routes(), event=workflow_run_event(), argv=["--json", path])
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        self.assertEqual(data[0]["verdict"], "NOT OK")
 
 
 class SelfCheck(unittest.TestCase):
-    def tree(self, manifest: dict, workflows: dict) -> str:
-        root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, root)
-        os.makedirs(os.path.join(root, ".github", "workflows"))
-        with open(os.path.join(root, ci_ok.MANIFEST_PATH), "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh)
-        for name, text in workflows.items():
-            with open(os.path.join(root, ".github", "workflows", name), "w", encoding="utf-8") as fh:
-                fh.write(text)
-        return root
-
-    CI = "on:\n  pull_request:\njobs:\n  engines:\n    continue-on-error: true\n"
-    DOCKER = 'on:\n  pull_request:\n    paths:\n      - "docker/**"\n      - .github/workflows/docker.yml\n'
-
     def test_consistent(self):
-        root = self.tree(MANIFEST, {"ci.yml": self.CI, "docker.yml": self.DOCKER, "ci-ok.yml": self.CI})
-        self.assertEqual(ci_ok.self_check(root), [])
+        self.assertEqual(ci_ok.self_check(good_tree(self)), [])
 
     def test_filter_drift_is_reported(self):
-        root = self.tree(MANIFEST, {"ci.yml": self.CI, "docker.yml": self.DOCKER.replace("docker/**", "dock/**")})
+        root = good_tree(self, **{"docker.yml": DOCKER_WF.replace("docker/**", "dock/**")})
         problems = ci_ok.self_check(root)
         self.assertEqual(len(problems), 1)
         self.assertIn("docker.yml: path_filters", problems[0])
 
     def test_unlisted_pull_request_workflow_and_missing_file(self):
-        root = self.tree(MANIFEST, {"ci.yml": self.CI, "new.yml": self.CI})
+        root = good_tree(self, **{"docker.yml": None, "new.yml": CI_WF.replace("CI", "New")})
         problems = "\n".join(ci_ok.self_check(root))
         self.assertIn("new.yml runs on pull_request but is not in the manifest", problems)
         self.assertIn("docker.yml is in the manifest but", problems)
 
     def test_advisory_must_be_listed_and_continue_on_error(self):
         manifest = dict(MANIFEST, advisory=["ci.yml/engines (webkit)", "ci.yml/ghost"])
-        root = self.tree(manifest, {"ci.yml": "on:\n  pull_request:\n", "docker.yml": self.DOCKER})
+        root = good_tree(self, manifest, **{"ci.yml": "name: CI\non:\n  pull_request:\n"})
         problems = "\n".join(ci_ok.self_check(root))
         self.assertIn("'ci.yml/ghost' is not a listed job", problems)
         self.assertIn("has no continue-on-error", problems)
 
-    def test_self_check_is_report_only_unless_enforced(self):
-        root = self.tree(MANIFEST, {"ci.yml": self.CI})
+    # F8
+    def test_empty_manifest_fails(self):
+        root = good_tree(self, {"pull_request": {"ci.yml": []}}, **{"docker.yml": None})
+        problems = "\n".join(ci_ok.self_check(root))
+        self.assertIn("lists no mandatory pull_request job", problems)
+
+    def test_path_filtered_without_filter_entry_fails(self):
+        manifest = {"pull_request": {"ci.yml": ["lint"]}, "pull_request_path_filtered": {"docker.yml": ["docker"]}}
+        problems = "\n".join(ci_ok.self_check(good_tree(self, manifest)))
+        self.assertIn("docker.yml is path-filtered but has no path_filters entry", problems)
+
+    def test_workflow_run_list_must_match_the_manifest_names(self):
+        root = good_tree(self, **{"ci-ok.yml": GATE_WF.replace("[CI, Docker]", "[CI, Nightly]")})
+        problems = "\n".join(ci_ok.self_check(root))
+        self.assertIn("lacks ['Docker']", problems)
+        self.assertIn("has ['Nightly']", problems)
+        renamed = good_tree(self, **{"docker.yml": DOCKER_WF.replace("name: Docker", "name: Docker build")})
+        self.assertIn("lacks ['Docker build']", "\n".join(ci_ok.self_check(renamed)))
+
+    def test_gate_must_not_run_on_pull_request_and_must_exist(self):
+        root = good_tree(self, **{"ci-ok.yml": "name: ci-ok\non:\n  pull_request:\n"})
+        problems = "\n".join(ci_ok.self_check(root))
+        self.assertIn("ci-ok.yml runs on pull_request", problems)
+        self.assertIn("no on.workflow_run.workflows", problems)
+        self.assertIn("does not exist", "\n".join(ci_ok.self_check(good_tree(self, **{"ci-ok.yml": None}))))
+
+    def test_impostor_workflow_fails(self):
+        root = good_tree(self, **{"ci.yml": CI_WF + "  ci-ok:\n    runs-on: x\n"})
+        self.assertIn("impostor", "\n".join(ci_ok.self_check(root)))
+
+    def test_duplicate_workflow_names_fail(self):
+        root = good_tree(self, **{"other.yml": "name: Docker\non:\n  push:\n"})
+        self.assertIn("share the name ['Docker']", "\n".join(ci_ok.self_check(root)))
+
+    def test_unreadable_manifest_fails(self):
+        root = good_tree(self, manifest=None)
+        self.assertIn("cannot read", ci_ok.self_check(root)[0])
+
+    def test_self_check_exit_code_fails_without_enforce(self):
+        bad = good_tree(self, **{"docker.yml": None})
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(ci_ok.main(["--self-check", "--root", root], env={}), 0)
-            self.assertEqual(ci_ok.main(["--self-check", "--root", root], env={"CI_OK_ENFORCE": "1"}), 1)
+            self.assertEqual(ci_ok.main(["--self-check", "--root", bad], env={}), 1)
+            self.assertEqual(ci_ok.main(["--self-check", "--root", good_tree(self)], env={}), 0)
 
 
 if __name__ == "__main__":
