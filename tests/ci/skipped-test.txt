@@ -63,3 +63,5 @@ tests.test_sandbox_gateway::test_raw_requests_cannot_smuggle_past_the_gateway  #
 tests.test_sandbox_gateway::test_tools_run_through_the_gateway_and_escapes_are_refused  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
 tests.test_tenant_filters::test_every_api_statement_on_tenant_data_is_bound_to_one_tenant  # nodestro_api is not in this job (scanned by nodestro-api's own tests)
 tests.test_tenant_filters::test_the_review_sample_in_the_api_package_is_caught  # nodestro_api is not in this job (scanned by nodestro-api's own tests)
+tests.test_upgrade_scenarios::test_u2_upgrade_with_pgvector_ranks_alike_in_both_paths  # the test job's service postgres:17 has no pgvector (runs in pg-b)
+tests.test_upgrade_scenarios::test_u4_pgvector_installed_later_is_used_after_refresh  # the test job's service postgres:17 has no pgvector (runs in pg-b)
