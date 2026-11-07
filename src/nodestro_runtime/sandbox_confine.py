@@ -180,6 +180,12 @@ DENIED: dict[str, int] = {
     "fspick": 433,
     "pidfd_getfd": 438,
     "mount_setattr": 442,
+    # Newer than the first list (finding A6 of the arm64 audit, RT-018): quotas and the mount table by file
+    # descriptor or mount id, and the process's own LSM attributes (numbers checked against the kernel headers).
+    "quotactl_fd": 443,
+    "statmount": 457,
+    "listmount": 458,
+    "lsm_set_self_attr": 460,
     # Signals and scheduling aimed at a process by pid file descriptor.
     "pidfd_open": 434,
     "pidfd_send_signal": 424,
