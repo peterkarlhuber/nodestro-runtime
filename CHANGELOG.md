@@ -1899,6 +1899,13 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     header values up to the line end, and the password in a URL's user information
     (`postgresql://app:<password>@db`); the prefix stays readable. Axentra's redaction already removed them (found by
     the shared security test vectors).
+  - tests/ci: shared security test vectors (A8, VB-7). `tests/vectors/security-vectors.json` (version 1) is the
+    canonical corpus of egress, ID token and redaction cases with the documented `known_differences` between
+    Nodestro and Axentra; `tests/test_security_vectors.py` runs the egress cases against `netguard` and the
+    redaction cases against `sanitize` (T-VEC-1). Axentra and nodestro-api keep checksummed copies. The new job
+    `security-vectors-sync` checks out axentra anonymously (no secret) and compares its copy and `SOURCE.md` with
+    the canonical file (T-VEC-4, `NODESTRO_AXENTRA_SRC`, `NODESTRO_REQUIRE_VECTOR_SYNC=1`); the main test matrix
+    lists the comparison as skipped with that reason. Maintenance: `tests/vectors/README.md`.
 
 ## 0.2.0 (2026-10-29)
 
