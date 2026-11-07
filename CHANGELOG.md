@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- MUP-ONA B4 (PR 2 of 2): the generic part of the PostgreSQL index, file store and memory moved into the new package
+  `nodestro_runtime.pg_generic` (`connection`, `_sql`, `_vector`, `index`, `files`, `memory`), shaped to be taken
+  over into orkexa as `orkexa.backends.postgres` (B5); it imports nothing of Nodestro (second import-linter
+  contract). It gets connections only through the `ConnectionSource` protocol (one method, `transaction(mode, *,
+  tenant_id)`; Nodestro's adapter `storage_postgres.DatabaseSource` keeps the old behavior: reads without the lock
+  and retried on a lost connection, single writes in autocommit, transactions under the process lock; an optional
+  transaction-local tenant setting for A9, off). Every SQL text is a named entry of the statement catalog
+  (`pg_generic._sql.CATALOG`, 43 entries, variants as separate entries), rendered with
+  `psycopg.sql.Identifier(prefix + table)` for a prefix matching `^[a-z][a-z0-9_]{0,30}_$`; text unchanged except
+  for named placeholders. The executor runs catalog names only, and its partition guard raises
+  `RetrievalError("partition.missing")` before any database access unless `tenant_id` is the instance's tenant.
+  `postgres_tables.py` keeps Nodestro's wiring, `counts`/`attach_file`/`text` and `memory_totals`; its public names and
+  behavior are unchanged. New tests: `tests/test_sql_catalog.py` (T-CAT-1..4, mutation probe as a CI artifact),
+  `tests/test_partition_guard.py` (T-GUARD-1/2), `tests/test_sql_parity.py` (T-PAR-1 against the baseline of PR 1).
 - MUP-ONA B4 (PR 1 of 2): the rule engine of the tenant SQL check is a module of its own,
   `nodestro_runtime.sqlcheck_rules`: `check_statement(sql, *, tenant_tables, column="tenant_id",
   placeholder="psycopg", allow_any=False)` returns `Finding(kind, position, message)` items (`leak`, `unparsed`,
