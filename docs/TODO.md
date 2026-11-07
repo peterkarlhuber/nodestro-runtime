@@ -606,14 +606,6 @@ Packages of the MUP-ONA plan
 change this repository. Each entry is removed in the
 PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
 
-### RT-MUP-A8 · Shared security test vectors (MUP-ONA MP-A8)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** `netguard`, JWT and `sanitize` are tested with their own cases only, not against the corpus Axentra uses.
-- **Next step:** `tests/vectors/security-vectors.json` (canonical, versioned) with its tests; Axentra keeps a
-  checksummed copy.
-
 ### RT-MUP-B1 · Backend conformance suite against Nodestro's classes (MUP-ONA MP-B1)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**
