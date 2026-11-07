@@ -183,15 +183,19 @@ the exact versions of every package (`python_envs`), into a separate environment
 
 **Checked key figures.** A number field of an agent's structured result can declare `source="tool"`
 (`OutputField.source`): a figure that a decision or a later step relies on. After the agent answered, the engine
-accepts it only when it is the result of a successful tool call of this step or of an earlier step of the run,
-rounded to the decimals the agent gave (`nodestro_runtime.value_checks`). When the backing call is `table_totals`,
+accepts it only when it is the result of a successful call of a computing tool (the calculator, `table_totals`,
+`days_between`, `text_statistics` or a tool of the agent's own library; never input files, knowledge search, memory,
+the date, MCP or provider server tools) of this step or of a step that feeds it (its ancestors, loop connections
+included; never a parallel branch), rounded to the decimals the agent gave (`nodestro_runtime.value_checks`). When the backing call is `table_totals`,
 the table the agent passed must have every row of the matching table in the step's input. A value that fails goes
 back to the agent once with the reason (event `values_unverified`); a second failure fails the step with
 `run.value_unverified`, so no condition decides on an unchecked number. The built-in `table_totals` tool adds up a
 column of a Markdown or CSV table exactly (count, total, mean, min, max, groups in Pareto order, share of a reference
 total) and reads European number formats. The workflow check warns with `check.value_source_type` (the field is not a
 number of a structured result) and refuses with `check.value_source_no_tool` (neither the agent nor one before it has
-a tool). A matching number proves where the value came from, not that the agent chose the right inputs for the tool;
+a tool). The agent test in the inspector does not correct or fail: it lists a figure its own computing calls do not
+back in `AgentTestResult.value_warnings` (a step that copies a figure from an earlier step has none there). A matching
+number proves where the value came from, not that the agent chose the right inputs for the tool;
 figures inside free text are not checked.
 
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an

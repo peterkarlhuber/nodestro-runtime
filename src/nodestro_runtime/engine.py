@@ -81,7 +81,7 @@ from .cost_tracking import PricedTracker, PriceMode, request_regions, stale_requ
 from .file_delivery import TOOL_NAME as FILES_TOOL_NAME
 from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
-from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, ports
+from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
 from .orchestrator import (
@@ -144,7 +144,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
-from .value_checks import Unverified, checked_fields, correction_prompt, unverified_fields
+from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
 
@@ -3959,12 +3959,28 @@ class RunManager:
         outcome: AgentOutcome,
         ask: Callable[..., AgentOutcome],
     ) -> AgentOutcome:
-        """Key figures (``source="tool"``) must come from a tool result: one correction, then the step fails."""
+        """Key figures (``source="tool"``) must come from a tool result: one correction, then the step fails.
+
+        Only calls of computing tools count (:func:`~.value_checks.computing_call`), of this step and of the steps
+        that feed it (:func:`~.graph.feeding_nodes`), never of a parallel branch (RT-054)."""
         source_text = "\n\n".join([prompt, *(block["text"] for block in extra if block.get("type") == "text")])
+        nodes = {node.id: node for node in context.run.workflow.nodes}
+        feeding = {*feeding_nodes(context.run.workflow, node_id), node_id}
+        own: dict[str, set[str]] = {node_id: set(config.tools)}
+        for found in feeding - {node_id}:
+            step_node = nodes.get(found)
+            if step_node is not None and step_node.agent is not None:
+                own[found] = set(step_node.agent.tools)
 
         def failed_of(result: Any) -> list[Unverified]:
             with context.lock:
-                calls = [call for node in context.run.nodes.values() for call in node.tool_calls]
+                calls = [
+                    call
+                    for found in feeding
+                    if (step := context.run.nodes.get(found)) is not None
+                    for call in step.tool_calls
+                    if computing_call(call, own.get(found, ()))
+                ]
             return unverified_fields(config.output, result, calls, source_text)
 
         failed = failed_of(outcome.output)

@@ -36,6 +36,7 @@ from .providers import Connection
 from .reasoning import ReasoningTrace, trace_hook
 from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
 from .tool_approvals import CallBinding, ToolGate, bind_call, tool_facts
+from .value_checks import checked_fields, computing_call, unverified_fields
 
 #: Test results show at most this much of a tool result (the run view keeps 20,000 too).
 _MAX_TOOL_OUTPUT = 20_000
@@ -49,6 +50,21 @@ class AgentTestIn(BaseModel):
     raw: bool = False
     #: The workflow the agent belongs to: its tools run in the workflow's Python environment.
     workflow_id: str | None = None
+
+
+class ValueWarning(BaseModel):
+    """A key figure (``source="tool"``) that the agent's own computing tool calls in the test do not back (RT-054).
+
+    A workflow run would ask the agent once to correct it and then fail the step (``run.value_unverified``); the
+    test only warns, because a step that copies a figure an earlier step computed has no earlier steps here.
+    ``reason`` as :class:`~nodestro_runtime.value_checks.Unverified`: ``missing``, ``not_from_tool``,
+    ``table_incomplete`` or ``table_changed``."""
+
+    field: str
+    value: Any = None
+    reason: str
+    rows_passed: int | None = None
+    rows_in_input: int | None = None
 
 
 class AgentTestResult(BaseModel):
@@ -75,6 +91,8 @@ class AgentTestResult(BaseModel):
     memory: dict[str, str] | None = None
     #: True when the agent worked on a copy of its persistent memory space.
     memory_isolated: bool = False
+    #: Key figures no computing tool call of the test backs: shown as warnings, the test still succeeds (RT-054).
+    value_warnings: list[ValueWarning] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=now)
     finished_at: datetime | None = None
 
@@ -218,6 +236,19 @@ class AgentTester:
             result.output = outcome.output
             result.evaluation = outcome.evaluation
             result.memory = outcome.memory
+            if checked_fields(config.output):
+                with lock:
+                    computed = [call for call in result.tool_calls if computing_call(call, config.tools)]
+                result.value_warnings = [
+                    ValueWarning(
+                        field=item.field,
+                        value=item.value,
+                        reason=item.reason,
+                        rows_passed=item.rows_passed,
+                        rows_in_input=item.rows_in_input,
+                    )
+                    for item in unverified_fields(config.output, outcome.output, computed, prompt)
+                ]
         except Exception as exc:  # API errors, budget, invalid configuration: shown in the inspector
             found: Problem = node_problem(exc)
             if isinstance(exc, MaxToolRoundsError) and not isinstance(exc, MaxToolCallsError):

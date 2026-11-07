@@ -4,8 +4,10 @@ An agent's result field may declare ``source="tool"`` (:class:`~nodestro_runtime
 a key figure (a share, a total, a margin) that later steps decide on, so the model must not estimate it. The engine
 checks it after the agent answered (:func:`unverified_fields`):
 
-- the value must be the result of a successful tool call of this step or of an earlier step of the run, rounded to
-  the decimals the agent reported (the calculator, ``table_totals``, a stored tool), and not a number the call
+- the value must be the result of a successful call of a *computing* tool (:func:`computing_call`: the calculator,
+  ``table_totals``, ``days_between``, ``text_statistics`` or a tool of the agent's own tool library) of this step
+  or of a step that feeds it (its ancestors in the workflow, loop connections included; never a parallel branch),
+  rounded to the decimals the agent reported, and not a number the call
   already had in its input (a calculator called with the value itself, in any spelling, computed nothing; neither
   did one that only rounds or transforms a single number). Of a ``table_totals`` result only what the tool computed
   counts (totals, means, extremes, shares, row counts), never what it repeats from its input (the reference total,
@@ -17,7 +19,9 @@ checks it after the agent answered (:func:`unverified_fields`):
 
 The check proves where a value comes from, not that the tool got the right figures: a calculator call written out
 from made-up numbers, or ``table_totals`` over a made-up table whose value column no table of the step's input has
-(e.g. a table that came from a tool), still backs its result.
+(e.g. a table that came from a tool), still backs its result. Tools that look things up rather than compute (input
+files, knowledge search, memory, the current date, MCP servers, provider server tools) never back a value, even when
+their result contains the number.
 
 A value that fails is sent back to the agent once with the reason; a second failure fails the step with
 ``run.value_unverified``, so no decision is made on an unchecked figure.
@@ -40,7 +44,15 @@ from pydantic import BaseModel
 from .builtin_tools import number_of, parse_table, parse_tables
 from .schemas import OutputConfig, ToolCallRecord
 
-__all__ = ["Unverified", "checked_fields", "correction_prompt", "tool_numbers", "unverified_fields"]
+__all__ = [
+    "COMPUTING_BUILTINS",
+    "Unverified",
+    "checked_fields",
+    "computing_call",
+    "correction_prompt",
+    "tool_numbers",
+    "unverified_fields",
+]
 
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 _NUMERIC = ("number", "integer")
@@ -56,6 +68,23 @@ class Unverified:
     reason: str
     rows_passed: int | None = None
     rows_in_input: int | None = None
+
+
+#: Nodestro's built-in tools that compute a number from their input (``current_datetime`` only looks one up).
+COMPUTING_BUILTINS = frozenset({"calculator", "table_totals", "days_between", "text_statistics"})
+#: Names that are never a library tool of an agent (its memory, Orkexa's own tools for files and knowledge search).
+_LOOKUPS = frozenset({"memory", "current_datetime", "input_files", "search"})
+
+
+def computing_call(record: ToolCallRecord, own_tools: Iterable[str] = ()) -> bool:
+    """Whether ``record`` is a call of a tool that computes: a built-in computing tool, or a tool of the agent's own
+    library (``own_tools``: the names in its configuration, a stored Python tool) that is not an MCP server's tool.
+    Lookups (input files, knowledge search, memory, the date, MCP, provider server tools) are not."""
+    if record.name in COMPUTING_BUILTINS:
+        return True
+    if record.name in _LOOKUPS or record.name.startswith("mcp__") or record.provenance.get("source") == "mcp":
+        return False
+    return record.name in set(own_tools)
 
 
 def checked_fields(output: OutputConfig) -> list[str]:

@@ -351,3 +351,93 @@ async def test_the_correction_only_computes_and_never_repeats_a_tool_with_effect
         offered = {tool.get("name") for tool in correction.get("tools") or []}
         assert "table_totals" in offered and own not in offered
         assert "212.0" in str(correction["messages"]) and "must not be repeated" in str(correction["messages"])
+
+
+# ---- which calls back a value (RT-054) ---------------------------------------------------------------------------
+
+
+def test_only_computing_tools_back_a_value() -> None:
+    from nodestro_runtime.value_checks import computing_call
+
+    for name in ("calculator", "table_totals", "days_between", "text_statistics"):
+        assert computing_call(_call(name, {}, 1))
+    # Lookups: their result may contain the number, but they computed nothing.
+    for name in ("input_files", "search", "memory", "current_datetime", "mcp__ledger__read"):
+        assert not computing_call(_call(name, {}, 4.62), own_tools=[name])
+    mcp = ToolCallRecord(id="c", name="ledger_total", output="4.62", provenance={"source": "mcp"})
+    assert not computing_call(mcp, own_tools=["ledger_total"])
+    # A tool of the agent's own library computes; the same name without it in the agent is not trusted.
+    assert computing_call(_call("margin", {}, 4.62), own_tools=["margin"])
+    assert not computing_call(_call("margin", {}, 4.62))
+    assert not computing_call(_call("web_search", {}, 4.62))  # a provider server tool
+
+
+def test_the_steps_that_feed_a_step_include_loops_but_no_parallel_branch() -> None:
+    from nodestro_runtime.graph import feeding_nodes
+
+    flow = WorkflowIn.model_validate(
+        {
+            "name": "Shape",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "b", "type": "agent", "agent": {"name": "B"}},
+                {"id": "c", "type": "agent", "agent": {"name": "C"}},
+                {"id": "a", "type": "agent", "agent": {"name": "A"}},
+                {"id": "later", "type": "agent", "agent": {"name": "L"}},
+            ],
+            "edges": [
+                {"id": "e1", "source": "start", "target": "b"},
+                {"id": "e2", "source": "start", "target": "c"},
+                {"id": "e3", "source": "b", "target": "a"},
+                {"id": "e4", "source": "a", "target": "later"},
+                {"id": "loop", "source": "later", "target": "a", "loop": {"max_iterations": 2}},
+            ],
+        }
+    )
+    assert feeding_nodes(flow, "a") == {"start", "b", "later"}  # c is a parallel branch
+    assert feeding_nodes(flow, "c") == {"start"}
+
+
+def _two_branches(*, chained: bool) -> WorkflowIn:
+    """``b`` computes the share; ``a`` reports it without a tool, after ``b`` (chained) or beside it (parallel)."""
+    flow = _flow(tools=["table_totals"]).model_dump()
+    computing = {**flow["nodes"][1], "id": "b", "label": "B"}
+    computing["agent"] = {**computing["agent"], "name": "Computer", "system_prompt": "Computer"}
+    flow["nodes"].insert(1, computing)
+    flow["edges"][0] = {"id": "e1", "source": "b" if chained else "start", "target": "a"}
+    flow["edges"].append({"id": "e0", "source": "start", "target": "b"})
+    return WorkflowIn.model_validate(flow)
+
+
+@pytest.mark.parametrize("chained", [True, False], ids=["earlier-step", "parallel-branch"])
+async def test_a_figure_an_earlier_step_computed_counts_one_of_a_parallel_branch_does_not(
+    tmp_path: Path, chained: bool
+) -> None:
+    fake = ScriptedClient(
+        {"Computer": [tool_use("table_totals", TOTALS_CALL), _share(4.62)], "Analyst": [_share(4.62), _share(4.62)]}
+    )
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[]) as workspace:
+        saved = workspace.save_workflow(_two_branches(chained=chained))
+        done = await workspace.wait((await workspace.run(saved, RunIn(input=LOG))).id, timeout=20)
+        assert done.nodes["b"].status == "succeeded"
+        if chained:
+            assert done.nodes["a"].status == "succeeded", done.nodes["a"].error
+        else:
+            assert done.nodes["a"].error_code == "run.value_unverified"
+
+
+def test_the_agent_test_warns_about_an_unbacked_figure_and_still_succeeds(tmp_path: Path) -> None:
+    from nodestro_runtime.agent_test import AgentTestIn
+    from nodestro_runtime.schemas import AgentConfig
+
+    agent = AgentConfig.model_validate(_flow(tools=["table_totals"]).model_dump()["nodes"][1]["agent"])
+    fake = ScriptedClient({"Analyst": [_share(2.83), tool_use("table_totals", TOTALS_CALL), _share(4.62)]})
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[]) as workspace:
+        warned, _ = workspace.tester.run(AgentTestIn(agent=agent, input=LOG))
+        assert warned.status == "succeeded" and warned.output == {"downtime_share_percent": 2.83}
+        assert [(item.field, item.value, item.reason) for item in warned.value_warnings] == [
+            ("downtime_share_percent", 2.83, "not_from_tool")
+        ]
+        assert len(fake.messages.calls) == 1  # no correction in a test
+        backed, _ = workspace.tester.run(AgentTestIn(agent=agent, input=LOG))
+        assert backed.status == "succeeded" and backed.value_warnings == []
