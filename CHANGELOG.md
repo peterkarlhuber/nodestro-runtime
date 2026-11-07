@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Tests: `test_a_change_while_a_step_runs_refuses_the_old_version` (`tests/test_worker_tool_changes.py`) changes the
+  tool only once the step asked the model, so it holds its tools. It waited for the step to be stored as running,
+  which happens before the agent is built (AD-10): on a slow runner the deletion came first and the step failed with
+  `config.unknown_tools` without a call (`[delete]` failed intermittently in CI). No runtime change.
+
 - MUP-ONA B6: the PostgreSQL knowledge index, file store and memory are Orkexa's backends (`orkexa.backends.postgres`,
   orkexa pinned to 792a041, the merge of orkexa #66, B5). `postgres_tables.PostgresIndex`, `PostgresFileStore` and
   `PostgresMemory` subclass them with `PostgresLayout("nodestro_")` (`postgres_tables.LAYOUT`), the

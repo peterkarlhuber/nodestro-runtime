@@ -118,8 +118,11 @@ def output(offset: int) -> str:
     return f"{212.0 + offset}"
 
 
-def calling(before: threading.Event | None = None) -> Callable[[dict[str, Any]], Any]:
-    """Calls the tool once (after ``before`` is set, if given), then answers."""
+def calling(
+    before: threading.Event | None = None, asked: threading.Event | None = None
+) -> Callable[[dict[str, Any]], Any]:
+    """Calls the tool once (after ``before`` is set, if given), then answers. ``asked`` is set when the model is
+    first asked: the agent is built by then, so the step holds its tools."""
 
     def respond(request: dict[str, Any]) -> Any:
         answered = any(
@@ -129,6 +132,8 @@ def calling(before: threading.Event | None = None) -> Callable[[dict[str, Any]],
         )
         if answered:
             return text("done")
+        if asked is not None:
+            asked.set()
         if before is not None:
             before.wait(20)
         return tool_use(TOOL, {"celsius": 100})
@@ -346,20 +351,17 @@ async def test_a_tool_deleted_in_the_api_runs_on_no_worker(processes: Make) -> N
 
 @pytest.mark.parametrize("change", ["save", "delete"])
 async def test_a_change_while_a_step_runs_refuses_the_old_version(processes: Make, change: str) -> None:
-    release = threading.Event()
-    server = Server(processes, calling(release))
+    asked, release = threading.Event(), threading.Event()
+    server = Server(processes, calling(release, asked))
     server.save(0)
     server.warm()
     (serving,) = server.serve(0)
     try:
         started = await server.start()
-        for _ in range(200):  # the step started and holds its tools
-            if (
-                server.run(started.id).nodes.get("a") is not None
-                and server.run(started.id).nodes["a"].status == "running"
-            ):
-                break
-            await asyncio.sleep(0.05)
+        # The step holds its tools once the model is asked. A step is stored as running before its agent is built
+        # (and takes its tools), so a change made then is no change "while a step runs": a deletion fails the step
+        # with config.unknown_tools before any call, a new version is simply used.
+        assert await asyncio.to_thread(asked.wait, 20), "the step never asked the model"
         server.save(1000) if change == "save" else server.delete()
         release.set()
         done = await server.until_done(started.id)
