@@ -566,7 +566,9 @@ None known.
   keeps ranking vectors itself until an operator runs `CREATE EXTENSION vector` in the schema. Done 2026-11-07 in
   this repository: `storage_postgres.pgvector_status(database)` reports `active`, `installable`, `other_schema` or
   `unavailable` with the SQL to run and an English message (tested against a real pgvector server,
-  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`).
+  `tests/test_pgvector_status.py`, opt-in `NODESTRO_TEST_PGVECTOR`). MUP-ONA MP-B3: an open `PostgresIndex` checks
+  again after `refresh()` (T-PG-4, U4; nothing in the API calls it yet, so processes still need a restart), and the CI job `pg-b` runs every
+  PostgreSQL test on `pgvector/pgvector:pg17` with `NODESTRO_REQUIRE_PGVECTOR=1`.
 - **Next step:** `nodestro-server check` (nodestro-api `server.check`) warns with that status, and the nodestro-server
   RUNBOOK names the commands.
 - **Plan:** MUP-ONA MP-B8 (optional package, gate G4), [MUP-ONA.md](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md).
@@ -622,15 +624,6 @@ PR that completes its package. They are tracked by the plan's execution status a
   `tenant_id = ANY(%s)` is accepted without an allowlist entry.
 - **Next step:** Marker `tenant_api_scan` with `NODESTRO_API_SRC`/`NODESTRO_REQUIRE_API_SCAN`, a `tenant-sql-api` CI job
   with a public API checkout, and `allow_any=False` with reasoned allowlist entries.
-
-### RT-MUP-B3 · PostgreSQL drift and pgvector in CI (MUP-ONA MP-B3)
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** Ten documented differences between `PostgresIndex` and `SQLiteIndex`; pgvector is not tested in a required
-  job.
-- **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
-  tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
 ### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
 

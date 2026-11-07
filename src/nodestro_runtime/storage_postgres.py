@@ -837,7 +837,7 @@ def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
     ``command`` is the SQL that fixes it (run by a superuser, or a role that may create the extension: pgvector is
     not a trusted extension), ``None`` when nothing is to be done or the package must be installed first; ``message``
     says it in English for operator output. Processes that already run keep ranking themselves until they restart
-    (each knowledge index checks pgvector once)."""
+    (each knowledge index checks pgvector once, and again after ``PostgresIndex.refresh()``)."""
     rows = database._query(
         "SELECT to_regtype('vector') IS NOT NULL, current_schema()::text,"
         " (SELECT e.extversion::text FROM pg_extension e WHERE e.extname = 'vector'),"

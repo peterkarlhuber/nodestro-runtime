@@ -1906,6 +1906,30 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     over 1000 characters or 64 distinct words with `RetrievalError` `query.too_long`, as SQLite does since A10.
     New catalog code `run.agent.VectorError` (orkexa's vector check). Orkexa pinned to the B1 suite commit `5aa6346`
     (temporary integration pin).
+  - B3: the PostgreSQL knowledge index follows orkexa's index contract; the ten documented drifts are fixed and
+    `tests/test_orkexa_conformance.py` has no expected failure left. Behavior changes, each in a commit of its own:
+    (1) the embedding model's identity is read again before vectors are written, and a model updated during a
+    reindex discards the new space (`reindex_required`); (2) NaN, infinity and vectors of another length are refused
+    (`VectorError` `vector.invalid`/`vector.dimension`); (3) zero vectors are stored but never ranked, a zero query
+    vector finds nothing; (4) without pgvector the runtime ranks by cosine (before: the dot product, which ordered
+    vectors that are not normalized differently from pgvector); (5) vector scores are rounded to 6 digits and
+    full-text scores are `1 / (60 + rank)` instead of `ts_rank`; (6) without a mode an index with an embedding model
+    searches `hybrid` (the knowledge base passes its mode, so agents are not affected); (7) at most 50,000 sources per
+    search (`ValueError`); (8) query words are orkexa's (`\w` runs): `order_id` finds "order id" in sequence, no
+    longer "order" or "id" alone (diacritics stay folded on both sides); (9) a chunk deleted during a reindex gets no
+    vector instead of failing the reindex; (10) `vector_status()` returns `PostgresVectorStatus` with `excluded` (NaN,
+    infinity and zero vectors searches leave out; they stay stored) and sets `legacy` while there is any.
+    `PostgresIndex.refresh()` detects pgvector again. Examples on FX-RANK-0 (`tests/fixtures/ranking/PG-CURRENT.json`,
+    before: `FX-RANK-0.json`): "order_id" in `fts` finds c021-c023 (before also c024 for "identifier" and c012-c014
+    for "order" alone); "REFUND POLICY" in `vector` without pgvector on vectors that are not normalized now ranks like
+    pgvector (Overlap@10 with before 0.2); "invoice refund placeholder" (a zero query vector) finds nothing in
+    `vector` (before c001-c010 in arbitrary order). Score thresholds: none are stored in this repository, the API,
+    Studio or the examples (searched before the change). CI: new jobs `pg-a` (`postgres:17`) and `pg-b`
+    (`pgvector/pgvector:pg17`, `NODESTRO_REQUIRE_PGVECTOR=1`), each with the restricted runtime role, on every
+    Python version; images pinned by digest. New tests: drift cases (`tests/test_pg_drift.py`, T-PG-1/3/4),
+    ranking compatibility (`tests/test_ranking_compat.py`, T-RANK-1/2), upgrade and rollback on FX-PG-0/0v
+    (`tests/test_upgrade_scenarios.py`, U1-U5, U8) and tenant isolation under load
+    (`tests/test_pg_partitions.py`, T-PART-1..9).
 
 ## 0.2.0 (2026-10-29)
 
