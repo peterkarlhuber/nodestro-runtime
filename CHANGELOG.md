@@ -1910,8 +1910,8 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     the runtime. The ten documented PostgreSQL drifts are strict expected failures (`MUP-DRIFT-1` to `-10`, fixed by
     MP-B3); every partition case passes. Through orkexa's `Index` contract the PostgreSQL index now refuses a query
     over 1000 characters or 64 distinct words with `RetrievalError` `query.too_long`, as SQLite does since A10.
-    New catalog code `run.agent.VectorError` (orkexa's vector check). Orkexa pinned to the B1 suite commit `5aa6346`
-    (temporary integration pin).
+    New catalog code `run.agent.VectorError` (orkexa's vector check). Orkexa pinned to `b3d6fae` (orkexa #63, the B1
+    conformance suite).
 
 ## 0.2.0 (2026-10-29)
 
