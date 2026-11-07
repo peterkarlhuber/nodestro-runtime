@@ -1861,6 +1861,16 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     `make_legacy_pg.py` and a restore test (T-FX-1); the ranking corpus FX-RANK-0 with its PostgreSQL results
     (`tests/fixtures/ranking/`, T-RANK-0); every CI pytest job compares its skipped tests with
     `tests/ci/skipped-<job>.txt` (`scripts/check_skips.py`, T-SKIP-1).
+  - A1 (PS-1): PDF text is read with limits in a separate process. Knowledge uploads, input files
+    (`file_formats.extract`) and adoption previews read PDFs through `documents.pdf_pages`, that is orkexa's
+    `pdf_pages_isolated`; the runtime no longer imports orkexa's private `_pdf_pages`, and a knowledge upload no longer
+    reads a PDF a second time in the API process (`Index.add_file`, `pdf_has_text`; `documents.pdf_has_text` is
+    removed). New settings `NODESTRO_PDF_TIMEOUT_SECONDS` (30), `NODESTRO_PDF_MAX_PAGES` (2000),
+    `NODESTRO_PDF_MAX_CHARS` (5,000,000) and `NODESTRO_PDF_MAX_MEMORY_MB` (512, Linux only), read by
+    `documents.pdf_limits`; an invalid value is `document.limits_invalid`. Behavior change: a PDF over a limit is
+    refused with the new code `document.too_complex` (`name`, `reason`) and nothing is stored; a PDF with text only
+    after page 20 is no longer marked as a scan. Orkexa pinned to `f89102c` (orkexa PR #59, MUP-ONA A1, which also
+    brings A10: SQLite integrity checks, the FTS5 race fix and search limits).
 
 ## 0.2.0 (2026-10-29)
 

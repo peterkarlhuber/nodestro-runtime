@@ -627,15 +627,6 @@ Packages of the MUP-ONA plan
 change this repository. Each entry is removed in the
 PR that completes its package. They are tracked by the plan's execution status and not counted in the summary.
 
-### RT-MUP-A1 · PDF extraction with a guaranteed end (MUP-ONA MP-A1)
-
-- **Priority:** P2 Medium · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
-- **What:** Knowledge uploads extract PDF text in the API process (`documents.py` imports orkexa's private `_pdf_pages`,
-  `file_formats.py` has a second path); a thread timeout does not stop `pypdf`.
-- **Next step:** After orkexa's `pdf_pages_isolated`: both paths use it, with the limits configurable
-  (`NODESTRO_PDF_TIMEOUT_SECONDS`, `NODESTRO_PDF_MAX_PAGES`, ...).
-
 ### RT-MUP-A7 · Price sync integrity (MUP-ONA MP-A7, VB-1)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**
@@ -701,7 +692,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 |---|---|---|---|
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | axentra | axentra #42 (`cfa80dc`): IP and request id on login/setup audit events | Runtime pins axentra `0a1d1cc`. #42 adds only optional parameters and does not change what Nodestro calls; runtime `test_axentra_*` and the api server-profile tests pass against `cfa80dc`. Move the pin in the next functional cascade (no cascade of its own) |
-| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `1b61fda`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
+| — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | RT-015 | nodestro-api | API-021 (region in usage views) | Runtime records the region first |

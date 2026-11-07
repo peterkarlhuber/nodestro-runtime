@@ -392,7 +392,7 @@ def _preview_text(ctx: Workspace, source: AdoptSource, item: _Item) -> str:
         from .documents import pdf_pages
 
         try:
-            return "\n\n".join(pdf_pages(item.data))
+            return "\n\n".join(pdf_pages(item.data, item.name))
         except Exception:
             return ""
     return ""
