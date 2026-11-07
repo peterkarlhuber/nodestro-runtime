@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix: a PostgreSQL reindex under steady writes switches again under CI load. The switch embedded at most one batch
+  while writes wait, but writers add about what one unlocked round takes to embed, which under load is more than a
+  batch, so every attempt failed with `vector_incomplete` (T-PART-CC on runtime #133). The switch now embeds what the
+  last round left in batches, up to 256 chunks (or one batch if larger) while writes to the namespace wait; above
+  that, writes outpace the model and `vector_incomplete` still comes back. New test
+  `test_the_switch_embeds_what_the_last_round_left` (fails on the old code).
 - Fix: the sandbox gateway keeps each connection's task alive until it ends. asyncio holds tasks and stream readers only
   weakly, so after `docker run -i` half-closed an attached stream a garbage collection could destroy the task before
   the container's output arrived; the client then saw exit code 0 with no output (seen as a module check reporting
@@ -1946,7 +1952,7 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     infinity and zero vectors searches leave out; they stay stored) and sets `legacy` while there is any.
     A reindex now finishes while chunks keep being added: it embeds in rounds bounded by the chunks that exist at
     each round's start, then switches under a lock on the namespace's vector spaces that every write takes too, so
-    the last chunks are embedded while writes wait (at most one batch); before, a chunk added just before the
+    the last chunks are embedded while writes wait (up to 256 chunks, see the later fix); before, a chunk added just before the
     switch failed it with `vector_incomplete`, and under steady uploads every attempt could fail. If writes still
     outpace the model, `vector_incomplete` comes back as before. The knowledge base's reindex job now fails with
     `knowledge.vector_incomplete` after three such attempts instead of reporting `done` without switching.

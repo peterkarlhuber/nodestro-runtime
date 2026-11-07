@@ -282,3 +282,76 @@ def test_a_reindex_finishes_while_writers_keep_adding(database: Any, ranking: st
     assert {hit.source for hit in make(new).retrieve("steady beta", 100, mode="vector")} >= {
         f"steady-{number}.md" for number in range(len(writers))
     }
+
+
+# MUP-ONA T-PART-7
+@pytest.mark.parametrize("ranking", ["database", "runtime"])
+@pytest.mark.parametrize("switch_chunks", [256, 16])
+def test_the_switch_embeds_what_the_last_round_left(
+    database: Any, ranking: str, switch_chunks: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writers add more than a batch during every unlocked round (five chunks per request of four), so the rounds
+    never get below one batch. Before, the switch embedded at most one batch and failed every attempt with
+    ``vector_incomplete`` (T-PART-CC under CI load). Now it embeds the rest while writes wait, up to
+    ``_REINDEX_SWITCH_CHUNKS``; above that, writes outpace the model and the reindex still says so."""
+    from nodestro_runtime import postgres_tables
+    from nodestro_runtime.postgres_tables import PostgresIndex
+
+    if ranking == "database" and not PostgresIndex(database, TENANTS[0], namespace="probe").pgvector():
+        postgres_support.require_pgvector()
+    monkeypatch.setattr(postgres_tables, "_REINDEX_SWITCH_CHUNKS", switch_chunks)
+    old, new = KeywordEmbeddings("burst-old"), KeywordEmbeddings("burst-new")
+
+    def make(model: KeywordEmbeddings | None) -> PostgresIndex:
+        index = PostgresIndex(database, "part-b", namespace=f"burst-{switch_chunks}", embeddings=model)
+        if ranking == "runtime":
+            index._pgvector = False
+        return index
+
+    for number in range(20):
+        make(old).add(f"Base note {number} about alpha.", source=f"base-{number}.md")
+    writers: list[threading.Thread] = []
+    errors: list[str] = []
+    added = [0]
+
+    def write(first: int) -> None:
+        try:
+            for number in range(first, first + 5):
+                for model in (old, new):
+                    try:
+                        make(model).add(f"Burst note {number} about beta.", source=f"burst-{number}.md")
+                        break
+                    except RetrievalError as exc:
+                        if exc.code != "reindex_required":
+                            raise
+        except BaseException as exc:  # reported below
+            errors.append(f"burst-{first}: {type(exc).__name__}: {exc}")
+
+    reindexing = threading.current_thread()
+
+    def on_embed(_texts: Any) -> None:
+        if threading.current_thread() is not reindexing:
+            return
+        writer = threading.Thread(target=write, args=(added[0],))
+        added[0] += 5
+        writers.append(writer)
+        writer.start()
+        writer.join(0.05)  # done at once while unlocked; at the switch it waits, and adds after it
+
+    new.on_embed = on_embed
+    try:
+        if switch_chunks < 20:
+            with pytest.raises(RetrievalError) as raised:
+                make(None).reindex(new, batch_size=4)
+            assert raised.value.code == "vector_incomplete"
+        else:
+            status = make(None).reindex(new, batch_size=4)  # one call
+            assert status.active is not None and status.active["model"] == "burst-new", status
+    finally:
+        new.on_embed = None
+        for writer in writers:
+            writer.join(30)
+    assert errors == []
+    if switch_chunks >= 20:
+        final = make(new).vector_status()
+        assert final.chunks == 20 + added[0] and final.embedded == final.chunks, final
