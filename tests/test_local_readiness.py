@@ -63,7 +63,10 @@ def managed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Workspa
 
 
 def _plenty(monkeypatch: pytest.MonkeyPatch, free: int | None = 10**12) -> None:
+    """``free`` bytes in the models folder for the readiness check and for a download's own disk check, whatever
+    the disk of the test machine has free."""
     monkeypatch.setattr("nodestro_runtime.local_readiness._free_bytes", lambda folder: free)
+    monkeypatch.setattr("nodestro_runtime.local_service._free_bytes", lambda folder: free)
 
 
 def test_an_installed_model_is_ready_and_a_cloud_model_is_not_checked(managed: Workspace) -> None:
