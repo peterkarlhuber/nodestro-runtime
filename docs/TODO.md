@@ -616,12 +616,15 @@ PR that completes its package. They are tracked by the plan's execution status a
 
 ### RT-MUP-B4 · Generic PostgreSQL parts decoupled, statement catalog (MUP-ONA MP-B4)
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md)
+- **Priority:** P3 Low · **Status:** In progress · **Refs:**
+  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md),
+  `sqlcheck_rules.py`, `tests/fixtures/sql_parity_before.json`
 - **What:** The generic PostgreSQL index, file store and memory code is mixed with product code; its SQL is not a
   catalog.
-- **Next step:** Prepare the generic part for orkexa with a statement catalog while proving the tenant SQL check keeps
-  its coverage (T-PAR). Needs gate G1.
+- **Done (PR 1, `mup/b4-sqlcheck-engine`):** parity baseline checked in before any change; the rule engine of the
+  tenant SQL check separated as `sqlcheck_rules.py` (parameterized, import-linter contract, T-SQLC-1).
+- **Next step:** PR 2 (`mup/b4-pg-catalog`): `ConnectionSource`, statement catalog, executor with partition guard,
+  T-CAT-1..4, T-GUARD-1/2 and the parity test T-PAR-1 against the baseline. Gate G1 is granted.
 
 ### RT-MUP-B6 · Switch to orkexa's PostgreSQL backend (MUP-ONA MP-B6)
 

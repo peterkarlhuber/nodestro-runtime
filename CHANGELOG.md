@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- MUP-ONA B4 (PR 1 of 2): the rule engine of the tenant SQL check is a module of its own,
+  `nodestro_runtime.sqlcheck_rules`: `check_statement(sql, *, tenant_tables, column="tenant_id",
+  placeholder="psycopg", allow_any=False)` returns `Finding(kind, position, message)` items (`leak`, `unparsed`,
+  `unsupported`). Its rules are unchanged, moved and parameterized (partition column, tenant tables, placeholder
+  style); it holds no Nodestro constant and no allowlist and imports only `pglast` and the standard library, enforced
+  by a new import-linter contract (`lint-imports` in the CI `test` job; `import-linter` joins the `dev` extra), so
+  orkexa can take it over as `orkexa.testing.sqlcheck` (B5). `tenant_sql_check.py` keeps the migration table
+  detection, the source reconstruction, the allowlist and the skip rules and calls the engine; its public names
+  (`check_sql`, `scan_package`, `statements_of`, `tenant_tables`, `Report`, `Finding`, `to_postgres_params`) and
+  messages are unchanged, `tenant_id = ANY(<param>)` still needs an allowlist entry (A11, O12). Two allowlist entries
+  that only covered the checker's own problem messages are gone. The SQL parity baseline
+  `tests/fixtures/sql_parity_before.json` (46 statements of `postgres_tables.py`, written by
+  `tests/fixtures/make_sql_parity.py` before any change) is the "before" side of the parity test of PR 2. New tests
+  `tests/test_sqlcheck_rules.py`, among them T-SQLC-1 (the engine with the column `org_id` and tables `t_docs`,
+  `t_notes`, and every baseline statement renamed to them).
 - Orkexa pinned to `028faa1` (orkexa #64, MUP-ONA B2): the SQLite backends moved to `orkexa.backends.sqlite`; every
   old import path returns the same class, behavior unchanged. No code change here; RT-069 records the private
   attributes Nodestro still uses.
