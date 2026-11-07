@@ -358,11 +358,17 @@ class PostgresIndex(Index):
         return int(rows[0][0])
 
     def pgvector(self) -> bool:
-        """Whether the database ranks vectors itself (pgvector is installed)."""
+        """Whether the database ranks vectors itself (pgvector is installed). Detected once; :meth:`refresh` detects
+        it again."""
         if self._pgvector is None:
             rows = self.database._query("SELECT to_regtype('vector') IS NOT NULL")
             self._pgvector = bool(rows and rows[0][0])
         return self._pgvector
+
+    def refresh(self) -> None:
+        """Forget what was detected about the database (pgvector), so the next search detects it again: after an
+        administrator installs (``CREATE EXTENSION vector``) or removes pgvector while the server runs."""
+        self._pgvector = None
 
     def vector_status(self) -> PostgresVectorStatus:
         """The vector state of this namespace, with the active space's vectors searches leave out (drift 10)."""

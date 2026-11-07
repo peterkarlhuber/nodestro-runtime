@@ -41,6 +41,7 @@ tests.test_knowledge_retrieval::test_uploads_work_while_the_model_server_is_down
 tests.test_legacy_fixtures::test_restored_fixture_passes_the_migration_check_and_keeps_its_data[FX-PG-0v.sql.gz]  # FX-PG-0v needs a server with pgvector; the test job's service is postgres:17 (runs in pg-b)
 tests.test_local_registry::test_live_registry  # reads registry.ollama.ai, opt-in (NODESTRO_LIVE_REGISTRY=1)
 tests.test_mcp_stdio::test_a_real_third_party_server_runs_in_the_sandbox_container  # real Docker images run in the docker job (NODESTRO_DOCKER_TESTS)
+tests.test_pg_drift::test_refresh_detects_pgvector_again  # the test job's service postgres:17 has no pgvector (runs in pg-b)
 tests.test_pgvector_status::test_states_on_a_real_server  # needs a PostgreSQL server with pgvector (NODESTRO_TEST_PGVECTOR); the test job's service postgres:17 has none (runs in pg-b)
 tests.test_report_formats::test_excel_files_open_with_typed_cells  # openpyxl is not installed (not a dev dependency)
 tests.test_report_formats::test_word_files_open_with_their_content  # python-docx is not installed (not a dev dependency)

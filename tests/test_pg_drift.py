@@ -273,3 +273,34 @@ def test_vectors_left_out_are_counted_until_a_reindex_replaces_them(make: Callab
     status = index.reindex(KeywordEmbeddings("drift-replacement"))
     assert (status.legacy, status.excluded, status.complete) == (False, 0, True)
     assert {hit.source for hit in index.retrieve("beta gamma delta", 10, mode="vector")} >= {"nan.md", "inf.md"}
+
+
+# ---- refresh(): pgvector installed or removed while the server runs ------------------------------------------
+
+
+# MUP-ONA T-PG-4
+def test_refresh_detects_pgvector_again(database: Any) -> None:
+    from psycopg import sql
+
+    from nodestro_runtime.postgres_tables import PostgresIndex
+
+    index = PostgresIndex(database, TENANT, namespace="refresh", embeddings=KeywordEmbeddings())
+    index.add("A chunk about alpha.", source="a.md")
+    index.add("A chunk about beta.", source="b.md")
+    detected = index.pgvector()
+    index._pgvector = not detected  # a stale detection
+    index.refresh()
+    assert index.pgvector() is detected
+    if not detected:
+        postgres_support.require_pgvector_or_skip("T-PG-4 installs pgvector while the index is open")
+    expected = [(hit.source, hit.score) for hit in index.retrieve("alpha", 2, mode="vector")]
+    owner = postgres_support.owner_of(database)
+    owner._write("DROP EXTENSION vector", ())
+    index.refresh()
+    assert index.pgvector() is False
+    assert [(hit.source, hit.score) for hit in index.retrieve("alpha", 2, mode="vector")] == expected
+    owner._write(sql.SQL("CREATE EXTENSION vector SCHEMA {}").format(sql.Identifier(database.schema)), ())
+    assert index.pgvector() is False  # detected once, until refresh()
+    index.refresh()
+    assert index.pgvector() is True
+    assert [(hit.source, hit.score) for hit in index.retrieve("alpha", 2, mode="vector")] == expected
