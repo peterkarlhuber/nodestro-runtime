@@ -22,7 +22,7 @@ classifiers = [
 dependencies = [
     # The agent library, at the exact commit Nodestro was validated with (orkexa has no tags). Every orkexa requirement
     # in this file names the same commit; move them together.
-    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
+    "orkexa[all,pdf,local,convert] @ git+https://github.com/peterkarlhuber/orkexa.git@744c9a173c7f45e388fc2180d6d92d207d8b50d5",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
@@ -42,7 +42,7 @@ dependencies = [
 # Every Axentra requirement below names the same commit (MUP-ONA B0); move them together.
 postgres = [
     # Orkexa's PostgreSQL backends (orkexa.backends.postgres, MUP-ONA B6) under the knowledge base and memory.
-    "orkexa[postgres] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
+    "orkexa[postgres] @ git+https://github.com/peterkarlhuber/orkexa.git@744c9a173c7f45e388fc2180d6d92d207d8b50d5",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
@@ -50,7 +50,7 @@ postgres = [
 dev = [
     # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's
     # own parser pglast; tests/test_tenant_filters.py, tests/test_sql_catalog.py).
-    "orkexa[postgres,sqlcheck] @ git+https://github.com/peterkarlhuber/orkexa.git@950c81e3d94f792775e7e85ba6e3906a72b0d847",
+    "orkexa[postgres,sqlcheck] @ git+https://github.com/peterkarlhuber/orkexa.git@744c9a173c7f45e388fc2180d6d92d207d8b50d5",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
