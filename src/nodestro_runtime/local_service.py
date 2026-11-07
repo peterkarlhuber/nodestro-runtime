@@ -923,7 +923,7 @@ class LocalModelService:
                 tracker.finish("check", detail=detail)
             else:
                 tracker.skip("check", note="not_here")
-            progress = PullProgress(tracker, present)
+            progress = PullProgress(tracker, present, _download_sizes(name, tracker))
             for item in client.pull(name, cancel=cancel):
                 progress.update(item.status, item.digest, item.total, item.completed)
 
@@ -1432,6 +1432,21 @@ def _existing_dir(path: str) -> Path:
     if not folder.is_dir():
         raise NodestroError("local.folder_missing", f"{folder} is not a folder", path=str(folder))
     return folder
+
+
+def _download_sizes(name: str, tracker: Tracker) -> dict[str, int] | None:
+    """The size of every file of ``name``'s download from the Ollama registry, for a remaining time of the whole
+    download from its start (RT-064); ``None`` (logged) when the registry cannot tell, e.g. without internet access
+    here or for a model of another host. Ollama's own report stays the source of the progress."""
+    from .local_registry import RegistryError, download_sizes
+
+    try:
+        sizes = download_sizes(name)
+    except RegistryError as exc:
+        tracker.log(f"manifest: the registry did not give the download size ({str(exc)[:160]})")
+        return None
+    tracker.log(f"manifest: {len(sizes)} files, {sum(sizes.values())} bytes (registry)")
+    return sizes
 
 
 def _model_name(name: str) -> str:

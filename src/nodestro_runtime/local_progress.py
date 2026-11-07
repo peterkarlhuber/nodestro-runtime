@@ -350,17 +350,36 @@ class PullProgress:
     """Ollama's ``/api/pull`` statuses as steps, with the bytes of all files of the model added up.
 
     Ollama reports one line per file (layer) with that file's ``total`` and ``completed``; the sum over the files
-    seen so far is the job's progress. Its total is final once Ollama verifies the download (it does so after the
-    last file), so until then ``total_final`` is false and no remaining time is given. A file that is already there
-    (complete, or partly from an interrupted download that Ollama continues) counts as ``resumed_bytes``."""
+    seen so far is the job's progress. Without ``expected`` its total is final once Ollama verifies the download (it
+    does so after the last file), so until then ``total_final`` is false and only the current file gets a remaining
+    time. With ``expected`` (every file's size from the registry manifest, RT-064) the total is final from the first
+    file on and the remaining time covers the whole download, as long as every file Ollama names is one of them with
+    that size; a file that is not (another registry, a tag that moved) drops ``expected`` for the rest of the job. A
+    file that is already there (complete, or partly from an interrupted download that Ollama continues) counts as
+    ``resumed_bytes``."""
 
-    def __init__(self, tracker: Tracker, present: dict[str, int] | None = None) -> None:
+    def __init__(
+        self, tracker: Tracker, present: dict[str, int] | None = None, expected: dict[str, int] | None = None
+    ) -> None:
         """``present``: bytes already in the model folder before the download started, by digest
-        (``sha256:<hex>``): complete files with their size, partial ones with the bytes Ollama recorded for them."""
+        (``sha256:<hex>``): complete files with their size, partial ones with the bytes Ollama recorded for them.
+        ``expected``: the size of every file of the download by digest, from the registry manifest."""
         self.tracker = tracker
         self.layers: dict[str, JobLayer] = {}
         self.present = dict(present or {})
+        self.expected = dict(expected) if expected else None
         self.statuses: list[str] = []
+
+    def _expected_matches(self, layer: JobLayer) -> bool:
+        """Whether ``expected`` still describes this download (``layer`` was just reported); drops it if not."""
+        if self.expected is None:
+            return False
+        size = self.expected.get(layer.digest)
+        if size is None or (layer.total is not None and layer.total != size):
+            self.expected = None
+            self.tracker.log(f"{layer.digest[:19]}: not in the registry manifest; the overall size is not known yet")
+            return False
+        return True
 
     def update(self, status: str, digest: str = "", total: int | None = None, completed: int | None = None) -> None:
         tracker, job = self.tracker, self.tracker.job
@@ -385,9 +404,18 @@ class PullProgress:
                 layer.total = total
             if completed is not None:
                 layer.completed = max(layer.completed, completed)
-            known = [item.total for item in self.layers.values()]
             done = sum(item.completed for item in self.layers.values())
-            tracker.progress(done, sum(item or 0 for item in known) or None, final=False)
+            if self._expected_matches(layer) and self.expected is not None:
+                # Files Ollama has not named yet count with what is already there of them.
+                waiting = sum(
+                    min(self.present.get(digest, 0), size)
+                    for digest, size in self.expected.items()
+                    if digest not in self.layers
+                )
+                tracker.progress(done + waiting, sum(self.expected.values()), final=True)
+            else:
+                known = [item.total for item in self.layers.values()]
+                tracker.progress(done, sum(item or 0 for item in known) or None, final=False)
         elif status.startswith("verifying"):
             self._final()
             tracker.enter("verify")

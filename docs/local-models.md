@@ -54,9 +54,16 @@ indeterminate bar. Nothing is estimated:
   Ollama's own `-partial-N` records in the models folder, read before the pull starts, so the value is exact.
 
 **Model downloads (Ollama 0.40).** `/api/pull` names one file (layer) at a time and gives its size only when that
-file starts. So the overall total is not known up front. `PullProgress` sums the files seen so far with
-`total_final=False`, and lists each in `layers`. It sets `total_final=True` at `verifying sha256 digest`, when all
-files are known. The interface measures the current file until then, so the bar never jumps back.
+file starts, so Ollama never reports the overall total up front. Before the pull the runtime therefore reads the
+model's manifest from Ollama's public registry (`local_registry.download_sizes`: one HTTPS request of a few
+kilobytes, logged as `manifest: N files, B bytes (registry)`). With it `PullProgress` has the size of every file from
+the first one on: `total` is the whole download, `total_final=True`, and `eta_scope` is `job`; files that are already
+in the model folder count as done. As soon as Ollama names a file the manifest does not list, or with another size
+(another registry, a tag that moved meanwhile), the manifest is dropped for the rest of the job (logged). Without the
+manifest (no internet access here, a model of another host such as `hf.co/...`) `PullProgress` sums the files seen
+so far with `total_final=False`, lists each in `layers`, gives the remaining time of the current file
+(`eta_scope=file`) and sets `total_final=True` at `verifying sha256 digest`, when all files are known. Ollama's own
+report stays the source of `completed` in both cases.
 
 **Errors and retry.** Error codes are kept from the bottom up:
 
@@ -94,6 +101,14 @@ not, why and what may this person do? `diagnose(ws, model, action=, needs=, can_
   `server_unreachable`, `server_missing`, `model_name_invalid` (also Ollama cloud names), `disk_full` (catalog size
   against the free space of the model folder, partial files counted), `capability_missing` (`ModelNeeds`: kind chat
   or embedding, capabilities such as `tools` or `structured_output` from `/api/show`), `hardware_insufficient`.
+- Before a download: for a model that is neither installed nor in the catalog and an action that needs capabilities,
+  `local_registry.registry_facts` reads the registry manifest, config and prompt template (never the weights; not in
+  the strict offline mode, not on a server, only names of Ollama's public registry; cached for an hour, failures for
+  ten minutes). A capability it proves missing is reported as `capability_missing` with `from_registry=true` and no
+  download is offered. Only `tools` can be proven missing there: no built-in parser (`parser`/`renderer` in the
+  config) and no `.Tools` in the template, which is how Ollama derives it. Vision, thinking, completion and
+  embedding need the model file's GGUF metadata and stay unknown until after the download; any registry failure is
+  "unknown", never an error.
 - `location` (`this_computer`, `container`, `remote` with `host`, `server` for the server profile) and `mode`.
 - `actions`, computed here and only here (`_offered`): `download`, `setup_server`, `retry`, `choose_model`,
   `ask_admin`, `open_settings`. `blocked` says why no download is offered: `permission` (no install permission),
