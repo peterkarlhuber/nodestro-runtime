@@ -2,7 +2,10 @@
 
 After a full use (connect, discover, approve, a workflow run that calls the tool) the token is searched in the log
 output, the exported run trace, every file of the data folder (SQLite database, ``-wal`` and ``-shm`` files) and,
-with ``NODESTRO_TEST_POSTGRES``, in every row of every table of the tenant's PostgreSQL schema.
+with ``NODESTRO_TEST_POSTGRES``, in every row of every table of the tenant's PostgreSQL schema (``bytea`` columns as
+their raw bytes). The files and the PostgreSQL rows are searched for the token itself and for its encoded forms:
+Base64 and URL-safe Base64 (at every byte alignment, so also inside a longer encoded value), URL encoding and hex
+(re-review L-2, RT-026).
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import urllib.parse
 
 from mcp_support import LoopbackServer, serve
 import pytest
@@ -26,6 +30,54 @@ from nodestro_runtime.workspace import Workspace
 
 TOKEN = "l8-Zq7vXw2Rt9Kp4Ls6Nd"
 TOOL = "mcp__catalog__search"
+
+
+def _base64_forms(data: bytes) -> list[bytes]:
+    """The part of the Base64 (and URL-safe Base64) of ``data`` that does not depend on the bytes around it, for each
+    of the three positions ``data`` can have inside a longer encoded value."""
+    forms = []
+    for shift in range(3):
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            encoded = encode(b"\0" * shift + data)
+            start = -(-shift * 4 // 3)  # the first character made of the token's bits only
+            end = (shift + len(data)) * 8 // 6  # the last one that does not include padding bits
+            forms.append(encoded[start:end])
+    return forms
+
+
+def _token_forms(token: str) -> list[bytes]:
+    raw = token.encode()
+    return list(
+        dict.fromkeys(
+            [
+                raw,
+                urllib.parse.quote(token, safe="").encode(),
+                urllib.parse.quote_plus(token).encode(),
+                raw.hex().encode(),
+                raw.hex().upper().encode(),
+                *_base64_forms(raw),
+            ]
+        )
+    )
+
+
+#: Everything that counts as the token showing up.
+TOKEN_FORMS = _token_forms(TOKEN)
+
+
+def _holds_token(data: bytes | str) -> bool:
+    found = data.encode() if isinstance(data, str) else data
+    return any(form in found for form in TOKEN_FORMS)
+
+
+def test_the_search_finds_encoded_forms_of_the_token() -> None:
+    """Control for the searches below: every encoded form is found, also inside a longer encoded value."""
+    for prefix in (b"", b"a", b"ab", b"abc"):
+        blob = prefix + TOKEN.encode() + b"tail"
+        assert _holds_token(base64.b64encode(blob)) and _holds_token(base64.urlsafe_b64encode(blob))
+    assert _holds_token(urllib.parse.quote("token=" + TOKEN, safe=""))
+    assert _holds_token(TOKEN.encode().hex()) and _holds_token(memoryview(TOKEN.encode()).tobytes())
+    assert not _holds_token(base64.b64encode(b"something else entirely"))
 
 
 @pytest.fixture
@@ -53,10 +105,11 @@ def _flow() -> WorkflowIn:
     )
 
 
-def _files_holding(root: Path, needle: bytes) -> list[str]:
+def _files_holding(root: Path) -> list[str]:
+    """The files under ``root`` that hold the token in any of its forms."""
     found = []
     for path in root.rglob("*"):
-        if path.is_file() and needle in path.read_bytes():
+        if path.is_file() and _holds_token(path.read_bytes()):
             found.append(str(path.relative_to(root)))
     return found
 
@@ -83,15 +136,15 @@ async def test_the_token_is_nowhere_in_logs_traces_or_data_files(
         assert done.status == "succeeded", done.error
         assert any(r["headers"].get("authorization") == f"Bearer {TOKEN}" for r in server.requests)  # it was used
         # The exported trace (the run as JSON) and the API views.
-        assert TOKEN not in done.model_dump_json()
+        assert not _holds_token(done.model_dump_json())
         assert TOKEN not in workspace.mcp.view(workspace.mcp.server(added.id)).model_dump_json()
         assert TOKEN not in str([event.model_dump() for event in workspace.mcp.events()])
         # The data folder while the database is open (write-ahead log still present) ...
-        assert _files_holding(data, TOKEN.encode()) == []
+        assert _files_holding(data) == []
     finally:
         workspace.close()
     # ... and after it was checkpointed and closed.
-    assert _files_holding(data, TOKEN.encode()) == []
+    assert _files_holding(data) == []
     assert TOKEN not in caplog.text
 
 
@@ -108,8 +161,13 @@ async def test_the_token_is_nowhere_in_the_postgres_schema(
     nowhere else); storage, vault, discovery, approval and the call are the server's own."""
     import postgres_support
 
-    pytest.importorskip("psycopg")
-    import psycopg
+    dsn = postgres_support.require_postgres()
+    try:
+        import psycopg
+    except ImportError:  # never a silent skip where PostgreSQL is required (re-review L-2)
+        if postgres_support.REQUIRED:
+            pytest.fail("NODESTRO_REQUIRE_POSTGRES=1 but psycopg is not installed")
+        pytest.skip("psycopg is not installed")
     from psycopg import sql
 
     from nodestro_runtime.engine import RunManager
@@ -120,7 +178,6 @@ async def test_the_token_is_nowhere_in_the_postgres_schema(
     from nodestro_runtime.storage_postgres import PostgresDatabase
     from nodestro_runtime.tool_approvals import ENABLE_ENV, ToolApprovals, audit_events
 
-    dsn = postgres_support.require_postgres()
     schema = postgres_support.new_schema()
     database = PostgresDatabase(dsn, schema=schema)
     database.migrate()
@@ -211,7 +268,7 @@ async def test_the_token_is_nowhere_in_the_postgres_schema(
         assert any("deleted 7" in event for event in events)  # control: the search sees the call's events
         assert TOKEN not in str([event.model_dump() for event in workspace.mcp.events()])
         assert TOKEN not in str([event.model_dump() for event in audit_events(workspace.store)])
-        assert TOKEN not in done.model_dump_json()
+        assert not _holds_token(done.model_dump_json())
         assert TOKEN not in workspace.mcp.view(workspace.mcp.server(added.id)).model_dump_json()
         with psycopg.connect(dsn) as connection:
             tables = [
@@ -225,16 +282,27 @@ async def test_the_token_is_nowhere_in_the_postgres_schema(
             hits = []
             seen = []  # control: the search sees the run's data (its tool results)
             for table in tables:
-                query = sql.SQL("SELECT t::text FROM {}.{} AS t").format(sql.Identifier(schema), sql.Identifier(table))
-                for (row,) in connection.execute(query):
+                columns = connection.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns"
+                    " WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+                    (schema, table),
+                ).fetchall()
+                # bytea as its raw bytes (as text it would be hex), every other column as text.
+                selected = sql.SQL(", ").join(
+                    sql.Identifier(name) if kind == "bytea" else sql.SQL("{}::text").format(sql.Identifier(name))
+                    for name, kind in columns
+                )
+                query = sql.SQL("SELECT {} FROM {}.{}").format(selected, sql.Identifier(schema), sql.Identifier(table))
+                for row in connection.execute(query):
                     rows += 1
-                    if TOKEN in row:
+                    values = [bytes(value) if isinstance(value, memoryview) else value for value in row]
+                    if any(value is not None and _holds_token(value) for value in values):
                         hits.append(table)
-                    if "deleted 7" in row:
+                    if any(isinstance(value, str) and "deleted 7" in value for value in values):
                         seen.append(table)
             assert hits == []
             assert rows > 0 and seen
-        assert _files_holding(tmp_path, TOKEN.encode()) == []
+        assert _files_holding(tmp_path) == []
     finally:
         stop.set()
         await asyncio.wait_for(serving, 30)
