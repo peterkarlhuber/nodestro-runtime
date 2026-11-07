@@ -69,11 +69,13 @@ def _restore(conninfo: str, dump: str) -> None:
 @pytest.fixture
 def restored(request: pytest.FixtureRequest) -> Iterator[str]:
     """A new database with ``request.param`` restored into it; dropped afterwards."""
+    # Skip (or fail under NODESTRO_REQUIRE_POSTGRES=1) before touching psycopg: a plain install without the
+    # postgres extra has no psycopg and must skip these cases, not error.
+    dsn = postgres_support.require_postgres()
     import psycopg
     from psycopg import sql
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-    dsn = postgres_support.require_postgres()
     name = f"nodestro_fx_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True) as admin:
         if (
