@@ -1,0 +1,345 @@
+{
+  "description": "Statements the tenant SQL check finds before MUP-ONA B4 (tests/fixtures/make_sql_parity.py).",
+  "modules": [
+    "nodestro_runtime/postgres_tables.py"
+  ],
+  "tenant_tables": [
+    "nodestro_bootstrap_tokens",
+    "nodestro_chunk_vectors",
+    "nodestro_chunks",
+    "nodestro_documents",
+    "nodestro_files",
+    "nodestro_jobs",
+    "nodestro_login_states",
+    "nodestro_memberships",
+    "nodestro_memory_files",
+    "nodestro_run_events",
+    "nodestro_schedule_firings",
+    "nodestro_sessions",
+    "nodestro_vector_spaces"
+  ],
+  "statements": [
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s AND source = %s",
+      "canonical": "DELETE FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 AND source = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
+      "canonical": "DELETE FROM nodestro_files WHERE tenant_id = $1 AND namespace = $2 AND id = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s",
+      "canonical": "DELETE FROM nodestro_memory_files WHERE tenant_id = $1 AND namespace = $2",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s AND (path = %s OR starts_with(path, %s))",
+      "canonical": "DELETE FROM nodestro_memory_files WHERE tenant_id = $1 AND namespace = $2 AND (path = $3 OR starts_with(path, $4))",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s",
+      "canonical": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space <> %s",
+      "canonical": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2 AND space <> $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space = %s",
+      "canonical": "DELETE FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2 AND space = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding) SELECT c.tenant_id, c.namespace, %s, c.id, %s FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = %s ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
+      "canonical": "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding) SELECT c.tenant_id, c.namespace, $1, c.id, $2 FROM nodestro_chunks AS c WHERE c.tenant_id = $3 AND c.namespace = $4 AND c.id = $5 ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding) VALUES (%s, %s, %s, %s, %s)",
+      "canonical": "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding) VALUES ($1, $2, $3, $4, $5)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_chunks (tenant_id, namespace, source, title, file_id, metadata, text, search_text) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id",
+      "canonical": "INSERT INTO nodestro_chunks (tenant_id, namespace, source, title, file_id, metadata, text, search_text) VALUES ($1, $2, $3, $4, $5, CAST($6 AS jsonb), $7, $8) RETURNING id",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_files (tenant_id, namespace, id, entry, data) VALUES (%s, %s, %s, %s::jsonb, %s) ON CONFLICT (tenant_id, namespace, id) DO UPDATE SET entry = excluded.entry, data = excluded.data",
+      "canonical": "INSERT INTO nodestro_files (tenant_id, namespace, id, entry, data) VALUES ($1, $2, $3, CAST($4 AS jsonb), $5) ON CONFLICT (tenant_id, namespace, id) DO UPDATE SET entry = excluded.entry, data = excluded.data",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content) VALUES (%s, %s, %s, %s) ON CONFLICT (tenant_id, namespace, path) DO UPDATE SET content = excluded.content, updated_at = clock_timestamp()",
+      "canonical": "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, namespace, path) DO UPDATE SET content = excluded.content, updated_at = clock_timestamp()",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state) VALUES (%s, %s, %s, %s::jsonb, %s, 'active')",
+      "canonical": "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state) VALUES ($1, $2, $3, CAST($4 AS jsonb), $5, 'active')",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state) VALUES (%s, %s, %s, %s::jsonb, %s, 'building') ON CONFLICT (tenant_id, namespace, space) DO NOTHING",
+      "canonical": "INSERT INTO nodestro_vector_spaces (tenant_id, namespace, space, identity, dimensions, state) VALUES ($1, $2, $3, CAST($4 AS jsonb), $5, 'building') ON CONFLICT (tenant_id, namespace, space) DO NOTHING",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT DISTINCT source FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s ORDER BY source",
+      "canonical": "SELECT DISTINCT source FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 ORDER BY source",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, c.source, c.title, c.file_id, c.metadata::text, c.text, round((1 - (v.embedding::vector <=> %s::vector))::numeric, 6)::float8 AS score FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s AND NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[]) AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)]) ORDER BY score DESC, c.id LIMIT %s",
+      "canonical": "SELECT c.id, c.source, c.title, c.file_id, CAST(c.metadata AS text), c.text, CAST(round(CAST(1 - (CAST(v.embedding AS vector) <=> CAST($1 AS vector)) AS numeric), 6) AS float8) AS score FROM nodestro_chunk_vectors AS v INNER JOIN nodestro_chunks AS c ON c.id = v.chunk_id WHERE v.tenant_id = $2 AND v.space = $3 AND c.tenant_id = $4 AND c.namespace = $5 AND NOT v.embedding && CAST('{NaN,Infinity,-Infinity}' AS real[]) AND v.embedding <> array_fill(CAST(0 AS real), ARRAY[cardinality(v.embedding)]) ORDER BY score DESC, c.id LIMIT $6",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, c.source, c.title, c.file_id, c.metadata::text, c.text, round((1 - (v.embedding::vector <=> %s::vector))::numeric, 6)::float8 AS score FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s AND c.source = ANY(%s) AND NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[]) AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)]) ORDER BY score DESC, c.id LIMIT %s",
+      "canonical": "SELECT c.id, c.source, c.title, c.file_id, CAST(c.metadata AS text), c.text, CAST(round(CAST(1 - (CAST(v.embedding AS vector) <=> CAST($1 AS vector)) AS numeric), 6) AS float8) AS score FROM nodestro_chunk_vectors AS v INNER JOIN nodestro_chunks AS c ON c.id = v.chunk_id WHERE v.tenant_id = $2 AND v.space = $3 AND c.tenant_id = $4 AND c.namespace = $5 AND c.source = ANY($6) AND NOT v.embedding && CAST('{NaN,Infinity,-Infinity}' AS real[]) AND v.embedding <> array_fill(CAST(0 AS real), ARRAY[cardinality(v.embedding)]) ORDER BY score DESC, c.id LIMIT $7",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id) AND c.id <= %s ORDER BY c.id LIMIT %s",
+      "canonical": "SELECT c.id, c.text FROM nodestro_chunks AS c WHERE c.tenant_id = $1 AND c.namespace = $2 AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors AS v WHERE v.tenant_id = $3 AND v.space = $4 AND v.chunk_id = c.id) AND c.id <= $5 ORDER BY c.id LIMIT $6",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id) ORDER BY c.id LIMIT %s",
+      "canonical": "SELECT c.id, c.text FROM nodestro_chunks AS c WHERE c.tenant_id = $1 AND c.namespace = $2 AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors AS v WHERE v.tenant_id = $3 AND v.space = $4 AND v.chunk_id = c.id) ORDER BY c.id LIMIT $5",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, t.w FROM nodestro_chunks c, unnest(%s::text[], %s::text[]) AS t(w, q) WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = ANY(%s) AND c.search @@ to_tsquery('simple', t.q)",
+      "canonical": "SELECT c.id, t.w FROM nodestro_chunks AS c, unnest(CAST($1 AS text[]), CAST($2 AS text[])) AS t (w, q) WHERE c.tenant_id = $3 AND c.namespace = $4 AND c.id = ANY($5) AND c.search @@ to_tsquery('simple', t.q)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, v.embedding FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s AND NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[]) AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)])",
+      "canonical": "SELECT c.id, v.embedding FROM nodestro_chunk_vectors AS v INNER JOIN nodestro_chunks AS c ON c.id = v.chunk_id WHERE v.tenant_id = $1 AND v.space = $2 AND c.tenant_id = $3 AND c.namespace = $4 AND NOT v.embedding && CAST('{NaN,Infinity,-Infinity}' AS real[]) AND v.embedding <> array_fill(CAST(0 AS real), ARRAY[cardinality(v.embedding)])",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT c.id, v.embedding FROM nodestro_chunk_vectors v JOIN nodestro_chunks c ON c.id = v.chunk_id WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s AND c.source = ANY(%s) AND NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[]) AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)])",
+      "canonical": "SELECT c.id, v.embedding FROM nodestro_chunk_vectors AS v INNER JOIN nodestro_chunks AS c ON c.id = v.chunk_id WHERE v.tenant_id = $1 AND v.space = $2 AND c.tenant_id = $3 AND c.namespace = $4 AND c.source = ANY($5) AND NOT v.embedding && CAST('{NaN,Infinity,-Infinity}' AS real[]) AND v.embedding <> array_fill(CAST(0 AS real), ARRAY[cardinality(v.embedding)])",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT coalesce(max(id), 0) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
+      "canonical": "SELECT COALESCE(max(id), 0) FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT content FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s AND path = %s",
+      "canonical": "SELECT content FROM nodestro_memory_files WHERE tenant_id = $1 AND namespace = $2 AND path = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = %s AND namespace = %s AND space = %s",
+      "canonical": "SELECT count(*) FROM nodestro_chunk_vectors WHERE tenant_id = $1 AND namespace = $2 AND space = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT count(*) FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.namespace = %s AND v.space = %s AND NOT (NOT (v.embedding && '{NaN,Infinity,-Infinity}'::real[]) AND v.embedding <> array_fill(0::real, ARRAY[cardinality(v.embedding)]))",
+      "canonical": "SELECT count(*) FROM nodestro_chunk_vectors AS v WHERE v.tenant_id = $1 AND v.namespace = $2 AND v.space = $3 AND NOT(NOT v.embedding && CAST('{NaN,Infinity,-Infinity}' AS real[]) AND v.embedding <> array_fill(CAST(0 AS real), ARRAY[cardinality(v.embedding)]))",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
+      "canonical": "SELECT count(*) FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id)",
+      "canonical": "SELECT count(*) FROM nodestro_chunks AS c WHERE c.tenant_id = $1 AND c.namespace = $2 AND NOT EXISTS (SELECT 1 FROM nodestro_chunk_vectors AS v WHERE v.tenant_id = $3 AND v.space = $4 AND v.chunk_id = c.id)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT data FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
+      "canonical": "SELECT data FROM nodestro_files WHERE tenant_id = $1 AND namespace = $2 AND id = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT entry::text FROM nodestro_files WHERE tenant_id = %s AND namespace = %s",
+      "canonical": "SELECT CAST(entry AS text) FROM nodestro_files WHERE tenant_id = $1 AND namespace = $2",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT entry::text FROM nodestro_files WHERE tenant_id = %s AND namespace = %s AND id = %s",
+      "canonical": "SELECT CAST(entry AS text) FROM nodestro_files WHERE tenant_id = $1 AND namespace = $2 AND id = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s AND id = ANY(%s)",
+      "canonical": "SELECT id, source, title, file_id, CAST(metadata AS text), text FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 AND id = ANY($3)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks, to_tsquery('simple', %s) AS query WHERE tenant_id = %s AND namespace = %s AND search @@ query AND source = ANY(%s) ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
+      "canonical": "SELECT id, source, title, file_id, CAST(metadata AS text), text FROM nodestro_chunks, to_tsquery('simple', $1) AS query WHERE tenant_id = $2 AND namespace = $3 AND search @@ query AND source = ANY($4) ORDER BY ts_rank(search, query, 1) DESC, id LIMIT $5",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT id, source, title, file_id, metadata::text, text FROM nodestro_chunks, to_tsquery('simple', %s) AS query WHERE tenant_id = %s AND namespace = %s AND search @@ query ORDER BY ts_rank(search, query, 1) DESC, id LIMIT %s",
+      "canonical": "SELECT id, source, title, file_id, CAST(metadata AS text), text FROM nodestro_chunks, to_tsquery('simple', $1) AS query WHERE tenant_id = $2 AND namespace = $3 AND search @@ query ORDER BY ts_rank(search, query, 1) DESC, id LIMIT $4",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT namespace, count(*), sum(octet_length(content)) FROM nodestro_memory_files WHERE tenant_id = %s AND starts_with(namespace, %s) GROUP BY namespace ORDER BY namespace",
+      "canonical": "SELECT namespace, count(*), sum(octet_length(content)) FROM nodestro_memory_files WHERE tenant_id = $1 AND starts_with(namespace, $2) GROUP BY namespace ORDER BY namespace",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT path, octet_length(content) FROM nodestro_memory_files WHERE tenant_id = %s AND namespace = %s AND starts_with(path, %s)",
+      "canonical": "SELECT path, octet_length(content) FROM nodestro_memory_files WHERE tenant_id = $1 AND namespace = $2 AND starts_with(path, $3)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT source, count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s GROUP BY source",
+      "canonical": "SELECT source, count(*) FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 GROUP BY source",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space FOR SHARE",
+      "canonical": "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2 ORDER BY space FOR SHARE",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space FOR UPDATE",
+      "canonical": "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2 ORDER BY space FOR UPDATE",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT space, identity::text FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND state = %s",
+      "canonical": "SELECT space, CAST(identity AS text) FROM nodestro_vector_spaces WHERE tenant_id = $1 AND namespace = $2 AND state = $3",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT t.w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s AND search @@ to_tsquery('simple', t.q)) FROM unnest(%s::text[], %s::text[]) AS t(w, q)",
+      "canonical": "SELECT t.w, (SELECT count(*) FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 AND search @@ to_tsquery('simple', t.q)) FROM unnest(CAST($3 AS text[]), CAST($4 AS text[])) AS t (w, q)",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "SELECT text FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s AND source = %s ORDER BY id",
+      "canonical": "SELECT text FROM nodestro_chunks WHERE tenant_id = $1 AND namespace = $2 AND source = $3 ORDER BY id",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "UPDATE nodestro_chunks SET file_id = %s WHERE tenant_id = %s AND namespace = %s AND source = %s",
+      "canonical": "UPDATE nodestro_chunks SET file_id = $1 WHERE tenant_id = $2 AND namespace = $3 AND source = $4",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "UPDATE nodestro_files SET entry = %s::jsonb WHERE tenant_id = %s AND namespace = %s AND id = %s",
+      "canonical": "UPDATE nodestro_files SET entry = CAST($1 AS jsonb) WHERE tenant_id = $2 AND namespace = $3 AND id = $4",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "UPDATE nodestro_memory_files SET path = %s || substr(path, %s), updated_at = clock_timestamp() WHERE tenant_id = %s AND namespace = %s AND (path = %s OR starts_with(path, %s))",
+      "canonical": "UPDATE nodestro_memory_files SET path = $1 || substr(path, $2), updated_at = clock_timestamp() WHERE tenant_id = $3 AND namespace = $4 AND (path = $5 OR starts_with(path, $6))",
+      "findings": [],
+      "allowlisted": false
+    },
+    {
+      "module": "nodestro_runtime/postgres_tables.py",
+      "text": "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = %s AND namespace = %s AND space = %s",
+      "canonical": "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = $1 AND namespace = $2 AND space = $3",
+      "findings": [],
+      "allowlisted": false
+    }
+  ]
+}

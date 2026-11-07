@@ -48,6 +48,8 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
+      # Import contracts (pyproject.toml, [tool.importlinter]): the SQL rule engine stays free of Nodestro (MUP-ONA B4).
+      - run: lint-imports
       # Every pytest step compares its skipped tests with an expectation file (MUP-ONA A0, scripts/check_skips.py):
       # a test that starts or stops being skipped fails the job until the file says why.
       - run: pytest --junitxml=junit-test.xml

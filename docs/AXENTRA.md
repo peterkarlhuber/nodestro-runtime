@@ -154,7 +154,11 @@ milliseconds over a network; a pipeline saves the round trips but not the commit
 
 Instead, a static check keeps every statement bound to one tenant (security review SR-01 found the first version
 unsound: a substring test for `tenant_id` on five tables of the runtime only). `nodestro_runtime/tenant_sql_check.py`,
-run by `tests/test_tenant_filters.py` of the runtime and of the API:
+run by `tests/test_tenant_filters.py` of the runtime and of the API. Since MUP-ONA B4 it has two parts: the source
+side (tables from the migrations, rebuilding statements from Python source, allowlist) stays in `tenant_sql_check.py`;
+whether one statement is bound to one tenant is decided by the rule engine `sqlcheck_rules.py`
+(`check_statement(sql, *, tenant_tables, column, placeholder, allow_any)`), which holds no Nodestro constant and
+imports only `pglast` (import-linter contract), so orkexa can take it over (B5). The rules are:
 
 - tenant tables are every `nodestro_*` table with a `tenant_id` column in the migrations (read at test time, so a new
   table is covered at once): documents, files, chunks, memory files, jobs, run events, schedule firings, sessions,
@@ -221,9 +225,9 @@ that needs it passes only through an allowlist entry whose reason (more than 30 
 exactly one tenant. At the time of this rule neither the runtime nor the API had such a statement, so no entry was
 added.
 
-**Rule for checker changes.** A runtime PR that changes `tenant_sql_check.py`, `tenant_sql_allowlist.py` or a
-migration is ready to merge only when a nodestro-api PR with a temporary integration pin on that runtime commit shows
-a green `tenant-sql` job; both PRs are linked to each other (see `CONTRIBUTING.md`).
+**Rule for checker changes.** A runtime PR that changes `tenant_sql_check.py`, `sqlcheck_rules.py`,
+`tenant_sql_allowlist.py` or a migration is ready to merge only when a nodestro-api PR with a temporary integration
+pin on that runtime commit shows a green `tenant-sql` job; both PRs are linked to each other (see `CONTRIBUTING.md`).
 
 **Remaining isolation risk.** Without row-level security, PostgreSQL itself does not stop a statement that reads or
 changes another tenant's rows in `nodestro_*` tables; the check is a test-time review of source code. What can still
@@ -247,6 +251,10 @@ slip through it:
   ...`) and for fragments such as `"/**/OR true"` and `" IS NOT NULL OR true"`, but other text in front of an unknown
   part (`f"tag {BASE} OR true"`) still slips through: ordinary messages have the same shape (`f"The setting {key} is
   not allowed in a sandbox container"`), so reporting it would flag them;
+- what the rule engine cannot see in a statement it checks: views, functions, triggers and rules on the server that
+  reach a tenant table under another name, and a `search_path` that resolves another name to a tenant table
+  (Nodestro's migrations create no view, trigger or rule, and their one function, `nodestro_created_order`, reads no
+  table);
 - a wrong tenant value in a correctly shaped statement (a store created for the wrong tenant), and the allowlisted
   cross-tenant statements themselves (each has a reason; a changed statement no longer matches and is reviewed again).
 

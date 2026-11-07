@@ -2,8 +2,9 @@
 
 ## Changes to the tenant SQL check or the migrations
 
-A pull request that changes `src/nodestro_runtime/tenant_sql_check.py`, `src/nodestro_runtime/tenant_sql_allowlist.py`
-or a file in `src/nodestro_runtime/migrations/postgres/` is ready to merge only when:
+A pull request that changes `src/nodestro_runtime/tenant_sql_check.py`, its rule engine
+`src/nodestro_runtime/sqlcheck_rules.py`, `src/nodestro_runtime/tenant_sql_allowlist.py` or a file in
+`src/nodestro_runtime/migrations/postgres/` is ready to merge only when:
 
 - a nodestro-api pull request with a temporary integration pin on this pull request's runtime commit shows a green
   `tenant-sql` job (the API scanned with this checker and these migrations), and both pull requests link each other;
