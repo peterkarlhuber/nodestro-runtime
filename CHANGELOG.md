@@ -1885,6 +1885,12 @@ runs, settings and memory stay compatible, and the public Python API is unchange
   - Price sync (A7, VB-1): LiteLLM's cost map is read at a fixed commit and must match the SHA-256 shipped with
     the release (`LITELLM_COMMIT`, `LITELLM_SHA256`); another file is not imported and a warning is logged.
     Price downloads no longer follow redirects. See `docs/pricing-sync.md`.
+  - tests/ci: the tenant SQL check is anchored in CI (A11). `check_sql`/`scan_package` take `allow_any` (default
+    off): `tenant_id = ANY(<param>)` no longer binds a reference and needs an allowlist entry with its reason
+    (no statement of the runtime or the API uses it). The API scan tests carry the marker `tenant_api_scan` and
+    read `NODESTRO_API_SRC`; `NODESTRO_REQUIRE_API_SCAN=1` fails instead of skipping. The new job
+    `tenant-sql-api` scans a public checkout of nodestro-api with this commit's checker, including a planted
+    leak. `CONTRIBUTING.md`: a checker or migration change needs a green nodestro-api `tenant-sql` run.
   - A1 (PS-1): PDF text is read with limits in a separate process. Knowledge uploads, input files
     (`file_formats.extract`) and adoption previews read PDFs through `documents.pdf_pages`, that is orkexa's
     `pdf_pages_isolated`; the runtime no longer imports orkexa's private `_pdf_pages`, and a knowledge upload no longer

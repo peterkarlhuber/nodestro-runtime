@@ -20,6 +20,9 @@ _UNAVAILABLE = SandboxStatus(False, "untested-system", "not available in this te
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "real_sandbox_status: use the computer's real built-in sandbox status")
     config.addinivalue_line("markers", "real_docker_status: use the computer's real Docker status (background check)")
+    config.addinivalue_line(
+        "markers", "tenant_api_scan: scans nodestro-api's source (NODESTRO_API_SRC; CI job tenant-sql-api, MUP-ONA A11)"
+    )
     import postgres_support
 
     if postgres_support.RUNTIME_ROLE_MODE and postgres_support.DSN:

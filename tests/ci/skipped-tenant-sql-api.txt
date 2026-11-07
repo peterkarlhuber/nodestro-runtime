@@ -1,0 +1,2 @@
+# Skipped tests of the CI job tenant-sql-api (MUP-ONA A11; checked by scripts/check_skips.py).
+# Empty by design: with NODESTRO_REQUIRE_API_SCAN=1 no test of the tenant SQL check may be skipped.

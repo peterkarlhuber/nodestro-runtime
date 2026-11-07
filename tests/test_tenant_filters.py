@@ -7,6 +7,12 @@ the API's source, parses each candidate with PostgreSQL's grammar and requires `
 are cross-tenant by design are listed in :mod:`nodestro_runtime.tenant_sql_allowlist` (and the API's own list), each
 with its reason, matched on the whole normalized text.
 
+The API's source comes from ``NODESTRO_API_SRC`` (the directory that holds the ``nodestro_api`` package, or a
+checkout of nodestro-api), else from a checkout next to this one or the installed package. Without any of them the
+API scan (marker ``tenant_api_scan``) is skipped with a fixed reason that the CI skip expectation lists: the CI job
+``tenant-sql-api`` and nodestro-api's own job ``tenant-sql`` scan the API. ``NODESTRO_REQUIRE_API_SCAN=1`` (set in
+``tenant-sql-api``) turns a missing ``NODESTRO_API_SRC`` into a failure (MUP-ONA A11).
+
 The check reads source only; it runs the same with and without ``NODESTRO_TEST_RUNTIME_ROLE``. What it guarantees and
 what it does not: the check's module docstring and ``docs/AXENTRA.md`` ("Remaining isolation risk"). Every bypass of
 the security review (rounds 1 to 4; round 3: issue #89) is a regression test below.
@@ -17,7 +23,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 import importlib
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 import textwrap
 from types import ModuleType
 
@@ -31,15 +39,37 @@ RUNTIME = Path(nodestro_runtime.__file__).parent
 TABLES = tenant_tables(RUNTIME / "migrations" / "postgres")
 
 
-def _api_package() -> tuple[Path, ModuleType] | None:
-    """nodestro_api's source (next to this runtime's checkout, else the installed package) and its allowlist;
-    ``None`` when neither exists."""
+#: The skip reason of the API scan where the API is not available; tests/ci/skipped-test.txt lists it.
+API_SCAN_SKIP = "API covered by nodestro-api job tenant-sql (MUP-ONA A11)"
+
+
+def _api_source(environ: Mapping[str, str]) -> Path | None:
+    """The ``nodestro_api`` package directory: from ``NODESTRO_API_SRC`` (fails when it names none), else next to
+    this runtime's checkout, else the installed package; ``None`` when there is none. With
+    ``NODESTRO_REQUIRE_API_SCAN=1`` only ``NODESTRO_API_SRC`` counts, and a missing one fails instead of skipping."""
+    given = environ.get("NODESTRO_API_SRC", "")
+    required = environ.get("NODESTRO_REQUIRE_API_SCAN") == "1"
+    if given:
+        for root in (Path(given) / "nodestro_api", Path(given) / "src" / "nodestro_api", Path(given)):
+            if root.name == "nodestro_api" and (root / "__init__.py").is_file():
+                return root
+        pytest.fail(f"NODESTRO_API_SRC={given} holds no nodestro_api package")
+    if required:
+        pytest.fail("NODESTRO_REQUIRE_API_SCAN=1 but NODESTRO_API_SRC names no nodestro-api source")
     root = RUNTIME.parents[2] / "nodestro-api" / "src" / "nodestro_api"
-    if not (root / "__init__.py").is_file():
-        try:
-            root = Path(importlib.import_module("nodestro_api").__file__ or "").parent
-        except ImportError:
-            return None
+    if (root / "__init__.py").is_file():
+        return root
+    try:
+        return Path(importlib.import_module("nodestro_api").__file__ or "").parent
+    except ImportError:
+        return None
+
+
+def _api_package(environ: Mapping[str, str] = os.environ) -> tuple[Path, ModuleType] | None:
+    """nodestro_api's source (see :func:`_api_source`) and its allowlist; ``None`` when there is no source."""
+    root = _api_source(environ)
+    if root is None:
+        return None
     path = root / "tenant_sql_allowlist.py"
     if not path.is_file():
         pytest.fail(f"{root} has no tenant_sql_allowlist.py: the API's statements cannot be checked")
@@ -108,13 +138,49 @@ def test_every_runtime_statement_on_tenant_data_is_bound_to_one_tenant() -> None
     _assert_clean(report)
 
 
-def test_every_api_statement_on_tenant_data_is_bound_to_one_tenant() -> None:
+@pytest.mark.tenant_api_scan
+def test_every_api_statement_on_tenant_data_is_bound_to_one_tenant(tmp_path: Path) -> None:
     found = _api_package()
     if found is None:
-        pytest.skip("nodestro_api is neither next to this checkout nor importable: its own test suite checks it")
+        pytest.skip(API_SCAN_SKIP)
     root, allowlist = found
     report = scan_package(root, TABLES, allowlist.ALLOWLIST, allowlist.SKIP_MODULES)
+    # The API's SQL goes through the runtime's stores, so it may hold no statement at all; the scan must see its
+    # modules, and the planted leak below proves it reads them.
+    assert len(list(root.rglob("*.py"))) > 10, f"{root} holds almost no Python modules"
     _assert_clean(report)
+    # MUP-ONA T-CHK-1: the same scan reports a leak planted in a copy of the API's source.
+    copy = tmp_path / "nodestro_api"
+    shutil.copytree(root, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    (copy / "_mup_planted_leak.py").write_text(
+        'PLANTED = "SELECT * FROM nodestro_chunks WHERE namespace = %s"\n', encoding="utf-8"
+    )
+    planted = scan_package(copy, TABLES, allowlist.ALLOWLIST, allowlist.SKIP_MODULES)
+    assert [(f.module, f.kind) for f in planted.findings] == [("nodestro_api/_mup_planted_leak.py", "leak")]
+
+
+# MUP-ONA T-CHK-4
+def test_a_required_api_scan_fails_instead_of_skipping(tmp_path: Path) -> None:
+    with pytest.raises(pytest.fail.Exception, match="NODESTRO_API_SRC"):
+        _api_package({"NODESTRO_REQUIRE_API_SCAN": "1"})
+    with pytest.raises(pytest.fail.Exception, match="holds no nodestro_api package"):
+        _api_package({"NODESTRO_REQUIRE_API_SCAN": "1", "NODESTRO_API_SRC": str(tmp_path / "missing")})
+    with pytest.raises(pytest.fail.Exception, match="holds no nodestro_api package"):
+        _api_package({"NODESTRO_API_SRC": str(tmp_path)})  # a wrong path fails even when not required
+    api = tmp_path / "checkout" / "src" / "nodestro_api"
+    api.mkdir(parents=True)
+    (api / "__init__.py").write_text("", encoding="utf-8")
+    (api / "tenant_sql_allowlist.py").write_text("ALLOWLIST: dict = {}\nSKIP_MODULES: dict = {}\n", encoding="utf-8")
+    for given in (tmp_path / "checkout", tmp_path / "checkout" / "src", api):
+        found = _api_package({"NODESTRO_REQUIRE_API_SCAN": "1", "NODESTRO_API_SRC": str(given)})
+        assert found is not None and found[0] == api
+
+
+# MUP-ONA T-CHK-4
+def test_the_api_scan_is_marked_and_skips_only_with_the_documented_reason() -> None:
+    marked = test_every_api_statement_on_tenant_data_is_bound_to_one_tenant
+    assert any(m.name == "tenant_api_scan" for m in getattr(marked, "pytestmark", []))
+    assert API_SCAN_SKIP == "API covered by nodestro-api job tenant-sql (MUP-ONA A11)"
 
 
 def test_every_allowlist_entry_has_a_reason() -> None:
@@ -180,10 +246,11 @@ def test_the_review_sample_extending_an_allowlisted_statement_is_caught(tmp_path
     assert [f.kind for f in report.findings if f.kind != "stale"] == []
 
 
+@pytest.mark.tenant_api_scan
 def test_the_review_sample_in_the_api_package_is_caught(tmp_path: Path) -> None:
     # The old test scanned only the runtime. The API is scanned too (test above); a leak there is reported.
     if _api_package() is None:
-        pytest.skip("nodestro_api is neither next to this checkout nor importable")
+        pytest.skip(API_SCAN_SKIP)
     report = _scan(
         'Q = "SELECT data FROM nodestro_documents WHERE collection = %s"\n', tmp_path, package="nodestro_api"
     )
@@ -391,12 +458,50 @@ LEAKING = [
 
 @pytest.mark.parametrize("text", BOUND)
 def test_statements_bound_to_one_tenant_pass(text: str) -> None:
-    assert check_sql(text, TABLES) == []
+    # MUP-ONA A11 (O12): `tenant_id = ANY(%s)` binds only with allow_any=True; by default it needs an allowlist entry.
+    assert check_sql(text, TABLES, allow_any=True) == []
+    if "ANY(" not in text:
+        assert check_sql(text, TABLES) == []
 
 
 @pytest.mark.parametrize("text", LEAKING)
 def test_statements_not_bound_to_one_tenant_fail(text: str) -> None:
     assert check_sql(text, TABLES) != []
+
+
+ANY_SAMPLES = [
+    "SELECT data FROM nodestro_documents WHERE tenant_id = ANY(%s)",
+    "SELECT data FROM nodestro_documents WHERE tenant_id = ANY(%s::text[]) AND collection = %s",
+    "DELETE FROM nodestro_jobs WHERE tenant_id = ANY(%(tenants)s)",
+    "SELECT d.data FROM nodestro_documents d WHERE d.tenant_id = ANY(%s)",
+]
+
+
+# MUP-ONA T-CHK-2
+@pytest.mark.parametrize("text", ANY_SAMPLES)
+def test_tenant_id_any_is_a_leak_unless_allowed(text: str) -> None:
+    problems = check_sql(text, TABLES)
+    assert len(problems) == 2 and "is not bound" in problems[0] and "array of tenant ids" in problems[1]
+    assert check_sql(text, TABLES, allow_any=True) == []
+    # ANY on another column binds nothing either way; bound by tenant_id = %s it passes without allow_any.
+    assert check_sql("SELECT data FROM nodestro_documents WHERE tenant_id = %s AND id = ANY(%s)", TABLES) == []
+    assert check_sql("SELECT data FROM nodestro_documents WHERE id = ANY(%s)", TABLES, allow_any=True) != []
+
+
+# MUP-ONA T-CHK-2
+def test_tenant_id_any_passes_only_through_an_allowlist_entry(tmp_path: Path) -> None:
+    source = 'Q = "SELECT data FROM nodestro_documents WHERE tenant_id = ANY(%s)"\n'
+    key = ("sample/sample.py", "SELECT data FROM nodestro_documents WHERE tenant_id = ANY(%s)")
+    reason = "the array always holds exactly the one tenant of the calling store (test sample)"
+    report = _scan(source, tmp_path / "plain")
+    assert {(f.kind, f.module, f.text) for f in report.findings} == {("leak", *key)}
+    _assert_clean(_scan(source, tmp_path / "listed", allowlist={key: reason}))
+    stale = _scan(
+        'Q = "SELECT data FROM nodestro_documents WHERE tenant_id = %s"\n', tmp_path / "stale", allowlist={key: reason}
+    )
+    assert [(f.kind, f.module, f.text) for f in stale.findings] == [("stale", *key)]
+    # allow_any=True is the old rule: the statement passes without an entry.
+    _assert_clean(scan_package(tmp_path / "plain" / "sample", TABLES, {}, {}, allow_any=True))
 
 
 def test_a_statement_is_found_through_implicit_concatenation_and_plus() -> None:
