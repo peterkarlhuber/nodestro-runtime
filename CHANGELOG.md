@@ -1940,6 +1940,12 @@ runs, settings and memory stay compatible, and the public Python API is unchange
     longer "order" or "id" alone (diacritics stay folded on both sides); (9) a chunk deleted during a reindex gets no
     vector instead of failing the reindex; (10) `vector_status()` returns `PostgresVectorStatus` with `excluded` (NaN,
     infinity and zero vectors searches leave out; they stay stored) and sets `legacy` while there is any.
+    A reindex now finishes while chunks keep being added: it embeds in rounds bounded by the chunks that exist at
+    each round's start, then switches under a lock on the namespace's vector spaces that every write takes too, so
+    the last chunks are embedded while writes wait (at most one batch); before, a chunk added just before the
+    switch failed it with `vector_incomplete`, and under steady uploads every attempt could fail. If writes still
+    outpace the model, `vector_incomplete` comes back as before. The knowledge base's reindex job now fails with
+    `knowledge.vector_incomplete` after three such attempts instead of reporting `done` without switching.
     `PostgresIndex.refresh()` detects pgvector again. Examples on FX-RANK-0 (`tests/fixtures/ranking/PG-CURRENT.json`,
     before: `FX-RANK-0.json`): "order_id" in `fts` finds c021-c023 (before also c024 for "identifier" and c012-c014
     for "order" alone); "REFUND POLICY" in `vector` without pgvector on vectors that are not normalized now ranks like

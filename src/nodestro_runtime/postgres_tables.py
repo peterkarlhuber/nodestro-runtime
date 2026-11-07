@@ -62,6 +62,17 @@ if TYPE_CHECKING:
 
 #: Words as SQLite's unicode61 tokenizer sees them: runs of letters and digits.
 _WORD = re.compile(r"[^\W_]+")
+#: Unlocked rounds of a reindex before it switches (PostgresIndex.reindex).
+_REINDEX_ROUNDS = 5
+#: Chunks of a namespace without a vector in a space (params: tenant, namespace, tenant, space).
+_MISSING = (
+    "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
+    " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id)"
+)
+_COUNT_MISSING = (
+    "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
+    " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s AND v.chunk_id = c.id)"
+)
 #: Most sources one search may be limited to (``retrieve(sources=...)``), as in ``orkexa.SQLiteIndex``.
 MAX_SOURCES = 50_000
 #: Stored vectors a search may use. A zero vector has no direction, so no cosine: it is stored (its chunk counts as
@@ -287,6 +298,12 @@ class PostgresIndex(Index):
                 # NaN or infinity: vector.invalid; another length than the model's: vector.dimension (drift 2).
                 validate_vector(vector, identity)
         with self.database._transaction() as db:
+            # The lock a reindex's switch waits for (FOR UPDATE): no chunk is added while it embeds the last ones.
+            db.execute(
+                "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space"
+                " FOR SHARE",
+                (self.tenant_id, self.namespace),
+            )
             space = self._active_for(identity) if identity is not None else None
             for position, chunk in enumerate(kept):
                 row = db.execute(
@@ -450,64 +467,104 @@ class PostgresIndex(Index):
                 (self.tenant_id, self.namespace, space, json.dumps(identity.to_dict()), identity.dimensions),
             )
         total = len(self)
-        while True:
-            if cancel is not None and cancel.is_set():
-                raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
-            rows = self.database._query(
-                "SELECT c.id, c.text FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
-                " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s"
-                " AND v.chunk_id = c.id) ORDER BY c.id LIMIT %s",
-                (self.tenant_id, self.namespace, self.tenant_id, space, batch_size),
-            )
-            if not rows:
+        # Unlocked rounds: embed what exists at the start of each round (high-water mark), so writers that keep
+        # adding chunks cannot keep a round from ending. Stop once at most one batch is left (or after a few rounds).
+        for _round in range(_REINDEX_ROUNDS):
+            high = self.database._query(
+                "SELECT coalesce(max(id), 0) FROM nodestro_chunks WHERE tenant_id = %s AND namespace = %s",
+                (self.tenant_id, self.namespace),
+            )[0][0]
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise RetrievalError("cancelled", "The reindex was cancelled; start it again to continue")
+                rows = self.database._query(
+                    f"{_MISSING} AND c.id <= %s ORDER BY c.id LIMIT %s",
+                    (self.tenant_id, self.namespace, self.tenant_id, space, int(high), batch_size),
+                )
+                if not rows:
+                    break
+                vectors = self._embed_batch(model, identity, rows)
+                with self.database._transaction() as db:
+                    self._store_batch(db, space, rows, vectors)
+                if progress is not None:
+                    progress(self._count_vectors(space), total)
+            if self._count_missing(space) <= batch_size:
                 break
-            vectors = model.embed_documents([str(row[1]) for row in rows])
-            if len(vectors) != len(rows):
-                raise RetrievalError("vector_unavailable", "The embedding model returned a wrong number of vectors")
-            with self.database._transaction() as db:
-                for (chunk_id, _), vector in zip(rows, vectors, strict=True):
-                    if len(vector) != identity.dimensions:
-                        raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
-                    validate_vector(vector)  # NaN or infinity: vector.invalid (drift 2)
-                    # Only while the chunk still exists: one deleted while its batch was embedded gets no vector
-                    # (no foreign key error that ends the reindex, drift 9).
-                    db.execute(
-                        "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
-                        " SELECT c.tenant_id, c.namespace, %s, c.id, %s FROM nodestro_chunks c"
-                        " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = %s"
-                        " ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
-                        (space, [float(x) for x in vector], self.tenant_id, self.namespace, int(chunk_id)),
-                    )
-            if progress is not None:
-                progress(self._count_vectors(space), total)
-        _refresh_identity(model)
-        if model.identity().key != identity.key:
+        # The switch: under a lock on the namespace's spaces that every write takes too (add_chunks, FOR SHARE), so no
+        # chunk can be added between embedding the last ones and switching. Before, a chunk written in that moment
+        # made the switch fail (vector_incomplete) and a reindex under steady writes could fail every time.
+        changed = False
+        with self.database._transaction() as db:
+            db.execute(
+                "SELECT space FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s ORDER BY space"
+                " FOR UPDATE",
+                (self.tenant_id, self.namespace),
+            )
+            rows = db.execute(
+                f"{_MISSING} ORDER BY c.id LIMIT %s",
+                (self.tenant_id, self.namespace, self.tenant_id, space, batch_size + 1),
+            ).fetchall()
+            if len(rows) > batch_size:
+                # Writes outpace the model: embedding more while every write waits would stall them; try later.
+                missing = self._count_missing(space)
+                raise RetrievalError("vector_incomplete", f"{missing} chunks were added during the reindex")
+            if rows:  # at most one batch, embedded while writes wait
+                self._store_batch(db, space, rows, self._embed_batch(model, identity, rows))
+            _refresh_identity(model)
+            changed = model.identity().key != identity.key
+            if not changed:
+                db.execute(
+                    "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space <> %s",
+                    (self.tenant_id, self.namespace, space),
+                )
+                db.execute(
+                    "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = %s AND namespace = %s"
+                    " AND space = %s",
+                    (self.tenant_id, self.namespace, space),
+                )
+        if changed:
             # The model changed on its server while it embedded: the new space may mix two builds.
             self._discard(space)
             raise RetrievalError(
                 "reindex_required",
                 f"{identity.model} changed during the reindex; its new vectors were discarded, start it again",
             )
-        with self.database._transaction() as db:
-            missing = db.execute(
-                "SELECT count(*) FROM nodestro_chunks c WHERE c.tenant_id = %s AND c.namespace = %s AND NOT EXISTS"
-                " (SELECT 1 FROM nodestro_chunk_vectors v WHERE v.tenant_id = %s AND v.space = %s"
-                " AND v.chunk_id = c.id)",
-                (self.tenant_id, self.namespace, self.tenant_id, space),
-            ).fetchone()[0]
-            if missing:
-                raise RetrievalError("vector_incomplete", f"{missing} chunks were added during the reindex")
-            db.execute(
-                "DELETE FROM nodestro_vector_spaces WHERE tenant_id = %s AND namespace = %s AND space <> %s",
-                (self.tenant_id, self.namespace, space),
-            )
-            db.execute(
-                "UPDATE nodestro_vector_spaces SET state = 'active' WHERE tenant_id = %s AND namespace = %s"
-                " AND space = %s",
-                (self.tenant_id, self.namespace, space),
-            )
+        if progress is not None:
+            progress(self._count_vectors(space), total)
         self.embeddings = model
         return self.vector_status()
+
+    def _count_missing(self, space: str) -> int:
+        rows = self.database._query(_COUNT_MISSING, (self.tenant_id, self.namespace, self.tenant_id, space))
+        return int(rows[0][0])
+
+    @staticmethod
+    def _embed_batch(
+        model: EmbeddingModel, identity: EmbeddingIdentity, rows: builtins.list[tuple[Any, ...]]
+    ) -> builtins.list[builtins.list[float]]:
+        """The checked vectors of a batch of ``(chunk id, text)`` rows."""
+        vectors = [[float(x) for x in vector] for vector in model.embed_documents([str(row[1]) for row in rows])]
+        if len(vectors) != len(rows):
+            raise RetrievalError("vector_unavailable", "The embedding model returned a wrong number of vectors")
+        for vector in vectors:
+            if len(vector) != identity.dimensions:
+                raise RetrievalError("vector_unavailable", "The embedding model changed its vector size")
+            validate_vector(vector)  # NaN or infinity: vector.invalid (drift 2)
+        return vectors
+
+    def _store_batch(
+        self, db: Any, space: str, rows: builtins.list[tuple[Any, ...]], vectors: builtins.list[builtins.list[float]]
+    ) -> None:
+        for (chunk_id, _), vector in zip(rows, vectors, strict=True):
+            # Only while the chunk still exists: one deleted while its batch was embedded gets no vector (no foreign
+            # key error that ends the reindex, drift 9).
+            db.execute(
+                "INSERT INTO nodestro_chunk_vectors (tenant_id, namespace, space, chunk_id, embedding)"
+                " SELECT c.tenant_id, c.namespace, %s, c.id, %s FROM nodestro_chunks c"
+                " WHERE c.tenant_id = %s AND c.namespace = %s AND c.id = %s"
+                " ON CONFLICT (tenant_id, space, chunk_id) DO UPDATE SET embedding = excluded.embedding",
+                (space, vector, self.tenant_id, self.namespace, int(chunk_id)),
+            )
 
     def _hits(self, rows: Iterable[tuple[Any, ...]]) -> builtins.list[Hit]:
         return [

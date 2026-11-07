@@ -217,3 +217,68 @@ def test_three_tenants_with_eight_threads_each(database: Any, ranking: str) -> N
     assert stray == [(0,)]
     spaces = owner._query("SELECT tenant_id, state, count(*) FROM nodestro_vector_spaces GROUP BY 1, 2 ORDER BY 1, 2")
     assert spaces == [(tenant, "active", 1) for tenant in TENANTS]
+
+
+# MUP-ONA T-PART-7
+@pytest.mark.parametrize("ranking", ["database", "runtime"])
+def test_a_reindex_finishes_while_writers_keep_adding(database: Any, ranking: str) -> None:
+    """Every embedding request of the reindex lets a writer add a chunk (with the old model, switching to the new one
+    on ``reindex_required``, as the knowledge base does). Before, a chunk added between the last batch and the switch
+    failed the switch (``vector_incomplete``) every time, so a reindex under steady writes never finished (seen in
+    T-PART-CC). Now the switch holds the namespace's lock that writes take: one call finishes, writes made meanwhile
+    wait or land in the new space, and nothing is left without a vector."""
+    from nodestro_runtime.postgres_tables import PostgresIndex
+
+    if ranking == "database" and not PostgresIndex(database, TENANTS[0], namespace="probe").pgvector():
+        postgres_support.require_pgvector()
+    old, new = KeywordEmbeddings("steady-old"), KeywordEmbeddings("steady-new")
+
+    def make(model: KeywordEmbeddings | None) -> PostgresIndex:
+        index = PostgresIndex(database, "part-a", namespace="steady", embeddings=model)
+        if ranking == "runtime":
+            index._pgvector = False
+        return index
+
+    for number in range(20):
+        make(old).add(f"Base note {number} about alpha.", source=f"base-{number}.md")
+    writers: list[threading.Thread] = []
+    errors: list[str] = []
+    waited: list[bool] = []
+
+    def write(number: int) -> None:
+        try:
+            for model in (old, new):
+                try:
+                    make(model).add(f"Steady note {number} about beta.", source=f"steady-{number}.md")
+                    return
+                except RetrievalError as exc:
+                    if exc.code != "reindex_required":
+                        raise
+            errors.append(f"steady-{number}: not written")
+        except BaseException as exc:  # reported below
+            errors.append(f"steady-{number}: {type(exc).__name__}: {exc}")
+
+    reindexing = threading.current_thread()
+
+    def on_embed(_texts: Any) -> None:
+        if threading.current_thread() is not reindexing:
+            return  # a writer embedding with the new model after the switch
+        writer = threading.Thread(target=write, args=(len(writers),))
+        writers.append(writer)
+        writer.start()
+        writer.join(0.5)  # done at once, unless the switch holds the lock: then it waits for the switch
+        waited.append(writer.is_alive())
+
+    new.on_embed = on_embed
+    status = make(None).reindex(new, batch_size=4)  # one call: no vector_incomplete
+    new.on_embed = None
+    for writer in writers:
+        writer.join(30)
+    assert errors == []
+    assert status.active is not None and status.active["model"] == "steady-new" and status.building is None
+    assert waited[-1] and not any(waited[:-1]), waited  # only the switch's own batch made a writer wait
+    final = make(new).vector_status()
+    assert final.chunks == 20 + len(writers) and final.embedded == final.chunks, final
+    assert {hit.source for hit in make(new).retrieve("steady beta", 100, mode="vector")} >= {
+        f"steady-{number}.md" for number in range(len(writers))
+    }
