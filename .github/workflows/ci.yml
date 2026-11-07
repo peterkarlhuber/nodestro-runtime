@@ -46,14 +46,21 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
-      - run: pytest
+      # Every pytest step compares its skipped tests with an expectation file (MUP-ONA A0, scripts/check_skips.py):
+      # a test that starts or stops being skipped fails the job until the file says why.
+      - run: pytest --junitxml=junit-test.xml
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-test.xml tests/ci/skipped-test.txt
       # The PostgreSQL tests again as a production server runs: a restricted runtime role (no DDL, no BYPASSRLS, owns
       # nothing) for every database the tests open; the CI user stays the owner that migrates (tests/postgres_support.py).
       - name: PostgreSQL tests as the restricted runtime role
         if: matrix.python == '3.13'
         env:
           NODESTRO_TEST_RUNTIME_ROLE: "1"
-        run: pytest $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+        run: pytest --junitxml=junit-test-runtime-role.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+      - name: Skipped tests as expected (restricted runtime role)
+        if: matrix.python == '3.13'
+        run: python scripts/check_skips.py junit-test-runtime-role.xml tests/ci/skipped-test-runtime-role.txt
       # Known vulnerabilities in the installed dependencies (as orkexa's CI checks them). Blocking: an advisory that
       # was reviewed and cannot be fixed yet goes into PIP_AUDIT_IGNORE (space-separated IDs, with the reason here).
       - name: Dependency audit
@@ -85,13 +92,17 @@ jobs:
         run: |
           pip install -e ".[dev]"
       - run: docker info
-      - run: pytest tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
+      - run: pytest --junitxml=junit-docker.xml tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-docker.xml tests/ci/skipped-docker.txt
       # The dependency-resolve path (RT-038) on this engine: the pinned resolver image from ghcr.io by digest, its
       # self-test with the resolve limits, the resolve container's effective limits, network and environment, timeout,
       # cancel and cleanup, and one pure-Python wheel resolved from PyPI. Under NODESTRO_REQUIRE_DOCKER an unproven
       # daemon fails these tests instead of skipping them.
       - name: Dependency resolve on the real engine
-        run: pytest -v tests/test_resolve_real_engine.py
+        run: pytest -v --junitxml=junit-docker-resolve.xml tests/test_resolve_real_engine.py
+      - name: Skipped tests as expected (dependency resolve)
+        run: python scripts/check_skips.py junit-docker-resolve.xml tests/ci/skipped-docker-resolve.txt
 
   builtin-sandbox:
     # Security probes and compatibility checks of the built-in Linux sandbox (Landlock + seccomp, ADR-0006) as the
@@ -116,7 +127,9 @@ jobs:
         run: |
           id; uname -r; cat /sys/kernel/security/lsm; echo
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
-      - run: pytest -s tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+      - run: pytest -s --junitxml=junit-builtin-sandbox.xml tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-builtin-sandbox.xml tests/ci/skipped-builtin-sandbox.txt
       - name: Python environment with a compiled library, installed offline from hash-pinned wheels
         run: |
           pip download --only-binary=:all: --no-deps --require-hashes -r tests/data/compiled-library.txt -d "$RUNNER_TEMP/wheels"
@@ -149,7 +162,11 @@ jobs:
           python -c "import platform, struct; print(platform.machine(), struct.calcsize('P') * 8, 'bit')"
           python -c "from nodestro_runtime.sandbox_confine import landlock_abi; print('landlock ABI', landlock_abi())"
       - name: The sandbox fails closed on AArch64
-        run: pytest -v tests/test_sandbox_arch.py tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+        run: >-
+          pytest -v --junitxml=junit-builtin-sandbox-arm64.xml
+          tests/test_sandbox_arch.py tests/test_builtin_sandbox.py tests/test_sandbox_policy.py
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-builtin-sandbox-arm64.xml tests/ci/skipped-builtin-sandbox-arm64.txt
       - name: The probe command reports the sandbox unavailable (exit status 2, reason platform)
         run: |
           set +e

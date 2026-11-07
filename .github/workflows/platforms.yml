@@ -48,4 +48,7 @@ jobs:
         run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
       - name: Import the workspace (the path that failed on macOS)
         run: python -c "import nodestro_runtime.workspace as w; print('imported', w.__name__)"
-      - run: pytest -v tests/test_platform_start.py
+      - run: pytest -v --junitxml=junit-platforms.xml tests/test_platform_start.py
+      # MUP-ONA A0: the skipped tests of each system as listed in its expectation file (scripts/check_skips.py).
+      - name: Skipped tests as expected
+        run: python scripts/check_skips.py junit-platforms.xml "tests/ci/skipped-platforms-${{ matrix.os }}.txt"

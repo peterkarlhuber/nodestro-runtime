@@ -1,0 +1,3 @@
+# Skipped tests of the CI job builtin-sandbox (MUP-ONA A0; checked by scripts/check_skips.py).
+# One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
+# NODESTRO_REQUIRE_SANDBOX=1: nothing may be skipped.
