@@ -13,7 +13,7 @@ mixed writes, searches, deletes and reindexes for 60 seconds: :func:`test_three_
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import os
 import threading
 import time
@@ -128,17 +128,21 @@ def test_three_tenants_with_eight_threads_each(database: Any, ranking: str) -> N
     errors: list[str] = []
     deadline = time.monotonic() + seconds
 
-    def add(tenant: str, text: str, source: str) -> None:
+    def current(tenant: str, action: Callable[[PostgresIndex], Any]) -> Any:
+        """``action`` on an index with the tenant's current model; a reindex that switched the model meanwhile makes
+        a write or search with the old one raise ``reindex_required`` (never a fallback): then again with the new."""
         for _attempt in range(20):
             try:
-                make(tenant).add(text, source=source)
-                return
-            except RetrievalError as exc:  # a reindex switched the model meanwhile: write with the new one
+                return action(make(tenant))
+            except RetrievalError as exc:
                 if exc.code != "reindex_required":
                     raise
                 with lock:
                     counts["retries"] += 1
-        raise AssertionError(f"{tenant}: {source} was not written after 20 attempts")
+        raise AssertionError(f"{tenant}: still reindex_required after 20 attempts")
+
+    def add(tenant: str, text: str, source: str) -> None:
+        current(tenant, lambda index: index.add(text, source=source))
 
     def reindex(tenant: str, generation: int) -> None:
         model = KeywordEmbeddings(f"part-{tenant}-{generation}")
@@ -164,7 +168,9 @@ def test_three_tenants_with_eight_threads_each(database: Any, ranking: str) -> N
                     counts["writes"] += 1
                     kept[tenant].add(source)
                 for mode in ("fts", "vector", "hybrid"):
-                    hits = make(tenant).retrieve(f"alpha policy {MARKER}", 50, mode=mode)
+                    hits = current(
+                        tenant, lambda index, mode=mode: index.retrieve(f"alpha policy {MARKER}", 50, mode=mode)
+                    )
                     marker = [hit.source for hit in hits if hit.source == "marker.md" or MARKER in hit.text]
                     if tenant == "part-a" and marker:
                         errors.append(f"{tenant} thread {worker} {mode}: marker visible {marker}")
