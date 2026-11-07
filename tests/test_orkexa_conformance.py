@@ -55,18 +55,15 @@ TARGETS: dict[str, tuple[tuple[Case, ...], frozenset[str]]] = {
 #: ranking vectors (``pgvector``: the database ranks; ``runtime``: the runtime ranks, a server without pgvector).
 #: Drift 10 (``VectorStatus.legacy``) has no generic case; see test_legacy_vectors_are_reported.
 _SHARED_DRIFTS = {
+    # Both paths compute the cosine now (drift 4); neither rounds it yet.
+    "vector.scores_are_rounded_to_6_digits": 5,
     "index.full_text_score_is_the_reciprocal_rank": 5,
     "index.default_mode_is_hybrid_with_embeddings": 6,
     "index.too_many_sources_are_refused": 7,
     "index.query_words_follow_tokenize": 8,
     "reindex.chunk_deleted_during_embedding_gets_no_vector": 9,
 }
-DRIFTS: dict[str, dict[str, int]] = {
-    # pgvector computes the cosine (drift 4 is the runtime's dot product) but does not round it (drift 5).
-    "pgvector": {**_SHARED_DRIFTS, "vector.scores_are_rounded_to_6_digits": 5},
-    # The dot product of the suite's vectors is a whole number, so only the cosine case shows drift 4.
-    "runtime": {**_SHARED_DRIFTS, "vector.score_is_the_cosine": 4},
-}
+DRIFTS: dict[str, dict[str, int]] = {"pgvector": _SHARED_DRIFTS, "runtime": _SHARED_DRIFTS}
 
 
 def _database() -> Any:

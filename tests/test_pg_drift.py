@@ -131,3 +131,22 @@ def test_zero_vectors_are_stored_but_never_ranked(make: Callable[..., Any]) -> N
     hybrid = index.retrieve("zerovector gardens", 10, mode="hybrid")
     assert [hit.source for hit in hybrid] == ["zero.md"] and hybrid[0].ranks == {"fts": 1}
     assert all(hit.score == hit.score for hit in hybrid)  # never NaN
+
+
+# ---- drift 4: the cosine in both paths -------------------------------------------------------------------------
+
+
+# MUP-ONA T-PG-1
+@pytest.mark.parametrize("normalized", [False, True])
+def test_both_paths_score_the_cosine(make: Callable[..., Any], normalized: bool) -> None:
+    from orkexa.testing.conformance._models import cosine
+
+    model = KeywordEmbeddings("drift-cosine", normalized=normalized)
+    index = make(embeddings=model)
+    texts = {"loud.md": "A loudvector chunk about alpha.", "two.md": "Alpha and beta.", "three.md": "Alpha beta gamma."}
+    for source, text in texts.items():
+        index.add(text, source=source)
+    hits = index.retrieve("alpha", 3, mode="vector")
+    assert [hit.source for hit in hits] == ["loud.md", "two.md", "three.md"]
+    for hit in hits:
+        assert abs(hit.score - cosine(model.vector("alpha"), model.vector(texts[hit.source]))) <= 1e-6, hit

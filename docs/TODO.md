@@ -632,15 +632,6 @@ PR that completes its package. They are tracked by the plan's execution status a
 - **Next step:** Fix the drifts, add a `pg-b` job on `pgvector/pgvector:pg17` (`NODESTRO_REQUIRE_PGVECTOR=1`), upgrade
   tests on FX-PG-0/FX-PG-0v, and the ranking and compatibility report for gate G1.
 
-### RT-MUP-DRIFT-4 · The runtime ranks vectors by dot product (MUP-ONA MP-B3)
-
-- **Priority:** P3 Low · **Status:** Open · **Refs:**
-  [MUP-ONA](https://github.com/peterkarlhuber/nodestro-studio/blob/master/docs/architecture/mup-ona/MUP-ONA.md), `tests/test_orkexa_conformance.py`
-- **What:** Without pgvector the runtime ranks by the dot product, which is the cosine only for unit vectors;
-  `EmbeddingIdentity.normalized` is ignored. pgvector computes the cosine. Strict expected failure `MUP-DRIFT-4`:
-  `vector.score_is_the_cosine` (runtime ranking).
-- **Next step:** Fix it in MP-B3 and remove the expected failure in the same commit.
-
 ### RT-MUP-DRIFT-5 · Scores are not the contract's (MUP-ONA MP-B3)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:**

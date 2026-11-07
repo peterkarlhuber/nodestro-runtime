@@ -28,6 +28,7 @@ import builtins
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 import json
+import math
 import re
 from typing import TYPE_CHECKING, Any
 import unicodedata
@@ -81,6 +82,12 @@ def search_words(text: str) -> builtins.list[str]:
     """The words of ``text`` for the search index: lower case, without diacritics."""
     folded = "".join(char for char in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(char))
     return _WORD.findall(folded)
+
+
+def _cosine(query: builtins.list[float], query_norm: float, stored: builtins.list[float]) -> float:
+    """The cosine similarity of a query vector (with its length) and a stored vector (neither is all zeros)."""
+    dot = math.fsum(a * b for a, b in zip(query, stored, strict=True))
+    return dot / (query_norm * math.sqrt(math.fsum(x * x for x in stored)))
 
 
 def _text(value: str) -> str:
@@ -529,9 +536,12 @@ class PostgresIndex(Index):
             f" WHERE v.tenant_id = %s AND v.space = %s AND c.tenant_id = %s AND c.namespace = %s{scope} AND {_USABLE}",
             base,
         )
-        # The stored vectors are normalized: the dot product is the cosine similarity.
+        # The cosine similarity, as pgvector's <=> gives it, whatever the length of the vectors: a model whose
+        # identity is not ``normalized`` returns vectors of any length, where the dot product is no cosine (drift 4).
+        # math.fsum is exactly rounded, so the result is the same on every Python version.
+        query_norm = math.sqrt(math.fsum(x * x for x in vector))
         similarity = [
-            (sum(a * b for a, b in zip(vector, embedding, strict=False)), int(chunk_id))
+            (_cosine(vector, query_norm, [float(x) for x in embedding]), int(chunk_id))
             for chunk_id, embedding in candidates
         ]
         scored = sorted(similarity, key=lambda item: (-item[0], item[1]))[:k]
