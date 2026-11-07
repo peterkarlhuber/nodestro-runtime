@@ -997,6 +997,8 @@ class ContainerImages:
             self.docker, name, image_id, sandbox.limits(), owner=self.owner, deadline=float(deadline.partition("=")[2])
         )
         check_shape(shaped, proven)  # exactly the self-tested shape, no allowance
+        import time as _t  # DEBUG
+        print("DEBUG MM start", _t.time(), name)
         try:
             code, output = sandbox.run_container([*shaped, *command], name, max_stdout=_VERIFY_STDOUT)
         except SandboxError as exc:
@@ -1008,6 +1010,9 @@ class ContainerImages:
         print("DEBUG MM code", code, "stdout", repr(output.stdout[-3000:]), "stderr", repr(output.stderr[-3000:]))
         print("DEBUG MM environ", {k: v for k, v in sandbox.environ.items() if "DOCKER" in k})
         import os as _os  # DEBUG
+        _log = _os.path.join(_os.path.dirname(sandbox.environ.get("DOCKER_HOST", "unix:///x/y")[7:]), "gateway.log")
+        if _os.path.exists(_log):
+            print("DEBUG MM gateway log\n" + open(_log, encoding="utf-8", errors="replace").read()[-40000:])
         for _i in range(3):
             _n = f"nodestro-sandbox-verify-{uuid.uuid4().hex[:12]}"
             _args = [_n if a == name else a for a in [*shaped, *command]]

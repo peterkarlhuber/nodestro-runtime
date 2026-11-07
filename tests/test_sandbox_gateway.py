@@ -1101,7 +1101,7 @@ def real_gateway(tmp_path: Path) -> Iterator[dict[str, str]]:
     process = subprocess.Popen(
         [sys.executable, "-m", "nodestro_runtime.sandbox_gateway", "--listen", listen],
         env=environ,
-        stdout=subprocess.PIPE,
+        stdout=open(tmp_path / "gateway.log", "wb"),
         stderr=subprocess.STDOUT,
     )
     try:
@@ -1109,7 +1109,7 @@ def real_gateway(tmp_path: Path) -> Iterator[dict[str, str]]:
             if Path(listen).exists():
                 break
             if process.poll() is not None:
-                pytest.fail(process.stdout.read().decode() if process.stdout else "gateway stopped")
+                pytest.fail((tmp_path / "gateway.log").read_text())
             time.sleep(0.1)
         # The client side: only the gateway's socket; the legacy builder (as in the image without buildx).
         client = {
@@ -1123,6 +1123,7 @@ def real_gateway(tmp_path: Path) -> Iterator[dict[str, str]]:
         process.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(10)
+        print("DEBUG GATEWAY LOG\n" + (tmp_path / "gateway.log").read_text()[-60000:])
 
 
 def test_tools_run_through_the_gateway_and_escapes_are_refused(real_gateway: dict[str, str]) -> None:
