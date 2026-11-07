@@ -48,6 +48,8 @@ dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
+    # Keeps the rule engine of the tenant SQL check free of Nodestro (lint-imports, contracts below).
+    "import-linter>=2.1",
     "mypy>=1.13",
     # moto's S3 server, for the Axentra file storage's S3 backend (tests/test_axentra_storage.py); brings boto3.
     "moto[server]>=5",
@@ -90,6 +92,30 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
 known-first-party = ["nodestro_runtime"]
+
+[tool.importlinter]
+root_package = "nodestro_runtime"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+# MUP-ONA B4: the rule engine is taken over unchanged into orkexa (orkexa.testing.sqlcheck, B5). It imports only
+# pglast (late, by name) and the standard library. import-linter does not report an import of the package root
+# (`import nodestro_runtime`); tests/test_sqlcheck_rules.py checks that every import is the standard library or pglast.
+name = "The SQL rule engine imports nothing of Nodestro and no third-party package"
+type = "forbidden"
+source_modules = ["nodestro_runtime.sqlcheck_rules"]
+forbidden_modules = [
+    "nodestro_runtime.**",
+    "orkexa",
+    "axentra",
+    "psycopg",
+    "psycopg_pool",
+    "pydantic",
+    "mcp",
+    "cryptography",
+    "sqlite_vec",
+    "packaging",
+]
 
 [tool.mypy]
 python_version = "3.11"

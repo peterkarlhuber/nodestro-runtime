@@ -256,12 +256,4 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "messages and mailbox) to prove the key bytes; the identifiers come from that list, names no Nodestro "
         "tenant table, returns nothing of a value"
     ),
-    (
-        "nodestro_runtime/tenant_sql_check.py",
-        "{ref.table} (as {ref.name}) is not bound to one tenant by a top-level `tenant_id = <param>` conjunct",
-    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
-    (
-        "nodestro_runtime/tenant_sql_check.py",
-        "{ref.table} is not bound to one tenant by a top-level `tenant_id = <param>` conjunct",
-    ): ("not SQL: a problem message of the check itself (an unknown part followed by SQL words)"),
 }

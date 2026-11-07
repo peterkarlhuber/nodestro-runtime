@@ -5,6 +5,15 @@ filters on (or writes) ``tenant_id`` (``docs/AXENTRA.md``, "Row-level security o
 the control that keeps it so. It is used by the test suites of nodestro-runtime and nodestro-api; nothing imports it at
 run time, and its parser (``pglast``, PostgreSQL's own grammar) is a test dependency only.
 
+Architecture (MUP-ONA B4): the check has two parts. This module is Nodestro's part: it finds the tenant tables in the
+migrations, rebuilds the statements from Python source (and decides which texts are candidates at all), applies the
+allowlist and the skipped modules, and reports ``dynamic`` and ``stale`` findings. Whether one rebuilt statement is
+bound to one tenant is decided by the rule engine :mod:`nodestro_runtime.sqlcheck_rules`, which knows no Nodestro
+constant, no allowlist and no source code (the partition column, the tenant tables and the placeholder style are its
+parameters; it imports only ``pglast`` and the standard library, enforced by import-linter) and is to be taken over
+into orkexa as ``orkexa.testing.sqlcheck`` (MUP-ONA B5). The engine's ``leak``, ``unparsed`` and ``unsupported``
+findings become this module's findings of the same kind, with the module and line of the statement.
+
 How it works:
 
 - :func:`tenant_tables` reads the migrations and returns every ``nodestro_*`` table with a ``tenant_id`` column, so a
@@ -42,18 +51,20 @@ How it works:
   ``LIMIT``, ``ORDER BY``, an operator such as ``IS NOT NULL`` ... and holds SQL) is a candidate too. A candidate with
   an unresolved part is reported as ``dynamic``; one that the PostgreSQL parser rejects is reported as ``unparsed``.
   Neither passes silently: such a text passes only when it is fixed or through an allowlist entry with its reason.
-- A parsed candidate passes when every reference to a tenant table (its name in any case) -- in ``FROM``, joins,
-  ``USING``, the target of ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level
-  ``AND`` conjunct of its statement's ``WHERE`` (or of an inner join's ``ON``) of the form ``<ref>.tenant_id =
-  <param>``, or by ``<ref>.tenant_id = <other>.tenant_id`` with ``<other>`` bound (in the same statement or an
-  enclosing one; a name of the statement's own ``FROM`` hides an outer one). ``<ref>.tenant_id = ANY(<param>)`` may
-  hold several tenants: it binds only with ``allow_any=True``; by default (MUP-ONA A11, decision O12) it is a
-  ``leak`` that passes only through an allowlist entry whose reason says why the array holds one tenant.
-  ``INSERT`` into a tenant table must list ``tenant_id`` with a parameter (or a bound ``tenant_id`` of its
-  ``SELECT``) as the value; an upsert that updates must have ``tenant_id`` in its conflict target; ``UPDATE`` (and
-  an upsert, except ``tenant_id = excluded.tenant_id``) must not set ``tenant_id``. A string literal or code body
-  that names a tenant table (``DO $$ ... $$``, ``query_to_xml('...')``), ``TRUNCATE``, ``COPY``, ``MERGE`` and other
-  statements that touch a tenant table are reported as ``unsupported``.
+- A parsed candidate is checked by the rule engine :func:`nodestro_runtime.sqlcheck_rules.check_statement` with
+  Nodestro's partition column ``tenant_id``, psycopg's placeholders and the tenant tables above. It passes when every
+  reference to a tenant table (its name in any case) -- in ``FROM``, joins, ``USING``, the target of
+  ``UPDATE``/``DELETE``, subqueries, CTEs and set operations -- is bound by a top-level ``AND`` conjunct of its
+  statement's ``WHERE`` (or of an inner join's ``ON``) of the form ``<ref>.tenant_id = <param>``, or by
+  ``<ref>.tenant_id = <other>.tenant_id`` with ``<other>`` bound (in the same statement or an enclosing one; a name of
+  the statement's own ``FROM`` hides an outer one). ``<ref>.tenant_id = ANY(<param>)`` may hold several tenants: it
+  binds only with ``allow_any=True``; by default (MUP-ONA A11, decision O12) it is a ``leak`` that passes only through
+  an allowlist entry whose reason says why the array holds one tenant. ``INSERT`` into a tenant table must list
+  ``tenant_id`` with a parameter (or a bound ``tenant_id`` of its ``SELECT``) as the value; an upsert that updates
+  must have ``tenant_id`` in its conflict target; ``UPDATE`` (and an upsert, except ``tenant_id = excluded.tenant_id``)
+  must not set ``tenant_id``. A string literal or code body that names a tenant table (``DO $$ ... $$``,
+  ``query_to_xml('...')``), ``TRUNCATE``, ``COPY``, ``MERGE`` and other statements that touch a tenant table are
+  reported as ``unsupported``; a text the parser rejects as ``unparsed``.
 - Everything that is cross-tenant (or not a PostgreSQL statement) by design is listed in an allowlist that maps the
   module and the **whole** normalized text (whitespace collapsed) to its reason. Matching is exact; an entry that no
   longer matches anything is reported as stale.
@@ -67,7 +78,9 @@ together without a known part that shows it -- an argument of a helper that runs
 callers that pass a literal text), a text made only of unknown parts whose fragments live in another package, a
 lower-case keyword without a SQL shape after an unknown part (``{BASE} or deleted``), text other than space,
 parentheses and comments in front of an unknown part (``f"tag {BASE} OR true"``), a changing method whose text and
-arguments are both unknown (``base().replace(old, new)`` with parameters), ``getattr``/``eval``.
+arguments are both unknown (``base().replace(old, new)`` with parameters), ``getattr``/``eval``. The rule engine adds
+its own blind spots (:mod:`nodestro_runtime.sqlcheck_rules`): views, functions, triggers and rules on the server that
+reach a tenant table under another name, and a ``search_path`` that resolves an unlisted name to a tenant table.
 """
 
 from __future__ import annotations
@@ -82,26 +95,13 @@ import re
 import string
 from typing import Any
 
+from nodestro_runtime import sqlcheck_rules
+from nodestro_runtime.sqlcheck_rules import to_postgres_params as to_postgres_params
+
 #: At most this many variants of one expression are checked; more is reported as ``dynamic``.
 MAX_VARIANTS = 256
 #: Statement keywords that read or change rows (a candidate with an unresolved part that starts with one is reported).
 _DATA_KEYWORDS = frozenset({"select", "insert", "update", "delete", "with", "merge", "copy", "truncate", "table"})
-#: Statements that change the schema, not rows: allowed on tenant tables (migrations, indexes, grants).
-_SCHEMA_STATEMENTS = frozenset(
-    {
-        "CreateStmt",
-        "IndexStmt",
-        "AlterTableStmt",
-        "CommentStmt",
-        "GrantStmt",
-        "DropStmt",
-        "VacuumStmt",
-        "LockStmt",
-        "CreatePolicyStmt",
-        "AlterPolicyStmt",
-    }
-)
-_DATA_STATEMENTS = frozenset({"SelectStmt", "InsertStmt", "UpdateStmt", "DeleteStmt"})
 
 
 @dataclass(frozen=True)
@@ -1311,347 +1311,39 @@ def statements_of(source: str, module: str, tables: frozenset[str]) -> list[Stat
     return list(dict.fromkeys(found))
 
 
-# --- SQL side: check a statement with PostgreSQL's parser -------------------------------------------------------
+# --- SQL side: the rule engine ------------------------------------------------------------------------------------
 
 
-def to_postgres_params(text: str) -> str:
-    """psycopg's placeholders (``%s``, ``%(name)s``, ``%b``, ``%t``) as ``$n``; ``%%`` as ``%``."""
-    out: list[str] = []
-    names: dict[str, int] = {}
-    count = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char != "%":
-            out.append(char)
-            index += 1
-            continue
-        following = text[index + 1 : index + 2]
-        if following == "%":
-            out.append("%")
-            index += 2
-        elif following in ("s", "b", "t"):
-            count += 1
-            out.append(f"${count}")
-            index += 2
-        elif following == "(":
-            end = text.find(")", index)
-            if end == -1 or text[end + 1 : end + 2] not in ("s", "b", "t"):
-                out.append(char)
-                index += 1
-                continue
-            name = text[index + 2 : end]
-            if name not in names:
-                count += 1
-                names[name] = count
-            out.append(f"${names[name]}")
-            index = end + 2
-        else:
-            out.append(char)
-            index += 1
-    return "".join(out)
-
-
-@dataclass
-class _Ref:
-    name: str  # alias or table name, as columns qualify it
-    table: str
-    bound: bool = False
-    #: Only a refused ``tenant_id = ANY(<param>)`` names it (``allow_any`` off): reported with that reason.
-    any_refused: bool = False
-
-
-def _children(node: Any) -> Iterator[Any]:
-    pg = _pglast("ast")
-
-    if isinstance(node, (list, tuple)):
-        for item in node:
-            yield from _children(item) if isinstance(item, (list, tuple)) else iter([item])
-        return
-    if isinstance(node, pg.Node):
-        for slot in node.__slots__:
-            value = getattr(node, slot, None)
-            if isinstance(value, pg.Node):
-                yield value
-            elif isinstance(value, (list, tuple)):
-                yield from _children(value)
-
-
-def _walk(node: Any) -> Iterator[Any]:
-    yield node
-    for child in _children(node):
-        yield from _walk(child)
-
-
-def _conjuncts(expr: Any) -> list[Any]:
-    pg = _pglast("ast")
-    BoolExprType = _pglast("enums").BoolExprType
-
-    if expr is None:
-        return []
-    if isinstance(expr, pg.BoolExpr) and expr.boolop == BoolExprType.AND_EXPR:
-        return [c for arg in expr.args for c in _conjuncts(arg)]
-    return [expr]
-
-
-def _is_param(expr: Any) -> bool:
-    pg = _pglast("ast")
-
-    while isinstance(expr, pg.TypeCast):
-        expr = expr.arg
-    return isinstance(expr, pg.ParamRef)
-
-
-def _tenant_column(expr: Any) -> tuple[str, ...] | None:
-    """The qualifier of a ``tenant_id`` column reference (``()`` when unqualified), else ``None``."""
-    pg = _pglast("ast")
-
-    while isinstance(expr, pg.TypeCast):
-        expr = expr.arg
-    if not isinstance(expr, pg.ColumnRef):
-        return None
-    names = tuple(getattr(f, "sval", None) for f in expr.fields)
-    if not names or names[-1] != "tenant_id" or any(n is None for n in names):
-        return None
-    return tuple(str(n) for n in names[:-1])
-
-
-#: Why a reference named only by a tenant id array parameter is reported (``allow_any`` off; MUP-ONA A11, O12).
+#: Why a reference named only by a tenant id array parameter is reported (``allow_any`` off; MUP-ONA A11, O12): the
+#: engine's reason with the way out that this check adds (an allowlist entry).
 _ANY_REFUSED = (
     "an array of tenant ids may hold several tenants: such a statement passes only through an allowlist entry that "
     "says why the array holds exactly one tenant (MUP-ONA A11)"
 )
 
 
-class _Checker:
-    def __init__(self, tables: frozenset[str], *, allow_any: bool = False) -> None:
-        self.tables = tables
-        #: Whether ``tenant_id = ANY(<param>)`` binds a reference (off by default: the array may hold several tenants).
-        self.allow_any = allow_any
-        self.problems: list[str] = []
-
-    def _from_refs(self, items: Any, ctes: set[str]) -> tuple[list[_Ref], list[tuple[Any, list[_Ref]]], set[str]]:
-        """Tenant table references of a FROM list, the join conditions that bind them (``quals``, refs) and every name
-        the FROM list defines (tenant table or not: an inner name hides an outer one)."""
-        pg = _pglast("ast")
-        JoinType = _pglast("enums").JoinType
-
-        refs: list[_Ref] = []
-        quals: list[tuple[Any, list[_Ref]]] = []
-        names: set[str] = set()
-
-        def visit(item: Any) -> list[_Ref]:
-            alias = getattr(item, "alias", None)
-            if alias is not None and getattr(alias, "aliasname", None):
-                names.add(alias.aliasname)
-            if isinstance(item, pg.RangeVar):
-                if alias is None:
-                    names.add(item.relname)  # an alias hides the table's own name
-                table = item.relname.lower()
-                if table in self.tables and not (item.schemaname is None and item.relname in ctes):
-                    ref = _Ref(item.alias.aliasname if item.alias else item.relname, table)
-                    refs.append(ref)
-                    return [ref]
-                return []
-            if isinstance(item, pg.JoinExpr):
-                left, right = visit(item.larg), visit(item.rarg)
-                if item.quals is not None:
-                    if item.jointype == JoinType.JOIN_INNER:
-                        quals.append((item.quals, left + right))
-                    elif item.jointype == JoinType.JOIN_LEFT:
-                        quals.append((item.quals, right))
-                    elif item.jointype == JoinType.JOIN_RIGHT:
-                        quals.append((item.quals, left))
-                return left + right
-            return []  # subselects and functions are statements of their own
-
-        for item in items or ():
-            visit(item)
-        return refs, quals, names
-
-    def _bind(
-        self,
-        refs: list[_Ref],
-        pools: list[tuple[Any, list[_Ref]]],
-        outer: list[tuple[set[str], list[_Ref]]],
-        names: set[str],
-    ) -> None:
-        """Mark refs bound by ``tenant_id = param`` (``= ANY(param)`` only with ``allow_any``) or by equality with a
-        bound ref. A qualifier means the nearest name: this statement's own (which hides an outer one of the same
-        name), then the enclosing statements' from the inside out."""
-        pg = _pglast("ast")
-        A_Expr_Kind = _pglast("enums").A_Expr_Kind
-
-        def partner_binds(qualifier: str, ref: _Ref) -> bool:
-            if qualifier in names:
-                own = [r for r in refs if r.name == qualifier]
-                return len(own) == 1 and own[0] is not ref and own[0].bound
-            for scope_names, scope_refs in reversed(outer):
-                if qualifier in scope_names:
-                    # An enclosing statement's ref: reported there if it is not bound itself.
-                    return len([r for r in scope_refs if r.name == qualifier]) == 1
-            return False
-
-        def lookup(qualifier: tuple[str, ...], candidates: list[_Ref]) -> _Ref | None:
-            if not qualifier:  # unqualified: only unambiguous with a single tenant table in the statement
-                return refs[0] if len(refs) == 1 and any(r is refs[0] for r in candidates) else None
-            matches = [r for r in candidates if r.name == qualifier[-1]]
-            return matches[0] if len(matches) == 1 else None
-
-        changed = True
-        while changed:
-            changed = False
-            for expr, applies in pools:
-                for conjunct in _conjuncts(expr):
-                    if not isinstance(conjunct, pg.A_Expr) or conjunct.lexpr is None or conjunct.rexpr is None:
-                        continue
-                    if [getattr(n, "sval", None) for n in conjunct.name] != ["="]:
-                        continue
-                    if conjunct.kind not in (A_Expr_Kind.AEXPR_OP, A_Expr_Kind.AEXPR_OP_ANY):
-                        continue
-                    sides = [(conjunct.lexpr, conjunct.rexpr), (conjunct.rexpr, conjunct.lexpr)]
-                    if conjunct.kind == A_Expr_Kind.AEXPR_OP_ANY:
-                        sides = sides[:1]  # tenant_id = ANY(param)
-                        if not self.allow_any:
-                            qualifier = _tenant_column(conjunct.lexpr)
-                            ref = None if qualifier is None else lookup(qualifier, applies)
-                            if ref is not None and _is_param(conjunct.rexpr):
-                                ref.any_refused = True
-                            continue
-                    for column, other in sides:
-                        qualifier = _tenant_column(column)
-                        if qualifier is None:
-                            continue
-                        ref = lookup(qualifier, applies)
-                        if ref is None or ref.bound:
-                            continue
-                        if _is_param(other):
-                            ref.bound = changed = True
-                            continue
-                        other_qualifier = _tenant_column(other)
-                        if conjunct.kind != A_Expr_Kind.AEXPR_OP or other_qualifier is None or not other_qualifier:
-                            continue
-                        if partner_binds(other_qualifier[-1], ref):
-                            ref.bound = changed = True
-
-    def _check_insert(self, node: Any, table: str) -> None:
-        """``tenant_id`` is listed and its value is a parameter (or a bound ``tenant_id``); an upsert's conflict target
-        includes ``tenant_id``, so the update it turns into cannot hit another tenant's row."""
-        pg = _pglast("ast")
-        OnConflictAction = _pglast("enums").OnConflictAction
-
-        columns = [c.name for c in node.cols or ()]
-        if "tenant_id" not in columns:
-            self.problems.append(f"the INSERT into {table} lists no tenant_id column")
-            return
-        index = columns.index("tenant_id")
-        select = node.selectStmt
-        if isinstance(select, pg.SelectStmt) and select.valuesLists:
-            values = [row[index] if index < len(row) else None for row in select.valuesLists]
-        elif isinstance(select, pg.SelectStmt) and select.targetList and select.larg is None:
-            own, _quals, _names = self._from_refs(select.fromClause, set())
-            target = select.targetList[index].val if index < len(select.targetList) else None
-            qualifier = _tenant_column(target)
-            from_own = qualifier is not None and (
-                [r for r in own if r.name == qualifier[-1]] if qualifier else own[:1] if len(own) == 1 else []
-            )
-            values = [None if not from_own and not _is_param(target) else target]
-        else:
-            values = [None]
-        if not all(value is not None and (_is_param(value) or _tenant_column(value) is not None) for value in values):
-            self.problems.append(f"the tenant_id written into {table} is not a parameter or a bound tenant_id")
-        clause = node.onConflictClause
-        if clause is not None and clause.action == OnConflictAction.ONCONFLICT_UPDATE:
-            infer = clause.infer
-            target_columns = [e.name for e in (infer.indexElems or ())] if infer is not None else []
-            if "tenant_id" not in target_columns:
-                self.problems.append(
-                    f"the conflict target of an upsert into {table} lacks tenant_id: it may update another tenant's row"
-                )
-            for item in clause.targetList or ():
-                if item.name == "tenant_id" and not (
-                    "tenant_id" in target_columns and _tenant_column(item.val) == ("excluded",)
-                ):
-                    self.problems.append(f"the upsert into {table} sets tenant_id: it moves a row to another tenant")
-
-    def check(self, node: Any, outer: list[tuple[set[str], list[_Ref]]], ctes: set[str]) -> None:
-        pg = _pglast("ast")
-
-        own: list[_Ref] = []
-        names: set[str] = set()
-        if isinstance(node, (pg.SelectStmt, pg.UpdateStmt, pg.DeleteStmt, pg.InsertStmt)):
-            with_clause = getattr(node, "withClause", None)
-            if with_clause is not None:
-                for cte in with_clause.ctes or ():
-                    if cte.ctename in self.tables:
-                        self.problems.append(f"CTE named like the tenant table {cte.ctename}")
-                    ctes = ctes | {cte.ctename}
-        if isinstance(node, pg.SelectStmt):
-            own, quals, names = self._from_refs(node.fromClause, ctes)
-            self._bind(own, [(node.whereClause, own), *quals], outer, names)
-        elif isinstance(node, (pg.UpdateStmt, pg.DeleteStmt)):
-            target = [node.relation]
-            extra = node.fromClause if isinstance(node, pg.UpdateStmt) else node.usingClause
-            own, quals, names = self._from_refs([*target, *(extra or ())], ctes)
-            self._bind(own, [(node.whereClause, own), *quals], outer, names)
-            if (
-                isinstance(node, pg.UpdateStmt)
-                and node.relation.relname.lower() in self.tables
-                and any(item.name == "tenant_id" for item in node.targetList or ())
-            ):
-                self.problems.append(
-                    f"the UPDATE of {node.relation.relname} sets tenant_id: it moves a row to another tenant"
-                )
-        elif isinstance(node, pg.InsertStmt):
-            table = node.relation.relname
-            if table.lower() in self.tables:
-                self._check_insert(node, table)
-        for ref in own:
-            if not ref.bound:
-                self.problems.append(
-                    f"{ref.table}"
-                    + (f" (as {ref.name})" if ref.name != ref.table else "")
-                    + " is not bound to one tenant by a top-level `tenant_id = <param>` conjunct"
-                )
-                if ref.any_refused and _ANY_REFUSED not in self.problems:
-                    self.problems.append(_ANY_REFUSED)
-        for child in _children(node):
-            self.check(child, [*outer, (names, own)], ctes)
+def _detail(finding: sqlcheck_rules.Finding) -> str:
+    """The text of an engine finding as this check reports it."""
+    return _ANY_REFUSED if finding.message == sqlcheck_rules.ANY_REFUSED else finding.message
 
 
-#: A (possibly qualified) name: a string that is only a name reads no rows (``relname = 'nodestro_documents'``).
-_IDENTIFIER = re.compile(r"[\w$]+(?:\.[\w$]+)*")
+def _check(text: str, tables: frozenset[str], *, allow_any: bool) -> list[sqlcheck_rules.Finding]:
+    """The engine's findings for one rebuilt statement: Nodestro's partition column ``tenant_id``, psycopg's
+    placeholders."""
+    return sqlcheck_rules.check_statement(
+        text, tenant_tables=tables, column="tenant_id", placeholder="psycopg", allow_any=allow_any
+    )
 
 
 def check_sql(text: str, tables: frozenset[str], *, allow_any: bool = False) -> list[str]:
     """Why ``text`` (one or more PostgreSQL statements with psycopg placeholders) may read or change another tenant's
     rows; empty when every reference to a tenant table is bound to one tenant. ``allow_any``: ``tenant_id =
-    ANY(<param>)`` binds too (off by default). Raises ``pglast.parser.ParseError``."""
-    parse_sql = _pglast("").parse_sql
-
-    problems: list[str] = []
-    for raw in parse_sql(to_postgres_params(text)):
-        stmt = raw.stmt
-        kind = type(stmt).__name__
-        # SQL in a string (a DO block, a function body, query_to_xml('...')) is run by the server, not checked here.
-        for node in _walk(stmt):
-            value = getattr(node, "sval", None) if type(node).__name__ == "String" else None
-            if isinstance(value, str) and _words(value) & tables and not _IDENTIFIER.fullmatch(value):
-                problems.append(f"a string that names a tenant table ({value[:80]!r}) is not supported by the check")
-        if kind in _DATA_STATEMENTS or kind == "ExplainStmt":
-            checker = _Checker(tables, allow_any=allow_any)
-            checker.check(stmt, [], set())
-            problems.extend(checker.problems)
-            continue
-        touched = sorted(
-            {n.relname for n in _walk(stmt) if type(n).__name__ == "RangeVar" and n.relname.lower() in tables}
-        )
-        if not touched:
-            continue
-        if kind in _SCHEMA_STATEMENTS:
-            continue
-        problems.append(f"{kind} on {', '.join(touched)} is not supported by the check")
-    return problems
+    ANY(<param>)`` binds too (off by default). Raises ``pglast.parser.ParseError``. The rules are those of
+    :func:`nodestro_runtime.sqlcheck_rules.check_statement`."""
+    findings = _check(text, tables, allow_any=allow_any)
+    if any(f.kind == "unparsed" for f in findings):
+        _pglast("").parse_sql(to_postgres_params(text))  # raises the parser's own error, as before the engine
+    return [_detail(f) for f in findings]
 
 
 # --- packages ------------------------------------------------------------------------------------------------------
@@ -1697,8 +1389,6 @@ def scan_package(
     (``nodestro_runtime/jobs.py``); ``allowlist`` maps ``(module, normalized text)`` to its reason; ``skip_modules``
     maps a module that holds no PostgreSQL statements (the desktop's SQLite store) to the reason. ``allow_any``: see
     :func:`check_sql` (off by default; an allowlisted statement is not checked at all)."""
-    from pglast.parser import ParseError
-
     skip_modules = skip_modules or {}
     report = Report()
     prefix = root.name + "/"
@@ -1735,14 +1425,8 @@ def scan_package(
                     detail = "SQL with a part that is not known"
                 report.findings.append(Finding(module, statement.line, "dynamic", statement.text, detail))
                 continue
-            try:
-                problems = check_sql(statement.text, tables, allow_any=allow_any)
-            except ParseError as exc:
-                report.findings.append(Finding(module, statement.line, "unparsed", statement.text, str(exc)))
-                continue
-            for problem in problems:
-                kind = "unsupported" if "not supported" in problem else "leak"
-                report.findings.append(Finding(module, statement.line, kind, statement.text, problem))
+            for finding in _check(statement.text, tables, allow_any=allow_any):
+                report.findings.append(Finding(module, statement.line, finding.kind, statement.text, _detail(finding)))
     for module in skip_modules:
         if module.startswith(prefix) and not (root.parent / module).is_file():
             report.findings.append(Finding(module, 0, "stale", "", "skipped module does not exist"))
