@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "comment": "Mandatory checks (S2) per CI-FAST. A PR is ok only if every listed check ran on the PR head SHA and succeeded. Changing this list needs a reason in the PR.",
+  "pull_request": {
+    "ci.yml": [
+      "test (3.11)",
+      "test (3.13)",
+      "test (3.14)",
+      "pg-a (3.11)",
+      "pg-a (3.13)",
+      "pg-a (3.14)",
+      "pg-b (3.11)",
+      "pg-b (3.13)",
+      "pg-b (3.14)",
+      "tenant-sql-api",
+      "security-vectors-sync",
+      "docker",
+      "builtin-sandbox",
+      "builtin-sandbox-arm64",
+      "package"
+    ],
+    "platforms.yml": [
+      "start (ubuntu-latest)",
+      "start (macos-latest)",
+      "start (macos-15-intel)",
+      "start (windows-latest)",
+      "start (windows-11-arm)"
+    ]
+  },
+  "nightly": {
+    "nightly.yml": [
+      "report"
+    ]
+  }
+}

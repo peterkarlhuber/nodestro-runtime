@@ -1,0 +1,100 @@
+name: Nightly
+
+# CI-FAST W0 (AP15): the whole PR/push suite (ci.yml and platforms.yml) once a night on master, so that breakage from
+# outside the repository (new dependency releases, advisories, runner images, a change on orkexa, nodestro-api or
+# axentra master that the cross-repo jobs check) shows up as an open issue rather than on the next unrelated PR. The
+# test-ID inventory (AP0) is the baseline that later waves compare against. Publishes nothing: the "dist" artifact of
+# ci.yml's package job is a workflow artifact, not a release or a registry upload.
+on:
+  schedule:
+    # Staggered across the repositories (CI-FAST cron table) so that the night runs stay under the job limit.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      canary_fail:
+        description: Make the canary job fail (proves that a red nightly opens an issue)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # ci.yml uses no secrets (nodestro-api and axentra are checked out anonymously), so nothing is inherited.
+    uses: ./.github/workflows/ci.yml
+
+  platforms:
+    # platforms.yml uses no secrets, so nothing is inherited.
+    uses: ./.github/workflows/platforms.yml
+
+  canary:
+    # Proves that a red nightly opens an issue (CI-FAST W0 acceptance).
+    if: inputs.canary_fail
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+
+  inventory:
+    # The test IDs of the suite, counted and hashed, so that a change which silently drops tests is visible.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+      - name: Collect the test IDs (test-ids.txt)
+        run: python -m pytest --collect-only -q -p no:cacheprovider > "$GITHUB_WORKSPACE/test-ids.txt" || true
+      # A suite that collects nothing (an import error, a moved test directory) fails here instead of looking green.
+      - name: Count the test IDs and write the job summary
+        run: |
+          set -euo pipefail
+          count() {
+            grep -E "$2" "$1" | sort > "$1.sorted" || true
+            n=$(wc -l < "$1.sorted")
+            sum=$(sha256sum "$1.sorted" | cut -d' ' -f1)
+            echo "| $1 | $n | \`$sum\` |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$n" -lt 1 ]; then echo "::error::$1 has no test IDs:"; tail -n 30 "$1"; exit 1; fi
+          }
+          { echo "### Test-ID inventory"; echo; echo "| File | Tests | SHA-256 of the sorted list |"; echo "|---|---|---|"; } >> "$GITHUB_STEP_SUMMARY"
+          count test-ids.txt '::'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-ids
+          path: |
+            test-ids.txt.sorted
+
+  report:
+    # Opens one "Nightly failed" issue on red, comments on it while it stays red, closes it on the next green run.
+    needs: [ci, platforms, canary, inventory]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the nightly issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Nightly failed"
+          failed=$(python3 -c 'import json,os; n=json.loads(os.environ["NEEDS"]); print(" ".join(k for k,v in n.items() if v["result"] not in ("success","skipped")))')
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq "map(select(.title==\"$title\"))[0].number // empty")
+          if [ -n "$failed" ]; then
+            body="Nightly run $RUN_URL failed: $failed (commit $GITHUB_SHA)."
+            if [ -n "$number" ]; then gh issue comment "$number" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
+            exit 1
+          elif [ -n "$number" ]; then
+            gh issue comment "$number" --body "Nightly run $RUN_URL is green again (commit $GITHUB_SHA). Closing."
+            gh issue close "$number"
+          fi
