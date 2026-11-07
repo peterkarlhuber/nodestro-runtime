@@ -64,6 +64,8 @@ def after() -> dict[str, tuple[str, set[str]]]:
 
 # MUP-ONA T-PAR-1
 def test_every_statement_of_the_baseline_is_still_checked() -> None:
+    # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
+    pytest.importorskip("psycopg")
     baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
     entries = baseline["statements"]
     assert len(entries) == 46
@@ -84,6 +86,8 @@ def test_every_statement_of_the_baseline_is_still_checked() -> None:
 def test_the_baseline_splits_into_catalog_and_nodestro_source() -> None:
     """Of the 46 statements, 42 are the catalog's partitioned entries and 4 stay in Nodestro's source (chunk counts,
     attaching a file, a source's text, the memory totals); the catalog adds only the unpartitioned pgvector probe."""
+    # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
+    pytest.importorskip("psycopg")
     baseline = {
         re.sub(r"\$\d+", "$?", entry["canonical"])
         for entry in json.loads(BASELINE.read_text(encoding="utf-8"))["statements"]
