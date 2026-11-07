@@ -41,13 +41,16 @@ import re
 import select
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import weakref
 
 from pydantic import BaseModel
 
 from .problems import NodestroError
 from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time
+
+if TYPE_CHECKING:
+    from psycopg.abc import Params, Query
 
 try:  # optional: nodestro-runtime[postgres]
     import psycopg
@@ -379,7 +382,7 @@ class PostgresDatabase:
                 state.connection, state.depth = None, 0
                 connection.execute("COMMIT")
 
-    def _query(self, query: str, params: tuple[Any, ...] = ()) -> builtins.list[tuple[Any, ...]]:
+    def _query(self, query: Query, params: Params = ()) -> builtins.list[tuple[Any, ...]]:
         current: Any = getattr(self._local, "connection", None)
         if current is not None:  # inside this thread's transaction: read its own writes
             rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
@@ -399,7 +402,7 @@ class PostgresDatabase:
                     raise
         raise AssertionError("unreachable")
 
-    def _write(self, query: str, params: tuple[Any, ...]) -> int:
+    def _write(self, query: Query, params: Params) -> int:
         if getattr(self._local, "depth", 0):
             return int(self._local.connection.execute(query, params).rowcount)
         # One statement is atomic on its own: run it in autocommit (no BEGIN/COMMIT round trips), still serialized
@@ -720,6 +723,86 @@ class SharedPool:
     @property
     def max_size(self) -> int:
         return int(self._database._pool.max_size)
+
+
+class _Rows:
+    """The result of a statement a :class:`DatabaseSource` ran on its own: its rows, or how many rows it changed."""
+
+    def __init__(self, rows: builtins.list[tuple[Any, ...]], rowcount: int) -> None:
+        self._rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> builtins.list[tuple[Any, ...]]:
+        return builtins.list(self._rows)
+
+
+class _Reads:
+    """``read`` mode outside a transaction: each statement is a read of :class:`PostgresDatabase` (a pooled
+    connection, no lock, repeated on another connection when its connection was lost)."""
+
+    def __init__(self, database: PostgresDatabase) -> None:
+        self._database = database
+
+    def execute(self, query: Any, params: Any = None) -> _Rows:
+        rows = self._database._query(query, () if params is None else params)
+        return _Rows(rows, len(rows))
+
+
+class _Writes:
+    """``write`` mode outside a transaction: the statement is a write of :class:`PostgresDatabase` (autocommit,
+    serialized with the process's transactions, never repeated)."""
+
+    def __init__(self, database: PostgresDatabase) -> None:
+        self._database = database
+
+    def execute(self, query: Any, params: Any = None) -> _Rows:
+        return _Rows([], self._database._write(query, () if params is None else params))
+
+
+class DatabaseSource:
+    """A :class:`PostgresDatabase` as the ``ConnectionSource`` of the generic PostgreSQL classes
+    (:mod:`nodestro_runtime.pg_generic.connection`, MUP-ONA B4).
+
+    The modes run as the database ran the same statements before: ``read`` as :meth:`PostgresDatabase._query` (no
+    lock, retried on a lost connection), ``write`` as :meth:`PostgresDatabase._write` (autocommit under the process
+    lock), ``transaction`` as :meth:`PostgresDatabase.transaction` (``BEGIN``/``COMMIT`` under the process lock). Inside
+    a transaction of the calling thread every mode joins it, so the generic classes and the document store of the same
+    database share one transaction.
+
+    ``tenant_setting`` is the hook for row-level security on Nodestro's tables (MUP-ONA A9, not used yet): with a name
+    such as ``"app.tenant_id"`` every transaction for a tenant starts with ``set_config(<name>, <tenant>, true)``,
+    and ``read`` and ``write`` open a transaction too, because the setting is transaction-local. ``None`` (default):
+    nothing is set."""
+
+    def __init__(self, database: PostgresDatabase, *, tenant_setting: str | None = None) -> None:
+        if tenant_setting is not None and not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*", tenant_setting):
+            raise ValueError(f"Invalid setting name {tenant_setting!r}")
+        self.database = database
+        self.tenant_setting = tenant_setting
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The lock that serializes the database's transactions and writes in this process; the generic classes hold
+        it for every command, so a command never waits for it while holding a lock of its own."""
+        return self.database._lock
+
+    @contextmanager
+    def transaction(self, mode: str = "transaction", *, tenant_id: str | None = None) -> Iterator[Any]:
+        if mode not in ("read", "write", "transaction"):
+            raise ValueError(f"Unknown transaction mode {mode!r}")
+        setting = self.tenant_setting if tenant_id is not None else None
+        if mode == "transaction" or setting is not None:
+            with self.database._transaction() as connection:
+                if setting is not None:
+                    connection.execute("SELECT set_config(%s, %s, true)", (setting, tenant_id))
+                yield connection
+        elif mode == "read":
+            yield _Reads(self.database)
+        else:
+            yield _Writes(self.database)
 
 
 def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
@@ -1156,6 +1239,7 @@ __all__ = [
     "MIGRATION_LOCK",
     "POSTGRES_SCHEMA_VERSION",
     "TENANT_ID",
+    "DatabaseSource",
     "PostgresDatabase",
     "PostgresStep",
     "PostgresStore",
