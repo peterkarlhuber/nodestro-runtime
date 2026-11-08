@@ -37,6 +37,7 @@ series, assistant drafts, Python environment installations) still runs in the pr
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 import contextlib
@@ -78,6 +79,49 @@ _COLUMNS = (
     "id, tenant_id, kind, ref, status, payload, attempts, worker, lease_until, cancel_requested, error,"
     " created_at, started_at, finished_at"
 )
+#: The queued or running job of a piece of work (tenant, kind, ref).
+_ACTIVE = (
+    f"SELECT {_COLUMNS} FROM nodestro_jobs"
+    " WHERE tenant_id = %s AND kind = %s AND ref = %s AND status IN ('queued', 'running')"
+)
+#: The payload key of :meth:`JobQueue.enqueue`'s client token (JQ-3): after a lost connection it identifies the row
+#: this call inserted. Reserved; it is not part of :attr:`Job.payload`.
+ENQUEUE_TOKEN = "_enqueue_token"
+
+
+class _Claims:
+    """The claims of one worker name on one database (connection string and schema) in this process, shared by every
+    :class:`JobQueue` on it (JQ-3).
+
+    ``held``: jobs :meth:`JobQueue.claim` handed out and not finished yet. ``abandoned``: jobs whose ``finish`` raised
+    (the last 1024); neither is ever handed out again. ``unsure``: the kinds of claims whose outcome is unknown (the
+    connection was lost and what the server did could not be shown); the next claim of such a kind first adopts the
+    worker's running jobs that were never handed out. ``lock`` runs the claims of the name one at a time; ``guard``
+    is only ever held for a change of the sets."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.guard = threading.Lock()
+        self.held: set[int] = set()
+        self.abandoned: deque[int] = deque(maxlen=1024)
+        self.unsure: set[str] = set()
+
+    def excluded(self) -> list[int]:
+        with self.guard:
+            return sorted(self.held.union(self.abandoned))
+
+
+_CLAIMS: dict[tuple[str, str | None, str], _Claims] = {}
+_CLAIMS_GUARD = threading.Lock()
+
+
+def _claims(database: PostgresDatabase, worker: str) -> _Claims:
+    key = (database._conninfo, database.schema, worker)
+    with _CLAIMS_GUARD:
+        found = _CLAIMS.get(key)
+        if found is None:
+            found = _CLAIMS[key] = _Claims()
+        return found
 
 
 class Job(BaseModel):
@@ -98,13 +142,15 @@ class Job(BaseModel):
 
 
 def _job(row: tuple[Any, ...]) -> Job:
+    payload = dict(row[5] or {})
+    payload.pop(ENQUEUE_TOKEN, None)
     return Job(
         id=row[0],
         tenant_id=row[1],
         kind=row[2],
         ref=row[3],
         status=row[4],
-        payload=row[5] or {},
+        payload=payload,
         attempts=row[6],
         worker=row[7],
         lease_until=row[8],
@@ -131,46 +177,124 @@ class JobQueue:
         self.lease = lease
 
     def enqueue(self, tenant_id: str, kind: str, ref: str, payload: Mapping[str, Any] | None = None) -> Job | None:
-        """Queue a job; ``None`` when the same work (tenant, kind, ref) is already queued or running."""
-        rows = self.database._query(
+        """Queue a job; ``None`` when the same work (tenant, kind, ref) is already queued or running.
+
+        Never repeated (RT2-03). The row carries a client token (:data:`ENQUEUE_TOKEN`); when the connection is
+        lost, the row with this token is the answer, whatever its status by now (a worker may have run it already).
+        Without it the insert was not applied, or met an active job of the same work (the answer would have been
+        ``None``); the two cannot be told apart, so the error of the lost connection is raised, as it is when the
+        outcome cannot be shown (:meth:`PostgresDatabase._write_returning`)."""
+        token = uuid.uuid4().hex
+        rows = self.database._write_returning(
             "INSERT INTO nodestro_jobs (tenant_id, kind, ref, status, payload) VALUES (%s, %s, %s, 'queued', %s)"
             " ON CONFLICT (tenant_id, kind, ref) WHERE status IN ('queued', 'running') DO NOTHING"
             f" RETURNING {_COLUMNS}",
-            (tenant_id, kind, ref, json.dumps(dict(payload or {}))),
+            (tenant_id, kind, ref, json.dumps({**dict(payload or {}), ENQUEUE_TOKEN: token})),
+            if_lost=(
+                f"SELECT {_COLUMNS} FROM nodestro_jobs"
+                " WHERE tenant_id = %s AND kind = %s AND ref = %s AND payload ->> %s = %s",
+                (tenant_id, kind, ref, ENQUEUE_TOKEN, token),
+            ),
         )
         return _job(rows[0]) if rows else None
 
     def claim(self, worker: str, kinds: Iterable[str] = (RUN_JOB,)) -> Job | None:
-        """The oldest queued job of ``kinds``, now running for ``worker`` with a fresh lease; ``None``: none."""
-        rows = self.database._query(
-            "UPDATE nodestro_jobs SET status = 'running', worker = %s, attempts = attempts + 1,"
-            " started_at = clock_timestamp(), lease_until = clock_timestamp() + %s"
-            " WHERE id = (SELECT id FROM nodestro_jobs WHERE status = 'queued' AND kind = ANY(%s)"
-            " ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)"
-            f" RETURNING {_COLUMNS}",
-            (worker, self.lease, list(kinds)),
+        """The oldest queued job of ``kinds``, now running for ``worker`` with a fresh lease; ``None``: none.
+
+        Never repeated (RT2-03): a repeated claim would take a second job and leave the first one running without
+        anyone executing it. When the connection is lost and the server is seen to be done with the statement
+        (:meth:`PostgresDatabase._write_returning`), the claimed job is the newest running job of ``worker`` of
+        ``kinds`` that was never handed out; with none, the claim was not applied and the error is raised. When the
+        outcome cannot be shown, the error is raised and the claim stays unsure: the next claim of these kinds for
+        ``worker`` first adopts such a job (it may have committed late) before it claims a new one.
+
+        Two rules make "the worker's job that was never handed out" exact (JQ-3, L-3): ``worker`` is a name no other
+        process uses (:func:`worker_name`; a name given to a worker by configuration must be unique on the
+        server), and the queue's record of handed-out jobs is shared by every :class:`JobQueue` of this process on
+        the same database, so ``heartbeat`` and ``finish`` may go through another instance. A claim cannot run
+        inside a transaction (lock order: the name's claim lock, then the process lock of the database)."""
+        if self.database.in_transaction:
+            raise RuntimeError("claim() cannot run inside a transaction")
+        wanted = list(kinds)
+        claims = _claims(self.database, worker)
+        with claims.lock:
+            with claims.guard:
+                unsure = sorted(claims.unsure.intersection(wanted))
+            if unsure:
+                found = self.database._query(*self._unheld(worker, unsure, claims.excluded()))
+                if found:
+                    return self._hand_out(claims, found[0])
+                with claims.guard:
+                    claims.unsure.difference_update(unsure)
+            try:
+                rows = self.database._write_returning(
+                    "UPDATE nodestro_jobs SET status = 'running', worker = %s, attempts = attempts + 1,"
+                    " started_at = clock_timestamp(), lease_until = clock_timestamp() + %s"
+                    " WHERE id = (SELECT id FROM nodestro_jobs WHERE status = 'queued' AND kind = ANY(%s)"
+                    " ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)"
+                    f" RETURNING {_COLUMNS}",
+                    (worker, self.lease, wanted),
+                    if_lost=self._unheld(worker, wanted, claims.excluded()),
+                )
+            except Exception:
+                with claims.guard:
+                    claims.unsure.update(wanted)
+                raise
+            return self._hand_out(claims, rows[0]) if rows else None
+
+    @staticmethod
+    def _unheld(worker: str, kinds: list[str], excluded: list[int]) -> tuple[str, tuple[Any, ...]]:
+        """The read of the newest running job of ``worker`` and ``kinds`` that was never handed out."""
+        return (
+            f"SELECT {_COLUMNS} FROM nodestro_jobs WHERE worker = %s AND status = 'running'"
+            " AND kind = ANY(%s) AND NOT (id = ANY(%s)) ORDER BY started_at DESC, id DESC LIMIT 1",
+            (worker, kinds, excluded),
         )
-        return _job(rows[0]) if rows else None
+
+    @staticmethod
+    def _hand_out(claims: _Claims, row: tuple[Any, ...]) -> Job:
+        job = _job(row)
+        with claims.guard:
+            claims.held.add(job.id)
+        return job
+
+    def _release(self, job_id: int, worker: str, *, abandoned: bool = False) -> None:
+        """Forget a job :meth:`claim` handed to ``worker`` (it finished or its lease was lost); an ``abandoned`` one
+        (its ``finish`` failed) is never handed out again."""
+        claims = _claims(self.database, worker)
+        with claims.guard:
+            claims.held.discard(job_id)
+            if abandoned:
+                claims.abandoned.append(job_id)
 
     def heartbeat(self, job_id: int, worker: str) -> Job | None:
         """Renew the lease of a job ``worker`` runs; ``None`` when the job is no longer its own (lease lost)."""
+        # Safe to repeat after a lost reply (JQ-3, tests/test_query_writes.py): it only renews the lease again.
         rows = self.database._query(
             "UPDATE nodestro_jobs SET lease_until = clock_timestamp() + %s"
             " WHERE id = %s AND worker = %s AND status = 'running'"
             f" RETURNING {_COLUMNS}",
             (self.lease, job_id, worker),
         )
-        return _job(rows[0]) if rows else None
+        if not rows:
+            self._release(job_id, worker)
+            return None
+        return _job(rows[0])
 
     def finish(self, job_id: int, worker: str, status: JobStatus, error: str | None = None) -> bool:
         """End a running job of ``worker``; ``False`` when it was no longer its own (it was reaped)."""
         if status not in ("done", "failed", "cancelled"):
             raise ValueError(f"A job cannot finish as {status!r}")
-        count = self.database._write(
-            "UPDATE nodestro_jobs SET status = %s, error = %s, finished_at = clock_timestamp(), lease_until = NULL"
-            " WHERE id = %s AND worker = %s AND status = 'running'",
-            (status, error, job_id, worker),
-        )
+        try:
+            count = self.database._write(
+                "UPDATE nodestro_jobs SET status = %s, error = %s, finished_at = clock_timestamp(),"
+                " lease_until = NULL WHERE id = %s AND worker = %s AND status = 'running'",
+                (status, error, job_id, worker),
+            )
+        except BaseException:
+            self._release(job_id, worker, abandoned=True)
+            raise
+        self._release(job_id, worker)
         return count == 1
 
     def request_cancel(self, tenant_id: str, kind: str, ref: str) -> Job | None:
@@ -194,8 +318,12 @@ class JobQueue:
         return _job(row) if row is not None else None
 
     def reap_expired(self) -> list[Job]:
-        """Mark every running job whose lease has expired as interrupted (its worker died); returns them."""
-        rows = self.database._query(
+        """Mark every running job whose lease has expired as interrupted (its worker died); returns them.
+
+        Never repeated (RT2-03): after a lost reply a repeat would find nothing and report no job, so the error is
+        raised instead. The jobs it may have marked are not reported; their runs are interrupted by the next
+        :func:`reap` as runs without an active job (C-11, after twice the lease)."""
+        rows = self.database._write_returning(
             "UPDATE nodestro_jobs SET status = 'interrupted', finished_at = clock_timestamp(),"
             " error = 'The worker stopped renewing its lease'"
             " WHERE id IN (SELECT id FROM nodestro_jobs WHERE status = 'running' AND lease_until < clock_timestamp()"
@@ -207,13 +335,17 @@ class JobQueue:
     def report(self, job: Job, worker: str, progress: Mapping[str, Any]) -> Job | None:
         """Merge ``progress`` into the payload of a job ``worker`` runs and renew its lease (one statement); ``None``
         when the job is no longer its own (lease lost)."""
+        # Safe to repeat after a lost reply (JQ-3, tests/test_query_writes.py): the same keys are merged again.
         rows = self.database._query(
             "UPDATE nodestro_jobs SET payload = payload || %s::jsonb, lease_until = clock_timestamp() + %s"
             " WHERE tenant_id = %s AND id = %s AND worker = %s AND status = 'running'"
             f" RETURNING {_COLUMNS}",
             (json.dumps(dict(progress)), self.lease, job.tenant_id, job.id, worker),
         )
-        return _job(rows[0]) if rows else None
+        if not rows:
+            self._release(job.id, worker)
+            return None
+        return _job(rows[0])
 
     def latest(self, tenant_id: str, kind: str, ref: str) -> Job | None:
         """The newest job of a piece of work (active or ended), if any."""
@@ -230,11 +362,7 @@ class JobQueue:
 
     def active(self, tenant_id: str, kind: str, ref: str) -> Job | None:
         """The queued or running job of a piece of work, if any."""
-        rows = self.database._query(
-            f"SELECT {_COLUMNS} FROM nodestro_jobs"
-            " WHERE tenant_id = %s AND kind = %s AND ref = %s AND status IN ('queued', 'running')",
-            (tenant_id, kind, ref),
-        )
+        rows = self.database._query(_ACTIVE, (tenant_id, kind, ref))
         return _job(rows[0]) if rows else None
 
     def jobs(self, tenant_id: str, kind: str, ref: str) -> list[Job]:

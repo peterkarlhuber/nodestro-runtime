@@ -127,10 +127,19 @@ class IdentityStore:
     def create_tenant(self, tenant_id: str, name: str) -> Tenant:
         if not TENANT_ID.fullmatch(tenant_id):
             raise NodestroError("identity.tenant_id", f"Invalid tenant id {tenant_id!r}", tenant=tenant_id)
-        rows = self.database._query(
+        # Never repeated (RT2-03): a repeat after a lost reply would report the new tenant as existing. When the
+        # connection is lost, a stored tenant with this id and this name is the answer; one with another name is
+        # someone else's, and the error is raised. (A tenant that existed before with the same id and name cannot be
+        # told apart from one created now; both mean the same tenant.)
+        display = name.strip() or tenant_id
+        rows = self.database._write_returning(
             "INSERT INTO nodestro_tenants (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING"
             " RETURNING id, name, created_at, status",
-            (tenant_id, name.strip() or tenant_id),
+            (tenant_id, display),
+            if_lost=(
+                "SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s AND name = %s",
+                (tenant_id, display),
+            ),
         )
         if not rows:
             raise NodestroError("identity.tenant_exists", f"Tenant {tenant_id} exists already", tenant=tenant_id)
@@ -158,9 +167,16 @@ class IdentityStore:
         suspended, so resuming restores them unless they expired); ``identity.tenant_unknown`` for an unknown tenant."""
         if status not in TENANT_STATUSES:
             raise NodestroError("identity.tenant_status", f"Unknown tenant status {status!r}", status=status)
-        rows = self.database._query(
+        # Never repeated (RT2-03): a repeat after a lost reply could undo a change another writer made meanwhile
+        # (a suspension, JQ-3). When the connection is lost, the tenant stored with this status is the answer;
+        # otherwise the error is raised.
+        rows = self.database._write_returning(
             "UPDATE nodestro_tenants SET status = %s WHERE id = %s RETURNING id, name, created_at, status",
             (status, tenant_id),
+            if_lost=(
+                "SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s AND status = %s",
+                (tenant_id, status),
+            ),
         )
         if not rows:
             raise NodestroError("identity.tenant_unknown", f"No tenant {tenant_id}", tenant=tenant_id)
@@ -172,6 +188,8 @@ class IdentityStore:
         """The user of an OpenID Connect identity, created on the first login (without any role)."""
         if not issuer or not subject:
             raise NodestroError("identity.subject_missing", "The identity provider sent no subject")
+        # Safe to repeat after a lost reply (JQ-3, tests/test_query_writes.py): the repeat meets the row the first
+        # attempt inserted and returns its id.
         rows = self.database._query(
             "INSERT INTO nodestro_users (id, issuer, subject, email, name, last_login_at)"
             " VALUES (%s, %s, %s, %s, %s, clock_timestamp())"
@@ -322,10 +340,13 @@ class IdentityStore:
         return state
 
     def take_login_state(self, state: str) -> LoginState | None:
-        """The login of ``state``, removed so it cannot be used twice; ``None`` when unknown or expired."""
+        """The login of ``state``, removed so it cannot be used twice; ``None`` when unknown or expired.
+
+        Never repeated (RT2-03): a repeat after a lost reply would find the state gone and call it expired. The
+        error is raised instead; the state is used up either way."""
         if not state or len(state) > 256:
             return None
-        rows = self.database._query(
+        rows = self.database._write_returning(
             "DELETE FROM nodestro_login_states WHERE state_hash = %s"
             " RETURNING nonce, code_verifier, return_to, tenant_id, bootstrap_hash, expires_at > clock_timestamp()",
             (_hash(state),),

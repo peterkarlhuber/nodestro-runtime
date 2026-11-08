@@ -192,6 +192,14 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ),
     (
         "nodestro_runtime/jobs.py",
+        "SELECT id, tenant_id, kind, ref, status, payload, attempts, worker, lease_until, cancel_requested, error, created_at, started_at, finished_at FROM nodestro_jobs WHERE worker = %s AND status = 'running' AND kind = ANY(%s) AND NOT (id = ANY(%s)) ORDER BY started_at DESC, id DESC LIMIT 1",
+    ): (
+        "worker claim after a lost reply (JQ-3): the claim's own job, found by the claiming worker's process-unique "
+        "name among its running jobs; returns no more than the claim itself would have (one job of any tenant, "
+        "carrying its tenant_id)"
+    ),
+    (
+        "nodestro_runtime/jobs.py",
         "UPDATE nodestro_jobs SET lease_until = clock_timestamp() + %s WHERE id = %s AND worker = %s AND status = 'running' RETURNING id, tenant_id, kind, ref, status, payload, attempts, worker, lease_until, cancel_requested, error, created_at, started_at, finished_at",
     ): (
         "worker heartbeat: keyed by the server-generated job id (bigserial) plus the claiming worker's name; "

@@ -202,8 +202,12 @@ class PostgresDatabase:
     handed out, so a connection the server dropped (a restart, a failover, an idle timeout of a proxy) is replaced
     instead of failing the next call; so is, on every checkout, a connection the server closed or spoke on while it
     sat idle, which shows on its socket without a round trip (RT2-03). A read outside a transaction that meets a lost
-    connection anyway is retried on another one; a write is not repeated (it may have been applied) and fails. The
-    pool discards lost connections.
+    connection anyway is retried on another one (:meth:`_query`); a write is not repeated (it may have been applied)
+    and fails (:meth:`_write`, :meth:`_write_returning`). A write that returns rows may name a read that finds what it
+    did when its reply was lost (``if_lost``, JQ-3); only a write whose repeat has the same effect and answer goes
+    through :meth:`_query`, as ``tests/test_query_writes.py`` checks. After a lost connection such a write first waits
+    for the lost statement's server process, up to :attr:`lost_statement_wait` (31 s by default; on a half-open
+    connection the full time). The pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
     transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
@@ -383,6 +387,9 @@ class PostgresDatabase:
                 connection.execute("COMMIT")
 
     def _query(self, query: Query, params: Params = ()) -> builtins.list[tuple[Any, ...]]:
+        """The rows of a read. Outside a transaction a lost connection is replaced and the read repeated (RT2-03),
+        so a statement that writes never goes through here (:meth:`_write`, :meth:`_write_returning`), except one
+        that is safe to repeat, as listed in ``tests/test_query_writes.py`` with its reason (JQ-3)."""
         current: Any = getattr(self._local, "connection", None)
         if current is not None:  # inside this thread's transaction: read its own writes
             rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
@@ -401,6 +408,79 @@ class PostgresDatabase:
                 if connection is None or not connection.broken or attempt == attempts:
                     raise
         raise AssertionError("unreachable")
+
+    def _write_returning(
+        self, query: Query, params: Params = (), *, if_lost: tuple[Query, Params] | None = None
+    ) -> builtins.list[tuple[Any, ...]]:
+        """The rows of one writing statement with ``RETURNING``, run as :meth:`_write` runs a write: in the calling
+        thread's transaction, or else in autocommit, serialized with this process's transactions and never repeated
+        (RT2-03). A lost connection may have lost the reply of a statement the server applied and committed, so
+        running it again could apply it twice or answer for a second change (JQ-3).
+
+        ``if_lost`` is a read (statement, parameters) that finds what the write did when its connection was lost
+        outside a transaction. A lost socket does not mean that the server is done with the statement: it may still
+        run and commit afterwards (the server notices the closed connection only when it next writes to it). So the
+        read waits until the statement's server process has ended (:meth:`_statement_ended`, bounded by
+        :attr:`lost_statement_wait`): a server process whose connection is closed ends once it has run what it had
+        received. Then its rows stand for the lost reply, and no rows mean the write was not
+        applied. When the end cannot be seen in time, or the read finds nothing, the error of the lost connection is
+        raised: the outcome is then unknown to the caller (``tests/test_write_retry.py``). Any other error, such as
+        a statement timeout (the connection stays usable and the statement was rolled back), is raised as it is.
+
+        The wait has a cost: when the server keeps a half-open connection (packets dropped without a reset), a lost
+        write blocks its caller for up to :attr:`lost_statement_wait` (the statement timeout plus 1 s, 31 s by
+        default) before it raises; a claim waits under its worker name's claim lock (JQ-3 re-review N-4).
+
+        Behind a pooler in transaction mode the server process is the pooler's, not this statement's own; the wait
+        then only bounds the time, and the read may run before a late commit (documented limit)."""
+        if getattr(self._local, "depth", 0):
+            rows: builtins.list[tuple[Any, ...]] = self._local.connection.execute(query, params).fetchall()
+            return rows
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            connection: Any = None
+            backend: int | None = None
+            try:
+                with self._connection() as connection:
+                    backend = connection.info.backend_pid
+                    rows = connection.execute(query, params).fetchall()
+                return rows
+            except psycopg.OperationalError as exc:
+                # A statement timeout leaves the connection usable and the statement rolled back: nothing to find.
+                if if_lost is None or connection is None or not connection.broken:
+                    raise
+                lost = exc
+        if backend is None or not self._statement_ended(backend):
+            raise lost
+        found = self._query(*if_lost)  # a read: retried on another connection if this one is lost too
+        if not found:
+            raise lost
+        return found
+
+    @property
+    def lost_statement_wait(self) -> float:
+        """How long (seconds) :meth:`_write_returning` waits for the server process of a statement whose connection
+        was lost: the statement timeout and a second (the server cancels a statement by then), else 30 seconds."""
+        override = getattr(self, "_lost_statement_wait", None)
+        if override is not None:
+            return float(override)
+        return self.statement_timeout + 1.0 if self.statement_timeout > 0 else 30.0
+
+    def _statement_ended(self, backend: int) -> bool:
+        """Whether the server process ``backend`` has ended within :attr:`lost_statement_wait`, so nothing it
+        received can still run or commit. Polls ``pg_stat_activity``. An idle process does not count: it may not
+        have read the statement yet. A connection the server still holds open (a network that drops packets without
+        a reset) is only seen to end after the server's TCP timeouts; the wait then runs out."""
+        deadline = time.monotonic() + self.lost_statement_wait
+        pause = 0.005
+        while True:
+            if not self._query("SELECT 1 FROM pg_stat_activity WHERE pid = %s", (backend,)):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(pause, max(deadline - time.monotonic(), 0.0)))
+            pause = min(pause * 2, 0.1)
 
     def _write(self, query: Query, params: Params) -> int:
         if getattr(self._local, "depth", 0):
