@@ -8,6 +8,8 @@ with the sandbox set the status themselves or are in a marked module.
 
 from __future__ import annotations
 
+# The fault-injection proxy (JQ-1) as a fixture for every test module.
+from postgres_support import fault_proxy  # noqa: F401
 import pytest
 
 from nodestro_runtime import docker_status
