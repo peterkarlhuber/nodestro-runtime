@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Tests (TABRION QA-18): blocked-module tests per optional edge (AC-3). `tests/test_optional_edges.py` runs one fresh
+  `python -I` per edge of the K-33 list with its modules blocked (`sys.modules[name] = None`) and imports every module
+  of the package: without `axentra` (and `axentra_platform.available()` is false), without `tabrion.postgres`, and
+  without psycopg. A meta test keeps the edges equal to K-33 and to the `postgres` extra; a mutation probe per edge
+  adds a top-level import to a copy of the package and expects red. Tests only.
+
 - TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
   nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
   #105, nodestro-studio #162 (`check_versions.py`: pins agree), nodestro-server #75, nodestro-desktop #61 and

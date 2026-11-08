@@ -656,6 +656,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
+| (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and MIG-NOD-6 (mandatory `tabrion` core) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
