@@ -45,7 +45,7 @@ postgres = [
     "orkexa[postgres] @ git+https://github.com/peterkarlhuber/orkexa.git@792a041883c74d613c3af491db51210881d2a453",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@9c4666fe5a44b158ffa9f0149b7bcd6008b1cd7e",
 ]
 dev = [
     # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's
@@ -53,7 +53,7 @@ dev = [
     "orkexa[postgres,sqlcheck] @ git+https://github.com/peterkarlhuber/orkexa.git@792a041883c74d613c3af491db51210881d2a453",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
-    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@60d83b31b0bfbd357b88d9e30b2601dfcfa5256e",
+    "axentra[oidc] @ git+https://github.com/peterkarlhuber/axentra.git@9c4666fe5a44b158ffa9f0149b7bcd6008b1cd7e",
     # Keeps the rule engine of the tenant SQL check free of Nodestro (lint-imports, contracts below).
     "import-linter>=2.1",
     "mypy>=1.13",

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Axentra pinned to `9c4666f` (axentra #61, TABRION MIG-AXE-0, B-06-1: the values in database errors, the server's
+  `DETAIL` text such as `Key (email)=(...)`, are redacted process-wide from logs, tracebacks, OpenTelemetry spans,
+  stored job and notification errors and CLI messages; problem-JSON answers are unchanged). The pin also brings the
+  Axentra CI-FAST W0/W1 commits (CI only). Axentra's dependencies are unchanged. The `axentra` extra is off by
+  default (`NODESTRO_AXENTRA=on`). The runtime's Axentra, identity, database role, security-vector and tenant
+  filter tests pass unchanged, also with `NODESTRO_TEST_RUNTIME_ROLE=1`.
+
 - Fixed (JQ-3, RT2-03): five writing statements no longer run through the retrying `PostgresDatabase._query`, which
   repeated a statement on another connection when its connection was lost, also when the server had already applied
   and committed it. Reproduced under fault injection (not observed in operation): `JobQueue.claim` left the claimed
