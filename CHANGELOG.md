@@ -12,6 +12,8 @@
   `reasoning_reduced="output_limit"` (emits `reasoning_reduced`). The Orkexa pin brings the root-cause fix: on
   Ollama only the latest thinking text is sent back (the 2026-11-06 o400 fix replayed every earlier one, so tool
   conversations outgrew the context window and Ollama silently cut the task out of the prompt).
+  Orkexa pinned to `840add4` (orkexa #71; it also brings #67..#70: CI-FAST W0/W1 and the master CI race fixes,
+  and a SIGTERM inside a finalizer is no longer lost in `orkexa-local serve`).
 - `run.agent.IncompleteResponseError` params now say why: `cause` (`context_window`, `reasoning` or `answer`),
   `max_tokens` and `output_tokens`, and the message ends with what to change.
 
