@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Fixed (RT-067): agents on local thinking models (qwen3.5 on Ollama) no longer fail with
+  `run.agent.IncompleteResponseError` or `run.agent.MaxToolRoundsError` where an answer was within reach. Every
+  agent step builds its Orkexa agent with `on_max_tool_rounds="answer"` (the last allowed round asks for the final
+  answer from the tool results so far, without tools) and `on_reasoning_overflow="answer"` (a response that spent
+  the whole `max_tokens` on thinking is asked once more without thinking). Limits are not raised and nothing runs
+  unbounded: each handling costs at most one more request per turn and is billed and recorded. `NodeRun` gains
+  `limits_handled` (`"reasoning"`, `"tool_rounds"`), the run emits `limit_handled`, and a reasoning overflow sets
+  `reasoning_reduced="output_limit"` (emits `reasoning_reduced`). The Orkexa pin brings the root-cause fix: on
+  Ollama only the latest thinking text is sent back (the 2026-11-06 o400 fix replayed every earlier one, so tool
+  conversations outgrew the context window and Ollama silently cut the task out of the prompt).
+- `run.agent.IncompleteResponseError` params now say why: `cause` (`context_window`, `reasoning` or `answer`),
+  `max_tokens` and `output_tokens`, and the message ends with what to change.
+
 - TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
   nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
   #105, nodestro-studio #162 (`check_versions.py`: pins agree), nodestro-server #75, nodestro-desktop #61 and
