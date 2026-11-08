@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Tests (TABRION QA-21): AC-7 public API check. `python scripts/check_tabrion_api.py` reads `src`, `tests`, `scripts`
+  and `examples` with `ast` and fails on a private Tabrion name (`tabrion._x`, a `_` attribute on a Tabrion name,
+  `getattr`/`import_module` with a private constant, a star import); with Tabrion installed every used name must be
+  in its module's `__all__`, and `--surface` compares with Tabrion's frozen API snapshot. `--export` writes the used
+  names to `docs/api-consumers.md` (none yet); `tests/test_tabrion_api_check.py` fails when it is stale. `docs/TODO.md`
+  adds RT-073 (the lint step).
+
 - TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
   nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
   #105, nodestro-studio #162 (`check_versions.py`: pins agree), nodestro-server #75, nodestro-desktop #61 and
