@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 2 |
 | P2 Medium | 6 |
-| P3 Low | 22 |
+| P3 Low | 23 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -285,14 +285,39 @@ Items that need an independent or external review (an internal audit does not re
 - **TABRION JQ-1** (fault-injection fixture `fault_proxy`, regression tests for the nine sites): Done in PR #143.
 - **TABRION JQ-2** (impact analysis, `docs/reports/jq-write-retry.md`): Done in PR #143.
 - **TABRION JQ-3** (fix option A, `_write_returning`, guard `tests/test_query_writes.py`): Done in PR #143. The
-  independent review accepted it with conditions (M-1..M-3, L-1..L-4, G-1); all are fixed in PR #143, the
-  re-acceptance of the review is outstanding.
+  independent review accepted it with conditions (M-1..M-3, L-1..L-4, G-1); all are fixed in PR #143 (61eb9fc), and
+  the re-review accepted it. Its non-blocking findings N-1..N-5 are follow-ups in RT-071.
 - **TABRION JQ-4** (docs, CHANGELOG, export adjustment, pin wave W7): CHANGELOG and the RT2-03 note done in PR
   #143. The API-side regression test of the export path is in nodestro-api PR #113 (`portable_build.py:401-406`
   needs no change, see the report). Open: the pins runtime → api → sdk → studio (coordinated outside this repository).
-- **Next step:** Re-acceptance of the review; merge; then the pin wave (nodestro-api PR #113 and nodestro-examples
+- **Next step:** Merge; then the pin wave (nodestro-api PR #113 and nodestro-examples
   PR #91 carry temporary pins for the tenant SQL check, CONTRIBUTING). Delete this entry when
   JQ-4 is done.
+
+### RT-071 · Follow-ups of the JQ-3 re-review (N-1..N-5)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION JQ-3 re-review at 61eb9fc (accepted), RT-070,
+  `docs/reports/jq-write-retry.md` ("Review findings"). None blocks a release.
+- **N-1 (Low):** the `unsure` mark of a claim is cleared before a late commit can land (`JobQueue.claim`): when
+  `lost_statement_wait` runs out while the claim still runs, the next claim finds nothing to adopt and clears the
+  mark, and the later commit is never adopted. The reaper heals it after the lease. Reproduced only with a commit
+  that outlives the statement timeout (e.g. a synchronous standby) or `statement_timeout = 0`. Fix: keep the lost
+  backend pid with the mark and clear it only once that pid has left `pg_stat_activity`.
+- **N-2 (Low):** the process-wide record of handed-out jobs is keyed by the connection string, not by the server
+  (`_claims`): two `PostgresDatabase` objects with different conninfo strings for the same server and schema can
+  hand out one job twice after a lost claim. Not reachable in nodestro-api (one database per worker process). Fix:
+  key the record by schema and worker name, or document that a process claims for a worker name through one
+  database.
+- **N-3 (Low, latent):** `claim` refuses a transaction but not a thread that holds the process lock outside one
+  (an Orkexa command holding `DatabaseSource.lock()`); with another thread inside `claim` the two would deadlock. No
+  caller does this. Fix: also refuse when the calling thread owns `database._lock`.
+- **N-4 (Info):** a lost write can block its caller for up to `lost_statement_wait` (statement timeout plus 1 s,
+  31 s by default) on a half-open connection; for `claim` under the worker name's claim lock. Documented in the
+  RT2-03 notes of `PostgresDatabase` and in the report; `RunWorker.run_once` calls `claim` on the event loop thread.
+- **N-5 (Info):** the write guard allows `JobQueue.claim` wholesale in `ALLOWED_UNRESOLVED`, so a future unresolved
+  `_query` in `claim` would pass; the adoption read has its own test. Fix: allow that one statement instead.
+- **Next step:** N-1 and N-2 together in one small PR with regression tests (the reviewer's probes `test_r2` and
+  `test_r3`); N-3 and N-5 alongside.
 
 ### RT-031 · Environment image caps and collection: follow-ups
 

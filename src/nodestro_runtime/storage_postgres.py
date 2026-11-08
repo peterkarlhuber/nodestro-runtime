@@ -205,7 +205,9 @@ class PostgresDatabase:
     connection anyway is retried on another one (:meth:`_query`); a write is not repeated (it may have been applied)
     and fails (:meth:`_write`, :meth:`_write_returning`). A write that returns rows may name a read that finds what it
     did when its reply was lost (``if_lost``, JQ-3); only a write whose repeat has the same effect and answer goes
-    through :meth:`_query`, as ``tests/test_query_writes.py`` checks. The pool discards lost connections.
+    through :meth:`_query`, as ``tests/test_query_writes.py`` checks. After a lost connection such a write first waits
+    for the lost statement's server process, up to :attr:`lost_statement_wait` (31 s by default; on a half-open
+    connection the full time). The pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
     transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
@@ -424,6 +426,10 @@ class PostgresDatabase:
         applied. When the end cannot be seen in time, or the read finds nothing, the error of the lost connection is
         raised: the outcome is then unknown to the caller (``tests/test_write_retry.py``). Any other error, such as
         a statement timeout (the connection stays usable and the statement was rolled back), is raised as it is.
+
+        The wait has a cost: when the server keeps a half-open connection (packets dropped without a reset), a lost
+        write blocks its caller for up to :attr:`lost_statement_wait` (the statement timeout plus 1 s, 31 s by
+        default) before it raises; a claim waits under its worker name's claim lock (JQ-3 re-review N-4).
 
         Behind a pooler in transaction mode the server process is the pooler's, not this statement's own; the wait
         then only bounds the time, and the read may run before a late commit (documented limit)."""

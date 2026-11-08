@@ -11,7 +11,8 @@ JQ-2 table). Each answer cites the test that shows it. Line numbers refer to mas
   repeated").
 - Fixed by JQ-3 (option A, no schema change, no public signature change); see "The fix" below. The independent
   review of runtime #143 (accepted with conditions) found that the first version's reconciliations were less exact
-  than stated; its findings are fixed and listed under "Review findings".
+  than stated; its findings are fixed and listed under "Review findings". The re-review at 61eb9fc **accepted** the
+  fix; its non-blocking findings N-1..N-5 are listed there too (runtime TODO RT-071).
 
 ## Mechanism
 
@@ -208,11 +209,14 @@ Behavior that changes with the fix:
 - A write of sites 1, 2, 4, 6, 7 and 9 whose connection is lost **before** it reached the server, or whose outcome
   cannot be shown, now fails with `psycopg.OperationalError` instead of being repeated, as RT2-03 says for every
   write (`test_an_enqueue_whose_request_is_lost_fails_and_queues_nothing`).
-- After a lost connection, such a call can take up to `lost_statement_wait` before it answers.
+- After a lost connection, such a call can take up to `lost_statement_wait` before it answers. On a half-open
+  connection (the server keeps it, packets are dropped without a reset) that is the full time: the statement timeout
+  plus 1 s, 31 s by default. A claim waits under its worker name's claim lock, so the process's other claims wait
+  too (re-review N-4).
 - These writes also run under the process lock now, like every other write of a process (review L-5, not measured;
   see runtime TODO RT-008).
 
-## Review findings (independent review of #143, accepted with conditions)
+## Review findings (independent review of #143: accepted with conditions, then accepted at 61eb9fc)
 
 | Finding | Fix | Test |
 |---|---|---|
@@ -230,6 +234,17 @@ Behavior that changes with the fix:
 The reviewer's four probes (`test_review_probes.py`, not committed) each confirmed a finding on 166d9fe. On the
 fixed code all four fail, which means the defects they show no longer happen. One example: the in-flight claim
 returns the job instead of raising.
+
+Re-review at 61eb9fc: **accepted**. Every condition above is met. Non-blocking findings, tracked as runtime TODO
+RT-071:
+
+| Finding | Summary |
+|---|---|
+| N-1 (Low) | the `unsure` mark of a claim is cleared before a late commit that outlives `lost_statement_wait` can land; the reaper heals the job after its lease |
+| N-2 (Low) | the record of handed-out jobs is keyed by the connection string, not the server; two databases with different conninfo for one server could hand out a job twice (not reachable in nodestro-api) |
+| N-3 (Low, latent) | `claim` is not refused for a thread holding the process lock outside a transaction; no caller does this |
+| N-4 (Info) | a lost write can block for up to `lost_statement_wait` (31 s by default) on a half-open connection; documented above and in `PostgresDatabase` |
+| N-5 (Info) | the guard allows `JobQueue.claim` wholesale in `ALLOWED_UNRESOLVED` |
 
 ## Test results
 
