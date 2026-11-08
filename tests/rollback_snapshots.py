@@ -6,10 +6,14 @@ roles, MIG-NOD-7 extension status; document 06, document 11 section 3.2) replace
 identical". These tools write the "before" picture from the old code:
 
 ``catalog``
-    Row-level security and the runtime role's privileges on every Nodestro table after
+    Row-level security and the runtime role's privileges on every table of the schema after
     :func:`~nodestro_runtime.storage_postgres.grant_runtime_role` (Nodestro's and Axentra's migrations run as the
-    owner, as on a server), the schema and database privileges, the default privileges, and the distinct privilege
-    sets on Axentra's tables (without their names, so a new Axentra pin does not change the file).
+    owner, as on a server): Nodestro's tables and, per table, Axentra's (names, RLS and FORCE flags, privileges,
+    counts), every policy, every function (owner, ``SECURITY DEFINER``, ``proconfig``, runtime ``EXECUTE``), the
+    schema and database privileges (including ``TEMPORARY``), the default privileges, every access control entry of
+    the schema's objects (``aclexplode`` of ``relacl``, ``attacl``, ``proacl``, ``nspacl``: grantor, grantee including
+    ``PUBLIC``, privilege, grant option), the database ACL entries of the run's roles and their memberships. Axentra's
+    tables are named, so an Axentra pin that changes them rewrites this file (a reviewed diff, like a migration).
 ``roles``
     The role decision table: eight role variants through ``inspect_role``, ``grant_runtime_role`` and
     ``PostgresDatabase.role_info`` (decision, error code, parameters and message).
@@ -27,18 +31,27 @@ identical". These tools write the "before" picture from the old code:
     migrations), without server version or extension objects (pgvector), so it is the same with and without
     pgvector and across PostgreSQL versions.
 
-Every run creates a schema and roles of its own (names start with ``--prefix``) in the given database, drops them
-again, and writes names as placeholders (``<schema>``, ``<owner>``, ``<runtime>``, ``<role:superuser>``), so two runs
-write identical files (``tests/test_rollback_snapshots.py``). The golden files in ``tests/fixtures/rollback/`` are
-from the old code (``tests/fixtures/rollback/SOURCE.md``). Usage, from the repository root, with a superuser
-connection string (as ``NODESTRO_TEST_POSTGRES``)::
+Every run creates a schema and roles of its own (names start with ``--prefix``, ``[a-z][a-z0-9_]{0,19}``; the login
+roles get a random password per run, never a fixed one) in the given database, drops them again, and writes names as
+placeholders (``<schema>``, ``<owner>``, ``<runtime>``, ``<role:superuser>``), so two runs write identical files
+(``tests/test_rollback_snapshots.py``). The golden files in ``tests/fixtures/rollback/`` are from the old code
+(``tests/fixtures/rollback/SOURCE.md``). Usage, from the repository root, with a superuser connection string (as
+``NODESTRO_TEST_POSTGRES``)::
 
     python tests/rollback_snapshots.py --dsn "host=127.0.0.1 user=postgres password=... dbname=postgres" check
     python tests/rollback_snapshots.py --dsn ... write            # rewrite the golden files
     python tests/rollback_snapshots.py --dsn ... write --dir out  # write elsewhere (e.g. the old SHA's checkout)
 
 ``check`` prints a unified diff per snapshot that differs and exits with 1. A step that changes a snapshot on purpose
-rewrites the golden file in the same pull request, so the diff is reviewed; a new migration does the same.
+rewrites the golden file in the same pull request, so the diff is reviewed; a new migration does the same. A run that
+was killed (SIGKILL, CI timeout) cannot drop its objects; ``check`` and ``write`` report such leftovers of the same
+prefix first, and ``cleanup`` drops them::
+
+    python tests/rollback_snapshots.py --dsn ... cleanup          # leftovers of crashed runs (own prefix only)
+
+``cleanup`` matches only the exact names a run creates (``<prefix><8 hex>``, ``..._scratch``, ``..._roles``,
+``..._owner``, ``..._runtime``, ``..._v_<variant>``), in the connected database; do not run it while another run with
+the same prefix is still going.
 """
 
 from __future__ import annotations
@@ -52,6 +65,7 @@ import difflib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 from typing import Any
@@ -63,7 +77,9 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "rollback"
 NAMES = ("catalog", "roles", "errors", "settings", "schema")
-PASSWORD = "nodestro-evidence-pw"
+DEFAULT_PREFIX = "nodestro_ev_"
+#: Allowed prefixes: short enough that no generated name exceeds PostgreSQL's 63 bytes (L-2 of the QA-13 review).
+_PREFIX = re.compile(r"[a-z][a-z0-9_]{0,19}")
 #: The canary value of the error snapshot: it must never be part of a message once B-06-2 is closed.
 CANARY = "canary-qa13@example.com"
 #: The tenant of the transactions of the settings snapshot (any id: no row is read).
@@ -81,7 +97,54 @@ ROLE_VARIANTS = (
 )
 
 
-def with_user(dsn: str, user: str, password: str = PASSWORD) -> str:
+def validate_prefix(prefix: str) -> str:
+    """``prefix`` when it is a valid run prefix, else :class:`ValueError`."""
+    if not _PREFIX.fullmatch(prefix):
+        raise ValueError(f"invalid prefix {prefix!r}: expected [a-z][a-z0-9_]{{0,19}}")
+    return prefix
+
+
+def _run_names(prefix: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """The exact schema and role names a run with ``prefix`` creates."""
+    base = re.escape(prefix) + r"[0-9a-f]{8}"
+    variants = "|".join(re.escape(v) for v in ROLE_VARIANTS)
+    return re.compile(base + r"(?:_scratch|_roles)?"), re.compile(base + rf"_(?:owner|runtime|v_(?:{variants}))")
+
+
+def leftovers(admin_dsn: str, prefix: str = DEFAULT_PREFIX, bases: list[str] | None = None) -> list[str]:
+    """Schemas (of the connected database) and roles of runs with ``prefix`` that still exist (only ``bases``'s)."""
+    schema_name, role_name = _run_names(validate_prefix(prefix))
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        found = [
+            f"schema {r[0]}"
+            for r in _rows(conn, "SELECT nspname::text FROM pg_namespace")
+            if schema_name.fullmatch(r[0])
+        ]
+        found += [
+            f"role {r[0]}" for r in _rows(conn, "SELECT rolname::text FROM pg_roles") if role_name.fullmatch(r[0])
+        ]
+    if bases is not None:
+        found = [item for item in found if any(item.split(" ", 1)[1].startswith(b) for b in bases)]
+    return sorted(found)
+
+
+def cleanup(admin_dsn: str, prefix: str = DEFAULT_PREFIX) -> list[str]:
+    """Drop the leftovers of crashed runs with ``prefix`` (schemas first, then roles); what was dropped."""
+    left = leftovers(admin_dsn, prefix)
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        for item in left:
+            kind, name = item.split(" ", 1)
+            if kind == "schema":
+                conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
+        for item in left:
+            kind, name = item.split(" ", 1)
+            if kind == "role":
+                conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(name)))
+                conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(name)))
+    return left
+
+
+def with_user(dsn: str, user: str, password: str) -> str:
     parts = conninfo_to_dict(dsn)
     parts.update(user=user, password=password)
     return make_conninfo("", **parts)
@@ -94,6 +157,8 @@ class EvidenceSchema:
     admin_dsn: str
     base: str
     names: dict[str, str] = field(default_factory=dict)
+    #: The password of every login role of this run: random per run, never stored (M-2 of the QA-13 review).
+    password: str = field(default_factory=lambda: secrets.token_urlsafe(24), repr=False)
 
     @property
     def schema(self) -> str:
@@ -116,7 +181,7 @@ class EvidenceSchema:
         return f"{self.base}_v_{name}"
 
     def dsn(self, role: str) -> str:
-        return with_user(self.admin_dsn, role)
+        return with_user(self.admin_dsn, role, self.password)
 
     def normalize(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -141,12 +206,18 @@ def _key() -> str:
 
 
 @contextmanager
-def evidence_schema(admin_dsn: str, prefix: str = "nodestro_ev_") -> Iterator[EvidenceSchema]:
-    """Create the roles and schema, migrate as the owner, grant the runtime role; drop everything afterwards."""
+def evidence_schema(
+    admin_dsn: str, prefix: str = DEFAULT_PREFIX, bases: list[str] | None = None
+) -> Iterator[EvidenceSchema]:
+    """Create the roles and schema, migrate as the owner, grant the runtime role; drop everything afterwards.
+
+    The run's base name is appended to ``bases`` when given (the tests check that nothing of it is left)."""
     from nodestro_runtime.axentra_platform import AxentraConfig, AxentraServices
     from nodestro_runtime.storage_postgres import grant_runtime_role
 
-    ev = EvidenceSchema(admin_dsn, f"{prefix}{uuid.uuid4().hex[:8]}")
+    ev = EvidenceSchema(admin_dsn, f"{validate_prefix(prefix)}{uuid.uuid4().hex[:8]}")
+    if bases is not None:
+        bases.append(ev.base)
     ev.names = {ev.owner: "<owner>", ev.runtime: "<runtime>", ev.schema: "<schema>"}
     ev.names.update({ev.variant(v): f"<role:{v}>" for v in ROLE_VARIANTS})
     ev.names.update(
@@ -163,7 +234,7 @@ def evidence_schema(admin_dsn: str, prefix: str = "nodestro_ev_") -> Iterator[Ev
             for role in roles:
                 admin.execute(
                     sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD {}").format(
-                        sql.Identifier(role), sql.Literal(PASSWORD)
+                        sql.Identifier(role), sql.Literal(ev.password)
                     )
                 )
             for schema in ev.schemas:
@@ -217,7 +288,7 @@ def catalog_snapshot(ev: EvidenceSchema) -> dict[str, Any]:
     role = ev.runtime
     with psycopg.connect(ev.admin_dsn, autocommit=True) as conn:
         nodestro: list[dict[str, Any]] = []
-        axentra_sets: set[tuple[bool, bool, tuple[str, ...]]] = set()
+        axentra: list[dict[str, Any]] = []
         for name, kind, rls, force, owner, oid in _rows(
             conn,
             "SELECT c.relname, c.relkind::text, c.relrowsecurity, c.relforcerowsecurity, pg_get_userbyid(c.relowner),"
@@ -225,26 +296,25 @@ def catalog_snapshot(ev: EvidenceSchema) -> dict[str, Any]:
             " WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY c.relname",
             (ev.schema,),
         ):
-            privileges = tuple(
+            privileges = [
                 p
                 for p in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
                 if _rows(conn, "SELECT has_table_privilege(%s, %s::oid, %s)", (role, oid, p))[0][0]
-            )
+            ]
+            entry = {
+                "table": name,
+                "kind": kind,
+                "row_security": rls,
+                "force_row_security": force,
+                "owner": owner,
+                "runtime_privileges": privileges,
+            }
             if _is_nodestro(name):
-                nodestro.append(
-                    {
-                        "table": name,
-                        "kind": kind,
-                        "row_security": rls,
-                        "force_row_security": force,
-                        "owner": owner,
-                        "runtime_privileges": list(privileges),
-                    }
-                )
+                nodestro.append(entry)
             elif name == "axentra_schema_migrations":
-                nodestro.append({"table": name, "owner": owner, "runtime_privileges": list(privileges)})
+                nodestro.append({"table": name, "owner": owner, "runtime_privileges": privileges})
             else:
-                axentra_sets.add((rls, force, privileges))
+                axentra.append(entry)
         policies = [
             {"table": t, "policy": p, "permissive": perm, "roles": sorted(r), "command": c, "using": q, "with_check": w}
             for t, p, perm, r, c, q, w in _rows(
@@ -253,7 +323,25 @@ def catalog_snapshot(ev: EvidenceSchema) -> dict[str, Any]:
                 " FROM pg_policies WHERE schemaname = %s ORDER BY tablename, policyname",
                 (ev.schema,),
             )
-            if _is_nodestro(t)
+        ]
+        functions = [
+            {
+                "function": f"{name}({args})",
+                "owner": owner,
+                "security_definer": secdef,
+                "config": sorted(config or []),
+                "runtime_execute": execute,
+            }
+            for name, args, owner, secdef, config, execute in _rows(
+                conn,
+                "SELECT p.proname, pg_get_function_identity_arguments(p.oid), pg_get_userbyid(p.proowner),"
+                " p.prosecdef, p.proconfig, has_function_privilege(%s, p.oid, 'EXECUTE')"
+                " FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = %s"
+                " AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass"
+                "   AND d.objid = p.oid AND d.deptype = 'e')"
+                " ORDER BY 1, 2",
+                (role, ev.schema),
+            )
         ]
         sequences = sorted(
             {
@@ -287,20 +375,103 @@ def catalog_snapshot(ev: EvidenceSchema) -> dict[str, Any]:
         }
         database = {
             p.lower(): _rows(conn, "SELECT has_database_privilege(%s, current_database(), %s)", (role, p))[0][0]
-            for p in ("CONNECT", "CREATE")
+            for p in ("CONNECT", "CREATE", "TEMPORARY")
         }
+        run_roles = [ev.owner, ev.runtime]
+        database_acl = sorted(
+            list(row)
+            for row in _rows(
+                conn,
+                "SELECT pg_get_userbyid(a.grantee), a.privilege_type, a.is_grantable FROM pg_database d,"
+                " LATERAL aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a"
+                " WHERE d.datname = current_database() AND pg_get_userbyid(a.grantee) = ANY(%s)",
+                (run_roles,),
+            )
+        )
+        memberships = sorted(
+            list(row)
+            for row in _rows(
+                conn,
+                "SELECT pg_get_userbyid(m.roleid), pg_get_userbyid(m.member), m.admin_option FROM pg_auth_members m"
+                " WHERE pg_get_userbyid(m.member) = ANY(%s) OR pg_get_userbyid(m.roleid) = ANY(%s)",
+                (run_roles, run_roles),
+            )
+        )
+        acl = _acl_entries(conn, ev.schema)
     return ev.normalize(
         {
             "nodestro_tables": nodestro,
-            "nodestro_policies": policies,
-            "axentra_table_privilege_sets": [
-                {"row_security": rls, "force_row_security": force, "runtime_privileges": list(p)}
-                for rls, force, p in sorted(axentra_sets)
-            ],
+            "axentra_tables": axentra,
+            "axentra_summary": {
+                "tables": len(axentra),
+                "row_security": sum(1 for t in axentra if t["row_security"]),
+                "force_row_security": sum(1 for t in axentra if t["force_row_security"]),
+            },
+            "policies": policies,
+            "functions": functions,
             "sequence_privilege_sets": [list(s) for s in sequences],
             "default_privileges": defaults,
-            "runtime_role": {"schema": schema, "database": database},
+            "runtime_role": {
+                "schema": schema,
+                "database": database,
+                "database_acl": database_acl,
+                "memberships": memberships,
+            },
+            "acl": acl,
         }
+    )
+
+
+#: Every access control entry of the schema's objects; ``NULL`` ACLs are read as their default (``acldefault``). An
+#: owner's entries for its own object (grantor = grantee = owner) are left out: they are implicit, and PostgreSQL 17
+#: adds ``MAINTAIN`` to them. Extension members (pgvector) are left out, so the file is the same with and without it.
+_ACL_SQL = """
+SELECT kind, object, grantor, grantee, privilege, grantable FROM (
+  SELECT CASE WHEN c.relkind = 'S' THEN 'sequence' ELSE 'relation' END AS kind, c.relname::text AS object,
+         c.relowner AS owner, a.grantor, a.grantee, a.privilege_type AS privilege, a.is_grantable AS grantable
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+         LATERAL aclexplode(coalesce(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::"char",
+                                                          c.relowner))) a
+   WHERE n.nspname = %(schema)s AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+     AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                     AND d.deptype = 'e')
+  UNION ALL
+  SELECT 'column', c.relname || '.' || at.attname, c.relowner, a.grantor, a.grantee, a.privilege_type,
+         a.is_grantable
+    FROM pg_attribute at JOIN pg_class c ON c.oid = at.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace,
+         LATERAL aclexplode(at.attacl) a
+   WHERE n.nspname = %(schema)s AND at.attacl IS NOT NULL AND at.attnum > 0 AND NOT at.attisdropped
+  UNION ALL
+  SELECT 'function', p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', p.proowner,
+         a.grantor, a.grantee, a.privilege_type, a.is_grantable
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace,
+         LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+   WHERE n.nspname = %(schema)s
+     AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                     AND d.deptype = 'e')
+  UNION ALL
+  SELECT 'schema', '<schema>', n.nspowner, a.grantor, a.grantee, a.privilege_type, a.is_grantable
+    FROM pg_namespace n, LATERAL aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+   WHERE n.nspname = %(schema)s
+) e
+WHERE NOT (e.grantee = e.owner AND e.grantor = e.owner)
+"""
+
+
+def _acl_entries(conn: psycopg.Connection[Any], schema: str) -> list[list[Any]]:
+    """``[kind, object, grantor, grantee, privilege, grantable]`` of every entry; ``PUBLIC`` and ``<admin>`` named."""
+    admin = str(_rows(conn, "SELECT current_user")[0][0])
+    names: dict[int, str] = {0: "PUBLIC"}
+
+    def name(oid: int) -> str:
+        if oid not in names:
+            found = str(_rows(conn, "SELECT pg_get_userbyid(%s)", (oid,))[0][0])
+            names[oid] = "<admin>" if found == admin else found
+        return names[oid]
+
+    return sorted(
+        [kind, obj, name(grantor), name(grantee), privilege, grantable]
+        for kind, obj, grantor, grantee, privilege, grantable in _rows(conn, _ACL_SQL, {"schema": schema})
     )
 
 
@@ -339,7 +510,7 @@ def _create_variant(ev: EvidenceSchema, name: str) -> str:
     with psycopg.connect(ev.admin_dsn, autocommit=True) as admin:
         admin.execute(
             sql.SQL("CREATE ROLE {} LOGIN " + attributes + " PASSWORD {}").format(
-                sql.Identifier(role), sql.Literal(PASSWORD)
+                sql.Identifier(role), sql.Literal(ev.password)
             )
         )
         if name == "owner_member":
@@ -579,7 +750,8 @@ def schema_snapshot(ev: EvidenceSchema) -> dict[str, Any]:
             conn,
             "SELECT c.relname, k.conname, k.contype::text, pg_get_constraintdef(k.oid) FROM pg_constraint k"
             " JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace"
-            " WHERE n.nspname = %s ORDER BY c.relname, k.conname",
+            # NOT NULL constraints are catalogued from PostgreSQL 18 on (contype 'n'); ``columns`` holds them already.
+            " WHERE n.nspname = %s AND k.contype <> 'n' ORDER BY c.relname, k.conname",
             (s,),
         ):
             if table in relations:
@@ -640,9 +812,11 @@ COLLECTORS: dict[str, Callable[[EvidenceSchema], dict[str, Any]]] = {
 }
 
 
-def collect(admin_dsn: str, prefix: str = "nodestro_ev_", names: tuple[str, ...] = NAMES) -> dict[str, dict[str, Any]]:
+def collect(
+    admin_dsn: str, prefix: str = DEFAULT_PREFIX, names: tuple[str, ...] = NAMES, bases: list[str] | None = None
+) -> dict[str, dict[str, Any]]:
     """All snapshots of one run (its own schema and roles, dropped afterwards)."""
-    with evidence_schema(admin_dsn, prefix) as ev:
+    with evidence_schema(admin_dsn, prefix, bases) as ev:
         found = {name: COLLECTORS[name](ev) for name in COLLECTORS if name in names}
     return {name: found[name] for name in names}
 
@@ -667,14 +841,36 @@ def diff(name: str, expected: dict[str, Any], actual: dict[str, Any]) -> str:
     )
 
 
+def _prefix_argument(value: str) -> str:
+    try:
+        return validate_prefix(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python tests/rollback_snapshots.py", description=__doc__.split("\n")[0])
     parser.add_argument("--dsn", required=True, help="a superuser connection string (as NODESTRO_TEST_POSTGRES)")
-    parser.add_argument("--prefix", default="nodestro_ev_", help="prefix of the schema and role names of the run")
+    parser.add_argument(
+        "--prefix",
+        default=DEFAULT_PREFIX,
+        type=_prefix_argument,
+        help="prefix of the schema and role names of the run ([a-z][a-z0-9_]{0,19})",
+    )
     parser.add_argument("--dir", type=Path, default=GOLDEN, help="directory of the snapshot files")
     parser.add_argument("--only", action="append", choices=NAMES, help="only this snapshot (repeatable)")
-    parser.add_argument("action", choices=("write", "check"))
+    parser.add_argument("action", choices=("write", "check", "cleanup"))
     args = parser.parse_args(argv)
+    if args.action == "cleanup":
+        dropped = cleanup(args.dsn, args.prefix)
+        for item in dropped:
+            print(f"dropped {item}")
+        print(f"cleanup: {len(dropped)} leftover(s) of prefix {args.prefix} dropped")
+        return 0
+    left = leftovers(args.dsn, args.prefix)
+    if left:
+        print(f"leftovers of earlier runs with prefix {args.prefix} (a killed run?): {', '.join(left)}")
+        print(f"  drop them with: python tests/rollback_snapshots.py --dsn ... --prefix {args.prefix} cleanup")
     snapshots = collect(args.dsn, args.prefix, tuple(args.only or NAMES))
     if args.action == "write":
         args.dir.mkdir(parents=True, exist_ok=True)

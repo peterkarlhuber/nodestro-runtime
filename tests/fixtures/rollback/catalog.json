@@ -1,24 +1,2549 @@
 {
-  "axentra_table_privilege_sets": [
-    {
-      "force_row_security": false,
-      "row_security": false,
-      "runtime_privileges": [
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE"
-      ]
-    },
+  "acl": [
+    [
+      "function",
+      "axentra_jobs_touch()",
+      "<owner>",
+      "PUBLIC",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "axentra_jobs_touch()",
+      "<owner>",
+      "<runtime>",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "axentra_scope_allows(p text, t text)",
+      "<owner>",
+      "PUBLIC",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "axentra_scope_allows(p text, t text)",
+      "<owner>",
+      "<runtime>",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "axentra_scope_allows_write(p text, t text)",
+      "<owner>",
+      "PUBLIC",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "axentra_scope_allows_write(p text, t text)",
+      "<owner>",
+      "<runtime>",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "nodestro_created_order(value text)",
+      "<owner>",
+      "PUBLIC",
+      "EXECUTE",
+      false
+    ],
+    [
+      "function",
+      "nodestro_created_order(value text)",
+      "<owner>",
+      "<runtime>",
+      "EXECUTE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_access_definitions",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_access_definitions",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_access_definitions",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_access_definitions",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_account_tokens",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_account_tokens",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_account_tokens",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_account_tokens",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_api_keys",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_api_keys",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_api_keys",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_api_keys",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_audit_events",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_audit_events",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_audit_events",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_audit_events",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_overrides",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_overrides",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_overrides",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_overrides",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_plans",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_plans",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_plans",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_plans",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_subscriptions",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_subscriptions",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_subscriptions",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_subscriptions",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_webhook_events",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_webhook_events",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_webhook_events",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_billing_webhook_events",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_events",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_events",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_events",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_events",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_files",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_files",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_files",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_files",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_invitations",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_invitations",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_invitations",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_invitations",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_jobs",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_jobs",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_jobs",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_jobs",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_login_states",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_login_states",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_login_states",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_login_states",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_memberships",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_memberships",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_memberships",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_memberships",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_mailbox",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_mailbox",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_mailbox",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_mailbox",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_messages",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_messages",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_messages",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_messages",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_preferences",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_preferences",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_preferences",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_preferences",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_templates",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_templates",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_templates",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_notify_templates",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_platform_roles",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_platform_roles",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_platform_roles",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_platform_roles",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_members",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_members",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_members",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_members",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_permissions",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_permissions",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_permissions",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_product_permissions",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_products",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_products",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_products",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_products",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_rate_limits",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_rate_limits",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_rate_limits",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_rate_limits",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_records",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_records",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_records",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_records",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_roles",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_roles",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_roles",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_roles",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedules",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedules",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedules",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schedules",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_schema_migrations",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_search_documents",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_search_documents",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_search_documents",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_search_documents",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_sessions",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_sessions",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_sessions",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_sessions",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_setup_tokens",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_setup_tokens",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_setup_tokens",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_setup_tokens",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_quotas",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_quotas",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_quotas",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_quotas",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_usage",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_usage",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_usage",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_storage_usage",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_tenants",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_tenants",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_tenants",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_tenants",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_counters",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_counters",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_counters",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_counters",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_events",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_events",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_events",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_events",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_meters",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_meters",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_meters",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_meters",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_quotas",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_quotas",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_quotas",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_quotas",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_reservations",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_reservations",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_reservations",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_usage_reservations",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_user_identities",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_user_identities",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_user_identities",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_user_identities",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_users",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_users",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_users",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_users",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_deliveries",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_deliveries",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_deliveries",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_deliveries",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_endpoints",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_endpoints",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_endpoints",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "axentra_webhook_endpoints",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_axentra_ids",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_axentra_ids",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_axentra_ids",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_axentra_ids",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_bootstrap_tokens",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_bootstrap_tokens",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_bootstrap_tokens",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_bootstrap_tokens",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunk_vectors",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunk_vectors",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunk_vectors",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunk_vectors",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunks",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunks",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunks",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_chunks",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_documents",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_documents",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_documents",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_documents",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_files",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_files",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_files",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_files",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_jobs",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_jobs",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_jobs",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_jobs",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_login_states",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_login_states",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_login_states",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_login_states",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memberships",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memberships",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memberships",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memberships",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memory_files",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memory_files",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memory_files",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_memory_files",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_run_events",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_run_events",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_run_events",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_run_events",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_schedule_firings",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_schema_migrations",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_sessions",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_sessions",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_sessions",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_sessions",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_tenants",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_tenants",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_tenants",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_tenants",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_users",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_users",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_users",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_users",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_vector_spaces",
+      "<owner>",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_vector_spaces",
+      "<owner>",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_vector_spaces",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "relation",
+      "nodestro_vector_spaces",
+      "<owner>",
+      "<runtime>",
+      "UPDATE",
+      false
+    ],
+    [
+      "schema",
+      "<schema>",
+      "<owner>",
+      "<runtime>",
+      "USAGE",
+      false
+    ],
+    [
+      "sequence",
+      "axentra_stream_seq",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "sequence",
+      "axentra_stream_seq",
+      "<owner>",
+      "<runtime>",
+      "USAGE",
+      false
+    ],
+    [
+      "sequence",
+      "nodestro_chunks_id_seq",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "sequence",
+      "nodestro_chunks_id_seq",
+      "<owner>",
+      "<runtime>",
+      "USAGE",
+      false
+    ],
+    [
+      "sequence",
+      "nodestro_jobs_id_seq",
+      "<owner>",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "sequence",
+      "nodestro_jobs_id_seq",
+      "<owner>",
+      "<runtime>",
+      "USAGE",
+      false
+    ]
+  ],
+  "axentra_summary": {
+    "force_row_security": 34,
+    "row_security": 34,
+    "tables": 42
+  },
+  "axentra_tables": [
     {
       "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
       "row_security": true,
       "runtime_privileges": [
         "SELECT",
         "INSERT",
         "UPDATE",
         "DELETE"
-      ]
+      ],
+      "table": "axentra_access_definitions"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_account_tokens"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_api_keys"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_audit_events"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_billing_overrides"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_billing_plans"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_billing_subscriptions"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_billing_webhook_events"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_events"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_files"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_invitations"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_jobs"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_login_states"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_memberships"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_notify_mailbox"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_notify_messages"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_notify_preferences"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_notify_templates"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_platform_roles"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_product_members"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_product_permissions"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_products"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_rate_limits"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_records"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_roles"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_schedule_firings"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_schedules"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_search_documents"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_sessions"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_setup_tokens"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_storage_quotas"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_storage_usage"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_tenants"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_usage_counters"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_usage_events"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_usage_meters"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_usage_quotas"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_usage_reservations"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_user_identities"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_users"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_webhook_deliveries"
+    },
+    {
+      "force_row_security": true,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "axentra_webhook_endpoints"
     }
   ],
   "default_privileges": [
@@ -72,7 +2597,40 @@
       false
     ]
   ],
-  "nodestro_policies": [],
+  "functions": [
+    {
+      "config": [],
+      "function": "axentra_jobs_touch()",
+      "owner": "<owner>",
+      "runtime_execute": true,
+      "security_definer": false
+    },
+    {
+      "config": [],
+      "function": "axentra_scope_allows(p text, t text)",
+      "owner": "<owner>",
+      "runtime_execute": true,
+      "security_definer": false
+    },
+    {
+      "config": [],
+      "function": "axentra_scope_allows_write(p text, t text)",
+      "owner": "<owner>",
+      "runtime_execute": true,
+      "security_definer": false
+    },
+    {
+      "config": [
+        "DateStyle=ISO, YMD",
+        "TimeZone=UTC",
+        "search_path=pg_catalog"
+      ],
+      "function": "nodestro_created_order(value text)",
+      "owner": "<owner>",
+      "runtime_execute": true,
+      "security_definer": false
+    }
+  ],
   "nodestro_tables": [
     {
       "owner": "<owner>",
@@ -300,11 +2858,1138 @@
       "table": "nodestro_vector_spaces"
     }
   ],
+  "policies": [
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_access_definitions",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_access_definitions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_access_definitions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_api_keys",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_api_keys",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_api_keys",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_audit_events",
+      "using": "(<schema>.axentra_scope_allows(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR (product_id IS NULL))"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_audit_events",
+      "using": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_audit_events",
+      "using": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_overrides",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_overrides",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_overrides",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_plans",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_plans",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_plans",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_subscriptions",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_subscriptions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_subscriptions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_webhook_events",
+      "using": "(<schema>.axentra_scope_allows(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_webhook_events",
+      "using": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_billing_webhook_events",
+      "using": "(<schema>.axentra_scope_allows_write(product_id, tenant_id) OR ((product_id IS NULL) AND (current_setting('axentra.scope'::text, true) = 'platform'::text)))",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_events",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_events",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_events",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_files",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_files",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_files",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_invitations",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_invitations",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_invitations",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_jobs",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_jobs",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_jobs",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_memberships",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_memberships",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_memberships",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_mailbox",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_mailbox",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_mailbox",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_messages",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_messages",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_messages",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_preferences",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_preferences",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_preferences",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_templates",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_templates",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_notify_templates",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_members",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_members",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_members",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_permissions",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_permissions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_product_permissions",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_products",
+      "using": "<schema>.axentra_scope_allows(id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_products",
+      "using": "<schema>.axentra_scope_allows_write(id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_products",
+      "using": "<schema>.axentra_scope_allows_write(id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_records",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_records",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_records",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_roles",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_roles",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_roles",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedule_firings",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedule_firings",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedule_firings",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedules",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedules",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_schedules",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_search_documents",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_search_documents",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_search_documents",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_quotas",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_quotas",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_quotas",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_usage",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_usage",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_storage_usage",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_tenants",
+      "using": "<schema>.axentra_scope_allows(product_id, id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_tenants",
+      "using": "<schema>.axentra_scope_allows_write(product_id, id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_tenants",
+      "using": "<schema>.axentra_scope_allows_write(product_id, id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_counters",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_counters",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_counters",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_events",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_events",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_events",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_meters",
+      "using": "<schema>.axentra_scope_allows(product_id, NULL::text)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, NULL::text)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_meters",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_meters",
+      "using": "<schema>.axentra_scope_allows_write(product_id, NULL::text)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_quotas",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_quotas",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_quotas",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_reservations",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_reservations",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_usage_reservations",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_deliveries",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_deliveries",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_deliveries",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "ALL",
+      "permissive": "PERMISSIVE",
+      "policy": "scope",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_endpoints",
+      "using": "<schema>.axentra_scope_allows(product_id, tenant_id)",
+      "with_check": "<schema>.axentra_scope_allows_write(product_id, tenant_id)"
+    },
+    {
+      "command": "DELETE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_delete",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_endpoints",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    },
+    {
+      "command": "UPDATE",
+      "permissive": "RESTRICTIVE",
+      "policy": "scope_update",
+      "roles": [
+        "public"
+      ],
+      "table": "axentra_webhook_endpoints",
+      "using": "<schema>.axentra_scope_allows_write(product_id, tenant_id)",
+      "with_check": null
+    }
+  ],
   "runtime_role": {
     "database": {
       "connect": true,
-      "create": false
+      "create": false,
+      "temporary": true
     },
+    "database_acl": [],
+    "memberships": [],
     "schema": {
       "create": false,
       "usage": true
