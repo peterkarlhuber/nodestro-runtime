@@ -10,7 +10,7 @@
 | Priority | Count |
 |---|---|
 | P0 Critical | 0 |
-| P1 High | 2 |
+| P1 High | 1 |
 | P2 Medium | 6 |
 | P3 Low | 23 |
 | P4 Optional | 14 |
@@ -274,29 +274,9 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Bugs and reliability
 
-### RT-070 · Writes repeated after a lost reply (TABRION JQ-1..JQ-4)
-
-- **Priority:** P1 High · **Status:** In progress (PR #143) · **Refs:** TABRION JQ-1, JQ-2, JQ-3, JQ-4 (planning
-  documents 06 and 09), RT2-03, `docs/reports/jq-write-retry.md`
-- **What:** `PostgresDatabase._query` repeated nine writing statements of `jobs.py` and `identity_store.py` after a
-  lost connection, also when the server had already committed them: a lost claimed job, false
-  `run.already_queued` / `knowledge.reindex_running` / `export.busy` / `identity.tenant_exists`, an empty reap.
-  Reproduced under fault injection only; not observed in operation.
-- **TABRION JQ-1** (fault-injection fixture `fault_proxy`, regression tests for the nine sites): Done in PR #143.
-- **TABRION JQ-2** (impact analysis, `docs/reports/jq-write-retry.md`): Done in PR #143.
-- **TABRION JQ-3** (fix option A, `_write_returning`, guard `tests/test_query_writes.py`): Done in PR #143. The
-  independent review accepted it with conditions (M-1..M-3, L-1..L-4, G-1); all are fixed in PR #143 (61eb9fc), and
-  the re-review accepted it. Its non-blocking findings N-1..N-5 are follow-ups in RT-071.
-- **TABRION JQ-4** (docs, CHANGELOG, export adjustment, pin wave W7): CHANGELOG and the RT2-03 note done in PR
-  #143. The API-side regression test of the export path is in nodestro-api PR #113 (`portable_build.py:401-406`
-  needs no change, see the report). Open: the pins runtime → api → sdk → studio (coordinated outside this repository).
-- **Next step:** Merge; then the pin wave (nodestro-api PR #113 and nodestro-examples
-  PR #91 carry temporary pins for the tenant SQL check, CONTRIBUTING). Delete this entry when
-  JQ-4 is done.
-
 ### RT-071 · Follow-ups of the JQ-3 re-review (N-1..N-5)
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION JQ-3 re-review at 61eb9fc (accepted), RT-070,
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION JQ-3 re-review at 61eb9fc (accepted), runtime #143 (TABRION JQ-1..JQ-4, done),
   `docs/reports/jq-write-retry.md` ("Review findings"). None blocks a release.
 - **N-1 (Low):** the `unsure` mark of a claim is cleared before a late commit can land (`JobQueue.claim`): when
   `lost_statement_wait` runs out while the claim still runs, the next claim finds nothing to adopt and clears the
@@ -406,7 +386,7 @@ Items that need an independent or external review (an internal audit does not re
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
 - **What:** With fresh statistics the pooled store is about 12 % below the pre-audit single-connection throughput,
-  and writes of one process still run one after another (since RT-070 also `JobQueue.enqueue`, `claim` and
+  and writes of one process still run one after another (since runtime #143, TABRION JQ-3, also `JobQueue.enqueue`, `claim` and
   `reap_expired` and `IdentityStore.create_tenant` and `take_login_state`, which were not serialized before). Not measured on server hardware under load. Local numbers
   (one 4-CPU machine, before and after Axentra) are in `docs/AXENTRA.md`, "Performance": with Axentra identity an
   API process is CPU-bound at about 40 % of the requests per second of the Axentra-off configuration.

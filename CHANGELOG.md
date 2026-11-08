@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
+  nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
+  #105, nodestro-studio #162 (`check_versions.py`: pins agree), nodestro-server #75, nodestro-desktop #61 and
+  nodestro-local-docker #51. `docs/TODO.md` drops RT-070
+  (TABRION JQ-1..JQ-4); the review follow-ups stay as RT-071.
+
 - Axentra pinned to `9c4666f` (axentra #61, TABRION MIG-AXE-0, B-06-1: the values in database errors, the server's
   `DETAIL` text such as `Key (email)=(...)`, are redacted process-wide from logs, tracebacks, OpenTelemetry spans,
   stored job and notification errors and CLI messages; problem-JSON answers are unchanged). The pin also brings the
