@@ -1,0 +1,319 @@
+{
+  "axentra_table_privilege_sets": [
+    {
+      "force_row_security": false,
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    {
+      "force_row_security": true,
+      "row_security": true,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    }
+  ],
+  "default_privileges": [
+    [
+      "<owner>",
+      "S",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "<owner>",
+      "S",
+      "<runtime>",
+      "USAGE",
+      false
+    ],
+    [
+      "<owner>",
+      "f",
+      "<runtime>",
+      "EXECUTE",
+      false
+    ],
+    [
+      "<owner>",
+      "r",
+      "<runtime>",
+      "DELETE",
+      false
+    ],
+    [
+      "<owner>",
+      "r",
+      "<runtime>",
+      "INSERT",
+      false
+    ],
+    [
+      "<owner>",
+      "r",
+      "<runtime>",
+      "SELECT",
+      false
+    ],
+    [
+      "<owner>",
+      "r",
+      "<runtime>",
+      "UPDATE",
+      false
+    ]
+  ],
+  "nodestro_policies": [],
+  "nodestro_tables": [
+    {
+      "owner": "<owner>",
+      "runtime_privileges": [
+        "SELECT"
+      ],
+      "table": "axentra_schema_migrations"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_axentra_ids"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_bootstrap_tokens"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_chunk_vectors"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_chunks"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_documents"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_files"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_jobs"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_login_states"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_memberships"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_memory_files"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_run_events"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_schedule_firings"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT"
+      ],
+      "table": "nodestro_schema_migrations"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_sessions"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_tenants"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_users"
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "owner": "<owner>",
+      "row_security": false,
+      "runtime_privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ],
+      "table": "nodestro_vector_spaces"
+    }
+  ],
+  "runtime_role": {
+    "database": {
+      "connect": true,
+      "create": false
+    },
+    "schema": {
+      "create": false,
+      "usage": true
+    }
+  },
+  "sequence_privilege_sets": [
+    [
+      "USAGE",
+      "SELECT"
+    ]
+  ]
+}

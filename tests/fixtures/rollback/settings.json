@@ -1,0 +1,125 @@
+{
+  "kinds": {
+    "database_source_tenant": {
+      "after": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "IDLE"
+      },
+      "inside": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "<tenant_id>",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "INTRANS"
+      }
+    },
+    "pool_without_schema": {
+      "idle": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "IDLE"
+      }
+    },
+    "session_lock": {
+      "held": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "IDLE"
+      }
+    },
+    "shared_pool_axentra": {
+      "after": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "IDLE"
+      },
+      "inside": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "<product_id>",
+          "axentra.scope": "tenant",
+          "axentra.tenant_id": "<tenant_id>"
+        },
+        "transaction_status": "INTRANS"
+      }
+    },
+    "transaction": {
+      "after": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "IDLE"
+      },
+      "inside": {
+        "differs_from_plain": {
+          "idle_in_transaction_session_timeout": "300000",
+          "search_path": "\"<schema>\"",
+          "statement_timeout": "30000"
+        },
+        "scope": {
+          "app.tenant_id": "",
+          "axentra.product_id": "",
+          "axentra.scope": "",
+          "axentra.tenant_id": ""
+        },
+        "transaction_status": "INTRANS"
+      }
+    }
+  }
+}

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Tests (TABRION QA-13): snapshot tools for rollback evidence of the server profile. `python tests/rollback_snapshots.py
+  --dsn <superuser connection string> write|check` creates a schema and roles of its own, runs Nodestro's and
+  Axentra's migrations as an owner role, grants a runtime role (`grant_runtime_role`), writes five canonical JSON
+  snapshots and drops everything again: `catalog` (row-level security and runtime role privileges per Nodestro table,
+  privilege sets on Axentra's tables, default privileges), `roles` (decision table of eight role variants through
+  `inspect_role`, `grant_runtime_role` and `role_info`), `errors` (code, parameters and message of the database error
+  paths, with whether the server's `DETAIL` value reaches the message, finding B-06-2), `settings` (`SHOW` extract
+  per kind of connection, including the pool lent to Axentra) and `schema` (schema dump of Nodestro's tables from the
+  catalog, without pgvector objects). The golden files in `tests/fixtures/rollback/` are from the old code (463e0d9);
+  `tests/test_rollback_snapshots.py` checks them and that two runs are identical. Tests only; `docs/TODO.md` adds
+  RT-072 (use the snapshots in each MIG-NOD step).
+
 - TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
   nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
   #105, nodestro-studio #162 (`check_versions.py`: pins agree), nodestro-server #75, nodestro-desktop #61 and
