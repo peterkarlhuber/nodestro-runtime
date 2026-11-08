@@ -202,8 +202,10 @@ class PostgresDatabase:
     handed out, so a connection the server dropped (a restart, a failover, an idle timeout of a proxy) is replaced
     instead of failing the next call; so is, on every checkout, a connection the server closed or spoke on while it
     sat idle, which shows on its socket without a round trip (RT2-03). A read outside a transaction that meets a lost
-    connection anyway is retried on another one; a write is not repeated (it may have been applied) and fails. The
-    pool discards lost connections.
+    connection anyway is retried on another one (:meth:`_query`); a write is not repeated (it may have been applied)
+    and fails (:meth:`_write`, :meth:`_write_returning`). A write that returns rows may name a read that finds what it
+    did when its reply was lost (``if_lost``, JQ-3); only a write whose repeat has the same effect and answer goes
+    through :meth:`_query`, as ``tests/test_query_writes.py`` checks. The pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
     transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Fixed (JQ-3, RT2-03): five writing statements no longer run through the retrying `PostgresDatabase._query`, which
+  repeated a statement on another connection when its connection was lost, also when the server had already applied
+  and committed it. Reproduced under fault injection (not observed in operation): `JobQueue.claim` left the claimed
+  job running with nobody executing it (it was interrupted after its lease) and returned the next one,
+  `JobQueue.enqueue` returned `None` (so `QueuedRuns.dispatch` raised `run.already_queued`, `QueuedReindex.start`
+  `knowledge.reindex_running` and nodestro-api's export queue `export.busy`, deleting the export job document) for
+  work it had just queued, `JobQueue.reap_expired` reported no job, `IdentityStore.create_tenant` raised
+  `identity.tenant_exists` for the tenant it had created, and `IdentityStore.take_login_state` called a login state
+  expired. They now use the new `PostgresDatabase._write_returning` (never repeated, like `_write`); after a lost
+  connection `enqueue` returns the work's active job, `claim` the newest running job of the worker that its queue has
+  not handed out yet, `create_tenant` the stored tenant, and `reap_expired` and `take_login_state` raise (the next
+  reaper interrupts the affected runs, C-11). A write whose request was lost before it reached the server now fails
+  instead of being repeated. Reads keep their retry; `heartbeat`, `report`, `set_tenant_status` and `login` stay on
+  `_query` because a repeat has the same effect and answer. No schema change, no public signature change. Tests:
+  `tests/test_write_retry.py` (fault-injection proxy `fault_proxy` in `tests/postgres_support.py`, all nine former
+  sites, counter-probes), guard `tests/test_query_writes.py` (no writing statement through `_query` unless allowed
+  with a reason); analysis in `docs/reports/jq-write-retry.md`. The tenant SQL allowlist gets the claim's
+  reconciliation read.
+
 - Tests: `test_a_change_while_a_step_runs_refuses_the_old_version` (`tests/test_worker_tool_changes.py`) changes the
   tool only once the step asked the model, so it holds its tools. It waited for the step to be stored as running,
   which happens before the agent is built (AD-10): on a slow runner the deletion came first and the step failed with

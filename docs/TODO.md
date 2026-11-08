@@ -10,7 +10,7 @@
 | Priority | Count |
 |---|---|
 | P0 Critical | 0 |
-| P1 High | 1 |
+| P1 High | 2 |
 | P2 Medium | 6 |
 | P3 Low | 22 |
 | P4 Optional | 14 |
@@ -274,6 +274,25 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Bugs and reliability
 
+### RT-070 · Writes repeated after a lost reply (TABRION JQ-1..JQ-4)
+
+- **Priority:** P1 High · **Status:** In progress (PR #143) · **Refs:** TABRION JQ-1, JQ-2, JQ-3, JQ-4 (planning
+  documents 06 and 09), RT2-03, `docs/reports/jq-write-retry.md`
+- **What:** `PostgresDatabase._query` repeated nine writing statements of `jobs.py` and `identity_store.py` after a
+  lost connection, also when the server had already committed them: a lost claimed job, false
+  `run.already_queued` / `knowledge.reindex_running` / `export.busy` / `identity.tenant_exists`, an empty reap.
+  Reproduced under fault injection only; not observed in operation.
+- **TABRION JQ-1** (fault-injection fixture `fault_proxy`, regression tests for the nine sites): Done in PR #143.
+- **TABRION JQ-2** (impact analysis, `docs/reports/jq-write-retry.md`): Done in PR #143.
+- **TABRION JQ-3** (fix option A, `_write_returning`, guard `tests/test_query_writes.py`): Done in PR #143; the
+  independent review it requires is outstanding.
+- **TABRION JQ-4** (docs, CHANGELOG, export adjustment, pin wave W7): CHANGELOG and the RT2-03 note done in PR
+  #143. Open: an API-side regression test of the export path (nodestro-api, `portable_build.py:401-406` needs no
+  change, see the report) and the pins runtime → api → sdk → studio (coordinated outside this repository).
+- **Next step:** Independent review of the PR; nodestro-api PR with a temporary integration pin for the tenant SQL
+  check (CONTRIBUTING: the allowlist gained the claim's reconciliation read); then the pin wave. Delete this entry when
+  JQ-4 is done.
+
 ### RT-031 · Environment image caps and collection: follow-ups
 
 - **Priority:** P3 Low · **Status:** Needs decision · **Refs:** Docker-first plan R3, `container_images.py`,
@@ -361,7 +380,8 @@ Items that need an independent or external review (an internal audit does not re
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** backend audit C-14 (partly fixed), #65
 - **What:** With fresh statistics the pooled store is about 12 % below the pre-audit single-connection throughput,
-  and writes of one process still run one after another. Not measured on server hardware under load. Local numbers
+  and writes of one process still run one after another (since RT-070 also `JobQueue.enqueue`, `claim` and
+  `reap_expired` and `IdentityStore.create_tenant` and `take_login_state`, which were not serialized before). Not measured on server hardware under load. Local numbers
   (one 4-CPU machine, before and after Axentra) are in `docs/AXENTRA.md`, "Performance": with Axentra identity an
   API process is CPU-bound at about 40 % of the requests per second of the Axentra-off configuration.
 - **Next step:** Load test on target hardware (run in nodestro-server, SRV-013); then decide on parallel writes or a pool-free read path
