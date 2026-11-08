@@ -383,6 +383,9 @@ class PostgresDatabase:
                 connection.execute("COMMIT")
 
     def _query(self, query: Query, params: Params = ()) -> builtins.list[tuple[Any, ...]]:
+        """The rows of a read. Outside a transaction a lost connection is replaced and the read repeated (RT2-03),
+        so a statement that writes never goes through here (:meth:`_write`, :meth:`_write_returning`), except one
+        that is safe to repeat, as listed in ``tests/test_query_writes.py`` with its reason (JQ-3)."""
         current: Any = getattr(self._local, "connection", None)
         if current is not None:  # inside this thread's transaction: read its own writes
             rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
@@ -401,6 +404,38 @@ class PostgresDatabase:
                 if connection is None or not connection.broken or attempt == attempts:
                     raise
         raise AssertionError("unreachable")
+
+    def _write_returning(
+        self, query: Query, params: Params = (), *, if_lost: tuple[Query, Params] | None = None
+    ) -> builtins.list[tuple[Any, ...]]:
+        """The rows of one writing statement with ``RETURNING``, run as :meth:`_write` runs a write: in the calling
+        thread's transaction, or else in autocommit, serialized with this process's transactions and never repeated
+        (RT2-03). A lost connection may have lost the reply of a statement the server applied and committed, so
+        running it again could apply it twice or answer for a second change (JQ-3).
+
+        ``if_lost`` is a read (statement, parameters) that finds what the write did when its connection was lost
+        outside a transaction: its rows stand for the lost reply; no rows mean the write cannot be shown to have
+        been applied, and the error of the lost connection is raised. Any other error is raised as it is."""
+        if getattr(self._local, "depth", 0):
+            rows: builtins.list[tuple[Any, ...]] = self._local.connection.execute(query, params).fetchall()
+            return rows
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("The database is closed")
+            connection: Any = None
+            try:
+                with self._connection() as connection:
+                    rows = connection.execute(query, params).fetchall()
+                return rows
+            except psycopg.OperationalError as exc:
+                # A statement timeout leaves the connection usable and the statement rolled back: nothing to find.
+                if if_lost is None or connection is None or not connection.broken:
+                    raise
+                lost = exc
+        found = self._query(*if_lost)  # a read: retried on another connection if this one is lost too
+        if not found:
+            raise lost
+        return found
 
     def _write(self, query: Query, params: Params) -> int:
         if getattr(self._local, "depth", 0):

@@ -4,7 +4,10 @@
 a read and wrong for a write that may already have been applied. The nine writing statements that went through it
 (``jobs.py`` ``enqueue``, ``claim``, ``heartbeat``, ``reap_expired``, ``report``; ``identity_store.py``
 ``create_tenant``, ``set_tenant_status``, ``login``, ``take_login_state``) are driven here through a
-:class:`~postgres_support.FaultProxy` that lets the statement commit and then loses its reply. The counter-probes
+:class:`~postgres_support.FaultProxy` that lets the statement commit and then loses its reply. Five of them
+(``enqueue``, ``claim``, ``reap_expired``, ``create_tenant``, ``take_login_state``) failed these tests before the fix
+(JQ-3: they now run through ``PostgresDatabase._write_returning``, never repeated); the four idempotent ones stay on
+``_query`` (``tests/test_query_writes.py``). The counter-probes
 (``finish``, ``cleanup``, ``request_cancel``) show the paths that never repeated a write, and the reads show that the
 read retry of RT2-03 stays. Every test asserts that the fault really fired. Nothing here sleeps: leases are expired
 by moving ``lease_until`` into the past.
@@ -43,11 +46,6 @@ from nodestro_runtime.jobs import (
 )
 from nodestro_runtime.postgres_tables import tenant_storage
 from nodestro_runtime.storage_postgres import PostgresDatabase
-
-#: The cases that fail before the fix (JQ-3): the retry after a lost reply changes the outcome.
-BEFORE_FIX = pytest.mark.xfail(
-    strict=True, reason="JQ-3: _query repeats a write whose reply was lost after it was applied"
-)
 
 
 @pytest.fixture
@@ -104,7 +102,6 @@ def lost_reply(proxy: FaultProxy) -> None:
 ENQUEUE = b"INSERT INTO nodestro_jobs"
 
 
-@BEFORE_FIX
 def test_an_enqueue_whose_reply_is_lost_returns_the_queued_job(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -115,7 +112,6 @@ def test_an_enqueue_whose_reply_is_lost_returns_the_queued_job(
     assert job is not None and (job.ref, job.status) == ("run-1", "queued")
 
 
-@BEFORE_FIX
 def test_a_dispatch_whose_reply_is_lost_does_not_report_run_already_queued(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -125,7 +121,6 @@ def test_a_dispatch_whose_reply_is_lost_does_not_report_run_already_queued(
     assert jobs(direct) == [("run-1", "queued", None, 0)]
 
 
-@BEFORE_FIX
 def test_a_reindex_whose_reply_is_lost_does_not_report_reindex_running(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -140,7 +135,6 @@ def test_a_reindex_whose_reply_is_lost_does_not_report_reindex_running(
 CLAIM = b"SET status = 'running'"
 
 
-@BEFORE_FIX
 def test_a_claim_whose_reply_is_lost_returns_the_claimed_job(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -234,7 +228,6 @@ async def start_run(api: Process, queue: JobQueue, tenant: str) -> str:
     return run.id
 
 
-@BEFORE_FIX
 async def test_a_worker_whose_claim_reply_is_lost_executes_the_run(
     proxied: PostgresDatabase,
     direct: PostgresDatabase,
@@ -253,7 +246,6 @@ async def test_a_worker_whose_claim_reply_is_lost_executes_the_run(
     assert jobs(direct) == [(run_id, "done", "w1", 1)]
 
 
-@BEFORE_FIX
 async def test_an_api_start_whose_enqueue_reply_is_lost_succeeds(
     proxied: PostgresDatabase,
     direct: PostgresDatabase,
@@ -290,7 +282,6 @@ def test_a_heartbeat_whose_reply_is_lost_renews_the_lease(
 REAP = b"SET status = 'interrupted'"
 
 
-@BEFORE_FIX
 def test_a_reap_whose_reply_is_lost_fails_instead_of_reporting_nothing(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -304,7 +295,6 @@ def test_a_reap_whose_reply_is_lost_fails_instead_of_reporting_nothing(
     assert jobs(direct) == [("run-1", "interrupted", "dead-worker", 1)]
 
 
-@BEFORE_FIX
 async def test_the_run_of_a_lost_reap_is_healed_by_the_orphan_check(
     proxied: PostgresDatabase,
     direct: PostgresDatabase,
@@ -345,7 +335,6 @@ def test_a_report_whose_reply_is_lost_merges_the_progress_once(
 # ---- 6 create_tenant ----------------------------------------------------------------------------
 
 
-@BEFORE_FIX
 def test_a_tenant_creation_whose_reply_is_lost_returns_the_tenant(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -388,7 +377,6 @@ def test_a_first_login_whose_reply_is_lost_returns_the_one_stored_user(
 # ---- 9 take_login_state -------------------------------------------------------------------------
 
 
-@BEFORE_FIX
 def test_a_login_state_whose_reply_is_lost_fails_instead_of_reporting_it_expired(
     proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
 ) -> None:
@@ -466,3 +454,71 @@ def test_a_read_whose_request_is_lost_is_repeated_on_another_connection(
     found = JobQueue(proxied).get(created.id)
     assert (fault_proxy.fired, fault_proxy.replies_lost) == (1, 0)
     assert found is not None and found.id == created.id
+
+
+# ---- a write whose request is lost is not repeated either (RT2-03) ------------------------------
+
+
+def test_an_enqueue_whose_request_is_lost_fails_and_queues_nothing(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """The client cannot tell a lost request from a lost reply: with no active job found, the error is raised."""
+    fault_proxy.arm(ENQUEUE, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        JobQueue(proxied).enqueue("alpha", RUN_JOB, "run-1")
+    assert (fault_proxy.fired, fault_proxy.replies_lost) == (1, 0)
+    assert jobs(direct) == []
+
+
+def test_a_claim_whose_request_is_lost_fails_and_leaves_the_job_queued(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    JobQueue(direct).enqueue("alpha", RUN_JOB, "run-1")
+    queue = JobQueue(proxied)
+    fault_proxy.arm(CLAIM, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        queue.claim("w1")
+    assert (fault_proxy.fired, fault_proxy.replies_lost) == (1, 0)
+    assert jobs(direct) == [("run-1", "queued", None, 0)]
+    job = queue.claim("w1")
+    assert job is not None and job.ref == "run-1"
+
+
+def test_a_lost_claim_never_returns_a_job_the_worker_already_holds(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """A worker holding a run (S-2) loses a claim: the newer job is found, the held one is never handed out twice."""
+    for ref in ("run-1", "run-2"):
+        JobQueue(direct).enqueue("alpha", RUN_JOB, ref)
+    queue = JobQueue(proxied)
+    held = queue.claim("w1")
+    assert held is not None and held.ref == "run-1"
+    fault_proxy.arm(CLAIM)
+    job = queue.claim("w1")
+    lost_reply(fault_proxy)
+    assert job is not None and job.ref == "run-2"
+    fault_proxy.arm(CLAIM, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        queue.claim("w1")  # nothing queued was claimed; the two held jobs are not candidates
+    assert queue.finish(held.id, "w1", "done") and queue.finish(job.id, "w1", "done")
+    assert queue._claimed == {}
+
+
+def test_a_tenant_creation_whose_request_is_lost_fails_and_creates_nothing(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    fault_proxy.arm(b"INSERT INTO nodestro_tenants", lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        IdentityStore(proxied).create_tenant("alpha", "Alpha")
+    assert IdentityStore(direct).tenants() == []
+
+
+def test_a_write_inside_a_transaction_joins_it_and_is_not_reconciled(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """In a transaction the lost connection rolls everything back; nothing is looked up or repeated."""
+    fault_proxy.arm(ENQUEUE)
+    with pytest.raises(psycopg.OperationalError), proxied.transaction():
+        JobQueue(proxied).enqueue("alpha", RUN_JOB, "run-1")
+    assert fault_proxy.fired == 1
+    assert jobs(direct) == []
