@@ -128,12 +128,18 @@ class IdentityStore:
         if not TENANT_ID.fullmatch(tenant_id):
             raise NodestroError("identity.tenant_id", f"Invalid tenant id {tenant_id!r}", tenant=tenant_id)
         # Never repeated (RT2-03): a repeat after a lost reply would report the new tenant as existing. When the
-        # connection is lost, the stored tenant is the answer (it was created now, or existed already).
+        # connection is lost, a stored tenant with this id and this name is the answer; one with another name is
+        # someone else's, and the error is raised. (A tenant that existed before with the same id and name cannot be
+        # told apart from one created now; both mean the same tenant.)
+        display = name.strip() or tenant_id
         rows = self.database._write_returning(
             "INSERT INTO nodestro_tenants (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING"
             " RETURNING id, name, created_at, status",
-            (tenant_id, name.strip() or tenant_id),
-            if_lost=("SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s", (tenant_id,)),
+            (tenant_id, display),
+            if_lost=(
+                "SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s AND name = %s",
+                (tenant_id, display),
+            ),
         )
         if not rows:
             raise NodestroError("identity.tenant_exists", f"Tenant {tenant_id} exists already", tenant=tenant_id)
@@ -161,10 +167,16 @@ class IdentityStore:
         suspended, so resuming restores them unless they expired); ``identity.tenant_unknown`` for an unknown tenant."""
         if status not in TENANT_STATUSES:
             raise NodestroError("identity.tenant_status", f"Unknown tenant status {status!r}", status=status)
-        # Safe to repeat after a lost reply (JQ-3, tests/test_query_writes.py): it sets the same status again.
-        rows = self.database._query(
+        # Never repeated (RT2-03): a repeat after a lost reply could undo a change another writer made meanwhile
+        # (a suspension, JQ-3). When the connection is lost, the tenant stored with this status is the answer;
+        # otherwise the error is raised.
+        rows = self.database._write_returning(
             "UPDATE nodestro_tenants SET status = %s WHERE id = %s RETURNING id, name, created_at, status",
             (status, tenant_id),
+            if_lost=(
+                "SELECT id, name, created_at, status FROM nodestro_tenants WHERE id = %s AND status = %s",
+                (tenant_id, status),
+            ),
         )
         if not rows:
             raise NodestroError("identity.tenant_unknown", f"No tenant {tenant_id}", tenant=tenant_id)

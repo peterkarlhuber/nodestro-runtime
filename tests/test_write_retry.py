@@ -16,8 +16,10 @@ by moving ``lease_until`` into the past.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,9 +34,11 @@ from nodestro_runtime.workspace import Workspace
 pytest.importorskip("psycopg")
 
 import psycopg
+from psycopg import sql
 
 from nodestro_runtime.identity_store import IdentityStore
 from nodestro_runtime.jobs import (
+    ENQUEUE_TOKEN,
     REINDEX_JOB,
     REINDEX_REF,
     RUN_JOB,
@@ -42,6 +46,7 @@ from nodestro_runtime.jobs import (
     QueuedReindex,
     QueuedRuns,
     RunWorker,
+    _claims,
     reap,
 )
 from nodestro_runtime.postgres_tables import tenant_storage
@@ -159,8 +164,7 @@ def test_a_lost_claim_never_gives_one_job_to_two_workers(
     lost_reply(fault_proxy)
     second = JobQueue(direct).claim("w2")
     assert second is not None
-    if first is not None:
-        assert first.id != second.id
+    assert first is not None and first.id != second.id
     assert all(attempts <= 1 for _ref, _status, _worker, attempts in jobs(direct))
 
 
@@ -501,7 +505,7 @@ def test_a_lost_claim_never_returns_a_job_the_worker_already_holds(
     with pytest.raises(psycopg.OperationalError):
         queue.claim("w1")  # nothing queued was claimed; the two held jobs are not candidates
     assert queue.finish(held.id, "w1", "done") and queue.finish(job.id, "w1", "done")
-    assert queue._claimed == {}
+    assert _claims(proxied, "w1").held == set()
 
 
 def test_a_tenant_creation_whose_request_is_lost_fails_and_creates_nothing(
@@ -522,3 +526,269 @@ def test_a_write_inside_a_transaction_joins_it_and_is_not_reconciled(
         JobQueue(proxied).enqueue("alpha", RUN_JOB, "run-1")
     assert fault_proxy.fired == 1
     assert jobs(direct) == []
+
+
+# ---- JQ-3 review: a statement still running when the connection is lost (M-1) ---------------------
+
+
+@contextmanager
+def locked_jobs(schema: str) -> Iterator[Callable[[], None]]:
+    """Holds a lock on ``nodestro_jobs`` that every write waits for (reads and ``SKIP LOCKED`` subqueries do not);
+    yields the release. A statement sent meanwhile is still running on the server when its connection is cut."""
+    with psycopg.connect(postgres_support.DSN) as locker:
+        locker.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+        locker.execute("LOCK TABLE nodestro_jobs IN SHARE ROW EXCLUSIVE MODE")
+        released = threading.Event()
+
+        def release() -> None:
+            if not released.is_set():
+                released.set()
+                locker.commit()
+
+        try:
+            yield release
+        finally:
+            release()
+
+
+def test_a_claim_still_running_when_its_connection_is_cut_is_returned_after_it_commits(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy, schema: str
+) -> None:
+    """The server commits the claim after the client lost its connection: the reconciliation waits for the claim's
+    server process to end, so it sees the commit and returns the job (it was a lost job before)."""
+    JobQueue(direct).enqueue("alpha", RUN_JOB, "run-1")
+    queue = JobQueue(proxied)
+    with locked_jobs(schema) as release:
+        fault_proxy.arm(CLAIM, lose="inflight", then=release)  # the claim goes on once the client is cut off
+        job = queue.claim("w1")
+    fault_proxy.check()
+    assert fault_proxy.fired == 1
+    assert job is not None and (job.ref, job.status, job.worker) == ("run-1", "running", "w1")
+    assert jobs(direct) == [("run-1", "running", "w1", 1)]
+    assert _claims(proxied, "w1").held == {job.id}
+
+
+def test_a_claim_whose_outcome_cannot_be_shown_is_adopted_by_the_next_claim(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy, schema: str
+) -> None:
+    """The claim's server process does not end within the wait (it waits for a lock): the claim raises and stays
+    unsure; when it commits later, the next claim of the worker adopts that job before it claims another one."""
+    for ref in ("run-1", "run-2"):
+        JobQueue(direct).enqueue("alpha", RUN_JOB, ref)
+    proxied._lost_statement_wait = 0.2  # type: ignore[attr-defined]
+    queue = JobQueue(proxied)
+    with locked_jobs(schema) as release:
+        fault_proxy.arm(CLAIM, lose="inflight")
+        with pytest.raises(psycopg.OperationalError):
+            queue.claim("w1")
+        backend = fault_proxy.fired_backend
+        assert backend is not None and not postgres_support.backend_gone(postgres_support.DSN, backend)
+        assert _claims(proxied, "w1").unsure == {RUN_JOB}
+        release()  # the lost claim goes on and commits
+        proxied._lost_statement_wait = 30  # type: ignore[attr-defined]
+        assert proxied._statement_ended(backend)
+    assert jobs(direct) == [("run-1", "running", "w1", 1), ("run-2", "queued", None, 0)]
+    adopted = queue.claim("w1")
+    assert adopted is not None and adopted.ref == "run-1"  # not run-2: the late claim is not lost
+    following = queue.claim("w1")
+    assert following is not None and following.ref == "run-2"
+    assert _claims(proxied, "w1").unsure == set()
+    assert queue.claim("w1") is None
+
+
+def test_an_enqueue_still_running_when_its_connection_is_cut_is_returned_after_it_commits(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy, schema: str
+) -> None:
+    """The export path (``QueuedExports.enqueue`` deletes the export document when this raises): the insert commits
+    after the cut, and the reconciliation still finds it."""
+    with locked_jobs(schema) as release:
+        fault_proxy.arm(ENQUEUE, lose="inflight", then=release)
+        job = JobQueue(proxied).enqueue("alpha", "export", "exp-1", {"publication_id": "pub-1"})
+    fault_proxy.check()
+    assert job is not None and (job.ref, job.status, job.payload) == ("exp-1", "queued", {"publication_id": "pub-1"})
+    assert [row[:2] for row in jobs(direct)] == [("exp-1", "queued")]
+
+
+# ---- JQ-3 review: concurrent writers and other callers' rows (M-2, M-3, L-1) ------------------------
+
+
+def test_a_lost_tenant_status_change_is_not_repeated_over_a_later_one(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """A resumes a tenant and loses the reply; B suspends it meanwhile and is told so. A's call fails instead of
+    resuming the tenant again over B's suspension (SR-03: a suspension must not be undone silently)."""
+    IdentityStore(direct).create_tenant("acme", "Acme")
+    IdentityStore(direct).set_tenant_status("acme", "suspended")
+    fault_proxy.arm(
+        b"UPDATE nodestro_tenants SET status",
+        then=lambda: IdentityStore(direct).set_tenant_status("acme", "suspended"),
+    )
+    with pytest.raises(psycopg.OperationalError):
+        IdentityStore(proxied).set_tenant_status("acme", "active")
+    lost_reply(fault_proxy)
+    fault_proxy.check()
+    found = IdentityStore(direct).tenant("acme")
+    assert found is not None and found.status == "suspended"
+
+
+def test_a_lost_reindex_start_is_not_answered_with_another_running_reindex(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """A reindex with model A runs; starting one with model B loses its request: the start fails instead of
+    reporting model B started (the reconciliation looks for this call's own row, by its token)."""
+    QueuedReindex(JobQueue(direct), "alpha", knowledge=None).start("model-a")
+    fault_proxy.arm(ENQUEUE, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        QueuedReindex(JobQueue(proxied), "alpha", knowledge=None).start("model-b")
+    assert fault_proxy.fired == 1
+    with postgres_support.owner_of(direct)._transaction() as db:
+        assert db.execute("SELECT payload ->> 'model' FROM nodestro_jobs").fetchall() == [("model-a",)]
+
+
+def test_a_lost_enqueue_that_conflicted_with_active_work_fails(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """The insert met an active job of the same work (the answer would have been ``None``) and its reply was lost:
+    the other job is not returned as this call's own."""
+    other = JobQueue(direct).enqueue("alpha", RUN_JOB, "run-1")
+    assert other is not None
+    fault_proxy.arm(ENQUEUE)
+    with pytest.raises(psycopg.OperationalError):
+        JobQueue(proxied).enqueue("alpha", RUN_JOB, "run-1")
+    lost_reply(fault_proxy)
+    assert jobs(direct) == [("run-1", "queued", None, 0)]
+
+
+def test_a_lost_enqueue_whose_job_already_ran_returns_it(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """A worker claims and finishes the job before the reconciliation reads: it is found by its token anyway."""
+
+    def run_it() -> None:
+        queue = JobQueue(direct)
+        claimed = queue.claim("w2")
+        assert claimed is not None and queue.finish(claimed.id, "w2", "done")
+
+    fault_proxy.arm(ENQUEUE, then=run_it)
+    job = JobQueue(proxied).enqueue("alpha", RUN_JOB, "run-1")
+    lost_reply(fault_proxy)
+    fault_proxy.check()
+    assert job is not None and (job.ref, job.status) == ("run-1", "done")
+
+
+def test_the_enqueue_token_is_not_part_of_the_payload(direct: PostgresDatabase) -> None:
+    queue = JobQueue(direct)
+    job = queue.enqueue("alpha", REINDEX_JOB, REINDEX_REF, {"model": "m"})
+    assert job is not None and job.payload == {"model": "m"}
+    found = queue.get(job.id)
+    assert found is not None and found.payload == {"model": "m"}
+    with postgres_support.owner_of(direct)._transaction() as db:
+        stored = db.execute("SELECT payload FROM nodestro_jobs").fetchone()
+    assert stored is not None and set(stored[0]) == {"model", ENQUEUE_TOKEN}
+
+
+def test_a_lost_tenant_creation_does_not_return_another_tenant(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    IdentityStore(direct).create_tenant("acme", "Acme Corp (someone else)")
+    fault_proxy.arm(b"INSERT INTO nodestro_tenants", lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        IdentityStore(proxied).create_tenant("acme", "Acme Mine")
+    assert fault_proxy.fired == 1
+
+
+# ---- JQ-3 review: the record of handed-out jobs (L-2, L-3, L-4) -----------------------------------
+
+
+def test_a_report_that_lost_its_lease_releases_the_job(direct: PostgresDatabase) -> None:
+    queue = JobQueue(direct)
+    queue.enqueue("alpha", REINDEX_JOB, REINDEX_REF, {"model": "m"})
+    job = queue.claim("w1", (REINDEX_JOB,))
+    assert job is not None and _claims(direct, "w1").held == {job.id}
+    expire_leases(direct)
+    assert queue.reap_expired() != []
+    assert queue.report(job, "w1", {"completed": 1}) is None
+    assert _claims(direct, "w1").held == set()
+
+
+def test_a_finish_that_fails_releases_the_job_and_it_is_never_handed_out_again(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """``finish`` loses its request: the job stays running for the worker. It leaves the record of held jobs, and a
+    later adoption (after an unsure claim) never hands it out again."""
+    JobQueue(direct).enqueue("alpha", RUN_JOB, "run-1")
+    queue = JobQueue(proxied)
+    job = queue.claim("w1")
+    assert job is not None
+    fault_proxy.arm(b"finished_at = clock_timestamp(), lease_until = NULL", lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        queue.finish(job.id, "w1", "done")
+    claims = _claims(proxied, "w1")
+    assert claims.held == set() and list(claims.abandoned) == [job.id]
+    fault_proxy.arm(CLAIM, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        queue.claim("w1")
+    assert claims.unsure == {RUN_JOB}
+    assert queue.claim("w1") is None  # the adoption skips the abandoned job, and nothing is queued
+    assert jobs(direct) == [("run-1", "running", "w1", 1)]
+
+
+def test_every_queue_of_a_process_shares_the_record_of_handed_out_jobs(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """A job one queue handed out is never returned by another queue's reconciliation for the same name."""
+    for ref in ("run-1", "run-2"):
+        JobQueue(direct).enqueue("alpha", RUN_JOB, ref)
+    held = JobQueue(proxied).claim("w1")
+    assert held is not None and held.ref == "run-1"
+    fault_proxy.arm(CLAIM)
+    job = JobQueue(proxied).claim("w1")
+    lost_reply(fault_proxy)
+    assert job is not None and job.ref == "run-2"
+    fault_proxy.arm(CLAIM, lose="request")
+    with pytest.raises(psycopg.OperationalError):
+        JobQueue(proxied).claim("w1")
+    assert JobQueue(proxied).claim("w1") is None  # neither held job is adopted
+
+
+def test_a_claim_inside_a_transaction_is_refused(direct: PostgresDatabase) -> None:
+    """Lock order (L-4): a claim takes the name's claim lock, then the process lock; never the other way round."""
+    JobQueue(direct).enqueue("alpha", RUN_JOB, "run-1")
+    with pytest.raises(RuntimeError, match="transaction"), direct.transaction():
+        JobQueue(direct).claim("w1")
+    assert jobs(direct) == [("run-1", "queued", None, 0)]
+
+
+def test_concurrent_claims_through_lost_connections_never_hand_a_job_out_twice(
+    proxied: PostgresDatabase, direct: PostgresDatabase, fault_proxy: FaultProxy
+) -> None:
+    """Concurrent writers: four threads claim for four workers while one claim's reply is lost; every job is
+    claimed once and returned to exactly the worker that holds it."""
+    for number in range(8):
+        JobQueue(direct).enqueue("alpha", RUN_JOB, f"run-{number}")
+    fault_proxy.arm(CLAIM)
+    returned: dict[str, list[int]] = {}
+    errors: list[BaseException] = []
+
+    def work(name: str) -> None:
+        queue = JobQueue(proxied)
+        try:
+            while (job := queue.claim(name)) is not None:
+                returned.setdefault(name, []).append(job.id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(f"w{number}",)) for number in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert errors == [] and fault_proxy.fired == 1
+    handed = sorted(job_id for ids in returned.values() for job_id in ids)
+    assert len(handed) == 8 == len(set(handed))
+    with postgres_support.owner_of(direct)._transaction() as db:
+        rows = db.execute("SELECT id, worker, attempts FROM nodestro_jobs").fetchall()
+    assert all(attempts == 1 for _id, _worker, attempts in rows)
+    assert {job_id: worker for job_id, worker, _attempts in rows} == {
+        job_id: name for name, ids in returned.items() for job_id in ids
+    }

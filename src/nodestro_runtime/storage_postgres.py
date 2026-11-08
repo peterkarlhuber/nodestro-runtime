@@ -416,8 +416,17 @@ class PostgresDatabase:
         running it again could apply it twice or answer for a second change (JQ-3).
 
         ``if_lost`` is a read (statement, parameters) that finds what the write did when its connection was lost
-        outside a transaction: its rows stand for the lost reply; no rows mean the write cannot be shown to have
-        been applied, and the error of the lost connection is raised. Any other error is raised as it is."""
+        outside a transaction. A lost socket does not mean that the server is done with the statement: it may still
+        run and commit afterwards (the server notices the closed connection only when it next writes to it). So the
+        read waits until the statement's server process has ended (:meth:`_statement_ended`, bounded by
+        :attr:`lost_statement_wait`): a server process whose connection is closed ends once it has run what it had
+        received. Then its rows stand for the lost reply, and no rows mean the write was not
+        applied. When the end cannot be seen in time, or the read finds nothing, the error of the lost connection is
+        raised: the outcome is then unknown to the caller (``tests/test_write_retry.py``). Any other error, such as
+        a statement timeout (the connection stays usable and the statement was rolled back), is raised as it is.
+
+        Behind a pooler in transaction mode the server process is the pooler's, not this statement's own; the wait
+        then only bounds the time, and the read may run before a late commit (documented limit)."""
         if getattr(self._local, "depth", 0):
             rows: builtins.list[tuple[Any, ...]] = self._local.connection.execute(query, params).fetchall()
             return rows
@@ -425,8 +434,10 @@ class PostgresDatabase:
             if self._closed:
                 raise RuntimeError("The database is closed")
             connection: Any = None
+            backend: int | None = None
             try:
                 with self._connection() as connection:
+                    backend = connection.info.backend_pid
                     rows = connection.execute(query, params).fetchall()
                 return rows
             except psycopg.OperationalError as exc:
@@ -434,10 +445,36 @@ class PostgresDatabase:
                 if if_lost is None or connection is None or not connection.broken:
                     raise
                 lost = exc
+        if backend is None or not self._statement_ended(backend):
+            raise lost
         found = self._query(*if_lost)  # a read: retried on another connection if this one is lost too
         if not found:
             raise lost
         return found
+
+    @property
+    def lost_statement_wait(self) -> float:
+        """How long (seconds) :meth:`_write_returning` waits for the server process of a statement whose connection
+        was lost: the statement timeout and a second (the server cancels a statement by then), else 30 seconds."""
+        override = getattr(self, "_lost_statement_wait", None)
+        if override is not None:
+            return float(override)
+        return self.statement_timeout + 1.0 if self.statement_timeout > 0 else 30.0
+
+    def _statement_ended(self, backend: int) -> bool:
+        """Whether the server process ``backend`` has ended within :attr:`lost_statement_wait`, so nothing it
+        received can still run or commit. Polls ``pg_stat_activity``. An idle process does not count: it may not
+        have read the statement yet. A connection the server still holds open (a network that drops packets without
+        a reset) is only seen to end after the server's TCP timeouts; the wait then runs out."""
+        deadline = time.monotonic() + self.lost_statement_wait
+        pause = 0.005
+        while True:
+            if not self._query("SELECT 1 FROM pg_stat_activity WHERE pid = %s", (backend,)):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(pause, max(deadline - time.monotonic(), 0.0)))
+            pause = min(pause * 2, 0.1)
 
     def _write(self, query: Query, params: Params) -> int:
         if getattr(self._local, "depth", 0):

@@ -10,16 +10,25 @@
   `knowledge.reindex_running` and nodestro-api's export queue `export.busy`, deleting the export job document) for
   work it had just queued, `JobQueue.reap_expired` reported no job, `IdentityStore.create_tenant` raised
   `identity.tenant_exists` for the tenant it had created, and `IdentityStore.take_login_state` called a login state
-  expired. They now use the new `PostgresDatabase._write_returning` (never repeated, like `_write`); after a lost
-  connection `enqueue` returns the work's active job, `claim` the newest running job of the worker that its queue has
-  not handed out yet, `create_tenant` the stored tenant, and `reap_expired` and `take_login_state` raise (the next
-  reaper interrupts the affected runs, C-11). A write whose request was lost before it reached the server now fails
-  instead of being repeated. Reads keep their retry; `heartbeat`, `report`, `set_tenant_status` and `login` stay on
-  `_query` because a repeat has the same effect and answer. No schema change, no public signature change. Tests:
-  `tests/test_write_retry.py` (fault-injection proxy `fault_proxy` in `tests/postgres_support.py`, all nine former
-  sites, counter-probes), guard `tests/test_query_writes.py` (no writing statement through `_query` unless allowed
-  with a reason); analysis in `docs/reports/jq-write-retry.md`. The tenant SQL allowlist gets the claim's
-  reconciliation read.
+  expired. They now use the new `PostgresDatabase._write_returning` (never repeated, like `_write`). After a lost
+  connection it first waits, bounded by `lost_statement_wait` (the statement timeout plus one second, else 30 s),
+  until the lost statement's server backend is gone from `pg_stat_activity`, because the server can still commit
+  after the socket broke; only then does it read the outcome. `enqueue` finds its own job by a client token in the
+  payload (`_enqueue_token`, removed from `Job.payload`; no schema change) instead of any active job of the same
+  work, `claim` returns a running job of the worker that no queue of the process has handed out, and a claim whose
+  outcome still cannot be shown makes the next claim of that worker adopt such a job. `create_tenant` matches id and
+  name, `set_tenant_status` moved to `_write_returning` and matches the status (a repeat could undo a later change),
+  and `reap_expired` and `take_login_state` raise (the next reaper interrupts the affected runs, C-11). The record of
+  handed-out jobs is shared by every `JobQueue` of a process for the same database and worker; `report` releases a
+  job whose lease is gone, `finish` one whose write failed (it is never handed out again), and `claim` inside a
+  transaction is refused. A write whose request was lost before it reached the server now fails instead of being
+  repeated. Reads keep their retry; `heartbeat`, `report` and `login` stay on `_query` because a repeat has the same
+  effect and answer. No public signature change. Tests: `tests/test_write_retry.py` (fault-injection proxy
+  `fault_proxy` in `tests/postgres_support.py` with lost replies, lost requests and connections cut while the
+  statement still runs; all nine former sites, counter-probes, a concurrent-writer test), guard
+  `tests/test_query_writes.py` (no writing statement through `_query` unless allowed with a reason, keyed by the
+  normalized statement; also f-string constants, aliases, `getattr`, `SELECT ... INTO`, `SET`); analysis and the
+  review findings in `docs/reports/jq-write-retry.md`. The tenant SQL allowlist gets the claim's reconciliation read.
 
 - Tests: `test_a_change_while_a_step_runs_refuses_the_old_version` (`tests/test_worker_tool_changes.py`) changes the
   tool only once the step asked the model, so it holds its tools. It waited for the step to be stored as running,

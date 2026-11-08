@@ -284,13 +284,14 @@ Items that need an independent or external review (an internal audit does not re
   Reproduced under fault injection only; not observed in operation.
 - **TABRION JQ-1** (fault-injection fixture `fault_proxy`, regression tests for the nine sites): Done in PR #143.
 - **TABRION JQ-2** (impact analysis, `docs/reports/jq-write-retry.md`): Done in PR #143.
-- **TABRION JQ-3** (fix option A, `_write_returning`, guard `tests/test_query_writes.py`): Done in PR #143; the
-  independent review it requires is outstanding.
+- **TABRION JQ-3** (fix option A, `_write_returning`, guard `tests/test_query_writes.py`): Done in PR #143. The
+  independent review accepted it with conditions (M-1..M-3, L-1..L-4, G-1); all are fixed in PR #143, the
+  re-acceptance of the review is outstanding.
 - **TABRION JQ-4** (docs, CHANGELOG, export adjustment, pin wave W7): CHANGELOG and the RT2-03 note done in PR
-  #143. Open: an API-side regression test of the export path (nodestro-api, `portable_build.py:401-406` needs no
-  change, see the report) and the pins runtime → api → sdk → studio (coordinated outside this repository).
-- **Next step:** Independent review of the PR; nodestro-api PR with a temporary integration pin for the tenant SQL
-  check (CONTRIBUTING: the allowlist gained the claim's reconciliation read); then the pin wave. Delete this entry when
+  #143. The API-side regression test of the export path is in nodestro-api PR #113 (`portable_build.py:401-406`
+  needs no change, see the report). Open: the pins runtime → api → sdk → studio (coordinated outside this repository).
+- **Next step:** Re-acceptance of the review; merge; then the pin wave (nodestro-api PR #113 and nodestro-examples
+  PR #91 carry temporary pins for the tenant SQL check, CONTRIBUTING). Delete this entry when
   JQ-4 is done.
 
 ### RT-031 · Environment image caps and collection: follow-ups
