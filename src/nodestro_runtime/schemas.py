@@ -798,9 +798,15 @@ class NodeRun(_Model):
     error_params: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
-    #: Why the step's local model thought less than its effort asks: ``cpu_saving`` (the CPU saving mode of the
+    #: Why the step's model thought less than its effort asks: ``output_limit`` (it spent the answer limit on reasoning
+    #: and answered once more without it, see ``limits_handled``), ``cpu_saving`` (the CPU saving mode of the
     #: workspace setting ``local_reasoning``, RT-050); ``None`` when it ran as configured.
     reasoning_reduced: str | None = None
+    #: Limits the step's agent reached and continued at instead of failing (RT-067): ``reasoning`` (the model spent
+    #: the answer limit on reasoning, so it answered once more without reasoning; ``reasoning_reduced`` is then
+    #: ``output_limit``) and ``tool_rounds`` (the last tool round was used up, so the model gave its answer from the
+    #: tool results so far instead of calling more tools).
+    limits_handled: list[Literal["reasoning", "tool_rounds"]] = Field(default_factory=list)
     evaluation: EvaluationRecord | None = None
     memory: dict[str, str] | None = None
     started_at: datetime | None = None
