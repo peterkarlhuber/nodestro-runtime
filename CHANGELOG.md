@@ -16,6 +16,25 @@
   and a SIGTERM inside a finalizer is no longer lost in `orkexa-local serve`).
 - `run.agent.IncompleteResponseError` params now say why: `cause` (`context_window`, `reasoning` or `answer`),
   `max_tokens` and `output_tokens`, and the message ends with what to change.
+- Tests (TABRION QA-13): snapshot tools for rollback evidence of the server profile. `python
+  tests/rollback_snapshots.py --dsn <superuser connection string> write|check` creates a schema and roles of its own,
+  runs Nodestro's and Axentra's migrations as an owner role, grants a runtime role (`grant_runtime_role`), writes five
+  canonical JSON snapshots and drops everything again: `catalog` (row-level security and runtime role privileges per
+  table, Nodestro's and Axentra's by name, every policy, function and ACL entry of the schema, default privileges,
+  memberships), `roles` (decision table of eight role variants through `inspect_role`, `grant_runtime_role` and
+  `role_info`), `errors` (code, parameters and message of the database error paths, with whether the server's `DETAIL`
+  value reaches the message, finding B-06-2), `settings` (`SHOW` extract per kind of connection, including the pool
+  lent to Axentra) and `schema` (schema dump of Nodestro's tables from the catalog, without pgvector objects). The
+  golden files in `tests/fixtures/rollback/` are from the old code (463e0d9); `tests/test_rollback_snapshots.py`
+  checks them and that two runs are identical. Tests only; `docs/TODO.md` adds RT-072 (use the snapshots in each
+  MIG-NOD step).
+- Tests (TABRION QA-13 review fixes, `qa-13-25-review.md` M-1, M-2, M-6, L-1, L-2, L-7): the rollback catalog snapshot
+  names Axentra's tables with their RLS and FORCE flags and holds every policy, function (owner, `SECURITY DEFINER`,
+  `proconfig`, runtime `EXECUTE`) and ACL entry (column ACLs, grant options, `PUBLIC`) of the schema, the database's
+  `TEMPORARY` privilege and the run roles' memberships; a test per kind of change shows that it is detected (including
+  RLS or FORCE turned off on `axentra_tenants`). The login roles of a run get a random password per run; `check`/`write`
+  report leftovers of a killed run and `cleanup` drops them (exact names only); the prefix is validated. `catalog.json`
+  was rewritten from `463e0d9`.
 
 - TABRION JQ-4 done: pin wave W7 moved every consumer to runtime f5da80d (the merge of #143) and Axentra 9c4666f:
   nodestro-examples #91, nodestro-integrations #79, nodestro-api #113 (with the export regression test), nodestro-sdk
