@@ -453,6 +453,12 @@ class AgentBuilder:
             raise_tool_errors=config.raise_tool_errors,
             stream=True,
             on_refusal=config.on_refusal,
+            # At the round limit the last request asks for the answer from the results so far (no extra request,
+            # the budget stays the same); a model that spent the answer limit on reasoning answers once more without
+            # it (Ollama's thinking models have no graded effort and think without a bound). The run shows both
+            # (NodeRun.limits_handled); providers that cannot do either keep failing with the error as before.
+            on_max_tool_rounds="answer",
+            on_reasoning_overflow="answer",
             options=options,
             max_retries=MAX_RETRIES,
             usage_tracker=usage_tracker,
