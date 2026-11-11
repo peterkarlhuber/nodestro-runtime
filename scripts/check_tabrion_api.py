@@ -93,7 +93,7 @@ class _Visitor(ast.NodeVisitor):
         self.used: set[str] = set()
         #: local name -> dotted Tabrion name it is bound to.
         self.bound: dict[str, str] = {}
-        #: names that call ``importlib.import_module`` or ``__import__`` (plus aliases from ``from importlib``).
+        #: names that call ``import_module`` or ``__import__`` (with their ``from importlib`` aliases).
         self.importers: set[str] = {"import_module", "__import__"}
 
     def _use(self, dotted: str, node: ast.AST) -> None:
