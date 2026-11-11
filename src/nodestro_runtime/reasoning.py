@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal
 
-from orkexa import ModelCapabilities, ReasoningDelta, ReasoningStatus
+from orkexa import LimitHandled, ModelCapabilities, ReasoningDelta, ReasoningStatus
 from pydantic import BaseModel, PrivateAttr
 
 ReasoningKind = Literal["thinking", "summary"]
@@ -91,8 +91,10 @@ class ReasoningTrace(BaseModel):
 def reasoning_hook(
     on_delta: Callable[[str, ReasoningKind], Any],
     on_status: Callable[[str, ReasoningKind | None, bool], Any] | None = None,
+    on_limit: Callable[[str, int], Any] | None = None,
 ) -> Callable[[Any], None]:
-    """An ``on_event`` hook for ``orkexa.Agent`` that passes on reasoning events only."""
+    """An ``on_event`` hook for ``orkexa.Agent`` that passes on reasoning events (and, with ``on_limit``, the limits
+    the agent handled instead of failing: ``orkexa.LimitHandled``)."""
 
     def on_event(event: Any) -> None:
         if isinstance(event, ReasoningDelta):
@@ -100,6 +102,8 @@ def reasoning_hook(
                 on_delta(event.text, event.kind)
         elif isinstance(event, ReasoningStatus) and on_status is not None:
             on_status(event.state, event.kind, event.redacted)
+        elif isinstance(event, LimitHandled) and on_limit is not None:
+            on_limit(event.limit, event.round)
 
     return on_event
 

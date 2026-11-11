@@ -331,13 +331,17 @@ Items that need an independent or external review (an internal audit does not re
 
 ### RT-067 · Small local thinking models loop on tool calls
 
-- **Priority:** P3 Low · **Status:** Open (needs a live local model) · **Refs:** settings/providers round 2026-11-06
-  (Ollama 400 fix, O400-5)
+- **Priority:** P3 Low · **Status:** Mitigated 2026-11-08 (max_tokens regression order); open for evidence ·
+  **Refs:** settings/providers round 2026-11-06 (Ollama 400 fix, O400-5)
 - **What:** After the 400 fix, the production-downtime example on qwen3.5:2b (CPU) failed twice with
-  `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). The error now says what the calls show
-  (`rounds`, `calls`, `repeated`, `tool`, `looping`, `local`) with advice, so a loop is told apart from a long task.
-- **Next step:** Compare tool looping with and without reasoning sent back on a live local model; then decide on a
-  higher default `max_tool_rounds` for local thinking models.
+  `run.agent.MaxToolRoundsError` (single calculator calls, 8 rounds). Cause found on 2026-11-08: the o400 fix sent
+  every earlier thinking text back to Ollama, which renders it into the prompt; long tool conversations outgrew the
+  context window and Ollama silently kept only the system prompt and the last message, so the model lost the task
+  and asked the same tool again. Orkexa now replays only the latest thinking on Ollama, and agent steps answer at
+  the tool-round limit and after a thinking overflow instead of failing (`NodeRun.limits_handled`).
+- **Next step:** Keep watching `limits_handled` in live runs; if `tool_rounds` stays frequent on a model, consider
+  deduplicating identical calls of pure built-in tools or a model-dependent `max_tool_rounds`. Not tested on GPU,
+  Apple Silicon or Windows hardware (see RT-049).
 
 ## Architecture and modularity
 
