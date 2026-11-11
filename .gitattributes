@@ -6,3 +6,7 @@ tests/fixtures/legacy/*.gz -text
 tests/fixtures/legacy/*.sha256 -text
 tests/fixtures/ranking/FX-RANK-0.json -text
 tests/fixtures/ranking/*.sha256 -text
+
+# The shared Tabrion API check is pinned by its SHA-256 in tests/test_tabrion_api_check.py (TABRION QA-21);
+# keep LF on every platform so the hash is the same in each checkout.
+scripts/check_tabrion_api.py text eol=lf

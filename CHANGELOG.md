@@ -16,6 +16,13 @@
   and a SIGTERM inside a finalizer is no longer lost in `orkexa-local serve`).
 - `run.agent.IncompleteResponseError` params now say why: `cause` (`context_window`, `reasoning` or `answer`),
   `max_tokens` and `output_tokens`, and the message ends with what to change.
+- Tests (TABRION QA-21): AC-7 public API check. `python scripts/check_tabrion_api.py` reads `src`, `tests`, `scripts`
+  and `examples` with `ast` and fails on a private Tabrion name (`tabrion._x`, a `_` attribute on a Tabrion name,
+  `getattr`/`import_module` with a private constant, a star import). Every used name must be in its module's `__all__`
+  in the installed Tabrion (a used name without an installed Tabrion fails), and `--surface` compares with Tabrion's
+  frozen API snapshot and refuses experimental (`X`) names. `--export` writes the used names to
+  `docs/api-consumers.md` (none yet); `tests/test_tabrion_api_check.py` fails when it is stale or missing.
+  `docs/TODO.md` adds RT-073 (the lint step).
 - Tests (TABRION QA-18): blocked-module tests per optional edge (AC-3). `tests/test_optional_edges.py` runs one fresh
   `python -I` per edge of the K-33 list with its modules blocked (`sys.modules[name] = None`) and imports every module
   of the package: without `axentra` (and `axentra_platform.available()` is false), without `tabrion.postgres`, and
