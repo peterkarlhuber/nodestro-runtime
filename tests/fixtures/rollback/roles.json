@@ -1,0 +1,344 @@
+{
+  "table": {
+    "bypass_rls": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<role:bypass_rls>' has BYPASSRLS; row-level security would not apply to it",
+        "params": {
+          "role": "<role:bypass_rls>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": true,
+          "can_create": false,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<role:bypass_rls>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 17
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": true,
+          "role": "<role:bypass_rls>",
+          "superuser": false,
+          "table_owner": false
+        }
+      }
+    },
+    "connecting_owner": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<owner>' is the owner role itself and owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
+        "params": {
+          "role": "<owner>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": true,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [
+            "nodestro_axentra_ids",
+            "nodestro_bootstrap_tokens",
+            "nodestro_chunk_vectors",
+            "nodestro_chunks",
+            "nodestro_documents",
+            "nodestro_files",
+            "nodestro_jobs",
+            "nodestro_login_states",
+            "nodestro_memberships",
+            "nodestro_memory_files",
+            "nodestro_run_events",
+            "nodestro_schedule_firings",
+            "nodestro_schema_migrations",
+            "nodestro_sessions",
+            "nodestro_tenants",
+            "nodestro_users",
+            "nodestro_vector_spaces"
+          ],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<owner>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 18
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": false,
+          "role": "<owner>",
+          "superuser": false,
+          "table_owner": true
+        }
+      }
+    },
+    "missing": {
+      "grant_runtime_role": {
+        "code": "storage.role_missing",
+        "message": "The database role '<role:missing>' does not exist",
+        "params": {
+          "role": "<role:missing>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "code": "storage.role_missing",
+        "message": "The database role '<role:missing>' does not exist",
+        "params": {
+          "role": "<role:missing>"
+        },
+        "refused": "NodestroError"
+      }
+    },
+    "owner_member": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<role:owner_member>' owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
+        "params": {
+          "role": "<role:owner_member>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": true,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [
+            "nodestro_axentra_ids",
+            "nodestro_bootstrap_tokens",
+            "nodestro_chunk_vectors",
+            "nodestro_chunks",
+            "nodestro_documents",
+            "nodestro_files",
+            "nodestro_jobs",
+            "nodestro_login_states",
+            "nodestro_memberships",
+            "nodestro_memory_files",
+            "nodestro_run_events",
+            "nodestro_schedule_firings",
+            "nodestro_schema_migrations",
+            "nodestro_sessions",
+            "nodestro_tenants",
+            "nodestro_users",
+            "nodestro_vector_spaces"
+          ],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<role:owner_member>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 18
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": false,
+          "role": "<role:owner_member>",
+          "superuser": false,
+          "table_owner": true
+        }
+      }
+    },
+    "restricted": {
+      "grant_runtime_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": false,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [],
+          "owner": "<owner>",
+          "restricted": true,
+          "role": "<role:restricted>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 17
+        }
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": false,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [],
+          "owner": "<owner>",
+          "restricted": true,
+          "role": "<role:restricted>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 17
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": false,
+          "role": "<role:restricted>",
+          "superuser": false,
+          "table_owner": false
+        }
+      }
+    },
+    "superuser": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<role:superuser>' is a superuser and owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
+        "params": {
+          "role": "<role:superuser>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": true,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [
+            "nodestro_axentra_ids",
+            "nodestro_bootstrap_tokens",
+            "nodestro_chunk_vectors",
+            "nodestro_chunks",
+            "nodestro_documents",
+            "nodestro_files",
+            "nodestro_jobs",
+            "nodestro_login_states",
+            "nodestro_memberships",
+            "nodestro_memory_files",
+            "nodestro_run_events",
+            "nodestro_schedule_firings",
+            "nodestro_schema_migrations",
+            "nodestro_sessions",
+            "nodestro_tenants",
+            "nodestro_users",
+            "nodestro_vector_spaces"
+          ],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<role:superuser>",
+          "schema": "<roles_schema>",
+          "superuser": true,
+          "tables": 17
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": false,
+          "role": "<role:superuser>",
+          "superuser": true,
+          "table_owner": true
+        }
+      }
+    },
+    "superuser_bypass_rls": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<role:superuser_bypass_rls>' is a superuser and has BYPASSRLS and owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
+        "params": {
+          "role": "<role:superuser_bypass_rls>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": true,
+          "can_create": true,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [
+            "nodestro_axentra_ids",
+            "nodestro_bootstrap_tokens",
+            "nodestro_chunk_vectors",
+            "nodestro_chunks",
+            "nodestro_documents",
+            "nodestro_files",
+            "nodestro_jobs",
+            "nodestro_login_states",
+            "nodestro_memberships",
+            "nodestro_memory_files",
+            "nodestro_run_events",
+            "nodestro_schedule_firings",
+            "nodestro_schema_migrations",
+            "nodestro_sessions",
+            "nodestro_tenants",
+            "nodestro_users",
+            "nodestro_vector_spaces"
+          ],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<role:superuser_bypass_rls>",
+          "schema": "<roles_schema>",
+          "superuser": true,
+          "tables": 17
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": true,
+          "role": "<role:superuser_bypass_rls>",
+          "superuser": true,
+          "table_owner": true
+        }
+      }
+    },
+    "table_owner": {
+      "grant_runtime_role": {
+        "code": "storage.role_unsafe",
+        "message": "The runtime role '<role:table_owner>' owns tables (<owned_table>); row-level security would not apply to it",
+        "params": {
+          "role": "<role:table_owner>"
+        },
+        "refused": "NodestroError"
+      },
+      "inspect_role": {
+        "ok": {
+          "bypass_rls": false,
+          "can_create": false,
+          "connect": true,
+          "database": "<database>",
+          "owned_tables": [
+            "<owned_table>"
+          ],
+          "owner": "<owner>",
+          "restricted": false,
+          "role": "<role:table_owner>",
+          "schema": "<roles_schema>",
+          "superuser": false,
+          "tables": 18
+        }
+      },
+      "role_info": {
+        "ok": {
+          "bypass_rls": false,
+          "role": "<role:table_owner>",
+          "superuser": false,
+          "table_owner": true
+        }
+      }
+    }
+  },
+  "variants": [
+    "restricted",
+    "superuser",
+    "bypass_rls",
+    "superuser_bypass_rls",
+    "table_owner",
+    "owner_member",
+    "connecting_owner",
+    "missing"
+  ]
+}

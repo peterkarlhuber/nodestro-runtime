@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 23 |
+| P3 Low | 24 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -485,6 +485,33 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Price the fees in the pricing engine, then enable them through `model_profile` like Anthropic's server tools.
 
 ## Tests and quality assurance
+
+### RT-072 · Rollback snapshots before and after each TABRION MIG-NOD step
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION QA-13 (this change), Tabrion plan documents 06 and 11
+  (section 3.2), `tests/rollback_snapshots.py`, `tests/fixtures/rollback/SOURCE.md`
+- **What:** The snapshot tools and the golden files of the old code (catalog and runtime role privileges after
+  `grant_runtime_role`, role decision table of eight variants, error answers of the database paths, `SHOW` extract per
+  kind of connection, schema dump) are in place and checked by `tests/test_rollback_snapshots.py`. The steps that use
+  them are still to come: MIG-NOD-3 (error texts; it rewrites `errors.json`, whose migration and backup messages
+  carry the canary value of finding B-06-2 today), MIG-NOD-4 (session configuration, `settings.json`), MIG-NOD-5
+  (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not covered: it records its own "before"
+  output of `pgvector_status` in pg-a and pg-b first (review L-6). Review fix round (`qa-13-25-review.md` M-1, M-2,
+  M-6, L-1, L-2, L-7): `catalog.json` names Axentra's tables (RLS/FORCE flags, privileges, counts) and holds every
+  policy, function and ACL entry of the schema and the run roles' memberships, with one detection test per kind of
+  change (column grant, `WITH GRANT OPTION`, `PUBLIC`, membership, RLS or FORCE off on `axentra_tenants`); an Axentra
+  pin that changes Axentra's tables rewrites `catalog.json` in the pin pull request. Random password per run;
+  `cleanup` action for leftovers of killed runs; prefix validated.
+- **Binding rule:** the P3 rating is for tracking only; whether a MIG-NOD step may merge is decided by TABRION QA-14 /
+  G-M ("ohne Probe kein Merge"): a step without the `check` result before and after does not merge.
+- **Open (CI, `.github` not edited here):** MIG-NOD-5 needs "Katalog-Snapshot leer" on PostgreSQL 16, 17 and 18
+  (review I-2); CI runs 17 only. Proposed change to `.github/workflows/ci.yml`: a job `pg-18` as a copy of `pg-a`
+  with `matrix.python: ["3.13"]`, the service image `postgres:18` pinned by digest (O8), and the steps reduced to
+  `pytest tests/test_rollback_snapshots.py` once as the superuser and once with `NODESTRO_TEST_RUNTIME_ROLE=1`;
+  nightly is enough (E-QA1). The schema dump already leaves out PostgreSQL 18's catalogued NOT NULL constraints
+  (`contype = 'n'`, also in `columns`); a remaining difference on 18 is a finding for that pull request.
+- **Next step:** Each of these pull requests states the `check` result before and after the change and the reason
+  for every rewritten golden file; remove this entry with the last of them.
 
 ### RT-073 · CI step for the Tabrion public API check (TABRION QA-21)
 
