@@ -12,12 +12,26 @@ The check reads every Python file with :mod:`ast` (nothing is imported or run) a
 - an attribute with a leading underscore on a name bound to Tabrion (``tabrion.postgres._pool``,
   ``roles._query`` after ``from tabrion.postgres import roles``), and ``getattr(<tabrion name>, "_x")``
   (attributes of objects that Tabrion returns are not tracked: the check is static);
-- ``importlib.import_module("tabrion._x")`` and ``__import__("tabrion._x")`` with a constant name.
+- ``importlib.import_module("tabrion._x")`` and ``__import__("tabrion._x")`` with a constant name, also as
+  ``import_module(name="tabrion._x")``, ``import_module("._x", "tabrion")`` and under an alias
+  (``from importlib import import_module as im``).
 
-Names of the form ``__x__`` (``tabrion.__version__``) are public. When Tabrion is installed, every used
-name must also be public there: a module, or a name in its module's ``__all__`` (document 04 of the Tabrion
-plan). With ``--surface`` every used name must be in Tabrion's frozen API snapshot
-(``docs/api/surface.json``, K10) or be a module of it.
+Names of the form ``__x__`` (``tabrion.__version__``) are public. Every used name must also be public in
+the installed Tabrion: a module, or a name in its module's ``__all__`` (document 04 of the Tabrion plan).
+When names are used and Tabrion is not installed, that is a problem too (install the pinned Tabrion); with
+no name used there is nothing to check. With ``--surface`` every used name must be in Tabrion's frozen API
+snapshot (``docs/api/surface.json``, K10) with stability ``S``, or be a module of it: consumer libraries
+must not use experimental (``X``) names (Tabrion plan 02 §14 S-2).
+
+The check is static, so it does not see:
+
+- attributes of objects that Tabrion returns (``db.run_transaction(...)`` on a ``Database`` instance,
+  ``Database(...)._engine``);
+- aliases made by assignment (``t = tabrion``), names in strings (``"tabrion._sa.Database"`` annotations,
+  ``sys.modules["tabrion._sa"]``) and computed module names.
+
+A local name bound to Tabrion stays bound for the whole file, even after it is assigned something else, so
+``from tabrion import errors`` followed by ``errors = {}`` and ``errors._x`` is reported (fails closed).
 
 The used names are written to ``docs/api-consumers.md`` (``--export``), the consumer side of Tabrion's
 ``docs/api-consumers.md``. Standard library only; the same file is used in tabrion-studio, axentra, orkexa
@@ -36,6 +50,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import ModuleType
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PATHS = ("src", "tests", "scripts", "examples")
@@ -60,7 +75,11 @@ class Finding:
 
 
 def _private(part: str) -> bool:
-    return part.startswith("_") and not (part.startswith("__") and part.endswith("__"))
+    return part.startswith("_") and not _dunder(part)
+
+
+def _dunder(part: str) -> bool:
+    return part.startswith("__") and part.endswith("__")
 
 
 def _is_tabrion(dotted: str) -> bool:
@@ -74,6 +93,8 @@ class _Visitor(ast.NodeVisitor):
         self.used: set[str] = set()
         #: local name -> dotted Tabrion name it is bound to.
         self.bound: dict[str, str] = {}
+        #: names that call ``importlib.import_module`` or ``__import__`` (plus aliases from ``from importlib``).
+        self.importers: set[str] = {"import_module", "__import__"}
 
     def _use(self, dotted: str, node: ast.AST) -> None:
         parts = dotted.split(".")
@@ -95,6 +116,10 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
+        if node.level == 0 and module in ("importlib", "builtins"):
+            for alias in node.names:
+                if alias.name in ("import_module", "__import__"):
+                    self.importers.add(alias.asname or alias.name)
         if node.level == 0 and _is_tabrion(module):
             if any(_private(p) for p in module.split(".")[1:]):
                 self._use(module, node)
@@ -127,16 +152,34 @@ class _Visitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
-        first = node.args[0] if node.args else None
-        constant = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
-        if name in ("import_module", "__import__") and constant is not None and _is_tabrion(constant):
-            self._use(constant, node)
+        if name in self.importers:
+            target = self._import_target(node)
+            if target is not None and _is_tabrion(target):
+                self._use(target, node)
         if name == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
             base = self._dotted(node.args[0])
             attr = node.args[1].value
             if base is not None and isinstance(attr, str):
                 self._use(f"{base}.{attr}", node)
         self.generic_visit(node)
+
+    @staticmethod
+    def _import_target(node: ast.Call) -> str | None:
+        """The constant module name of an ``import_module``/``__import__`` call, resolved when relative."""
+        keywords = {k.arg: k.value for k in node.keywords if k.arg}
+        first = node.args[0] if node.args else keywords.get("name")
+        second = node.args[1] if len(node.args) > 1 else keywords.get("package")
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            return None
+        name = first.value
+        if name.startswith("."):
+            if not (isinstance(second, ast.Constant) and isinstance(second.value, str)):
+                return None
+            try:
+                return importlib.util.resolve_name(name, second.value)
+            except (ImportError, ValueError):
+                return None
+        return name
 
 
 def _files(paths: list[Path]) -> list[Path]:
@@ -182,34 +225,73 @@ def scan(paths: list[Path], root: Path = ROOT) -> tuple[list[Finding], dict[str,
     return findings, dict(used)
 
 
+def tabrion_installed() -> bool:
+    """Whether a real Tabrion is importable (a directory named ``tabrion`` on ``sys.path`` is not one)."""
+    try:
+        spec = importlib.util.find_spec("tabrion")
+    except (ImportError, ValueError):
+        return False
+    return spec is not None and spec.origin not in (None, "namespace")
+
+
+def _missing(exc: ImportError, module_name: str) -> bool:
+    """Whether ``exc`` only says that ``module_name`` (or a Tabrion package above it) does not exist."""
+    missing = exc.name if isinstance(exc, ModuleNotFoundError) else None
+    return missing is not None and (module_name == missing or module_name.startswith(missing + "."))
+
+
 def installed_check(names: set[str]) -> list[str]:
-    """Names that are not public in the installed Tabrion (empty when Tabrion is not installed)."""
-    if importlib.util.find_spec("tabrion") is None:
+    """Names that are not public in the installed Tabrion: not a module and not in their module's ``__all__``.
+
+    With no names there is nothing to check. With names and no Tabrion installed the check cannot run, which
+    is reported as one problem. A module that fails to import (an extra it needs is missing) is reported
+    with the import error."""
+    if not names:
         return []
+    if not tabrion_installed():
+        return [
+            f"cannot check {len(names)} used Tabrion name(s) against __all__: tabrion is not installed "
+            "(install the pinned Tabrion with the extras this repository uses)"
+        ]
     problems = []
     for name in sorted(names):
         parts = name.split(".")
-        for cut in range(len(parts), 0, -1):  # the longest importable module prefix
-            module_name = ".".join(parts[:cut])
+        module: ModuleType | None = None
+        module_name, rest = "", parts
+        for cut in range(1, len(parts) + 1):  # import the module chain from the top, to the deepest module
+            candidate = ".".join(parts[:cut])
             try:
-                module = importlib.import_module(module_name)
-            except ImportError:
-                continue
-            rest = parts[cut:]
-            if rest:
-                public = getattr(module, "__all__", None)
-                if public is not None and rest[0] not in public:
-                    problems.append(f"{name}: {rest[0]} is not in {module_name}.__all__")
-            break
+                imported = importlib.import_module(candidate)
+            except ImportError as exc:
+                if not _missing(exc, candidate):
+                    problems.append(f"{name}: cannot import {candidate} ({type(exc).__name__}: {exc})")
+                    module = None
+                break
+            module, module_name, rest = imported, candidate, parts[cut:]
+        if module is not None and rest and not _dunder(rest[0]):
+            public = getattr(module, "__all__", None)
+            if public is None or rest[0] not in public:
+                problems.append(f"{name}: {rest[0]} is not in {module_name}.__all__")
     return problems
 
 
 def surface_check(names: set[str], surface: Path) -> list[str]:
-    """Names that are neither in the frozen API snapshot nor one of its modules."""
-    keys = set(json.loads(surface.read_text(encoding="utf-8"))["names"])
-    modules = {"tabrion"} | {k.rsplit(".", 1)[0] for k in keys}
-    missing = sorted(name for name in names if name not in keys and name not in modules)
-    return [f"{name}: not in {surface.name}" for name in missing]
+    """Names that are neither a stable (``S``) name of the frozen API snapshot nor one of its modules.
+
+    Experimental (``X``) names, and entries without a stability, are refused: consumer libraries must not
+    use them (Tabrion plan 02 §14 S-2)."""
+    entries: dict[str, dict[str, object]] = json.loads(surface.read_text(encoding="utf-8"))["names"]
+    modules = {"tabrion"} | {k.rsplit(".", 1)[0] for k in entries}
+    problems = []
+    for name in sorted(names):
+        if name in entries:
+            stability = entries[name].get("stability")
+            if stability != "S":
+                note = "consumers use only S names"
+                problems.append(f"{name}: stability {stability} in {surface.name}, {note}")
+        elif name not in modules:
+            problems.append(f"{name}: not in {surface.name}")
+    return problems
 
 
 def render(used: dict[str, set[str]]) -> str:

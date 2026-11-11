@@ -491,10 +491,14 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION QA-21 (AC-7), `scripts/check_tabrion_api.py`,
   `docs/api-consumers.md`, `tests/test_tabrion_api_check.py`
 - **What:** The AC-7 check is in place: `scripts/check_tabrion_api.py` (AST, standard library only, the same file as
-  in tabrion-studio, axentra and orkexa) refuses private Tabrion names, checks used names against the installed
-  Tabrion's `__all__` (and, with `--surface`, Tabrion's `docs/api/surface.json`), and exports them to
-  `docs/api-consumers.md` (none yet: the runtime imports no Tabrion name before its MIG-NOD steps). The test job fails
-  when the export is stale or a private name is used (`tests/test_tabrion_api_check.py`), but no lint step names it.
+  in tabrion-studio, axentra and orkexa; the test pins its SHA-256) refuses private Tabrion names, checks used names
+  against the installed Tabrion's `__all__` (a used name without an installed Tabrion fails; a module whose extra is
+  missing is reported with its import error) and, with `--surface`, against Tabrion's `docs/api/surface.json` (stable
+  `S` names only: experimental `X` names are refused, 02 §14 S-2), and exports them to `docs/api-consumers.md` (none
+  yet: the runtime imports no Tabrion name before its MIG-NOD steps). The `__all__` and `--surface` parts first have a
+  name to check with the first Tabrion pin (MIG-NOD-3); until then tests cover them against a fake package and a fake
+  snapshot. The test job fails when the export is stale or missing or a private name is used
+  (`tests/test_tabrion_api_check.py`), but no lint step names it.
 - **Next step:** Add `python scripts/check_tabrion_api.py --check-export docs/api-consumers.md` to the lint job (a
   `.github` change, not made in the QA-21 pull request); Tabrion collects the consumer lists into its own
   `docs/api-consumers.md` (Tabrion's side of QA-21).
