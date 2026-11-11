@@ -1,7 +1,7 @@
 """AC-3 (TABRION QA-18): one blocked-module test per optional edge of nodestro-runtime (edge list K-33, document 13).
 
-The runtime's optional edges (document 13, section 2.2; document 07, AC-3: "nodestro-runtime-Kern ohne axentra (und
-ohne tabrion.postgres)"):
+The runtime's optional edges (document 13, section 2.2; document 07, AC-3: "the nodestro-runtime core without axentra
+(and without tabrion.postgres)"):
 
 * ``axentra``: ``nodestro-runtime[postgres]`` brings Axentra (the platform services of the server profile); without
   it every module imports and ``axentra_platform.available()`` says so, so switching it on is refused;
@@ -142,5 +142,5 @@ def test_a_top_level_import_turns_the_edge_red(tmp_path: Path, edge: str) -> Non
     spec = EDGES[edge]
     result = run_python(check_source(spec), _copy_with(tmp_path, *spec.probe))
     assert result.returncode != 0, f"the probe {spec.probe} went unnoticed"
-    assert "ImportError" in result.stderr or "ModuleNotFoundError" in result.stderr
+    assert "halted; None in sys.modules" in result.stderr  # failed on the block itself, not for another reason
     assert str(tmp_path) in result.stderr  # the copy was imported (the positive control is the edge test on SRC)
