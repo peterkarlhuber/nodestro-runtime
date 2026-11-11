@@ -96,7 +96,8 @@ def test_tenant_sessions_ignore_the_operator_profile_and_config(
     assert core.get_scoped_config() == {} and core.full_config == {"profiles": {}}
     assert core.get_config_variable("profile") is None
     assert core.get_config_variable("ca_bundle") is None
-    assert core.get_config_variable("retry_mode") == "legacy"  # botocore's default, not the operator's
+    # botocore's own default, not the operator's "adaptive": "legacy" up to botocore 1.43, "standard" from 1.44 on.
+    assert core.get_config_variable("retry_mode") in {"legacy", "standard"}
     client = session.client("bedrock-runtime")
     assert client.meta.region_name == "eu-central-1"
     assert client.meta.endpoint_url == "https://bedrock-runtime.eu-central-1.amazonaws.com"
