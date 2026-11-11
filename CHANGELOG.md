@@ -23,6 +23,11 @@
   frozen API snapshot and refuses experimental (`X`) names. `--export` writes the used names to
   `docs/api-consumers.md` (none yet); `tests/test_tabrion_api_check.py` fails when it is stale or missing.
   `docs/TODO.md` adds RT-073 (the lint step).
+- Tests (TABRION QA-18): blocked-module tests per optional edge (AC-3). `tests/test_optional_edges.py` runs one fresh
+  `python -I` per edge of the K-33 list with its modules blocked (`sys.modules[name] = None`) and imports every module
+  of the package: without `axentra` (and `axentra_platform.available()` is false), without `tabrion.postgres`, and
+  without psycopg. A meta test keeps the edges equal to K-33 and to the `postgres` extra; a mutation probe per edge
+  adds a top-level import to a copy of the package and expects red. Tests only.
 - Tests (TABRION QA-13): snapshot tools for rollback evidence of the server profile. `python
   tests/rollback_snapshots.py --dsn <superuser connection string> write|check` creates a schema and roles of its own,
   runs Nodestro's and Axentra's migrations as an owner role, grants a runtime role (`grant_runtime_role`), writes five
