@@ -1,0 +1,169 @@
+{
+  "canary": "canary-qa13@example.com",
+  "errors": {
+    "backup_failed": {
+      "code": "storage.backup_failed",
+      "message": "The backup before the schema migration failed, so nothing was changed: duplicate key value violates unique constraint \"canary_backup_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
+      "message_has_canary": true,
+      "params": {
+        "found": 1,
+        "supported": 2
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "backup_required": {
+      "code": "storage.backup_required",
+      "message": "A schema migration of a database with data needs a backup first; none was configured",
+      "message_has_canary": false,
+      "params": {
+        "found": 1,
+        "supported": 2
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "migration_changed": {
+      "code": "storage.migration_changed",
+      "message": "Applied migrations differ from the files of this release: 0001 (0001_canary). An applied migration is never edited; restore a backup made with the release that applied them",
+      "message_has_canary": false,
+      "params": {
+        "changed": [
+          "0001 (0001_canary)"
+        ]
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "migration_failed": {
+      "code": "storage.migration_failed",
+      "message": "The schema migration to version 1 failed; the database is unchanged: duplicate key value violates unique constraint \"nodestro_canary_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
+      "message_has_canary": true,
+      "params": {
+        "found": 0,
+        "step": 1,
+        "supported": 1
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "migration_failed_after_backup": {
+      "code": "storage.migration_failed",
+      "message": "The schema migration to version 2 failed; the database is unchanged: duplicate key value violates unique constraint \"nodestro_canary_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
+      "message_has_canary": true,
+      "params": {
+        "found": 1,
+        "step": 2,
+        "supported": 2
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "migration_missing": {
+      "code": "storage.migration_missing",
+      "message": "No migration to schema version 2",
+      "message_has_canary": false,
+      "params": {
+        "found": 1,
+        "supported": 3
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "role_missing": {
+      "code": "storage.role_missing",
+      "message": "The database role '<role:missing>' does not exist",
+      "message_has_canary": false,
+      "params": {
+        "role": "<role:missing>"
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "schema_mismatch": {
+      "code": "storage.schema_mismatch",
+      "message": "The PostgreSQL database has schema version 1; this release needs 10. Run the migration first",
+      "message_has_canary": false,
+      "params": {
+        "found": 1,
+        "supported": 10
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "schema_too_new": {
+      "code": "storage.schema_too_new",
+      "message": "The PostgreSQL database has schema version 1; this Nodestro release reads version 0. Use the newer release, or restore a backup made with this one",
+      "message_has_canary": false,
+      "params": {
+        "found": 1,
+        "supported": 0
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    },
+    "settings_invalid": {
+      "code": "storage.settings_invalid",
+      "message": "NODESTRO_DATABASE_STATEMENT_TIMEOUT must be a number of at least 0, not 'soon'",
+      "message_has_canary": false,
+      "params": {
+        "variable": "NODESTRO_DATABASE_STATEMENT_TIMEOUT"
+      },
+      "problem_fields": [
+        "code",
+        "message",
+        "params"
+      ]
+    }
+  },
+  "problem_schema": {
+    "properties": {
+      "code": {
+        "title": "Code",
+        "type": "string"
+      },
+      "message": {
+        "title": "Message",
+        "type": "string"
+      },
+      "params": {
+        "additionalProperties": true,
+        "title": "Params",
+        "type": "object"
+      }
+    },
+    "required": [
+      "code",
+      "message"
+    ],
+    "title": "Problem",
+    "type": "object"
+  }
+}
