@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 import json
 import os
 from pathlib import Path
+import secrets
 from typing import Any
 
 import postgres_support
@@ -27,15 +28,16 @@ import rollback_snapshots
 PREFIX = os.environ.get("NODESTRO_TEST_EVIDENCE_PREFIX", rollback_snapshots.DEFAULT_PREFIX)
 #: The base names of this module's runs (the leftover check looks only at these, not at parallel runs).
 BASES: list[str] = []
+#: The base names of the two runs of the ``runs`` fixture (a subset of ``BASES``).
+RUN_BASES: list[str] = []
 
 
 @pytest.fixture(scope="module")
 def runs() -> Iterator[list[dict[str, dict[str, Any]]]]:
     dsn = postgres_support.require_postgres()
-    yield [
-        rollback_snapshots.collect(dsn, PREFIX, bases=BASES),
-        rollback_snapshots.collect(dsn, PREFIX, bases=BASES),
-    ]
+    collected = [rollback_snapshots.collect(dsn, PREFIX, bases=RUN_BASES) for _ in range(2)]
+    BASES.extend(RUN_BASES)
+    yield collected
 
 
 @pytest.mark.parametrize("name", rollback_snapshots.NAMES)
@@ -56,7 +58,7 @@ def test_golden_files_are_canonical(name: str) -> None:
 
 
 def test_no_object_of_a_run_is_left_behind(runs: list[dict[str, dict[str, Any]]]) -> None:
-    assert len(BASES) == 2
+    assert len(RUN_BASES) == 2  # independent of which other fixtures ran before (review D-2)
     assert rollback_snapshots.leftovers(postgres_support.DSN, PREFIX, bases=BASES) == []
 
 
@@ -197,7 +199,7 @@ def test_cleanup_drops_the_leftovers_of_a_killed_run_and_nothing_else() -> None:
 
     dsn = postgres_support.require_postgres()
     prefix = PREFIX + "kill_"  # a prefix of its own: no other run's objects
-    base = prefix + "deadbeef"
+    base = prefix + secrets.token_hex(4)  # unique per run: concurrent suites on one server never share it (D-1)
     roles = [f"{base}_owner", f"{base}_v_superuser"]
     untouched = f"{base}_other"  # same start, not a name a run creates
     with psycopg.connect(dsn, autocommit=True) as conn:
