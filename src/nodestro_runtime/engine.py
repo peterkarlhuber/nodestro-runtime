@@ -49,6 +49,7 @@ from orkexa import (
     DataResidencyError,
     EphemeralMemory,
     Evaluator,
+    IncompleteResponseError,
     InvalidRequestError,
     MaxToolCallsError,
     MaxToolRoundsError,
@@ -4096,6 +4097,18 @@ class RunManager:
             state.thinking_phases, state.thinking_redacted = trace.phases, trace.redacted
             self._emit(context, "thinking_status", node_id, state=phase, reasoning_kind=kind, redacted=redacted)
 
+        def on_limit(limit: str, round_number: int) -> None:
+            """The agent continued at a limit instead of failing (see :data:`LIMITS_HANDLED`)."""
+            with context.lock:
+                if limit not in state.limits_handled:
+                    state.limits_handled.append(limit)  # type: ignore[arg-type]
+                reduce = limit == "reasoning" and state.reasoning_reduced is None
+                if reduce:
+                    state.reasoning_reduced = "output_limit"
+            self._emit(context, "limit_handled", node_id, limit=limit, round=round_number)
+            if reduce:
+                self._emit(context, "reasoning_reduced", node_id, reason="output_limit")
+
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
             context.tracker.check()
@@ -4158,7 +4171,7 @@ class RunManager:
         }
         # Whatever reasoning the provider transmits is passed on, for every provider; showing it is the interface's
         # choice (Anthropic's thinking_display decides whether Claude sends text at all).
-        hooks["on_event"] = reasoning_hook(on_thinking, on_reasoning_status)
+        hooks["on_event"] = reasoning_hook(on_thinking, on_reasoning_status, on_limit)
 
         extra: list[ContentBlock] = []
         extra_tools: list[Tool] = []
@@ -4645,6 +4658,8 @@ def node_problem(exc: BaseException) -> Problem:
         return provider_problem(exc, text)
     if isinstance(exc, DataResidencyError):
         return problem("provider.data_residency_violation", text, provider="bedrock")
+    if isinstance(exc, IncompleteResponseError):
+        return incomplete_problem(exc, text)
     if isinstance(exc, OrkexaError):
         return problem(f"run.agent.{kind}", text, type=kind)
     found = library_problem(exc, code="run.failed")
@@ -4706,6 +4721,39 @@ def provider_problem(exc: ProviderError, text: str) -> Problem:
     if status in _OVERLOADED_STATUSES or (not client_error and "overloaded" in text.lower()):
         return problem("run.provider_overloaded", text, **known)
     return problem("run.api_error", text, status=status or "", provider=provider)
+
+
+def incomplete_problem(exc: IncompleteResponseError, text: str) -> Problem:
+    """The problem of a step whose model stopped before its answer was complete, with what to change.
+
+    The code stays ``run.agent.IncompleteResponseError``; ``params`` say why: ``cause`` is ``context_window`` (the
+    conversation filled the model's context window), ``reasoning`` (the model reasoned until the answer limit and
+    could not answer, also not once more without reasoning) or ``answer`` (the answer itself is longer than the
+    limit), plus ``max_tokens`` and ``output_tokens`` where known."""
+    if exc.stop_reason == "context_window_exceeded":
+        cause = "context_window"
+        advice = (
+            "The conversation filled the model's context window. Give the step less material (shorter inputs, "
+            "on-demand files) or use a model or local model server with a larger context window."
+        )
+    elif exc.reasoning and not exc.answered:
+        cause = "reasoning"
+        advice = (
+            "The model spent the whole answer limit on reasoning before it answered. Lower the agent's effort or "
+            "raise its answer limit (max_tokens)."
+        )
+    else:
+        cause = "answer"
+        advice = (
+            "The answer is longer than the agent's answer limit (max_tokens). Raise the limit or ask for a shorter "
+            "answer in the agent's instructions."
+        )
+    params: dict[str, Any] = {"type": "IncompleteResponseError", "cause": cause}
+    if exc.max_tokens is not None:
+        params["max_tokens"] = exc.max_tokens
+    if exc.output_tokens is not None:
+        params["output_tokens"] = exc.output_tokens
+    return problem("run.agent.IncompleteResponseError", f"{text} {advice}", **params)
 
 
 #: Calls of one tool with the same arguments, from which on a step that ran out of tool rounds counts as looping.

@@ -209,11 +209,9 @@ async def test_the_downtime_flow_runs_through_after_several_tool_rounds_with_thi
     assert len(sent) == 5  # three tool rounds, the thinking-only end of the tool phase, the structured answer
     last = sent[-1]["messages"]
     assert last[-2] == {"role": "assistant", "content": "", "reasoning": "The share is about 2.15 %, below the target."}
-    assert [m["reasoning"] for m in last if m.get("tool_calls")] == [
-        "Round 1: table_totals.",
-        "Round 2: table_totals.",
-        "Round 3: calculator.",
-    ]
+    # Only the latest assistant turn's reasoning goes back to Ollama (RT-067: replaying every round's thinking
+    # filled the context window); here that is the thinking-only end of the tool phase.
+    assert [m.get("reasoning") for m in last if m.get("tool_calls")] == [None, None, None]
     assert run.nodes["measures"].status == "succeeded"
 
 
