@@ -7,8 +7,9 @@ name: Nightly
 # ci.yml's package job is a workflow artifact, not a release or a registry upload.
 on:
   schedule:
-    # Staggered across the repositories (CI-FAST cron table) so that the night runs stay under the job limit.
-    - cron: "0 1 * * *"
+    # Staggered across the repositories (CI-FAST cron table) so that the night runs stay under the job limit. GitHub starts
+    # these scheduled runs about 6 h late on this account (measured 2026-11-08..11), so the crons sit 6 h before the night.
+    - cron: "0 19 * * *"
   workflow_dispatch:
     inputs:
       canary_fail:
