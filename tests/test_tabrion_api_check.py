@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_tabrion_api.py"
 EXPORT = ROOT / "docs" / "api-consumers.md"
 #: SHA-256 of ``scripts/check_tabrion_api.py``, the same in all four repositories.
-SCRIPT_SHA256 = "7a403418977b8df6338dc8a4ab0970523394588e66ea854329169d200a38040b"
+SCRIPT_SHA256 = "39c8daf3035cf5b606419e25557d56eb0ba04db7dce052c015afcb86eed98a70"
 
 
 def _load() -> ModuleType:
@@ -141,6 +141,28 @@ def test_the_surface_comparison_refuses_names_outside_the_snapshot_and_experimen
     assert check.surface_check({"tabrion.Database.run_transaction", "tabrion.errors.old"}, surface) == [
         "tabrion.Database.run_transaction: stability X in surface.json, consumers use only S names",
         "tabrion.errors.old: stability None in surface.json, consumers use only S names",
+    ]
+
+
+def test_the_surface_comparison_accepts_members_and_fields_of_stable_entries(tmp_path: Path) -> None:
+    # Tabrion's surface.json lists enum members and dataclass fields inside the parent entry, not as keys.
+    surface = tmp_path / "surface.json"
+    names: dict[str, dict[str, object]] = {
+        "tabrion.TLSMode": {"kind": "enum", "members": ["AUTO = 'auto'", "REQUIRE = 'require'"], "stability": "S"},
+        "tabrion.Health": {"kind": "dataclass", "fields": ["ok: bool", "latency_ms: float | None"], "stability": "S"},
+        "tabrion.Beta": {"kind": "enum", "members": ["ON = 'on'"], "stability": "X"},
+        "tabrion.Database": {"kind": "class", "stability": "S"},
+    }
+    surface.write_text(json.dumps({"names": names}), encoding="utf-8")
+    ok = {"tabrion.TLSMode.AUTO", "tabrion.TLSMode.REQUIRE", "tabrion.Health.ok", "tabrion.Health.latency_ms"}
+    assert check.surface_check(ok, surface) == []
+    assert check.surface_check({"tabrion.TLSMode.OFF", "tabrion.Health.bool", "tabrion.Database.x"}, surface) == [
+        "tabrion.Database.x: not in surface.json",
+        "tabrion.Health.bool: not in surface.json",
+        "tabrion.TLSMode.OFF: not in surface.json",
+    ]
+    assert check.surface_check({"tabrion.Beta.ON"}, surface) == [
+        "tabrion.Beta.ON: stability X in surface.json, consumers use only S names"
     ]
 
 
