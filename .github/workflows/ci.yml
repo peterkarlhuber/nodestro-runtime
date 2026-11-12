@@ -56,6 +56,8 @@ jobs:
       - name: Install
         run: |
           pip install -e ".[dev]"
+          # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
+          pip install pytest-xdist==3.8.0
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
@@ -63,7 +65,13 @@ jobs:
       - run: lint-imports
       # Every pytest step compares its skipped tests with an expectation file (MUP-ONA A0, scripts/check_skips.py):
       # a test that starts or stops being skipped fails the job until the file says why.
-      - run: pytest --junitxml=junit-test.xml
+      # CI-FAST AP6: the test IDs this run must report; after the run each must appear exactly once in the report.
+      # --dist loadfile keeps each file on one worker (tests/test_sql_catalog.py writes its probe report per process).
+      - name: Collect the test IDs
+        run: pytest --collect-only -q -p no:cacheprovider > "$RUNNER_TEMP/ids-test.txt"
+      - run: pytest -n auto --dist loadfile --junitxml=junit-test.xml
+      - name: Every collected test ran exactly once
+        run: python scripts/check_test_ids.py "$RUNNER_TEMP/ids-test.txt" junit-test.xml
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-test.xml tests/ci/skipped-test.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -124,16 +132,29 @@ jobs:
       - name: Install
         run: |
           pip install -e ".[dev]"
+          # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
+          pip install pytest-xdist==3.8.0
+      # CI-FAST AP6: collected IDs first, then the parallel run, then each ID exactly once in the report.
+      - name: Collect the test IDs (superuser)
+        run: pytest --collect-only -q -p no:cacheprovider $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py) > "$RUNNER_TEMP/ids-pg-a.txt"
       - name: PostgreSQL tests (superuser)
-        run: pytest --junitxml=junit-pg-a.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+        run: pytest -n auto --dist loadfile --junitxml=junit-pg-a.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+      - name: Every collected test ran exactly once (superuser)
+        run: python scripts/check_test_ids.py "$RUNNER_TEMP/ids-pg-a.txt" junit-pg-a.xml
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-pg-a.xml tests/ci/skipped-pg-a.txt
+      - name: Collect the test IDs (restricted runtime role)
+        env:
+          NODESTRO_TEST_RUNTIME_ROLE: "1"
+        run: pytest --collect-only -q -p no:cacheprovider $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py) > "$RUNNER_TEMP/ids-pg-a-runtime-role.txt"
       - name: PostgreSQL tests as the restricted runtime role (pg-a-restricted)
         env:
           NODESTRO_TEST_RUNTIME_ROLE: "1"
         run: >-
-          pytest --junitxml=junit-pg-a-runtime-role.xml
+          pytest -n auto --dist loadfile --junitxml=junit-pg-a-runtime-role.xml
           $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES" tests/test_*.py)
+      - name: Every collected test ran exactly once (restricted runtime role)
+        run: python scripts/check_test_ids.py "$RUNNER_TEMP/ids-pg-a-runtime-role.txt" junit-pg-a-runtime-role.xml
       - name: Skipped tests as expected (restricted runtime role)
         run: python scripts/check_skips.py junit-pg-a-runtime-role.xml tests/ci/skipped-pg-a-runtime-role.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -181,16 +202,29 @@ jobs:
       - name: Install
         run: |
           pip install -e ".[dev]"
+          # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
+          pip install pytest-xdist==3.8.0
+      # CI-FAST AP6: collected IDs first, then the parallel run, then each ID exactly once in the report.
+      - name: Collect the test IDs (superuser)
+        run: pytest --collect-only -q -p no:cacheprovider $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py) > "$RUNNER_TEMP/ids-pg-b.txt"
       - name: PostgreSQL tests with pgvector (superuser)
-        run: pytest --junitxml=junit-pg-b.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py)
+        run: pytest -n auto --dist loadfile --junitxml=junit-pg-b.xml $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py)
+      - name: Every collected test ran exactly once (superuser)
+        run: python scripts/check_test_ids.py "$RUNNER_TEMP/ids-pg-b.txt" junit-pg-b.xml
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-pg-b.xml tests/ci/skipped-pg-b.txt
+      - name: Collect the test IDs (restricted runtime role)
+        env:
+          NODESTRO_TEST_RUNTIME_ROLE: "1"
+        run: pytest --collect-only -q -p no:cacheprovider $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py) > "$RUNNER_TEMP/ids-pg-b-runtime-role.txt"
       - name: PostgreSQL tests with pgvector as the restricted runtime role (pg-b-restricted)
         env:
           NODESTRO_TEST_RUNTIME_ROLE: "1"
         run: >-
-          pytest --junitxml=junit-pg-b-runtime-role.xml
+          pytest -n auto --dist loadfile --junitxml=junit-pg-b-runtime-role.xml
           $(grep -l -E "postgres_support|NODESTRO_TEST_POSTGRES|NODESTRO_TEST_PGVECTOR" tests/test_*.py)
+      - name: Every collected test ran exactly once (restricted runtime role)
+        run: python scripts/check_test_ids.py "$RUNNER_TEMP/ids-pg-b-runtime-role.txt" junit-pg-b-runtime-role.xml
       - name: Skipped tests as expected (restricted runtime role)
         run: python scripts/check_skips.py junit-pg-b-runtime-role.xml tests/ci/skipped-pg-b-runtime-role.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -25,6 +25,57 @@ import uuid
 
 import pytest
 
+#: The databases this pytest-xdist worker created for itself: ``(original DSN, database)`` per variable.
+XDIST_DATABASES: dict[str, tuple[str, str]] = {}
+
+
+def _own_database_per_xdist_worker() -> None:
+    """Under pytest-xdist every worker process gets its own PostgreSQL database (CI-FAST AP6).
+
+    Each test migrates into its own schema, but some state belongs to the whole database: session advisory locks
+    (the scheduler leader) and the pgvector extension, which the upgrade and drift tests install and remove while
+    other tests use it. Workers sharing one database would change that state under each other's tests; a worker's
+    own database keeps them apart, exactly as in a serial run. ``NODESTRO_TEST_POSTGRES`` and
+    ``NODESTRO_TEST_PGVECTOR`` are rewritten when this module is first imported (by ``conftest.py``, before any test
+    module reads them), so the tests and the child processes they start use the worker's database; ``conftest.py``
+    drops it when the worker ends (:func:`drop_xdist_databases`). Serial runs are unchanged.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    # A child process a test starts inherits the worker's variables (already rewritten): it uses the same database.
+    if not worker or os.environ.get("NODESTRO_TEST_XDIST_DATABASE") == worker:
+        return
+    created: dict[str, str] = {}  # original DSN -> the worker's DSN (both variables usually name one database)
+    for variable in ("NODESTRO_TEST_POSTGRES", "NODESTRO_TEST_PGVECTOR"):
+        dsn = os.environ.get(variable)
+        if not dsn:
+            continue
+        if dsn not in created:
+            import psycopg
+            from psycopg import sql
+            from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+            name = f"{conninfo_to_dict(dsn).get('dbname') or 'postgres'}_xdist_{worker}"
+            with psycopg.connect(dsn, autocommit=True) as admin:
+                admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+                admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+            created[dsn] = make_conninfo(dsn, dbname=name)
+            XDIST_DATABASES[variable] = (dsn, name)
+        os.environ[variable] = created[dsn]
+    os.environ["NODESTRO_TEST_XDIST_DATABASE"] = worker
+
+
+def drop_xdist_databases() -> None:
+    """Drop the databases :func:`_own_database_per_xdist_worker` created (called when the worker ends)."""
+    import psycopg
+    from psycopg import sql
+
+    for dsn, name in dict.fromkeys(XDIST_DATABASES.values()):
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
+_own_database_per_xdist_worker()
+
 DSN = os.environ.get("NODESTRO_TEST_POSTGRES", "")
 REQUIRED = os.environ.get("NODESTRO_REQUIRE_POSTGRES") == "1"
 RUNTIME_ROLE_MODE = os.environ.get("NODESTRO_TEST_RUNTIME_ROLE") == "1"
@@ -75,11 +126,13 @@ def install_runtime_role_mode() -> None:
 
     with psycopg.connect(DSN, autocommit=True) as admin:
         if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (RUNTIME_ROLE,)).fetchone() is None:
-            admin.execute(
-                sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD {}").format(
-                    sql.Identifier(RUNTIME_ROLE), sql.Literal(RUNTIME_PASSWORD)
+            # Roles belong to the whole server: pytest-xdist workers create it at the same time, and only one wins.
+            with suppress(psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
+                admin.execute(
+                    sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD {}").format(
+                        sql.Identifier(RUNTIME_ROLE), sql.Literal(RUNTIME_PASSWORD)
+                    )
                 )
-            )
     cls = storage_postgres.PostgresDatabase
     original_init, original_migrate, original_close = cls.__init__, cls.migrate, cls.close
     runtime = runtime_dsn()
