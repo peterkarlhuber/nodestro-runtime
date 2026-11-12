@@ -42,3 +42,10 @@ def _docker_sandbox_status(request: pytest.FixtureRequest, monkeypatch: pytest.M
     docker_status.reset_monitors()
     if request.node.get_closest_marker("real_docker_status") is None:
         monkeypatch.setattr(docker_status, "monitor_for", lambda *args, **kwargs: StaticDockerMonitor())
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    import postgres_support
+
+    if postgres_support.XDIST_DATABASES:
+        postgres_support.drop_xdist_databases()
