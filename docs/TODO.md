@@ -526,6 +526,8 @@ Items that need an independent or external review (an internal audit does not re
   name to check with the first Tabrion pin (MIG-NOD-3); until then tests cover them against a fake package and a fake
   snapshot. The test job fails when the export is stale or missing or a private name is used
   (`tests/test_tabrion_api_check.py`), but no lint step names it.
+- **Done (2026-11-12):** `--surface` checks enum members and dataclass fields (`tabrion.TLSMode.AUTO`) against
+  their parent's `members`/`fields` in `surface.json` instead of reporting them as missing.
 - **Next step:** Add `python scripts/check_tabrion_api.py --check-export docs/api-consumers.md` to the lint job (a
   `.github` change, not made in the QA-21 pull request); Tabrion collects the consumer lists into its own
   `docs/api-consumers.md` (Tabrion's side of QA-21).

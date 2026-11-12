@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed (TABRION QA-21): `scripts/check_tabrion_api.py --surface` no longer reports enum members and dataclass
+  fields as missing. Tabrion's `docs/api/surface.json` lists them in the parent entry (`members`, `fields`), so a
+  name such as `tabrion.TLSMode.AUTO` is now checked against its parent's entry and passes when the parent is stable
+  (`S`). Tooling only.
 - Fixed (RT-067): agents on local thinking models (qwen3.5 on Ollama) no longer fail with
   `run.agent.IncompleteResponseError` or `run.agent.MaxToolRoundsError` where an answer was within reach. Every
   agent step builds its Orkexa agent with `on_max_tool_rounds="answer"` (the last allowed round asks for the final
