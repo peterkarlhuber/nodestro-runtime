@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .net_address import address_problem, url_secret_problem
+from .net_address import METADATA_HOSTS, address_problem, url_secret_problem
 from .platform_events import platform_events
 from .problems import NodestroError
 from .schemas import new_id, now
@@ -70,6 +70,11 @@ _LABEL = r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(\.{_LABEL})*$")
 _EMAIL = re.compile(r"^[^@\s<>\"',;]{1,64}@[A-Za-z0-9.-]{1,253}$")
 _LOOPBACK_NAMES = frozenset({"localhost"})
+#: The form of a connection id (``new_id("conn")``); releases and exported packages accept no other.
+CONNECTION_ID = re.compile(r"^conn_[0-9a-f]{12}$")
+#: A last label of digits or a ``0x`` number: an IPv4 address in a form ``ipaddress`` refuses but resolvers take
+#: (``127.1``, ``2130706433``, ``0x7f000001``, ``0177.0.0.1``).
+_NUMERIC_LABEL = re.compile(r"^(?:[0-9]+|0x[0-9a-f]*)$")
 
 
 # ---- settings of the shipped types --------------------------------------------------------------------------------
@@ -221,8 +226,10 @@ def host_problem(host: str, *, mode: Mode) -> str | None:
     try:
         address = ipaddress.ip_address(literal)
     except ValueError:
-        if not _HOST.match(host):
+        if not _HOST.match(host) or _NUMERIC_LABEL.match(host.rsplit(".", 1)[-1]):
             return "invalid"
+        if host.rstrip(".") in METADATA_HOSTS:
+            return "metadata"
         if host in _LOOPBACK_NAMES or host.endswith(".localhost"):
             return None if mode != "server" else "loopback"
         return None
@@ -611,6 +618,10 @@ class ConnectionService:
             if data.name is not None:
                 self._unique_name(data.name, except_id=item.id)
             changed_target = provider != item.provider or settings.model_dump(mode="json") != item.settings
+            # A secret only goes where it was entered for: a new address drops it (ADR-0001, write-only secrets).
+            moved = sorted(egress) != sorted(item.egress)
+            if moved:
+                self._session.pop(item.id, None)
             item = item.model_copy(
                 update={
                     "name": data.name.strip() if data.name is not None else item.name,
@@ -620,13 +631,17 @@ class ConnectionService:
                     "egress": egress,
                     # A connection that points somewhere else has to be checked again.
                     "check": ConnectionCheck() if changed_target else item.check,
+                    **({"secret_sealed": None, "secret_storage": "none"} if moved else {}),
                     "updated_at": now(),
                     "updated_by": actor,
                 }
             )
             self.store.put(CONNECTIONS, item.id, item)
         fields = sorted(name for name in data.model_dump(exclude_none=True))
-        self.event("updated", item, actor=actor, fields=fields)
+        if moved:
+            self.event("updated", item, actor=actor, fields=fields, target_changed=True, secret_cleared=True)
+        else:
+            self.event("updated", item, actor=actor, fields=fields)
         return item
 
     def delete(self, connection_id: str, *, actor: str | None = None, force: bool = False) -> None:
@@ -721,8 +736,8 @@ class ConnectionService:
                 result = kind.check(self.resolve(item.id))
             except NodestroError as exc:
                 result = CheckResult(ok=False, code=exc.code)
-            except Exception:
-                logger.exception("Check of a %s connection failed", item.type)
+            except Exception as exc:  # the type only: an error text may repeat an address or a credential
+                logger.warning("Check of a %s connection failed: %s", item.type, type(exc).__name__)
                 result = CheckResult(ok=False, code="connection.check_failed")
         with self._lock:
             item = self.get(connection_id)
@@ -795,6 +810,9 @@ class StaticConnections:
         self.problems: dict[str, str] = {}
         env = environ or {}
         for connection_id, entry in entries.items():
+            if not CONNECTION_ID.match(connection_id):
+                self.problems[connection_id] = "connection.id_invalid"
+                continue
             try:
                 self._entries[connection_id] = self._parse(connection_id, entry, env, mode)
             except NodestroError as exc:
@@ -863,6 +881,7 @@ def secret_variable(connection_id: str) -> str:
 
 
 __all__ = [
+    "CONNECTION_ID",
     "CONTRACT_VERSION",
     "RESERVED_TYPES",
     "CheckResult",

@@ -46,8 +46,11 @@ None known.
 - **Priority:** P3 Low · **Status:** Needs external review · **Refs:** ADR-0001 (runtime), `connections.py`,
   nodestro-api `api_connections.py`, NAL plan v1.1 package D1
 - **What:** NAL-A1 added write-only secrets for service connections (shared vault with MCP tokens), tenant binding,
-  egress derivation and a management API. It was reviewed internally only. Plan v1.1 puts it into the next
-  independent review brief (D1, with NAL-A2). No feature flag depends on it; it gates nothing today.
+  egress derivation and a management API. A separate internal review (2026-11-13) found no high findings; its
+  five findings are fixed (key rotation covers connection secrets, numeric IPv4 forms and metadata names refused, a
+  new address drops the secret, release connection ids validated, check errors logged by type only). Plan v1.1
+  still puts it into the next independent review brief (D1, with NAL-A2), together with the call-time network guard
+  (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
 - **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
 
 Items that need an independent or external review (an internal audit does not replace it):

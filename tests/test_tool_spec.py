@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from orkexa import Tool, ToolResultError
+from pydantic import ValidationError
 import pytest
 
 from nodestro_runtime.agent_test import AgentTestIn
@@ -314,3 +315,13 @@ def test_releases_record_builtin_versions_without_changing_old_digests() -> None
     assert old.digest() == same.digest() and old.tool_marker("calculator") == "builtin:calculator"
     new = old.model_copy(update={"builtin_versions": {"calculator": 1}})
     assert new.tool_marker("calculator") == "builtin:calculator@1" and new.digest() != old.digest()
+
+
+def test_a_release_accepts_only_generated_connection_ids() -> None:
+    """Ids of the form conn_<12 hex> only: a crafted release cannot bring colliding variable names or control text."""
+    flow = workflow(AgentConfig(name="A", tools=["calculator"]))
+    ok = ReleaseBundle(workflow_id="w", workflow=flow, required_connections={"conn_0123456789ab": "search:test"})
+    assert ok.required_connections == {"conn_0123456789ab": "search:test"}
+    for bad in ({"conn-a": "search:test"}, {"conn_0123456789ab": "search:\x1b[2J"}, {"CONN_0123456789AB": "smtp:x"}):
+        with pytest.raises(ValidationError):
+            ReleaseBundle(workflow_id="w", workflow=flow, required_connections=bad)
