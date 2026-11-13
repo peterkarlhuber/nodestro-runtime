@@ -1,4 +1,4 @@
-"""Unit tests for ci_ok.py (CI-FAST W1, v2). Standard library only, no network: the HTTP layer is a fake.
+"""Unit tests for ci_ok.py (CI-FAST W1, v3). Standard library only, no network: the HTTP layer is a fake.
 
 Run: python3 -I -m unittest discover -s .github/scripts -p test_ci_ok.py   (or: python3 .github/scripts/test_ci_ok.py).
 `python3 -m unittest .github/scripts/test_ci_ok.py` does not work: unittest turns the path into the module name
@@ -28,11 +28,14 @@ BASE = "b" * 40
 
 
 class FakeApi:
-    """Answers GET paths from a dict; values may be callables or ApiError instances (raised)."""
+    """Answers GET paths from a dict; values may be callables or ApiError instances (raised). A str value is a raw
+    file (contents API). POSTs are recorded in `posts`; `post_error` makes them raise."""
 
-    def __init__(self, routes: dict):
+    def __init__(self, routes: dict, post_error: Exception | None = None):
         self.routes = routes
         self.calls: list[str] = []
+        self.posts: list[tuple[str, dict]] = []
+        self.post_error = post_error
 
     def get(self, path: str, raw: bool = False):
         self.calls.append(path)
@@ -42,8 +45,17 @@ class FakeApi:
                 value = value() if callable(value) else value
                 if isinstance(value, ci_ok.ApiError):
                     raise value
-                return json.dumps(value) if raw else value
+                if raw:
+                    return value if isinstance(value, str) else json.dumps(value)
+                return value
         raise ci_ok.ApiError(404, path)
+
+    def post(self, path: str, body: dict):
+        self.calls.append("POST " + path)
+        if self.post_error is not None:
+            raise self.post_error
+        self.posts.append((path, body))
+        return {"id": 500 + len(self.posts), "html_url": f"https://x/check-runs/{500 + len(self.posts)}"}
 
 
 def run(
@@ -62,7 +74,7 @@ def run(
     repo_id=1,
     pr_heads=None,
 ):
-    """pr_heads: {number: (head ref, head repo id)} for listed PRs; without it a listed PR carries no head."""
+    """pr_heads: {number: (head ref, head repo id[, head sha])} for listed PRs; a listed PR without it has no head."""
     pr_heads = pr_heads or {}
     return {
         "id": rid,
@@ -80,11 +92,15 @@ def run(
         "pull_requests": [
             {
                 "number": n,
-                **({"head": {"ref": pr_heads[n][0], "repo": {"id": pr_heads[n][1]}}} if n in pr_heads else {}),
+                **({"head": _pr_head(*pr_heads[n])} if n in pr_heads else {}),
             }
             for n in prs
         ],
     }
+
+
+def _pr_head(ref, repo_id, sha=None):
+    return {"ref": ref, "repo": {"id": repo_id}, **({"sha": sha} if sha else {})}
 
 
 def job(jid, name, *, status="completed", conclusion="success", completed="2026-11-07T10:20:00Z"):
@@ -105,6 +121,9 @@ def routes_for(runs: list, jobs_by_run: dict, files=("src/a.py",)) -> dict:
         f"/repos/{REPO}/pulls/8/files": [{"filename": f} for f in files],
         f"/repos/{REPO}/pulls/7": {"number": 7, "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE}},
         f"/repos/{REPO}/compare/master...{HEAD}": {"files": [{"filename": f} for f in files]},
+        # The impostor scan: nothing on the head SHA but this evaluator's own check runs.
+        f"/repos/{REPO}/commits/{HEAD}/check-runs": {"check_runs": []},
+        f"/repos/{REPO}/commits/{HEAD}/statuses": [],
     }
     for rid, jobs in jobs_by_run.items():
         r[f"/repos/{REPO}/actions/runs/{rid}/jobs"] = {"jobs": jobs}
@@ -609,8 +628,8 @@ DOCKER_WF = (
     'name: Docker\non:\n  pull_request:\n    paths:\n      - "docker/**"\n      - .github/workflows/docker.yml\n'
 )
 GATE_WF = (
-    "name: ci-ok\non:\n  workflow_run:\n    workflows: [CI, Docker]\n    types: [completed]\njobs:\n  ci-ok:\n"
-    "    name: ci-ok\n"
+    "name: ci-ok\non:\n  workflow_run:\n    workflows: [CI, Docker]\n    types: [completed, requested]\njobs:\n"
+    "  ci-ok:\n    name: ci-ok evaluate\n    permissions:\n      contents: read\n      checks: write\n"
 )
 NIGHTLY_WF = "name: Nightly\non:\n  schedule:\n    - cron: '0 1 * * *'\n"
 
@@ -634,7 +653,25 @@ def good_tree(test, manifest=MANIFEST, **overrides):
     return make_tree(test, manifest, {k: v for k, v in workflows.items() if v is not None})
 
 
-def workflow_run_event(prs=(7,), event="pull_request", head_branch=None, head_repo_id=None):
+def tree_routes(root: str, sha: str = HEAD) -> dict:
+    """Contents API routes that serve the tree under `root` (manifest and workflow files) at `sha`, as raw text."""
+    routes: dict = {}
+    wf_dir = os.path.join(root, ".github", "workflows")
+    manifest = os.path.join(root, ci_ok.MANIFEST_PATH)
+    prefix = f"/repos/{REPO}/contents/"
+    if os.path.exists(manifest):
+        with open(manifest, encoding="utf-8") as fh:
+            routes[f"{prefix}{ci_ok.MANIFEST_PATH}?ref={sha}"] = fh.read()
+    if os.path.isdir(wf_dir):
+        names = sorted(os.listdir(wf_dir))
+        routes[f"{prefix}{ci_ok.WORKFLOWS_DIR}?ref={sha}"] = [{"name": n, "type": "file"} for n in names]
+        for n in names:
+            with open(os.path.join(wf_dir, n), encoding="utf-8") as fh:
+                routes[f"{prefix}{ci_ok.WORKFLOWS_DIR}/{n}?ref={sha}"] = fh.read()
+    return routes
+
+
+def workflow_run_event(prs=(7,), event="pull_request", head_branch=None, head_repo_id=None, action="completed"):
     wr = {
         "id": 99,
         "name": "CI",
@@ -647,12 +684,16 @@ def workflow_run_event(prs=(7,), event="pull_request", head_branch=None, head_re
     if head_branch is not None:
         wr["head_branch"] = head_branch
         wr["head_repository"] = {"id": head_repo_id}
-    return {"workflow_run": wr, "repository": {"default_branch": "master"}}
+    return {"action": action, "workflow_run": wr, "repository": {"default_branch": "master"}}
 
 
-class Main(unittest.TestCase):
-    def main(self, routes, *, event=None, env=None, argv=None, root=None, api=None):
+class MainHarness(unittest.TestCase):
+    def main(self, routes, *, event=None, env=None, argv=None, root=None, api=None, pr_root=None):
+        """pr_root: the PR head's tree served by the contents API (default: the same tree as the default branch)."""
         root = root or good_tree(self)
+        api = api or FakeApi(routes)
+        for key, value in tree_routes(pr_root or root).items():
+            api.routes.setdefault(key, value)
         env = {"GITHUB_REPOSITORY": REPO, **(env or {})}
         with tempfile.TemporaryDirectory() as tmp:
             env["GITHUB_STEP_SUMMARY"] = os.path.join(tmp, "summary.md")
@@ -662,7 +703,7 @@ class Main(unittest.TestCase):
                     json.dump(event, fh)
             out = io.StringIO()
             with redirect_stdout(out):
-                code = ci_ok.main(["--root", root, *(argv or [])], env=env, api=api or FakeApi(routes))
+                code = ci_ok.main(["--root", root, *(argv or [])], env=env, api=api)
             summary = ""
             if os.path.exists(env["GITHUB_STEP_SUMMARY"]):
                 with open(env["GITHUB_STEP_SUMMARY"], encoding="utf-8") as fh:
@@ -675,6 +716,8 @@ class Main(unittest.TestCase):
     def green_routes(self):
         return routes_for([run(1, "ci.yml")], {1: GREEN})
 
+
+class Main(MainHarness):
     def test_workflow_run_event_ok_prints_one_notice(self):
         code, out, summary = self.main(self.green_routes(), event=workflow_run_event())
         self.assertEqual(code, 0)
@@ -888,6 +931,471 @@ class SelfCheck(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ci_ok.main(["--self-check", "--root", bad], env={}), 1)
             self.assertEqual(ci_ok.main(["--self-check", "--root", good_tree(self)], env={}), 0)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# v3: the posted check run (C1), impostors (H1), the PR tree's self-check (C3), several PRs on one SHA (C5)
+# --------------------------------------------------------------------------------------------------------------------
+
+RUN_ENV = {"GITHUB_RUN_ID": "4242", "GITHUB_SERVER_URL": "https://github.com"}
+
+
+def own_check_run(cid=1, conclusion="success"):
+    return {
+        "id": cid,
+        "name": "ci-ok",
+        "app": {"slug": "github-actions"},
+        "external_id": ci_ok.OWN_EXTERNAL_ID,
+        "status": "completed",
+        "conclusion": conclusion,
+        "html_url": f"https://x/check-runs/{cid}",
+    }
+
+
+class PostedCheck(MainHarness):
+    """C1 (review B1): every workflow_run evaluation posts the check run `ci-ok` on the PR head SHA."""
+
+    def posted(self, api):
+        self.assertEqual(len(api.posts), 1)
+        path, body = api.posts[0]
+        self.assertEqual(path, f"/repos/{REPO}/check-runs")
+        self.assertEqual(body["name"], "ci-ok")
+        self.assertEqual(body["head_sha"], HEAD)
+        self.assertEqual(body["external_id"], ci_ok.OWN_EXTERNAL_ID)
+        return body
+
+    def test_ok_posts_completed_success_with_the_table(self):
+        api = FakeApi(self.green_routes())
+        code, out, _ = self.main({}, event=workflow_run_event(), api=api, env=RUN_ENV)
+        self.assertEqual(code, 0)
+        body = self.posted(api)
+        self.assertEqual((body["status"], body["conclusion"]), ("completed", "success"))
+        self.assertTrue(body["output"]["title"].startswith("OK for PR #7"))
+        self.assertIn("| ci.yml | lint |", body["output"]["summary"])
+        self.assertIn("Report-only", body["output"]["summary"])
+        self.assertEqual(body["details_url"], f"https://github.com/{REPO}/actions/runs/4242")
+        self.assertIn("posted the check run 'ci-ok' (completed/success)", out)
+
+    def test_not_ok_posts_failure_and_report_only_still_exits_zero(self):
+        api = FakeApi(self.failing_routes())
+        code, out, _ = self.main({}, event=workflow_run_event(), api=api)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.posted(api)["conclusion"], "failure")
+        self.assertEqual(out.count("::warning"), 1)
+        code, _, _ = self.main(self.failing_routes(), event=workflow_run_event(), env={"CI_OK_ENFORCE": "1"})
+        self.assertEqual(code, 1)
+
+    def test_pending_posts_in_progress_without_conclusion(self):
+        api = FakeApi(routes_for([run(1, "ci.yml", status="in_progress")], {1: [job(1, "lint", status="queued")]}))
+        self.main({}, event=workflow_run_event(), api=api)
+        body = self.posted(api)
+        self.assertEqual(body["status"], "in_progress")
+        self.assertNotIn("conclusion", body)
+
+    def test_api_error_posts_not_ok(self):
+        routes = self.green_routes()
+        routes[f"/repos/{REPO}/actions/runs?head_sha={HEAD}"] = ci_ok.ApiError(502, "runs")
+        api = FakeApi(routes)
+        code, _, _ = self.main({}, event=workflow_run_event(), api=api)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.posted(api)["conclusion"], "failure")
+
+    def test_failure_to_post_fails_the_job_visibly(self):
+        for verdict_routes in (self.green_routes(), self.failing_routes()):
+            with self.subTest():
+                api = FakeApi(verdict_routes, post_error=ci_ok.ApiError(403, "check-runs", "not accessible"))
+                code, out, summary = self.main({}, event=workflow_run_event(), api=api)
+                self.assertEqual(code, 1)
+                self.assertIn("::error title=ci-ok::could not post the 'ci-ok' check run", out)
+                self.assertIn("could not post", summary)
+
+    def test_requested_event_posts_in_progress_without_evaluating(self):
+        api = FakeApi(self.failing_routes())
+        code, _, _ = self.main({}, event=workflow_run_event(action="requested"), api=api)
+        self.assertEqual(code, 0)
+        body = self.posted(api)
+        self.assertEqual(body["status"], "in_progress")
+        self.assertIn("was requested", body["output"]["summary"])
+        self.assertEqual(api.calls, [f"POST /repos/{REPO}/check-runs"])
+        failing = FakeApi({}, post_error=ci_ok.ApiError(500, "check-runs"))
+        self.assertEqual(self.main({}, event=workflow_run_event(action="requested"), api=failing)[0], 1)
+
+    def test_dry_runs_and_push_completions_never_post(self):
+        api = FakeApi(self.green_routes())
+        self.main({}, argv=["--repo", REPO, "--pr", "7"], api=api, event=workflow_run_event())
+        self.assertEqual(api.posts, [])
+        api = FakeApi(self.green_routes())
+        self.main({}, event=workflow_run_event(event="push"), api=api)
+        self.assertEqual(api.posts, [])
+
+    def test_output_is_truncated_to_the_api_limits(self):
+        body = ci_ok.check_run_body(HEAD, "NOT OK", "t" * 1000, "s" * 100000)
+        self.assertLessEqual(len(body["output"]["title"]), ci_ok.MAX_TITLE)
+        self.assertLessEqual(len(body["output"]["summary"]), ci_ok.MAX_SUMMARY)
+        self.assertLess(ci_ok.MAX_SUMMARY, 65535)
+        self.assertTrue(body["output"]["summary"].endswith("(truncated; the full report is in the ci-ok evaluate run)"))
+        self.assertEqual(ci_ok.check_run_body(HEAD, "OK", "t", "s")["output"], {"title": "t", "summary": "s"})
+
+    def test_api_post_sends_json(self):
+        seen = {}
+
+        def opener(req, timeout):
+            seen.update(method=req.get_method(), body=json.loads(req.data), ctype=req.get_header("Content-type"))
+            return io.BytesIO(b'{"id": 5}')
+
+        api = ci_ok.Api("t", "https://api", opener=opener)
+        self.assertEqual(api.post("/repos/o/r/check-runs", {"name": "ci-ok"}), {"id": 5})
+        self.assertEqual(seen, {"method": "POST", "body": {"name": "ci-ok"}, "ctype": "application/json"})
+
+
+class ImpostorScan(MainHarness):
+    """H1 (partial): any `ci-ok` check run on the head SHA not posted by this evaluator, and any `ci-ok` commit
+    status, is a counted impostor row."""
+
+    def run_with(self, check_runs=(), statuses=()):
+        routes = self.green_routes()
+        routes[f"/repos/{REPO}/commits/{HEAD}/check-runs"] = {"check_runs": list(check_runs)}
+        routes[f"/repos/{REPO}/commits/{HEAD}/statuses"] = list(statuses)
+        api = FakeApi(routes)
+        _, out, summary = self.main({}, event=workflow_run_event(), api=api)
+        return api, out, summary
+
+    def test_own_earlier_check_runs_are_not_impostors(self):
+        api, out, _ = self.run_with([own_check_run(1, "failure"), own_check_run(2)])
+        self.assertIn(": OK", out)
+        self.assertEqual(api.posts[0][1]["conclusion"], "success")
+        scan = next(c for c in api.calls if "/check-runs" in c and not c.startswith("POST"))
+        self.assertIn("check_name=ci-ok", scan)
+        self.assertIn("filter=all", scan)
+
+    def test_foreign_check_runs_named_ci_ok_are_impostors(self):
+        for impostor in (
+            dict(own_check_run(9), app={"slug": "some-app"}),  # another app
+            dict(own_check_run(9), external_id=None),  # a GitHub Actions job named ci-ok (old evaluator, on: push)
+            dict(own_check_run(9), external_id="forged", app={"slug": "github-actions"}),  # a POST /check-runs
+        ):
+            with self.subTest(impostor=impostor):
+                api, out, summary = self.run_with([own_check_run(1), impostor])
+                self.assertIn("NOT OK", out)
+                self.assertIn(f"ci-ok (id 9, app {impostor['app']['slug']})", summary)
+                self.assertIn("impostor", summary)
+                self.assertEqual(api.posts[0][1]["conclusion"], "failure")
+
+    def test_other_names_are_ignored(self):
+        _, out, _ = self.run_with([dict(own_check_run(3), name="ci-ok evaluate", external_id=None)])
+        self.assertIn(": OK", out)
+
+    def test_commit_status_ci_ok_is_an_impostor(self):
+        statuses = [
+            {"id": 4, "context": "ci-ok", "state": "success", "creator": {"login": "mallory"}, "target_url": "u"},
+            {"id": 5, "context": "other", "state": "success"},
+        ]
+        api, out, summary = self.run_with(statuses=statuses)
+        self.assertIn("NOT OK", out)
+        self.assertIn("ci-ok (id 4, by mallory)", summary)
+        self.assertNotIn("id 5", summary)
+        self.assertEqual(api.posts[0][1]["conclusion"], "failure")
+
+    def test_scan_api_error_is_not_ok(self):
+        routes = self.green_routes()
+        routes[f"/repos/{REPO}/commits/{HEAD}/statuses"] = ci_ok.ApiError(403, "statuses")
+        api = FakeApi(routes)
+        _, _, summary = self.main({}, event=workflow_run_event(), api=api)
+        self.assertIn("api error", summary)
+        self.assertEqual(api.posts[0][1]["conclusion"], "failure")
+
+
+class GateJobName(unittest.TestCase):
+    """The evaluator job is `ci-ok evaluate`, so its own check run never collides with the posted `ci-ok` check."""
+
+    def problems(self, gate):
+        return "\n".join(ci_ok.self_check(good_tree(self, **{"ci-ok.yml": gate})))
+
+    def test_old_job_name_is_a_problem(self):
+        problems = self.problems(GATE_WF.replace("name: ci-ok evaluate", "name: ci-ok"))
+        self.assertIn("has a job or step named 'ci-ok'", problems)
+        self.assertIn("has no job named 'ci-ok evaluate'", problems)
+
+    def test_quoted_name_and_job_id_ci_ok_are_fine(self):
+        self.assertEqual(self.problems(GATE_WF.replace("name: ci-ok evaluate", 'name: "ci-ok evaluate"  # x')), "")
+
+    def test_checks_write_is_required(self):
+        self.assertIn("lacks 'checks: write'", self.problems(GATE_WF.replace("checks: write", "checks: read")))
+        self.assertIn("lacks 'checks: write'", self.problems(GATE_WF.replace("checks: write", "# checks: write")))
+
+    def test_completed_type_is_required(self):
+        self.assertIn("lacks 'completed'", self.problems(GATE_WF.replace("[completed, requested]", "[requested]")))
+        self.assertEqual(ci_ok.read_workflow_run_types(GATE_WF), ["completed", "requested"])
+
+
+# nodestro-server's shape: a path-filtered upgrade.yml next to ci.yml.
+SERVER_MANIFEST = {
+    "pull_request": {"ci.yml": ["lint"]},
+    "pull_request_path_filtered": {"upgrade.yml": ["upgrade"]},
+    "path_filters": {"upgrade.yml": {"paths": ["compose/**", ".github/workflows/upgrade.yml"]}},
+}
+SERVER_CI_WF = "name: ci\non:\n  pull_request:\n  push:\n    branches: [master]\njobs:\n  lint:\n"
+SERVER_UPGRADE_WF = (
+    "name: upgrade\non:\n  pull_request:\n    paths:\n      - compose/**\n      - .github/workflows/upgrade.yml\n"
+    "jobs:\n  upgrade:\n"
+)
+SERVER_UPGRADE_WF_81 = SERVER_UPGRADE_WF.replace(
+    "      - compose/**\n", "      - compose/**\n      - scripts/restore.sh\n"
+)
+SERVER_MANIFEST_83 = dict(
+    SERVER_MANIFEST,
+    path_filters={"upgrade.yml": {"paths": ["compose/**", "scripts/restore.sh", ".github/workflows/upgrade.yml"]}},
+)
+SERVER_GATE_WF = GATE_WF.replace("[CI, Docker]", "[ci, upgrade]")
+
+
+def server_tree(test, manifest=SERVER_MANIFEST, upgrade=SERVER_UPGRADE_WF, **extra):
+    workflows = {"ci.yml": SERVER_CI_WF, "upgrade.yml": upgrade, "ci-ok.yml": SERVER_GATE_WF, **extra}
+    return make_tree(test, manifest, workflows)
+
+
+UPGRADE_PATH = ".github/workflows/upgrade.yml"
+OLD_GATE_WF = GATE_WF.replace("name: ci-ok evaluate", "name: ci-ok").replace("      checks: write\n", "")
+
+
+def pr_files(*names, removed=()):
+    """A pulls/{n}/files answer: changed names, plus removed ones."""
+    return [{"filename": n, "status": "modified"} for n in names] + [
+        {"filename": n, "status": "removed"} for n in removed
+    ]
+
+
+class PrTreeSelfCheck(MainHarness):
+    """C3 (review H2): the post-merge view (the PR's versions of the self-check inputs it changed, the rest from the
+    default branch, read as data) is self-checked too. Replays nodestro-server #81 (drift introduced by the PR), #82
+    (default branch drifted, PR unrelated), #83 (the PR fixes it)."""
+
+    def run_pr(self, master, pr, files, *, extra_runs=(), extra_jobs=None):
+        routes = routes_for([run(1, "ci.yml"), *extra_runs], {1: [job(1, "lint")], **(extra_jobs or {})})
+        routes[f"/repos/{REPO}/pulls/7/files"] = pr_files(*files) if isinstance(files, tuple) else files
+        api = FakeApi(routes)
+        _, out, summary = self.main({}, event=workflow_run_event(), api=api, root=master, pr_root=pr)
+        return api, out, summary, api.posts[0][1].get("conclusion")
+
+    def contents_calls(self, api):
+        return [c for c in api.calls if "/contents/" in c]
+
+    def test_server_81_pr_adds_a_path_without_the_manifest_is_not_ok(self):
+        master = server_tree(self)
+        self.assertEqual(ci_ok.self_check(master), [])
+        upgrade_green = {"extra_runs": [run(2, "upgrade.yml")], "extra_jobs": {2: [job(2, "upgrade")]}}
+        api, out, summary, conclusion = self.run_pr(
+            master, server_tree(self, upgrade=SERVER_UPGRADE_WF_81), (UPGRADE_PATH,), **upgrade_green
+        )
+        self.assertIn("NOT OK", out)
+        self.assertEqual(conclusion, "failure")
+        self.assertIn("| self-check (PR) | inconsistent |", summary)
+        self.assertIn("introduced by this PR: upgrade.yml: path_filters in the manifest", summary)
+        self.assertIn("post-merge view: the PR's .github/workflows/upgrade.yml", summary)
+        self.assertEqual(self.contents_calls(api), [f"/repos/{REPO}/contents/{UPGRADE_PATH}?ref={HEAD}"])
+
+    def test_server_82_default_branch_drifted_and_unrelated_pr_is_not_ok(self):
+        master = server_tree(self, upgrade=SERVER_UPGRADE_WF_81)
+        api, out, summary, conclusion = self.run_pr(master, master, ("src/a.py",))
+        self.assertIn("NOT OK", out)
+        self.assertEqual(conclusion, "failure")
+        self.assertIn("| self-check | inconsistent |", summary)
+        self.assertIn("upgrade.yml: path_filters", summary)
+        self.assertNotIn("self-check (PR)", summary)
+        self.assertEqual(self.contents_calls(api), [])
+
+    def test_server_82_pr_touching_another_workflow_keeps_the_drift(self):
+        master = server_tree(self, upgrade=SERVER_UPGRADE_WF_81)
+        pr = server_tree(self, upgrade=SERVER_UPGRADE_WF_81, **{"extra.yml": "name: X\non:\n  push:\n"})
+        _, out, summary, _ = self.run_pr(master, pr, (".github/workflows/extra.yml",))
+        self.assertIn("NOT OK", out)
+        self.assertIn("default branch and this PR: upgrade.yml: path_filters", summary)
+        self.assertNotIn("self-check (PR)", summary)
+
+    def test_server_83_pr_fixes_the_drift_is_ok_with_a_note(self):
+        master = server_tree(self, upgrade=SERVER_UPGRADE_WF_81)
+        pr = server_tree(self, SERVER_MANIFEST_83, upgrade=SERVER_UPGRADE_WF_81)
+        self.assertEqual(ci_ok.self_check(pr), [])
+        _, out, summary, conclusion = self.run_pr(master, pr, (ci_ok.MANIFEST_PATH, ci_ok.SCRIPT_PATH))
+        self.assertIn(": OK", out)
+        self.assertEqual(conclusion, "success")
+        self.assertIn("| fixed in this PR |", summary)
+        self.assertIn("default branch drift that the PR fixes", summary)
+
+    def test_a_pr_on_an_old_default_branch_not_touching_github_has_no_pr_rows(self):
+        # (a) The PR's tree still has the old ci-ok.yml (job named ci-ok, no checks: write), but the PR does not
+        # change it: the post-merge view is the default branch's, so nothing is read and nothing is blamed.
+        master = good_tree(self)
+        old = good_tree(self, **{"ci-ok.yml": OLD_GATE_WF})
+        self.assertTrue(ci_ok.self_check(old))
+        api = FakeApi(routes_for([run(1, "ci.yml")], {1: GREEN}))
+        _, out, summary = self.main({}, event=workflow_run_event(), api=api, root=master, pr_root=old)
+        self.assertIn(": OK", out)
+        self.assertNotIn("self-check", summary)
+        self.assertEqual(self.contents_calls(api), [])
+        # Unchanged: the raw PR tree would have reported the old gate.
+        self.assertTrue(ci_ok.pr_tree_problems(FakeApi(tree_routes(old)), REPO, HEAD))
+
+    def test_pr_changing_only_a_workflows_paths_is_not_ok(self):
+        # (b) docker.yml's paths change, the manifest's path_filters do not.
+        master = good_tree(self)
+        pr = good_tree(self, **{"docker.yml": DOCKER_WF.replace("docker/**", "dock/**")})
+        api = FakeApi(routes_for([run(1, "ci.yml")], {1: GREEN}, files=(".github/workflows/docker.yml",)))
+        api.routes[f"/repos/{REPO}/actions/runs?head_sha={HEAD}"] = {
+            "workflow_runs": [run(1, "ci.yml"), run(2, "docker.yml")]
+        }
+        api.routes[f"/repos/{REPO}/actions/runs/2/jobs"] = {"jobs": [job(9, "docker")]}
+        _, out, summary = self.main({}, event=workflow_run_event(), api=api, root=master, pr_root=pr)
+        self.assertIn("NOT OK", out)
+        self.assertIn("introduced by this PR: docker.yml: path_filters in the manifest", summary)
+        self.assertEqual(api.posts[0][1]["conclusion"], "failure")
+
+    def test_pr_changing_workflow_and_manifest_consistently_is_ok(self):
+        # (c) docker.yml's paths and the manifest's path_filters change together.
+        master = good_tree(self)
+        manifest = dict(MANIFEST, path_filters={"docker.yml": {"paths": ["dock/**", ".github/workflows/docker.yml"]}})
+        pr = good_tree(self, manifest, **{"docker.yml": DOCKER_WF.replace("docker/**", "dock/**")})
+        self.assertEqual(ci_ok.self_check(pr), [])
+        files = (".github/workflows/docker.yml", ci_ok.MANIFEST_PATH)
+        api = FakeApi(routes_for([run(1, "ci.yml"), run(2, "docker.yml")], {1: GREEN, 2: [job(9, "docker")]}, files))
+        _, out, summary = self.main({}, event=workflow_run_event(), api=api, root=master, pr_root=pr)
+        self.assertIn(": OK", out)
+        self.assertNotIn("self-check", summary)
+        self.assertEqual(api.posts[0][1]["conclusion"], "success")
+
+    def test_removed_and_renamed_files_are_gone_in_the_post_merge_view(self):
+        master = good_tree(self)
+        api = FakeApi({})
+        removed = ci_ok.FileList([".github/workflows/docker.yml"], removed=[".github/workflows/docker.yml"])
+        problems, note = ci_ok.pr_view_problems(api, REPO, HEAD, removed, MANIFEST, ci_ok.read_workflow_texts(master))
+        self.assertIn("docker.yml is in the manifest but .github/workflows/docker.yml does not exist", problems[0])
+        self.assertIn("post-merge view", note)
+        self.assertEqual(api.calls, [])
+        renamed = ci_ok._file_names(
+            [{"filename": ".github/workflows/d2.yml", "previous_filename": ".github/workflows/docker.yml"}], 3000
+        )
+        self.assertEqual(renamed.removed, {".github/workflows/docker.yml"})
+        api = FakeApi({f"/repos/{REPO}/contents/.github/workflows/d2.yml?ref={HEAD}": DOCKER_WF})
+        problems, _ = ci_ok.pr_view_problems(api, REPO, HEAD, renamed, MANIFEST, ci_ok.read_workflow_texts(master))
+        self.assertIn("docker.yml is in the manifest but", "\n".join(problems))
+        self.assertIn("d2.yml runs on pull_request but is not in the manifest", "\n".join(problems))
+
+    def test_pr_removing_the_manifest_is_not_ok(self):
+        master = server_tree(self)
+        files = pr_files(removed=[ci_ok.MANIFEST_PATH])
+        _, out, summary, _ = self.run_pr(master, master, files)
+        self.assertIn("NOT OK", out)
+        self.assertIn("introduced by this PR: cannot read .github/ci-manifest.json: removed by this PR", summary)
+
+    def test_truncated_or_unknown_changed_files_fall_back_to_the_raw_pr_tree(self):
+        master = good_tree(self)
+        old = good_tree(self, **{"ci-ok.yml": OLD_GATE_WF})
+        texts = ci_ok.read_workflow_texts(master)
+        for changed, why in (
+            (ci_ok.FileList(["src/a.py"], truncated=True), "truncated by the API cap"),
+            (None, "the changed files are unknown"),
+        ):
+            with self.subTest(why=why):
+                problems, note = ci_ok.pr_view_problems(FakeApi(tree_routes(old)), REPO, HEAD, changed, MANIFEST, texts)
+                self.assertEqual(problems, ci_ok.self_check(old))
+                self.assertIn("raw PR tree checked", note)
+                self.assertIn(why, note)
+                rows = ci_ok.self_check_rows([], problems, note)
+                self.assertTrue(all("raw PR tree checked" in r.note for r in rows))
+
+    def test_changed_files_caps_mark_the_list_truncated(self):
+        pages = {p: [{"filename": f"f{p}-{i}"} for i in range(100)] for p in range(1, 31)}
+        api = FakeApi({})
+        api.get = lambda path, raw=False: pages[int(path.rsplit("page=", 1)[1])]
+        changed = ci_ok.fetch_changed_files(api, REPO, 7, BASE, HEAD)
+        self.assertEqual(len(changed), ci_ok.PR_FILES_CAP)
+        self.assertTrue(changed.truncated)
+        self.assertFalse(ci_ok.fetch_changed_files(FakeApi(routes_for([], {})), REPO, 7, BASE, HEAD).truncated)
+        compare = {"files": [{"filename": f"f{i}"} for i in range(300)]}
+        self.assertTrue(
+            ci_ok.fetch_changed_files_without_pr(
+                FakeApi({f"/repos/{REPO}/compare/": compare}), REPO, "master", HEAD
+            ).truncated
+        )
+
+    def test_contents_api_error_is_not_ok(self):
+        api = FakeApi(routes_for([run(1, "ci.yml")], {1: GREEN}, files=(ci_ok.MANIFEST_PATH,)))
+        api.routes[f"/repos/{REPO}/contents/{ci_ok.MANIFEST_PATH}?ref={HEAD}"] = ci_ok.ApiError(502, "contents")
+        _, _, summary = self.main({}, event=workflow_run_event(), api=api, root=good_tree(self))
+        self.assertIn("api error", summary)
+        self.assertEqual(api.posts[0][1]["conclusion"], "failure")
+
+    def test_raw_pr_tree_reads_data_like_the_checkout(self):
+        for tree in (good_tree(self), server_tree(self, upgrade=SERVER_UPGRADE_WF_81)):
+            api = FakeApi(tree_routes(tree))
+            self.assertEqual(ci_ok.pr_tree_problems(api, REPO, HEAD), ci_ok.self_check(tree))
+            self.assertTrue(
+                all(c.startswith(f"/repos/{REPO}/contents/") and c.endswith(f"?ref={HEAD}") for c in api.calls)
+            )
+        no_wf = FakeApi({f"/repos/{REPO}/contents/{ci_ok.MANIFEST_PATH}?ref={HEAD}": json.dumps(SERVER_MANIFEST)})
+        self.assertEqual(
+            ci_ok.pr_tree_problems(no_wf, REPO, HEAD)[-1], "cannot list .github/workflows: not found at the head SHA"
+        )
+
+    def test_self_check_rows(self):
+        rows = ci_ok.self_check_rows(["a", "b"], ["b", "c"])
+        self.assertEqual(
+            [(r.job, r.state, r.ok) for r in rows],
+            [
+                ("self-check", "fixed in this PR", True),
+                ("self-check", "inconsistent", False),
+                ("self-check (PR)", "inconsistent", False),
+            ],
+        )
+        self.assertEqual([r.ok for r in ci_ok.self_check_rows(["a"], None)], [False])
+
+
+class SeveralPrsOnOneSha(MainHarness):
+    """C5 (review M1): one check run per head SHA carries the worst verdict of every PR pointing at it."""
+
+    def test_worst_verdict(self):
+        self.assertEqual(ci_ok.worst_verdict(["OK", "PENDING"]), "PENDING")
+        self.assertEqual(ci_ok.worst_verdict(["PENDING", "NOT OK", "OK"]), "NOT OK")
+        self.assertEqual(ci_ok.worst_verdict(["OK", "OK"]), "OK")
+        self.assertEqual(ci_ok.worst_verdict([]), "NOT OK")
+
+    def test_two_prs_in_the_event_post_the_worst(self):
+        routes = routes_for(
+            [run(1, "ci.yml", prs=(7,)), run(2, "ci.yml", prs=(8,))],
+            {1: LINT_TEST, 2: [job(3, "lint", status="in_progress", conclusion=None), job(4, "test (3.11)")]},
+        )
+        api = FakeApi(routes)
+        _, out, _ = self.main({}, event=workflow_run_event(prs=(7, 8)), api=api)
+        self.assertIn("PR #7 @ hhhhhhhhhhhh: OK", out)
+        self.assertIn("PR #8 @ hhhhhhhhhhhh: PENDING", out)
+        body = api.posts[0][1]
+        self.assertEqual(body["status"], "in_progress")
+        self.assertIn("2 pull requests point at this head SHA (#7, #8)", body["output"]["summary"])
+        self.assertIn("WORST", body["output"]["summary"])
+
+    def test_another_pr_on_the_same_sha_is_found_and_counts(self):
+        runs = [
+            run(1, "ci.yml", prs=(7,)),
+            run(2, "ci.yml", prs=(8,), pr_heads={8: ("other", 1, HEAD)}, branch="other"),
+            run(3, "ci.yml", prs=(9,), pr_heads={9: ("moved", 1, "m" * 40)}, branch="moved"),  # head moved on
+        ]
+        jobs = {1: LINT_TEST, 2: [job(5, "lint", conclusion="failure"), job(6, "test (3.11)")], 3: LINT_TEST}
+        api = FakeApi(routes_for(runs, jobs))
+        _, out, summary = self.main({}, event=workflow_run_event(prs=(7,)), api=api)
+        self.assertIn("PR #7 @ hhhhhhhhhhhh: OK", out)
+        self.assertIn("PR #8 @ hhhhhhhhhhhh: NOT OK", out)
+        self.assertNotIn("PR #9", out)
+        self.assertIn("PR #8 also points at this head SHA", summary)
+        body = api.posts[0][1]
+        self.assertEqual(body["conclusion"], "failure")
+        self.assertIn("(#7, #8)", body["output"]["summary"])
+
+    def test_fork_pr_says_attribution_is_by_head_sha(self):
+        api = FakeApi(routes_for([run(1, "ci.yml", prs=())], {1: GREEN}))
+        self.main({}, event=workflow_run_event(prs=()), api=api)
+        body = api.posts[0][1]
+        self.assertEqual(body["conclusion"], "success")
+        self.assertIn("Attribution is by head SHA alone", body["output"]["summary"])
 
 
 if __name__ == "__main__":

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """ci-ok: did every mandatory pull-request check run on the PR head SHA and succeed?
 
-CI-FAST W1, v2. The mandatory checks are listed in .github/ci-manifest.json. The workflow .github/workflows/ci-ok.yml
-runs on `workflow_run: completed` of every listed workflow, so GitHub always takes its definition, this script and the
-manifest from the DEFAULT branch: a pull request cannot change its own gate. Each completion starts one short
-evaluation of the current state (no waiting, no polling): OK, NOT OK, or PENDING while listed workflows are still
-running. The latest completed evaluation for a head SHA is the verdict. The result is a markdown table in
-$GITHUB_STEP_SUMMARY plus one ::notice or ::warning line.
+CI-FAST W1, v3. The mandatory checks are listed in .github/ci-manifest.json. The workflow .github/workflows/ci-ok.yml
+runs on `workflow_run: requested, completed` of every listed workflow, so GitHub always takes its definition, this
+script and the manifest from the DEFAULT branch: a pull request cannot change its own gate. Each completion starts one
+short evaluation of the current state (no waiting, no polling): OK, NOT OK, or PENDING while listed workflows are still
+running. The verdict is posted as the check run `ci-ok` on the PR head SHA (completed success / failure, or
+in_progress for PENDING and for a `requested` event); the evaluator job itself is named `ci-ok evaluate`. The report
+is also a markdown table in $GITHUB_STEP_SUMMARY plus one ::notice or ::warning line per pull request.
+
+Before posting, every `ci-ok` check run on the head SHA that this evaluator did not post, and every commit status with
+the context `ci-ok`, is an impostor (NOT OK). When the PR changes the manifest or a workflow file, the post-merge view
+(the PR's versions of the files it changed, read as data through the contents API, the rest from the default branch)
+is self-checked like the default branch. When several pull requests point at the head SHA, the check
+carries the worst verdict.
 
 REPORT-ONLY: the exit code is 0 whatever the verdict, also on API errors (they are reported as NOT OK), unless
-CI_OK_ENFORCE=1. --self-check is a lint and exits 1 on any problem.
+CI_OK_ENFORCE=1. A failure to post the check run always exits 1. --self-check is a lint and exits 1 on any problem.
 
 The same file is used in every repository (canonical copy: nodestro-studio, design note
 docs/architecture/ci-fast/ci-ok.md there). Standard library only, Python 3.10+.
@@ -44,7 +51,13 @@ from dataclasses import dataclass, field
 MANIFEST_PATH = ".github/ci-manifest.json"
 WORKFLOWS_DIR = ".github/workflows"
 SELF_WORKFLOW = "ci-ok.yml"  # the gate's own workflow; it runs on workflow_run only, never on pull_request
-GATE_NAME = "ci-ok"  # the gate's job and check name; any pull_request job of this name is an impostor
+GATE_NAME = "ci-ok"  # the posted check run's name; any pull_request job of this name is an impostor
+EVALUATOR_JOB = "ci-ok evaluate"  # the evaluator job's name in ci-ok.yml (its own check run is on the default branch)
+OWN_APP_SLUG = "github-actions"  # the app behind GITHUB_TOKEN, which posts the check run
+OWN_EXTERNAL_ID = "ci-ok-evaluator"  # set on every check run this evaluator posts; tells its own runs from impostors
+MAX_TITLE = 200  # check run output.title, kept short
+MAX_SUMMARY = 65000  # check run output.summary (the API limit is 65535 characters)
+VERDICT_RANK = {"OK": 0, "PENDING": 1, "NOT OK": 2}
 SCRIPT_PATH = ".github/scripts/ci_ok.py"
 API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
@@ -280,6 +293,15 @@ def read_workflow_run_workflows(text: str) -> list[str] | None:
     return None if kv is None else _list_value(block, kv[0], kv[1])
 
 
+def read_workflow_run_types(text: str) -> list[str] | None:
+    """on.workflow_run.types of a workflow file (None when absent: GitHub then uses every activity type)."""
+    present, block = _trigger(text, "workflow_run")
+    if not present:
+        return None
+    kv = _key_value(block, "types")
+    return None if kv is None else _list_value(block, kv[0], kv[1])
+
+
 def workflow_name(text: str, filename: str) -> str:
     """The workflow's top-level `name:`; without one, GitHub shows (and workflow_run matches) the file path."""
     for line in text.splitlines():
@@ -342,13 +364,16 @@ def listed_workflows(manifest: dict) -> set[str]:
 
 
 class ApiError(RuntimeError):
-    def __init__(self, status: int, url: str, body: str = ""):
-        super().__init__(f"HTTP {status} for {url}: {body[:200]}" if status else f"GET {url} failed: {body[:200]}")
+    def __init__(self, status: int, url: str, body: str = "", method: str = "GET"):
+        super().__init__(
+            f"HTTP {status} for {method} {url}: {body[:200]}" if status else f"{method} {url} failed: {body[:200]}"
+        )
         self.status = status
 
 
 class Api:
-    """Tiny read-only REST client. Tests replace it with a fake that implements get(), or inject `opener`.
+    """Tiny REST client: reads, plus POST for the ci-ok check run. Tests replace it with a fake that implements get()
+    and post(), or inject `opener`.
 
     Retries 5xx, network errors and rate limits within one overall deadline (default 180 s,
     $CI_OK_API_DEADLINE_SECONDS), so that a short evaluation stays short; after that the error propagates and is
@@ -385,6 +410,13 @@ class Api:
         return 60.0
 
     def get(self, path: str, raw: bool = False):
+        return self.request("GET", path, raw=raw)
+
+    def post(self, path: str, body: dict):
+        """POST a JSON body. A retried POST after a 5xx may create a second check run; the newer one is identical."""
+        return self.request("POST", path, body=body)
+
+    def request(self, method: str, path: str, *, body: dict | None = None, raw: bool = False):
         url = path if path.startswith("http") else self.base_url + path
         headers = {
             "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json",
@@ -393,26 +425,31 @@ class Api:
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        data_out = None
+        if body is not None:
+            data_out = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         attempt = 0
         while True:
             attempt += 1
             self.calls += 1
             try:
-                with self._opener(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+                req = urllib.request.Request(url, data=data_out, headers=headers, method=method)
+                with self._opener(req, timeout=30) as resp:
                     data = resp.read().decode("utf-8")
-                    return data if raw else json.loads(data)
+                    return data if raw else json.loads(data or "null")
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")
+                text = exc.read().decode("utf-8", "replace")
                 hdrs = exc.headers or {}
                 limited = exc.code == 429 or (
-                    exc.code == 403 and ("rate limit" in body.lower() or bool(hdrs.get("retry-after")))
+                    exc.code == 403 and ("rate limit" in text.lower() or bool(hdrs.get("retry-after")))
                 )
                 if exc.code < 500 and not limited:
-                    raise ApiError(exc.code, url, body) from None
-                error = ApiError(exc.code, url, body)
+                    raise ApiError(exc.code, url, text, method) from None
+                error = ApiError(exc.code, url, text, method)
                 pause = self._rate_limit_pause(hdrs) if limited else 5.0 * attempt
             except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-                error = ApiError(0, url, str(exc))
+                error = ApiError(0, url, str(exc), method)
                 pause = 5.0 * attempt
             if attempt >= self.max_attempts or self._clock() + pause > self.deadline:
                 raise error
@@ -433,25 +470,43 @@ def paged(api, path: str, key: str | None, limit_pages: int = 50) -> list:
     return items
 
 
-def _file_names(files: list) -> list[str]:
-    names = []
+PR_FILES_CAP = 3000  # pulls/{n}/files lists at most this many files
+COMPARE_FILES_CAP = 300  # the compare API lists at most this many files
+
+
+class FileList(list):
+    """Changed file names (renames contribute both names), plus the names that no longer exist after the PR (removed
+    files and the old name of a renamed file) and whether an API cap may have cut the list."""
+
+    def __init__(self, names=(), removed=(), truncated: bool = False):
+        super().__init__(names)
+        self.removed = set(removed)
+        self.truncated = truncated
+
+
+def _file_names(files: list, cap: int) -> FileList:
+    names, removed = [], set()
     for f in files:
         names.append(f["filename"])
+        if f.get("status") == "removed":
+            removed.add(f["filename"])
         if f.get("previous_filename"):
             names.append(f["previous_filename"])
-    return names
+            removed.add(f["previous_filename"])
+    return FileList(names, removed, truncated=len(files) >= cap)
 
 
 def fetch_changed_files(api, repo: str, pr_number: int, base_sha: str | None, head_sha: str) -> list[str]:
     """Changed files of the PR (renames contribute both names). Uses pulls/{n}/files and falls back to the compare
     API, which needs only contents: read (the ci-ok job has no pull-requests permission)."""
     try:
-        files = paged(api, f"/repos/{repo}/pulls/{pr_number}/files", None, limit_pages=30)
+        files = paged(api, f"/repos/{repo}/pulls/{pr_number}/files", None, limit_pages=PR_FILES_CAP // 100)
     except ApiError as exc:
         if exc.status not in (403, 404) or not base_sha:
             raise
         files = api.get(f"/repos/{repo}/compare/{base_sha}...{head_sha}").get("files", [])
-    return _file_names(files)
+        return _file_names(files, COMPARE_FILES_CAP)
+    return _file_names(files, PR_FILES_CAP)
 
 
 def fetch_changed_files_without_pr(api, repo: str, default_branch: str, head_sha: str) -> list[str] | None:
@@ -463,7 +518,7 @@ def fetch_changed_files_without_pr(api, repo: str, default_branch: str, head_sha
         if exc.status in (404, 422):
             return None
         raise
-    return _file_names(data.get("files", []))
+    return _file_names(data.get("files", []), COMPARE_FILES_CAP)
 
 
 @dataclass
@@ -598,11 +653,48 @@ def _join(*notes: str) -> str:
     return "; ".join(n for n in notes if n)
 
 
-def evaluate(manifest: dict, snap: Snapshot, changed_files: list[str] | None, problems=()) -> Evaluation:
+def self_check_rows(problems, pr_problems: list[str] | None, pr_note: str = "") -> list[Row]:
+    """Rows for the default branch's self-check, compared with the PR head's (C3, review H2).
+
+    pr_problems None (the PR changes no file the self-check reads): every default-branch problem is NOT ok. Otherwise,
+    pr_problems is the post-merge view's self-check (pr_view_problems; pr_note says how it was built), by problem text:
+    only in the PR = introduced by the PR (NOT ok); on both = still there (NOT ok); only on the default branch = fixed
+    by this PR (ok, with a note; the fix takes effect after merge).
+    """
+    rows: list[Row] = []
+    if pr_problems is None:
+        return [Row(MANIFEST_PATH, "self-check", "inconsistent", True, False, note=p) for p in problems]
+    pr_set, default_set = set(pr_problems), set(problems)
+    how = f" ({pr_note})" if pr_note else ""
+    for p in problems:
+        if p in pr_set:
+            note = f"default branch and this PR: {p}{how}"
+            rows.append(Row(MANIFEST_PATH, "self-check", "inconsistent", True, False, note=note))
+        else:
+            note = f"default branch drift that the PR fixes (takes effect after merge): {p}{how}"
+            rows.append(Row(MANIFEST_PATH, "self-check", "fixed in this PR", True, True, note=note))
+    for p in pr_problems:
+        if p not in default_set:
+            note = f"introduced by this PR: {p}{how}"
+            rows.append(Row(MANIFEST_PATH, "self-check (PR)", "inconsistent", True, False, note=note))
+    return rows
+
+
+def evaluate(
+    manifest: dict,
+    snap: Snapshot,
+    changed_files: list[str] | None,
+    problems=(),
+    pr_problems: list[str] | None = None,
+    extra_rows=(),
+    pr_note: str = "",
+) -> Evaluation:
     """Turn one snapshot into rows and a verdict. No waiting: anything unfinished is pending.
 
     changed_files None: unknown, so a path-filtered workflow without a run counts as missing (fail closed).
-    problems: manifest problems (--self-check of the default branch); each one is a counted NOT ok row.
+    problems: manifest problems (--self-check of the default branch). pr_problems: the same check of the post-merge
+    view (None when the PR changes no self-check input); see self_check_rows. extra_rows: counted rows from the head
+    SHA (impostor scan).
     """
     filters = manifest.get("path_filters", {})
     rows: list[Row] = []
@@ -660,8 +752,8 @@ def evaluate(manifest: dict, snap: Snapshot, changed_files: list[str] | None, pr
             why += " (changed files unknown, so its paths filter cannot excuse it)"
         rows.append(Row(exp.workflow, exp.job, "missing", counts, False, note=note or why))
 
-    for problem in problems:
-        rows.append(Row(MANIFEST_PATH, "self-check", "inconsistent", True, False, note=problem))
+    rows += self_check_rows(problems, pr_problems, pr_note)
+    rows += list(extra_rows)
 
     unlisted = []
     for (workflow, name), jobs in sorted(snap.jobs.items()):
@@ -777,32 +869,50 @@ def load_manifest(path: str) -> dict:
 
 def self_check(root: str, manifest: dict | None = None) -> list[str]:
     """Problems between the manifest and the workflow files under `root` (empty list = consistent)."""
-    problems: list[str] = []
     if manifest is None:
         try:
             manifest = load_manifest(os.path.join(root, MANIFEST_PATH))
         except (OSError, ValueError) as exc:
             return [f"cannot read {MANIFEST_PATH}: {exc}"]
+    try:
+        texts = read_workflow_texts(root)
+    except OSError as exc:
+        return [*_manifest_problems(manifest), f"cannot list {WORKFLOWS_DIR}: {exc}"]
+    return check_tree(manifest, texts)
+
+
+def read_workflow_texts(root: str) -> dict:
+    """{file name: text} of the .yml/.yaml files in <root>/.github/workflows (raises OSError)."""
     wf_dir = os.path.join(root, WORKFLOWS_DIR)
+    texts: dict = {}
+    for name in sorted(os.listdir(wf_dir)):
+        if name.endswith((".yml", ".yaml")):
+            with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
+                texts[name] = fh.read()
+    return texts
+
+
+def _manifest_problems(manifest: dict) -> list[str]:
+    problems: list[str] = []
     filters = manifest.get("path_filters", {})
     path_filtered = manifest.get("pull_request_path_filtered", {})
-    listed_wfs = listed_workflows(manifest)
     if not any(jobs for jobs in [*manifest.get("pull_request", {}).values(), *path_filtered.values()]):
         problems.append("the manifest lists no mandatory pull_request job (an empty gate is always OK)")
     for name in sorted(path_filtered):
         if name not in filters:
             problems.append(f"{name} is path-filtered but has no path_filters entry (ci-ok could not tell if it ran)")
-    texts: dict = {}
+    return problems
+
+
+def check_tree(manifest: dict, texts: dict) -> list[str]:
+    """Problems between a manifest and workflow file texts ({file name: text}), wherever they come from: the
+    default-branch checkout, or the PR head read through the contents API as data (never executed)."""
+    problems = _manifest_problems(manifest)
+    filters = manifest.get("path_filters", {})
+    path_filtered = manifest.get("pull_request_path_filtered", {})
+    listed_wfs = listed_workflows(manifest)
     file_filters: dict = {}
-    try:
-        names = sorted(os.listdir(wf_dir))
-    except OSError as exc:
-        return [*problems, f"cannot list {WORKFLOWS_DIR}: {exc}"]
-    for name in names:
-        if not name.endswith((".yml", ".yaml")):
-            continue
-        with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
-            texts[name] = fh.read()
+    for name in sorted(texts):
         if name == SELF_WORKFLOW:
             continue
         if defines_gate_name(texts[name]):
@@ -848,19 +958,36 @@ def self_check(root: str, manifest: dict | None = None) -> list[str]:
     return problems
 
 
+_JOB_NAME_RX = re.compile(r"^\s+(?:-\s+)?name\s*:\s*[\"']?(.*?)[\"']?\s*$")
+
+
 def _check_gate_workflow(texts: dict, listed_wfs: set[str]) -> list[str]:
-    """ci-ok.yml must run on workflow_run of exactly the listed workflows (by their `name:`), never on a PR event."""
+    """ci-ok.yml must run on workflow_run of exactly the listed workflows (by their `name:`), never on a PR event; its
+    job is named `ci-ok evaluate` (never `ci-ok`, the posted check's name) and may write checks."""
     text = texts.get(SELF_WORKFLOW)
     if text is None:
         return [f"{WORKFLOWS_DIR}/{SELF_WORKFLOW} does not exist"]
     problems = []
+    names = [m.group(1) for m in (_JOB_NAME_RX.match(_strip_comment(line)) for line in text.splitlines()) if m]
+    if GATE_NAME in names:
+        problems.append(
+            f"{SELF_WORKFLOW} has a job or step named {GATE_NAME!r}; its job must be named {EVALUATOR_JOB!r} so that "
+            f"its own check run never collides with the posted {GATE_NAME!r} check"
+        )
+    if EVALUATOR_JOB not in names:
+        problems.append(f"{SELF_WORKFLOW} has no job named {EVALUATOR_JOB!r}")
+    if not re.search(r"^\s+checks\s*:\s*write\s*$", "\n".join(_strip_comment(x) for x in text.splitlines()), re.M):
+        problems.append(f"{SELF_WORKFLOW} lacks 'checks: write': it could not post the {GATE_NAME!r} check run")
     try:
         for trigger in ("pull_request", "pull_request_target"):
             if has_trigger(text, trigger):
                 problems.append(f"{SELF_WORKFLOW} runs on {trigger}: the pull request would control its own gate")
         workflows = read_workflow_run_workflows(text)
+        types = read_workflow_run_types(text)
     except YamlSubsetError as exc:
         return [*problems, f"{SELF_WORKFLOW}: cannot read its on: block ({exc})"]
+    if types is not None and "completed" not in types:
+        problems.append(f"{SELF_WORKFLOW} workflow_run.types lacks 'completed': no verdict would ever be posted")
     if workflows is None:
         return [*problems, f"{SELF_WORKFLOW} has no on.workflow_run.workflows list"]
     expected = {workflow_name(texts[n], n) for n in listed_wfs if n in texts}
@@ -874,6 +1001,214 @@ def _check_gate_workflow(texts: dict, listed_wfs: set[str]) -> list[str]:
     if dupes:
         problems.append(f"several workflow files share the name {dupes}; workflow_run cannot tell them apart")
     return problems
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Head SHA: the PR's own tree (as data), impostors, the posted check run
+# --------------------------------------------------------------------------------------------------------------------
+
+
+def _contents_path(repo: str, path: str, sha: str) -> str:
+    return f"/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={sha}"
+
+
+def pr_tree_problems(api, repo: str, head_sha: str) -> list[str]:
+    """--self-check of the PR head's tree (C3, review H2). The manifest and .github/workflows/*.yml are read through
+    the contents API at the head SHA as DATA: nothing from the pull request is checked out or executed. A missing
+    manifest or workflows directory is a problem like on the default branch; any other API error propagates."""
+    try:
+        manifest = json.loads(api.get(_contents_path(repo, MANIFEST_PATH, head_sha), raw=True))
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{MANIFEST_PATH} is not a JSON object")
+    except ApiError as exc:
+        if exc.status != 404:
+            raise
+        return [f"cannot read {MANIFEST_PATH}: not found at the head SHA"]
+    except ValueError as exc:
+        return [f"cannot read {MANIFEST_PATH}: {exc}"]
+    try:
+        listing = api.get(_contents_path(repo, WORKFLOWS_DIR, head_sha))
+    except ApiError as exc:
+        if exc.status != 404:
+            raise
+        return [*_manifest_problems(manifest), f"cannot list {WORKFLOWS_DIR}: not found at the head SHA"]
+    texts: dict = {}
+    for entry in sorted(listing if isinstance(listing, list) else [], key=lambda e: e.get("name", "")):
+        name = entry.get("name", "")
+        if entry.get("type") == "file" and name.endswith((".yml", ".yaml")):
+            texts[name] = api.get(_contents_path(repo, f"{WORKFLOWS_DIR}/{name}", head_sha), raw=True)
+    return check_tree(manifest, texts)
+
+
+def is_self_check_input(path: str) -> bool:
+    """A file that the self-check reads: the manifest or a file directly in .github/workflows."""
+    if path == MANIFEST_PATH:
+        return True
+    prefix = WORKFLOWS_DIR + "/"
+    return path.startswith(prefix) and "/" not in path[len(prefix) :] and path.endswith((".yml", ".yaml"))
+
+
+def pr_view_problems(
+    api, repo: str, head_sha: str, changed, default_manifest: dict, default_texts: dict | None
+) -> tuple[list[str] | None, str]:
+    """(problems, note) of the post-merge view (C3, review H2): for each file the self-check reads, the PR head's
+    version if the PR changed it (a removed file is gone), otherwise the default branch's. Read as data through the
+    contents API at the head SHA; nothing is checked out or executed. A PR that changes none of these files is not
+    checked at all (None, no API reads), so a PR based on an older default branch is not blamed for it.
+
+    When the changed files are unknown or may be cut by an API cap, or the default branch's workflows could not be
+    read, the raw PR tree is checked instead, and the note says so."""
+    if changed is None or getattr(changed, "truncated", False) or default_texts is None:
+        if changed is None:
+            why = "the changed files are unknown"
+        elif getattr(changed, "truncated", False):
+            why = "the changed-files list may be truncated by the API cap"
+        else:
+            why = "the default branch's workflow files could not be read"
+        return pr_tree_problems(api, repo, head_sha), f"raw PR tree checked, because {why}"
+    touched = sorted({p for p in changed if is_self_check_input(p)})
+    if not touched:
+        return None, ""
+    removed = getattr(changed, "removed", set())
+    manifest, texts = default_manifest, dict(default_texts)
+    for path in touched:
+        if path == MANIFEST_PATH:
+            if path in removed:
+                return [f"cannot read {MANIFEST_PATH}: removed by this PR"], f"post-merge view ({path})"
+            try:
+                manifest = json.loads(api.get(_contents_path(repo, path, head_sha), raw=True))
+                if not isinstance(manifest, dict):
+                    raise ValueError(f"{MANIFEST_PATH} is not a JSON object")
+            except ValueError as exc:
+                return [f"cannot read {MANIFEST_PATH}: {exc}"], f"post-merge view ({path})"
+            continue
+        name = path[len(WORKFLOWS_DIR) + 1 :]
+        if path in removed:
+            texts.pop(name, None)
+        else:
+            texts[name] = api.get(_contents_path(repo, path, head_sha), raw=True)
+    return check_tree(
+        manifest, texts
+    ), f"post-merge view: the PR's {', '.join(touched)}, the rest from the default branch"
+
+
+def is_own_check_run(check_run: dict) -> bool:
+    """A check run that this evaluator posted: GitHub Actions' app and our external_id. (Anything with GITHUB_TOKEN
+    and checks: write could imitate both; the residual risk is review condition C2.)"""
+    return (check_run.get("app") or {}).get("slug") == OWN_APP_SLUG and check_run.get("external_id") == OWN_EXTERNAL_ID
+
+
+def scan_impostors(api, repo: str, head_sha: str) -> list[Row]:
+    """Every `ci-ok` check run on the head SHA that this evaluator did not post (any app, including other GitHub
+    Actions jobs or API calls), and every commit status with the context `ci-ok`, is an impostor (H1): a counted NOT ok
+    row each. The old evaluator job named `ci-ok` counts too, on the rare head SHA that is also a default-branch
+    commit."""
+    rows: list[Row] = []
+    check_runs = paged(
+        api,
+        f"/repos/{repo}/commits/{head_sha}/check-runs?check_name={urllib.parse.quote(GATE_NAME)}&filter=all",
+        "check_runs",
+        limit_pages=10,
+    )
+    for cr in sorted(check_runs, key=lambda c: c.get("id") or 0):
+        if cr.get("name") != GATE_NAME or is_own_check_run(cr):
+            continue
+        app = (cr.get("app") or {}).get("slug") or "unknown app"
+        rows.append(
+            Row(
+                "check run",
+                f"{GATE_NAME} (id {cr.get('id')}, app {app})",
+                "impostor",
+                True,
+                False,
+                cr.get("html_url") or "",
+                f"a {GATE_NAME!r} check run on the head SHA that this evaluator did not post "
+                f"(external_id {cr.get('external_id')!r}, {cr.get('status')}/{cr.get('conclusion')})",
+            )
+        )
+    statuses = paged(api, f"/repos/{repo}/commits/{head_sha}/statuses", None, limit_pages=10)
+    for st in statuses:
+        if st.get("context") != GATE_NAME:
+            continue
+        who = (st.get("creator") or {}).get("login") or "unknown"
+        rows.append(
+            Row(
+                "commit status",
+                f"{GATE_NAME} (id {st.get('id')}, by {who})",
+                "impostor",
+                True,
+                False,
+                st.get("target_url") or "",
+                f"a commit status with the context {GATE_NAME!r} (state {st.get('state')}); the verdict is only ever "
+                "a check run",
+            )
+        )
+    return rows
+
+
+def _truncate(text: str, limit: int, tail: str = "") -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - len(tail) - 3, 0)] + "..." + tail
+
+
+def check_run_body(head_sha: str, verdict: str, title: str, summary: str, details_url: str = "") -> dict:
+    """The check run `ci-ok` on the head SHA: completed success (OK) or failure (NOT OK), in_progress (PENDING)."""
+    body: dict = {
+        "name": GATE_NAME,
+        "head_sha": head_sha,
+        "external_id": OWN_EXTERNAL_ID,
+        "output": {
+            "title": _truncate(title, MAX_TITLE),
+            "summary": _truncate(summary, MAX_SUMMARY, "\n\n(truncated; the full report is in the ci-ok evaluate run)"),
+        },
+    }
+    if verdict == "PENDING":
+        body["status"] = "in_progress"
+    else:
+        body["status"] = "completed"
+        body["conclusion"] = "success" if verdict == "OK" else "failure"
+    if details_url:
+        body["details_url"] = details_url
+    return body
+
+
+def post_check_run(api, repo: str, body: dict) -> dict:
+    """A new check run per evaluation (POST). GitHub shows, and a required check uses, the newest check run of a
+    name from an app on a SHA, and evaluations of one head SHA never overlap (job concurrency), so the newest posted
+    run is the latest verdict. Errors propagate: a verdict that could not be posted must fail the job."""
+    return api.post(f"/repos/{repo}/check-runs", body)
+
+
+def worst_verdict(verdicts) -> str:
+    """NOT OK > PENDING > OK (C5, review M1). No verdict at all is NOT OK."""
+    verdicts = list(verdicts)
+    return max(verdicts, key=lambda v: VERDICT_RANK.get(v, 2)) if verdicts else "NOT OK"
+
+
+def other_prs_on_sha(api, repo: str, head_sha: str, known: set) -> list:
+    """Open PRs that point at this head SHA but are not in the triggering run's pull_requests, as listed by any
+    pull_request run on the SHA (another branch at the same commit, for example). One check run belongs to the SHA,
+    so each of them is evaluated too and the check carries the worst verdict (C5)."""
+    runs = paged(
+        api, f"/repos/{repo}/actions/runs?head_sha={head_sha}&event=pull_request", "workflow_runs", limit_pages=10
+    )
+    found: dict = {}
+    for run in runs:
+        if run.get("event") != "pull_request" or run.get("head_sha") != head_sha:
+            continue
+        for p in run.get("pull_requests") or []:
+            number, head = p.get("number"), p.get("head") or {}
+            if number and number not in known and number not in found and head.get("sha") == head_sha:
+                found[number] = Target(
+                    head_sha,
+                    number,
+                    (p.get("base") or {}).get("sha"),
+                    notices=[f"PR #{number} also points at this head SHA (listed by a pull_request run on it)."],
+                    head_ref=head.get("ref"),
+                    head_repo_id=(head.get("repo") or {}).get("id"),
+                )
+    return [found[n] for n in sorted(found)]
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -968,7 +1303,18 @@ def targets_from(args, event: dict, api, repo: str) -> tuple[list[Target], str]:
     ], ""
 
 
-def evaluate_target(api, repo: str, manifest: dict, problems: list[str], target: Target, default_branch) -> dict:
+def evaluate_target(
+    api,
+    repo: str,
+    manifest: dict,
+    problems: list[str],
+    target: Target,
+    default_branch,
+    impostors_of=None,
+    default_texts: dict | None = None,
+) -> dict:
+    """impostors_of(head_sha) -> impostor rows (once per head SHA). default_texts: the default branch's workflow files
+    for the post-merge view of the PR's self-check inputs (C3)."""
     notices = list(target.notices)
     if target.pr_number:
         changed = fetch_changed_files(api, repo, target.pr_number, target.base_sha, target.head_sha)
@@ -986,7 +1332,9 @@ def evaluate_target(api, repo: str, manifest: dict, problems: list[str], target:
     snap = Collector(api, repo, target.head_sha, pr_number, target.head_ref, target.head_repo_id).snapshot()
     if snap.ignored_runs:
         notices.append(f"{snap.ignored_runs} run(s) on this SHA belong to other pull requests and were ignored.")
-    ev = evaluate(manifest, snap, changed, problems)
+    pr_problems, pr_note = pr_view_problems(api, repo, target.head_sha, changed, manifest, default_texts)
+    impostors = impostors_of(target.head_sha) if impostors_of else []
+    ev = evaluate(manifest, snap, changed, problems, pr_problems, impostors, pr_note)
     files = "unknown" if changed is None else str(len(changed))
     return {"ev": ev, "notices": notices, "files": files, "span": ci_span_minutes(snap)}
 
@@ -1010,6 +1358,7 @@ def main(argv=None, env=None, api=None) -> int:
     event: dict = {}
     repo = args.repo or env.get("GITHUB_REPOSITORY") or ""
     targets: list[Target] = []
+    dry_run = bool(args.pr or args.head_sha)
     try:
         if env.get("GITHUB_EVENT_PATH") and os.path.exists(env["GITHUB_EVENT_PATH"]):
             with open(env["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
@@ -1026,7 +1375,27 @@ def main(argv=None, env=None, api=None) -> int:
     except Exception as exc:  # report-only: never crash (F7)
         results.append((None, {"ev": error_evaluation("error", exc), "notices": [], "files": "?", "span": None}))
 
-    manifest, problems = None, []
+    wr = event.get("workflow_run") or {}
+    # C1: a workflow_run evaluation of a pull_request run posts its verdict as the check run `ci-ok` on the PR head
+    # SHA. Local dry runs (--pr, --head-sha) never post.
+    post_sha = wr.get("head_sha") if wr.get("event") == "pull_request" and not dry_run and repo and api else None
+    run_url = ""
+    if env.get("GITHUB_RUN_ID"):
+        run_url = f"{env.get('GITHUB_SERVER_URL') or 'https://github.com'}/{repo}/actions/runs/{env['GITHUB_RUN_ID']}"
+
+    if post_sha and targets and event.get("action") == "requested":
+        # L1: a listed workflow (or a re-run of one) was requested; whatever was posted before is stale until it
+        # completes, so the check goes back to in_progress. Its completion re-evaluates.
+        text = (
+            f"## ci-ok (report-only): PENDING\n\n{wr.get('name')!r} run {wr.get('id')} attempt {wr.get('run_attempt')} "
+            "was requested on this head SHA. The verdict follows when the listed workflows complete."
+        )
+        print(text)
+        _write_summary(env, text)
+        body = check_run_body(post_sha, "PENDING", f"PENDING: {wr.get('name')} requested", text, run_url)
+        return _post_verdict(api, repo, body, env)
+
+    manifest, problems, default_texts = None, [], None
     if targets:
         try:
             if args.manifest_file:
@@ -1035,10 +1404,19 @@ def main(argv=None, env=None, api=None) -> int:
                 manifest = load_manifest(os.path.join(args.root, MANIFEST_PATH))
             if os.path.isdir(os.path.join(args.root, WORKFLOWS_DIR)):
                 problems = self_check(args.root, manifest)
+                default_texts = read_workflow_texts(args.root)
         except (OSError, ValueError) as exc:
             manifest = None
             err = error_evaluation("no manifest", exc)
             results += [(t, {"ev": err, "notices": [], "files": "?", "span": None}) for t in targets]
+
+    if manifest is not None and post_sha:
+        try:
+            targets += other_prs_on_sha(api, repo, post_sha, {t.pr_number for t in targets if t.pr_number})
+        except Exception as exc:  # F7
+            err = error_evaluation("api error", exc)
+            notices = ["Listing the pull requests on this head SHA failed."]
+            results.append((None, {"ev": err, "notices": notices, "files": "?", "span": None}))
 
     cache: dict = {}
 
@@ -1049,10 +1427,18 @@ def main(argv=None, env=None, api=None) -> int:
             ]
         return cache["b"]
 
+    def impostors_of(sha: str) -> list[Row]:
+        # Once per head SHA, shared by every PR on it (H1).
+        if sha not in cache:
+            cache[sha] = scan_impostors(api, repo, sha)
+        return cache[sha]
+
     if manifest is not None:
         for target in targets:
             try:
-                result = evaluate_target(api, repo, manifest, problems, target, default_branch)
+                result = evaluate_target(
+                    api, repo, manifest, problems, target, default_branch, impostors_of, default_texts
+                )
             except Exception as exc:  # F7: API errors (after retries) and anything unexpected are NOT OK, not a crash
                 result = {
                     "ev": error_evaluation("api error", exc),
@@ -1065,21 +1451,27 @@ def main(argv=None, env=None, api=None) -> int:
     if args.manifest_file:
         for _, r in results:
             r["notices"].insert(0, f"Dry run: manifest from the local file {args.manifest_file}.")
-    wr = event.get("workflow_run") or {}
     trigger = (
         f"triggered by {wr.get('name')!r} run {wr.get('id')} attempt {wr.get('run_attempt')} ({wr.get('conclusion')})"
         if wr
         else "local dry run"
     )
+    where = (
+        f"The verdict is posted as the check run {GATE_NAME!r} on the head SHA."
+        if post_sha
+        else "Nothing is posted (no workflow_run event of a pull_request run, or a dry run)."
+    )
     report_json = []
+    reports = []
     for target, r in results:
         ev, label = r["ev"], target.label if target else "this event"
         header = (
             f"{label}, {r['files']} changed file(s), {getattr(api, 'calls', '?')} API call(s) so far, "
-            f"CI span on this head {r['span']} min, {trigger}. The latest completed ci-ok run for a head SHA is "
-            "its verdict. Mode: report-only (CI_OK_ENFORCE=1 makes NOT OK fail this job)."
+            f"CI span on this head {r['span']} min, {trigger}. {where} "
+            "Mode: report-only (CI_OK_ENFORCE=1 makes NOT OK fail this job)."
         )
         report = render_markdown(ev, r["notices"], header, label)
+        reports.append(report)
         print(report)
         _write_summary(env, report)
         level = "notice" if ev.verdict in ("OK", "PENDING") else "warning"
@@ -1097,7 +1489,49 @@ def main(argv=None, env=None, api=None) -> int:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(report_json, fh, indent=2)
-    return 1 if enforce and any(r["ev"].verdict != "OK" for _, r in results) else 0
+    code = 1 if enforce and any(r["ev"].verdict != "OK" for _, r in results) else 0
+    if post_sha:
+        body = check_run_body(post_sha, *check_run_text(results, reports), run_url)
+        code = max(code, _post_verdict(api, repo, body, env))
+    return code
+
+
+def check_run_text(results: list, reports: list[str]) -> tuple[str, str, str]:
+    """(verdict, title, summary) of the posted check run: the worst verdict over every report (C5)."""
+    verdict = worst_verdict(r["ev"].verdict for _, r in results)
+    labels = [t.label if t else "this event" for t, _ in results]
+    notes = []
+    prs = sorted({t.pr_number for t, _ in results if t and t.pr_number})
+    if len(prs) > 1:
+        notes.append(
+            f"{len(prs)} pull requests point at this head SHA ({', '.join(f'#{n}' for n in prs)}). A check run belongs "
+            "to the SHA, so it carries the WORST of their verdicts (NOT OK > PENDING > OK)."
+        )
+    if any(t is not None and not t.pr_number for t, _ in results):
+        notes.append(
+            "Attribution is by head SHA alone (no PR number, typical for a fork PR): pull_request runs of ANY pull "
+            "request on this SHA count."
+        )
+    if len(results) > 1 and len(prs) <= 1:
+        notes.append(f"{len(results)} reports for this head SHA; the check carries the worst verdict.")
+    head = [f"# ci-ok: {verdict}", "", "Report-only: ci-ok is not a required check until it is re-reviewed.", ""]
+    head += [f"> {n}" for n in notes] + ([""] if notes else [])
+    title = f"{verdict} for {', '.join(labels)} (report-only)"
+    return verdict, title, "\n".join(head) + "\n".join(reports)
+
+
+def _post_verdict(api, repo: str, body: dict, env: dict) -> int:
+    """Post the check run. Failing to post exits 1 whatever the mode: a verdict nobody can see must not pass."""
+    state = body["status"] + (f"/{body['conclusion']}" if body.get("conclusion") else "")
+    try:
+        created = post_check_run(api, repo, body) or {}
+    except Exception as exc:
+        msg = f"could not post the {GATE_NAME!r} check run ({state}) on {body['head_sha']}: {exc}"
+        print(f"::error title=ci-ok::{msg}")
+        _write_summary(env, f"**ci-ok: {msg}**")
+        return 1
+    print(f"ci-ok: posted the check run {GATE_NAME!r} ({state}) on {body['head_sha']}: {created.get('html_url', '')}")
+    return 0
 
 
 if __name__ == "__main__":
