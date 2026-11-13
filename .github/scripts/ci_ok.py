@@ -474,21 +474,53 @@ class Snapshot:
     ignored_runs: int = 0  # runs on this SHA that belong to other pull requests
 
 
-def run_rank(run: dict, pr_number: int | None) -> int | None:
-    """How well a run belongs to the evaluated PR: 0 listed (or no PR known), 1 lists no PR at all, None another PR."""
+def _same_head(head: dict | None, head_ref: str | None, head_repo_id: int | None) -> bool:
+    """Is this the evaluated PR's head branch in its head repository? Unknown on either side is never the same."""
+    if not head_ref or head_repo_id is None or not head:
+        return False
+    return head.get("ref") == head_ref and (head.get("repo") or {}).get("id") == head_repo_id
+
+
+def run_rank(
+    run: dict, pr_number: int | None, head_ref: str | None = None, head_repo_id: int | None = None
+) -> tuple[int | None, str]:
+    """(rank, note): how well a run belongs to the evaluated PR. Rank 0 listed (or no PR known), 1 lists no PR at all,
+    None another PR. GitHub fills a run's pull_requests from its head branch's currently OPEN PRs, so after the PR
+    closes its runs list none, or a follow-up PR opened from the same branch. A run on the evaluated PR's own head
+    branch and head repository (taken from the triggering run) therefore counts as the PR's when every PR it lists has
+    that same head; a PR from another branch or a fork still makes it another PR's run (F5)."""
     if pr_number is None:
-        return 0
-    numbers = {p.get("number") for p in run.get("pull_requests") or []}
+        return 0, ""
+    prs = run.get("pull_requests") or []
+    numbers = {p.get("number") for p in prs}
     if pr_number in numbers:
-        return 0
-    return None if numbers else 1
+        return 0, ""
+    run_head = {"ref": run.get("head_branch"), "repo": run.get("head_repository")}
+    if _same_head(run_head, head_ref, head_repo_id) and all(
+        _same_head(p.get("head"), head_ref, head_repo_id) for p in prs
+    ):
+        listed = ", ".join(f"#{n}" for n in sorted(n for n in numbers if n is not None))
+        why = f"lists {listed} from the same head branch" if listed else "lists no pull request"
+        return 0, f"run {why}; taken for PR #{pr_number} by head SHA and head branch {head_ref}"
+    if numbers:
+        return None, ""
+    return 1, f"run lists no pull request; taken for PR #{pr_number} by head SHA only"
 
 
 class Collector:
     """Reads the pull_request runs and their jobs for one head SHA (and, when known, one PR number)."""
 
-    def __init__(self, api, repo: str, head_sha: str, pr_number: int | None = None):
+    def __init__(
+        self,
+        api,
+        repo: str,
+        head_sha: str,
+        pr_number: int | None = None,
+        head_ref: str | None = None,
+        head_repo_id: int | None = None,
+    ):
         self.api, self.repo, self.head_sha, self.pr_number = api, repo, head_sha, pr_number
+        self.head_ref, self.head_repo_id = head_ref, head_repo_id
 
     def snapshot(self) -> Snapshot:
         runs = paged(
@@ -497,7 +529,7 @@ class Collector:
             "workflow_runs",
             limit_pages=10,
         )
-        best: dict = {}  # workflow -> (rank, created_at, id, run)
+        best: dict = {}  # workflow -> ((-rank, created_at, id), run, note)
         ignored = 0
         for run in runs:
             if run.get("event") != "pull_request" or run.get("head_sha") != self.head_sha:
@@ -506,7 +538,7 @@ class Collector:
             if not path.startswith(WORKFLOWS_DIR + "/"):
                 continue
             workflow = path[len(WORKFLOWS_DIR) + 1 :].split("@", 1)[0]
-            rank = run_rank(run, self.pr_number)
+            rank, note = run_rank(run, self.pr_number, self.head_ref, self.head_repo_id)
             if rank is None:
                 # F5: a run of another PR with the same head SHA tested another merge commit; it never decides here.
                 ignored += 1
@@ -514,12 +546,12 @@ class Collector:
             # A run attributed to this PR beats an unattributed one; among equals the newest wins (close/reopen).
             key = (-rank, run["created_at"], run["id"])
             if workflow not in best or key > best[workflow][0]:
-                best[workflow] = (key, run)
+                best[workflow] = (key, run, note)
         snap = Snapshot(ignored_runs=ignored)
-        for workflow, (key, run) in best.items():
+        for workflow, (_, run, note) in best.items():
             snap.runs[workflow] = run
-            if key[0] == -1:
-                snap.notes[workflow] = f"run lists no pull request; taken for PR #{self.pr_number} by head SHA only"
+            if note:
+                snap.notes[workflow] = note
             # filter=latest: the jobs of the most recent attempt, so a re-run replaces the failed attempt.
             jobs = paged(self.api, f"/repos/{self.repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
             for job in sorted(jobs, key=lambda j: j["id"]):
@@ -856,6 +888,8 @@ class Target:
     base_sha: str | None = None
     notices: list = field(default_factory=list)
     attribute: bool = True  # count only runs whose pull_requests list pr_number (F5)
+    head_ref: str | None = None  # the PR's head branch and head repository id: runs on them count as the PR's
+    head_repo_id: int | None = None
 
     @property
     def label(self) -> str:
@@ -888,7 +922,14 @@ def targets_from(args, event: dict, api, repo: str) -> tuple[list[Target], str]:
     if args.pr or args.head_sha:
         if args.pr:
             pr = api.get(f"/repos/{repo}/pulls/{args.pr}")
-            target = Target(args.head_sha or pr["head"]["sha"], args.pr, pr["base"]["sha"])
+            head = pr.get("head") or {}
+            target = Target(
+                args.head_sha or head["sha"],
+                args.pr,
+                pr["base"]["sha"],
+                head_ref=head.get("ref"),
+                head_repo_id=(head.get("repo") or {}).get("id"),
+            )
             if pr.get("state") != "open":
                 # GitHub fills a run's pull_requests from the head branch's currently OPEN pull requests, so the
                 # runs of a closed PR list another PR or none: attribute by head SHA alone in this dry run.
@@ -917,7 +958,14 @@ def targets_from(args, event: dict, api, repo: str) -> tuple[list[Target], str]:
                 ],
             )
         ], ""
-    return [Target(head, p["number"], (p.get("base") or {}).get("sha")) for p in prs], ""
+    # The triggering run's own head branch and repository identify the PR's runs even after GitHub stops listing the
+    # PR on them (closed or merged PR, follow-up PR from the same branch).
+    head_ref = wr.get("head_branch")
+    head_repo_id = (wr.get("head_repository") or {}).get("id")
+    return [
+        Target(head, p["number"], (p.get("base") or {}).get("sha"), head_ref=head_ref, head_repo_id=head_repo_id)
+        for p in prs
+    ], ""
 
 
 def evaluate_target(api, repo: str, manifest: dict, problems: list[str], target: Target, default_branch) -> dict:
@@ -934,7 +982,8 @@ def evaluate_target(api, repo: str, manifest: dict, problems: list[str], target:
                 f"This PR changes {path}. ci-ok always runs the default branch's copy; the change takes effect "
                 "after merge. A changed gate needs a reason in the PR description."
             )
-    snap = Collector(api, repo, target.head_sha, target.pr_number if target.attribute else None).snapshot()
+    pr_number = target.pr_number if target.attribute else None
+    snap = Collector(api, repo, target.head_sha, pr_number, target.head_ref, target.head_repo_id).snapshot()
     if snap.ignored_runs:
         notices.append(f"{snap.ignored_runs} run(s) on this SHA belong to other pull requests and were ignored.")
     ev = evaluate(manifest, snap, changed, problems)
