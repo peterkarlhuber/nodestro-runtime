@@ -7,11 +7,12 @@ specifier, no pre-release bound and no environment marker (one Tabrion version p
 Tabrion, which the lock chose, must be a final release inside that range (``0.1.0``, never ``0.1.1.dev0`` or
 ``0.2.0a1``, RC-8).
 
-DC-NR-1 (dependency confusion): the installed Tabrion must also come from the lock, not from a package index. Its
-``direct_url.json`` must name a git commit; when ``NODESTRO_STUDIO_LOCK`` names the lock file (CI sets it to the
-studio lock it installs with), the URL and commit must be the lock's ``tabrion @ git+URL@SHA``. A version check
-alone passes a foreign ``tabrion 0.1.99`` from an index. CI also runs ``scripts/check_tabrion_source.py`` (job
-``tabrion-source``): the install under a poisoned index must never ask it for ``tabrion``.
+DC-NR-1 (dependency confusion): the installed Tabrion's ``direct_url.json`` must name a git commit; when
+``NODESTRO_STUDIO_LOCK`` names the lock file (CI sets it to the studio lock it installs with), the URL and commit
+must be the lock's ``tabrion @ git+URL@SHA``. This detects an accidental install from a package index (a version
+check alone passed one); it is no proof of origin, because a wheel can ship a forged ``direct_url.json``. The
+protection is the direct-URL pin of the install (``-c <lock>``), and the proof that it never asks an index for
+Tabrion is CI's ``scripts/check_tabrion_source.py`` job ``tabrion source (poisoned index)`` (zero requests).
 """
 
 from __future__ import annotations
@@ -204,7 +205,7 @@ def test_the_locked_commit_passes_in_any_url_spelling() -> None:
 
 
 def test_the_installed_tabrion_is_the_locked_commit() -> None:
-    """DC-NR-1: the installed Tabrion came from the lock's git commit, not from an index."""
+    """DC-NR-1: the installed Tabrion's direct_url.json names the lock's git commit (detects an index install)."""
     text = metadata.distribution("tabrion").read_text("direct_url.json")
     direct_url = json.loads(text) if text else None
     lock_file = os.environ.get(LOCK_ENV)

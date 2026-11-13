@@ -7,23 +7,33 @@ Usage::
 
 The script
 
-1. writes a poisoned ``NAME`` 0.1.99 (default ``tabrion``) into a temporary directory: a wheel whose ``.pth`` file
-   and package write a marker file when Python starts or imports it, and an sdist whose build writes the marker and
-   then fails,
+1. writes a poisoned ``NAME`` (default ``tabrion``, version ``0.1.0``: plausible, inside every consumer's range)
+   into a temporary directory: a wheel that ships a forged ``direct_url.json`` naming ``LOCK``'s git URL and commit,
+   and whose ``.pth`` file and package write a marker file when Python starts or imports it, and an sdist whose build
+   writes the marker and then fails,
 2. serves a PEP 503/691 index on ``127.0.0.1`` with that release for ``NAME``; every other project is redirected to
    the real index (``--upstream``, default ``https://pypi.org/simple``), so the install under test runs unchanged,
 3. runs a positive control (unless ``--no-control``): ``pip install --dry-run "NAME"`` against the index must pick
-   0.1.99, so the poisoned index is live and the test is not vacuous,
-4. runs ``COMMAND`` with ``PIP_INDEX_URL``, ``UV_INDEX_URL`` and ``CHECK_TABRION_SOURCE_INDEX`` set to the index,
-5. fails (exit 1, RED) unless ``COMMAND`` succeeded, the index got no request for ``NAME`` (neither its project
-   page nor a file), no marker file exists, and the ``NAME`` installed in ``--python`` (default: this interpreter)
-   or ``--path`` was installed from the git URL of ``LOCK``'s ``NAME @ git+URL@SHA`` line at exactly that ``SHA``
-   (its ``direct_url.json``).
+   the poisoned release, so the poisoned index is live and the test is not vacuous; then it clears the request log,
+4. refuses any way around the poisoned index: an index option (``-i``/``--index-url``, ``--extra-index-url``,
+   ``-f``/``--find-links``, ``--no-index``, uv's ``--index``/``--default-index``) in ``COMMAND`` (also inside a shell
+   script argument) or in a requirements, constraints or overrides file it names (``-r``/``-c``/``--override``,
+   followed into nested ``-r``/``-c`` lines), or an index variable in the environment (``PIP_EXTRA_INDEX_URL``,
+   ``PIP_FIND_LINKS``, ``PIP_NO_INDEX``, ``UV_DEFAULT_INDEX``, ...),
+5. runs ``COMMAND`` with ``PIP_INDEX_URL``, ``UV_INDEX_URL`` and ``CHECK_TABRION_SOURCE_INDEX`` set to the index,
+6. fails (exit 1, RED) unless ``COMMAND`` succeeded, made at least one request to the index (it really used it, for
+   other names), made no request for ``NAME`` (neither its project page nor a file), no marker file exists, and the
+   ``NAME`` installed in ``--python`` (default: this interpreter) or ``--path`` has a ``direct_url.json`` with
+   ``LOCK``'s ``NAME @ git+URL@SHA`` URL and commit.
 
-A direct-URL candidate (``-r`` or ``-c`` on pip >= 26.1, uv ``--override``) makes pip and uv skip the index for the
-name, so step 5 holds; a plain range (``pip install -e ".[dev]"`` without the lock) asks the index and installs
-0.1.99, so it fails. Detection after an install is not prevention (an sdist runs its build code first): only the
-zero-request assertion shows that the pinned path never fetched the poisoned release.
+The zero-request assertion is the proof. ``direct_url.json`` is written by the installer or shipped inside a wheel,
+so a poisoned wheel can carry one with the real URL and commit and pip keeps it: the origin check of step 6 (like
+``lock_check.py`` and the consumers' installed-commit tests) detects an accidental index install, it does not prove
+where a package came from. The protection is the direct-URL pin in the install command (``-r`` or ``-c`` on pip >=
+26.1, uv ``--override``), which makes pip and uv skip the index for the name; this check shows that the pinned
+command never consulted the poisoned index for it. A plain range (``pip install -e ".[dev]"`` without the lock) asks
+the index and fails here. Detection after an install is not prevention either (an sdist runs its build code first).
+Run the command without a package cache (``--no-cache-dir``; uv ``--no-cache``), so every lookup reaches the index.
 
 Standard library only. Canonical copy: nodestro-studio ``scripts/check_tabrion_source.py``; the consumers carry an
 unchanged copy whose SHA-256 their tests pin (as for ``check_tabrion_api.py``, TABRION QA-21). Every line of output
@@ -35,6 +45,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Callable, Iterable, Mapping, Sequence
+import contextlib
 from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +54,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -52,7 +64,8 @@ from typing import Any
 import zipfile
 
 PREFIX = "check_tabrion_source:"
-POISON_VERSION = "0.1.99"
+#: A plausible version inside every consumer's range: only the zero-request assertion tells it from the pin.
+POISON_VERSION = "0.1.0"
 #: Extras the consumers request; the poisoned release declares them so no installer refuses it for a missing extra.
 POISON_EXTRAS = ("all", "dev", "migrations", "postgres", "sqlalchemy", "testing")
 UPLOAD_TIME = "2020-01-01T00:00:00Z"  # before every --uploaded-prior-to cutoff
@@ -61,6 +74,31 @@ DEFAULT_UPSTREAM = "https://pypi.org/simple"
 GIT_REQUIREMENT = re.compile(
     r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*@\s*git\+(?P<url>\S+?)@(?P<ref>[0-9a-f]{40})\b"
 )
+#: Options that point an installer at another index or at local files, around the poisoned index.
+INDEX_OPTIONS = (
+    "-i",
+    "--index-url",
+    "--extra-index-url",
+    "-f",
+    "--find-links",
+    "--no-index",
+    "--index",
+    "--default-index",
+)
+#: Options whose value is a requirements, constraints or overrides file the installer reads.
+FILE_OPTIONS = ("-r", "--requirement", "-c", "--constraint", "--constraints", "--override", "--overrides")
+#: Environment variables that add or replace an index, or name such files.
+INDEX_VARIABLES = (
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+    "PIP_NO_INDEX",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_NO_INDEX",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX",
+)
+FILE_VARIABLES = ("PIP_CONSTRAINT", "PIP_REQUIREMENT", "UV_CONSTRAINT", "UV_OVERRIDE")
 #: A distribution file name: ``name-version...`` (wheel) or ``name-version.tar.gz`` (sdist).
 FILE_NAME = re.compile(r"^(?P<name>[A-Za-z0-9._]+?)-\d")
 INSPECT = """
@@ -118,7 +156,10 @@ def same_url(found: str, expected: str) -> bool:
 
 
 def check_installed(name: str, found: Mapping[str, Any] | None, pin: Pin) -> list[str]:
-    """Problems of the installed ``name`` (``{"version", "direct_url"}`` or None) against its pin."""
+    """Problems of the installed ``name`` (``{"version", "direct_url"}`` or None) against its pin.
+
+    Detection of an accidental index install only: a wheel can ship a forged ``direct_url.json``.
+    """
     if found is None:
         return [f"{name}: not installed, the lock pins {pin.url}@{pin.commit[:12]}"]
     direct = found.get("direct_url")
@@ -157,17 +198,23 @@ def _marker_code(marker: Path, what: str) -> str:
     return f"exec({f'try: {write}{chr(10)}except OSError: pass'!r})"
 
 
-def build_wheel(name: str, marker: Path, directory: Path) -> Path:
-    """A pure wheel of ``name`` 0.1.99 that writes ``marker`` when any Python starts (``.pth``) or imports it."""
+def build_wheel(name: str, marker: Path, directory: Path, pin: Pin | None = None) -> Path:
+    """A pure poisoned wheel of ``name`` that writes ``marker`` when any Python starts (``.pth``) or imports it.
+
+    With ``pin`` it ships a forged ``dist-info/direct_url.json`` naming the pin's URL and commit (pip keeps it).
+    """
     module = normalize(name).replace("-", "_")
     dist_info = f"{module}-{POISON_VERSION}.dist-info"
-    files = {
+    files: dict[str, bytes] = {
         f"{module}/__init__.py": f"POISONED = True\n{_marker_code(marker, f'import {name}')}\n".encode(),
         f"{module}_poison.pth": f"import builtins; {_marker_code(marker, f'{name} .pth')}\n".encode(),
         f"{dist_info}/METADATA": _metadata(name).encode(),
         f"{dist_info}/WHEEL": b"Wheel-Version: 1.0\nGenerator: check_tabrion_source\nRoot-Is-Purelib: true\n"
         b"Tag: py3-none-any\n",
     }
+    if pin is not None:
+        forged = {"url": pin.url, "vcs_info": {"vcs": "git", "commit_id": pin.commit}}
+        files[f"{dist_info}/direct_url.json"] = json.dumps(forged).encode()
     record = [_record_line(path, data) for path, data in files.items()] + [f"{dist_info}/RECORD,,"]
     files[f"{dist_info}/RECORD"] = ("\n".join(record) + "\n").encode()
     path = directory / f"{module}-{POISON_VERSION}-py3-none-any.whl"
@@ -178,7 +225,7 @@ def build_wheel(name: str, marker: Path, directory: Path) -> Path:
 
 
 def build_sdist(name: str, marker: Path, directory: Path) -> Path:
-    """An sdist of ``name`` 0.1.99 whose in-tree build backend writes ``marker`` and then fails (no build deps)."""
+    """A poisoned sdist of ``name`` whose in-tree build backend writes ``marker`` and then fails (no build deps)."""
     module = normalize(name).replace("-", "_")
     root = f"{module}-{POISON_VERSION}"
     backend = (
@@ -235,8 +282,10 @@ class PoisonedIndex:
         self._server.server_close()
 
     def reset(self) -> None:
+        """Clears the request log (after the positive control)."""
         with self._lock:
             self.hits.clear()
+            self.requests = 0
 
     def _record(self, line: str, poisoned: bool) -> None:
         with self._lock:
@@ -328,6 +377,74 @@ def child_environment(index_url: str, base: Mapping[str, str] | None = None) -> 
     return env
 
 
+def _tokens(command: Sequence[str]) -> list[str]:
+    """The arguments of ``command``, and the words of any argument that is a shell script (``bash -c '...'``)."""
+    tokens: list[str] = []
+    for argument in command:
+        tokens.append(argument)
+        if any(space in argument for space in " \t\n;"):
+            with contextlib.suppress(ValueError):
+                tokens += shlex.split(argument, comments=True)
+    return tokens
+
+
+def _option(token: str, options: Sequence[str]) -> tuple[str, str | None] | None:
+    """``(option, inline value or None)`` when ``token`` is one of ``options`` (``--opt``, ``--opt=value``)."""
+    name, equals, value = token.partition("=")
+    if name in options and (name.startswith("--") or not equals):
+        return name, value if equals else None
+    return None
+
+
+def _scan_file(path: Path, seen: set[Path], problems: list[str]) -> None:
+    """Index options in a requirements, constraints or overrides file, and in the files it names."""
+    try:
+        resolved = path.resolve()
+        if resolved in seen or not resolved.is_file():
+            return
+        seen.add(resolved)
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if not line.startswith("-"):
+            continue
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            words = line.split()
+        found = _option(words[0], INDEX_OPTIONS)
+        if found is not None or re.match(r"^-[if]\S", words[0]):
+            problems.append(f"{path}:{number}: {line!r} bypasses the poisoned index")
+            continue
+        nested = _option(words[0], ("-r", "--requirement", "-c", "--constraint"))
+        if nested is not None:
+            value = nested[1] if nested[1] is not None else (words[1] if len(words) > 1 else "")
+            if value:
+                _scan_file(resolved.parent / value, seen, problems)
+
+
+def bypass_problems(command: Sequence[str], env: Mapping[str, str], cwd: Path) -> tuple[list[str], int]:
+    """``(problems, files read)``: every way ``command`` or its environment could install around the index."""
+    problems = [f"{name} is set: it bypasses the poisoned index" for name in INDEX_VARIABLES if env.get(name)]
+    files = [Path(value) for name in FILE_VARIABLES for value in env.get(name, "").split() if value]
+    tokens = _tokens(command)
+    for position, token in enumerate(tokens):
+        if _option(token, INDEX_OPTIONS) is not None:
+            problems.append(f"the command passes {token!r}: it bypasses the poisoned index")
+            continue
+        found = _option(token, FILE_OPTIONS)
+        if found is not None:
+            value = found[1] if found[1] is not None else (tokens[position + 1] if position + 1 < len(tokens) else "")
+            if value:
+                files.append(Path(value))
+    seen: set[Path] = set()
+    for file in files:
+        _scan_file(file if file.is_absolute() else cwd / file, seen, problems)
+    return problems, len(seen)
+
+
 def inspect(python: str, paths: list[str] | None, names: Sequence[str]) -> dict[str, Any]:
     """``{name: {"version", "direct_url"}}`` of the installed ``names`` in ``python`` (or in ``paths``)."""
     result = subprocess.run(
@@ -340,7 +457,7 @@ def inspect(python: str, paths: list[str] | None, names: Sequence[str]) -> dict[
 
 
 def control(index: PoisonedIndex, name: str, env: Mapping[str, str], workdir: Path) -> list[str]:
-    """Problems of the positive control: ``pip install --dry-run NAME`` against the index must choose 0.1.99."""
+    """Problems of the positive control: ``pip install --dry-run NAME`` must choose the poisoned release."""
     report = workdir / f"control-{name}.json"
     command = [sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed", "--no-deps", "--quiet"]
     result = subprocess.run(
@@ -377,7 +494,7 @@ def run(
         marker = workdir / "POISONED-MARKER"
         (workdir / "dist").mkdir()
         files = {
-            name: [build_wheel(name, marker, workdir / "dist"), build_sdist(name, marker, workdir / "dist")]
+            name: [build_wheel(name, marker, workdir / "dist", pins[name]), build_sdist(name, marker, workdir / "dist")]
             for name in names
         }
         with PoisonedIndex(files, upstream) as index:
@@ -393,6 +510,11 @@ def run(
                 if marker.exists():
                     problems.append("control: the marker exists before the command ran")
                     marker.unlink()
+            bypass, read = bypass_problems(command, os.environ, Path.cwd())
+            problems += bypass
+            if not bypass:
+                say(f"ok   no index option or variable bypasses the poisoned index ({read} file(s) read)")
+            index.reset()
             say(f"run  {' '.join(command)}")
             result = execute(list(command), env=env, check=False)
             if result.returncode != 0:
@@ -400,6 +522,11 @@ def run(
             hits = list(index.hits)
             if hits:
                 problems += [f"the index was asked for a poisoned name: {hit}" for hit in hits]
+            elif index.requests == 0:
+                problems.append(
+                    "the command made no request to the index at all: it did not use PIP_INDEX_URL/UV_INDEX_URL "
+                    "(another index, local files or a package cache), so it proves nothing"
+                )
             else:
                 say(f"ok   no request for {', '.join(names)} reached the index ({index.requests} other request(s))")
         try:
@@ -412,7 +539,8 @@ def run(
             problems += found_problems
             if not found_problems:
                 say(
-                    f"ok   {name} {installed[name]['version']} installed from {pins[name].url}@{pins[name].commit[:12]}"
+                    f"ok   {name} {installed[name]['version']}: direct_url.json names "
+                    f"{pins[name].url}@{pins[name].commit[:12]} (detection only; a wheel can forge it)"
                 )
         if marker.exists():
             written = marker.read_text(encoding="utf-8").splitlines()

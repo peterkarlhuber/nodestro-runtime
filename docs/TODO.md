@@ -518,16 +518,17 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Tests and quality assurance
 
-### RT-078 · Dependency confusion: the poisoned-index job joins the mandatory checks (TABRION DC-NR-1)
+### RT-078 · Dependency confusion: the poisoned-index job and the studio origin commit (TABRION DC-NR-1)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION DC-NR-1, `scripts/check_tabrion_source.py` (checksummed
   copy from nodestro-studio, `tests/test_tabrion_source_check.py`), `tests/test_tabrion_pin.py`, CI job
   `tabrion source (poisoned index)`
-- **What:** the CI install runs under a poisoned index that serves `tabrion` 0.1.99 and must get no request for it;
-  `tests/test_tabrion_pin.py` compares the installed Tabrion's commit with the studio lock (`NODESTRO_STUDIO_LOCK`).
-  Open: the job is not yet in `.github/ci-manifest.json` (CI-FAST owns that file), and the copy names an unmerged
-  studio commit as its origin until nodestro-studio's DC-NS-2 branch is merged.
-- **Next step:** after the studio merge, update the origin commit and add the job to the manifest; close this entry.
+- **What:** the CI install runs under a poisoned index that serves `tabrion` and must get no request for it (the
+  proof that the lock pin works); `tests/test_tabrion_pin.py` checks that the installed Tabrion's `direct_url.json`
+  names the studio lock's commit (`NODESTRO_STUDIO_LOCK`), which only detects an accidental index install. The job is
+  in `.github/ci-manifest.json` and reported by ci-ok. Open: the copy names an unmerged studio commit as its origin
+  until nodestro-studio's DC-NS-2 branch is merged.
+- **Next step:** after the studio merge, update the origin commit; close this entry.
 
 ### RT-072 · Rollback snapshots before and after each TABRION MIG-NOD step
 
