@@ -59,7 +59,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -143,7 +144,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -221,7 +223,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -292,7 +295,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -339,7 +343,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -374,7 +379,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -415,7 +421,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -457,7 +464,8 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
@@ -502,7 +510,8 @@ jobs:
           python -m venv "$RUNNER_TEMP/wheel"
           "$RUNNER_TEMP/wheel/bin/python" -m pip install "pip>=26.1"
           # The internal packages at the commits of the studio lock (pyproject.toml declares only version ranges).
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           "$RUNNER_TEMP/wheel/bin/pip" install -c "$RUNNER_TEMP/lock.txt" dist/*.whl
       - name: Check the installed wheel
         run: |
