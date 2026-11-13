@@ -38,11 +38,13 @@ Nodestro API and studio and may change between versions.
 Requires Python 3.11 or newer (CI tests 3.11, 3.13 and 3.14).
 
 ```bash
-pip install "nodestro-runtime @ git+https://github.com/peterkarlhuber/nodestro-runtime.git@<commit>"
+pip install -r https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt nodestro-runtime
 ```
 
-Orkexa is installed with it, pinned to commit `b85133d53d58616dfba164d45ccdc035766d4144` (Orkexa has no
-tags). Both repositories are private, so pip needs read access, for example through
+`pyproject.toml` declares only version ranges for the Nodestro components and Orkexa; their exact commits live in the
+studio lock (`nodestro-studio/platform/internal-server.txt`), which installs every internal package from its GitHub
+commit. The names are not registered on PyPI, so a plain `pip install nodestro-runtime` without the lock cannot work.
+Both repositories are private, so pip needs read access, for example through
 `git config url."https://<token>@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"`.
 The tested combination of all Nodestro components is recorded in `nodestro-studio/platform/versions.json`.
 

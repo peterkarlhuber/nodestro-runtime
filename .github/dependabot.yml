@@ -1,7 +1,8 @@
 # Weekly, grouped update pull requests with a small limit. Every action in the workflows is pinned by commit SHA
 # (the version is the trailing comment); Dependabot keeps those pins current.
-# Python dependencies are left out: pyproject.toml pins the (public) Nodestro components by git commit, and those
-# pins move only with the platform's pin cascade (studio scripts/check_versions.py); third-party ranges resolve
+# Python dependencies are left out: pyproject.toml declares version ranges for the (public) Nodestro components, whose
+# exact commits live in the studio lock (nodestro-studio platform/internal-server.txt) and move only with the
+# platform's pin cascade (studio scripts/check_versions.py); third-party ranges resolve
 # fresh in every CI run, whose blocking pip-audit step catches known vulnerabilities.
 # cooldown: a new release is proposed only after a few days, so a broken or compromised release
 # is usually withdrawn before it reaches a pull request; security updates are not delayed. Merging stays manual

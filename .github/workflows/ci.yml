@@ -53,9 +53,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
           # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
           pip install pytest-xdist==3.8.0
       - run: ruff check .
@@ -129,9 +137,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
           # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
           pip install pytest-xdist==3.8.0
       # CI-FAST AP6: collected IDs first, then the parallel run, then each ID exactly once in the report.
@@ -199,9 +215,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
           # CI-FAST AP6: the tests run on every CPU of the runner (pytest-xdist), not on one.
           pip install pytest-xdist==3.8.0
       # CI-FAST AP6: collected IDs first, then the parallel run, then each ID exactly once in the report.
@@ -262,9 +286,17 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - name: Checked API commit
         run: git -C nodestro-api rev-parse HEAD
       - name: Tenant SQL check of the API with this commit's checker
@@ -301,9 +333,17 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - name: Checked axentra commit
         run: git -C axentra rev-parse HEAD
       - name: Axentra's copy equals the canonical security vectors
@@ -328,9 +368,17 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - run: docker info
       - run: pytest --junitxml=junit-docker.xml tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
       - name: Skipped tests as expected
@@ -361,9 +409,17 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - name: Kernel features
         run: |
           id; uname -r; cat /sys/kernel/security/lsm; echo
@@ -395,9 +451,17 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - name: Kernel features
         run: |
           id; uname -m; uname -r; cat /sys/kernel/security/lsm; echo
@@ -433,9 +497,13 @@ jobs:
       - run: pip install build==1.6.1
       - run: python -m build
       - name: Install the wheel into a fresh environment
+        shell: bash
         run: |
           python -m venv "$RUNNER_TEMP/wheel"
-          "$RUNNER_TEMP/wheel/bin/pip" install dist/*.whl
+          "$RUNNER_TEMP/wheel/bin/python" -m pip install "pip>=26.1"
+          # The internal packages at the commits of the studio lock (pyproject.toml declares only version ranges).
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          "$RUNNER_TEMP/wheel/bin/pip" install -c "$RUNNER_TEMP/lock.txt" dist/*.whl
       - name: Check the installed wheel
         run: |
           cd "$RUNNER_TEMP"
