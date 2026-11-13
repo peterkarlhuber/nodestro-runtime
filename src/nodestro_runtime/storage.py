@@ -31,7 +31,7 @@ import threading
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
-from tabrion.errors import TabrionError, classify, safe_message
+from tabrion.errors import TabrionError, safe_message
 
 from .problems import NodestroError
 
@@ -40,32 +40,44 @@ _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 logger = logging.getLogger(__name__)
 
-#: Signs of a database server's text or a statement's parameters in a message (``DETAIL:``, ``HINT:`` ..., also in
-#: ``repr`` form after ``\n``, and SQLAlchemy's ``[parameters: ...]``/``[SQL: ...]``): such a message may quote values.
-_SERVER_TEXT = re.compile(r"(?:DETAIL|HINT|CONTEXT|QUERY|LINE \d+):|\[(?:parameters|SQL): ")
+#: Packages whose exceptions are database driver errors (their text may hold server text with data values).
+_DRIVER_PACKAGES = frozenset({"sqlite3", "psycopg", "psycopg2", "psycopg_pool", "sqlalchemy"})
+#: How many explicit links (``orig``, ``__cause__``) :func:`failure_text` follows, like :func:`tabrion.errors.classify`.
+_MAX_CAUSE_DEPTH = 5
+
+
+def _is_database_error(exc: BaseException) -> bool:
+    if isinstance(exc, sqlite3.Error) or isinstance(getattr(exc, "sqlstate", None), str):
+        return True
+    return any(
+        (getattr(cls, "__module__", "") or "").partition(".")[0] in _DRIVER_PACKAGES for cls in type(exc).__mro__
+    )
 
 
 def failure_text(exc: BaseException) -> str:
     """Why a backup or migration step failed, without data values (TABRION MIG-NOD-3, finding B-06-2).
 
-    The text goes into a :class:`NodestroError` message, which reaches clients and logs. A database error anywhere in
-    the chain (its cause, or the error being handled when it was raised) gives Tabrion's
-    :func:`~tabrion.errors.safe_message` (kind, SQLSTATE or SQLite code, object names; never ``DETAIL``, parameters
-    or paths). Tabrion's own errors are value-free already. A :class:`NodestroError` keeps its message: it would reach
-    the client unchanged when raised on its own, so wrapping it shows nothing more (only its code when the message
-    carries signs of database server text or statement parameters). Anything else is named by its class only (an
-    :class:`OSError` also by its system error name, never its file name), because its text may quote data or paths.
-    The original error stays chained (``raise ... from exc``) for the server's redacting log filter.
+    The text goes into a :class:`NodestroError` message, which reaches clients and logs, so it never holds the text of
+    an error: Tabrion's own errors are value-free and keep theirs; a database error in the explicit chain (the error
+    itself, ``orig`` or ``__cause__``) gives Tabrion's :func:`~tabrion.errors.safe_message` (kind, SQLSTATE or SQLite
+    code, object names; never ``DETAIL``, parameters or paths); a :class:`NodestroError` gives its code (its message
+    may quote a tool's output, such as pg_dump's); anything else its class name (an :class:`OSError` also its system
+    error name, never its file name). An error that was merely being handled (``__context__``) is not the cause and is
+    not named. The original error stays chained (``raise ... from exc``) for the server's redacting log filter.
     """
     try:
-        found = classify(exc)
-        if found.driver != "other" or found.sqlstate is not None or found.sqlite_code is not None:
-            return safe_message(found)
         if isinstance(exc, TabrionError):
             return str(exc)
+        link: BaseException | None = exc
+        for _ in range(_MAX_CAUSE_DEPTH + 1):
+            if link is None:
+                break
+            if _is_database_error(link):
+                return safe_message(link)
+            orig = getattr(link, "orig", None)
+            link = orig if isinstance(orig, BaseException) else link.__cause__
         if isinstance(exc, NodestroError):
-            text = str(exc)
-            return exc.code if _SERVER_TEXT.search(text) else text
+            return exc.code
         name = type(exc).__name__
         if isinstance(exc, OSError) and isinstance(exc.errno, int) and exc.errno in errno.errorcode:
             return f"{name} ({errno.errorcode[exc.errno]}: {os.strerror(exc.errno)})"
@@ -720,4 +732,5 @@ __all__ = [
     "ModelT",
     "SQLiteStore",
     "Store",
+    "failure_text",
 ]

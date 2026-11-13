@@ -24,8 +24,8 @@ The snapshots in this directory are the "before" picture of the server-profile s
 those three messages changed: they now end with Tabrion's value-free text; the other four files were identical) and
 the expectation in `tests/test_rollback_snapshots.py`. A revert of MIG-NOD-3 restores the old `errors.json` with it.
 A pull request that changes another snapshot on purpose (for example a new migration) rewrites the file with the tool
-and says why. A rollback (revert pull request)
-is verified by the same files: after the revert, `check` reports "snapshots identical" again.
+and says why. A rollback (revert pull request) is verified by the same files: after the revert, `check` reports
+"snapshots identical" again.
 
 MIG-NOD-7 (extension status) is **not** covered by these files: `schema.json` leaves extension objects out, and no
 file records `pgvector_status`, whose answer depends on the server (pgvector mode A or B). MIG-NOD-7 writes its own

@@ -4,9 +4,9 @@
 
 - Security (TABRION MIG-NOD-3, finding B-06-2): the messages of `storage.backup_failed` and
   `storage.migration_failed` (SQLite and PostgreSQL) no longer end with the error's text, which for PostgreSQL held the
-  server's `DETAIL` values. `storage.failure_text` gives Tabrion's value-free `safe_message` for database errors, a
-  Nodestro error's own message (its code when it carries server text), or the class name (plus the system error name
-  of an `OSError`). Codes and parameters are unchanged; `tests/fixtures/rollback/errors.json` is rewritten. `tabrion`
+  server's `DETAIL` values. `storage.failure_text` gives Tabrion's value-free `safe_message` for a database error in
+  the explicit chain, a Nodestro error's code, or the class name (plus the system error name of an `OSError`), never
+  an error's text. Codes and parameters are unchanged; `tests/fixtures/rollback/errors.json` is rewritten. `tabrion`
   (stdlib-only core, `>=0.1,<0.2`) becomes a base dependency and `tabrion[postgres]` joins the `postgres` extra
   (doc 06 N-1).
 - Changed (TABRION VER-1 after the CI-FAST pin switch): the `dev` extra requires `tabrion[testing,postgres]>=0.1,<0.2`

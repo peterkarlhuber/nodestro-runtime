@@ -58,10 +58,13 @@ def test_a_database_error_wrapped_in_another_error_is_found() -> None:
     assert text.startswith("unique violation (SQLite") and CANARY not in text
 
 
-def test_a_nodestro_error_keeps_its_own_message() -> None:
-    assert (
-        failure_text(NodestroError("storage.backup_failed", "pg_dump is not installed")) == "pg_dump is not installed"
+def test_a_nodestro_error_gives_only_its_code() -> None:
+    assert failure_text(NodestroError("storage.backup_failed", "pg_dump is not installed")) == "storage.backup_failed"
+    # pg_dump's stderr in the api's message: a primary message that quotes a value, and a lower-case detail line.
+    stderr = (
+        f'pg_dump: error: query failed: ERROR:  invalid input syntax for type integer: "{CANARY}"\npg_dump: detail: x'
     )
+    assert failure_text(NodestroError("storage.backup_failed", f"pg_dump failed: {stderr}")) == "storage.backup_failed"
 
 
 def test_a_nodestro_error_with_server_text_gives_only_its_code() -> None:
@@ -82,15 +85,32 @@ def test_server_text_in_other_forms_also_gives_only_the_code(message: str) -> No
     assert failure_text(NodestroError("storage.backup_failed", message)) == "storage.backup_failed"
 
 
-def test_an_error_raised_while_handling_a_database_error_names_that_error() -> None:
+def test_an_error_raised_while_handling_a_database_error_names_itself() -> None:
+    """``__context__`` is only what was being handled, not the cause: the error names its own class."""
     try:
         try:
             raise _sqlite_unique_error()
         except sqlite3.Error:
             raise ValueError(f"cannot convert {CANARY}")  # noqa: B904 - no explicit cause on purpose
     except ValueError as exc:
-        text = failure_text(exc)
-    assert text.startswith("unique violation (SQLite") and CANARY not in text
+        assert failure_text(exc) == "ValueError"
+    try:
+        try:
+            raise _sqlite_unique_error()
+        except sqlite3.Error:
+            raise NodestroError("storage.backup_failed", "backup tool missing")  # noqa: B904
+    except NodestroError as exc:
+        assert failure_text(exc) == "storage.backup_failed"
+
+
+def test_a_nodestro_error_caused_by_a_database_error_gives_the_safe_message() -> None:
+    try:
+        try:
+            raise _sqlite_unique_error()
+        except sqlite3.Error as inner:
+            raise NodestroError("storage.backup_failed", f"copy failed: {inner}") from inner
+    except NodestroError as exc:
+        assert failure_text(exc).startswith("unique violation (SQLite SQLITE_CONSTRAINT_UNIQUE")
 
 
 def test_an_os_error_gives_its_system_error_name_without_the_path() -> None:

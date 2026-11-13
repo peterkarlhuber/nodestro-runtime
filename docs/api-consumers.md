@@ -7,6 +7,5 @@ is used.
 | Name | Used in |
 |---|---|
 | `tabrion.errors.TabrionError` | `src/nodestro_runtime/storage.py` |
-| `tabrion.errors.classify` | `src/nodestro_runtime/storage.py` |
 | `tabrion.errors.safe_message` | `src/nodestro_runtime/storage.py` |
 | `tabrion.testing.configure` | `tests/postgres_support.py` |
