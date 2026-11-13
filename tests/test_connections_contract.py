@@ -123,6 +123,10 @@ def test_cr_db_can_register_the_database_type_once(store: SQLiteStore) -> None:
         providers=("postgresql",),
         secret_label="password",
         egress=lambda _provider, settings: [f"{settings.host}:{settings.port}"],  # type: ignore[attr-defined]
+        # Its own address rules (a TCP host, no URL): here, no private literal and nothing internal.
+        addresses=lambda settings, _mode: (
+            [{"field": "host", "reason": "internal"}] if settings.host.startswith("10.") else []  # type: ignore[attr-defined]
+        ),
     )
     register_connection_type(item)
     try:
@@ -137,6 +141,16 @@ def test_cr_db_can_register_the_database_type_once(store: SQLiteStore) -> None:
             )
         )
         assert created.egress == ["db.example.com:5432"]
+        with pytest.raises(NodestroError) as caught:
+            service(store).create(
+                ConnectionIn(
+                    type="database",
+                    name="Internal",
+                    provider="postgresql",
+                    settings={"host": "10.0.0.5", "database": "x"},
+                )
+            )
+        assert caught.value.code == "connection.address_invalid"
     finally:
         connections._TYPES.pop("database", None)
 

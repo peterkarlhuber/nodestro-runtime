@@ -1,7 +1,7 @@
 # Runtime ADR-0001: Built-in tool specs and service connections
 
-- Status: Proposed (2026-11-13). Becomes Accepted when the Tabrion program (CR-DB) has confirmed the connection
-  contract and this record is merged. Owner decisions: NAL plan v1.1 approved (E-1), one shared connection model
+- Status: Accepted (2026-11-13). The Tabrion program (CR-DB) confirmed the connection contract with conditions
+  C-1 to C-3, which are part of the text below. Owner decisions: NAL plan v1.1 approved (E-1), one shared connection model
   provided by NAL-A1 and reused by CR-DB (E-2), both on 2026-11-13.
 - Repositories: nodestro-runtime (models, storage, checks, tool binding), nodestro-api and nodestro-sdk (management
   interface), nodestro-studio (user interface). orkexa: unchanged.
@@ -69,7 +69,8 @@ databases; there is no `DatabaseConnection` next to it.
 | `created_at`, `updated_at`, `created_by`, `updated_by` | time, actor | audit fields |
 
 Types are registered with `register_connection_type(ConnectionType(...))`: name, settings model, providers,
-whether a secret is required, the secret's label, the `egress` derivation, an optional `check` and the modes.
+whether a secret is required, the secret's label, the `egress` derivation, optional own address rules
+(`addresses`), an optional `check` and the modes.
 Settings models forbid unknown fields, so a secret cannot be stored as a setting by mistake.
 
 **Secret rules.**
@@ -90,17 +91,21 @@ carries `tenant_id`; a document whose `tenant_id` is not the service's tenant is
 cannot be opened with another tenant's key.
 
 **Egress.** `egress` lists the only hosts a connection may reach, derived from its settings (e.g. the SMTP host and
-port, the webhook URL's host and port, a self-hosted search endpoint) or from the provider's adapter. Addresses are
-checked when saved, with the same rules as MCP server addresses (`net_address.py`, shared by both): no user information, no credential in query, path or fragment (`url_secret_problem`), https
+port, the webhook URL's host and port, a self-hosted search endpoint) or from the provider's adapter. `egress` may be empty (e.g. a
+local SQLite file; its path rules belong to that type). Addresses are checked when saved. URL-based types (the NAL
+types) use the same rules as MCP server addresses (`net_address.py`, shared by both): no user information, no credential in query, path or fragment (`url_secret_problem`), https
 only (http for loopback outside the server profile), address literals must be global unicast (loopback outside the
-server profile only). Host names are resolved and checked against private ranges at call time by the network guard
+server profile only). A type may supply its own address rules instead (`addresses`; e.g. `database`: a TCP
+`host:port` without a scheme, address literals checked with the `net_address.py` rules). Host names are resolved and checked against private ranges at call time by the network guard
 of the tool that uses the connection (NAL-A2 for web tools; CR-DB for databases, which must also block internal
 databases per NOD-CR-2).
 
 **Checks.** `check()` runs the type's check with the secret in memory and stores only status and an error code,
-never the service's message. Until the network guard of NAL-A2 exists, checks contact no service: search
+never the service's message. Until the network guard of NAL-A2 exists, the checks of the NAL types contact no
+service: search
 connections check only the offline `test` provider, SMTP and webhook connections are configuration checks
-(`kind="configuration"`).
+(`kind="configuration"`). The `database` type's check may contact the database through CR-DB's own call-time
+guard (internal Nodestro database blocked, `NODESTRO_DB_ENDPOINTS`).
 
 **Audit.** Creating, changing, deleting, setting or removing the secret and checking a connection write a
 `connection_events` record (actor, connection id and type, changed field names; never values). With the Axentra
@@ -133,10 +138,16 @@ integration can never make its tool look harmless to the approval rules.
 
 ## Consequences
 
-- CR-DB registers the `database` type (settings model with host, port, database name, TLS mode; secret =
-  password or connection string; egress = the database host; its own check) and references this ADR instead of
+- CR-DB registers the `database` type (providers = engines `sqlite`, `postgresql`; settings model with host, port,
+  database name, TLS mode, access mode and limits; secret = the password only, never a connection string, which
+  would carry the location past the settings-derived egress; egress = the database host, empty for SQLite; its own
+  address rules and check) and references this ADR instead of
   defining `DatabaseConnection`. Its tenant binding, egress allow-list and "block internal databases" rule are the
   ones above plus its own call-time check.
+- Agreed additive extensions for CR-DB (contract stays 1): per-provider modes (SQLite off on the server); a check
+  `ok` with a warning code (e.g. the role is superuser, owner or `BYPASSRLS`); a secret reference `env:NAME` as a
+  `secret_storage` value (Tabrion profile file); the export file `secrets/connections.json` replaces CR document
+  14's `databases.json`.
 - Model provider keys stay where they are; moving desktop provider keys into the vault is a separate follow-up.
 - MCP servers stay their own objects (with OAuth, discovery and tool approvals); they share the vault, not the model.
 - Cost booking of `cost_unit` into the run budget arrives with the first priced tool (NAL-A2); the spec field and the

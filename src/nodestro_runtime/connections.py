@@ -144,10 +144,14 @@ class ConnectionType:
     providers: tuple[str, ...] = ()
     #: Whether the type needs a secret before it can be used.
     secret_required: bool = True
-    #: What the secret is (shown next to the input): ``api_key``, ``password``, ``signing_key``, ``connection_string``.
+    #: What the secret is (shown next to the input): ``api_key``, ``password``, ``signing_key`` (never a connection
+    #: string: it would carry the location past the settings-derived ``egress``).
     secret_label: str = "api_key"
     egress: Callable[[str, _Settings], list[str]] = field(default=lambda _provider, _settings: [])
     check: Callable[[ResolvedConnection], CheckResult] | None = None
+    #: The type's own address rules (``(settings, mode) -> [{"field", "reason"}]``), e.g. a TCP ``host:port`` of a
+    #: database; ``None``: the URL and host rules of the NAL types (https, no credentials, global addresses).
+    addresses: Callable[[_Settings, Mode], list[dict[str, str]]] | None = None
     #: The modes a connection of this type can be used in.
     modes: frozenset[Mode] = frozenset({"desktop", "local-container", "server"})
 
@@ -253,8 +257,10 @@ def _is_loopback_literal(host: str) -> bool:
         return False
 
 
-def _address_issues(settings: _Settings, *, mode: Mode) -> list[dict[str, str]]:
+def _address_issues(settings: _Settings, *, mode: Mode, kind: ConnectionType | None = None) -> list[dict[str, str]]:
     """Problems with the addresses in ``settings`` (field names and reasons; never the value)."""
+    if kind is not None and kind.addresses is not None:
+        return kind.addresses(settings, mode)
     found: list[dict[str, str]] = []
     if isinstance(settings, SearchSettings) and settings.endpoint:
         reason = _url_problem(settings.endpoint, mode=mode)
@@ -555,7 +561,7 @@ class ConnectionService:
                 type=kind.name,
                 problems=_settings_problems(exc),
             ) from None
-        issues = _address_issues(parsed, mode=self.mode)
+        issues = _address_issues(parsed, mode=self.mode, kind=kind)
         if issues:
             raise NodestroError(
                 "connection.address_invalid",
@@ -808,7 +814,7 @@ class StaticConnections:
             raise NodestroError(
                 "connection.settings_invalid", "Invalid settings", type=kind.name, problems=[]
             ) from None
-        if _address_issues(settings, mode=mode):
+        if _address_issues(settings, mode=mode, kind=kind):
             raise NodestroError("connection.address_invalid", "Invalid address", type=kind.name, problems=[])
         secret = env.get(secret_variable(connection_id)) or entry.get("secret") or None
         return ResolvedConnection(
