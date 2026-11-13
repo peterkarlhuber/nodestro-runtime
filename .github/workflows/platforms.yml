@@ -41,6 +41,14 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      # pyproject.toml declares version ranges for the internal packages; their exact commits live in the
+      # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
+      - name: Studio lock
+        shell: bash
+        run: |
+          python -m pip install "pip>=26.1"
+          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > "$RUNNER_TEMP/lock.txt"
+          cat "$RUNNER_TEMP/lock.txt"
       # The Nodestro components and orkexa are public: pip clones them anonymously over https.
       - name: Install
         run: |
@@ -52,7 +60,7 @@ jobs:
           fi
           # Without the dev extra: psycopg-binary (the server profile) has no Windows ARM64 wheel, and the desktop
           # does not use PostgreSQL.
-          pip install -e . "pytest>=8" "pytest-asyncio>=0.24"
+          pip install -c "$RUNNER_TEMP/lock.txt" -e . "pytest>=8" "pytest-asyncio>=0.24"
       - name: System
         run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
       - name: Import the workspace (the path that failed on macOS)
