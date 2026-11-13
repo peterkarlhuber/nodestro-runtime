@@ -58,7 +58,12 @@ def run(
     head=HEAD,
     updated="2026-11-07T10:30:00Z",
     prs=(7,),
+    branch="feature",
+    repo_id=1,
+    pr_heads=None,
 ):
+    """pr_heads: {number: (head ref, head repo id)} for listed PRs; without it a listed PR carries no head."""
+    pr_heads = pr_heads or {}
     return {
         "id": rid,
         "path": f".github/workflows/{workflow}",
@@ -70,7 +75,15 @@ def run(
         "event": event,
         "head_sha": head,
         "html_url": f"https://x/runs/{rid}",
-        "pull_requests": [{"number": n} for n in prs],
+        "head_branch": branch,
+        "head_repository": {"id": repo_id},
+        "pull_requests": [
+            {
+                "number": n,
+                **({"head": {"ref": pr_heads[n][0], "repo": {"id": pr_heads[n][1]}}} if n in pr_heads else {}),
+            }
+            for n in prs
+        ],
     }
 
 
@@ -105,14 +118,16 @@ MANIFEST = {
     "advisory": ["ci.yml/engines (webkit)"],
 }
 GREEN = [job(1, "lint"), job(2, "test (3.11)"), job(3, "engines (webkit)")]
+LINT_TEST = [job(1, "lint"), job(2, "test (3.11)")]
 
 
-def snapshot(routes: dict, pr=7) -> ci_ok.Snapshot:
-    return ci_ok.Collector(FakeApi(routes), REPO, HEAD, pr).snapshot()
+def snapshot(routes: dict, pr=7, head_ref=None, head_repo_id=None) -> ci_ok.Snapshot:
+    return ci_ok.Collector(FakeApi(routes), REPO, HEAD, pr, head_ref, head_repo_id).snapshot()
 
 
-def evaluate(routes, manifest=MANIFEST, files=("src/a.py",), pr=7, problems=()):
-    return ci_ok.evaluate(manifest, snapshot(routes, pr), None if files is None else list(files), problems)
+def evaluate(routes, manifest=MANIFEST, files=("src/a.py",), pr=7, problems=(), head_ref=None, head_repo_id=None):
+    snap = snapshot(routes, pr, head_ref, head_repo_id)
+    return ci_ok.evaluate(manifest, snap, None if files is None else list(files), problems)
 
 
 def states(ev):
@@ -421,6 +436,63 @@ class Attribution(unittest.TestCase):
         self.assertEqual(evaluate(routes, pr=None).verdict, "OK")
 
 
+class SameBranchAttribution(unittest.TestCase):
+    """GitHub lists a run's PRs from its head branch's currently open PRs. After PR #7 is merged its runs list none,
+    or a follow-up PR (#82) opened from the same branch (live: nodestro-server #81/#82, ci-ok run 43387975413). The
+    triggering run's head branch and head repository identify PR #7's runs; another branch or a fork never does (F5)."""
+
+    def eval_same_branch(self, runs, jobs):
+        return evaluate(routes_for(runs, jobs), head_ref="feature", head_repo_id=1)
+
+    def test_follow_up_pr_on_the_same_branch_after_merge_all_green_is_ok(self):
+        ev = self.eval_same_branch([run(1, "ci.yml", prs=(82,), pr_heads={82: ("feature", 1)})], {1: LINT_TEST})
+        self.assertEqual(ev.verdict, "OK")
+        note = next(r for r in ev.rows if r.job == "lint").note
+        self.assertIn("lists #82 from the same head branch", note)
+        self.assertIn("head branch feature", note)
+
+    def test_follow_up_pr_on_the_same_branch_after_merge_one_failure_is_not_ok(self):
+        jobs = [job(1, "lint"), job(2, "test (3.11)", conclusion="failure")]
+        ev = self.eval_same_branch([run(1, "ci.yml", prs=(82,), pr_heads={82: ("feature", 1)})], {1: jobs})
+        self.assertEqual(ev.verdict, "NOT OK")
+        self.assertEqual(states(ev)[("ci.yml", "test (3.11)")], "failure")
+
+    def test_run_listing_no_pr_on_the_same_branch_is_the_prs_run(self):
+        # A re-run (attempt 2) of a PR whose run now lists no PR at all, with no new PR on the branch.
+        ev = self.eval_same_branch([run(1, "ci.yml", prs=(), attempt=2)], {1: LINT_TEST})
+        self.assertEqual(ev.verdict, "OK")
+        self.assertIn("lists no pull request; taken for PR #7 by head SHA and head branch feature", ev.rows[0].note)
+        failed = [job(1, "lint", conclusion="failure"), job(2, "test (3.11)")]
+        self.assertEqual(self.eval_same_branch([run(1, "ci.yml", prs=(), attempt=2)], {1: failed}).verdict, "NOT OK")
+
+    def test_pr_from_another_branch_or_a_fork_is_still_ignored(self):
+        for heads, branch, repo_id in (
+            ({8: ("other", 1)}, "other", 1),  # another branch of this repository
+            ({8: ("feature", 2)}, "feature", 2),  # a fork's branch of the same name
+            ({8: ("other", 1)}, "feature", 1),  # a run on our branch that lists a PR from another branch
+            ({}, "feature", 1),  # a listed PR without head information is never ours
+        ):
+            with self.subTest(heads=heads, branch=branch, repo_id=repo_id):
+                runs = [run(1, "ci.yml", prs=(8,), pr_heads=heads, branch=branch, repo_id=repo_id)]
+                snap = snapshot(routes_for(runs, {1: LINT_TEST}), head_ref="feature", head_repo_id=1)
+                self.assertEqual(snap.runs, {})
+                self.assertEqual(snap.ignored_runs, 1)
+                self.assertEqual(ci_ok.evaluate(MANIFEST, snap, ["a"]).verdict, "NOT OK")
+
+    def test_another_prs_failing_run_does_not_beat_the_same_branch_run(self):
+        runs = [
+            run(1, "ci.yml", prs=(82,), pr_heads={82: ("feature", 1)}, created="2026-11-07T10:00:00Z"),
+            run(2, "ci.yml", prs=(8,), pr_heads={8: ("other", 1)}, branch="other", created="2026-11-07T11:00:00Z"),
+        ]
+        ev = self.eval_same_branch(runs, {1: LINT_TEST, 2: [job(3, "lint", conclusion="failure")]})
+        self.assertEqual(ev.verdict, "OK")
+
+    def test_without_the_head_branch_the_follow_up_prs_run_is_ignored(self):
+        # Fail closed: when the event does not name the head branch and repository, F5 applies unchanged.
+        runs = [run(1, "ci.yml", prs=(82,), pr_heads={82: ("feature", 1)})]
+        self.assertEqual(evaluate(routes_for(runs, {1: LINT_TEST})).verdict, "NOT OK")
+
+
 class Impostors(unittest.TestCase):
     """F1/F13: the real gate never runs on pull_request; a pull_request job named ci-ok is an impostor."""
 
@@ -562,19 +634,20 @@ def good_tree(test, manifest=MANIFEST, **overrides):
     return make_tree(test, manifest, {k: v for k, v in workflows.items() if v is not None})
 
 
-def workflow_run_event(prs=(7,), event="pull_request"):
-    return {
-        "workflow_run": {
-            "id": 99,
-            "name": "CI",
-            "run_attempt": 1,
-            "conclusion": "success",
-            "event": event,
-            "head_sha": HEAD,
-            "pull_requests": [{"number": n, "base": {"sha": BASE}, "head": {"sha": HEAD}} for n in prs],
-        },
-        "repository": {"default_branch": "master"},
+def workflow_run_event(prs=(7,), event="pull_request", head_branch=None, head_repo_id=None):
+    wr = {
+        "id": 99,
+        "name": "CI",
+        "run_attempt": 1,
+        "conclusion": "success",
+        "event": event,
+        "head_sha": HEAD,
+        "pull_requests": [{"number": n, "base": {"sha": BASE}, "head": {"sha": HEAD}} for n in prs],
     }
+    if head_branch is not None:
+        wr["head_branch"] = head_branch
+        wr["head_repository"] = {"id": head_repo_id}
+    return {"workflow_run": wr, "repository": {"default_branch": "master"}}
 
 
 class Main(unittest.TestCase):
@@ -654,6 +727,29 @@ class Main(unittest.TestCase):
         self.assertIn("PR #7", summary)
         self.assertIn("PR #8", summary)
         self.assertEqual(out.count("::notice title=ci-ok::"), 2)
+
+    def test_merged_pr_whose_runs_list_a_follow_up_pr_on_the_same_branch(self):
+        # Live: nodestro-server #81 merged at 07:45:20, #82 opened from the same branch at 07:56:01, and the ci-ok run
+        # queued at 07:45:03 started at 07:56:26: both runs listed #82 and v2 reported every check as missing.
+        event = workflow_run_event(head_branch="feature", head_repo_id=1)
+        heads = {82: ("feature", 1)}
+        green = routes_for([run(1, "ci.yml", prs=(82,), pr_heads=heads)], {1: GREEN})
+        green[f"/repos/{REPO}/pulls/7"]["state"] = "closed"
+        _, out, summary = self.main(green, event=event)
+        self.assertIn("::notice title=ci-ok::ci-ok for PR #7 @ hhhhhhhhhhhh: OK", out)
+        self.assertIn("lists #82 from the same head branch", summary)
+        self.assertNotIn("belong to other pull requests", summary)
+        failed = routes_for(
+            [run(1, "ci.yml", prs=(82,), pr_heads=heads)],
+            {1: [*GREEN[:1], job(2, "test (3.11)", conclusion="failure")]},
+        )
+        _, out, _ = self.main(failed, event=event)
+        self.assertIn("::warning title=ci-ok::ci-ok for PR #7 @ hhhhhhhhhhhh: NOT OK", out)
+        self.assertIn("ci.yml/test (3.11)=failure", out)
+        other = routes_for([run(1, "ci.yml", prs=(8,), pr_heads={8: ("other", 1)}, branch="other")], {1: GREEN})
+        _, out, summary = self.main(other, event=event)
+        self.assertIn("NOT OK", out)
+        self.assertIn("1 run(s) on this SHA belong to other pull requests and were ignored.", summary)
 
     def test_api_error_is_not_ok_and_exits_zero(self):
         routes = self.green_routes()
