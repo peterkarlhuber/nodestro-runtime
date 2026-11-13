@@ -567,17 +567,18 @@ Items that need an independent or external review (an internal audit does not re
   K-32, Tabrion TODO TB-072, `tests/postgres_support.py`, `tests/test_tabrion_pin.py`
 - **What:** MIG-NOD-1 puts the PostgreSQL test helpers on `tabrion.testing` (plugin in `conftest.py`,
   `configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`, `require_postgres()` through the session
-  fixture `tabrion_postgres_url`) and pins `tabrion[testing,postgres]` in the `dev` extra at v0.1.0 final
-  (`d5821fa`); nodestro-api's `dev` extra pins the same commit. Two parts are left on purpose: (1) the pgvector
+  fixture `tabrion_postgres_url`) and requires `tabrion[testing,postgres]>=0.1,<0.2` in the `dev` extra (the
+  studio lock pins v0.1.0 final, `d5821fa`). Two parts are left on purpose: (1) the pgvector
   switch stays `NODESTRO_REQUIRE_PGVECTOR=1` (`require_pgvector`, `require_pgvector_or_skip`), because the helpers do
   not use `tabrion.testing.require_extension` yet; with it, CI's `pg-b` must set `NODESTRO_REQUIRE_EXTENSIONS=vector`
   instead (TB-072: pointing `require_extensions_env` at the old variable would read its `1` as an extension name), a
   `.github` change. (2) The mandatory base edge `tabrion` and `tabrion[postgres]` in the `postgres` extra (doc 06
   N-1, section 7.4) come with wave W2 (MIG-NOD-3, K-32 still `pending` in nodestro-studio's dependency policy), not
-  with the dev-only fixtures of W1; `tests/test_tabrion_pin.py` already requires that every Tabrion requirement here
-  is the canonical full-SHA pin of one final version.
+  with the dev-only fixtures of W1; `tests/test_tabrion_pin.py` requires that every Tabrion requirement here
+  names the same minor range `>=0.N,<0.(N+1)` and that the installed Tabrion is a final version inside it (the exact
+  commit lives in the studio lock since the CI-FAST pin switch).
 - **Next step:** MIG-NOD-7 (or the first step that uses `require_extension`) switches the pgvector variable in the
-  same pull request as its `.github` change; MIG-NOD-3 adds the base edge on the same commit as the dev pin.
+  same pull request as its `.github` change; MIG-NOD-3 adds the base edge with the same range as the dev extra.
 
 ### RT-056 · The test double answers in German in every language
 
