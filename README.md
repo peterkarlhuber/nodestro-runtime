@@ -281,7 +281,8 @@ copy. Runs without a readable `created_at` (and damaged documents) are not liste
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `postgres` (psycopg 3; with the studio lock as above,
-`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `-e ".[dev,postgres]"` in a checkout) and is not
+`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `pip install -c <lock URL> -e ".[dev,postgres]"` in a
+checkout, with pip >= 26.1; never without the lock, which pins Tabrion and the other internal packages) and is not
 used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns a pool of connections (`pool_size`, default
 `NODESTRO_DATABASE_POOL_SIZE`, else 8) shared by every tenant's store; `database.store(tenant_id)` gives
 the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store

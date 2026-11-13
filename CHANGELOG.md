@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added (TABRION DC-NR-1, dependency confusion): `tests/test_tabrion_pin.py` requires the installed Tabrion to come from
+  a git commit, and from the studio lock's commit when `NODESTRO_STUDIO_LOCK` names the lock (CI sets it); a version
+  check alone passed a foreign `tabrion 0.1.99` from an index. New CI job `tabrion source (poisoned index)` runs the
+  install with `scripts/check_tabrion_source.py` (an unchanged, checksummed copy from nodestro-studio): a poisoned
+  index must get no request for `tabrion`. README: the checkout install names the lock too.
 - Fixed (NAL-A1 review, ADR-0001): `secrets reencrypt` and the start-up key check now cover service connection
   secrets (`service_connections.secret_sealed`, field `connection:<id>`); before, retiring an old key id made them
   unreadable. Connection addresses refuse IPv4 in forms `ipaddress` does not parse (`127.1`, `2130706433`,
