@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 24 |
+| P3 Low | 25 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -521,16 +521,34 @@ Items that need an independent or external review (an internal audit does not re
   in tabrion-studio, axentra and orkexa; the test pins its SHA-256) refuses private Tabrion names, checks used names
   against the installed Tabrion's `__all__` (a used name without an installed Tabrion fails; a module whose extra is
   missing is reported with its import error) and, with `--surface`, against Tabrion's `docs/api/surface.json` (stable
-  `S` names only: experimental `X` names are refused, 02 §14 S-2), and exports them to `docs/api-consumers.md` (none
-  yet: the runtime imports no Tabrion name before its MIG-NOD steps). The `__all__` and `--surface` parts first have a
-  name to check with the first Tabrion pin (MIG-NOD-3); until then tests cover them against a fake package and a fake
-  snapshot. The test job fails when the export is stale or missing or a private name is used
+  `S` names only: experimental `X` names are refused, 02 §14 S-2), and exports them to `docs/api-consumers.md`. The
+  first used name is `tabrion.testing.configure` (TABRION MIG-NOD-1, `tests/postgres_support.py`, dev pin of Tabrion
+  v0.1.0 final), so the `__all__` and `--surface` parts now check a real name as well as the fake package and the fake
+  snapshot of the tests. The test job fails when the export is stale or missing or a private name is used
   (`tests/test_tabrion_api_check.py`), but no lint step names it.
 - **Done (2026-11-12):** `--surface` checks enum members and dataclass fields (`tabrion.TLSMode.AUTO`) against
   their parent's `members`/`fields` in `surface.json` instead of reporting them as missing.
 - **Next step:** Add `python scripts/check_tabrion_api.py --check-export docs/api-consumers.md` to the lint job (a
   `.github` change, not made in the QA-21 pull request); Tabrion collects the consumer lists into its own
   `docs/api-consumers.md` (Tabrion's side of QA-21).
+
+### RT-074 · Tabrion adoption after MIG-NOD-1: pgvector switch and the base edge
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-1 (done here), MIG-NOD-3, MIG-NOD-7, VER-1,
+  K-32, Tabrion TODO TB-072, `tests/postgres_support.py`, `tests/test_tabrion_pin.py`
+- **What:** MIG-NOD-1 puts the PostgreSQL test helpers on `tabrion.testing` (plugin in `conftest.py`,
+  `configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`, `require_postgres()` through the session
+  fixture `tabrion_postgres_url`) and pins `tabrion[testing,postgres]` in the `dev` extra at v0.1.0 final
+  (`d5821fa`); nodestro-api's `dev` extra pins the same commit. Two parts are left on purpose: (1) the pgvector
+  switch stays `NODESTRO_REQUIRE_PGVECTOR=1` (`require_pgvector`, `require_pgvector_or_skip`), because the helpers do
+  not use `tabrion.testing.require_extension` yet; with it, CI's `pg-b` must set `NODESTRO_REQUIRE_EXTENSIONS=vector`
+  instead (TB-072: pointing `require_extensions_env` at the old variable would read its `1` as an extension name), a
+  `.github` change. (2) The mandatory base edge `tabrion` and `tabrion[postgres]` in the `postgres` extra (doc 06
+  N-1, section 7.4) come with wave W2 (MIG-NOD-3, K-32 still `pending` in nodestro-studio's dependency policy), not
+  with the dev-only fixtures of W1; `tests/test_tabrion_pin.py` already requires that every Tabrion requirement here
+  is the canonical full-SHA pin of one final version.
+- **Next step:** MIG-NOD-7 (or the first step that uses `require_extension`) switches the pgvector variable in the
+  same pull request as its `.github` change; MIG-NOD-3 adds the base edge on the same commit as the dev pin.
 
 ### RT-056 · The test double answers in German in every language
 
@@ -707,6 +725,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
 | (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and MIG-NOD-6 (mandatory `tabrion` core) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
+| RT-074 | nodestro-api, tabrion | TABRION MIG-NOD-1, VER-1 (RC-2) | The `dev` extras of runtime and api pin `tabrion[testing,postgres]` at the same commit (v0.1.0 final `d5821fa`); a Tabrion pin bump moves both (runtime first, then api), and nodestro-studio's `check_versions.py` checks them |
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
