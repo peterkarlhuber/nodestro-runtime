@@ -33,6 +33,10 @@ dependencies = [
     # The MCP client (ADR-0007): the official SDK with its own protocol version negotiation.
     "mcp>=2.3,<3",
     "tzdata>=2024.1; sys_platform == 'win32'",
+    # Value-free database error messages (tabrion.errors, standard library only; TABRION MIG-NOD-3, doc 06 N-1). Every
+    # Tabrion requirement in this file names the same minor range (VER-1, tests/test_tabrion_pin.py); the exact commit
+    # lives in the studio lock (nodestro-studio platform/internal-server.txt).
+    "tabrion>=0.1,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +50,8 @@ postgres = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc]>=0.1.0.dev0,<0.2",
+    # Tabrion's PostgreSQL part (doc 06 N-1, N-2): imported only in server-profile modules, guarded like psycopg.
+    "tabrion[postgres]>=0.1,<0.2",
 ]
 dev = [
     # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's

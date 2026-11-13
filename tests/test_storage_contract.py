@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable, Iterator
 from datetime import UTC
+import errno
 from pathlib import Path
 import sqlite3
 import threading
@@ -381,12 +382,13 @@ def test_a_failing_step_leaves_the_database_unchanged(database: SQLiteStore) -> 
 
 def test_a_failing_backup_stops_the_migration(database: SQLiteStore) -> None:
     def backup(_current: int, _target: int) -> None:
-        raise OSError("disk full")
+        raise OSError(errno.ENOSPC, "No space left on device", "/private/backups/x.db")
 
     with pytest.raises(NodestroError) as error:
         database.migrate(before_migration=backup, migrations={1: _add_table}, target=1)
     assert error.value.code == "storage.backup_failed"
-    assert "disk full" in str(error.value)
+    # The system error name stays, the path does not (TABRION MIG-NOD-3).
+    assert "ENOSPC" in str(error.value) and "/private" not in str(error.value)
     _unchanged(database)
 
 

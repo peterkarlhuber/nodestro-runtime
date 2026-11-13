@@ -47,7 +47,7 @@ import weakref
 from pydantic import BaseModel
 
 from .problems import NodestroError
-from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time
+from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time, failure_text
 
 if TYPE_CHECKING:
     from psycopg.abc import Params, Query
@@ -653,7 +653,8 @@ class PostgresDatabase:
                     except Exception as exc:
                         raise NodestroError(
                             "storage.backup_failed",
-                            f"The backup before the schema migration failed, so nothing was changed: {exc}",
+                            "The backup before the schema migration failed, so nothing was changed: "
+                            + failure_text(exc),
                             found=current,
                             supported=target,
                         ) from exc
@@ -678,7 +679,8 @@ class PostgresDatabase:
                 except Exception as exc:
                     raise NodestroError(
                         "storage.migration_failed",
-                        f"The schema migration to version {step} failed; the database is unchanged: {exc}",
+                        f"The schema migration to version {step} failed; the database is unchanged: "
+                        + failure_text(exc),
                         found=current,
                         supported=target,
                         step=step,

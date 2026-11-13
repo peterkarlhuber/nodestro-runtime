@@ -20,8 +20,10 @@ import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
+import errno
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -29,6 +31,7 @@ import threading
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
+from tabrion.errors import TabrionError, classify, safe_message
 
 from .problems import NodestroError
 
@@ -36,6 +39,37 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 logger = logging.getLogger(__name__)
+
+#: Where a database server's text starts in a message (``DETAIL:``, ``HINT:`` ...): such a message may quote values.
+_SERVER_TEXT = re.compile(r"\b(?:DETAIL|HINT|CONTEXT|QUERY|LINE \d+):")
+
+
+def failure_text(exc: BaseException) -> str:
+    """Why a backup or migration step failed, without data values (TABRION MIG-NOD-3, finding B-06-2).
+
+    The text goes into a :class:`NodestroError` message, which reaches clients and logs. A database error anywhere in
+    the chain gives Tabrion's :func:`~tabrion.errors.safe_message` (kind, SQLSTATE or SQLite code, object names; never
+    ``DETAIL``, parameters or paths). Tabrion's own errors are value-free already. A :class:`NodestroError` keeps its
+    message (Nodestro's own text), or only its code when the message carries database server text. Anything else is
+    named by its class only (an :class:`OSError` also by its system error name), because its text may quote data or
+    paths. The original error stays chained (``raise ... from exc``) for the server's redacting log filter.
+    """
+    try:
+        found = classify(exc)
+        if found.driver != "other" or found.sqlstate is not None or found.sqlite_code is not None:
+            return safe_message(found)
+        if isinstance(exc, TabrionError):
+            return str(exc)
+        if isinstance(exc, NodestroError):
+            text = str(exc)
+            return exc.code if _SERVER_TEXT.search(text) else text
+        name = type(exc).__name__
+        if isinstance(exc, OSError) and isinstance(exc.errno, int) and exc.errno in errno.errorcode:
+            return f"{name} ({errno.errorcode[exc.errno]}: {os.strerror(exc.errno)})"
+        return name
+    except Exception:  # pragma: no cover - a broken exception object; never fail the error path
+        return "unknown error"
+
 
 #: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
 SCHEMA_VERSION = 2
@@ -616,7 +650,7 @@ class SQLiteStore:
             except Exception as exc:
                 raise NodestroError(
                     "storage.backup_failed",
-                    f"The backup before the schema migration failed, so nothing was changed: {exc}",
+                    f"The backup before the schema migration failed, so nothing was changed: {failure_text(exc)}",
                     found=current,
                     supported=target,
                 ) from exc
@@ -629,7 +663,7 @@ class SQLiteStore:
             except Exception as exc:
                 raise NodestroError(
                     "storage.migration_failed",
-                    f"The schema migration to version {step} failed; the database is unchanged: {exc}",
+                    f"The schema migration to version {step} failed; the database is unchanged: {failure_text(exc)}",
                     found=current,
                     supported=target,
                     step=step,
