@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed (NAL-A1 review, ADR-0001): `secrets reencrypt` and the start-up key check now cover service connection
+  secrets (`service_connections.secret_sealed`, field `connection:<id>`); before, retiring an old key id made them
+  unreadable. Connection addresses refuse IPv4 in forms `ipaddress` does not parse (`127.1`, `2130706433`,
+  `0x7f000001`, `0177.0.0.1`) and cloud metadata names (`metadata.google.internal`, ...). Changing a connection's
+  target (its egress) drops the stored secret, so a secret only goes where it was entered for; the `updated` event
+  says `secret_cleared`. Release bundles and exported packages accept only connection ids `conn_<12 hex>` and
+  `type:provider` values (`connections.CONNECTION_ID`, problem `connection.id_invalid`). A failed check logs the
+  exception type only.
 - Changed (TABRION VER-1 after the CI-FAST pin switch): the `dev` extra requires `tabrion[testing,postgres]>=0.1,<0.2`
   instead of a direct URL; the exact commit (v0.1.0 final, `d5821fa`) comes from the studio lock like every internal
   package. `tests/test_tabrion_pin.py` now requires every Tabrion requirement to name the same minor range
