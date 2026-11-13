@@ -527,6 +527,35 @@ class Impostors(unittest.TestCase):
                 # F13: other jobs of the gate's own workflow file are no longer hidden.
                 self.assertIn((workflow, "helper"), [(r.workflow, r.job) for r in ev.unlisted])
 
+    def test_own_posted_check_run_in_a_runs_job_list_is_not_a_job(self):
+        # GitHub files the posted verdict into some GitHub Actions check suite on the head SHA, so it can appear in
+        # the jobs list of a pull_request run (studio #174). It is neither an impostor nor an unlisted job.
+        routes = routes_for(
+            [run(1, "ci.yml"), run(2, "other.yml")], {1: GREEN, 2: [job(9, "ci-ok"), job(10, "helper")]}
+        )
+        routes[f"/repos/{REPO}/check-runs/9"] = {
+            "id": 9,
+            "name": "ci-ok",
+            "app": {"slug": ci_ok.OWN_APP_SLUG},
+            "external_id": ci_ok.OWN_EXTERNAL_ID,
+        }
+        ev = evaluate(routes)
+        self.assertEqual(ev.verdict, "OK")
+        self.assertNotIn(("other.yml", "ci-ok"), states(ev))
+        self.assertNotIn(("other.yml", "ci-ok"), [(r.workflow, r.job) for r in ev.unlisted])
+
+    def test_a_ci_ok_job_with_a_foreign_check_run_stays_an_impostor(self):
+        routes = routes_for([run(1, "ci.yml"), run(2, "other.yml")], {1: GREEN, 2: [job(9, "ci-ok")]})
+        routes[f"/repos/{REPO}/check-runs/9"] = {
+            "id": 9,
+            "name": "ci-ok",
+            "app": {"slug": ci_ok.OWN_APP_SLUG},
+            "external_id": "0b3c1d7e-actions-job",
+        }
+        ev = evaluate(routes)
+        self.assertEqual(ev.verdict, "NOT OK")
+        self.assertEqual(states(ev)[("other.yml", "ci-ok")], "impostor")
+
 
 class ChangedFiles(unittest.TestCase):
     def test_changed_files_fall_back_to_compare(self):

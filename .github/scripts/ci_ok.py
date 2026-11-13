@@ -610,8 +610,20 @@ class Collector:
             # filter=latest: the jobs of the most recent attempt, so a re-run replaces the failed attempt.
             jobs = paged(self.api, f"/repos/{self.repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
             for job in sorted(jobs, key=lambda j: j["id"]):
+                if job.get("name") == GATE_NAME and self._posted_verdict(job):
+                    continue
                 snap.jobs.setdefault((workflow, job["name"]), []).append(job)
         return snap
+
+    def _posted_verdict(self, job: dict) -> bool:
+        """Whether a "job" named ci-ok is in fact a verdict this evaluator posted. GitHub files a check run that a
+        workflow posts with GITHUB_TOKEN into one of the GitHub Actions check suites on its head SHA, so it shows up
+        in the jobs list of an unrelated pull_request run there (seen on studio #174). It is not a job of that run.
+        Anything else named ci-ok, or a check run that cannot be read, stays an impostor (fail closed)."""
+        try:
+            return is_own_check_run(self.api.get(f"/repos/{self.repo}/check-runs/{job['id']}"))
+        except ApiError:
+            return False
 
 
 # --------------------------------------------------------------------------------------------------------------------
