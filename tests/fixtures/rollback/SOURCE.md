@@ -22,8 +22,9 @@ The snapshots in this directory are the "before" picture of the server-profile s
 `errors.json` recorded the old messages as they were: three of them contained the canary value of the server's
 `DETAIL` text (`message_has_canary: true`). MIG-NOD-3 closed B-06-2 and rewrote `errors.json` with the tool (only
 those three messages changed: they now end with Tabrion's value-free text; the other four files were identical) and
-the expectation in `tests/test_rollback_snapshots.py`. A revert of MIG-NOD-3 restores the old `errors.json` with it. A pull request that changes another snapshot on
-purpose (for example a new migration) rewrites the file with the tool and says why. A rollback (revert pull request)
+the expectation in `tests/test_rollback_snapshots.py`. A revert of MIG-NOD-3 restores the old `errors.json` with it.
+A pull request that changes another snapshot on purpose (for example a new migration) rewrites the file with the tool
+and says why. A rollback (revert pull request)
 is verified by the same files: after the revert, `check` reports "snapshots identical" again.
 
 MIG-NOD-7 (extension status) is **not** covered by these files: `schema.json` leaves extension objects out, and no

@@ -49,27 +49,28 @@ import pathlib, tempfile
 from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.storage import SCHEMA_VERSION, SQLiteStore
 from nodestro_runtime.workspace import Workspace
-folder = pathlib.Path(tempfile.mkdtemp())
-with Workspace(folder / "workspace", integrations=[]) as workspace:
-    assert workspace.sqlite_store.schema_version == SCHEMA_VERSION
-store = SQLiteStore(folder / "canary.db")
-with store.maintenance() as connection:
-    connection.execute("CREATE TABLE canary (email TEXT UNIQUE)")
-    connection.execute("INSERT INTO canary VALUES ('canary@example.com')")
-try:
-    store.migrate(
-        before_migration=lambda *_: None,
-        migrations={1: lambda db: db.execute("INSERT INTO canary VALUES ('canary@example.com')")},
-        target=1,
-    )
-except NodestroError as exc:
-    assert exc.code == "storage.migration_failed", exc.code
-    assert str(exc).endswith("unchanged: unique violation (SQLite SQLITE_CONSTRAINT_UNIQUE, constraint canary.email,"
-                             " table canary, column email)"), str(exc)
-else:
-    raise AssertionError("the migration did not fail")
-finally:
-    store.close()
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as name:
+    folder = pathlib.Path(name)
+    with Workspace(folder / "workspace", integrations=[]) as workspace:
+        assert workspace.sqlite_store.schema_version == SCHEMA_VERSION
+    store = SQLiteStore(folder / "canary.db")
+    with store.maintenance() as connection:
+        connection.execute("CREATE TABLE canary (email TEXT UNIQUE)")
+        connection.execute("INSERT INTO canary VALUES ('canary@example.com')")
+    try:
+        store.migrate(
+            before_migration=lambda *_: None,
+            migrations={1: lambda db: db.execute("INSERT INTO canary VALUES ('canary@example.com')")},
+            target=1,
+        )
+    except NodestroError as exc:
+        assert exc.code == "storage.migration_failed", exc.code
+        assert "canary@example.com" not in str(exc), str(exc)
+        assert "unchanged: unique violation (SQLite SQLITE_CONSTRAINT_UNIQUE" in str(exc), str(exc)
+    else:
+        raise AssertionError("the migration did not fail")
+    finally:
+        store.close()
 """
 
 
@@ -82,7 +83,7 @@ EDGES: dict[str, Edge] = {
     ),
     "tabrion.postgres": Edge(
         blocked=("tabrion.postgres",),
-        checks=(),
+        checks=(_SQLITE_WORKSPACE_CHECK,),
         probe=("storage.py", "import tabrion.postgres"),
         requirement="tabrion",
     ),
@@ -90,7 +91,8 @@ EDGES: dict[str, Edge] = {
         blocked=("psycopg", "psycopg_binary", "psycopg_c", "psycopg_pool"),
         checks=(
             # Doc 06 N-2 (TABRION MIG-NOD-3): a SQLite workspace opens and migrates, and a failed SQLite migration gets
-            # Tabrion's value-free text (tabrion.errors, standard library only) without the PostgreSQL driver.
+            # Tabrion's value-free text (tabrion.errors, standard library only) without the PostgreSQL driver (and,
+            # in the edge above, without tabrion.postgres).
             _SQLITE_WORKSPACE_CHECK,
         ),
         probe=("storage.py", "import psycopg"),

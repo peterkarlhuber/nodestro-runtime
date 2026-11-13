@@ -71,6 +71,28 @@ def test_a_nodestro_error_with_server_text_gives_only_its_code() -> None:
     assert failure_text(error) == "storage.backup_failed"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"pg_dump failed: {'x' + chr(10) + 'DETAIL:  Key (email)=(' + CANARY + ')'!r}",  # repr form: \\nDETAIL:
+        f"insert failed [SQL: INSERT INTO t VALUES (%(email)s)] [parameters: {{'email': '{CANARY}'}}]",
+    ],
+)
+def test_server_text_in_other_forms_also_gives_only_the_code(message: str) -> None:
+    assert failure_text(NodestroError("storage.backup_failed", message)) == "storage.backup_failed"
+
+
+def test_an_error_raised_while_handling_a_database_error_names_that_error() -> None:
+    try:
+        try:
+            raise _sqlite_unique_error()
+        except sqlite3.Error:
+            raise ValueError(f"cannot convert {CANARY}")  # noqa: B904 - no explicit cause on purpose
+    except ValueError as exc:
+        text = failure_text(exc)
+    assert text.startswith("unique violation (SQLite") and CANARY not in text
+
+
 def test_an_os_error_gives_its_system_error_name_without_the_path() -> None:
     text = failure_text(OSError(errno.ENOSPC, "No space left on device", f"/data/{CANARY}.db"))
     assert text == f"OSError (ENOSPC: {os.strerror(errno.ENOSPC)})"

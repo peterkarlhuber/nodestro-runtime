@@ -40,19 +40,22 @@ _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 logger = logging.getLogger(__name__)
 
-#: Where a database server's text starts in a message (``DETAIL:``, ``HINT:`` ...): such a message may quote values.
-_SERVER_TEXT = re.compile(r"\b(?:DETAIL|HINT|CONTEXT|QUERY|LINE \d+):")
+#: Signs of a database server's text or a statement's parameters in a message (``DETAIL:``, ``HINT:`` ..., also in
+#: ``repr`` form after ``\n``, and SQLAlchemy's ``[parameters: ...]``/``[SQL: ...]``): such a message may quote values.
+_SERVER_TEXT = re.compile(r"(?:DETAIL|HINT|CONTEXT|QUERY|LINE \d+):|\[(?:parameters|SQL): ")
 
 
 def failure_text(exc: BaseException) -> str:
     """Why a backup or migration step failed, without data values (TABRION MIG-NOD-3, finding B-06-2).
 
     The text goes into a :class:`NodestroError` message, which reaches clients and logs. A database error anywhere in
-    the chain gives Tabrion's :func:`~tabrion.errors.safe_message` (kind, SQLSTATE or SQLite code, object names; never
-    ``DETAIL``, parameters or paths). Tabrion's own errors are value-free already. A :class:`NodestroError` keeps its
-    message (Nodestro's own text), or only its code when the message carries database server text. Anything else is
-    named by its class only (an :class:`OSError` also by its system error name), because its text may quote data or
-    paths. The original error stays chained (``raise ... from exc``) for the server's redacting log filter.
+    the chain (its cause, or the error being handled when it was raised) gives Tabrion's
+    :func:`~tabrion.errors.safe_message` (kind, SQLSTATE or SQLite code, object names; never ``DETAIL``, parameters
+    or paths). Tabrion's own errors are value-free already. A :class:`NodestroError` keeps its message: it would reach
+    the client unchanged when raised on its own, so wrapping it shows nothing more (only its code when the message
+    carries signs of database server text or statement parameters). Anything else is named by its class only (an
+    :class:`OSError` also by its system error name, never its file name), because its text may quote data or paths.
+    The original error stays chained (``raise ... from exc``) for the server's redacting log filter.
     """
     try:
         found = classify(exc)

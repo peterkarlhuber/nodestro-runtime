@@ -35,7 +35,7 @@ dependencies = [
     "tzdata>=2024.1; sys_platform == 'win32'",
     # Value-free database error messages (tabrion.errors, standard library only; TABRION MIG-NOD-3, doc 06 N-1). Every
     # Tabrion requirement in this file names the same minor range (VER-1, tests/test_tabrion_pin.py); the exact commit
-    # lives in the studio lock (nodestro-studio platform/internal-server.txt).
+    # lives in the studio locks (nodestro-studio platform/internal-server.txt and, from PIN-W2, platform/internal.txt).
     "tabrion>=0.1,<0.2",
 ]
 
