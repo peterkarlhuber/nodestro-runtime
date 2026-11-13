@@ -54,6 +54,7 @@ from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
+from .connections import ConnectionService
 from .container_images import ContainerImages, RuntimeImageSandbox
 from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
@@ -380,6 +381,7 @@ class Workspace:
             data_dir / "tools",
             sandbox=sandbox,
             extra_tools=self.extensions.tools(),
+            extra_specs=self.extensions.specs(),
             policy=self.sandbox_policy,
             provenance=StoredProvenance(self.store),
         )
@@ -387,16 +389,26 @@ class Workspace:
         self._apply_sandbox_mode()
         # MCP (ADR-0007): the egress policy is the operator's (process environment), tokens are sealed with the
         # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.
+        secret_box = storage.secrets if storage is not None else vault_box_from_env()
         self.mcp = McpService(
             self.store,
             McpHub(
                 EgressPolicy.from_env(server=storage is not None, loopback=self.profile.kind == "desktop"),
                 limits=McpLimits.from_env(),
             ),
-            TokenVault(storage.secrets if storage is not None else vault_box_from_env(), self.tenant_id),
+            TokenVault(secret_box, self.tenant_id),
         )
+        # Service connections (NAL-A1, ADR-0001): the same key store as MCP tokens, under their own namespace.
+        self.connections = ConnectionService(
+            self.store,
+            TokenVault(secret_box, self.tenant_id, namespace="connection"),
+            mode="server" if storage is not None else self.profile.kind,
+        )
+        self.connections.used_by = self._connection_users
         self.tools.mcp = self.mcp
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
+        self.builder.resolve_connection = self.connections.resolve
+        self.builder.find_connection = self.connections.find
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
         self.builder.declared_limits = lambda provider: dict(self._providers().get(provider, {}).get("limits") or {})
         # Local models (Ollama): the managed server of the desktop, the container of Nodestro Local Docker, or the
@@ -629,6 +641,22 @@ class Workspace:
         await self.aclose()
 
     # ---- settings ----------------------------------------------------------------
+
+    def _connection_users(self, connection_id: str) -> list[str]:
+        """The agents (``workflow / node``) that bind the service connection ``connection_id`` (current versions)."""
+        found: list[str] = []
+        for _collection, text in self.store.search_raw(("workflows",), connection_id):
+            try:
+                workflow = Workflow.model_validate_json(text)
+            except ValueError:
+                continue
+            for node in workflow.nodes:
+                agent = node.agent
+                if agent is None:
+                    continue
+                if any(item.connection_id == connection_id for item in agent.tool_settings.values()):
+                    found.append(f"{workflow.name} / {node.label or agent.name or node.id}")
+        return sorted(found)
 
     def _stored(self, key: str) -> Any:
         values = self.store.get_raw("settings", "app") or {}

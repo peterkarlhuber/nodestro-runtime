@@ -42,23 +42,29 @@ def vault_box_from_env(environ: dict[str, str] | None = None) -> SecretBox | Non
 
 
 class TokenVault:
-    """Seals and opens MCP tokens of one tenant; ``persistent`` tells whether tokens can be stored at all."""
+    """Seals and opens secrets of one tenant; ``persistent`` tells whether secrets can be stored at all.
 
-    def __init__(self, box: TenantSecrets | None, tenant_id: str) -> None:
+    ``namespace`` keeps the secrets of different owners apart: MCP tokens (``mcp``) and the secrets of service
+    connections (``connection``, :mod:`nodestro_runtime.connections`) use the same key store, and a value sealed for
+    one namespace, tenant or id cannot be opened as another (the field is part of the encryption context)."""
+
+    def __init__(self, box: TenantSecrets | None, tenant_id: str, *, namespace: str = "mcp") -> None:
         self._box = box
         self.tenant_id = tenant_id
+        self.namespace = namespace
 
     @property
     def persistent(self) -> bool:
         return self._box is not None
 
-    @staticmethod
-    def _field(server_id: str) -> str:
-        return f"mcp:{server_id}"
+    def _field(self, owner_id: str) -> str:
+        return f"{self.namespace}:{owner_id}"
 
     def seal(self, server_id: str, token: str) -> str:
         if self._box is None:
-            raise NodestroError("mcp.vault_unavailable", "No secure key store is available for MCP tokens")
+            if self.namespace == "mcp":
+                raise NodestroError("mcp.vault_unavailable", "No secure key store is available for MCP tokens")
+            raise NodestroError("secrets.vault_unavailable", "No secure key store is available for secrets")
         return self._box.encrypt(self.tenant_id, self._field(server_id), token)
 
     def open(self, server_id: str, sealed: str) -> str | None:

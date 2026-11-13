@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field, create_model
 
 from . import output_limits
 from .catalog import SERVER_TOOLS
+from .connections import ResolvedConnection
 from .knowledge import KnowledgeBase
 from .mcp_access import check_unattended_mcp
 from .memory_spaces import MemorySpaces
@@ -64,6 +65,7 @@ from .providers import (
 )
 from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField
 from .tool_library import ToolLibrary
+from .tool_spec import CallCounter, ToolSpec, bind_tool, host_tool_spec, settings_problems
 
 _FIELD_TYPES: dict[str, Any] = {
     "string": str,
@@ -293,6 +295,10 @@ class AgentBuilder:
         self.local_window: Callable[[], int | None] = lambda: None
         #: The workspace's output limit settings of Nodestro's own AI operations (see :mod:`.output_limits`).
         self.output_overrides: Callable[[], Mapping[str, int]] = lambda: {}
+        #: Service connections (NAL-A1): the resolver built-in tools get their connection from at call time, and a
+        #: lookup without the secret for validation. Unset (``None``/empty) outside a workspace.
+        self.resolve_connection: Callable[..., ResolvedConnection] | None = None
+        self.find_connection: Callable[[str], Any] = lambda _connection_id: None
 
     def output_limit(self, operation: str, model: str, connection: Connection | None = None) -> EffectiveLimit:
         """The output limit one of Nodestro's own AI operations sends to ``model``: the workspace setting, else the
@@ -389,8 +395,14 @@ class AgentBuilder:
             )
         if not attended:
             check_unattended_mcp(config.tools)
+        counter = CallCounter()
         tools = [
-            self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled, gated=gated)
+            self._bound(
+                tool_name,
+                self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled, gated=gated),
+                config,
+                counter,
+            )
             for tool_name in dict.fromkeys(config.tools)
         ]
         taken = {tool.name for tool in tools}
@@ -485,6 +497,78 @@ class AgentBuilder:
             reasoning_reduced=reasoning_reduction(config, connection, model),
         )
 
+    def _bound(self, name: str, tool: Tool, config: AgentConfig, counter: CallCounter) -> Tool:
+        """A built-in tool under its spec (time limit, call limit, connection; NAL-A1). Tools of integrations without
+        a spec keep a generous time limit only. Other tools are returned unchanged."""
+        if name not in self.tools.builtin:
+            return tool
+        spec = self.tools.specs.get(name) or host_tool_spec(name)
+        if spec is None:
+            return tool
+        resolve = self.resolve_connection
+
+        def connection(connection_id: str, connection_type: str) -> ResolvedConnection:
+            assert resolve is not None
+            return resolve(connection_id, expected_type=connection_type)
+
+        return bind_tool(
+            tool,
+            spec,
+            config.tool_settings.get(name),
+            resolve=connection if resolve is not None else None,
+            counter=counter,
+        )
+
+    def _settings_issues(self, config: AgentConfig) -> list[ConfigIssue]:
+        """Problems of the agent's tool settings (``tool_settings``): only for its built-in tools with a spec, with
+        valid parameters and an existing connection of the right type."""
+        found: list[ConfigIssue] = []
+
+        def issue(code: str, message: str, *, level: str = "error", field: str | None = None, **params: Any) -> None:
+            found.append(ConfigIssue(level=level, field=field, code=code, params=params, message=message))
+
+        def spec_of(name: str) -> ToolSpec | None:
+            return self.tools.specs.get(name) if name in self.tools.builtin else None
+
+        for name, settings in config.tool_settings.items():
+            where = f"tool_settings.{name}"
+            if name not in config.tools:
+                issue(
+                    "tool.settings_unused",
+                    f"Settings for {name}, which the agent does not use",
+                    level="warning",
+                    field=where,
+                    name=name,
+                )
+                continue
+            for item in settings_problems(name, spec_of(name), settings):
+                found.append(ConfigIssue(field=where, code=item.code, params=item.params, message=item.message))
+        for name in dict.fromkeys(config.tools):
+            spec = spec_of(name)
+            if spec is None or spec.connection_type is None:
+                continue
+            bound = config.tool_settings.get(name)
+            connection_id = bound.connection_id if bound is not None else None
+            stored = self.find_connection(connection_id) if connection_id else None
+            where = f"tool_settings.{name}"
+            if stored is None:
+                issue(
+                    "check.connection_missing",
+                    f"{name} needs a {spec.connection_type} connection",
+                    field=where,
+                    name=name,
+                    type=spec.connection_type,
+                )
+            elif stored.type != spec.connection_type:
+                issue(
+                    "connection.type_mismatch",
+                    f"{name} needs a {spec.connection_type} connection, not {stored.type}",
+                    field=where,
+                    type=stored.type,
+                    expected=spec.connection_type,
+                )
+        return found
+
     def validate(self, config: AgentConfig) -> list[ConfigIssue]:
         """Problems the inspector shows; uses the library's own model rules."""
         issues: list[ConfigIssue] = []
@@ -510,6 +594,7 @@ class AgentBuilder:
             found = library_problem(exc)
             issue(found.code, found.message, **found.params)
         issues.extend(self._limit_issues(config))
+        issues.extend(self._settings_issues(config))
         web = {"web_search", "web_fetch"} & set(config.server_tools)
         if web and "code_execution" in config.server_tools:
             issue(
