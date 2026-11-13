@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Tests (TABRION MIG-NOD-1, VER-1): the PostgreSQL test helpers run on `tabrion.testing`. `tests/conftest.py` loads
+  the plugin (`pytest_plugins = ["tabrion.testing"]`) and points it at Nodestro's variables
+  (`configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`); `postgres_support.require_postgres()` resolves
+  its session fixture `tabrion_postgres_url`, so skipping without `NODESTRO_TEST_POSTGRES` and failing under
+  `NODESTRO_REQUIRE_POSTGRES=1` follow Tabrion's rule (the skip reason now reads "PostgreSQL tests need one of
+  NODESTRO_TEST_POSTGRES"). Every helper and fixture keeps its name (`DSN`, `new_schema`, `drop_schema`, `owner_of`,
+  the runtime-role mode, `fault_proxy`, the pgvector helpers); collected tests and skip lists are unchanged. The `dev`
+  extra pins `tabrion[testing,postgres]` at Tabrion v0.1.0 final (`d5821fa`), and `tests/test_tabrion_pin.py`
+  requires every Tabrion requirement to be the canonical full-SHA pin of one commit with a final installed version
+  (no range, no specifier, no marker). Without the dev extra (CI's `platforms` job) the plugin is not loaded and
+  `require_postgres()` skips (fails under `NODESTRO_REQUIRE_POSTGRES=1`) by itself. Tests only; no runtime dependency changes. `docs/api-consumers.md` lists
+  `tabrion.testing.configure`; `docs/TODO.md` adds RT-074 (pgvector switch, base edge in W2).
 - Fixed (TABRION QA-21): `scripts/check_tabrion_api.py --surface` no longer reports enum members and dataclass
   fields as missing. Tabrion's `docs/api/surface.json` lists them in the parent entry (`members`, `fields`), so a
   name such as `tabrion.TLSMode.AUTO` is now checked against its parent's entry and passes when the parent is stable

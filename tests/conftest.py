@@ -8,13 +8,18 @@ with the sandbox set the status themselves or are in a marked module.
 
 from __future__ import annotations
 
-# The fault-injection proxy (JQ-1) as a fixture for every test module.
-from postgres_support import fault_proxy  # noqa: F401
+# The fault-injection proxy (JQ-1) as a fixture for every test module, and the session request through which
+# postgres_support resolves tabrion.testing's fixtures (TABRION MIG-NOD-1).
+from postgres_support import TABRION_TESTING, fault_proxy, tabrion_session  # noqa: F401
 import pytest
 
 from nodestro_runtime import docker_status
 from nodestro_runtime.builtin_sandbox import LinuxSandbox, SandboxStatus
 from nodestro_runtime.testing import StaticDockerMonitor
+
+# The PostgreSQL test fixtures and the skip/require rule (TABRION MIG-NOD-1); postgres_support.configure_tabrion
+# names Nodestro's variables in pytest_configure.
+pytest_plugins = ["tabrion.testing"] if TABRION_TESTING else []
 
 _UNAVAILABLE = SandboxStatus(False, "untested-system", "not available in this test", "", 0)
 
@@ -27,6 +32,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     import postgres_support
 
+    postgres_support.configure_tabrion()
     if postgres_support.RUNTIME_ROLE_MODE and postgres_support.DSN:
         postgres_support.install_runtime_role_mode()
 
