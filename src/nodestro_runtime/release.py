@@ -118,6 +118,11 @@ class ReleaseBundle(BaseModel):
     #: (a restored database can carry any claim); an exported project uses it.
     tool_trust: dict[str, TrustClass] = Field(default_factory=dict)
     builtin_tools: list[str] = Field(default_factory=list)
+    #: The spec version of each built-in tool when it was published (``ToolSpec.version``, NAL-A1): ``id@version``.
+    builtin_versions: dict[str, int] = Field(default_factory=dict)
+    #: The connections the bundle's built-in tools are bound to, as ``{connection_id: "type:provider"}``; never
+    #: settings, an address or a secret. An exported package asks for them when it is set up (ADR-0001).
+    required_connections: dict[str, str] = Field(default_factory=dict)
     server_tools: list[str] = Field(default_factory=list)
     #: Tools of connected MCP servers, frozen at the definition they were approved with (WP-9): server id and slug,
     #: hash, classification, definition; never an address or a token. A run uses them only while the tenant's
@@ -135,14 +140,23 @@ class ReleaseBundle(BaseModel):
     def digest(self) -> str:
         """SHA-256 of the content (without the creation time): equal bundles, equal digest.
 
-        An empty ``tool_trust`` or ``mcp_tools`` is left out, so bundles published before they existed keep their
-        digest."""
+        Empty ``tool_trust``, ``mcp_tools``, ``builtin_versions``, ``required_connections`` and agent
+        ``tool_settings`` are left out, so bundles published before they existed keep their digest."""
         exclude = {"created_at"}
         if not self.tool_trust:
             exclude.add("tool_trust")
         if not self.mcp_tools:
             exclude.add("mcp_tools")
+        if not self.builtin_versions:
+            exclude.add("builtin_versions")
+        if not self.required_connections:
+            exclude.add("required_connections")
         data = self.model_dump(mode="json", exclude=exclude)
+        for workflow in [data["workflow"], *(item["workflow"] for item in data.get("subworkflows", []))]:
+            for node in workflow.get("nodes", []):
+                agent = node.get("agent")
+                if isinstance(agent, dict) and not agent.get("tool_settings"):
+                    agent.pop("tool_settings", None)  # agents published before NAL-A1 keep their digest
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
     def all_workflows(self) -> list[Workflow]:
@@ -187,7 +201,10 @@ class ReleaseBundle(BaseModel):
         if pinned is not None:
             return f"{name}:mcp:{pinned.hash[:12]}"
         if record is None:
-            return f"builtin:{name}" if name in self.builtin_tools else f"{name}:missing"
+            if name not in self.builtin_tools:
+                return f"{name}:missing"
+            version = self.builtin_versions.get(name)
+            return f"builtin:{name}@{version}" if version else f"builtin:{name}"
         return f"{name}:v{record.get('version')}:{str(record.get('sha256') or '')[:12]}"
 
     def tool_sources(self, workflow: Workflow) -> list[tuple[str, str, str]]:

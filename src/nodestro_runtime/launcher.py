@@ -19,6 +19,7 @@ from .problems import NodestroError
 from .python_tools import state_problem
 from .run_views import workflow_runs
 from .schemas import NodeRun, Run, RunIn, RunTrigger, Workflow
+from .tool_spec import BUILTIN_SPECS
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -86,8 +87,16 @@ async def launch(
     )
 
 
+def _stays_inside(name: str) -> bool:
+    """Whether ``name`` is one of Nodestro's own built-in tools that never reaches outside Nodestro."""
+    spec = BUILTIN_SPECS.get(name)
+    return spec is not None and spec.network == "none" and spec.capability.reach == "internal"
+
+
 def external_tools(ctx: Workspace, workflow: Workflow, *, depth: int = 0) -> list[str]:
-    """Own and generated tools of a workflow and its sub-workflows: they may act outside Nodestro.
+    """Every tool of a workflow and its sub-workflows that may act outside Nodestro: all but Nodestro's own built-in
+    tools that reach nothing outside (own, generated, MCP and integration tools, and built-in tools that use the
+    network, NAL-A1).
 
     Automatic starts (schedules, batches, test series) name them and need the user's
     explicit agreement, so no external action happens unnoticed.
@@ -95,7 +104,7 @@ def external_tools(ctx: Workspace, workflow: Workflow, *, depth: int = 0) -> lis
     found: set[str] = set()
     for node in workflow.nodes:
         if node.agent is not None:
-            found.update(name for name in node.agent.tools if name not in ctx.tools.builtin)
+            found.update(name for name in node.agent.tools if not _stays_inside(name))
         if node.subworkflow is not None and node.subworkflow.workflow_id and depth < 5:
             try:
                 child, _ = ctx.resolve_workflow(node.subworkflow.workflow_id, node.subworkflow.version)

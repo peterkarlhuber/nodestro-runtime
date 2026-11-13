@@ -312,7 +312,9 @@ def _bundle(**fields: Any) -> ReleaseBundle:
 def test_a_bundle_without_trust_claims_keeps_its_digest() -> None:
     bundle = _bundle()
     # Fields that newer bundles add are left out of the digest while empty.
-    data = bundle.model_dump(mode="json", exclude={"created_at", "tool_trust", "mcp_tools"})
+    data = bundle.model_dump(
+        mode="json", exclude={"created_at", "tool_trust", "mcp_tools", "builtin_versions", "required_connections"}
+    )
     import hashlib
     import json
 

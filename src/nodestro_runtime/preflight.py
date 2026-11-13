@@ -391,6 +391,48 @@ def workflow_models(workflow: Workflow) -> set[str]:
     return models
 
 
+def _tool_spec_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
+    """Built-in tools under their spec (NAL-A1): not available in this mode, or bound to a connection that was not
+    checked successfully. A missing connection is an error of the agent's own check (``check.connection_missing``)."""
+    mode = nodestro.connections.mode
+    found: list[CheckIssue] = []
+    for node in workflow.nodes:
+        config = node.agent if node.type == "agent" else None
+        if config is None:
+            continue
+        for name in dict.fromkeys(config.tools):
+            spec = nodestro.tools.specs.get(name) if name in nodestro.tools.builtin else None
+            if spec is None:
+                continue
+            if mode not in spec.modes:
+                found.append(
+                    _issue(
+                        "check.tool_mode_unsupported",
+                        f"This installation's mode does not offer the tool {name}",
+                        level="error",
+                        node_id=node.id,
+                        name=name,
+                        mode=mode,
+                    )
+                )
+            settings = config.tool_settings.get(name)
+            if spec.connection_type is None or settings is None or not settings.connection_id:
+                continue
+            stored = nodestro.connections.find(settings.connection_id)
+            if stored is not None and stored.check.status != "ok":
+                found.append(
+                    _issue(
+                        "check.connection_unchecked",
+                        f"The connection {stored.name} of {name} has not been checked successfully",
+                        node_id=node.id,
+                        name=name,
+                        connection=stored.name,
+                        status=stored.check.status,
+                    )
+                )
+    return found
+
+
 def _offline_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]:
     """The strict offline mode (D12): nothing of the run may need the internet."""
     if not nodestro.strict_offline():
@@ -432,6 +474,22 @@ def _offline_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]
                     level="error",
                     node_id=node.id,
                     names=", ".join(config.server_tools),
+                )
+            )
+        specs = nodestro.tools.specs
+        online = [
+            name
+            for name in config.tools
+            if name in specs and name in nodestro.tools.builtin and not specs[name].offline
+        ]
+        if online:
+            found.append(
+                _issue(
+                    "check.offline_tool",
+                    "These built-in tools need the internet; the strict offline mode does not allow them",
+                    level="error",
+                    node_id=node.id,
+                    names=", ".join(online),
                 )
             )
         remote = [name for name in config.tools if name.startswith("mcp__") and not _local_mcp(nodestro, name)]
@@ -1160,6 +1218,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
     problems += _dependency_issues(nodestro, workflow)
     problems += _provider_issues(nodestro, workflow)
     problems += _offline_issues(nodestro, workflow)
+    problems += _tool_spec_issues(nodestro, workflow)
     problems += _knowledge_mode_issues(nodestro, workflow)
     problems += _local_model_issues(nodestro, workflow)
     pending = nodestro.tool_drafts.pending_names() | (pending_tools or set())

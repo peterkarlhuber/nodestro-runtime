@@ -30,7 +30,7 @@ suspension), although every request of the suspended tenant, a decision included
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 import hashlib
 import json
@@ -77,6 +77,7 @@ from .sandbox_policy import HOST_AWS_ENV, Isolation, SandboxPolicy, TrustClass, 
 from .schemas import new_id, now
 from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolAdoption, ToolProvenance, code_digest, content_hash
+from .tool_spec import BUILTIN_SPECS, PLANNED_BUILTIN_NAMES, ToolSpec
 
 if TYPE_CHECKING:
     from .docker_status import DockerStatus
@@ -89,7 +90,9 @@ ToolKind = Literal["builtin", "custom", "generated", "mcp"]
 _APPROVAL_TIMEOUT_SECONDS = 3600
 #: Names no own or generated tool may have: Orkexa's dynamic-agent tools and the agent's system memory tool
 #: (re-review R-2: a tool named ``memory`` would otherwise pass for the memory tool).
-RESERVED_NAMES: frozenset[str] = RESERVED_TOOL_NAMES | {MEMORY_TOOL_NAME}
+#: Also the names of built-in tools that later packages add (``tool_spec.PLANNED_BUILTIN_NAMES``), so a stored tool
+#: never shadows them when they arrive.
+RESERVED_NAMES: frozenset[str] = RESERVED_TOOL_NAMES | {MEMORY_TOOL_NAME} | PLANNED_BUILTIN_NAMES
 
 # Tools are technical artefacts: whatever language the requirement is written in, the code, the
 # names, the docstring (which becomes the tool description agents read) and the tests stay English.
@@ -166,6 +169,9 @@ class ToolInfo(BaseModel):
     #: What the tool may do (shared model S-1, :mod:`nodestro_runtime.tool_policy`). Set for every tool; without a
     #: statement ``write`` + ``external``. Information for people and for the approval rules, not proof of behavior.
     capability: ToolCapability = UNKNOWN
+    #: The catalog entry of a built-in tool (NAL-A1): Nodestro's own, or one an integration handed in (contract 2;
+    #: its capability is the author's statement and never replaces ``capability`` above).
+    spec: ToolSpec | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -512,6 +518,7 @@ class ToolLibrary:
         policy: SandboxPolicy | None = None,
         provenance: ToolProvenance | None = None,
         protected: tuple[str, ...] | None = None,
+        extra_specs: Mapping[str, ToolSpec] | None = None,
     ) -> None:
         """``extra_tools``: trusted tools of installed integrations (:mod:`nodestro_runtime.extensions`).
 
@@ -530,6 +537,10 @@ class ToolLibrary:
         for tool in (*BUILTIN_TOOLS, *extra_tools):
             assert tool.name is not None
             self.builtin[tool.name] = tool
+        #: The specs of built-in tools (NAL-A1): Nodestro's own and those integrations handed in (contract 2).
+        self.specs: dict[str, ToolSpec] = {
+            name: spec for name, spec in {**(extra_specs or {}), **BUILTIN_SPECS}.items() if name in self.builtin
+        }
         self._seen: _Fingerprint = ()
         self._registry = self._load(
             Path(path) if path is not None else None, sandbox or make_sandbox("subprocess", self.policy)
@@ -626,6 +637,7 @@ class ToolLibrary:
                 input_schema=record.input_schema,
                 created_at=record.created_at,
                 capability=capability_of(name=record.name, kind="builtin"),
+                spec=self.specs.get(record.name),
             )
         kind: ToolKind = "generated" if record.requirement else "custom"
         trust = self.trust(name)

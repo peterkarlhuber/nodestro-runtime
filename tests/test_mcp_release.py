@@ -87,7 +87,14 @@ def test_bundles_without_mcp_tools_keep_their_digest() -> None:
     import json
 
     bundle = bundle_with({})
-    data = bundle.model_dump(mode="json", exclude={"created_at", "tool_trust", "mcp_tools"})
+    # The shape before MCP and NAL-A1: no tool trust, MCP tools, built-in versions, connections or tool settings.
+    data = bundle.model_dump(
+        mode="json",
+        exclude={"created_at", "tool_trust", "mcp_tools", "builtin_versions", "required_connections"},
+    )
+    for node in data["workflow"]["nodes"]:
+        if node.get("agent"):
+            del node["agent"]["tool_settings"]
     expected = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     assert bundle.digest() == expected
 

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Added (NAL-A1, runtime ADR-0001): built-in tool specs and service connections.
+  - `tool_spec.ToolSpec` for every built-in tool (id, version, category, capability from `BUILTIN_CAPABILITIES`,
+    network, offline, connection type, binding parameters, cost unit, modes, time limit, call limit, i18n key);
+    `ToolInfo.spec` carries it. The five built-in tools keep capability and schema unchanged.
+  - `AgentConfig.tool_settings` (connection and parameters per built-in tool, validated against the spec). Built-in
+    tools run under their time limit (`tool.timeout`) and call limit per run (`tool.call_limit`) and read their binding
+    through `current_tool_context()`; tools of integrations without a spec get a 300-second time limit.
+  - `connections.ServiceConnection` and `ConnectionService`: one model for every service access (types `search`,
+    `smtp`, `webhook`; `database` reserved for CR-DB), write-only secrets sealed in the token vault shared with MCP
+    (namespace `connection`, bound to tenant and connection), egress derived from the settings, audit events
+    (`connection_events`, mirrored to Axentra when the audit mirror is on). `Workspace.connections`.
+  - Checks: `check.offline_tool`, `check.tool_mode_unsupported`, `check.connection_unchecked`; agent check
+    `check.connection_missing`, `connection.type_mismatch`, `tool.settings_*`.
+  - Integration contract 2 (`CONTRACT = 2`, contract 1 still accepted): `(ToolSpec, Tool)` pairs; such a spec is the
+    author's statement and never lowers the effective capability. Automatic starts now also list integration tools.
+  - `ReleaseBundle.builtin_versions` and `required_connections` (left out of the digest while empty).
+  - The names `search_web` and `fetch_web_page` are reserved for NAL-A2.
+  - `mcp/netguard.py`: the address rules (`address_problem`, `url_secret_problem`) moved unchanged to `net_address.py`
+    and are re-exported; `TokenVault` takes a `namespace` (default `mcp`, unchanged for MCP).
+  - `docs/TODO.md` adds RT-075, RT-076, RT-077.
+
 - Tests (TABRION MIG-NOD-1, VER-1): the PostgreSQL test helpers run on `tabrion.testing`. `tests/conftest.py` loads
   the plugin (`pytest_plugins = ["tabrion.testing"]`) and points it at Nodestro's variables
   (`configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`); `postgres_support.require_postgres()` resolves
