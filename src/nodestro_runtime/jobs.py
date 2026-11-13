@@ -53,6 +53,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from .error_texts import failure_text
 from .knowledge import ReindexJob
 from .problems import NodestroError
 from .schemas import Run, RunEvent
@@ -765,9 +766,12 @@ class RunWorker:
             runs = self._manager(job.tenant_id)
             runs.execute_claimed(job.ref)
         except Exception as exc:  # the run cannot be executed (gone, finished, cancelled): the job ends here
-            logger.warning("Job %s (run %s) cannot be executed: %s", job.id, job.ref, exc)
+            # Value-free (TABRION MIG-NOD-3): the job's error is shown to clients, and a database error's text may hold
+            # the server's DETAIL values.
+            reason = str(exc) if isinstance(exc, NodestroError) else failure_text(exc)
+            logger.warning("Job %s (run %s) cannot be executed: %s", job.id, job.ref, reason)
             code = exc.code if isinstance(exc, NodestroError) else type(exc).__name__
-            self.queue.finish(job.id, self.name, "failed", f"{code}: {exc}")
+            self.queue.finish(job.id, self.name, "failed", f"{code}: {reason}")
             return
         log = self._logs[job.tenant_id]
         waiting = asyncio.ensure_future(runs.wait(job.ref))

@@ -79,6 +79,9 @@ def test_a_nodestro_error_with_server_text_gives_only_its_code() -> None:
         f"pg_dump failed: {'x' + chr(10) + 'DETAIL:  Key (email)=(' + CANARY + ')'!r}",  # repr form: \\nDETAIL:
         f"insert failed [SQL: INSERT INTO t VALUES (%(email)s)] [parameters: {{'email': '{CANARY}'}}]",
         f"pg_dump: error: query failed: ERROR:  duplicate key\npg_dump: detail: Key (email)=({CANARY}) exists",
+        # A primary message that quotes the value, without any DETAIL line (review condition b).
+        f'pg_dump failed: pg_dump: error: query failed: ERROR:  invalid input syntax for type integer: "{CANARY}"',
+        f'restore failed: ERROR:  invalid input syntax for type integer: "{CANARY}"',
     ],
 )
 def test_server_text_in_other_forms_also_gives_only_the_code(message: str) -> None:
@@ -275,3 +278,57 @@ def test_a_failing_postgres_backup_names_no_value(postgres: object) -> None:
         " table canary_backup)"
     )
     assert CANARY not in repr(caught.value.problem.model_dump())
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Run jobs (jobs.py): the error of a job whose run cannot be executed
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _UniqueViolation(Exception):
+    """Stands in for psycopg's error: a SQLSTATE, and the server's DETAIL in its text."""
+
+    sqlstate = "23505"
+
+
+class _Runs:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def execute_claimed(self, _run_id: str) -> None:
+        raise self.error
+
+
+class _Workspace:
+    def __init__(self, error: Exception) -> None:
+        self.runs = _Runs(error)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            _UniqueViolation(f"duplicate key value\nDETAIL:  Key (email)=({CANARY}) already exists."),
+            "_UniqueViolation: unique violation (SQLSTATE 23505)",
+        ),
+        (ValueError(f"bad row {CANARY}"), "ValueError: ValueError"),
+        (NodestroError("run.not_found", "The run is gone"), "run.not_found: The run is gone"),
+    ],
+)
+def test_a_job_whose_run_cannot_be_executed_stores_no_value(
+    postgres: object, error: Exception, expected: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    import asyncio
+
+    from nodestro_runtime.jobs import RUN_JOB, JobQueue, RunWorker
+
+    queue = JobQueue(postgres)  # type: ignore[arg-type]
+    postgres.migrate()  # type: ignore[attr-defined]
+    job = queue.enqueue("alpha", RUN_JOB, "run-1")
+    assert job is not None
+    with caplog.at_level("WARNING", logger="nodestro_runtime.jobs"):
+        asyncio.run(RunWorker(queue, lambda _tenant: _Workspace(error), name="w1").run_once())
+    finished = queue.get(job.id)
+    assert finished is not None and finished.status == "failed"
+    assert finished.error == expected
+    assert CANARY not in caplog.text

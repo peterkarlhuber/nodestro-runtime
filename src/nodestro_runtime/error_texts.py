@@ -23,10 +23,14 @@ __all__ = ["failure_text"]
 _DRIVER_PACKAGES = frozenset({"sqlite3", "psycopg", "psycopg2", "psycopg_pool"})
 #: How many explicit links (``orig``, ``__cause__``) :func:`failure_text` follows, like :func:`tabrion.errors.classify`.
 _MAX_CAUSE_DEPTH = 5
-#: Signs of a database server's text in a message (``DETAIL:``, ``HINT:`` ..., also after an escaped ``\n`` and in
-#: pg_dump's lower-case form, and SQLAlchemy's ``[parameters: ...]``): defense in depth for :class:`NodestroError`
-#: messages, which are meant to be value-free by construction.
-_SERVER_TEXT = re.compile(r"(?:DETAIL|HINT|CONTEXT|QUERY|LINE \d+):|\[(?:parameters|SQL): ", re.IGNORECASE)
+#: Signs of a database server's or pg_dump's text in a message (``ERROR:``, ``DETAIL:``, ``HINT:`` ..., ``pg_dump:``,
+#: also after an escaped ``\n`` and in lower case, and SQLAlchemy's ``[parameters: ...]``): a :class:`NodestroError`
+#: whose message shows one gives only its code. Defense in depth, not a guarantee: a Nodestro message may still quote
+#: a value or a path without such a sign (nodestro-api's ``pg_dump failed: {stderr}`` and storage path messages are
+#: tracked as the api part of MIG-NOD-3).
+_SERVER_TEXT = re.compile(
+    r"(?:ERROR|DETAIL|HINT|CONTEXT|QUERY|LINE \d+):|pg_dump:|\[(?:parameters|SQL): ", re.IGNORECASE
+)
 
 
 _SQLSTATE = re.compile(r"[0-9A-Z]{5}")
@@ -69,8 +73,9 @@ def failure_text(exc: BaseException) -> str:
     * a Tabrion error or a database error in it gives its value-free text (Tabrion's
       :func:`~tabrion.errors.safe_message`: kind, SQLSTATE or SQLite code, object names; never ``DETAIL``,
       parameters or paths);
-    * otherwise a :class:`NodestroError` keeps its own message, which is value-free by construction and would reach
-      the client unchanged if raised on its own (only its code when the message shows database server text);
+    * otherwise a :class:`NodestroError` keeps its own message, which would reach the client unchanged if raised on
+      its own; Nodestro messages are meant to hold no values, but that is the raising code's duty, not guaranteed
+      here (only its code when the message shows database server or pg_dump text, :data:`_SERVER_TEXT`);
     * anything else gives its class name (an :class:`OSError` also its system error name, never its file name),
       because its text may quote data or paths.
 

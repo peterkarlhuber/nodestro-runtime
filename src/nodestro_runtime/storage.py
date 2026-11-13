@@ -38,7 +38,6 @@ _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 logger = logging.getLogger(__name__)
 
-
 #: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
 SCHEMA_VERSION = 2
 #: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
