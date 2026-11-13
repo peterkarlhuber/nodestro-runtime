@@ -26,10 +26,10 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from orkexa.dynamic import ToolRecord
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from .sandbox_policy import TrustClass
 from .schemas import Workflow, now
@@ -122,7 +122,11 @@ class ReleaseBundle(BaseModel):
     builtin_versions: dict[str, int] = Field(default_factory=dict)
     #: The connections the bundle's built-in tools are bound to, as ``{connection_id: "type:provider"}``; never
     #: settings, an address or a secret. An exported package asks for them when it is set up (ADR-0001).
-    required_connections: dict[str, str] = Field(default_factory=dict)
+    #: Ids have the form ``conn_<12 hex>`` (``connections.CONNECTION_ID``), so their variable names never collide.
+    required_connections: dict[
+        Annotated[str, StringConstraints(pattern=r"^conn_[0-9a-f]{12}$")],
+        Annotated[str, StringConstraints(max_length=100, pattern=r"^[a-z0-9_-]+:[a-z0-9_.-]+$")],
+    ] = Field(default_factory=dict)
     server_tools: list[str] = Field(default_factory=list)
     #: Tools of connected MCP servers, frozen at the definition they were approved with (WP-9): server id and slug,
     #: hash, classification, definition; never an address or a token. A run uses them only while the tenant's

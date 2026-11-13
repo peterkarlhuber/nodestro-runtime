@@ -131,6 +131,7 @@
   "connection.address_invalid": ["problems", "type"],
   "connection.check_failed": [],
   "connection.check_unavailable": [],
+  "connection.id_invalid": [],
   "connection.in_use": ["count", "names"],
   "connection.mode_unsupported": ["type"],
   "connection.name_taken": ["name"],

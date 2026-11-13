@@ -320,7 +320,8 @@ Rotation:
 
 1. Add the new key in front of the keyring (`k2:...,k1:...`) and restart: new values use `k2`, old ones stay readable.
 2. `nodestro-server secrets reencrypt --dry-run` counts the values per format; `secrets reencrypt` moves every
-   provider key, MCP token, pending OAuth state and billing admin key to the active key. One transaction per
+   provider key, MCP token, pending OAuth state, billing admin key and service connection secret (ADR-0001) to the
+   active key. One transaction per
    document with a row lock; resumable and idempotent; `--tenant` limits it.
 3. A value that cannot be read is **never overwritten or dropped**: it is reported (`tenant/collection/key:field`, no
    values) and the command exits with code 2.

@@ -189,6 +189,14 @@ def test_egress_is_derived_from_the_settings(store: SQLiteStore) -> None:
         ("https://10.0.0.5/in", "private"),
         ("https://169.254.169.254/latest", "metadata"),
         ("ftp://hooks.example.com/in", "scheme"),
+        # IPv4 in forms ``ipaddress`` refuses but resolvers accept, and cloud metadata names (security review).
+        ("https://2130706433/in", "invalid"),
+        ("https://0x7f000001/in", "invalid"),
+        ("https://127.1/in", "invalid"),
+        ("https://0177.0.0.1/in", "invalid"),
+        ("https://0/in", "invalid"),
+        ("https://metadata.google.internal/in", "metadata"),
+        ("https://metadata/in", "metadata"),
     ],
 )
 def test_addresses_without_credentials_https_and_no_internal_literals(
@@ -239,6 +247,21 @@ def test_removing_the_secret_and_changing_targets_resets_the_check(store: SQLite
     assert svc.check(item.id).check.status == "ok"
     assert svc.set_secret(item.id, "").secret_storage == "none"
     assert svc.get(item.id).check.status == "unchecked"
+
+
+def test_a_new_address_drops_the_secret(store: SQLiteStore) -> None:
+    """A secret only goes where it was entered for: moving the target clears it, other changes keep it."""
+    svc = service(store)
+    item = svc.create(ConnectionIn(type="webhook", name="Hook", settings={"url": "https://hooks.example.com/in"}))
+    svc.set_secret(item.id, MARKER)
+    kept = svc.update(item.id, ConnectionPatch(description="same target"))
+    assert kept.secret_storage == "vault" and kept.secret_sealed
+    path = svc.update(item.id, ConnectionPatch(settings={"url": "https://hooks.example.com/other"}))
+    assert path.secret_storage == "vault", "the same host keeps the secret"
+    moved = svc.update(item.id, ConnectionPatch(settings={"url": "https://attacker.example.net/in"}))
+    assert moved.secret_storage == "none" and moved.secret_sealed is None and not svc.view(moved).secret_set
+    event = svc.events()[0]
+    assert event.kind == "updated" and event.details.get("secret_cleared") is True
 
 
 def test_without_a_key_store_the_secret_stays_in_memory_only(store: SQLiteStore) -> None:
@@ -391,6 +414,7 @@ def test_exported_packages_read_connections_from_their_own_file_and_environment(
         "conn_bbbbbbbbbbbb": {"type": "webhook", "settings": {"url": "https://user:pw@example.com/x"}},
         "conn_cccccccccccc": {"type": "smtp", "settings": {"host": "mail.example.com", "unknown": 1}},
         "conn_dddddddddddd": "not an object",
+        "conn-a": {"type": "search", "provider": "test", "settings": {}, "secret": "x"},
     }
     variable = secret_variable("conn_aaaaaaaaaaaa")
     assert variable == "NODESTRO_CONNECTION_CONN_AAAAAAAAAAAA_SECRET"
@@ -401,6 +425,7 @@ def test_exported_packages_read_connections_from_their_own_file_and_environment(
         "conn_bbbbbbbbbbbb": "connection.address_invalid",
         "conn_cccccccccccc": "connection.settings_invalid",
         "conn_dddddddddddd": "connection.settings_invalid",
+        "conn-a": "connection.id_invalid",
     }
     required = {"conn_aaaaaaaaaaaa": "search:test", "conn_bbbbbbbbbbbb": "webhook:generic", "conn_x": "smtp:generic"}
     assert static.missing(required) == ["conn_bbbbbbbbbbbb", "conn_x"]

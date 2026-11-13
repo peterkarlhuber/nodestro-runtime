@@ -396,3 +396,19 @@ def test_a_rolled_back_nodestro_transaction_leaves_no_axentra_tenant(linked: Any
         == 0
     )
     assert linked.ensure_tenant("ghost", "Ghost").startswith("ten_")
+
+
+def test_reencryption_moves_service_connection_secrets(database: Any) -> None:
+    """Connection secrets (TokenVault namespace ``connection``, ADR-0001) rotate with every other tenant secret."""
+    legacy = SecretBox(b"L" * 32)
+    store = database.store("alpha")
+    sealed = legacy.encrypt("alpha", "connection:conn_0123456789ab", "smtp-password")
+    store.put_raw("service_connections", "conn_0123456789ab", {"id": "conn_0123456789ab", "secret_sealed": sealed})
+    box = _box(f"k1:{_key()}", legacy=legacy)
+    assert reencrypt_tenant_secrets(database, box, dry_run=True).pending == 1
+    report = reencrypt_tenant_secrets(database, box)
+    assert (report.reencrypted, report.failed) == (1, [])
+    moved = store.get_raw("service_connections", "conn_0123456789ab")["secret_sealed"]
+    assert (
+        moved.startswith("axs1.k1.") and box.decrypt("alpha", "connection:conn_0123456789ab", moved) == "smtp-password"
+    )

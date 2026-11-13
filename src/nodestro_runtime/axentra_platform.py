@@ -637,11 +637,18 @@ def _billing_keys(key: str, data: dict[str, Any]) -> Iterator[tuple[tuple[str, .
         yield ("admin_key",), f"pricing.billing.{key}.admin_key"
 
 
+def _connection_secrets(key: str, data: dict[str, Any]) -> Iterator[tuple[tuple[str, ...], str]]:
+    # The field name of TokenVault(namespace="connection"), see nodestro_runtime.connections (ADR-0001).
+    if isinstance(data.get("secret_sealed"), str):
+        yield ("secret_sealed",), f"connection:{data.get('id') or key}"
+
+
 #: Every place a server stores an encrypted tenant secret (see docs/AXENTRA.md, "Secrets").
 SECRET_FIELDS: tuple[SecretField, ...] = (
     SecretField("settings", _provider_keys),
     SecretField("mcp_servers", _mcp_tokens),
     SecretField("pricing_billing", _billing_keys),
+    SecretField("service_connections", _connection_secrets),
 )
 
 
