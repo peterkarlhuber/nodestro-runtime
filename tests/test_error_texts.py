@@ -58,13 +58,10 @@ def test_a_database_error_wrapped_in_another_error_is_found() -> None:
     assert text.startswith("unique violation (SQLite") and CANARY not in text
 
 
-def test_a_nodestro_error_gives_only_its_code() -> None:
-    assert failure_text(NodestroError("storage.backup_failed", "pg_dump is not installed")) == "storage.backup_failed"
-    # pg_dump's stderr in the api's message: a primary message that quotes a value, and a lower-case detail line.
-    stderr = (
-        f'pg_dump: error: query failed: ERROR:  invalid input syntax for type integer: "{CANARY}"\npg_dump: detail: x'
-    )
-    assert failure_text(NodestroError("storage.backup_failed", f"pg_dump failed: {stderr}")) == "storage.backup_failed"
+def test_a_nodestro_error_keeps_its_own_message() -> None:
+    """Value-free operator guidance of a hook (nodestro-api's backup) stays visible."""
+    error = NodestroError("storage.backup_required", "take a backup first (--backup-dir DIR runs pg_dump)")
+    assert failure_text(error) == "take a backup first (--backup-dir DIR runs pg_dump)"
 
 
 def test_a_nodestro_error_with_server_text_gives_only_its_code() -> None:
@@ -79,6 +76,7 @@ def test_a_nodestro_error_with_server_text_gives_only_its_code() -> None:
     [
         f"pg_dump failed: {'x' + chr(10) + 'DETAIL:  Key (email)=(' + CANARY + ')'!r}",  # repr form: \\nDETAIL:
         f"insert failed [SQL: INSERT INTO t VALUES (%(email)s)] [parameters: {{'email': '{CANARY}'}}]",
+        f"pg_dump: error: query failed: ERROR:  duplicate key\npg_dump: detail: Key (email)=({CANARY}) exists",
     ],
 )
 def test_server_text_in_other_forms_also_gives_only_the_code(message: str) -> None:
@@ -100,7 +98,7 @@ def test_an_error_raised_while_handling_a_database_error_names_itself() -> None:
         except sqlite3.Error:
             raise NodestroError("storage.backup_failed", "backup tool missing")  # noqa: B904
     except NodestroError as exc:
-        assert failure_text(exc) == "storage.backup_failed"
+        assert failure_text(exc) == "backup tool missing"
 
 
 def test_a_nodestro_error_caused_by_a_database_error_gives_the_safe_message() -> None:
@@ -111,6 +109,34 @@ def test_a_nodestro_error_caused_by_a_database_error_gives_the_safe_message() ->
             raise NodestroError("storage.backup_failed", f"copy failed: {inner}") from inner
     except NodestroError as exc:
         assert failure_text(exc).startswith("unique violation (SQLite SQLITE_CONSTRAINT_UNIQUE")
+
+
+def test_a_database_error_behind_a_non_database_orig_is_found() -> None:
+    class Adapter(Exception):
+        orig = ValueError(CANARY)
+
+    try:
+        raise Adapter(CANARY) from _sqlite_unique_error()
+    except Adapter as exc:
+        assert failure_text(exc).startswith("unique violation (SQLite")
+
+
+def test_a_pgcode_or_a_tabrion_error_in_the_chain_counts() -> None:
+    from tabrion.errors import StatementError, classify
+
+    class Psycopg2Like(Exception):
+        pgcode = "23505"
+
+    try:
+        raise RuntimeError(CANARY) from Psycopg2Like(f"DETAIL:  Key (email)=({CANARY})")
+    except RuntimeError as exc:
+        assert failure_text(exc) == "unique violation (SQLSTATE 23505)"
+    tabrion_error = StatementError("sqlite.statement_failed", classification=classify(_sqlite_unique_error()))
+    try:
+        raise RuntimeError(CANARY) from tabrion_error
+    except RuntimeError as exc:
+        text = failure_text(exc)
+    assert text == str(tabrion_error) and CANARY not in text
 
 
 def test_an_os_error_gives_its_system_error_name_without_the_path() -> None:
