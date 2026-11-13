@@ -2,8 +2,9 @@
 
 A failed backup (``storage.backup_failed``) or migration step (``storage.migration_failed``) used to end with
 ``str(exc)``: for PostgreSQL that is the server's text with ``DETAIL`` (``Key (email)=(...) already exists``), and for
-any other error whatever its text quoted. :func:`nodestro_runtime.storage.failure_text` replaces it on both stores. A
-canary value is put into every kind of failure and must not reach the message; the codes and parameters stay.
+any other error whatever its text quoted. :func:`nodestro_runtime.error_texts.failure_text` replaces it on both
+stores. A canary value is put into every kind of failure and must not reach the message; the codes and parameters
+stay.
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ import sqlite3
 import postgres_support
 import pytest
 
+from nodestro_runtime.error_texts import failure_text
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.storage import SQLiteStore, failure_text
+from nodestro_runtime.storage import SQLiteStore
 
 CANARY = "canary-nod3@example.com"
 

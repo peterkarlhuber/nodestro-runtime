@@ -46,8 +46,9 @@ import weakref
 
 from pydantic import BaseModel
 
+from .error_texts import failure_text
 from .problems import NodestroError
-from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time, failure_text
+from .storage import PAGED_COLLECTIONS, BeforeMigration, DamagedDocuments, ModelT, cursor_time
 
 if TYPE_CHECKING:
     from psycopg.abc import Params, Query
