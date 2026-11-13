@@ -1,28 +1,26 @@
-"""VER-1 (TABRION K-34, RC-2/RC-8): every Tabrion requirement of this package is the canonical pin of a final version.
+"""VER-1 (TABRION K-34, RC-1/RC-8): every Tabrion requirement of this package names one minor range of final versions.
 
-nodestro-runtime is an application in the V-B0 scheme: it names Tabrion by a direct URL, never by a range or a
-version specifier, and every Tabrion requirement in ``pyproject.toml`` (dependencies and extras) names the same
-commit (one Tabrion version per installation, AC-6). The form is the one nodestro-studio's ``check_versions.py``
-demands for every component: ``tabrion[<extras>] @ git+https://github.com/peterkarlhuber/tabrion.git@<40 hex>``.
-The pinned commit must be a final release (``0.1.0``, never ``0.1.1.dev0`` or ``0.2.0a1``, RC-8): the installed
-Tabrion, which pip or uv took from that commit, says which version it is.
+Since the CI-FAST pin switch, nodestro-runtime names its internal packages by version ranges, and the exact commits
+live in one lock (nodestro-studio ``platform/internal-server.txt``). For Tabrion, every requirement in
+``pyproject.toml`` (dependencies and extras) names the same range ``>=0.N,<0.(N+1)``: no direct URL, no other
+specifier, no pre-release bound and no environment marker (one Tabrion version per installation, AC-6). The installed
+Tabrion, which the lock chose, must be a final release inside that range (``0.1.0``, never ``0.1.1.dev0`` or
+``0.2.0a1``, RC-8).
 """
 
 from __future__ import annotations
 
 from importlib import metadata
-import json
 from pathlib import Path
-import re
 import tomllib
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 import pytest
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
-CANONICAL = re.compile(r"git\+https://github\.com/peterkarlhuber/tabrion\.git@(?P<sha>[0-9a-f]{40})")
 
 
 def tabrion_requirements(pyproject: dict) -> list[tuple[str, Requirement]]:
@@ -34,92 +32,102 @@ def tabrion_requirements(pyproject: dict) -> list[tuple[str, Requirement]]:
     return [(where, req) for where, req in found if canonicalize_name(req.name) == "tabrion"]
 
 
-def pin_problems(pyproject: dict) -> list[str]:
-    """What is wrong with the Tabrion pins of ``pyproject`` (empty: every pin is canonical, all on one commit)."""
+def minor_range(specifier: SpecifierSet) -> tuple[int, int] | None:
+    """``(0, N)`` when ``specifier`` is exactly ``>=0.N,<0.(N+1)`` (final bounds), else ``None``."""
+    specs = {spec.operator: spec.version for spec in specifier}
+    if len(specs) != 2 or set(specs) != {">=", "<"}:
+        return None
+    low, high = Version(specs[">="]), Version(specs["<"])
+    for bound in (low, high):
+        if bound.is_prerelease or bound.is_devrelease or bound.is_postrelease or bound.local:
+            return None
+    if any(low.release[2:]) or any(high.release[2:]):
+        return None
+    if low.major != 0 or high.major != 0 or high.minor != low.minor + 1:
+        return None
+    return (low.major, low.minor)
+
+
+def range_problems(pyproject: dict) -> list[str]:
+    """What is wrong with the Tabrion requirements of ``pyproject`` (empty: one minor range everywhere)."""
     problems: list[str] = []
-    shas: set[str] = set()
+    ranges: set[tuple[int, int]] = set()
     for where, req in tabrion_requirements(pyproject):
-        if req.url is None:
-            problems.append(f"{where}: {req} is not a direct URL pin (an application pins Tabrion, RC-2)")
+        if req.url is not None:
+            problems.append(f"{where}: {req} is a direct URL; the commit belongs in the studio lock (RC-1)")
             continue
-        match = CANONICAL.fullmatch(req.url)
-        if match is None:
-            problems.append(f"{where}: {req.url} is not git+https://github.com/peterkarlhuber/tabrion.git@<40 hex>")
-            continue
-        if req.specifier:
-            problems.append(f"{where}: {req} carries a version specifier next to the pin (RC-8)")
         if req.marker is not None:
             problems.append(f"{where}: {req} carries an environment marker (one Tabrion version everywhere)")
-        shas.add(match["sha"])
-    if len(shas) > 1:
-        problems.append(f"the Tabrion pins name {len(shas)} commits, not one: {', '.join(sorted(shas))}")
+            continue
+        found = minor_range(req.specifier)
+        if found is None:
+            problems.append(f"{where}: {req} does not name the range >=0.N,<0.(N+1) of final versions (RC-8)")
+            continue
+        ranges.add(found)
+    if len(ranges) > 1:
+        names = ", ".join(f">={major}.{minor},<{major}.{minor + 1}" for major, minor in sorted(ranges))
+        problems.append(f"the Tabrion requirements name {len(ranges)} ranges, not one: {names}")
     return problems
 
 
-def pinned_sha() -> str | None:
-    shas = {
-        CANONICAL.fullmatch(req.url)["sha"]  # type: ignore[index]
-        for _where, req in tabrion_requirements(tomllib.loads(PYPROJECT.read_text(encoding="utf-8")))
-        if req.url and CANONICAL.fullmatch(req.url)
-    }
-    return next(iter(shas)) if len(shas) == 1 else None
-
-
-def test_every_tabrion_requirement_is_the_canonical_pin_of_one_commit() -> None:
+def test_every_tabrion_requirement_names_one_minor_range() -> None:
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
-    assert tabrion_requirements(pyproject), "the dev extra pins tabrion[testing,postgres] (MIG-NOD-1)"
-    assert pin_problems(pyproject) == []
+    assert tabrion_requirements(pyproject), "the dev extra requires tabrion[testing,postgres] (MIG-NOD-1)"
+    assert range_problems(pyproject) == []
 
 
 @pytest.mark.parametrize(
     ("line", "problem"),
     [
-        ("tabrion[testing]>=0.1,<0.2", "not a direct URL pin"),
-        ("tabrion==0.1.0", "not a direct URL pin"),
-        ("tabrion>=0.1.0a1,<0.2", "not a direct URL pin"),
-        ("tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@d5821fa", "is not git+https"),
-        ("tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@v0.1.0", "is not git+https"),
-        ("tabrion @ git+https://github.com/peterkarlhuber/tabrion@" + "a" * 40, "is not git+https"),
-        ("tabrion @ git+ssh://git@github.com/peterkarlhuber/tabrion.git@" + "a" * 40, "is not git+https"),
-        ("tabrion @ git+https://github.com/someone/tabrion.git@" + "a" * 40, "is not git+https"),
-        ("tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@" + "A" * 40, "is not git+https"),
-        (
-            "tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@" + "a" * 40 + " ; python_version > '3'",
-            "marker",
-        ),
+        ("tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@" + "a" * 40, "direct URL"),
+        ("tabrion==0.1.0", "does not name the range"),
+        ("tabrion>=0.1", "does not name the range"),
+        ("tabrion>=0.1,<0.3", "does not name the range"),
+        ("tabrion>=0.1,<1.0", "does not name the range"),
+        ("tabrion>=0.1.0a1,<0.2", "does not name the range"),
+        ("tabrion>=0.1.dev0,<0.2", "does not name the range"),
+        ("tabrion>=0.1.1,<0.2", "does not name the range"),
+        ("tabrion>=0.1,<0.2,!=0.1.3", "does not name the range"),
+        ("tabrion>=0.1,<0.2 ; python_version > '3'", "marker"),
     ],
 )
-def test_a_pin_that_is_not_canonical_is_reported(line: str, problem: str) -> None:
-    problems = pin_problems({"project": {"dependencies": [line]}})
+def test_a_requirement_that_is_not_one_minor_range_is_reported(line: str, problem: str) -> None:
+    problems = range_problems({"project": {"dependencies": [line]}})
     assert len(problems) == 1 and problem in problems[0], problems
 
 
-def test_two_commits_are_reported() -> None:
-    pin = "tabrion[{}] @ git+https://github.com/peterkarlhuber/tabrion.git@{}"
+def test_two_ranges_are_reported() -> None:
     pyproject = {
         "project": {
-            "dependencies": [pin.format("postgres", "a" * 40)],
-            "optional-dependencies": {"dev": [pin.format("testing", "b" * 40)]},
+            "dependencies": ["tabrion[postgres]>=0.1,<0.2"],
+            "optional-dependencies": {"dev": ["tabrion[testing]>=0.2,<0.3"]},
         }
     }
-    problems = pin_problems(pyproject)
-    assert len(problems) == 1 and "2 commits" in problems[0], problems
+    problems = range_problems(pyproject)
+    assert len(problems) == 1 and "2 ranges" in problems[0], problems
+
+
+def test_the_same_range_in_two_places_is_fine() -> None:
+    pyproject = {
+        "project": {
+            "dependencies": ["tabrion[postgres]>=0.1,<0.2"],
+            "optional-dependencies": {"dev": ["tabrion[testing,postgres]>=0.1.0,<0.2.0"]},
+        }
+    }
+    assert range_problems(pyproject) == []
 
 
 def test_other_requirements_are_not_checked() -> None:
-    assert pin_problems({"project": {"dependencies": ["tabrion-studio>=0.1", "pytest>=8"]}}) == []
+    assert range_problems({"project": {"dependencies": ["tabrion-studio>=0.1", "pytest>=8"]}}) == []
 
 
-def test_the_installed_tabrion_is_the_final_version_of_the_pinned_commit() -> None:
-    """The commit is a final release: Tabrion installed from it (``pip install -e ".[dev]"``) has a final version."""
-    sha = pinned_sha()
-    assert sha is not None
-    distribution = metadata.distribution("tabrion")
-    version = Version(distribution.version)
+def test_the_installed_tabrion_is_a_final_version_inside_the_range() -> None:
+    """The lock chose a final release: Tabrion installed from it (``pip install -c <lock> -e ".[dev]"``)."""
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    assert range_problems(pyproject) == []
+    specifier = tabrion_requirements(pyproject)[0][1].specifier
+    version = Version(metadata.version("tabrion"))
     assert not (version.is_prerelease or version.is_devrelease or version.is_postrelease or version.local), (
-        f"tabrion {version} is not a final version (RC-8): pin the commit of a final release"
+        f"tabrion {version} is not a final version (RC-8): the lock must name the commit of a final release"
     )
-    direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
-    assert direct_url.get("vcs_info", {}).get("commit_id") == sha, (
-        f"the installed tabrion {version} is not the pinned commit {sha}: {direct_url}"
-    )
+    assert version in specifier, f"tabrion {version} is outside {specifier}"

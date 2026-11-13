@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Changed (TABRION VER-1 after the CI-FAST pin switch): the `dev` extra requires `tabrion[testing,postgres]>=0.1,<0.2`
+  instead of a direct URL; the exact commit (v0.1.0 final, `d5821fa`) comes from the studio lock like every internal
+  package. `tests/test_tabrion_pin.py` now requires every Tabrion requirement to name the same minor range
+  `>=0.N,<0.(N+1)` (no direct URL, no pre-release, no marker) and the installed Tabrion to be a final version inside it.
 - Added (NAL-A1, runtime ADR-0001): built-in tool specs and service connections.
   - `tool_spec.ToolSpec` for every built-in tool (id, version, category, capability from `BUILTIN_CAPABILITIES`,
     network, offline, connection type, binding parameters, cost unit, modes, time limit, call limit, i18n key);

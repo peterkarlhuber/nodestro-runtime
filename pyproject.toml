@@ -54,10 +54,10 @@ dev = [
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc]>=0.1.0.dev0,<0.2",
-    # The PostgreSQL test fixtures (tests/postgres_support.py, TABRION MIG-NOD-1): Tabrion v0.1.0 final, pinned by its
-    # commit (an application pins Tabrion, VER-1; tests/test_tabrion_pin.py). Every Tabrion requirement in this file and
-    # nodestro-api's dev extra name the same commit; move them together.
-    "tabrion[testing,postgres] @ git+https://github.com/peterkarlhuber/tabrion.git@d5821faa8742dea012abda3b663549c038d76543",
+    # The PostgreSQL test fixtures (tests/postgres_support.py, TABRION MIG-NOD-1). Every Tabrion requirement in this
+    # file names the same minor range (VER-1, RC-8; tests/test_tabrion_pin.py); the exact commit, a final release, lives
+    # in the studio lock (nodestro-studio platform/internal-server.txt).
+    "tabrion[testing,postgres]>=0.1,<0.2",
     # Keeps the rule engine of the tenant SQL check free of Nodestro (lint-imports, contracts below).
     "import-linter>=2.1",
     "mypy>=1.13",
