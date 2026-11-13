@@ -13,7 +13,9 @@
   requires every Tabrion requirement to be the canonical full-SHA pin of one commit with a final installed version
   (no range, no specifier, no marker). Without the dev extra (CI's `platforms` job) the plugin is not loaded and
   `require_postgres()` skips (fails under `NODESTRO_REQUIRE_POSTGRES=1`) by itself. Tests only; no runtime dependency changes. `docs/api-consumers.md` lists
-  `tabrion.testing.configure`; `docs/TODO.md` adds RT-074 (pgvector switch, base edge in W2).
+  `tabrion.testing.configure`; `docs/TODO.md` adds RT-074 (pgvector switch, base edge in W2). The test job now
+  skips `test_a_directory_named_tabrion_is_not_an_installed_tabrion` (a real Tabrion is installed;
+  `tests/ci/skipped-test.txt` lists it with its reason).
 - Fixed (TABRION QA-21): `scripts/check_tabrion_api.py --surface` no longer reports enum members and dataclass
   fields as missing. Tabrion's `docs/api/surface.json` lists them in the parent entry (`members`, `fields`), so a
   name such as `tabrion.TLSMode.AUTO` is now checked against its parent's entry and passes when the parent is stable
