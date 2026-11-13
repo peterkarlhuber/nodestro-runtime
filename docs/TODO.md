@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 24 |
+| P3 Low | 27 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -40,6 +40,15 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+### RT-077 · Independent review of the service connection API and secret handling (NAL-A1)
+
+- **Priority:** P3 Low · **Status:** Needs external review · **Refs:** ADR-0001 (runtime), `connections.py`,
+  nodestro-api `api_connections.py`, NAL plan v1.1 package D1
+- **What:** NAL-A1 added write-only secrets for service connections (shared vault with MCP tokens), tenant binding,
+  egress derivation and a management API. It was reviewed internally only. Plan v1.1 puts it into the next
+  independent review brief (D1, with NAL-A2). No feature flag depends on it; it gates nothing today.
+- **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
 
 Items that need an independent or external review (an internal audit does not replace it):
 
@@ -406,6 +415,26 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Features and enhancements
 
+### RT-075 · Desktop model provider keys into the vault (NAL-A1 follow-up)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** ADR-0001 (runtime) "Consequences", `workspace.py` provider
+  settings, `mcp/vault.py`
+- **What:** Service connections and MCP tokens are sealed in the vault; model provider keys of the desktop are still
+  stored as before (`workspace.py`). Moving them into the vault (namespace `provider`) was left out of NAL-A1 on
+  purpose (plan v1.1, NAL-A1 §4).
+- **Next step:** Migrate on first start with a key store, keep reading the old form, test on desktop and Local Docker.
+
+### RT-076 · Service connections: network check and cost booking (with NAL-A2)
+
+- **Priority:** P3 Low · **Status:** Blocked (NAL-A2 not released yet) · **Refs:** ADR-0001 D-1/D-3,
+  `connections.py` (`_check_search`, `_check_configuration`), `tool_spec.ToolSpec.cost_unit`
+- **What:** Until the network guard of NAL-A2 exists, a connection check contacts no service (only the offline
+  `test` search provider; SMTP and webhook connections get a configuration check). `cost_unit` and
+  `price_per_request_usd` exist, but no tool books a cost into the run budget yet, because no built-in tool has a
+  cost before NAL-A2.
+- **Next step:** With NAL-A2: checks through the guarded transport (egress list, private ranges at call time), and
+  book `cost_unit` x price into the run's tracker as `tool:<id>` (counted by BUDGET-1).
+
 ### RT-041 · Similarity hint for pasted code that resembles AI-generated code (R-4)
 
 - **Priority:** P4 Optional · **Status:** Open · **Refs:** ADR-0006 (R-4 amendment), `tool_library.editor_trust`,
@@ -710,6 +739,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
+| RT-077 | nodestro-api, tabrion | API-065 (connection API), CR-DB NOD-CR-2 (`database` type) | ADR-0001 is the shared connection contract; CR-DB registers `database` instead of its own model (owner decision E-2) |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |

@@ -33,13 +33,18 @@ from orkexa import Tool
 
 from .documents import OcrResult
 from .problems import NodestroError
+from .tool_spec import ToolSpec
 
 logger = logging.getLogger(__name__)
 
 #: The entry point group installed integrations register in.
 ENTRY_POINT_GROUP = "nodestro.integrations"
 #: The version of this contract; it changes only when existing integrations would break.
-CONTRACT = 1
+#: Version 2 (NAL-A1, ADR-0001) lets an integration hand in a :class:`~nodestro_runtime.tool_spec.ToolSpec` with each
+#: tool: ``tools`` may hold ``(spec, tool)`` pairs. Integrations written for version 1 keep working unchanged.
+CONTRACT = 2
+#: Every contract version the runtime still accepts.
+SUPPORTED_CONTRACTS: frozenset[int] = frozenset({1, 2})
 
 
 @runtime_checkable
@@ -63,7 +68,9 @@ class Integration:
 
     name: str
     version: str = "0"
-    tools: Sequence[Tool] = field(default_factory=tuple)
+    #: Tools, or (contract 2) ``(spec, tool)`` pairs. A spec's capability always counts as the integration author's
+    #: statement (``source="author"``), never as Nodestro's.
+    tools: Sequence[Tool | tuple[ToolSpec, Tool]] = field(default_factory=tuple)
     ocr: OcrEngine | None = None
     #: The contract version the integration was written for.
     contract: int = CONTRACT
@@ -74,9 +81,32 @@ class ExtensionError(NodestroError):
     """An integration that cannot be used (wrong contract version, duplicate tool names)."""
 
 
+def _split(item: Integration) -> list[tuple[ToolSpec | None, Tool]]:
+    """The tools of ``item`` with their specs (``None``: no spec, contract 1)."""
+    pairs: list[tuple[ToolSpec | None, Tool]] = []
+    for entry in item.tools:
+        if isinstance(entry, tuple):
+            if item.contract < 2 or len(entry) != 2:
+                raise ExtensionError(
+                    "extension.invalid",
+                    f"Integration {item.name!r} hands in a tool spec without contract 2",
+                    name=item.name,
+                )
+            spec, tool = entry
+            if not isinstance(spec, ToolSpec) or not isinstance(tool, Tool) or spec.id != tool.name:
+                raise ExtensionError(
+                    "extension.tool_spec", f"A tool spec of {item.name!r} does not match its tool", name=item.name
+                )
+            author = spec.capability.model_copy(update={"source": "author"})
+            pairs.append((spec.model_copy(update={"capability": author}), tool))
+        else:
+            pairs.append((None, entry))
+    return pairs
+
+
 def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list[str]:
     """The tool names of ``item``; raises when it cannot be used next to the integrations before it."""
-    if item.contract != CONTRACT:
+    if item.contract not in SUPPORTED_CONTRACTS:
         raise ExtensionError(
             "extension.contract",
             f"Integration {item.name!r} was written for contract {item.contract}, the runtime offers {CONTRACT}",
@@ -84,7 +114,7 @@ def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list
             contract=item.contract,
         )
     found: list[str] = []
-    for tool in item.tools:
+    for _spec, tool in _split(item):
         if tool.name is None:
             raise ExtensionError("extension.tool_name", f"A tool of {item.name!r} has no name", name=item.name)
         owner = names.get(tool.name) or ("the runtime" if tool.name in reserved else None)
@@ -156,7 +186,11 @@ class Extensions:
             self.integrations.append(item)
 
     def tools(self) -> list[Tool]:
-        return [tool for item in self.integrations for tool in item.tools]
+        return [tool for item in self.integrations for _spec, tool in _split(item)]
+
+    def specs(self) -> dict[str, ToolSpec]:
+        """The specs integrations handed in (contract 2), by tool name; their capability is the author's."""
+        return {tool.name: spec for item in self.integrations for spec, tool in _split(item) if spec and tool.name}
 
     def ocr(self) -> OcrEngine | None:
         """The first OCR engine that can run now (``None``: OCR unavailable)."""
@@ -171,7 +205,8 @@ class Extensions:
             {
                 "name": item.name,
                 "version": item.version,
-                "tools": [tool.name for tool in item.tools],
+                "tools": [tool.name for _spec, tool in _split(item)],
+                "contract": item.contract,
                 "ocr": item.ocr.name if item.ocr is not None else None,
             }
             for item in self.integrations

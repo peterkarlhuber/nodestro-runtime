@@ -182,6 +182,14 @@ class ToolChoice(_Model):
 MAX_TOKENS_BOUND = 1_000_000
 
 
+class ToolSettings(_Model):
+    """How an agent binds one built-in tool (NAL-A1, ADR-0001): the service connection it uses and its binding
+    parameters (validated against the tool's ``params_schema``). Never visible to the model."""
+
+    connection_id: str | None = Field(default=None, max_length=64)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentConfig(_Model):
     """Everything about one agent node; mirrors the arguments of ``orkexa.Agent``.
 
@@ -206,6 +214,8 @@ class AgentConfig(_Model):
     #: When the agent asks before calling a tool (S-2), by tool name; a tool without an entry is a new binding
     #: (``auto``). Only applies while per-call approvals are switched on.
     tool_policies: dict[str, ToolBinding] = Field(default_factory=dict)
+    #: Connection and parameters of built-in tools, by tool name (only tools with a spec; see ``tool_spec``).
+    tool_settings: dict[str, ToolSettings] = Field(default_factory=dict)
     server_tools: list[str] = Field(default_factory=list)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
