@@ -44,8 +44,7 @@ pip install -r https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/
 `pyproject.toml` declares only version ranges for the Nodestro components and Orkexa; their exact commits live in the
 studio lock (`nodestro-studio/platform/internal-server.txt`), which installs every internal package from its GitHub
 commit. The names are not registered on PyPI, so a plain `pip install nodestro-runtime` without the lock cannot work.
-Both repositories are private, so pip needs read access, for example through
-`git config url."https://<token>@github.com/peterkarlhuber/".insteadOf "https://github.com/peterkarlhuber/"`.
+Orkexa and the Nodestro repositories are public, so pip reads them anonymously; no token is needed.
 The tested combination of all Nodestro components is recorded in `nodestro-studio/platform/versions.json`.
 
 ## Quickstart (no provider account needed)
@@ -281,7 +280,8 @@ PostgreSQL migration `0009_created_order`), whatever the number of runs; times c
 copy. Runs without a readable `created_at` (and damaged documents) are not listed. `list` is unchanged.
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
-PostgreSQL; it needs the optional dependency `pip install "nodestro-runtime[postgres]"` (psycopg 3) and is not
+PostgreSQL; it needs the optional dependency `postgres` (psycopg 3; with the studio lock as above,
+`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `-e ".[dev,postgres]"` in a checkout) and is not
 used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns a pool of connections (`pool_size`, default
 `NODESTRO_DATABASE_POOL_SIZE`, else 8) shared by every tenant's store; `database.store(tenant_id)` gives
 the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store
@@ -441,7 +441,9 @@ AI Act or ISO/IEC 42001; that depends on how an operator uses and documents the 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install "pip>=26.1"
+curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt | grep -v '^nodestro-runtime ' > lock.txt
+pip install -c lock.txt -e ".[dev]"
 ruff check . && ruff format --check . && mypy && pytest
 ```
 
