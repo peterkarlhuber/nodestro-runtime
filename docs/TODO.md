@@ -525,8 +525,8 @@ Items that need an independent or external review (an internal audit does not re
 - **What:** The snapshot tools and the golden files of the old code (catalog and runtime role privileges after
   `grant_runtime_role`, role decision table of eight variants, error answers of the database paths, `SHOW` extract per
   kind of connection, schema dump) are in place and checked by `tests/test_rollback_snapshots.py`. The steps that use
-  them are still to come: MIG-NOD-3 (error texts; it rewrites `errors.json`, whose migration and backup messages
-  carry the canary value of finding B-06-2 today), MIG-NOD-4 (session configuration, `settings.json`), MIG-NOD-5
+  them: MIG-NOD-3 (error texts, done; it rewrote `errors.json`, whose backup and migration messages carried the
+  canary value of finding B-06-2), and still to come MIG-NOD-4 (session configuration, `settings.json`), MIG-NOD-5
   (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not covered: it records its own "before"
   output of `pgvector_status` in pg-a and pg-b first (review L-6). Review fix round (`qa-13-25-review.md` M-1, M-2,
   M-6, L-1, L-2, L-7): `catalog.json` names Axentra's tables (RLS/FORCE flags, privileges, counts) and holds every
@@ -575,13 +575,14 @@ Items that need an independent or external review (an internal audit does not re
   switch stays `NODESTRO_REQUIRE_PGVECTOR=1` (`require_pgvector`, `require_pgvector_or_skip`), because the helpers do
   not use `tabrion.testing.require_extension` yet; with it, CI's `pg-b` must set `NODESTRO_REQUIRE_EXTENSIONS=vector`
   instead (TB-072: pointing `require_extensions_env` at the old variable would read its `1` as an extension name), a
-  `.github` change. (2) The mandatory base edge `tabrion` and `tabrion[postgres]` in the `postgres` extra (doc 06
-  N-1, section 7.4) come with wave W2 (MIG-NOD-3, K-32 still `pending` in nodestro-studio's dependency policy), not
-  with the dev-only fixtures of W1; `tests/test_tabrion_pin.py` requires that every Tabrion requirement here
-  names the same minor range `>=0.N,<0.(N+1)` and that the installed Tabrion is a final version inside it (the exact
-  commit lives in the studio lock since the CI-FAST pin switch).
+  `.github` change. (2) Done in MIG-NOD-3 (wave W2): the mandatory base edge `tabrion` and `tabrion[postgres]` in
+  the `postgres` extra (doc 06 N-1, section 7.4); nodestro-studio's dependency policy still marks the base edge
+  `pending:K-32` and its studio-profile lock (`platform/internal.txt`) has no Tabrion yet, both for PIN-W2;
+  `tests/test_tabrion_pin.py` requires that every Tabrion requirement here names the same minor range
+  `>=0.N,<0.(N+1)` and that the installed Tabrion is a final version inside it (the exact commit lives in the studio
+  lock since the CI-FAST pin switch).
 - **Next step:** MIG-NOD-7 (or the first step that uses `require_extension`) switches the pgvector variable in the
-  same pull request as its `.github` change; MIG-NOD-3 adds the base edge with the same range as the dev extra.
+  same pull request as its `.github` change.
 
 ### RT-056 · The test double answers in German in every language
 
@@ -757,7 +758,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
-| (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and MIG-NOD-6 (mandatory `tabrion` core) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
+| (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and the mandatory `tabrion` core (since MIG-NOD-3) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
 | RT-074 | nodestro-api, tabrion | TABRION MIG-NOD-1, VER-1 (RC-2) | The `dev` extras of runtime and api pin `tabrion[testing,postgres]` at the same commit (v0.1.0 final `d5821fa`); a Tabrion pin bump moves both (runtime first, then api), and nodestro-studio's `check_versions.py` checks them |
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |

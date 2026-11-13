@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Security (TABRION MIG-NOD-3, finding B-06-2): the messages of `storage.backup_failed` and
+  `storage.migration_failed` (SQLite and PostgreSQL) no longer end with the error's text, which for PostgreSQL held the
+  server's `DETAIL` values. `error_texts.failure_text` gives Tabrion's value-free `safe_message` for a database error in
+  the explicit chain, a Nodestro error's own (value-free) message, or the class name (plus the system error name of an
+  `OSError`). Codes and parameters are unchanged; `tests/fixtures/rollback/errors.json` is rewritten. `tabrion`
+  (stdlib-only core, `>=0.1,<0.2`) becomes a base dependency and `tabrion[postgres]` joins the `postgres` extra
+  (doc 06 N-1).
 - Fixed (NAL-A1 review, ADR-0001): `secrets reencrypt` and the start-up key check now cover service connection
   secrets (`service_connections.secret_sealed`, field `connection:<id>`); before, retiring an old key id made them
   unreadable. Connection addresses refuse IPv4 in forms `ipaddress` does not parse (`127.1`, `2130706433`,

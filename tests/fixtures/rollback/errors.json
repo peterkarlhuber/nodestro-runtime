@@ -3,8 +3,8 @@
   "errors": {
     "backup_failed": {
       "code": "storage.backup_failed",
-      "message": "The backup before the schema migration failed, so nothing was changed: duplicate key value violates unique constraint \"canary_backup_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
-      "message_has_canary": true,
+      "message": "The backup before the schema migration failed, so nothing was changed: unique violation (SQLSTATE 23505, constraint canary_backup_email_key, table canary_backup)",
+      "message_has_canary": false,
       "params": {
         "found": 1,
         "supported": 2
@@ -46,8 +46,8 @@
     },
     "migration_failed": {
       "code": "storage.migration_failed",
-      "message": "The schema migration to version 1 failed; the database is unchanged: duplicate key value violates unique constraint \"nodestro_canary_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
-      "message_has_canary": true,
+      "message": "The schema migration to version 1 failed; the database is unchanged: unique violation (SQLSTATE 23505, constraint nodestro_canary_email_key, table nodestro_canary)",
+      "message_has_canary": false,
       "params": {
         "found": 0,
         "step": 1,
@@ -61,8 +61,8 @@
     },
     "migration_failed_after_backup": {
       "code": "storage.migration_failed",
-      "message": "The schema migration to version 2 failed; the database is unchanged: duplicate key value violates unique constraint \"nodestro_canary_email_key\"\nDETAIL:  Key (email)=(canary-qa13@example.com) already exists.",
-      "message_has_canary": true,
+      "message": "The schema migration to version 2 failed; the database is unchanged: unique violation (SQLSTATE 23505, constraint nodestro_canary_email_key, table nodestro_canary)",
+      "message_has_canary": false,
       "params": {
         "found": 1,
         "step": 2,

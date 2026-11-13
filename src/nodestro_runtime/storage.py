@@ -30,6 +30,7 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
+from .error_texts import failure_text
 from .problems import NodestroError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -616,7 +617,7 @@ class SQLiteStore:
             except Exception as exc:
                 raise NodestroError(
                     "storage.backup_failed",
-                    f"The backup before the schema migration failed, so nothing was changed: {exc}",
+                    f"The backup before the schema migration failed, so nothing was changed: {failure_text(exc)}",
                     found=current,
                     supported=target,
                 ) from exc
@@ -629,7 +630,7 @@ class SQLiteStore:
             except Exception as exc:
                 raise NodestroError(
                     "storage.migration_failed",
-                    f"The schema migration to version {step} failed; the database is unchanged: {exc}",
+                    f"The schema migration to version {step} failed; the database is unchanged: {failure_text(exc)}",
                     found=current,
                     supported=target,
                     step=step,
