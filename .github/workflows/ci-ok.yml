@@ -1,8 +1,9 @@
 name: ci-ok
 
-# CI-FAST W1 (v2): one report that says whether every mandatory pull-request check listed in .github/ci-manifest.json
-# ran on the PR head SHA and succeeded. REPORT-ONLY: the job stays green whatever the verdict (also on API errors) and
-# it is not a required check; the verdict is the job summary of the latest completed ci-ok run for that head SHA.
+# CI-FAST W1 (v3): one report that says whether every mandatory pull-request check listed in .github/ci-manifest.json
+# ran on the PR head SHA and succeeded. The verdict is posted as the check run `ci-ok` on the PR head SHA (this job is
+# named `ci-ok evaluate` so that its own check run never collides with it). REPORT-ONLY: the job stays green whatever
+# the verdict (also on API errors; it fails only when the check run cannot be posted) and `ci-ok` is not required.
 # Design note (nodestro-studio): docs/architecture/ci-fast/ci-ok.md.
 #
 # Why workflow_run and not pull_request: GitHub always runs a workflow_run workflow from the DEFAULT branch, so a pull
@@ -18,14 +19,15 @@ on:
     # run, their completion re-evaluates; when they do not, the other workflows' completions do). Not Nightly: it
     # never runs on pull_request. `ci_ok.py --self-check` fails when this list and the manifest differ.
     workflows: [CI, Platforms]
-    types: [completed]
+    # requested: the check goes back to in_progress while a listed workflow (or a re-run) runs; completed: evaluate.
+    types: [completed, requested]
 
 permissions:
   contents: read
 
 jobs:
   ci-ok:
-    name: ci-ok
+    name: ci-ok evaluate
     # Only pull_request runs are judged; completions of push, schedule or dispatch runs skip the job (no runner).
     if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
@@ -42,6 +44,10 @@ jobs:
       contents: read
       # Reading workflow runs and jobs of the PR head SHA.
       actions: read
+      # Posting the verdict as the check run `ci-ok` on the PR head SHA, and reading the check runs and commit
+      # statuses on it for the impostor scan.
+      checks: write
+      statuses: read
     steps:
       # The default branch's commit that this workflow_run event runs on (github.sha); never the pull request's code.
       - name: Check out the default branch's .github
