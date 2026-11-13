@@ -7,7 +7,9 @@
   (`configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`); `postgres_support.require_postgres()` resolves
   its session fixture `tabrion_postgres_url`, so skipping without `NODESTRO_TEST_POSTGRES` and failing under
   `NODESTRO_REQUIRE_POSTGRES=1` follow Tabrion's rule (the skip reason now reads "PostgreSQL tests need one of
-  NODESTRO_TEST_POSTGRES"). Every helper and fixture keeps its name (`DSN`, `new_schema`, `drop_schema`, `owner_of`,
+  NODESTRO_TEST_POSTGRES"). Behavior change: `NODESTRO_REQUIRE_POSTGRES` now counts when set to anything but
+  empty or `0` (Tabrion's rule; before, only `1` counted, so a value such as `true` skipped silently and now fails
+  closed); CI sets `1`, so nothing changes there. Every helper and fixture keeps its name (`DSN`, `new_schema`, `drop_schema`, `owner_of`,
   the runtime-role mode, `fault_proxy`, the pgvector helpers); collected tests and skip lists are unchanged. The `dev`
   extra pins `tabrion[testing,postgres]` at Tabrion v0.1.0 final (`d5821fa`), and `tests/test_tabrion_pin.py`
   requires every Tabrion requirement to be the canonical full-SHA pin of one commit with a final installed version

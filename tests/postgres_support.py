@@ -83,7 +83,8 @@ def drop_xdist_databases() -> None:
 _own_database_per_xdist_worker()
 
 DSN = os.environ.get("NODESTRO_TEST_POSTGRES", "")
-REQUIRED = os.environ.get("NODESTRO_REQUIRE_POSTGRES") == "1"
+#: ``NODESTRO_REQUIRE_POSTGRES`` set to anything but empty or ``0`` (Tabrion's rule since MIG-NOD-1).
+REQUIRED = os.environ.get("NODESTRO_REQUIRE_POSTGRES", "") not in ("", "0")
 RUNTIME_ROLE_MODE = os.environ.get("NODESTRO_TEST_RUNTIME_ROLE") == "1"
 RUNTIME_ROLE = "nodestro_test_runtime"
 RUNTIME_PASSWORD = "nodestro-test-runtime-pw"
@@ -132,11 +133,13 @@ def require_postgres() -> str:
     """The test database, or skip (fail when PostgreSQL is required).
 
     Through ``tabrion.testing``'s session fixture ``tabrion_postgres_url``: without ``NODESTRO_TEST_POSTGRES`` the
-    calling test skips, under ``NODESTRO_REQUIRE_POSTGRES=1`` it fails; the outcome is resolved once per session.
+    calling test skips, under ``NODESTRO_REQUIRE_POSTGRES`` it fails; the outcome is resolved once per session. The
+    require variable counts when it is set to anything but empty or ``0`` (Tabrion's rule; before MIG-NOD-1 only
+    ``1`` counted, so ``true`` now fails closed instead of skipping).
     """
     if not TABRION_TESTING:
-        if os.environ.get("NODESTRO_REQUIRE_POSTGRES") == "1":
-            pytest.fail("NODESTRO_REQUIRE_POSTGRES=1 but tabrion[testing] (the dev extra) is not installed")
+        if REQUIRED:
+            pytest.fail("NODESTRO_REQUIRE_POSTGRES is set but tabrion[testing] (the dev extra) is not installed")
         pytest.skip("PostgreSQL tests need the dev extra (tabrion[testing])")
     if _SESSION is None:
         raise RuntimeError("require_postgres() runs only inside a pytest session (conftest.py loads tabrion_session)")
