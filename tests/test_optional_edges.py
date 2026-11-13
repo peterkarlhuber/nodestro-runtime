@@ -44,6 +44,36 @@ class Edge:
     """The distribution of the ``postgres`` extra that brings the edge (checked by the meta test)."""
 
 
+_SQLITE_WORKSPACE_CHECK = """
+import pathlib, tempfile
+from nodestro_runtime.problems import NodestroError
+from nodestro_runtime.storage import SCHEMA_VERSION, SQLiteStore
+from nodestro_runtime.workspace import Workspace
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as name:
+    folder = pathlib.Path(name)
+    with Workspace(folder / "workspace", integrations=[]) as workspace:
+        assert workspace.sqlite_store.schema_version == SCHEMA_VERSION
+    store = SQLiteStore(folder / "canary.db")
+    with store.maintenance() as connection:
+        connection.execute("CREATE TABLE canary (email TEXT UNIQUE)")
+        connection.execute("INSERT INTO canary VALUES ('canary@example.com')")
+    try:
+        store.migrate(
+            before_migration=lambda *_: None,
+            migrations={1: lambda db: db.execute("INSERT INTO canary VALUES ('canary@example.com')")},
+            target=1,
+        )
+    except NodestroError as exc:
+        assert exc.code == "storage.migration_failed", exc.code
+        assert "canary@example.com" not in str(exc), str(exc)
+        assert "unchanged: unique violation (SQLite SQLITE_CONSTRAINT_UNIQUE" in str(exc), str(exc)
+    else:
+        raise AssertionError("the migration did not fail")
+    finally:
+        store.close()
+"""
+
+
 EDGES: dict[str, Edge] = {
     "axentra": Edge(
         blocked=("axentra",),
@@ -53,13 +83,18 @@ EDGES: dict[str, Edge] = {
     ),
     "tabrion.postgres": Edge(
         blocked=("tabrion.postgres",),
-        checks=(),
+        checks=(_SQLITE_WORKSPACE_CHECK,),
         probe=("storage.py", "import tabrion.postgres"),
         requirement="tabrion",
     ),
     "psycopg": Edge(
         blocked=("psycopg", "psycopg_binary", "psycopg_c", "psycopg_pool"),
-        checks=(),
+        checks=(
+            # Doc 06 N-2 (TABRION MIG-NOD-3): a SQLite workspace opens and migrates, and a failed SQLite migration gets
+            # Tabrion's value-free text (tabrion.errors, standard library only) without the PostgreSQL driver (and,
+            # in the edge above, without tabrion.postgres).
+            _SQLITE_WORKSPACE_CHECK,
+        ),
         probe=("storage.py", "import psycopg"),
         requirement="psycopg",
     ),
@@ -117,8 +152,9 @@ def test_every_k33_edge_has_exactly_one_test() -> None:
     extra = _names(project["optional-dependencies"]["postgres"])
     assert "axentra" in extra and "axentra" not in mandatory
     assert "psycopg" in extra and "psycopg" not in mandatory
-    # tabrion[postgres] arrives with MIG-NOD-3..5 in the extra; a mandatory tabrion (MIG-NOD-6) is fine, its
-    # postgres part is not.
+    # Since MIG-NOD-3 (doc 06 N-1) the stdlib-only tabrion core is mandatory and tabrion[postgres] is in the extra;
+    # its postgres part must never become mandatory.
+    assert "tabrion" in mandatory and "tabrion" in extra
     assert not any(re.match(r"tabrion\[[^\]]*postgres", r.replace(" ", "")) for r in project["dependencies"])
     for edge in EDGES.values():
         assert (SRC / "nodestro_runtime" / edge.probe[0]).is_file()

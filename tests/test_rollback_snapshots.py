@@ -228,9 +228,13 @@ def test_the_role_table_has_eight_variants() -> None:
     assert len(table["variants"]) == 8 and set(table["table"]) == set(table["variants"])
 
 
-def test_the_error_snapshot_records_finding_b_06_2() -> None:
-    """The old code puts the server's DETAIL value into two migration messages (B-06-2); MIG-NOD-3 closes it and
-    rewrites this snapshot, so the change is visible in its diff."""
+def test_the_error_snapshot_records_that_finding_b_06_2_is_closed() -> None:
+    """The old code put the server's DETAIL value into the backup and migration messages (B-06-2); since MIG-NOD-3 no
+    message of the snapshot holds the canary, and those three end with Tabrion's value-free text."""
     errors = rollback_snapshots.golden("errors")["errors"]
     leaking = sorted(label for label, answer in errors.items() if answer["message_has_canary"])
-    assert leaking == ["backup_failed", "migration_failed", "migration_failed_after_backup"]
+    assert leaking == []
+    for label in ("backup_failed", "migration_failed", "migration_failed_after_backup"):
+        message = errors[label]["message"]
+        assert ": unique violation (SQLSTATE 23505, constraint " in message
+        assert "DETAIL" not in message and "Key (" not in message
