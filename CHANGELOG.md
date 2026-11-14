@@ -12,6 +12,8 @@
   `grant_runtime_role` refuses to run inside `PostgresDatabase.transaction` (it needs a transaction of its own).
   It reports each Tabrion refusal reason in its own words and a missing schema as the new code
   `storage.schema_missing`; the role reads keep the read retry after a lost connection (RT2-03).
+  A member of `pg_write_all_data` is refused before anything is granted, and the grant fails when the role can
+  still write a schema-version table afterwards (both `storage.role_unsafe`).
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

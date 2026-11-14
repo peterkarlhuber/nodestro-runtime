@@ -58,16 +58,16 @@ None known.
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-5 (#169) and its security review,
   `storage_postgres.grant_runtime_role`, nodestro-api `server.py` (pre-migrate role check, ≈ `:876-891`)
 - **What:** The role tools follow Tabrion's rule I-20 since MIG-NOD-5 (a role that can become a superuser, a
-  `BYPASSRLS` role, the owner role or the schema's owner is refused). Still open, found in the review: (1) a member of
-  the predefined role `pg_write_all_data` (PostgreSQL 14+) passes the check, yet can write every table, the
-  schema-version tables included, so it can fake the schema gate (gap from before MIG-NOD-5; refuse it, and
-  `pg_read_all_data` is worth a warning); (2) `CREATEROLE` on PostgreSQL 15 and older lets a role grant itself
+  `BYPASSRLS` role, the owner role or the schema's owner is refused). Found in the review: (1) done in #169: a member
+  of `pg_write_all_data` (PostgreSQL 14+) is refused before anything is granted, and `grant_runtime_role` fails
+  (`storage.role_unsafe`) when the role can still write a schema-version table afterwards (`pg_read_all_data` is
+  still worth a warning); still open: (2) `CREATEROLE` on PostgreSQL 15 and older lets a role grant itself
   membership of any non-superuser role, the owner role included, so it is as good as the owner (refuse it there);
   (3) the api's pre-migrate check of the runtime role reads `inspect_role` and decides with its own flags, so it does
   not know the new "can become the owner role or the schema's owner" refusal, which only `grant_runtime_role`
   raises; it should use the same rule (the api part of MIG-NOD-5).
-- **Next step:** (1) and (2) need Tabrion support (a check in `tabrion.postgres.inspect_role`/`grant_runtime_role`)
-  or a Nodestro pre-check with a test per case; (3) goes with the api pin of MIG-NOD-5.
+- **Next step:** (2) needs Tabrion support (a check in `tabrion.postgres.inspect_role`/`grant_runtime_role`) or a
+  Nodestro pre-check with a test; (3) goes with the api pin of MIG-NOD-5.
 
 Items that need an independent or external review (an internal audit does not replace it):
 

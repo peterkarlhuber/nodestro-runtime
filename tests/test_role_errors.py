@@ -38,20 +38,29 @@ REPORT = {
 
 class _Owner:
     in_transaction = False
+    closed = False
+    pool_size = 1
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._local = threading.local()
 
     @contextmanager
     def _connection(self) -> Iterator[Any]:
         yield object()
 
 
+def _no_server_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(storage_postgres, "inspect_role", lambda _database, _role: dict(REPORT))
+    monkeypatch.setattr(storage_postgres, "_writes_all_data", lambda _connection, _role: False)
+    monkeypatch.setattr(storage_postgres, "_writable_schema_versions", lambda _connection, _role, _schema: [])
+
+
 def _grant_failing(error: BaseException, monkeypatch: pytest.MonkeyPatch) -> NodestroError:
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise error
 
-    monkeypatch.setattr(storage_postgres, "inspect_role", lambda _database, _role: dict(REPORT))
+    _no_server_checks(monkeypatch)
     monkeypatch.setattr(storage_postgres, "_tabrion_grant_runtime_role", refuse)
     with pytest.raises(NodestroError) as caught:
         storage_postgres.grant_runtime_role(_Owner(), "runtime")  # type: ignore[arg-type]
@@ -89,7 +98,7 @@ def test_a_missing_schema_is_a_nodestro_problem(error: BaseException, monkeypatc
 
 
 def test_other_usage_errors_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(storage_postgres, "inspect_role", lambda _database, _role: dict(REPORT))
+    _no_server_checks(monkeypatch)
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise UsageError("postgres.nested_transaction")

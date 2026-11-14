@@ -250,6 +250,58 @@ def test_grant_refuses_a_role_that_can_become_the_owner_of_the_schema(roles: Rol
         owner.close()
 
 
+def _acl_entries(owner: PostgresDatabase, role: str) -> list[str]:
+    """Every ACL entry of the schema and its tables that names ``role`` (its own grants, not inherited ones)."""
+    rows = owner._query(
+        "SELECT n.nspacl::text FROM pg_namespace n WHERE n.nspname = current_schema()"
+        " UNION ALL SELECT c.relacl::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+        " WHERE n.nspname = current_schema()"
+    )
+    return [str(row[0]) for row in rows if row[0] and f"{role}=" in str(row[0])]
+
+
+def test_grant_refuses_a_member_of_pg_write_all_data(roles: Roles, extra_roles: list[str]) -> None:
+    """Such a member may write every table, the schema versions included (MIG-NOD-5 review): refused, no grant."""
+    member = _create_role(extra_roles)
+    owner = _open(roles.owner_dsn, roles.schema)
+    try:
+        if not owner._query("SELECT 1 FROM pg_roles WHERE rolname = 'pg_write_all_data'"):
+            pytest.skip("pg_write_all_data exists from PostgreSQL 14")
+        with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+            admin.execute(sql.SQL("GRANT pg_write_all_data TO {}").format(sql.Identifier(member)))
+        with pytest.raises(NodestroError) as caught:
+            grant_runtime_role(owner, member)
+        assert caught.value.code == "storage.role_unsafe" and "pg_write_all_data" in str(caught.value)
+        assert caught.value.params == {"role": member}
+        assert _acl_entries(owner, member) == []
+        rows = owner._query("SELECT has_database_privilege(%s, current_database(), 'CONNECT')", (member,))
+        assert rows[0][0]  # PUBLIC may connect; nothing else was granted
+    finally:
+        owner.close()
+
+
+def test_grant_fails_when_the_schema_versions_stay_writable(roles: Roles, extra_roles: list[str]) -> None:
+    """A write privilege on the schema versions inherited from another role survives the REVOKE: refused after it."""
+    writer = _create_role(extra_roles)
+    member = _create_role(extra_roles)
+    with psycopg.connect(roles.owner_dsn, autocommit=True) as owner_connection:
+        owner_connection.execute(
+            sql.SQL("GRANT INSERT ON {}.nodestro_schema_migrations TO {}").format(
+                sql.Identifier(roles.schema), sql.Identifier(writer)
+            )
+        )
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(writer), sql.Identifier(member)))
+    owner = _open(roles.owner_dsn, roles.schema)
+    try:
+        with pytest.raises(NodestroError) as caught:
+            grant_runtime_role(owner, member)
+        assert caught.value.code == "storage.role_unsafe"
+        assert "can still write the schema versions (nodestro_schema_migrations)" in str(caught.value)
+    finally:
+        owner.close()
+
+
 def test_grant_runtime_role_needs_a_transaction_of_its_own(roles: Roles) -> None:
     owner = _open(roles.owner_dsn, roles.schema)
     try:

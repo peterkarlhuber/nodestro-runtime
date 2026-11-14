@@ -977,6 +977,15 @@ def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
             f"The runtime role {role!r} {' and '.join(problems)}; row-level security would not apply to it",
             role=role,
         )
+    # pg_write_all_data (PostgreSQL 14+) may write every table, the schema versions included, so such a member could
+    # fake the schema gate: refused before anything is granted (TABRION MIG-NOD-5 review, as Axentra does).
+    if _read(owner, lambda connection: _writes_all_data(connection, role)):
+        raise NodestroError(
+            "storage.role_unsafe",
+            f"The runtime role {role!r} is a member of pg_write_all_data, so it could write the schema versions; "
+            "use a role without that membership",
+            role=role,
+        )
     # The process's writes run one after the other (as PostgresDatabase.transaction does).
     with owner._lock, owner._connection() as connection:
         try:
@@ -1003,7 +1012,42 @@ def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
             # No schema to grant on (the owner connection has no current schema), or a name PostgreSQL would
             # truncate; the role and the schema were read from the server, so the first is the case that remains.
             raise _schema_missing(role) from None
+    # The schema versions must be read-only for the role afterwards, whatever it inherits from other roles.
+    writable = _read(owner, lambda connection: _writable_schema_versions(connection, role, report["schema"]))
+    if writable:
+        raise NodestroError(
+            "storage.role_unsafe",
+            f"The runtime role {role!r} can still write the schema versions ({', '.join(writable)}) after the grants, "
+            "through a role it is a member of; remove that membership, then grant again",
+            role=role,
+        )
     return granted.as_dict()
+
+
+def _writes_all_data(connection: Any, role: str) -> bool:
+    """Whether ``role`` is a member of ``pg_write_all_data`` (``False`` before PostgreSQL 14: no such role)."""
+    row = connection.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles p WHERE p.rolname = 'pg_write_all_data'"
+        " AND pg_catalog.pg_has_role(%s, p.oid, 'MEMBER'))",
+        (role,),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _writable_schema_versions(connection: Any, role: str, schema: str) -> builtins.list[str]:
+    """The schema-version tables of ``schema`` that ``role`` may still insert into, update, delete from or truncate."""
+    found: builtins.list[str] = []
+    for table in SCHEMA_VERSION_TABLES:
+        row = connection.execute(
+            "SELECT c.oid IS NOT NULL AND pg_catalog.has_table_privilege(%s, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')"
+            " FROM (SELECT 1) AS one LEFT JOIN pg_catalog.pg_class c"
+            "   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = %s"
+            "   ON c.relname = %s",
+            (role, schema, table),
+        ).fetchone()
+        if row and row[0]:
+            found.append(table)
+    return found
 
 
 def inspect_role(database: PostgresDatabase, role: str) -> dict[str, Any]:
