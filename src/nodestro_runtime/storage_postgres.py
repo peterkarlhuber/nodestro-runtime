@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import weakref
 
 from pydantic import BaseModel
-from tabrion.errors import UsageError
+from tabrion.errors import RoleMissing, RoleUnsafe, UsageError
 
 from .error_texts import failure_text
 from .problems import NodestroError
@@ -64,7 +64,6 @@ try:  # optional: nodestro-runtime[postgres]
     # (pgvector_status, TABRION MIG-NOD-7) and the role tools (role_info, inspect_role, grant_runtime_role; TABRION
     # MIG-NOD-5): tabrion[postgres], the same extra as psycopg. Nodestro keeps its dicts, codes and messages and wraps
     # Tabrion's answers.
-    from tabrion.errors import RoleMissing, RoleUnsafe
     from tabrion.postgres import SessionLock, SessionSettings, configure, extension_status
     from tabrion.postgres import grant_runtime_role as _tabrion_grant_runtime_role
     from tabrion.postgres import inspect_role as _tabrion_inspect_role
@@ -78,8 +77,6 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     SessionSettings = None  # type: ignore[assignment,misc]
     configure = None  # type: ignore[assignment]
     extension_status = None  # type: ignore[assignment]
-    RoleMissing = None  # type: ignore[assignment,misc]
-    RoleUnsafe = None  # type: ignore[assignment,misc]
     _tabrion_grant_runtime_role = None  # type: ignore[assignment]
     _tabrion_inspect_role = None  # type: ignore[assignment]
     _tabrion_role_info = None  # type: ignore[assignment]

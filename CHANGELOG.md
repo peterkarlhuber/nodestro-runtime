@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed (TABRION MIG-NOD-5): `RoleMissing` and `RoleUnsafe` come from `tabrion.errors` (standard library only, always
+  installed) outside the optional `postgres` import, so `except RoleMissing` works when psycopg is present but another
+  part of the extra is missing (studio components job).
 - Added (NAL-B1): versions of agent templates. `nodestro_runtime.agent_templates.AgentTemplates` stores every save that
   changes a template as an immutable version (`agent_template_versions`, numbered, under the lock of the template's
   versions, like workflow versions); a template from before versions counts as version 1 and its next save stores
