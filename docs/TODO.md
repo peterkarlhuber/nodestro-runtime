@@ -527,8 +527,8 @@ Items that need an independent or external review (an internal audit does not re
   kind of connection, schema dump) are in place and checked by `tests/test_rollback_snapshots.py`. The steps that use
   them: MIG-NOD-3 (error texts, done; it rewrote `errors.json`, whose backup and migration messages carried the
   canary value of finding B-06-2), and still to come MIG-NOD-4 (session configuration, `settings.json`), MIG-NOD-5
-  (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not covered: it records its own "before"
-  output of `pgvector_status` in pg-a and pg-b first (review L-6). Review fix round (`qa-13-25-review.md` M-1, M-2,
+  (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not covered by these files: it has its own
+  baseline `tests/fixtures/pgvector_status_before.json` (review L-6). Review fix round (`qa-13-25-review.md` M-1, M-2,
   M-6, L-1, L-2, L-7): `catalog.json` names Axentra's tables (RLS/FORCE flags, privileges, counts) and holds every
   policy, function and ACL entry of the schema and the run roles' memberships, with one detection test per kind of
   change (column grant, `WITH GRANT OPTION`, `PUBLIC`, membership, RLS or FORCE off on `axentra_tenants`); an Axentra
@@ -581,8 +581,9 @@ Items that need an independent or external review (an internal audit does not re
   `tests/test_tabrion_pin.py` requires that every Tabrion requirement here names the same minor range
   `>=0.N,<0.(N+1)` and that the installed Tabrion is a final version inside it (the exact commit lives in the studio
   lock since the CI-FAST pin switch).
-- **Next step:** MIG-NOD-7 (or the first step that uses `require_extension`) switches the pgvector variable in the
-  same pull request as its `.github` change.
+- **Next step:** the first step that uses `require_extension` switches the pgvector variable in the same pull request
+  as its `.github` change (MIG-NOD-7 does not: `pgvector_status` uses `extension_status`, the fixtures stay as they
+  are).
 
 ### RT-056 · The test double answers in German in every language
 

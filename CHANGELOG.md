@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed (TABRION MIG-NOD-7): `pgvector_status` reads the catalog and decides the state with
+  `tabrion.postgres.extension_status("vector", probe_type="vector")`; its answer (states, fields, commands, messages)
+  is unchanged, checked against `tests/fixtures/pgvector_status_before.json` from the code before. The read runs like
+  every other read (`PostgresDatabase._read`: on the transaction's connection inside one, else repeated on another
+  pooled connection when one was lost). Only a type named `vector` that pgvector did not create no longer counts as
+  `active`.
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

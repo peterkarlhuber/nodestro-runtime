@@ -5,50 +5,109 @@
 because an extension belongs to a whole database. ``test_a_server_without_pgvector`` runs on
 ``NODESTRO_TEST_POSTGRES`` when that server has no pgvector (CI's ``postgres:17``). The stand-in cases check the
 wording of every state without a server.
+
+TABRION MIG-NOD-7: the catalog read and the state come from ``tabrion.postgres.extension_status``. The output must not
+change: every case compares the whole answer with ``tests/fixtures/pgvector_status_before.json``, which the code before
+the switch wrote (``tests/fixtures/make_pgvector_status.py``): the stand-in cases for every state (mode A/B wording),
+the real servers for "unavailable" (mode A, pg-a) and "active", "installable", "other_schema" (mode B, pg-b).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+import json
 import os
+from pathlib import Path
 from typing import Any
 import uuid
 
 from postgres_support import drop_schema, new_schema, require_postgres
 import pytest
 
+from nodestro_runtime import storage_postgres
 from nodestro_runtime.storage_postgres import PostgresDatabase, pgvector_status
 
 PGVECTOR_DSN = os.environ.get("NODESTRO_TEST_PGVECTOR", "")
+#: The output of the code before TABRION MIG-NOD-7, per case (``tests/fixtures/make_pgvector_status.py``).
+BEFORE: dict[str, dict[str, Any]] = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "pgvector_status_before.json").read_text(encoding="utf-8")
+)
+#: The placeholders of the baseline: the pgvector version and the schema of the database.
+VERSION, SCHEMA = "<version>", "nodestro"
 
 
 class _Answers:
-    """A stand-in database that answers the status query with fixed values (no PostgreSQL)."""
+    """A stand-in database whose ``_read`` hands no connection to the reader (no PostgreSQL)."""
 
-    def __init__(self, *row: Any) -> None:
-        self.row = row
-
-    def _query(self, statement: str, params: Any = None) -> list[tuple[Any, ...]]:
-        assert statement.startswith("SELECT to_regtype('vector')")
-        return [self.row]
+    def _read(self, read: Callable[[Any], Any]) -> Any:
+        return read(None)
 
 
-@pytest.mark.parametrize(
-    ("row", "state", "command"),
-    [
-        ((True, "nodestro", "0.8.1", "nodestro", "0.8.1"), "active", None),
-        (
-            (False, "nodestro", "0.8.1", "public", "0.8.1"),
-            "other_schema",
-            'ALTER EXTENSION vector SET SCHEMA "nodestro";',
-        ),
-        ((False, 'odd"name', None, None, "0.8.1"), "installable", 'CREATE EXTENSION vector SCHEMA "odd""name";'),
-        ((False, "public", None, None, None), "unavailable", None),
-    ],
-)
-def test_every_state_names_what_to_do(row: tuple[Any, ...], state: str, command: str | None) -> None:
-    found = pgvector_status(_Answers(*row))  # type: ignore[arg-type]
-    assert found["state"] == state and found["command"] == command
+def _status(state: str, schema: str | None, installed: str | None, where: str | None, available: str | None) -> Any:
+    from tabrion.postgres import ExtensionStatus
+
+    return ExtensionStatus(
+        name="vector",
+        state=state,  # type: ignore[arg-type]
+        installed_version=installed,
+        available_version=available,
+        extension_schema=where,
+        schema=schema,
+        command="(Tabrion's own command is not shown)",
+    )
+
+
+#: What ``extension_status`` answers in each case of the baseline.
+STATUSES: dict[str, Any] = {
+    "active": _status("active", SCHEMA, VERSION, SCHEMA, VERSION),
+    "other_schema": _status("other_schema", SCHEMA, VERSION, "elsewhere", VERSION),
+    "installable": _status("installable", SCHEMA, None, None, VERSION),
+    "installable_quoted_schema": _status("installable", 'odd"name', None, None, VERSION),
+    "installable_no_current_schema": _status("installable", None, None, None, VERSION),
+    "unavailable": _status("unavailable", SCHEMA, None, None, None),
+}
+
+
+def _normalized(found: dict[str, Any], *, version: str | None, schema: str | None) -> dict[str, Any]:
+    """``found`` with the server's pgvector version and the test's schema replaced by the baseline's placeholders."""
+
+    def plain(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        if version:
+            value = value.replace(version, VERSION)
+        if schema and schema != SCHEMA:
+            value = value.replace(schema, SCHEMA)
+        return value
+
+    return {key: plain(value) for key, value in found.items()}
+
+
+def test_the_baseline_covers_every_state() -> None:
+    assert set(BEFORE) == set(STATUSES)
+    assert {case["state"] for case in BEFORE.values()} == {"active", "other_schema", "installable", "unavailable"}
+
+
+@pytest.mark.parametrize("case", sorted(STATUSES))
+def test_the_output_is_the_one_before_tabrion(case: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def answer(connection: Any, name: str, *, probe_type: str | None = None) -> Any:
+        calls.append((connection, name, probe_type))
+        return STATUSES[case]
+
+    monkeypatch.setattr(storage_postgres, "extension_status", answer)
+    assert pgvector_status(_Answers()) == BEFORE[case]  # type: ignore[arg-type]
+    assert calls == [(None, "vector", "vector")]
+
+
+@pytest.mark.parametrize("case", sorted(STATUSES))
+def test_every_state_names_what_to_do(case: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(storage_postgres, "extension_status", lambda *_args, **_kwargs: STATUSES[case])
+    found = pgvector_status(_Answers())  # type: ignore[arg-type]
+    state, command = found["state"], found["command"]
+    assert state == STATUSES[case].state
+    assert (command is None) == (state in ("active", "unavailable"))
     if command is not None:
         assert command in found["message"] and "restart" in found["message"]
     if state == "unavailable":
@@ -74,6 +133,15 @@ def test_a_server_without_pgvector(plain: PostgresDatabase) -> None:
         pytest.skip(f"this PostgreSQL server has pgvector ({found['state']})")
     assert found["command"] is None and found["version"] is None and found["available_version"] is None
     assert found["schema"] == plain.schema
+    assert _normalized(found, version=None, schema=plain.schema) == BEFORE["unavailable"]  # mode A
+
+
+def test_pgvector_status_reads_inside_a_transaction(plain: PostgresDatabase) -> None:
+    """Inside a transaction the status is read on its connection (a savepoint guards it) and leaves it usable."""
+    with plain.transaction():
+        found = pgvector_status(plain)
+        assert plain._query("SELECT 1") == [(1,)]
+    assert pgvector_status(plain) == found
 
 
 @pytest.fixture
@@ -111,17 +179,22 @@ def test_states_on_a_real_server(server_with_pgvector: str) -> None:
     database = PostgresDatabase(dsn, schema="nodestro")
     try:
         database.migrate()  # 0010 installs pgvector into the schema, as on a fresh server
-        assert pgvector_status(database)["state"] == "active"
+        found = pgvector_status(database)
+        assert found["state"] == "active"
+        version = found["version"]
+        assert version and _normalized(found, version=version, schema=None) == BEFORE["active"]  # mode B
         # pgvector installed after migration 0010: the database has it only as an available extension.
         _run(dsn, "DROP EXTENSION vector")
         found = pgvector_status(database)
         assert found["state"] == "installable" and found["available_version"]
         assert found["command"] == 'CREATE EXTENSION vector SCHEMA "nodestro";'
+        assert _normalized(found, version=version, schema=None) == BEFORE["installable"]
         # Installed, but in a schema the server's search_path (only NODESTRO_DATABASE_SCHEMA) does not see.
         _run(dsn, "CREATE EXTENSION vector SCHEMA elsewhere")
         found = pgvector_status(database)
         assert found["state"] == "other_schema" and found["extension_schema"] == "elsewhere"
         assert found["version"] == found["available_version"]
+        assert _normalized(found, version=version, schema=None) == BEFORE["other_schema"]
         _run(dsn, found["command"])  # what the operator runs
         found = pgvector_status(database)
         assert found["state"] == "active" and found["command"] is None and found["extension_schema"] == "nodestro"
