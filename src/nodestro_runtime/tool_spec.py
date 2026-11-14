@@ -164,6 +164,16 @@ FETCH_WEB_PAGE_SPEC = ToolSpec(
     },
 )
 
+#: ``notify_user`` (NAL-A3): an internal message in the inbox; the run allows three in total
+#: (:data:`~nodestro_runtime.notifications.MAX_MESSAGES_PER_RUN`), the per-step limit is the same number.
+NOTIFY_USER_SPEC = ToolSpec(
+    id="notify_user",
+    category="communication",
+    capability=BUILTIN_CAPABILITIES["notify_user"],
+    timeout_seconds=10.0,
+    max_calls_per_run=3,
+)
+
 #: The specs of Nodestro's built-in tools (``builtin_tools.BUILTIN_TOOLS`` and ``web_tools.WEB_TOOLS``), by name.
 BUILTIN_SPECS: dict[str, ToolSpec] = {
     spec.id: spec
@@ -175,6 +185,7 @@ BUILTIN_SPECS: dict[str, ToolSpec] = {
         _builtin("table_totals", "data"),
         SEARCH_WEB_SPEC,
         FETCH_WEB_PAGE_SPEC,
+        NOTIFY_USER_SPEC,
     )
 }
 
@@ -277,6 +288,9 @@ class RunServices:
     #: Calls per tool across all steps of the run; each tool may make at most :data:`RUN_CALL_FACTOR` times its
     #: per-step limit in one run (``None`` outside a run).
     run_calls: CallCounter | None = None
+    #: Leaves an internal message for the run's starter (NAL-A3): ``(title, text, level) -> message id``; raises
+    #: ``ValueError`` with a code. ``None``: no inbox here (outside a run, or a server with Axentra's inbox).
+    notify: Callable[[str, str, str], str] | None = None
 
 
 @dataclass(frozen=True)

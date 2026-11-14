@@ -85,6 +85,7 @@ from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
+from .notifications import RunNotifier
 from .orchestrator import (
     child_outcome,
     decision_fields,
@@ -984,6 +985,9 @@ class RunManager:
         self.after_run: Callable[[Run], object] | None = None
         #: Called whenever a run stops executing (finished or paused): batches, test series, schedules.
         self.listeners: list[Callable[[Run], None]] = []
+        #: The internal inbox (NAL-A3): notified by its rules when a run stops (it is one of ``listeners``) or is found
+        #: interrupted after a restart, and the sink of ``notify_user``. ``None``: no local inbox here.
+        self.notifier: RunNotifier | None = None
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
@@ -2007,6 +2011,11 @@ class RunManager:
             except Exception:
                 logger.exception("Marking run %s as interrupted failed; it stays as stored", run.id)
                 continue
+            if self.notifier is not None:
+                try:
+                    self.notifier(run)
+                except Exception:  # the message is extra; the run is marked
+                    logger.exception("Notifying about the interrupted run %s failed", run.id)
             count += 1
         return count
 
@@ -4075,12 +4084,22 @@ class RunManager:
             with suppress(BudgetExceededError):
                 context.tracker.add(record)
 
+        notifier = self.notifier
+        notify = None
+        if notifier is not None:
+            top = context.root.run
+
+            def notify(title: str, text: str, level: str) -> str:
+                """``notify_user``: a message of the top-level run (its starter, its limit)."""
+                return notifier.message(top, node_id, title, text, level)
+
         return RunServices(
             ledger=SourceLedger(context.run.sources, lock=context.lock, on_recorded=recorded),
             node_id=node_id,
             book=book,
             check_budget=context.tracker.check,
             run_calls=context.root.tool_calls,
+            notify=notify,
         )
 
     def _check_sources(

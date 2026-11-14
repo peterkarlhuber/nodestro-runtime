@@ -72,6 +72,7 @@ from .mcp.service import McpService
 from .mcp.vault import TokenVault, vault_box_from_env
 from .mcp_access import unattended_mcp_enabled
 from .memory_spaces import MemorySpaces, MemoryTables
+from .notifications import NOTIFY_TOOLS, LocalInbox, RunNotifier, local_inbox_enabled
 from .pricing import PricingService
 from .problems import NodestroError
 from .profile import RuntimeProfile
@@ -331,7 +332,7 @@ class Workspace:
         self.extensions = Extensions(
             discover() if integrations is None else integrations,
             strict=integrations is not None,
-            reserved={tool.name for tool in BUILTIN_TOOLS if tool.name},
+            reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS) if tool.name},
         )
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
@@ -450,6 +451,12 @@ class Workspace:
             assistant_model=lambda: self.settings().assistant_model,
         )
         self.runs.budget_policy = self._budget_policy
+        # The internal inbox (NAL-A3): everywhere but on a server whose Axentra inbox is on (that stays the only one).
+        self.inbox: LocalInbox | None = None
+        if local_inbox_enabled(server=storage is not None):
+            self.inbox = LocalInbox(self.store)
+            self.runs.notifier = RunNotifier(self.inbox)
+            self.runs.listeners.append(self.runs.notifier)
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
             self.runs.tool_gate = ToolGate(

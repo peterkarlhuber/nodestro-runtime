@@ -399,6 +399,8 @@
   "memory.space_name": ["name"],
   "model.choice_invalid": ["configured", "model"],
   "model.local_unavailable": [],
+  "notify.empty_title": [],
+  "notify.limit": [],
   "output.unknown_source": ["fields", "reason"],
   "preview.not_agent": [],
   "pricing.cache_read_above_input": [],
