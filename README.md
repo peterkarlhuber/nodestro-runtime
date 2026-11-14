@@ -199,6 +199,13 @@ back in `AgentTestResult.value_warnings` (a step that copies a figure from an ea
 number proves where the value came from, not that the agent chose the right inputs for the tool;
 figures inside free text are not checked.
 
+**Cited sources (NAL-A2).** Every run keeps a source ledger (`Run.sources`, `nodestro_runtime.source_ledger`): the web
+sources its built-in web tools saw, numbered `S1`, `S2` ... and announced with the run event `source_recorded`. A text
+field of a structured result marked `source="ledger"` (`string` or `string_list`) must name recorded sources, by id or
+address; a value that does not goes back to the agent once (event `sources_unknown`), and a second failure fails the
+step with `output.unknown_source`, so a made-up source is never delivered. The ledger holds addresses and metadata
+only and never leaves its run.
+
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).

@@ -65,7 +65,7 @@ from .providers import (
 )
 from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField
 from .tool_library import ToolLibrary
-from .tool_spec import CallCounter, ToolSpec, bind_tool, host_tool_spec, settings_problems
+from .tool_spec import CallCounter, RunServices, ToolSpec, bind_tool, host_tool_spec, settings_problems
 
 _FIELD_TYPES: dict[str, Any] = {
     "string": str,
@@ -368,6 +368,7 @@ class AgentBuilder:
         cancelled: Callable[[], bool] | None = None,
         attended: bool = True,
         gated: bool = False,
+        services: RunServices | None = None,
     ) -> BuiltAgent:
         """Build the agent; raises ``ValueError``/``TypeError``/``KeyError`` for invalid settings.
 
@@ -378,6 +379,7 @@ class AgentBuilder:
         (schedules, batches, test series, published APIs), which may use MCP tools only once the operator
         enabled it after the MCP security acceptance (ADR-0007 D-7). ``gated`` is true only when the ``before_tool``
         hook asks the shared per-call approval gate before every call; MCP tools that change data need it.
+        ``services`` lends the built-in tools the run's source ledger and cost booking (NAL-A2).
         """
         model = check_model(config.model)
         provider = provider_of(model)
@@ -402,6 +404,7 @@ class AgentBuilder:
                 self.tools.tool(tool_name, sandbox=sandbox, cancelled=cancelled, gated=gated),
                 config,
                 counter,
+                services,
             )
             for tool_name in dict.fromkeys(config.tools)
         ]
@@ -497,7 +500,9 @@ class AgentBuilder:
             reasoning_reduced=reasoning_reduction(config, connection, model),
         )
 
-    def _bound(self, name: str, tool: Tool, config: AgentConfig, counter: CallCounter) -> Tool:
+    def _bound(
+        self, name: str, tool: Tool, config: AgentConfig, counter: CallCounter, services: RunServices | None = None
+    ) -> Tool:
         """A built-in tool under its spec (time limit, call limit, connection; NAL-A1). Tools of integrations without
         a spec keep a generous time limit only. Other tools are returned unchanged."""
         if name not in self.tools.builtin:
@@ -517,6 +522,7 @@ class AgentBuilder:
             config.tool_settings.get(name),
             resolve=connection if resolve is not None else None,
             counter=counter,
+            services=services,
         )
 
     def _settings_issues(self, config: AgentConfig) -> list[ConfigIssue]:

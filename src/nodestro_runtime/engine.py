@@ -122,6 +122,7 @@ from .schemas import (
     RunIn,
     RunTrigger,
     RunWarning,
+    SourceEntry,
     ToolCallApproval,
     ToolCallRecord,
     ToolChoice,
@@ -129,6 +130,8 @@ from .schemas import (
     Workflow,
     now,
 )
+from .source_ledger import SourceLedger, UnknownSource, ledger_fields, unknown_sources
+from .source_ledger import correction_prompt as source_correction_prompt
 from .storage import DocumentStore
 from .tool_approvals import (
     EXECUTION_WINDOW,
@@ -145,6 +148,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
+from .tool_spec import RunServices
 from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
@@ -4004,6 +4008,78 @@ class RunManager:
             fields=[item.field for item in failed],
         )
 
+    def _run_services(self, context: _RunContext, node_id: str) -> RunServices:
+        """The run's source ledger and the booking of tools' own costs, lent to the built-in tools of one step."""
+
+        def recorded(entry: SourceEntry, new: bool) -> None:
+            self._emit(context, "source_recorded", node_id, source=entry.model_dump(mode="json"), new=new)
+
+        def book(provider: str, unit: str, units: int, cost_usd: Decimal | None) -> None:
+            """One usage record without tokens: the provider's requests (``web_search_requests``) and their cost.
+            It is recorded first (like a model request); a limit it exceeds stops the run's next request."""
+            record = UsageRecord(
+                agent=node_id,
+                model=f"{unit}:{provider}",
+                input_tokens=0,
+                output_tokens=0,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_creation_5m_input_tokens=0,
+                cache_creation_1h_input_tokens=0,
+                thinking_tokens=0,
+                web_search_requests=units,
+                web_fetch_requests=0,
+                estimated_cost_usd=cost_usd,
+                known_cost_usd=cost_usd if cost_usd is not None else Decimal(0),
+                missing_cost_components=() if cost_usd is not None else (f"{unit}:{provider}",),
+                pricing_source="connection" if cost_usd is not None else None,
+            )
+            with suppress(BudgetExceededError):
+                context.tracker.add(record)
+
+        return RunServices(
+            ledger=SourceLedger(context.run.sources, lock=context.lock, on_recorded=recorded),
+            node_id=node_id,
+            book=book,
+            check_budget=context.tracker.check,
+        )
+
+    def _check_sources(
+        self,
+        context: _RunContext,
+        node_id: str,
+        config: AgentConfig,
+        prompt: str,
+        outcome: AgentOutcome,
+        ask: Callable[..., AgentOutcome],
+    ) -> AgentOutcome:
+        """Cited sources (``source="ledger"``) must be in the run's source ledger: one correction, then the step
+        fails with ``output.unknown_source`` (:mod:`.source_ledger`)."""
+
+        def failed_of(result: Any) -> list[UnknownSource]:
+            with context.lock:
+                entries = list(context.run.sources)
+            return unknown_sources(config.output, result, entries)
+
+        failed = failed_of(outcome.output)
+        if not failed:
+            return outcome
+        self._emit(context, "sources_unknown", node_id, fields=[item.field for item in failed], attempt=1)
+        with context.lock:
+            entries = list(context.run.sources)
+        outcome = self._ask_correction(config, source_correction_prompt(prompt, failed, entries), ask)
+        failed = failed_of(outcome.output)
+        if not failed:
+            return outcome
+        first = failed[0]
+        raise NodestroError(
+            "output.unknown_source",
+            f"{first.field} cites a source that is not in the run's source ledger ({first.reason})",
+            field=first.field,
+            reason=first.reason,
+            fields=[item.field for item in failed],
+        )
+
     @staticmethod
     def _ask_correction(config: AgentConfig, prompt: str, ask: Callable[..., AgentOutcome]) -> AgentOutcome:
         """The agent's one correction of a checked figure, as a new turn that can only compute (RT3-03).
@@ -4220,10 +4296,13 @@ class RunManager:
                 refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
+                services=self._run_services(context, node_id),
             )
             outcome = ask(prompt)
             if checked_fields(config.output):
                 outcome = self._check_values(context, node_id, state, config, prompt, extra, outcome, ask)
+            if ledger_fields(config.output):
+                outcome = self._check_sources(context, node_id, config, prompt, outcome, ask)
             state.output = outcome.output
             state.memory = outcome.memory
             if config.knowledge_proposals.enabled and outcome.output not in (None, ""):
@@ -4387,6 +4466,7 @@ def execute_agent(
     refinement: Mapping[str, Any] | None = None,
     suspendable: bool = False,
     on_built: Callable[[BuiltAgent], None] | None = None,
+    services: RunServices | None = None,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -4415,6 +4495,7 @@ def execute_agent(
         cancelled=cancelled,
         attended=attended,
         gated=gated,
+        services=services,
     )
     judging = config.quality.enabled and bool(config.quality.criteria)
     judge = check_model(config.quality.judge_model) if judging else None

@@ -29,6 +29,7 @@ from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
+from .source_ledger import LEDGER_FIELD_TYPES, WEB_TOOL_NAMES
 from .value_checks import computes
 
 if TYPE_CHECKING:
@@ -1148,6 +1149,9 @@ def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
         if node.type != "agent" or agent is None:
             continue
         for item in agent.output.fields:
+            if item.source == "ledger":
+                found.extend(_ledger_field_issues(workflow, node.id, agent.output.mode, item.name, item.type))
+                continue
             if item.source != "tool":
                 continue
             if agent.output.mode != "structured" or item.type not in ("number", "integer"):
@@ -1176,6 +1180,37 @@ def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
                     )
                 )
     return found
+
+
+def _ledger_field_issues(workflow: Workflow, node_id: str, mode: str, name: str, kind: str) -> list[CheckIssue]:
+    """A field whose values must name sources of the run's source ledger (``source="ledger"``, NAL-A2): only text
+    fields of a structured result are checked, and some agent up to this one must have a web tool that records
+    sources."""
+    if mode != "structured" or kind not in LEDGER_FIELD_TYPES:
+        return [
+            _issue(
+                "check.ledger_source_type",
+                f"{name} must name sources, but only text fields of a structured result are checked",
+                level="warning",
+                node_id=node_id,
+                field=name,
+            )
+        ]
+    earlier = {node_id} | graph.feeding_nodes(workflow, node_id)
+    if any(
+        other.agent is not None and WEB_TOOL_NAMES & set(other.agent.tools)
+        for other in workflow.nodes
+        if other.id in earlier
+    ):
+        return []
+    return [
+        _issue(
+            "check.ledger_source_no_tool",
+            f"{name} must name sources, but no agent up to this one has a web tool that finds them",
+            node_id=node_id,
+            field=name,
+        )
+    ]
 
 
 def _contract_issues(workflow: Workflow) -> list[CheckIssue]:

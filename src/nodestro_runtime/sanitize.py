@@ -201,6 +201,10 @@ def sanitize_run(run: dict[str, Any], *, personal_data: bool = True, contents: b
                 state["memory"] = {path: sanitizer.removed(text) for path, text in state["memory"].items()}
             if state.get("evaluation"):
                 state["evaluation"]["feedback"] = sanitizer.removed(state["evaluation"].get("feedback"))
+        for source in copy.get("sources") or []:
+            # The source ledger (NAL-A2) tells what was looked up: addresses and titles go with the contents.
+            for field in ("url", "final_url", "title"):
+                source[field] = sanitizer.removed(source.get(field))
         for message in copy.get("chat") or []:
             # The live run chat (LRC-1) that a full trace export carries next to the run.
             message["content"] = sanitizer.removed(message.get("content"))
