@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed (TABRION MIG-NOD-7): without the `postgres` extra, `storage_postgres` now defines `SessionLock`,
+  `SessionSettings`, `configure` and `extension_status` as `None`, like `psycopg`, so the module's names are the same
+  with and without the extra (`tests/test_pgvector_status.py` patches `extension_status` and failed without psycopg).
 - Changed (TABRION MIG-NOD-7): `pgvector_status` reads the catalog and decides the state with
   `tabrion.postgres.extension_status("vector", probe_type="vector")`; its answer (states, fields, commands, messages)
   is unchanged, checked against `tests/fixtures/pgvector_status_before.json` from the code before. The read runs like
