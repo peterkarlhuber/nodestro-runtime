@@ -73,6 +73,16 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     psycopg = None  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
     ConnectionPool = None  # type: ignore[assignment,misc]
+    # The names stay defined so that callers and tests can see (and patch) them without the extra.
+    SessionLock = None  # type: ignore[assignment,misc]
+    SessionSettings = None  # type: ignore[assignment,misc]
+    configure = None  # type: ignore[assignment]
+    extension_status = None  # type: ignore[assignment]
+    RoleMissing = None  # type: ignore[assignment,misc]
+    RoleUnsafe = None  # type: ignore[assignment,misc]
+    _tabrion_grant_runtime_role = None  # type: ignore[assignment]
+    _tabrion_inspect_role = None  # type: ignore[assignment]
+    _tabrion_role_info = None  # type: ignore[assignment]
 
 _T = TypeVar("_T")
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

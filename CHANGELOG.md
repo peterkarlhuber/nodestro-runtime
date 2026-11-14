@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed (TABRION MIG-NOD-7): without the `postgres` extra, `storage_postgres` now defines `SessionLock`,
+  `SessionSettings`, `configure`, `extension_status` and the MIG-NOD-5 role names as `None`, like `psycopg`, so the module's names are the same
+  with and without the extra (`tests/test_pgvector_status.py` patches `extension_status` and failed without psycopg).
 - Security (TABRION MIG-NOD-5): `inspect_role`, `grant_runtime_role` and `PostgresDatabase.role_info` read and grant
   through `tabrion.postgres` (`inspect_role`, `grant_runtime_role` with the schema versions as protected tables,
   `role_info(owner_scope="schema")`); the dicts, codes (`storage.role_missing`, `storage.role_unsafe`) and messages
