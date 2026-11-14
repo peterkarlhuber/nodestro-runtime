@@ -135,8 +135,12 @@ class OutputField(_Model):
     #: earlier one (:mod:`nodestro_runtime.value_checks`), otherwise the step fails with ``run.value_unverified``.
     #: ``ledger`` (a ``string`` or ``string_list`` field): every value must name a source of the run's source ledger,
     #: by id (``S3``) or URL (:mod:`nodestro_runtime.source_ledger`), otherwise the step fails with
-    #: ``output.unknown_source`` after one correction.
-    source: Literal["model", "tool", "ledger"] = "model"
+    #: ``output.unknown_source`` after one correction. ``ledger_cited`` (text): every statement of the field cites
+    #: the sources it rests on as ``[S1]`` or ``[S1, S3]``, ids of the ledger, checked the same way.
+    #: ``ledger_list`` and ``ledger_range`` (text) are filled by the runtime after the step, never by the model (they
+    #: are not part of the answer format the model gets): the cited sources with id, title, address and retrieval
+    #: time, and the time range in which they were retrieved (:func:`nodestro_runtime.source_ledger.fill_from_ledger`).
+    source: Literal["model", "tool", "ledger", "ledger_cited", "ledger_list", "ledger_range"] = "model"
 
 
 class OutputConfig(_Model):

@@ -64,6 +64,7 @@ from .providers import (
     provider_of,
 )
 from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField
+from .source_ledger import model_output
 from .tool_library import ToolLibrary
 from .tool_spec import CallCounter, RunServices, ToolSpec, bind_tool, host_tool_spec, offered, settings_problems
 
@@ -465,7 +466,8 @@ class AgentBuilder:
             memory=memory,
             files=files,
             index=index,
-            output_format=output_model(config.output),
+            # Fields the run fills from the source ledger are not the model's to write (NAL-B2).
+            output_format=output_model(model_output(config.output)),
             effort=_effort(config, connection, model),
             tool_choice=tool_choice,
             max_tokens=config.max_tokens,
