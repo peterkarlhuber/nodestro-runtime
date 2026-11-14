@@ -219,7 +219,9 @@ def test_a_link_swapped_in_after_the_check_is_not_followed(tmp_path: Path, monke
 
     def swap(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
         info = lstat(path, *args, **kwargs)
-        if Path(path) == database and not database.is_symlink():
+        # The patch replaces os.lstat for everyone (pathlib included), so the swap uses only the saved lstat and plain
+        # strings; Path.is_symlink() here would call back into this function.
+        if os.fspath(path) == str(database) and not stat.S_ISLNK(lstat(database).st_mode):
             database.unlink()
             database.symlink_to(victim)
         return info
