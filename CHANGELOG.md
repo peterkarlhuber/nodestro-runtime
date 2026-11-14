@@ -20,6 +20,12 @@
     `<skill_script>` content as untrusted data, and such tools use no network, subprocesses or extra files. The tool
     chain is unchanged (isolation and a person's approval).
   - See `docs/skills.md`.
+
+- Changed (TABRION DC-NR-1 follow-up, 2026-11-14): `scripts/check_tabrion_source.py` is nodestro-studio's new copy
+  (#198, SHA-256 `f1edfc71b5da4986547abe0824833fb73bba532cb5e6a00e202c9ff317747456`): the poisoned `tabrion` is
+  0.2.99 (was 0.1.0), inside the package's range `>=0.2,<0.3` and above the locked 0.2.1, so an install by range
+  picks it. `tests/test_tabrion_source_check.py` installs by the package's own range again (was `>=0.1,<0.2`) and
+  names the studio PR head as the origin commit until that PR is merged.
 - Added (QA-17 (AC-2): dependency policy check, 2026-11-14): `dependency-policy.json` is this repository's copy of the
   dependency policy K-33 from nodestro-studio (only its outgoing edges: `orkexa[all,pdf,local,convert,web]` and
   `tabrion` in the core, `orkexa[postgres]`, `axentra[oidc]` and `tabrion[postgres]` in the extra `postgres`,

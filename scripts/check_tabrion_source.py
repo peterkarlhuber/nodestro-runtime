@@ -7,10 +7,10 @@ Usage::
 
 The script
 
-1. writes a poisoned ``NAME`` (default ``tabrion``, version ``0.1.0``: plausible, inside every consumer's range)
-   into a temporary directory: a wheel that ships a forged ``direct_url.json`` naming ``LOCK``'s git URL and commit,
-   and whose ``.pth`` file and package write a marker file when Python starts or imports it, and an sdist whose build
-   writes the marker and then fails,
+1. writes a poisoned ``NAME`` (default ``tabrion``, version ``0.2.99``: plausible, inside every consumer's range
+   ``>=0.2,<0.3`` and above the locked 0.2.1, so an install by range picks it) into a temporary directory: a wheel
+   that ships a forged ``direct_url.json`` naming ``LOCK``'s git URL and commit, and whose ``.pth`` file and package
+   write a marker file when Python starts or imports it, and an sdist whose build writes the marker and then fails,
 2. serves a PEP 503/691 index on ``127.0.0.1`` with that release for ``NAME``; every other project is redirected to
    the real index (``--upstream``, default ``https://pypi.org/simple``), so the install under test runs unchanged,
 3. runs a positive control (unless ``--no-control``): ``pip install --dry-run "NAME"`` against the index must pick
@@ -64,8 +64,10 @@ from typing import Any
 import zipfile
 
 PREFIX = "check_tabrion_source:"
-#: A plausible version inside every consumer's range: only the zero-request assertion tells it from the pin.
-POISON_VERSION = "0.1.0"
+#: A plausible version inside every consumer's range (``>=0.2,<0.3``) and above the locked tabrion (0.2.1), so an
+#: install by range picks it: only the zero-request assertion tells it from the pin. Same minor as the lock (a test
+#: checks it against platform/versions.json), so a new tabrion minor needs a new value here.
+POISON_VERSION = "0.2.99"
 #: Extras the consumers request; the poisoned release declares them so no installer refuses it for a missing extra.
 POISON_EXTRAS = ("all", "dev", "migrations", "postgres", "sqlalchemy", "testing")
 UPLOAD_TIME = "2020-01-01T00:00:00Z"  # before every --uploaded-prior-to cutoff
