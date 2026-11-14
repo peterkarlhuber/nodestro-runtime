@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import stat
 from typing import Any
@@ -261,3 +262,147 @@ def test_windows_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     database.write_bytes(b"")
     monkeypatch.setattr(storage.os, "name", "nt")
     assert repair_desktop_database_modes(database, confirmed=True) == []
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("old", "new"), [(0o644, 0o600), (0o664, 0o600), (0o444, 0o400), (0o755, 0o600), (0o4755, 0o600), (0o2700, 0o600)]
+)
+def test_the_mode_is_only_narrowed(tmp_path: Path, old: int, new: int) -> None:
+    database = _database(tmp_path / "data", old)
+    assert repair_desktop_database_modes(database, confirmed=False) == [
+        ModeRepair(database, "not_confirmed", old_mode=old, new_mode=new)
+    ]
+    assert _mode(database) == old
+    assert repair_desktop_database_modes(database, confirmed=True) == [
+        ModeRepair(database, "changed", old_mode=old, new_mode=new)
+    ]
+    assert _mode(database) == new
+
+
+@posix_only
+def test_a_private_or_read_only_file_is_unchanged(tmp_path: Path) -> None:
+    database = _database(tmp_path / "data", 0o400)
+    assert repair_desktop_database_modes(database, confirmed=True) == [
+        ModeRepair(database, "unchanged", old_mode=0o400, new_mode=0o400)
+    ]
+
+
+@posix_only
+def test_a_hard_link_is_skipped_and_not_fixable(tmp_path: Path) -> None:
+    database = _database(tmp_path / "data", 0o664)
+    other = tmp_path / "elsewhere.db"
+    os.link(database, other)
+    assert repair_desktop_database_modes(database, confirmed=True) == [
+        ModeRepair(database, "skipped", old_mode=0o664, reason="hard_link")
+    ]
+    assert _mode(other) == 0o664
+    with pytest.raises(NodestroError) as caught:
+        SQLiteStore(database)
+    assert caught.value.params == {"reason": "writable_by_others", "fixable": False}
+
+
+@posix_only
+def test_a_hard_link_made_after_the_check_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path / "data", 0o664)
+    open_file = os.open
+
+    def link_then_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == database:
+            os.link(database, tmp_path / "late.db")
+        return open_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "open", link_then_open)
+    [result] = repair_desktop_database_modes(database, confirmed=True)
+    monkeypatch.undo()
+    assert (result.status, result.reason) == ("skipped", "hard_link")
+    assert _mode(database) == 0o664
+
+
+@posix_only
+def test_a_fifo_or_directory_is_not_a_file(tmp_path: Path) -> None:
+    database = _database(tmp_path / "data", 0o664)
+    os.mkfifo(tmp_path / "data" / "nodestro.db-wal", 0o666)
+    os.chmod(tmp_path / "data" / "nodestro.db-wal", 0o666)
+    (tmp_path / "data" / "nodestro.db-journal").mkdir(mode=0o777)
+    os.chmod(tmp_path / "data" / "nodestro.db-journal", 0o777)
+    results = repair_desktop_database_modes(database, confirmed=True)
+    assert [(r.path.name, r.status, r.reason) for r in results] == [
+        ("nodestro.db", "changed", None),
+        ("nodestro.db-wal", "skipped", "not_a_file"),
+        ("nodestro.db-journal", "skipped", "not_a_file"),
+    ]
+    assert _mode(tmp_path / "data" / "nodestro.db-wal") == 0o666
+    assert _mode(tmp_path / "data" / "nodestro.db-journal") == 0o777
+
+
+def _regular_at_check(monkeypatch: pytest.MonkeyPatch, path: Path, like: Path) -> None:
+    """``lstat`` of ``path`` answers what ``like`` (a regular file) is: the check sees a file, the open does not."""
+    lstat = os.lstat
+
+    def fake(candidate: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(candidate) == path:
+            seen = lstat(like)
+            real = lstat(path)
+            return os.stat_result((seen.st_mode, real.st_ino, *seen[2:]))
+        return lstat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "lstat", fake)
+
+
+@posix_only
+def test_a_fifo_swapped_in_after_the_check_neither_blocks_nor_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O_NONBLOCK: opening a FIFO without a writer returns at once; fstat then sees it is no regular file."""
+    _database(tmp_path / "data", 0o664)
+    fifo = tmp_path / "data" / "nodestro.db-wal"
+    os.mkfifo(fifo, 0o666)
+    os.chmod(fifo, 0o666)
+    flags_seen: list[int] = []
+    open_file = os.open
+
+    def recording(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == fifo:
+            flags_seen.append(flags)
+        return open_file(path, flags, *args, **kwargs)
+
+    like = tmp_path / "regular"
+    like.write_bytes(b"")
+    os.chmod(like, 0o664)
+    _regular_at_check(monkeypatch, fifo, like)
+    monkeypatch.setattr(storage.os, "open", recording)
+    results = repair_desktop_database_modes(tmp_path / "data" / "nodestro.db", confirmed=True)
+    monkeypatch.undo()
+    assert [(r.path.name, r.status, r.reason) for r in results] == [
+        ("nodestro.db", "changed", None),
+        ("nodestro.db-wal", "skipped", "changed_during_repair"),
+    ]
+    assert flags_seen and all(flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW for flags in flags_seen)
+    assert _mode(fifo) == 0o666
+
+
+@posix_only
+def test_another_owner_seen_by_fstat_is_changed_during_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path / "data", 0o664)
+    fstat = os.fstat
+
+    def foreign(descriptor: int) -> os.stat_result:
+        info = fstat(descriptor)
+        return os.stat_result((info.st_mode, info.st_ino, info.st_dev, info.st_nlink, info.st_uid + 1, *info[5:]))
+
+    monkeypatch.setattr(storage.os, "fstat", foreign)
+    [result] = repair_desktop_database_modes(database, confirmed=True)
+    monkeypatch.undo()
+    assert (result.status, result.reason) == ("skipped", "changed_during_repair")
+    assert _mode(database) == 0o664
+
+
+@posix_only
+def test_the_advice_quotes_paths_with_spaces(tmp_path: Path) -> None:
+    database = _database(tmp_path / "my data", 0o664, sides=("-wal",))
+    with pytest.raises(NodestroError) as caught:
+        SQLiteStore(database)
+    assert caught.value.params == {"reason": "writable_by_others", "fixable": True}
+    quoted = shlex.join([str(database), f"{database}-wal"])
+    assert f"chmod 600 {quoted}," in str(caught.value) and "'" in quoted

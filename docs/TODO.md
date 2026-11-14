@@ -64,8 +64,8 @@ None known.
   `reason`: `symlink`, `writable_by_others`, `other_owner`, `unsafe_path`) with what to do (`chmod go-w`, `chown`);
   an import source is read whatever its owner and mode (`SHARED_SOURCE_PROFILE`, links still refused). Open:
   (1) runtime part done in MIG-NOD-9: starting never changes a mode; `storage.unsafe_file` says `fixable` (and what
-  to do) and `storage.repair_desktop_database_modes(path, confirmed=True)` sets `0600` on the user's own regular
-  files only after the user confirmed it. Open: the confirmation in the api and desktop app (an endpoint and a
+  to do) and `storage.repair_desktop_database_modes(path, confirmed=True)` narrows the user's own regular files
+  (no links, no hard links) to `old & 0o600` only after the user confirmed it. Open: the confirmation in the api and desktop app (an endpoint and a
   dialog that list the files and their modes; Peter decides), and the check on the desktop builds of three
   operating systems (Windows: no-op); a world-readable but not group-writable file (`0644`) still opens and keeps
   its mode, so the app should also offer the repair from its diagnostics; (2) the api part of MIG-NOD-6

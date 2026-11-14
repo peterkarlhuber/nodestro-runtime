@@ -5,12 +5,14 @@
 - Security (TABRION MIG-NOD-9, decision E-NOD-PERM): an existing desktop database is restricted to its owner only
   with the user's consent; starting never changes a mode. `storage.unsafe_file` has the new parameter `fixable`: `true`
   for `writable_by_others` when every existing file of the database (`nodestro.db`, `-wal`, `-shm`, `-journal`) is a
-  regular file of the running user; its message then names the files and says what to do (confirm the repair in the
-  app, or `chmod 600` on them). The new `storage.repair_desktop_database_modes(path, *, confirmed)` does nothing
-  without `confirmed=True` (it reports what it would do); confirmed, it sets `0600` on each of those files that group
-  or others have permissions on, never on a symbolic link, a file of another user or anything but a regular file
-  (opened with `O_NOFOLLOW`, checked again with `fstat`, changed with `fchmod`), changes the mode only, logs the old
-  mode and returns one result per file (`changed`, `unchanged`, `not_confirmed`, `skipped` with a reason, `failed`
+  regular file of the running user with one name (no hard link); its message then names the files (quoted for
+  a shell) and says what to do (confirm the repair in the app, or `chmod 600` on them). The new
+  `storage.repair_desktop_database_modes(path, *, confirmed)` does nothing
+  without `confirmed=True` (it reports what it would do); confirmed, it narrows the mode of each of those files to
+  `old & 0o600` (`0644` and `0664` become `0600`, `0444` becomes `0400`; no bit is ever added), never for a symbolic
+  link, a hard link, a file of another user or anything but a regular file (opened with `O_NOFOLLOW` and
+  `O_NONBLOCK`, checked again with `fstat`, changed with `fchmod`), changes the mode only, logs the old mode and
+  returns one result per file (`changed`, `unchanged`, `not_confirmed`, `skipped` with a reason, `failed`
   with a reason; a failure never raises). Windows: no-op (no POSIX modes). No API endpoint or interface yet. A
   `Workspace` whose database is refused no longer keeps its data directory locked, so the same process can open it
   again after the repair.
