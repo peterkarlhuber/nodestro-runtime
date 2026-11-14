@@ -23,7 +23,10 @@ no name used there is nothing to check. With ``--surface`` every used name must 
 snapshot (``docs/api/surface.json``, K10) with stability ``S``, or be a module of it: consumer libraries
 must not use experimental (``X``) names (Tabrion plan 02 §14 S-2). Enum members and dataclass fields have
 no entry of their own: the snapshot lists them in their parent's ``members`` or ``fields``, so
-``tabrion.TLSMode.AUTO`` is checked against the entry ``tabrion.TLSMode``.
+``tabrion.TLSMode.AUTO`` is checked against the entry ``tabrion.TLSMode``. A ``__x__`` name has no entry
+either: it is checked as the name before it, so ``tabrion.postgres.SessionSettings.__dataclass_fields__`` is
+checked against the entry ``tabrion.postgres.SessionSettings`` and ``tabrion.__version__`` against the module
+``tabrion``.
 
 The check is static, so it does not see:
 
@@ -36,9 +39,10 @@ A local name bound to Tabrion stays bound for the whole file, even after it is a
 ``from tabrion import errors`` followed by ``errors = {}`` and ``errors._x`` is reported (fails closed).
 
 The used names are written to ``docs/api-consumers.md`` (``--export``), the consumer side of Tabrion's
-``docs/api-consumers.md``. Standard library only; the same file is used in tabrion-studio, axentra, orkexa
-and nodestro-runtime (keep the copies identical). Exit codes: 0 clean, 1 findings or a stale export, 2 usage
-errors.
+``docs/api-consumers.md``. Standard library only. The source of this file is tabrion-studio's
+``scripts/check_tabrion_api.py``; axentra, orkexa, nodestro-runtime and nodestro-api hold byte-identical
+copies (change the source, then copy it and the SHA-256 pinned in each repository's test). Exit codes:
+0 clean, 1 findings or a stale export, 2 usage errors.
 """
 
 from __future__ import annotations
@@ -292,17 +296,25 @@ def _items(entry: dict[str, object]) -> set[str]:
     return found
 
 
+def _owner(name: str) -> str:
+    """``name`` up to its first ``__x__`` part (``tabrion.X.__dataclass_fields__`` -> ``tabrion.X``)."""
+    parts = name.split(".")
+    cut = next((i for i, part in enumerate(parts) if i and _dunder(part)), len(parts))
+    return ".".join(parts[:cut])
+
+
 def surface_check(names: set[str], surface: Path) -> list[str]:
     """Names that are neither a stable (``S``) name of the frozen API snapshot nor one of its modules.
 
     Experimental (``X``) names, and entries without a stability, are refused: consumer libraries must not
     use them (Tabrion plan 02 §14 S-2). An enum member or dataclass field (``tabrion.TLSMode.AUTO``) has no
     entry of its own: it is checked against its parent's entry when that lists it in ``members`` or
-    ``fields``, so it passes exactly when the parent is stable."""
+    ``fields``, so it passes exactly when the parent is stable. A ``__x__`` name is public (as in
+    :func:`installed_check`) and is checked as the name before it (:func:`_owner`)."""
     entries: dict[str, dict[str, object]] = json.loads(surface.read_text(encoding="utf-8"))["names"]
     modules = {"tabrion"} | {k.rsplit(".", 1)[0] for k in entries}
     problems = []
-    for name in sorted(names):
+    for name in sorted({_owner(n) for n in names}):
         entry = entries.get(name)
         if entry is None:
             parent, _, last = name.rpartition(".")

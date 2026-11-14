@@ -3,9 +3,10 @@
 The repository passes the check and its exported list ``docs/api-consumers.md`` is current; every
 forbidden form is found (mutation probes), and the allowed forms are not. A stale or missing export fails.
 The ``__all__`` check runs against a fake ``tabrion`` package, so it is exercised before any repository
-installs Tabrion; experimental (``X``) names of the K10 snapshot are refused. The script is the same file in
-tabrion-studio, axentra, orkexa and nodestro-runtime: its SHA-256 is pinned here, so a change to one copy
-fails until all four tests are updated with the new copy.
+installs Tabrion; experimental (``X``) names of the K10 snapshot are refused. The script's source is
+tabrion-studio's ``scripts/check_tabrion_api.py``; axentra, orkexa, nodestro-runtime and nodestro-api hold
+byte-identical copies. Its SHA-256 is pinned here, so a change to one copy fails until every test is updated
+with the new copy.
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_tabrion_api.py"
 EXPORT = ROOT / "docs" / "api-consumers.md"
-#: SHA-256 of ``scripts/check_tabrion_api.py``, the same in all four repositories.
-SCRIPT_SHA256 = "39c8daf3035cf5b606419e25557d56eb0ba04db7dce052c015afcb86eed98a70"
+#: SHA-256 of ``scripts/check_tabrion_api.py``, the same in every repository that has a copy.
+SCRIPT_SHA256 = "e48cc7f230c1fa8ae677a98b8e70f93ec75212c61b7e424d939ff3c6c7730aa1"
 
 
 def _load() -> ModuleType:
@@ -163,6 +164,33 @@ def test_the_surface_comparison_accepts_members_and_fields_of_stable_entries(tmp
     ]
     assert check.surface_check({"tabrion.Beta.ON"}, surface) == [
         "tabrion.Beta.ON: stability X in surface.json, consumers use only S names"
+    ]
+
+
+def test_the_surface_comparison_checks_dunder_names_as_their_owner(tmp_path: Path) -> None:
+    # SessionSettings.__dataclass_fields__ (as axentra uses it) has no snapshot entry in surface.json: a
+    # __x__ name is public (as in the __all__ check) and passes exactly when the name before it does.
+    surface = tmp_path / "surface.json"
+    names: dict[str, dict[str, object]] = {
+        "tabrion.postgres.SessionSettings": {
+            "kind": "dataclass",
+            "fields": ["application_name: str"],
+            "stability": "S",
+        },
+        "tabrion.Beta": {"kind": "class", "stability": "X"},
+    }
+    surface.write_text(json.dumps({"names": names}), encoding="utf-8")
+    ok = {
+        "tabrion.postgres.SessionSettings.__dataclass_fields__",
+        "tabrion.postgres.SessionSettings.__dataclass_fields__.items",
+        "tabrion.__version__",
+        "tabrion.postgres.__all__",
+    }
+    assert check.surface_check(ok, surface) == []
+    assert check.surface_check({"tabrion.Beta.__doc__", "tabrion.Gone.__doc__", "tabrion.Gone.x.__doc__"}, surface) == [
+        "tabrion.Beta: stability X in surface.json, consumers use only S names",
+        "tabrion.Gone: not in surface.json",
+        "tabrion.Gone.x: not in surface.json",
     ]
 
 
