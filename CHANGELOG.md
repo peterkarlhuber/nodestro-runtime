@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added (NAL-B2, web research): result fields filled from the run's source ledger (`docs/web-tools.md`). New values
+  of `OutputField.source`, additive: `ledger_cited` (every statement of a text field cites ledger ids inline, `[S1]`
+  or `[S1, S3]`; checked like `ledger`, new failure reason `uncited`), `ledger_list` and `ledger_range` (filled by the
+  runtime after the step: one line per cited source with id, title, address and retrieval time, and the retrieval
+  time range, all from the ledger; left out of the model's answer format, so the model supplies ids only). New
+  helpers in `source_ledger`: `citing_fields`, `filled_fields`, `model_output`, `cited_entries`, `fill_from_ledger`.
+  The workflow check covers the new sources with the existing codes `check.ledger_source_type` and
+  `check.ledger_source_no_tool`.
+
 - Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
   `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
   `SEARCH_WEB_SPEC` and `FETCH_WEB_PAGE_SPEC` (read + external, never offline, call and time limits, binding

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,12 @@ from nodestro_runtime.source_ledger import (
     MAX_SOURCES,
     SourceLedger,
     SourceNote,
+    citing_fields,
     correction_prompt,
+    fill_from_ledger,
+    filled_fields,
     ledger_fields,
+    model_output,
     normalize_url,
     unknown_sources,
 )
@@ -319,3 +324,163 @@ def test_a_run_wide_cap_limits_a_tool_across_steps() -> None:
     cap = spec.max_calls_per_run * RUN_CALL_FACTOR  # type: ignore[operator]
     assert all(counter.take(spec.id, cap) for _ in range(cap))
     assert not counter.take(spec.id, cap)
+
+
+# ---- statements that cite sources, and the fields the run fills (NAL-B2) ------------------------------------------
+
+REPORT = OutputConfig(
+    mode="structured",
+    fields=[
+        OutputField(name="answer"),
+        OutputField(name="findings", type="string_list", source="ledger_cited"),
+        OutputField(name="summary", source="ledger_cited", required=False),
+        OutputField(name="sources", type="string_list", source="ledger_list"),
+        OutputField(name="retrieved", source="ledger_range"),
+    ],
+)
+
+
+def _three() -> list[SourceEntry]:
+    entries: list[SourceEntry] = []
+    SourceLedger(entries).record(
+        [
+            SourceNote("https://example.com/a", "Page\n A"),
+            SourceNote("https://example.org/b", "B"),
+            SourceNote("https://example.net/c", ""),
+        ]
+    )
+    entries[0].retrieved_at = datetime(2026, 11, 14, 10, 0, 5, tzinfo=UTC)
+    entries[1].retrieved_at = datetime(2026, 11, 14, 10, 3, 0, tzinfo=UTC)
+    entries[2].retrieved_at = datetime(2026, 11, 14, 11, 0, 0, tzinfo=UTC)
+    return entries
+
+
+def test_every_statement_must_cite_a_recorded_source() -> None:
+    entries = _three()
+    assert citing_fields(REPORT) == ["findings", "summary"] and filled_fields(REPORT) == ["sources", "retrieved"]
+    good = {"findings": ["Rain is 620 mm [S1].", "It falls in summer [S1, S2]", "Both [S2; S1]"], "summary": "x [S3]"}
+    assert unknown_sources(REPORT, good, entries) == []
+    # Nothing found: an empty list of statements is no claim without a source.
+    assert unknown_sources(REPORT, {"findings": []}, entries) == []
+    [uncited] = unknown_sources(REPORT, {"findings": ["Rain is 620 mm [S1].", "It rains a lot."]}, entries)
+    assert (uncited.field, uncited.value, uncited.reason) == ("findings", "It rains a lot.", "uncited")
+    [strange] = unknown_sources(REPORT, {"findings": ["Rain [S1, S9]"]}, entries)
+    assert (strange.value, strange.reason) == ("S9", "unknown")
+    # A link or a footnote is no citation of the ledger.
+    assert unknown_sources(REPORT, {"findings": ["See https://example.com/a"]}, entries)[0].reason == "uncited"
+    assert unknown_sources(REPORT, {"findings": ["Rain [1]"]}, entries)[0].reason == "uncited"
+    assert unknown_sources(REPORT, {"findings": None}, entries)[0].reason == "missing"
+    text = correction_prompt("Task", [uncited], entries)
+    assert "'It rains a lot.' cites no source" in text and "[S1, S3]" in text
+
+
+def test_the_model_never_gets_the_fields_the_run_fills() -> None:
+    from nodestro_runtime.agent_builder import output_model
+
+    model = output_model(model_output(REPORT))
+    assert model is not None and set(model.model_fields) == {"answer", "findings", "summary"}
+    assert model_output(OUTPUT) is OUTPUT
+    # A contract still names every field: only the agent's answer format leaves them out.
+    assert [item.name for item in model_output(REPORT).fields] == ["answer", "findings", "summary"]
+    assert [item.name for item in REPORT.fields][-2:] == ["sources", "retrieved"]
+
+
+def test_the_cited_sources_and_their_retrieval_time_come_from_the_ledger() -> None:
+    entries = _three()
+    answer = {
+        "answer": "x",
+        "findings": ["Rain [S2]", "Summer [S1, S2]"],
+        "sources": ["S9 · Made up · https://made-up.example · 2020-01-01T00:00:00Z"],
+        "retrieved": "always",
+    }
+    filled = fill_from_ledger(REPORT, answer, entries)
+    # Only cited sources, in the ledger's order, with title, address and time from the ledger; S3 was not cited.
+    assert filled["sources"] == [
+        "S1 · Page A · https://example.com/a · 2026-11-14T10:00:05Z",
+        "S2 · B · https://example.org/b · 2026-11-14T10:03:00Z",
+    ]
+    assert filled["retrieved"] == "2026-11-14T10:00:05Z/2026-11-14T10:03:00Z"
+    assert filled["findings"] == answer["findings"] and answer["retrieved"] == "always"  # a copy
+    one = fill_from_ledger(REPORT, {"findings": ["[S3] has no title"]}, entries)
+    assert one["sources"] == ["S3 · https://example.net/c · 2026-11-14T11:00:00Z"]
+    assert one["retrieved"] == "2026-11-14T11:00:00Z"
+    nothing = fill_from_ledger(REPORT, {"answer": "Nothing found.", "findings": []}, entries)
+    assert nothing["sources"] == [] and nothing["retrieved"] == ""
+    # Without a checked field every source of the ledger is listed; text fields get lines, lists the range.
+    plain = OutputConfig(
+        mode="structured",
+        fields=[
+            OutputField(name="answer"),
+            OutputField(name="sources", source="ledger_list"),
+            OutputField(name="retrieved", type="string_list", source="ledger_range"),
+        ],
+    )
+    listed = fill_from_ledger(plain, '{"answer": "x"}', entries)
+    assert listed["sources"].count("\n") == 2 and listed["retrieved"] == ["2026-11-14T10:00:05Z/2026-11-14T11:00:00Z"]
+    assert fill_from_ledger(plain, "plain text", entries) == "plain text"
+    assert fill_from_ledger(OUTPUT, {"answer": "x"}, entries) == {"answer": "x"}
+
+
+def _report_flow(tools: list[str]) -> WorkflowIn:
+    flow = _flow(tools)
+    agent = flow.nodes[1].agent
+    assert agent is not None
+    agent.output = REPORT
+    return flow
+
+
+async def test_a_run_fills_the_source_list_and_the_retrieval_range(tmp_path: Path) -> None:
+    def answer(model: Any) -> Any:
+        assert "sources" not in model.model_fields and "retrieved" not in model.model_fields
+        return model(answer="It is so [S2].", findings=["It is so [S2]."], summary=None)
+
+    fake = ScriptedClient({"Researcher": [tool_use("find_pages", {"query": "q"}), parsed(answer)]})
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[_integration()]) as workspace:
+        saved = workspace.save_workflow(_report_flow(["find_pages"]))
+        done = await workspace.wait((await workspace.run(saved, RunIn(input="Question"))).id, timeout=20)
+        assert done.status == "succeeded", done.error
+        output = done.nodes["a"].output
+        second = done.sources[1]
+        stamp = second.retrieved_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert output["sources"] == [f"S2 · Page 1 · {FOUND[1]} · {stamp}"]
+        assert output["retrieved"] == stamp
+        assert done.output == output
+
+
+async def test_a_statement_without_a_source_gets_one_correction_and_then_fails(tmp_path: Path) -> None:
+    def uncited(model: Any) -> Any:
+        return model(answer="x", findings=["Everyone knows it."], summary=None)
+
+    fake = ScriptedClient({"Researcher": [tool_use("find_pages", {"query": "q"}), parsed(uncited), parsed(uncited)]})
+    with Workspace(tmp_path / "data", client_factory=lambda _p: fake, integrations=[_integration()]) as workspace:
+        saved = workspace.save_workflow(_report_flow(["find_pages"]))
+        done = await workspace.wait((await workspace.run(saved, RunIn(input="Question"))).id, timeout=20)
+        assert done.status == "failed"
+        step = done.nodes["a"]
+        assert (step.error_code, step.error_params["field"], step.error_params["reason"]) == (
+            "output.unknown_source",
+            "findings",
+            "uncited",
+        )
+        assert "Everyone knows it." not in str(done.output)
+        assert "cites no source" in str(fake.messages.calls[-1]["messages"])
+
+
+def test_the_workflow_check_knows_the_filled_and_citing_fields(tmp_path: Path) -> None:
+    with Workspace(tmp_path / "data", integrations=[_integration()]) as workspace:
+        without = Workflow.model_validate(_report_flow(["calculator"]).model_dump())
+        found = [(item.code, item.params.get("field")) for item in preflight(workspace, without).problems]
+        for name in ("findings", "summary", "sources", "retrieved"):
+            assert ("check.ledger_source_no_tool", name) in found
+        with_tool = Workflow.model_validate(_report_flow(["find_pages"]).model_dump())
+        assert not [item for item in preflight(workspace, with_tool).problems if "ledger" in item.code]
+        typed = Workflow.model_validate(_report_flow(["find_pages"]).model_dump())
+        typed.nodes[1].agent = AgentConfig(
+            name="A",
+            tools=["find_pages"],
+            output=OutputConfig(
+                mode="structured",
+                fields=[OutputField(name="a"), OutputField(name="n", type="number", source="ledger_range")],
+            ),
+        )
+        assert "check.ledger_source_type" in [item.code for item in preflight(workspace, typed).problems]
