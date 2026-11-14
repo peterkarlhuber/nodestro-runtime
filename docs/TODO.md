@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 28 |
+| P3 Low | 29 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -525,6 +525,18 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Price the fees in the pricing engine, then enable them through `model_profile` like Anthropic's server tools.
 
 ## Tests and quality assurance
+
+### RT-078 · Dependency confusion: the poisoned-index job and the studio origin commit (TABRION DC-NR-1)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION DC-NR-1, `scripts/check_tabrion_source.py` (checksummed
+  copy from nodestro-studio, `tests/test_tabrion_source_check.py`), `tests/test_tabrion_pin.py`, CI job
+  `tabrion source (poisoned index)`
+- **What:** the CI install runs under a poisoned index that serves `tabrion` and must get no request for it (the
+  proof that the lock pin works); `tests/test_tabrion_pin.py` checks that the installed Tabrion's `direct_url.json`
+  names the studio lock's commit (`NODESTRO_STUDIO_LOCK`), which only detects an accidental index install. The job is
+  in `.github/ci-manifest.json` and reported by ci-ok. Open: the copy names an unmerged studio commit as its origin
+  until nodestro-studio's DC-NS-2 branch is merged.
+- **Next step:** after the studio merge, update the origin commit; close this entry.
 
 ### RT-072 · Rollback snapshots before and after each TABRION MIG-NOD step
 
