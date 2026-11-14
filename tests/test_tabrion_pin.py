@@ -4,8 +4,8 @@ Since the CI-FAST pin switch, nodestro-runtime names its internal packages by ve
 live in one lock (nodestro-studio ``platform/internal-server.txt``). For Tabrion, every requirement in
 ``pyproject.toml`` (dependencies and extras) names the same range ``>=0.N,<0.(N+1)``: no direct URL, no other
 specifier, no pre-release bound and no environment marker (one Tabrion version per installation, AC-6). The installed
-Tabrion, which the lock chose, must be a final release inside that range (``0.1.0``, never ``0.1.1.dev0`` or
-``0.2.0a1``, RC-8).
+Tabrion, which the lock chose, must be a final release inside that range (``0.2.1``, never ``0.2.2.dev0`` or
+``0.3.0a1``, RC-8).
 
 DC-NR-1 (dependency confusion): the installed Tabrion's ``direct_url.json`` must name a git commit; when
 ``NODESTRO_STUDIO_LOCK`` names the lock file (CI sets it to the studio lock it installs with), the URL and commit
@@ -34,6 +34,8 @@ import pytest
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 LOCK_ENV = "NODESTRO_STUDIO_LOCK"
 #: The lock's Tabrion line: ``tabrion[extras] @ git+URL@<40 hex>``.
+#: The minor line every Tabrion requirement names today (``>=0.2,<0.3``, Tabrion v0.2.1 final in the studio lock).
+CURRENT_RANGE = (0, 2)
 LOCK_LINE = re.compile(r"^\s*tabrion\s*(?:\[[^\]]*\])?\s*@\s*git\+(?P<url>\S+?)@(?P<commit>[0-9a-f]{40})\b")
 
 
@@ -88,21 +90,25 @@ def test_every_tabrion_requirement_names_one_minor_range() -> None:
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     assert tabrion_requirements(pyproject), "the dev extra requires tabrion[testing,postgres] (MIG-NOD-1)"
     assert range_problems(pyproject) == []
+    found = {minor_range(req.specifier) for _, req in tabrion_requirements(pyproject)}
+    assert found == {CURRENT_RANGE}, f"expected >=0.{CURRENT_RANGE[1]},<0.{CURRENT_RANGE[1] + 1}, found {found}"
 
 
 @pytest.mark.parametrize(
     ("line", "problem"),
     [
         ("tabrion @ git+https://github.com/peterkarlhuber/tabrion.git@" + "a" * 40, "direct URL"),
-        ("tabrion==0.1.0", "does not name the range"),
-        ("tabrion>=0.1", "does not name the range"),
+        ("tabrion==0.2.1", "does not name the range"),
+        ("tabrion>=0.2", "does not name the range"),
         ("tabrion>=0.1,<0.3", "does not name the range"),
-        ("tabrion>=0.1,<1.0", "does not name the range"),
-        ("tabrion>=0.1.0a1,<0.2", "does not name the range"),
-        ("tabrion>=0.1.dev0,<0.2", "does not name the range"),
-        ("tabrion>=0.1.1,<0.2", "does not name the range"),
-        ("tabrion>=0.1,<0.2,!=0.1.3", "does not name the range"),
-        ("tabrion>=0.1,<0.2 ; python_version > '3'", "marker"),
+        ("tabrion>=0.2,<0.4", "does not name the range"),
+        ("tabrion>=0.2,<1.0", "does not name the range"),
+        ("tabrion>=0.2.0a1,<0.3", "does not name the range"),
+        ("tabrion>=0.2.dev0,<0.3", "does not name the range"),
+        ("tabrion>=0.2,<0.3.dev0", "does not name the range"),
+        ("tabrion>=0.2.1,<0.3", "does not name the range"),
+        ("tabrion>=0.2,<0.3,!=0.2.0", "does not name the range"),
+        ("tabrion>=0.2,<0.3 ; python_version > '3'", "marker"),
     ],
 )
 def test_a_requirement_that_is_not_one_minor_range_is_reported(line: str, problem: str) -> None:
@@ -113,8 +119,8 @@ def test_a_requirement_that_is_not_one_minor_range_is_reported(line: str, proble
 def test_two_ranges_are_reported() -> None:
     pyproject = {
         "project": {
-            "dependencies": ["tabrion[postgres]>=0.1,<0.2"],
-            "optional-dependencies": {"dev": ["tabrion[testing]>=0.2,<0.3"]},
+            "dependencies": ["tabrion[postgres]>=0.2,<0.3"],
+            "optional-dependencies": {"dev": ["tabrion[testing]>=0.1,<0.2"]},
         }
     }
     problems = range_problems(pyproject)
@@ -124,8 +130,8 @@ def test_two_ranges_are_reported() -> None:
 def test_the_same_range_in_two_places_is_fine() -> None:
     pyproject = {
         "project": {
-            "dependencies": ["tabrion[postgres]>=0.1,<0.2"],
-            "optional-dependencies": {"dev": ["tabrion[testing,postgres]>=0.1.0,<0.2.0"]},
+            "dependencies": ["tabrion[postgres]>=0.2,<0.3"],
+            "optional-dependencies": {"dev": ["tabrion[testing,postgres]>=0.2.0,<0.3.0"]},
         }
     }
     assert range_problems(pyproject) == []
@@ -178,7 +184,7 @@ def origin_problems(direct_url: dict[str, Any] | None, lock: tuple[str, str] | N
     return []
 
 
-SHA = "d5821faa8742dea012abda3b663549c038d76543"
+SHA = "af0458d54467571abfc1afdd44d76e1f4d727c06"
 URL = "https://github.com/peterkarlhuber/tabrion.git"
 
 
@@ -201,7 +207,7 @@ def test_the_locked_commit_passes_in_any_url_spelling() -> None:
     assert lock == (URL, SHA)
     for url in (URL, URL.removesuffix(".git"), URL + "/"):
         assert origin_problems({"url": url, "vcs_info": {"vcs": "git", "commit_id": SHA}}, lock) == []
-    assert locked_tabrion(f"# tabrion @ git+{URL}@{SHA}\ntabrion>=0.1\n") is None
+    assert locked_tabrion(f"# tabrion @ git+{URL}@{SHA}\ntabrion>=0.2,<0.3\n") is None
 
 
 def test_the_installed_tabrion_is_the_locked_commit() -> None:

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Changed (TABRION 0.2.1 switch): every Tabrion requirement (core, `postgres` and `dev` extras) names
+  `>=0.2,<0.3` instead of `>=0.1,<0.2`; the installed-commit tests expect Tabrion v0.2.1 final (`af0458d`), which the
+  studio lock must pin. Tabrion 0.2 has no breaking change, so no code changes.
 - Security (TABRION MIG-NOD-9, decision E-NOD-PERM): an existing desktop database is restricted to its owner only
   with the user's consent; starting never changes a mode. `storage.unsafe_file` has the new parameter `fixable`: `true`
   for `writable_by_others` when every existing file of the database (`nodestro.db`, `-wal`, `-shm`, `-journal`) is a

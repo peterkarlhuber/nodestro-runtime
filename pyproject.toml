@@ -37,7 +37,7 @@ dependencies = [
     # Value-free database error messages (tabrion.errors, standard library only; TABRION MIG-NOD-3, doc 06 N-1). Every
     # Tabrion requirement in this file names the same minor range (VER-1, tests/test_tabrion_pin.py); the exact commit
     # lives in the studio locks (nodestro-studio platform/internal-server.txt and, from PIN-W2, platform/internal.txt).
-    "tabrion>=0.1,<0.2",
+    "tabrion>=0.2,<0.3",
 ]
 
 [project.optional-dependencies]
@@ -52,7 +52,7 @@ postgres = [
     "cryptography>=42",
     "axentra[oidc]>=0.1.0.dev0,<0.2",
     # Tabrion's PostgreSQL part (doc 06 N-1, N-2): imported only in server-profile modules, guarded like psycopg.
-    "tabrion[postgres]>=0.1,<0.2",
+    "tabrion[postgres]>=0.2,<0.3",
 ]
 # The DDGS metasearch provider of search connections (NAL-A2): free, without a key and without guarantees; opt-in,
 # never a default and never offered on a server.
@@ -67,7 +67,7 @@ dev = [
     # The PostgreSQL test fixtures (tests/postgres_support.py, TABRION MIG-NOD-1). Every Tabrion requirement in this
     # file names the same minor range (VER-1, RC-8; tests/test_tabrion_pin.py); the exact commit, a final release, lives
     # in the studio lock (nodestro-studio platform/internal-server.txt).
-    "tabrion[testing,postgres]>=0.1,<0.2",
+    "tabrion[testing,postgres]>=0.2,<0.3",
     # Keeps the rule engine of the tenant SQL check free of Nodestro (lint-imports, contracts below).
     "import-linter>=2.1",
     "mypy>=1.13",
