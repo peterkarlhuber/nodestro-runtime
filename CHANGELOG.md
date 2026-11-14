@@ -10,6 +10,11 @@
   helpers in `source_ledger`: `citing_fields`, `filled_fields`, `model_output`, `cited_entries`, `fill_from_ledger`.
   The workflow check covers the new sources with the existing codes `check.ledger_source_type` and
   `check.ledger_source_no_tool`.
+- Changed (NAL-A2): the MCP network guard and the address rules of service connections use Orkexa's shared egress
+  guard (`orkexa.net.guard`, Orkexa ADR 0017) instead of their own copy: `net_address` re-exports its rules and
+  `mcp.netguard.GuardedBackend` is Orkexa's backend with MCP's error codes (`mcp.address_refused`, `mcp.dns_failed`)
+  on `httpcore2`. Behavior is unchanged: `tests/test_mcp_netguard.py` runs unchanged, and
+  `tests/test_net_address_parity.py` compares every address vector with the earlier rules.
 
 - Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
   `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
