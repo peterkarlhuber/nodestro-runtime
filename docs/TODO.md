@@ -542,6 +542,8 @@ Items that need an independent or external review (an internal audit does not re
   `pytest tests/test_rollback_snapshots.py` once as the superuser and once with `NODESTRO_TEST_RUNTIME_ROLE=1`;
   nightly is enough (E-QA1). The schema dump already leaves out PostgreSQL 18's catalogued NOT NULL constraints
   (`contype = 'n'`, also in `columns`); a remaining difference on 18 is a finding for that pull request.
+  MIG-NOD-5 (role tools through Tabrion) has `catalog.json` byte-identical on PostgreSQL 16 (local, superuser and
+  runtime role mode) and 17 (CI); 18 is still unchecked until this job exists.
 - **Next step:** Each of these pull requests states the `check` result before and after the change and the reason
   for every rewritten golden file; remove this entry with the last of them.
 

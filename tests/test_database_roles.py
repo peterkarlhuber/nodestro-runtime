@@ -174,6 +174,94 @@ def test_grant_refuses_roles_row_level_security_would_not_bind(roles: Roles) -> 
         owner.close()
 
 
+@pytest.fixture
+def extra_roles() -> Iterator[list[str]]:
+    """Roles (and schemas named like them) a test creates; dropped afterwards."""
+    created: list[str] = []
+    yield created
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        for name in reversed(created):
+            admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
+            admin.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(name)))
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name)))
+
+
+def _create_role(extra_roles: list[str], attributes: str = "") -> str:
+    name = f"nd_extra_{secrets.token_hex(4)}"
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE ROLE {} NOSUPERUSER " + attributes).format(sql.Identifier(name)))
+    extra_roles.append(name)
+    return name
+
+
+def _may_write(owner: PostgresDatabase, role: str) -> bool:
+    rows = owner._query("SELECT has_table_privilege(%s, 'nodestro_documents', 'INSERT')", (role,))
+    return bool(rows[0][0])
+
+
+def test_grant_refuses_a_member_of_a_bypassrls_role(roles: Roles, extra_roles: list[str]) -> None:
+    """TABRION MIG-NOD-5 (contract I-20): a role that can ``SET ROLE`` to a ``BYPASSRLS`` role is not restricted;
+    before Tabrion it was reported restricted and got the grants."""
+    bypass = _create_role(extra_roles, "BYPASSRLS")
+    member = _create_role(extra_roles)
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(bypass), sql.Identifier(member)))
+    owner = _open(roles.owner_dsn, roles.schema)
+    try:
+        report = inspect_role(owner, member)
+        assert report["bypass_rls"] and not report["superuser"] and not report["restricted"]
+        with pytest.raises(NodestroError) as caught:
+            grant_runtime_role(owner, member)
+        assert caught.value.code == "storage.role_unsafe" and "has BYPASSRLS" in str(caught.value)
+        assert caught.value.params == {"role": member}
+        assert not _may_write(owner, member)  # nothing granted
+    finally:
+        owner.close()
+
+
+def test_grant_refuses_a_role_that_can_become_the_owner_of_the_schema(roles: Roles, extra_roles: list[str]) -> None:
+    """The schema's owner may drop or alter every object in it: a role that can become it owns no table yet, but is
+    refused all the same (Tabrion's check, with Nodestro's code)."""
+    schema_owner = _create_role(extra_roles)
+    member = _create_role(extra_roles)
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(schema_owner), sql.Identifier(member)))
+        admin.execute(
+            sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                sql.Identifier(schema_owner), sql.Identifier(schema_owner)
+            )
+        )
+        admin.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(schema_owner), sql.Identifier(roles.owner))
+        )
+    owner = _open(roles.owner_dsn, schema_owner)
+    try:
+        report = inspect_role(owner, member)
+        assert report["restricted"] and report["tables"] == 0  # nothing the report shows
+        with pytest.raises(NodestroError) as caught:
+            grant_runtime_role(owner, member)
+        assert caught.value.code == "storage.role_unsafe" and "owner of the schema" in str(caught.value)
+        assert caught.value.params == {"role": member}
+        rows = owner._query("SELECT has_schema_privilege(%s, %s, 'USAGE')", (member, schema_owner))
+        assert rows[0][0]  # through its membership only: no grant of its own was written
+        acl = owner._query("SELECT nspacl::text FROM pg_namespace WHERE nspname = %s", (schema_owner,))
+        assert member not in str(acl[0][0] or "")
+    finally:
+        owner.close()
+
+
+def test_grant_runtime_role_needs_a_transaction_of_its_own(roles: Roles) -> None:
+    owner = _open(roles.owner_dsn, roles.schema)
+    try:
+        with owner.transaction():
+            assert inspect_role(owner, roles.runtime)["restricted"]  # reads work inside one
+            with pytest.raises(RuntimeError, match="inside a transaction"):
+                grant_runtime_role(owner, roles.runtime)
+        assert grant_runtime_role(owner, roles.runtime)["restricted"]
+    finally:
+        owner.close()
+
+
 def test_role_info_tells_owner_from_runtime_role(roles: Roles, runtime: PostgresDatabase) -> None:
     assert runtime.role_info() == {
         "role": roles.runtime,

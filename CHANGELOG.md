@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Security (TABRION MIG-NOD-5): `inspect_role`, `grant_runtime_role` and `PostgresDatabase.role_info` read and grant
+  through `tabrion.postgres` (`inspect_role`, `grant_runtime_role` with the schema versions as protected tables,
+  `role_info(owner_scope="schema")`); the dicts, codes (`storage.role_missing`, `storage.role_unsafe`) and messages
+  stay. The grants are byte-identical (`tests/fixtures/rollback/catalog.json` unchanged). Stricter, as Tabrion's
+  contract I-20 requires: `superuser`, `bypass_rls` and `table_owner` also hold when the role can become such a role
+  (`SET ROLE`), so a member of a `BYPASSRLS` role, which got the grants before, is refused, and so is a role that can
+  become the schema's owner; a superuser now reports `bypass_rls: true` (`roles.json` rewritten for that variant).
+  `grant_runtime_role` refuses to run inside `PostgresDatabase.transaction` (it needs a transaction of its own).
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no
