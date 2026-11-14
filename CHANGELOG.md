@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed (TABRION DC-NR-1 follow-up, 2026-11-14): `scripts/check_tabrion_source.py` is nodestro-studio's new copy
+  (#198, SHA-256 `f1edfc71b5da4986547abe0824833fb73bba532cb5e6a00e202c9ff317747456`): the poisoned `tabrion` is
+  0.2.99 (was 0.1.0), inside the package's range `>=0.2,<0.3` and above the locked 0.2.1, so an install by range
+  picks it. `tests/test_tabrion_source_check.py` installs by the package's own range again (was `>=0.1,<0.2`) and
+  names the studio PR head as the origin commit until that PR is merged.
+
 - Fixed (TABRION QA-7): `scripts/check_tabrion_api.py --surface` no longer reports a `__x__` name such as
   `tabrion.postgres.SessionSettings.__dataclass_fields__` (axentra) as missing from Tabrion's
   `docs/api/surface.json`. Such names are public (the `__all__` check already skipped them) and have no entry of
