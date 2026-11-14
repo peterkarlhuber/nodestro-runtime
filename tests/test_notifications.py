@@ -11,9 +11,11 @@ import pytest
 
 from nodestro_runtime.notifications import (
     COLLECTION,
+    MAX_LISTED,
     MAX_MESSAGES_PER_RUN,
     LocalInbox,
     Notification,
+    ReadState,
     RunNotifier,
     local_inbox_enabled,
     notification_id,
@@ -122,12 +124,49 @@ def test_rules_choose_events_and_recipients(store: SQLiteStore) -> None:
 
 def test_read_state_is_per_person(store: SQLiteStore) -> None:
     inbox = LocalInbox(store)
-    RunNotifier(inbox)(_run("failed"))
+    notifier = RunNotifier(inbox)
+    first = _run("failed")
+    notifier(first)
     assert inbox.unread("usr_a") == inbox.unread("usr_b") == 1
     assert inbox.mark_read("usr_a", ["ntf_unknown"]) == 0
     assert inbox.mark_read("usr_a") == 1
     assert inbox.mark_read("usr_a") == 0
     assert inbox.unread("usr_a") == 0 and inbox.unread("usr_b") == 1
+    # Marking all is a time stamp: a newer message is unread again.
+    second = _run("failed")
+    notifier(second)
+    assert inbox.unread("usr_a") == 1
+    newest = inbox.for_user("usr_b")[0]
+    assert inbox.mark_read("usr_b", [newest.id, newest.id]) == 1 and inbox.unread("usr_b") == 1
+    # The messages themselves never change.
+    assert inbox.get(newest.id) == newest
+
+
+def test_a_message_for_one_person_cannot_be_marked_by_another(store: SQLiteStore) -> None:
+    inbox = LocalInbox(store)
+    mine = _run("failed", started_by="usr_a")
+    mine.workflow.notifications = NotificationRules(recipients="starter")
+    RunNotifier(inbox)(mine)
+    [item] = inbox.for_user("usr_a")
+    assert inbox.mark_read("usr_b", [item.id]) == 0 and inbox.read_state("usr_b") == ReadState()
+
+
+def test_published_api_runs_never_notify(store: SQLiteStore) -> None:
+    inbox = LocalInbox(store)
+    RunNotifier(inbox)(_run("failed", trigger="api"))
+    assert inbox.recent() == []
+
+
+def test_listing_reads_only_the_newest_messages(store: SQLiteStore) -> None:
+    inbox = LocalInbox(store)
+    for number in range(MAX_LISTED + 5):
+        key = notification_key("run_failed", f"run_{number}")
+        store.put_raw_if_absent(
+            COLLECTION,
+            notification_id(key),
+            Notification(id=notification_id(key), key=key, kind="run_failed").model_dump(mode="json"),
+        )
+    assert len(inbox.recent()) == MAX_LISTED
 
 
 def test_old_messages_are_purged(store: SQLiteStore) -> None:
@@ -168,6 +207,12 @@ def test_messages_are_plain_text_and_limited_per_run(store: SQLiteStore) -> None
     notifier.message(run, "a", "Three", "", "error")
     with pytest.raises(ValueError, match=r"notify\.limit"):
         notifier.message(run, "a", "Four", "", "info")
+    # Another process that lost a race takes the next free key; the limit holds across processes.
+    other = RunNotifier(LocalInbox(store))
+    with pytest.raises(ValueError, match=r"notify\.limit"):
+        other.message(run, "a", "Five", "", "info")
+    assert notifier.message(_run("running"), None, "Multi\nline\ttitle", "", "info")
+    assert [item.title for item in notifier.inbox.recent() if item.title.startswith("Multi")] == ["Multi line title"]
     with pytest.raises(ValueError, match=r"notify\.empty_title"):
         notifier.message(_run("running"), "a", "  ", "", "info")
 

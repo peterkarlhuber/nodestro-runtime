@@ -4086,8 +4086,9 @@ class RunManager:
 
         notifier = self.notifier
         notify = None
-        if notifier is not None:
-            top = context.root.run
+        top = context.root.run
+        # A published API's caller is outside the workspace: its runs never write into the members' inbox (A3-M1).
+        if notifier is not None and top.trigger != "api":
 
             def notify(title: str, text: str, level: str) -> str:
                 """``notify_user``: a message of the top-level run (its starter, its limit)."""
@@ -4148,7 +4149,12 @@ class RunManager:
         proposals. It keeps the built-in tools (calculator, ``table_totals``), the run's input files and knowledge
         search, and it is told what the first turn's calls returned. It never waits for a budget decision: the
         waiting turn could not be continued with the full agent."""
-        kept = [name for name in config.tools if name in tool_policy.BUILTIN_CAPABILITIES]
+        # Only the built-in tools that read: ``notify_user`` writes (review A3-L2).
+        kept = [
+            name
+            for name in config.tools
+            if name in tool_policy.BUILTIN_CAPABILITIES and tool_policy.BUILTIN_CAPABILITIES[name].reads_only
+        ]
         choice = config.tool_choice
         if choice.type == "tool" and choice.name not in kept:
             choice = ToolChoice()

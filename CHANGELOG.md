@@ -10,6 +10,9 @@
     server with `NODESTRO_AXENTRA_NOTIFY=1`, whose Axentra inbox is unchanged.
   - Built-in tool `notify_user` (`write` + `internal`, offline, at most three per run) and `RunServices.notify`.
     New codes `notify.limit`, `notify.empty_title`.
+  - After the internal review: runs of a published API never notify and get no `notify_user`; read state is a
+    per-person record (`notification_reads`), messages never change; an inbox reads the newest 500 messages; the
+    per-run limit holds across processes; titles are one line; the correction turn keeps only reading built-ins.
 
 - Added (NAL-B4, skill resources and run-time selection; requires orkexa with `Member.skills`):
   - **Groups:** `SkillGroup` in `skill_groups` (`Skills.groups/group/save_group/delete_group`), and

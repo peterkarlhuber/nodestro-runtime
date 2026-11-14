@@ -61,8 +61,12 @@ RETENTION = timedelta(days=90)
 MAX_MESSAGES_PER_RUN = 3
 MAX_TITLE = 120
 MAX_TEXT = 2000
-#: Most people who can mark one message as read (a server's members); more are not recorded.
-MAX_READERS = 500
+#: The newest messages an inbox reads (listing, unread count, marking): older ones in the retention period are kept
+#: but no longer listed (security review A3-M2: every call costs at most this many documents).
+MAX_LISTED = 500
+#: Messages one person marked one by one that are remembered; marking all is one time stamp.
+MAX_MARKED = 500
+READS = "notification_reads"
 #: The values of ``NODESTRO_AXENTRA_NOTIFY`` that switch Axentra's inbox on (as ``axentra_platform`` reads them).
 _ON = frozenset({"1", "true", "yes", "on"})
 
@@ -85,15 +89,26 @@ class Notification(_Model):
     workflow_name: str = ""
     #: The one person it is for (``starter``); ``None``: every member who may read the workspace.
     user_id: str | None = None
-    #: Who read it, and when (user id -> time; ``local`` on a desktop).
-    read: dict[str, datetime] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=now)
 
     def for_user(self, user_id: str) -> bool:
         return self.user_id is None or self.user_id == user_id
 
-    def read_at(self, user_id: str) -> datetime | None:
-        return self.read.get(user_id)
+
+class ReadState(_Model):
+    """What one person has read (collection ``notification_reads``, keyed by user id): everything created up to
+    ``all_before``, and single messages marked since (newest :data:`MAX_MARKED`). The messages themselves never
+    change, so one person's read state cannot touch anyone else's (security review A3-L3)."""
+
+    all_before: datetime | None = None
+    marked: dict[str, datetime] = Field(default_factory=dict)
+
+    def read_at(self, item: Notification) -> datetime | None:
+        if item.id in self.marked:
+            return self.marked[item.id]
+        if self.all_before is not None and item.created_at <= self.all_before:
+            return self.all_before
+        return None
 
 
 def notification_key(event: str, record_id: str) -> str:
@@ -139,40 +154,45 @@ class LocalInbox:
         return found
 
     def recent(self) -> list[Notification]:
-        """Every message of the retention period, newest first (ties: higher id first)."""
-        found: list[Notification] = self.store.list_since(
-            COLLECTION, Notification, field="created_at", since=now() - self.retention
-        )
-        return found
+        """The newest :data:`MAX_LISTED` messages of the retention period, newest first (ties: higher id first)."""
+        cutoff = now() - self.retention
+        found: list[Notification] = self.store.list(COLLECTION, Notification, limit=MAX_LISTED)
+        kept = [item for item in found if item.created_at >= cutoff]
+        return sorted(kept, key=lambda item: (item.created_at, item.id), reverse=True)
 
     def for_user(self, user_id: str) -> list[Notification]:
         return [item for item in self.recent() if item.for_user(user_id)]
 
+    def read_state(self, user_id: str) -> ReadState:
+        found: ReadState | None = self.store.get(READS, user_id, ReadState)
+        return found or ReadState()
+
     def unread(self, user_id: str) -> int:
-        return sum(1 for item in self.for_user(user_id) if item.read_at(user_id) is None)
+        state = self.read_state(user_id)
+        return sum(1 for item in self.for_user(user_id) if state.read_at(item) is None)
 
     def mark_read(self, user_id: str, ids: list[str] | None = None) -> int:
-        """Mark ``user_id``'s messages as read (``ids``: only these; unknown or foreign ids change nothing)."""
-        wanted = set(ids) if ids else None
-        marked = 0
+        """Mark ``user_id``'s messages as read (``ids``: only these; unknown or foreign ids change nothing); returns
+        how many were unread. Marking all is one time stamp, whatever the number of messages."""
         moment = now()
         with self.store.transaction():
-            for item in self.for_user(user_id):
-                if wanted is not None and item.id not in wanted:
-                    continue
-                if item.read_at(user_id) is not None or len(item.read) >= MAX_READERS:
-                    continue
-                self.store.lock(COLLECTION, item.id)
-                current = self.get(item.id)
-                if current is None or current.read_at(user_id) is not None:
-                    continue
-                current.read[user_id] = moment
-                self.store.put_raw(COLLECTION, current.id, current.model_dump(mode="json"))
-                marked += 1
+            self.store.lock(READS, user_id)
+            state = self.read_state(user_id)
+            if not ids:
+                marked = sum(1 for item in self.for_user(user_id) if state.read_at(item) is None)
+                state = ReadState(all_before=moment)
+            else:
+                marked = 0
+                for notification_id in dict.fromkeys(ids):
+                    item = self.get(notification_id)
+                    if item is None or not item.for_user(user_id) or state.read_at(item) is not None:
+                        continue
+                    state.marked[item.id] = moment
+                    marked += 1
+                newest = sorted(state.marked.items(), key=lambda pair: (pair[1], pair[0]), reverse=True)
+                state.marked = dict(newest[:MAX_MARKED])
+            self.store.put(READS, user_id, state)
         return marked
-
-    def count_messages(self, run_id: str) -> int:
-        return sum(1 for item in self.recent() if item.kind == "message" and item.run_id == run_id)
 
     def purge(self) -> int:
         """Delete the messages older than the retention period; returns how many."""
@@ -214,7 +234,9 @@ def _paused_events(run: Run) -> list[tuple[NotificationEvent, str, dict[str, str
 
 def run_events(run: Run) -> list[tuple[NotificationEvent, str, dict[str, str]]]:
     """The notifiable events of a stored run in its current state: ``(event, record id, params)``."""
-    if run.parent_run_id is not None or run.imported_at is not None:
+    if run.parent_run_id is not None or run.imported_at is not None or run.trigger == "api":
+        # Runs of a published API are started by callers outside the workspace: they never fill the members' inbox
+        # (security review A3-M1/M2).
         return []
     if run.status == "paused":
         return _paused_events(run)
@@ -241,7 +263,6 @@ class RunNotifier:
 
     def __init__(self, inbox: LocalInbox) -> None:
         self.inbox = inbox
-        self._lock = threading.Lock()
 
     def __call__(self, run: Run) -> None:
         """Called when ``run`` ended or paused: notify its events that its workflow's rules name."""
@@ -268,17 +289,17 @@ class RunNotifier:
             )
 
     def message(self, run: Run, node_id: str | None, title: str, text: str, level: str) -> str:
-        """A ``notify_user`` message of ``run``; refused (``ValueError``) after :data:`MAX_MESSAGES_PER_RUN`."""
+        """A ``notify_user`` message of ``run``; refused (``ValueError``) after :data:`MAX_MESSAGES_PER_RUN`.
+
+        The messages of a run have the keys ``message:<run>:1`` to ``:3``: the first free one is taken, atomically
+        in the store, so the limit holds across processes and a lost race takes the next key (review A3-L1)."""
         level = level if level in LEVELS else "info"
-        title = _clean(title, MAX_TITLE)
+        title = " ".join(_clean(title, MAX_TITLE).split())  # one line (review A3-L4)
         text = _clean(text, MAX_TEXT)
         if not title:
             raise ValueError("notify.empty_title")
-        with self._lock:
-            count = self.inbox.count_messages(run.id)
-            if count >= MAX_MESSAGES_PER_RUN:
-                raise ValueError("notify.limit")
-            key = notification_key("message", f"{run.id}:{count + 1}")
+        for number in range(1, MAX_MESSAGES_PER_RUN + 1):
+            key = notification_key("message", f"{run.id}:{number}")
             item = Notification(
                 id=notification_id(key),
                 key=key,
@@ -292,8 +313,9 @@ class RunNotifier:
                 workflow_name=_clean(run.workflow_name, MAX_TITLE),
                 user_id=run.started_by or None,
             )
-            self.inbox.add(item)
-        return item.id
+            if self.inbox.add(item):
+                return item.id
+        raise ValueError("notify.limit")
 
 
 @Tool
@@ -348,6 +370,7 @@ __all__ = [
     "Notification",
     "NotificationEvent",
     "NotificationRules",
+    "ReadState",
     "RunNotifier",
     "local_inbox_enabled",
     "notification_id",
