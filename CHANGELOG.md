@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added (TABRION DC-NR-1, dependency confusion): new CI job `tabrion source (poisoned index)`, reported by ci-ok, runs
+  the install with `scripts/check_tabrion_source.py` (an unchanged, checksummed copy from nodestro-studio): a poisoned
+  index must get no request for `tabrion`, which proves that the lock's direct-URL pin keeps a foreign `tabrion` out.
+  `tests/test_tabrion_pin.py` requires the installed Tabrion's `direct_url.json` to name a git commit, the studio
+  lock's when `NODESTRO_STUDIO_LOCK` names the lock (CI sets it): it detects an accidental index install, but it is
+  no proof of origin (a wheel can forge the file). README: the checkout install names the lock too.
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

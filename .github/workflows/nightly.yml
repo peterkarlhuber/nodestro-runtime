@@ -58,6 +58,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
           grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
+          # DC-NR-1: tests/test_tabrion_pin.py compares the installed tabrion's commit with this lock's.
+          echo "NODESTRO_STUDIO_LOCK=$RUNNER_TEMP/lock.txt" >> "$GITHUB_ENV"
       - name: Install
         run: |
           pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
