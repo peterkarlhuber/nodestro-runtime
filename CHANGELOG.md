@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security (TABRION MIG-NOD-5): `inspect_role`, `grant_runtime_role` and `PostgresDatabase.role_info` read and grant
+  through `tabrion.postgres` (`inspect_role`, `grant_runtime_role` with the schema versions as protected tables,
+  `role_info(owner_scope="schema")`); the dicts, codes (`storage.role_missing`, `storage.role_unsafe`) and messages
+  stay. The grants are byte-identical (`tests/fixtures/rollback/catalog.json` unchanged). Stricter, as Tabrion's
+  contract I-20 requires: `superuser`, `bypass_rls` and `table_owner` also hold when the role can become such a role
+  (`SET ROLE`), so a member of a `BYPASSRLS` role, which got the grants before, is refused, and so is a role that can
+  become the schema's owner; a superuser now reports `bypass_rls: true` (`roles.json` rewritten for that variant).
+  `grant_runtime_role` refuses to run inside `PostgresDatabase.transaction` (it needs a transaction of its own).
+  It reports each Tabrion refusal reason in its own words and a missing schema as the new code
+  `storage.schema_missing`; the role reads keep the read retry after a lost connection (RT2-03).
+  A member of `pg_write_all_data` is refused before anything is granted, and the grant fails when the role can
+  still write a schema-version table afterwards (both `storage.role_unsafe`).
 - Changed (TABRION MIG-NOD-7): `pgvector_status` reads the catalog and decides the state with
   `tabrion.postgres.extension_status("vector", probe_type="vector")`; its answer (states, fields, commands, messages)
   is unchanged, checked against `tests/fixtures/pgvector_status_before.json` from the code before. The read runs like

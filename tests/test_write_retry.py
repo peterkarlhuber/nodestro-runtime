@@ -792,3 +792,23 @@ def test_concurrent_claims_through_lost_connections_never_hand_a_job_out_twice(
     assert {job_id: worker for job_id, worker, _attempts in rows} == {
         job_id: name for name, ids in returned.items() for job_id in ids
     }
+
+
+# ---- the role tools read through Tabrion, with the read retry of RT2-03 (TABRION MIG-NOD-5) --------------------
+
+
+def test_role_info_is_read_again_after_a_lost_reply(proxied: PostgresDatabase, fault_proxy: FaultProxy) -> None:
+    expected = proxied.role_info()
+    fault_proxy.arm(b"OR pg_catalog.pg_has_role(SESSION_USER")
+    assert proxied.role_info() == expected
+    lost_reply(fault_proxy)
+
+
+def test_inspect_role_is_read_again_after_a_lost_reply(proxied: PostgresDatabase, fault_proxy: FaultProxy) -> None:
+    from nodestro_runtime.storage_postgres import inspect_role
+
+    role = proxied.role_info()["role"]
+    expected = inspect_role(proxied, role)
+    fault_proxy.arm(b"(SELECT n.oid FROM pg_catalog.pg_namespace n")
+    assert inspect_role(proxied, role) == expected
+    lost_reply(fault_proxy)

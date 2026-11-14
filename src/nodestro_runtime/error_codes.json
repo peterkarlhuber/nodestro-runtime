@@ -617,6 +617,7 @@
   "storage.role_missing": ["role"],
   "storage.role_unsafe": ["role"],
   "storage.schema_mismatch": ["found", "problems", "supported"],
+  "storage.schema_missing": ["role"],
   "storage.schema_too_new": ["found", "supported"],
   "storage.settings_invalid": ["variable"],
   "tool.adoption_desktop_only": ["name", "profile"],

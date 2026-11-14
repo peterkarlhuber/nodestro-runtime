@@ -196,7 +196,7 @@
     "superuser": {
       "grant_runtime_role": {
         "code": "storage.role_unsafe",
-        "message": "The runtime role '<role:superuser>' is a superuser and owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
+        "message": "The runtime role '<role:superuser>' is a superuser and has BYPASSRLS and owns tables (nodestro_axentra_ids, nodestro_bootstrap_tokens, nodestro_chunk_vectors, nodestro_chunks, nodestro_documents); row-level security would not apply to it",
         "params": {
           "role": "<role:superuser>"
         },
@@ -204,7 +204,7 @@
       },
       "inspect_role": {
         "ok": {
-          "bypass_rls": false,
+          "bypass_rls": true,
           "can_create": true,
           "connect": true,
           "database": "<database>",
@@ -237,7 +237,7 @@
       },
       "role_info": {
         "ok": {
-          "bypass_rls": false,
+          "bypass_rls": true,
           "role": "<role:superuser>",
           "superuser": true,
           "table_owner": true
