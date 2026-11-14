@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Hardened skills after the internal security review of the import path (NAL-B3): skill text cannot close its
+  `<skill_content>`/`<skill_file>` frame; the skills block follows the security note; `read_skill_file` returns at
+  most 50 KB per call and 400 KB per step; imported content keeps a skill marked as imported (`Skills.save(origin=)`);
+  `ReleaseBundle.skill_source(status=)` stops frozen skills that are disabled or archived in the workspace; stored
+  files and frozen skills are checked against their hashes; every UTF-8 file is scanned for credentials; a
+  `metadata.language` that is no language tag is dropped instead of failing the import.
+- Added (NAL-B3, skill library): skills in the Agent Skills format (`orkexa.skills`).
+  - `skills.Skills` stores them in immutable versions (`skills`, `skill_versions`, file contents by SHA-256 in
+    `skill_blobs`). Names are unique, and an unchanged save makes no version. `check()` warns about credentials in
+    files (`skill.secret_suspected`).
+  - `AgentConfig.skills` assigns up to 20 skills in fixed versions with mode `always` or `on_demand`. The system
+    prompt lists them (`<available_skills>`), and `always` adds their instructions.
+  - The run's own tools `load_skill` and `read_skill_file` are not asked about by the per-call gate. They read only
+    the assigned versions and record each use (`NodeRun.skills`, event `skill_loaded`).
+  - The inspector reports `skill.not_found`, `skill.inactive`, `skill.duplicate_name`, `skill.newer_version`,
+    `skill.always_large` and `skill.imported_with_write_tools`.
+  - Releases freeze the used versions with all files (`ReleaseBundle.skills`, `skill_source()`).
+  - Skills never grant tools or permissions, and scripts are never run. Details are in `docs/skills.md`.
+- Fixed: agents published without `task` or `origin` (NAL-B1) keep the release digest they had before; `skills` and
+  an empty bundle `skills` are left out in the same way.
 - Changed (TABRION 0.2.1 switch): every Tabrion requirement (core, `postgres` and `dev` extras) names
   `>=0.2,<0.3` instead of `>=0.1,<0.2`; the installed-commit tests expect Tabrion v0.2.1 final (`af0458d`), which the
   studio lock must pin. Tabrion 0.2 has no breaking change, so no code changes.
