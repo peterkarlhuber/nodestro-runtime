@@ -635,8 +635,8 @@ Items that need an independent or external review (an internal audit does not re
   K-32, Tabrion TODO TB-072, `tests/postgres_support.py`, `tests/test_tabrion_pin.py`
 - **What:** MIG-NOD-1 puts the PostgreSQL test helpers on `tabrion.testing` (plugin in `conftest.py`,
   `configure(env_prefix="NODESTRO", schema_prefix="nodestro_test_")`, `require_postgres()` through the session
-  fixture `tabrion_postgres_url`) and requires `tabrion[testing,postgres]>=0.1,<0.2` in the `dev` extra (the
-  studio lock pins v0.1.0 final, `d5821fa`). Two parts are left on purpose: (1) the pgvector
+  fixture `tabrion_postgres_url`) and requires `tabrion[testing,postgres]>=0.2,<0.3` in the `dev` extra (the
+  studio lock pins v0.2.1 final, `af0458d`; before the TABRION 0.2.1 switch `>=0.1,<0.2` and v0.1.0 final `d5821fa`). Two parts are left on purpose: (1) the pgvector
   switch stays `NODESTRO_REQUIRE_PGVECTOR=1` (`require_pgvector`, `require_pgvector_or_skip`), because the helpers do
   not use `tabrion.testing.require_extension` yet; with it, CI's `pg-b` must set `NODESTRO_REQUIRE_EXTENSIONS=vector`
   instead (TB-072: pointing `require_extensions_env` at the old variable would read its `1` as an extension name), a
@@ -825,7 +825,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
 | (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and the mandatory `tabrion` core (since MIG-NOD-3) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
-| RT-074 | nodestro-api, tabrion | TABRION MIG-NOD-1, VER-1 (RC-2) | The `dev` extras of runtime and api pin `tabrion[testing,postgres]` at the same commit (v0.1.0 final `d5821fa`); a Tabrion pin bump moves both (runtime first, then api), and nodestro-studio's `check_versions.py` checks them |
+| RT-074 | nodestro-api, tabrion | TABRION MIG-NOD-1, VER-1 (RC-2) | The `dev` extras of runtime and api pin `tabrion[testing,postgres]` at the same commit (v0.2.1 final `af0458d`, range `>=0.2,<0.3`); a Tabrion pin bump moves both (runtime first, then api), and nodestro-studio's `check_versions.py` checks them |
 | (pointer) | nodestro-studio | ST-052 (Dependabot policy: weekly groups, cooldown, manual merge; auto-merge prerequisites) | Full entry in studio |
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
