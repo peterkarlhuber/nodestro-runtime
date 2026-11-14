@@ -64,8 +64,9 @@ from .providers import (
     provider_of,
 )
 from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField
+from .source_ledger import model_output
 from .tool_library import ToolLibrary
-from .tool_spec import CallCounter, RunServices, ToolSpec, bind_tool, host_tool_spec, settings_problems
+from .tool_spec import CallCounter, RunServices, ToolSpec, bind_tool, host_tool_spec, offered, settings_problems
 
 _FIELD_TYPES: dict[str, Any] = {
     "string": str,
@@ -299,6 +300,12 @@ class AgentBuilder:
         #: lookup without the secret for validation. Unset (``None``/empty) outside a workspace.
         self.resolve_connection: Callable[..., ResolvedConnection] | None = None
         self.find_connection: Callable[[str], Any] = lambda _connection_id: None
+        #: The installation's mode for the tool specs (``desktop``, ``local-container``, ``server``, ``export``): a
+        #: built-in tool not offered in it refuses every call (``tool.mode_unsupported``), whatever started the run.
+        # The installation's mode decides which built-in tools are offered (tool_spec.offered). A host that does not
+        # set it gets the strictest reading, "server" (NAL-A2 review): the workspace sets its connections' mode, a
+        # portable package sets "export".
+        self.mode: str = "server"
 
     def output_limit(self, operation: str, model: str, connection: Connection | None = None) -> EffectiveLimit:
         """The output limit one of Nodestro's own AI operations sends to ``model``: the workspace setting, else the
@@ -459,7 +466,8 @@ class AgentBuilder:
             memory=memory,
             files=files,
             index=index,
-            output_format=output_model(config.output),
+            # Fields the run fills from the source ledger are not the model's to write (NAL-B2).
+            output_format=output_model(model_output(config.output)),
             effort=_effort(config, connection, model),
             tool_choice=tool_choice,
             max_tokens=config.max_tokens,
@@ -511,6 +519,11 @@ class AgentBuilder:
         if spec is None:
             return tool
         resolve = self.resolve_connection
+        services = replace(
+            services or RunServices(),
+            mode=self.mode,
+            refused=None if offered(spec, self.mode) else "tool.mode_unsupported",
+        )
 
         def connection(connection_id: str, connection_type: str) -> ResolvedConnection:
             assert resolve is not None

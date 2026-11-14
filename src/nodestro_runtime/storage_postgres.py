@@ -32,6 +32,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+import dataclasses
 from datetime import datetime
 import hashlib
 from importlib import resources
@@ -45,6 +46,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import weakref
 
 from pydantic import BaseModel
+from tabrion.errors import UsageError
 
 from .error_texts import failure_text
 from .problems import NodestroError
@@ -58,9 +60,12 @@ try:  # optional: nodestro-runtime[postgres]
     from psycopg import sql
     from psycopg_pool import ConnectionPool
 
-    # The role tools (role_info, inspect_role, grant_runtime_role; TABRION MIG-NOD-5): tabrion[postgres], the same extra
-    # as psycopg. Nodestro keeps its dicts, codes and messages and wraps Tabrion's answers.
-    from tabrion.errors import RoleMissing, RoleUnsafe, UsageError
+    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8), the state of an extension
+    # (pgvector_status, TABRION MIG-NOD-7) and the role tools (role_info, inspect_role, grant_runtime_role; TABRION
+    # MIG-NOD-5): tabrion[postgres], the same extra as psycopg. Nodestro keeps its dicts, codes and messages and wraps
+    # Tabrion's answers.
+    from tabrion.errors import RoleMissing, RoleUnsafe
+    from tabrion.postgres import SessionLock, SessionSettings, configure, extension_status
     from tabrion.postgres import grant_runtime_role as _tabrion_grant_runtime_role
     from tabrion.postgres import inspect_role as _tabrion_inspect_role
     from tabrion.postgres import role_info as _tabrion_role_info
@@ -219,7 +224,8 @@ class PostgresDatabase:
     connection the full time). The pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
-    transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
+    transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own
+    (:class:`tabrion.postgres.SessionLock`, TABRION MIG-NOD-4).
     """
 
     def __init__(
@@ -259,6 +265,14 @@ class PostgresDatabase:
         self._closed = False
         #: When each pooled connection went back into the pool (``time.monotonic()``).
         self._returned: weakref.WeakKeyDictionary[Any, float] = weakref.WeakKeyDictionary()
+        #: What :meth:`_configure` sets on every connection: the time limits and the schema, nothing else (no
+        #: ``lock_timeout``, ``application_name`` or ``TimeZone``: the server's defaults stay, TABRION MIG-NOD-8).
+        self._session_settings = dataclasses.replace(
+            SessionSettings.unchanged(),
+            statement_timeout_ms=int(self.statement_timeout * 1000),
+            idle_in_transaction_timeout_ms=int(self.idle_in_transaction_timeout * 1000),
+            search_path=schema,
+        )
         # A first connection outside the pool reports a wrong address or password at once (the pool would retry).
         probe = psycopg.connect(conninfo, **self._connect_kwargs)
         try:
@@ -280,23 +294,23 @@ class PostgresDatabase:
         except BaseException:
             self._pool.close()
             raise
-        #: The connection that holds session-level advisory locks (key -> how often this process took it).
-        self._session_guard = threading.Lock()
+        #: The session-level advisory locks: their own unpooled autocommit connection, opened at the first lock and
+        #: replaced when it is lost (the locks it held are gone with it); the holds are counted per key.
+        self._session_locks = SessionLock(
+            conninfo, connect_kwargs=self._connect_kwargs, configure=self._configure_session_lock
+        )
+        #: The latest connection of the session locks (for the tests; it may be closed once that one was lost).
         self._session: Any = None
-        self._session_held: dict[int, int] = {}
 
     def _configure(self, connection: Any) -> None:
-        """Settings of every new connection: the schema and the time limits (one round trip)."""
-        connection.execute(
-            "SELECT set_config('statement_timeout', %s, false),"
-            " set_config('idle_in_transaction_session_timeout', %s, false)"
-            + (", set_config('search_path', %s, false)" if self.schema is not None else ""),
-            (
-                f"{int(self.statement_timeout * 1000)}",
-                f"{int(self.idle_in_transaction_timeout * 1000)}",
-                *((f'"{self.schema}"',) if self.schema is not None else ()),
-            ),
-        )
+        """Settings of every new connection: the schema and the time limits (one round trip,
+        :func:`tabrion.postgres.configure`)."""
+        configure(connection, self._session_settings)
+
+    def _configure_session_lock(self, connection: Any) -> None:
+        """The settings of the session locks' connection: the same as every pooled connection."""
+        self._configure(connection)
+        self._session = connection
 
     @contextmanager
     def _connection(self, timeout: float | None = None) -> Iterator[Any]:
@@ -335,12 +349,9 @@ class PostgresDatabase:
             if self._closed:
                 return
             self._closed = True
-        with self._session_guard:
-            if self._session is not None:
-                with suppress(Exception):
-                    self._session.close()
-                self._session = None
-                self._session_held.clear()
+        with suppress(Exception):
+            self._session_locks.close()
+        self._session = None
         self._pool.close()
 
     @property
@@ -399,10 +410,19 @@ class PostgresDatabase:
         """The rows of a read. Outside a transaction a lost connection is replaced and the read repeated (RT2-03),
         so a statement that writes never goes through here (:meth:`_write`, :meth:`_write_returning`), except one
         that is safe to repeat, as listed in ``tests/test_query_writes.py`` with its reason (JQ-3)."""
+
+        def rows(connection: Any) -> builtins.list[tuple[Any, ...]]:
+            found: builtins.list[tuple[Any, ...]] = connection.execute(query, params).fetchall()
+            return found
+
+        return self._read(rows)
+
+    def _read(self, read: Callable[[Any], _T]) -> _T:
+        """``read(connection)``, which only reads, the way :meth:`_query` runs a read: inside this thread's
+        transaction on its connection, else on a pooled one, repeated on another one when the connection was lost."""
         current: Any = getattr(self._local, "connection", None)
         if current is not None:  # inside this thread's transaction: read its own writes
-            rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
-            return rows
+            return read(current)
         attempts = self.pool_size + 1  # every pooled connection may have been dropped at once
         for attempt in range(1, attempts + 1):
             if self._closed:
@@ -410,8 +430,7 @@ class PostgresDatabase:
             connection: Any = None
             try:
                 with self._connection() as connection:
-                    rows = connection.execute(query, params).fetchall()
-                return rows
+                    return read(connection)
             except psycopg.OperationalError:
                 # A lost connection (not a statement timeout, which leaves the connection usable): try another one.
                 if connection is None or not connection.broken or attempt == attempts:
@@ -504,70 +523,42 @@ class PostgresDatabase:
 
     # ---- session-level advisory locks ------------------------------------------------------------
 
-    def _session_connection(self) -> Any:
-        """The live connection of the session locks (called under ``_session_guard``); a lost one is replaced, and
-        the locks it held are gone with it."""
-        if self._session is not None:
-            try:
-                self._session.execute("SELECT 1")
-            except psycopg.Error:
-                with suppress(Exception):
-                    self._session.close()
-                self._session = None
-                self._session_held.clear()
-        if self._session is None:
-            if self._closed:
-                raise RuntimeError("The database is closed")
-            connection = psycopg.connect(self._conninfo, **self._connect_kwargs)
-            try:
-                self._configure(connection)
-            except BaseException:
-                connection.close()
-                raise
-            self._session = connection
-        return self._session
-
     def try_session_lock(self, key: int) -> bool:
         """Take the session-level advisory lock ``key`` unless another process holds it (``False``).
 
         Held until :meth:`release_session_lock` or until the connection of the locks ends (with the process, or
         when the server drops it: then :meth:`holds_session_lock` says ``False`` and a later call takes it again,
         if it is still free). Taking it again in this process counts, as in PostgreSQL."""
-        with self._session_guard:
-            connection = self._session_connection()
-            if self._session_held.get(key):
-                self._session_held[key] += 1
-                return True
-            row = connection.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()
-            if not row or not row[0]:
-                return False
-            self._session_held[key] = 1
-            return True
+        if self._closed:
+            raise RuntimeError("The database is closed")
+        try:
+            return self._session_locks.try_acquire(key)
+        except UsageError as exc:
+            if exc.code == "postgres.lock_closed":
+                raise RuntimeError("The database is closed") from None
+            if exc.code != "postgres.lock_lost":
+                raise
+        # The key was held on a connection that was lost. SessionLock refuses it until the loss is acknowledged;
+        # this method has always taken such a lock again when it is free, so it acknowledges the loss and tries once.
+        self._session_locks.holds(key)
+        return self._session_locks.try_acquire(key)
 
     def holds_session_lock(self, key: int) -> bool:
         """Whether this process still holds the session lock ``key`` (checks that its connection is alive)."""
-        with self._session_guard:
-            if not self._session_held.get(key) or self._closed:
-                return False
-            try:
-                self._session_connection()
-            except Exception:
-                return False
-            return bool(self._session_held.get(key))
+        if self._closed:
+            return False
+        try:
+            return self._session_locks.holds(key)
+        except Exception:
+            return False
 
     def release_session_lock(self, key: int) -> None:
         """Give up one hold of the session lock ``key`` (the lock is free when the last one is released)."""
-        with self._session_guard:
-            count = self._session_held.get(key, 0)
-            if count > 1:
-                self._session_held[key] = count - 1
-                return
-            if not count:
-                return
-            del self._session_held[key]
-            if self._session is not None:
-                with suppress(psycopg.Error):
-                    self._session.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        try:
+            self._session_locks.release(key)
+        except UsageError as exc:
+            if exc.code != "postgres.lock_closed":  # closed: every lock went with the connection
+                raise
 
     # ---- tenants -----------------------------------------------------------------------------
 
@@ -1070,9 +1061,11 @@ def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
 
     Migration ``0010`` installs pgvector only when it is available at that moment and the migrating role may install
     it; one installed later, or in a schema this database's ``search_path`` does not include, leaves the runtime
-    ranking the vectors itself. Read-only; ``state`` is one of:
+    ranking the vectors itself. Read-only; the catalog read and the state come from
+    :func:`tabrion.postgres.extension_status` (TABRION MIG-NOD-7), the wording from here. ``state`` is one of:
 
-    - ``active``: the type ``vector`` is usable here; pgvector ranks the vectors.
+    - ``active``: the extension is installed in a schema this connection sees and the type ``vector`` resolves;
+      pgvector ranks the vectors.
     - ``other_schema``: the extension is installed in ``extension_schema``, which this connection does not see (a
       server with ``NODESTRO_DATABASE_SCHEMA`` sets its ``search_path`` to that schema only).
     - ``installable``: the server has pgvector (``available_version``) but this database does not use it.
@@ -1082,38 +1075,30 @@ def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
     not a trusted extension), ``None`` when nothing is to be done or the package must be installed first; ``message``
     says it in English for operator output. Processes that already run keep ranking themselves until they restart
     (each knowledge index checks pgvector once, and again after ``PostgresIndex.refresh()``)."""
-    rows = database._query(
-        "SELECT to_regtype('vector') IS NOT NULL, current_schema()::text,"
-        " (SELECT e.extversion::text FROM pg_extension e WHERE e.extname = 'vector'),"
-        " (SELECT n.nspname::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace"
-        "   WHERE e.extname = 'vector'),"
-        " (SELECT a.default_version::text FROM pg_available_extensions a WHERE a.name = 'vector')"
-    )
-    usable, schema, version, extension_schema, available = rows[0] if rows else (False, None, None, None, None)
+    found = database._read(lambda connection: extension_status(connection, "vector", probe_type="vector"))
+    state, version, available = found.state, found.installed_version, found.available_version
+    schema, extension_schema = found.schema, found.extension_schema
+    # The commands name the extension unquoted, as before Tabrion (an operator copies them; the output is unchanged).
     target = '"' + str(schema or "public").replace('"', '""') + '"'
     command: str | None = None
-    if usable:
-        state = "active"
+    if state == "active":
         message = (
             f"pgvector {version} ranks the knowledge vectors" if version else "pgvector ranks the knowledge vectors"
         )
-    elif version is not None:
-        state = "other_schema"
+    elif state == "other_schema":
         command = f"ALTER EXTENSION vector SET SCHEMA {target};"
         message = (
             f"pgvector {version} is installed in schema {extension_schema!r}, which this database's search_path "
             f"({schema!r}) does not include: the runtime ranks the vectors itself. Move it ({command}), unless other "
             "applications of this database use it there, then restart the API and worker processes"
         )
-    elif available is not None:
-        state = "installable"
+    elif state == "installable":
         command = f"CREATE EXTENSION vector SCHEMA {target};"
         message = (
             f"pgvector {available} is available on the PostgreSQL server but not installed in this database: the "
             f"runtime ranks the vectors itself. As a superuser run {command} then restart the API and worker processes"
         )
     else:
-        state = "unavailable"
         message = (
             "The PostgreSQL server has no pgvector: the runtime ranks the vectors itself (semantic search works, but "
             "reads every candidate vector). Install the pgvector package on the server, then check again"

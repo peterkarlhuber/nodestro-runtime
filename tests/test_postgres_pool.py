@@ -8,6 +8,8 @@ session-level advisory locks (the scheduler leader, the price sync) notice a los
 from __future__ import annotations
 
 from collections.abc import Iterator
+import subprocess
+import sys
 import threading
 import time
 
@@ -273,6 +275,181 @@ def test_the_session_lock_counts_like_postgresql(database: PostgresDatabase, sch
         other.release_session_lock(77)
     finally:
         other.close()
+
+
+def _lock_holder(key: int) -> int:
+    """The server process that holds the one-key advisory lock ``key`` (asked as the owner of the tests)."""
+    with psycopg.connect(postgres_support.DSN, autocommit=True) as admin:
+        row = admin.execute(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted"
+            " AND classid = ((%s::bigint >> 32) & 4294967295)::oid AND objid = (%s::bigint & 4294967295)::oid"
+            " AND objsubid = 1",
+            (key, key),
+        ).fetchone()
+    assert row is not None, "nobody holds the lock"
+    return int(row[0])
+
+
+def test_the_session_locks_are_tabrions_session_lock(database: PostgresDatabase) -> None:
+    """TABRION MIG-NOD-4: the session-level advisory locks are a ``tabrion.postgres.SessionLock``."""
+    from tabrion.postgres import SessionLock
+
+    assert isinstance(database._session_locks, SessionLock)
+    assert database.try_session_lock(4711)
+    try:
+        assert database._session_locks.held_keys() == {4711}
+        assert _lock_holder(4711) == database._session.info.backend_pid
+    finally:
+        database.release_session_lock(4711)
+    assert database._session_locks.held_keys() == frozenset()
+
+
+def test_a_second_session_cannot_take_a_held_lock(database: PostgresDatabase, schema: str) -> None:
+    other = PostgresDatabase(postgres_support.DSN, schema=schema)
+    try:
+        assert not other.holds_session_lock(4712)
+        assert database.try_session_lock(4712)
+        assert not other.try_session_lock(4712)
+        assert not other.holds_session_lock(4712)
+        other.release_session_lock(4712)  # not held: nothing happens, the holder keeps it
+        assert database.holds_session_lock(4712)
+        assert not other.try_session_lock(4712)
+        database.release_session_lock(4712)
+        assert other.try_session_lock(4712)
+        assert not database.try_session_lock(4712)
+        other.release_session_lock(4712)
+    finally:
+        other.close()
+
+
+def test_a_lost_session_lock_is_taken_again_by_a_later_call(database: PostgresDatabase, schema: str) -> None:
+    """The public API since before Tabrion: after a lost connection, ``try_session_lock`` takes the lock again when it
+    is free, also without asking :meth:`holds_session_lock` first (SessionLock alone would refuse until then)."""
+    other = PostgresDatabase(postgres_support.DSN, schema=schema)
+    try:
+        assert database.try_session_lock(4713) and database.try_session_lock(4713)
+        _terminate({_lock_holder(4713)})
+        time.sleep(0.2)
+        assert other.try_session_lock(4713)  # free again: the server ended the leader's session
+        assert not database.try_session_lock(4713)  # the loss is noticed, the lock is not taken twice
+        assert not database.holds_session_lock(4713)
+        other.release_session_lock(4713)
+        assert database.try_session_lock(4713)  # without holds_session_lock: taken again
+        assert database.holds_session_lock(4713)
+        database.release_session_lock(4713)
+        assert not database.holds_session_lock(4713)
+        assert other.try_session_lock(4713)
+        other.release_session_lock(4713)
+    finally:
+        other.close()
+
+
+def test_the_session_locks_after_close(schema: str) -> None:
+    database = PostgresDatabase(postgres_support.DSN, schema=schema)
+    assert database.try_session_lock(4714)
+    database.close()
+    assert not database.holds_session_lock(4714)
+    database.release_session_lock(4714)  # harmless: the lock went with the connection
+    with pytest.raises(RuntimeError, match="closed"):
+        database.try_session_lock(4714)
+    other = PostgresDatabase(postgres_support.DSN, schema=schema)
+    try:
+        assert other.try_session_lock(4714)
+        other.release_session_lock(4714)
+    finally:
+        other.close()
+
+
+_LEADER = """
+import sys
+from nodestro_runtime.jobs import LeaderLock
+from nodestro_runtime.storage_postgres import PostgresDatabase
+
+database = PostgresDatabase(sys.argv[1], schema=sys.argv[2])
+leader = LeaderLock(database, key=int(sys.argv[3]))
+print("leader" if leader.acquire() else "follower", flush=True)
+sys.stdin.readline()
+"""
+
+
+def test_the_leader_changes_between_two_processes(database: PostgresDatabase, schema: str) -> None:
+    """Leader change across processes: the leader process dies, and another process takes over."""
+    key = 4715
+    child = subprocess.Popen(
+        [sys.executable, "-c", _LEADER, database._conninfo, schema, str(key)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "leader"
+        follower = LeaderLock(database, key=key)
+        assert not follower.acquire()
+        child.kill()  # no release: the server ends the session when the process is gone
+        child.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while not follower.acquire():
+            assert time.monotonic() < deadline, "the lock of the dead leader was not freed"
+            time.sleep(0.05)
+        assert database.holds_session_lock(key)
+        follower.release()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def _settings(connection: psycopg.Connection) -> dict[str, str]:
+    return {str(name): str(value) for name, value, _ in connection.execute("SHOW ALL").fetchall()}
+
+
+def test_every_connection_sets_only_the_time_limits_and_the_schema(
+    schema: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TABRION MIG-NOD-8: ``_configure`` goes through ``tabrion.postgres.configure`` and, with the defaults, sets what
+    it always set and nothing else (``SHOW ALL`` of a pooled and of the lock connection against a plain connection):
+    no ``lock_timeout``, no ``application_name``, no ``TimeZone``."""
+    for variable in ("NODESTRO_DATABASE_STATEMENT_TIMEOUT", "NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT"):
+        monkeypatch.delenv(variable, raising=False)
+    database = PostgresDatabase(postgres_support.DSN, schema=schema, pool_size=1)
+    try:
+        with psycopg.connect(database._conninfo, autocommit=True) as plain:
+            baseline = _settings(plain)
+        expected = {
+            "statement_timeout": "30s",
+            "idle_in_transaction_session_timeout": "5min",
+            "search_path": f'"{schema}"',
+        }
+        with database._connection() as pooled:
+            shown = _settings(pooled)
+        assert {k: v for k, v in shown.items() if baseline.get(k) != v} == expected
+        assert database.try_session_lock(4716)
+        try:
+            shown = _settings(database._session)
+        finally:
+            database.release_session_lock(4716)
+        assert {k: v for k, v in shown.items() if baseline.get(k) != v} == expected
+    finally:
+        database.close()
+
+
+def test_configure_without_a_schema_leaves_the_search_path(schema: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NODESTRO_DATABASE_STATEMENT_TIMEOUT", raising=False)
+    database = PostgresDatabase(postgres_support.DSN, statement_timeout=1.5, idle_in_transaction_timeout=0, pool_size=1)
+    try:
+        with psycopg.connect(database._conninfo, autocommit=True) as plain:
+            baseline = _settings(plain)
+        with database._connection() as pooled:
+            shown = _settings(pooled)
+        changed = {k: v for k, v in shown.items() if baseline.get(k) != v}
+        assert changed == {"statement_timeout": "1500ms"} | (
+            {}
+            if baseline["idle_in_transaction_session_timeout"] == "0"
+            else {"idle_in_transaction_session_timeout": "0"}
+        )
+    finally:
+        database.close()
 
 
 def test_migrate_has_no_statement_time_limit(schema: str) -> None:

@@ -130,7 +130,7 @@ from .schemas import (
     Workflow,
     now,
 )
-from .source_ledger import SourceLedger, UnknownSource, ledger_fields, unknown_sources
+from .source_ledger import SourceLedger, UnknownSource, citing_fields, fill_from_ledger, filled_fields, unknown_sources
 from .source_ledger import correction_prompt as source_correction_prompt
 from .storage import DocumentStore
 from .tool_approvals import (
@@ -148,7 +148,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
-from .tool_spec import RunServices
+from .tool_spec import CallCounter, RunServices
 from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
@@ -901,6 +901,8 @@ class _RunContext:
         self.flow_stop: flow.Stop | None = None
         #: Set when the run's time limit was reached and its running nodes were cancelled.
         self.timed_out = False
+        #: Calls of built-in tools across all steps of the run (NAL-A2: a run-wide cap besides the per-step one).
+        self.tool_calls = CallCounter()
         #: Set (root context) when the process stops gracefully (SIGTERM, quitting the app): the run ends as
         #: interrupted, not as cancelled by a person (AD-10).
         self.shutting_down = False
@@ -4042,6 +4044,7 @@ class RunManager:
             node_id=node_id,
             book=book,
             check_budget=context.tracker.check,
+            run_calls=context.root.tool_calls,
         )
 
     def _check_sources(
@@ -4053,8 +4056,8 @@ class RunManager:
         outcome: AgentOutcome,
         ask: Callable[..., AgentOutcome],
     ) -> AgentOutcome:
-        """Cited sources (``source="ledger"``) must be in the run's source ledger: one correction, then the step
-        fails with ``output.unknown_source`` (:mod:`.source_ledger`)."""
+        """Cited sources (``source="ledger"`` or ``"ledger_cited"``) must be in the run's source ledger: one
+        correction, then the step fails with ``output.unknown_source`` (:mod:`.source_ledger`)."""
 
         def failed_of(result: Any) -> list[UnknownSource]:
             with context.lock:
@@ -4301,8 +4304,12 @@ class RunManager:
             outcome = ask(prompt)
             if checked_fields(config.output):
                 outcome = self._check_values(context, node_id, state, config, prompt, extra, outcome, ask)
-            if ledger_fields(config.output):
+            if citing_fields(config.output):
                 outcome = self._check_sources(context, node_id, config, prompt, outcome, ask)
+            if filled_fields(config.output):
+                with context.lock:
+                    entries = list(context.run.sources)
+                outcome.output = fill_from_ledger(config.output, outcome.output, entries)
             state.output = outcome.output
             state.memory = outcome.memory
             if config.knowledge_proposals.enabled and outcome.output not in (None, ""):

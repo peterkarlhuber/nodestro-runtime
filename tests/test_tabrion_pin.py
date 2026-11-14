@@ -6,13 +6,24 @@ live in one lock (nodestro-studio ``platform/internal-server.txt``). For Tabrion
 specifier, no pre-release bound and no environment marker (one Tabrion version per installation, AC-6). The installed
 Tabrion, which the lock chose, must be a final release inside that range (``0.1.0``, never ``0.1.1.dev0`` or
 ``0.2.0a1``, RC-8).
+
+DC-NR-1 (dependency confusion): the installed Tabrion's ``direct_url.json`` must name a git commit; when
+``NODESTRO_STUDIO_LOCK`` names the lock file (CI sets it to the studio lock it installs with), the URL and commit
+must be the lock's ``tabrion @ git+URL@SHA``. This detects an accidental install from a package index (a version
+check alone passed one); it is no proof of origin, because a wheel can ship a forged ``direct_url.json``. The
+protection is the direct-URL pin of the install (``-c <lock>``), and the proof that it never asks an index for
+Tabrion is CI's ``scripts/check_tabrion_source.py`` job ``tabrion source (poisoned index)`` (zero requests).
 """
 
 from __future__ import annotations
 
 from importlib import metadata
+import json
+import os
 from pathlib import Path
+import re
 import tomllib
+from typing import Any
 
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
@@ -21,6 +32,9 @@ from packaging.version import Version
 import pytest
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+LOCK_ENV = "NODESTRO_STUDIO_LOCK"
+#: The lock's Tabrion line: ``tabrion[extras] @ git+URL@<40 hex>``.
+LOCK_LINE = re.compile(r"^\s*tabrion\s*(?:\[[^\]]*\])?\s*@\s*git\+(?P<url>\S+?)@(?P<commit>[0-9a-f]{40})\b")
 
 
 def tabrion_requirements(pyproject: dict) -> list[tuple[str, Requirement]]:
@@ -131,3 +145,74 @@ def test_the_installed_tabrion_is_a_final_version_inside_the_range() -> None:
         f"tabrion {version} is not a final version (RC-8): the lock must name the commit of a final release"
     )
     assert version in specifier, f"tabrion {version} is outside {specifier}"
+
+
+def locked_tabrion(text: str) -> tuple[str, str] | None:
+    """``(url, commit)`` of the lock's Tabrion line, or ``None``."""
+    for line in text.splitlines():
+        found = LOCK_LINE.match(line.split("#", 1)[0])
+        if found:
+            return found["url"], found["commit"]
+    return None
+
+
+def _strip(url: str) -> str:
+    return url.removeprefix("git+").rstrip("/").removesuffix(".git")
+
+
+def origin_problems(direct_url: dict[str, Any] | None, lock: tuple[str, str] | None) -> list[str]:
+    """What is wrong with where Tabrion came from (``direct_url.json``), against the lock's ``(url, commit)``."""
+    if not direct_url:
+        return ["tabrion has no direct_url.json: installed from a package index, not from the lock's commit"]
+    vcs = direct_url.get("vcs_info") or {}
+    url = str(direct_url.get("url", ""))
+    commit = str(vcs.get("commit_id", ""))
+    if vcs.get("vcs") != "git" or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        return [f"tabrion is not installed from a git commit ({url})"]
+    if lock is None:
+        return []
+    if _strip(url) != _strip(lock[0]):
+        return [f"tabrion is installed from {url}, the lock pins {lock[0]}"]
+    if commit != lock[1]:
+        return [f"tabrion is installed at {commit[:12]}, the lock pins {lock[1][:12]}"]
+    return []
+
+
+SHA = "d5821faa8742dea012abda3b663549c038d76543"
+URL = "https://github.com/peterkarlhuber/tabrion.git"
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "problem"),
+    [
+        (None, "installed from a package index"),
+        ({"url": "file:///src/tabrion", "dir_info": {"editable": True}}, "not installed from a git commit"),
+        ({"url": URL, "vcs_info": {"vcs": "git", "commit_id": "e" * 40}}, "installed at eeeeeeeeeeee, the lock pins"),
+        ({"url": "https://evil.invalid/tabrion.git", "vcs_info": {"vcs": "git", "commit_id": SHA}}, "the lock pins"),
+    ],
+)
+def test_a_tabrion_not_from_the_locked_commit_is_reported(direct_url: dict[str, Any] | None, problem: str) -> None:
+    problems = origin_problems(direct_url, (URL, SHA))
+    assert len(problems) == 1 and problem in problems[0], problems
+
+
+def test_the_locked_commit_passes_in_any_url_spelling() -> None:
+    lock = locked_tabrion(f"nodestro-api @ git+https://x/y.git@{'a' * 40}\ntabrion[testing] @ git+{URL}@{SHA}\n")
+    assert lock == (URL, SHA)
+    for url in (URL, URL.removesuffix(".git"), URL + "/"):
+        assert origin_problems({"url": url, "vcs_info": {"vcs": "git", "commit_id": SHA}}, lock) == []
+    assert locked_tabrion(f"# tabrion @ git+{URL}@{SHA}\ntabrion>=0.1\n") is None
+
+
+def test_the_installed_tabrion_is_the_locked_commit() -> None:
+    """DC-NR-1: the installed Tabrion's direct_url.json names the lock's git commit (detects an index install)."""
+    text = metadata.distribution("tabrion").read_text("direct_url.json")
+    direct_url = json.loads(text) if text else None
+    lock_file = os.environ.get(LOCK_ENV)
+    lock = None
+    if lock_file:
+        lock = locked_tabrion(Path(lock_file).read_text(encoding="utf-8"))
+        assert lock is not None, f"{lock_file} ({LOCK_ENV}) has no line tabrion @ git+URL@<40 hex>"
+    elif direct_url and direct_url.get("dir_info") is not None:
+        pytest.skip(f"tabrion is installed from a local directory and {LOCK_ENV} is unset: no commit to compare")
+    assert origin_problems(direct_url, lock) == []

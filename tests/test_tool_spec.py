@@ -32,6 +32,7 @@ from nodestro_runtime.tool_spec import (
     current_tool_context,
     settings_problems,
 )
+from nodestro_runtime.web_tools import WEB_TOOLS
 from nodestro_runtime.workspace import Workspace
 
 EXTERNAL = ToolCapability(access="read", reach="external", source="nodestro")
@@ -98,7 +99,8 @@ def workflow(agent: AgentConfig) -> Workflow:
 
 def test_the_five_tools_keep_capability_and_schema() -> None:
     """Snapshot: specs add metadata only; what the model sees and what the approval rules read is unchanged."""
-    assert set(BUILTIN_SPECS) == {tool.name for tool in BUILTIN_TOOLS} == set(BUILTIN_CAPABILITIES)
+    # The five tools of NAL-A1 plus the two web tools of NAL-A2 (tests/test_web_tools.py covers those).
+    assert set(BUILTIN_SPECS) == {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS)} == set(BUILTIN_CAPABILITIES)
     for tool in BUILTIN_TOOLS:
         assert tool.name is not None
         item = BUILTIN_SPECS[tool.name]

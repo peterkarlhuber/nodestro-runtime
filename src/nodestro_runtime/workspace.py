@@ -409,6 +409,7 @@ class Workspace:
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
         self.builder.resolve_connection = self.connections.resolve
         self.builder.find_connection = self.connections.find
+        self.builder.mode = self.connections.mode
         self.builder.declared = lambda provider: dict(self._providers().get(provider, {}).get("capabilities") or {})
         self.builder.declared_limits = lambda provider: dict(self._providers().get(provider, {}).get("limits") or {})
         # Local models (Ollama): the managed server of the desktop, the container of Nodestro Local Docker, or the

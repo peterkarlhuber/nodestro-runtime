@@ -14,6 +14,59 @@
   `storage.schema_missing`; the role reads keep the read retry after a lost connection (RT2-03).
   A member of `pg_write_all_data` is refused before anything is granted, and the grant fails when the role can
   still write a schema-version table afterwards (both `storage.role_unsafe`).
+- Changed (TABRION MIG-NOD-7): `pgvector_status` reads the catalog and decides the state with
+  `tabrion.postgres.extension_status("vector", probe_type="vector")`; its answer (states, fields, commands, messages)
+  is unchanged, checked against `tests/fixtures/pgvector_status_before.json` from the code before. The read runs like
+  every other read (`PostgresDatabase._read`: on the transaction's connection inside one, else repeated on another
+  pooled connection when one was lost). Only a type named `vector` that pgvector did not create no longer counts as
+  `active`.
+- Added (NAL-B2, web research): result fields filled from the run's source ledger (`docs/web-tools.md`). New values
+  of `OutputField.source`, additive: `ledger_cited` (every statement of a text field cites ledger ids inline, `[S1]`
+  or `[S1, S3]`; checked like `ledger`, new failure reason `uncited`), `ledger_list` and `ledger_range` (filled by the
+  runtime after the step: one line per cited source with id, title, address and retrieval time, and the retrieval
+  time range, all from the ledger; left out of the model's answer format, so the model supplies ids only). New
+  helpers in `source_ledger`: `citing_fields`, `filled_fields`, `model_output`, `cited_entries`, `fill_from_ledger`.
+  The workflow check covers the new sources with the existing codes `check.ledger_source_type` and
+  `check.ledger_source_no_tool`.
+- Changed (NAL-A2): the MCP network guard and the address rules of service connections use Orkexa's shared egress
+  guard (`orkexa.net.guard`, Orkexa ADR 0017) instead of their own copy: `net_address` re-exports its rules and
+  `mcp.netguard.GuardedBackend` is Orkexa's backend with MCP's error codes (`mcp.address_refused`, `mcp.dns_failed`)
+  on `httpcore2`. Behavior is unchanged: `tests/test_mcp_netguard.py` runs unchanged, and
+  `tests/test_net_address_parity.py` compares every address vector with the earlier rules.
+
+- Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
+  `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
+  `SEARCH_WEB_SPEC` and `FETCH_WEB_PAGE_SPEC` (read + external, never offline, call and time limits, binding
+  parameters for hosts, defaults and `max_calls`). Results are marked as external content with a per-call nonce,
+  recorded in the run's source ledger and errors reach the model as codes only. Search providers `test`, `ddgs`
+  (keyless, never on a server, extra `web-ddgs`), `brave`, `tavily`, `mojeek` and `searxng` (keyless, self-hosted);
+  none is a default, a paid provider without a known price is not called (`search.price_unknown`), and the
+  connection check sends no real search. The web tools are not offered in the server profile
+  (`check.tool_mode_unsupported`, calls refused with `tool.mode_unsupported`) unless `NODESTRO_WEB_TOOLS_SERVER=1`
+  (RT-078). Connection contract, additive (ADR-0001 amendment): `keyless_providers`, `provider_modes`,
+  `offers()`/`needs_secret()`, `add_search_provider(host=, keyless=, modes=)`, problem
+  `connection.provider_unsupported_mode`. A built-in tool not offered in the installation's mode now refuses every
+  call, not only the workflow check. The base dependency becomes `orkexa[all,pdf,local,convert,web]`.
+  Internal review fixes: on a server a SearXNG endpoint must not resolve to private or loopback addresses;
+  `AgentBuilder.mode` defaults to `server` (hosts that build agents set their mode); search hits and ledger entries
+  with whitespace or control characters in the address are left out, and the correction prompt lists the run's
+  sources inside the external-content marker; a run-wide cap (`RUN_CALL_FACTOR` x the per-step limit) per tool; host
+  patterns follow the fetch guard (`*.example.com` matches example.com itself only in deny lists); source ids are
+  matched by normalized address.
+
+- Changed (TABRION MIG-NOD-4, MIG-NOD-8): `PostgresDatabase` configures every connection with
+  `tabrion.postgres.configure` (statement and idle-in-transaction time limits and the schema, as before; no
+  `lock_timeout`, `application_name` or `TimeZone`, so `SHOW ALL` is unchanged) and keeps its session-level advisory
+  locks (`try_session_lock`, `holds_session_lock`, `release_session_lock`, the scheduler's `LeaderLock`) in a
+  `tabrion.postgres.SessionLock`. The public API is unchanged: a lock lost with its connection is still taken again by a
+  later `try_session_lock` when it is free. The lock connection is now fork-safe (a child process never uses the
+  parent's session).
+- Added (TABRION DC-NR-1, dependency confusion): new CI job `tabrion source (poisoned index)`, reported by ci-ok, runs
+  the install with `scripts/check_tabrion_source.py` (an unchanged, checksummed copy from nodestro-studio): a poisoned
+  index must get no request for `tabrion`, which proves that the lock's direct-URL pin keeps a foreign `tabrion` out.
+  `tests/test_tabrion_pin.py` requires the installed Tabrion's `direct_url.json` to name a git commit, the studio
+  lock's when `NODESTRO_STUDIO_LOCK` names the lock (CI sets it): it detects an accidental index install, but it is
+  no proof of origin (a wheel can forge the file). README: the checkout install names the lock too.
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

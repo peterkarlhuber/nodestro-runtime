@@ -206,6 +206,11 @@ address; a value that does not goes back to the agent once (event `sources_unkno
 step with `output.unknown_source`, so a made-up source is never delivered. The ledger holds addresses and metadata
 only and never leaves its run.
 
+**Web tools (NAL-A2).** `search_web` asks the search provider of the agent's `search` connection (none is chosen
+automatically) and `fetch_web_page` reads one page through Orkexa's egress guard; both mark their results as external
+content and fill the source ledger. They are refused in the strict offline mode and not offered in the server profile
+unless `NODESTRO_WEB_TOOLS_SERVER=1`. Details: [docs/web-tools.md](docs/web-tools.md).
+
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).
@@ -288,7 +293,8 @@ copy. Runs without a readable `created_at` (and damaged documents) are not liste
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `postgres` (psycopg 3; with the studio lock as above,
-`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `-e ".[dev,postgres]"` in a checkout) and is not
+`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `pip install -c <lock URL> -e ".[dev,postgres]"` in a
+checkout, with pip >= 26.1; never without the lock, which pins Tabrion and the other internal packages) and is not
 used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns a pool of connections (`pool_size`, default
 `NODESTRO_DATABASE_POOL_SIZE`, else 8) shared by every tenant's store; `database.store(tenant_id)` gives
 the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store
@@ -469,4 +475,4 @@ Open work (release blockers, known bugs, security follow-ups, debt) is listed in
 ## Provenance and license
 
 Extracted from `nodestro` 0.1 (15e2076); see [PROVENANCE.md](PROVENANCE.md) and [CHANGELOG.md](CHANGELOG.md).
-MIT, see [LICENSE](LICENSE).
+Proprietary: Copyright (c) 2026 Levuvo. All rights reserved. See [LICENSE](LICENSE).

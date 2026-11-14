@@ -13,6 +13,12 @@ is used.
 | `tabrion.errors.UsageError` | `src/nodestro_runtime/storage_postgres.py`, `tests/test_role_errors.py` |
 | `tabrion.errors.classify` | `tests/test_error_texts.py` |
 | `tabrion.errors.safe_message` | `src/nodestro_runtime/error_texts.py` |
+| `tabrion.postgres.ExtensionStatus` | `tests/test_pgvector_status.py` |
+| `tabrion.postgres.SessionLock` | `src/nodestro_runtime/storage_postgres.py`, `tests/test_postgres_pool.py` |
+| `tabrion.postgres.SessionSettings` | `src/nodestro_runtime/storage_postgres.py` |
+| `tabrion.postgres.SessionSettings.unchanged` | `src/nodestro_runtime/storage_postgres.py` |
+| `tabrion.postgres.configure` | `src/nodestro_runtime/storage_postgres.py` |
+| `tabrion.postgres.extension_status` | `src/nodestro_runtime/storage_postgres.py` |
 | `tabrion.postgres.grant_runtime_role` | `src/nodestro_runtime/storage_postgres.py` |
 | `tabrion.postgres.inspect_role` | `src/nodestro_runtime/storage_postgres.py` |
 | `tabrion.postgres.role_info` | `src/nodestro_runtime/storage_postgres.py` |
