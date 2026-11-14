@@ -44,6 +44,7 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 ENDPOINTS_ENV = "NODESTRO_MCP_ENDPOINTS"
 
+
 def _normal_origin(url: str) -> tuple[str, str, int]:
     parts = urlsplit(url.strip())
     scheme = parts.scheme.lower()
@@ -165,7 +166,11 @@ class GuardedBackend(_CoreBackend):
     httpcore_module: str = "httpcore2"
 
     def error(self, code: str, message: str, **details: Any) -> Exception:
-        return NodestroError(f"mcp.{code}", message, **details)
+        # The guard raises exactly these two; written out so the error code catalog finds both.
+        host = details.get("host", "")
+        if code == "dns_failed":
+            return NodestroError("mcp.dns_failed", message, host=host)
+        return NodestroError("mcp.address_refused", message, host=host, reason=details.get("reason", ""))
 
 
 def redact_url(url: str) -> str:
