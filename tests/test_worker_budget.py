@@ -76,6 +76,10 @@ async def test_a_budget_wait_frees_its_worker_and_continues_after_the_raise(
     try:
         run_id, request = await waiting(api, "AGENT")
         assert api.job_status(run_id) == "done"  # the job ended: the worker holds nothing while the run waits
+        for _ in range(100):  # the job is finished before the held task's done callback releases it
+            if serving.worker.held == 0:
+                break
+            await asyncio.sleep(0.01)
         assert serving.worker.held == 0
         assert len(worker.client.messages.calls) == 0  # paused before the request was sent
         assert tool_checkpoints.runs_with_checkpoints(api.process("alpha").store, "budget") == {run_id}

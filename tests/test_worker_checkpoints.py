@@ -77,6 +77,10 @@ async def test_a_paused_run_frees_its_worker_and_continues_after_the_decision(
     try:
         run_id, request = await paused(api, "AGENT")
         assert api.job_status(run_id) == "done"  # the job ended: the worker holds nothing while the run waits
+        for _ in range(100):  # the job is finished before the held task's done callback releases it
+            if serving.worker.held == 0:
+                break
+            await asyncio.sleep(0.01)
         assert serving.worker.held == 0
         assert tool_checkpoints.runs_with_checkpoints(api.process("alpha").store) == {run_id}
         api.process("alpha").runs.decide_tool_call(
