@@ -60,9 +60,15 @@ try:  # optional: nodestro-runtime[postgres]
     from psycopg import sql
     from psycopg_pool import ConnectionPool
 
-    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8) and the state of an extension
-    # (pgvector_status, TABRION MIG-NOD-7): tabrion[postgres], the same extra as psycopg.
+    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8), the state of an extension
+    # (pgvector_status, TABRION MIG-NOD-7) and the role tools (role_info, inspect_role, grant_runtime_role; TABRION
+    # MIG-NOD-5): tabrion[postgres], the same extra as psycopg. Nodestro keeps its dicts, codes and messages and wraps
+    # Tabrion's answers.
+    from tabrion.errors import RoleMissing, RoleUnsafe
     from tabrion.postgres import SessionLock, SessionSettings, configure, extension_status
+    from tabrion.postgres import grant_runtime_role as _tabrion_grant_runtime_role
+    from tabrion.postgres import inspect_role as _tabrion_inspect_role
+    from tabrion.postgres import role_info as _tabrion_role_info
 except ImportError:  # pragma: no cover - exercised only without the extra
     psycopg = None  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
@@ -72,6 +78,11 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     SessionSettings = None  # type: ignore[assignment,misc]
     configure = None  # type: ignore[assignment]
     extension_status = None  # type: ignore[assignment]
+    RoleMissing = None  # type: ignore[assignment,misc]
+    RoleUnsafe = None  # type: ignore[assignment,misc]
+    _tabrion_grant_runtime_role = None  # type: ignore[assignment]
+    _tabrion_inspect_role = None  # type: ignore[assignment]
+    _tabrion_role_info = None  # type: ignore[assignment]
 
 _T = TypeVar("_T")
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -758,16 +769,19 @@ class PostgresDatabase:
     def role_info(self) -> dict[str, Any]:
         """How row-level security applies to this connection's role: ``superuser`` and ``bypass_rls`` (ignore every
         policy), ``table_owner`` (owns, or may act as the owner of, a table of its schema: it could switch row-level
-        security off, alter or drop the table) and ``role`` (its name)."""
-        rows = self._query(
-            "SELECT current_user::text, r.rolsuper, r.rolbypassrls,"
-            " EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
-            "   WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
-            "   AND pg_has_role(current_user, c.relowner, 'MEMBER'))"
-            " FROM pg_roles r WHERE r.rolname = current_user"
-        )
-        role, superuser, bypass, owner = rows[0] if rows else ("", False, False, False)
-        return {"role": role, "superuser": bool(superuser), "bypass_rls": bool(bypass), "table_owner": bool(owner)}
+        security off, alter or drop the table) and ``role`` (its name).
+
+        Read by :func:`tabrion.postgres.role_info` (``owner_scope="schema"``, TABRION MIG-NOD-5): each flag also holds
+        when the role can become such a role (``SET ROLE`` to a role it is a member of, or ``RESET ROLE`` to the
+        session user), so a superuser reports ``bypass_rls`` too (it can become the bootstrap superuser, which has
+        ``BYPASSRLS``)."""
+        info = _read(self, lambda connection: _tabrion_role_info(connection, owner_scope="schema"))
+        return {
+            "role": info.role,
+            "superuser": info.superuser,
+            "bypass_rls": info.bypass_rls,
+            "table_owner": info.table_owner,
+        }
 
     def shared_pool(self) -> SharedPool:
         """This database's pool for another library of the same process (Axentra: ``Database.on_pool``), so the
@@ -886,6 +900,50 @@ class DatabaseSource:
             yield _Writes(self.database)
 
 
+def _read(database: PostgresDatabase, read: Callable[[Any], _T]) -> _T:
+    """``read(connection)`` for the role tools, run as :meth:`PostgresDatabase._query` runs a read: on the calling
+    thread's transaction connection inside :meth:`PostgresDatabase.transaction` (the reads see its writes; Tabrion
+    guards them with a savepoint), else on a pooled connection, repeated on another one when that connection was lost
+    (RT2-03; the role tools only read here)."""
+    current: Any = getattr(database._local, "connection", None)
+    if current is not None:
+        return read(current)
+    attempts = database.pool_size + 1  # every pooled connection may have been dropped at once
+    for attempt in range(1, attempts + 1):
+        if database.closed:
+            raise RuntimeError("The database is closed")
+        connection: Any = None
+        try:
+            with database._connection() as connection:
+                return read(connection)
+        except psycopg.OperationalError:
+            # A lost connection (not a statement timeout, which leaves the connection usable): try another one.
+            if connection is None or not connection.broken or attempt == attempts:
+                raise
+    raise AssertionError("unreachable")
+
+
+#: What each refusal reason of ``tabrion.postgres.grant_runtime_role`` means, in the words of the messages above.
+_UNSAFE_REASONS = {
+    "superuser": "is a superuser or can become one (SET ROLE)",
+    "bypass_rls": "has BYPASSRLS or can become a role that has it (SET ROLE)",
+    "table_owner": "is or can become the owner role or the owner of the schema (SET ROLE)",
+}
+
+
+def _role_missing(role: str) -> NodestroError:
+    return NodestroError("storage.role_missing", f"The database role {role!r} does not exist", role=role)
+
+
+def _schema_missing(role: str) -> NodestroError:
+    return NodestroError(
+        "storage.schema_missing",
+        f"There is no schema to grant the runtime role {role!r} access to: the owner connection has no current schema "
+        "(set NODESTRO_DATABASE_SCHEMA), or it was dropped meanwhile",
+        role=role,
+    )
+
+
 def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
     """Give the runtime role ``role`` data access (no DDL) to every table of the schema, now and for the tables the
     owner creates later (default privileges): ``USAGE`` on the schema, ``SELECT, INSERT, UPDATE, DELETE`` on tables,
@@ -894,7 +952,15 @@ def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
 
     ``owner`` is connected as the owner role (``NODESTRO_DATABASE_MIGRATION_URL``). Refused (``storage.role_unsafe``,
     nothing granted) when ``role`` is the owner itself, a superuser, has ``BYPASSRLS`` or owns tables of the schema:
-    row-level security would not apply to it. Returns what applies to the role afterwards."""
+    row-level security would not apply to it; also when it can become the owner role or the schema's owner
+    (``SET ROLE``). Returns what applies to the role afterwards.
+
+    The grants are :func:`tabrion.postgres.grant_runtime_role` (TABRION MIG-NOD-5: the same statements in the same
+    order, one transaction, the schema versions :data:`SCHEMA_VERSION_TABLES` read-only for the role, then
+    ``CONNECT``). It needs a transaction of its own, so it cannot run inside :meth:`PostgresDatabase.transaction`.
+    ``storage.schema_missing`` when the owner connection has no schema to grant on."""
+    if owner.in_transaction:
+        raise RuntimeError("grant_runtime_role() cannot run inside a transaction")
     report = inspect_role(owner, role)
     problems = [
         reason
@@ -912,77 +978,92 @@ def grant_runtime_role(owner: PostgresDatabase, role: str) -> dict[str, Any]:
             f"The runtime role {role!r} {' and '.join(problems)}; row-level security would not apply to it",
             role=role,
         )
-    target = sql.Identifier(role)
-    schema = sql.Identifier(report["schema"])
-    with owner._transaction() as connection:
-        for statement in (
-            "GRANT USAGE ON SCHEMA {schema} TO {role}",
-            "GRANT " + RUNTIME_TABLE_PRIVILEGES + " ON ALL TABLES IN SCHEMA {schema} TO {role}",
-            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}",
-            "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT " + RUNTIME_TABLE_PRIVILEGES + " ON TABLES TO {role}",
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT USAGE, SELECT ON SEQUENCES TO {role}",
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
-        ):
-            connection.execute(sql.SQL(statement).format(schema=schema, role=target))
-        # The schema versions are the migration runners' (owner role): the runtime role reads them for the schema
-        # gate and cannot fake them.
-        for table in SCHEMA_VERSION_TABLES:
-            if connection.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
-                connection.execute(
-                    sql.SQL("REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON {} FROM {}").format(
-                        sql.Identifier(table), target
-                    )
-                )
-    if not report["connect"]:
+    # pg_write_all_data (PostgreSQL 14+) may write every table, the schema versions included, so such a member could
+    # fake the schema gate: refused before anything is granted (TABRION MIG-NOD-5 review, as Axentra does).
+    if _read(owner, lambda connection: _writes_all_data(connection, role)):
+        raise NodestroError(
+            "storage.role_unsafe",
+            f"The runtime role {role!r} is a member of pg_write_all_data, so it could write the schema versions; "
+            "use a role without that membership",
+            role=role,
+        )
+    # The process's writes run one after the other (as PostgresDatabase.transaction does).
+    with owner._lock, owner._connection() as connection:
         try:
-            with owner._transaction() as connection:
-                connection.execute(
-                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(report["database"]), target)
-                )
-        except psycopg.errors.InsufficientPrivilege:
-            pass  # reported as connect: false; the database's owner grants it
-    return inspect_role(owner, role)
+            granted = _tabrion_grant_runtime_role(
+                connection, role, schema=report["schema"], protected_tables=SCHEMA_VERSION_TABLES
+            )
+        except RoleMissing:
+            raise _role_missing(role) from None
+        except RoleUnsafe as exc:
+            # What the check above does not show (the role can become the owner role or the schema's owner), or what
+            # changed since: one phrase per reason Tabrion names.
+            reasons = [part for part in str(exc.details.get("reasons", "")).split(",") if part]
+            problems = [_UNSAFE_REASONS.get(reason, reason) for reason in reasons] or ["is not restricted"]
+            raise NodestroError(
+                "storage.role_unsafe",
+                f"The runtime role {role!r} {' and '.join(problems)}; row-level security would not apply to it",
+                role=role,
+            ) from None
+        except UsageError as exc:
+            if exc.code != "postgres.schema_missing":
+                raise
+            raise _schema_missing(role) from None
+        except ValueError:
+            # No schema to grant on (the owner connection has no current schema), or a name PostgreSQL would
+            # truncate; the role and the schema were read from the server, so the first is the case that remains.
+            raise _schema_missing(role) from None
+    # The schema versions must be read-only for the role afterwards, whatever it inherits from other roles.
+    writable = _read(owner, lambda connection: _writable_schema_versions(connection, role, report["schema"]))
+    if writable:
+        raise NodestroError(
+            "storage.role_unsafe",
+            f"The runtime role {role!r} can still write the schema versions ({', '.join(writable)}) after the grants, "
+            "through a role it is a member of; remove that membership, then grant again",
+            role=role,
+        )
+    return granted.as_dict()
+
+
+def _writes_all_data(connection: Any, role: str) -> bool:
+    """Whether ``role`` is a member of ``pg_write_all_data`` (``False`` before PostgreSQL 14: no such role)."""
+    row = connection.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles p WHERE p.rolname = 'pg_write_all_data'"
+        " AND pg_catalog.pg_has_role(%s, p.oid, 'MEMBER'))",
+        (role,),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def _writable_schema_versions(connection: Any, role: str, schema: str) -> builtins.list[str]:
+    """The schema-version tables of ``schema`` that ``role`` may still insert into, update, delete from or truncate."""
+    found: builtins.list[str] = []
+    for table in SCHEMA_VERSION_TABLES:
+        row = connection.execute(
+            "SELECT c.oid IS NOT NULL AND pg_catalog.has_table_privilege(%s, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')"
+            " FROM (SELECT 1) AS one LEFT JOIN pg_catalog.pg_class c"
+            "   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = %s"
+            "   ON c.relname = %s",
+            (role, schema, table),
+        ).fetchone()
+        if row and row[0]:
+            found.append(table)
+    return found
 
 
 def inspect_role(database: PostgresDatabase, role: str) -> dict[str, Any]:
     """How row-level security applies to ``role`` in ``database``'s schema (read-only): whether it is a superuser,
     has ``BYPASSRLS``, which tables it owns, whether it may connect and create objects; plus the connecting role
-    (``owner``), the schema and the database. ``storage.role_missing`` when the role does not exist."""
-    rows = database._query(
-        "SELECT current_user::text, current_schema()::text, current_database()::text, r.rolsuper, r.rolbypassrls"
-        " FROM pg_roles r WHERE r.rolname = %s",
-        (role,),
-    )
-    if not rows:
-        raise NodestroError("storage.role_missing", f"The database role {role!r} does not exist", role=role)
-    owner, schema, dbname, superuser, bypass = rows[0]
-    tables = database._query(
-        "SELECT c.relname, pg_has_role(%s, c.relowner, 'MEMBER') FROM pg_class c"
-        " JOIN pg_namespace n ON n.oid = c.relnamespace"
-        " WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') ORDER BY c.relname",
-        (role,),
-    )
-    privileges = database._query(
-        "SELECT has_database_privilege(%s, current_database(), 'CONNECT'),"
-        " has_schema_privilege(%s, current_schema(), 'CREATE')",
-        (role, role),
-    )
-    connect, create = privileges[0] if privileges else (False, False)
-    owned = [str(name) for name, own in tables if own]
-    return {
-        "role": role,
-        "owner": owner,
-        "schema": schema,
-        "database": dbname,
-        "tables": len(tables),
-        "superuser": bool(superuser),
-        "bypass_rls": bool(bypass),
-        "owned_tables": owned,
-        "connect": bool(connect),
-        "can_create": bool(create),
-        "restricted": not (superuser or bypass or owned),
-    }
+    (``owner``), the schema and the database. ``storage.role_missing`` when the role does not exist.
+
+    Read by :func:`tabrion.postgres.inspect_role` (TABRION MIG-NOD-5): ``superuser`` and ``bypass_rls`` also hold when
+    ``role`` is a member of such a role, and a superuser reports ``bypass_rls`` (see
+    :meth:`PostgresDatabase.role_info`)."""
+    try:
+        report = _read(database, lambda connection: _tabrion_inspect_role(connection, role))
+    except RoleMissing:
+        raise _role_missing(role) from None
+    return report.as_dict()
 
 
 def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
