@@ -122,6 +122,7 @@ from .schemas import (
     RunIn,
     RunTrigger,
     RunWarning,
+    SkillUse,
     SourceEntry,
     ToolCallApproval,
     ToolCallRecord,
@@ -130,6 +131,7 @@ from .schemas import (
     Workflow,
     now,
 )
+from .skill_tools import SkillSet
 from .source_ledger import SourceLedger, UnknownSource, citing_fields, fill_from_ledger, filled_fields, unknown_sources
 from .source_ledger import correction_prompt as source_correction_prompt
 from .storage import DocumentStore
@@ -4270,6 +4272,17 @@ class RunManager:
             extra_tools.append(
                 _proposal_tool(state, config, lambda: self._emit(context, "knowledge_proposed", node_id))
             )
+
+        def skill_used(use: SkillUse) -> None:
+            with context.lock:
+                state.skills.append(use)
+            self._emit(context, "skill_loaded", node_id, **use.model_dump())
+
+        # The agent's skills in their fixed versions (NAL-B3); their tools only read those versions, so they are the
+        # run's own tools like the ones above and the per-call gate does not ask about them.
+        skills = context.env.builder.skill_set(config, skill_used)
+        if skills is not None:
+            extra_tools += skills.tools
         suspended = False
         interruptible: _Interruptible | None = None
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
@@ -4287,7 +4300,8 @@ class RunManager:
                 extra_context=extra,
                 on_evaluation_start=lambda: self._emit(context, "evaluation_started", node_id),
                 sandbox=context.env.tool_sandbox(context.run.workflow_id),
-                extra_tools=extra_tools,
+                extra_tools=[tool for tool in extra_tools if skills is None or tool not in skills.tools],
+                skills=skills,
                 cancelled=context.cancelled.is_set,
                 attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
                 run_memory=(
@@ -4474,6 +4488,7 @@ def execute_agent(
     suspendable: bool = False,
     on_built: Callable[[BuiltAgent], None] | None = None,
     services: RunServices | None = None,
+    skills: SkillSet | None = None,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -4503,6 +4518,7 @@ def execute_agent(
         attended=attended,
         gated=gated,
         services=services,
+        skills=skills,
     )
     judging = config.quality.enabled and bool(config.quality.criteria)
     judge = check_model(config.quality.judge_model) if judging else None

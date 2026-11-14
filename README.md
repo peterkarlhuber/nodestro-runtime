@@ -211,6 +211,11 @@ automatically) and `fetch_web_page` reads one page through Orkexa's egress guard
 content and fill the source ledger. They are refused in the strict offline mode and not offered in the server profile
 unless `NODESTRO_WEB_TOOLS_SERVER=1`. Details: [docs/web-tools.md](docs/web-tools.md).
 
+**Skills (NAL-B3).** Agents can have skills of the workspace's skill library (Agent Skills format) in fixed versions,
+always in the prompt or loaded on demand with the run's own tools `load_skill` and `read_skill_file`. Skills add
+instructions only; they never grant tools or permissions, and their scripts are never run. Releases freeze the
+versions they use. Details: [docs/skills.md](docs/skills.md).
+
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).

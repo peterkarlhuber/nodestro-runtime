@@ -204,6 +204,21 @@ class TemplateRef(_Model):
     version: int = Field(ge=1)
 
 
+#: How an assigned skill reaches the model (NAL-B3): ``always`` puts its instructions into the system prompt,
+#: ``on_demand`` only its name and description; the model loads the instructions with the ``load_skill`` tool.
+SkillMode = Literal["always", "on_demand"]
+#: The most skills one agent may have.
+MAX_AGENT_SKILLS = 20
+
+
+class SkillBinding(_Model):
+    """A skill assigned to an agent in one fixed version (NAL-B3). A newer version is never used automatically."""
+
+    skill_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    mode: SkillMode = "on_demand"
+
+
 class AgentConfig(_Model):
     """Everything about one agent node; mirrors the arguments of ``orkexa.Agent``.
 
@@ -257,6 +272,8 @@ class AgentConfig(_Model):
     task: str | None = Field(default=None, max_length=40)
     #: The agent template version this agent was made from (NAL-B1); history, never followed automatically.
     origin: TemplateRef | None = None
+    #: Skills of the skill library in fixed versions (NAL-B3). They add instructions, never tools or permissions.
+    skills: list[SkillBinding] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
 
 
 # ---- workflows ------------------------------------------------------------------
@@ -663,6 +680,57 @@ class TemplateMeta(_Model):
     locale: str | None = Field(default=None, max_length=10)
 
 
+# ---- skills (NAL-B3) -------------------------------------------------------------
+#: Where a skill comes from: ``user`` (made in Nodestro), ``builtin:<package>@<version>/<name>`` (copied from the
+#: shipped skills) or ``import:<sha256 of the imported file>``.
+SKILL_ORIGIN_PATTERN = r"^(user|builtin:[a-z0-9_.-]+@[A-Za-z0-9_.+-]+/[a-z0-9-]+|import:[0-9a-f]{64})$"
+SkillStatus = Literal["active", "disabled", "archived"]
+
+
+class SkillFileRef(_Model):
+    """A file of a skill version: its path in the package, size and SHA-256 (the content is stored by hash)."""
+
+    path: str
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class Skill(_Model):
+    """A skill of the library in its latest version (NAL-B3). ``name`` is unique in a workspace."""
+
+    id: str = Field(default_factory=lambda: new_id("skl"))
+    name: str
+    description: str = ""
+    status: SkillStatus = "active"
+    version: int = Field(default=1, ge=1)
+    #: The language of the skill's content (``metadata.language`` of the package), ``None``: not stated.
+    language: str | None = Field(default=None, max_length=10)
+    origin: str = Field(default="user", pattern=SKILL_ORIGIN_PATTERN)
+    has_scripts: bool = False
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
+
+
+class SkillVersion(_Model):
+    """One version of a skill; never changed once stored. ``digest`` covers every path and its bytes."""
+
+    skill_id: str
+    version: int = Field(ge=1)
+    digest: str
+    name: str
+    description: str = ""
+    license: str | None = None
+    compatibility: str | None = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    allowed_tools: str | None = None
+    files: list[SkillFileRef] = Field(default_factory=list)
+    origin: str = Field(default="user", pattern=SKILL_ORIGIN_PATTERN)
+    note: str = ""
+    created_at: datetime = Field(default_factory=now)
+    #: Who saved it (the user id on a server, empty on the desktop).
+    created_by: str = ""
+
+
 class AgentTemplateIn(_Model):
     agent: AgentConfig
     meta: TemplateMeta = Field(default_factory=TemplateMeta)
@@ -889,6 +957,15 @@ class KnowledgeProposal(_Model):
     adopted_file_id: str | None = None
 
 
+class SkillUse(_Model):
+    """A skill an agent loaded (``path`` ``None``) or one of its files it read, during one step (NAL-B3)."""
+
+    skill_id: str
+    name: str
+    version: int
+    path: str | None = None
+
+
 class GuidanceRef(_Model):
     """One instruction of a person that was part of an orchestrator decision's prompt."""
 
@@ -956,6 +1033,8 @@ class NodeRun(_Model):
     files: list[ProvidedFile] = Field(default_factory=list)
     #: Agents: content proposed for knowledge (nothing is stored without a person's confirmation).
     proposals: list[KnowledgeProposal] = Field(default_factory=list)
+    #: Agents: the skills the agent loaded and the skill files it read (NAL-B3), in order.
+    skills: list[SkillUse] = Field(default_factory=list)
     #: Inside loops: the iteration of every loop around the node, outermost first, counted from 0
     #: (empty outside loops). The state above is the node's latest execution.
     iteration: list[int] = Field(default_factory=list)

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Added (NAL-B3, skill library): skills in the Agent Skills format (`orkexa.skills`).
+  - `skills.Skills` stores them in immutable versions (`skills`, `skill_versions`, file contents by SHA-256 in
+    `skill_blobs`). Names are unique, and an unchanged save makes no version. `check()` warns about credentials in
+    files (`skill.secret_suspected`).
+  - `AgentConfig.skills` assigns up to 20 skills in fixed versions with mode `always` or `on_demand`. The system
+    prompt lists them (`<available_skills>`), and `always` adds their instructions.
+  - The run's own tools `load_skill` and `read_skill_file` are not asked about by the per-call gate. They read only
+    the assigned versions and record each use (`NodeRun.skills`, event `skill_loaded`).
+  - The inspector reports `skill.not_found`, `skill.inactive`, `skill.duplicate_name`, `skill.newer_version`,
+    `skill.always_large` and `skill.imported_with_write_tools`.
+  - Releases freeze the used versions with all files (`ReleaseBundle.skills`, `skill_source()`).
+  - Skills never grant tools or permissions, and scripts are never run. Details are in `docs/skills.md`.
+- Fixed: agents published without `task` or `origin` (NAL-B1) keep the release digest they had before; `skills` and
+  an empty bundle `skills` are left out in the same way.
 - Security (TABRION MIG-NOD-9, decision E-NOD-PERM): an existing desktop database is restricted to its owner only
   with the user's consent; starting never changes a mode. `storage.unsafe_file` has the new parameter `fixable`: `true`
   for `writable_by_others` when every existing file of the database (`nodestro.db`, `-wal`, `-shm`, `-journal`) is a
