@@ -28,5 +28,6 @@ and says why. A rollback (revert pull request) is verified by the same files: af
 "snapshots identical" again.
 
 MIG-NOD-7 (extension status) is **not** covered by these files: `schema.json` leaves extension objects out, and no
-file records `pgvector_status`, whose answer depends on the server (pgvector mode A or B). MIG-NOD-7 writes its own
-"before" output of `pgvector_status` in both CI modes (pg-a, pg-b) from the old code first (review L-6).
+file records `pgvector_status`, whose answer depends on the server (pgvector mode A or B). MIG-NOD-7 has its own
+baseline instead (review L-6): `tests/fixtures/pgvector_status_before.json`, written by the old code
+(`tests/fixtures/make_pgvector_status.py`) and compared in both CI modes (pg-a, pg-b) by `tests/test_pgvector_status.py`.

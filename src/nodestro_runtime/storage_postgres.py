@@ -42,7 +42,7 @@ import re
 import select
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 import weakref
 
 from pydantic import BaseModel
@@ -60,14 +60,15 @@ try:  # optional: nodestro-runtime[postgres]
     from psycopg import sql
     from psycopg_pool import ConnectionPool
 
-    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8): tabrion[postgres], the same
-    # extra as psycopg.
-    from tabrion.postgres import SessionLock, SessionSettings, configure
+    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8) and the state of an extension
+    # (pgvector_status, TABRION MIG-NOD-7): tabrion[postgres], the same extra as psycopg.
+    from tabrion.postgres import SessionLock, SessionSettings, configure, extension_status
 except ImportError:  # pragma: no cover - exercised only without the extra
     psycopg = None  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
     ConnectionPool = None  # type: ignore[assignment,misc]
 
+_T = TypeVar("_T")
 _FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 #: Tenant ids: lower-case letters, digits, ``-`` and ``_``; at most 63 characters. The desktop's tenant is ``local``.
 TENANT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
@@ -403,10 +404,19 @@ class PostgresDatabase:
         """The rows of a read. Outside a transaction a lost connection is replaced and the read repeated (RT2-03),
         so a statement that writes never goes through here (:meth:`_write`, :meth:`_write_returning`), except one
         that is safe to repeat, as listed in ``tests/test_query_writes.py`` with its reason (JQ-3)."""
+
+        def rows(connection: Any) -> builtins.list[tuple[Any, ...]]:
+            found: builtins.list[tuple[Any, ...]] = connection.execute(query, params).fetchall()
+            return found
+
+        return self._read(rows)
+
+    def _read(self, read: Callable[[Any], _T]) -> _T:
+        """``read(connection)``, which only reads, the way :meth:`_query` runs a read: inside this thread's
+        transaction on its connection, else on a pooled one, repeated on another one when the connection was lost."""
         current: Any = getattr(self._local, "connection", None)
         if current is not None:  # inside this thread's transaction: read its own writes
-            rows: builtins.list[tuple[Any, ...]] = current.execute(query, params).fetchall()
-            return rows
+            return read(current)
         attempts = self.pool_size + 1  # every pooled connection may have been dropped at once
         for attempt in range(1, attempts + 1):
             if self._closed:
@@ -414,8 +424,7 @@ class PostgresDatabase:
             connection: Any = None
             try:
                 with self._connection() as connection:
-                    rows = connection.execute(query, params).fetchall()
-                return rows
+                    return read(connection)
             except psycopg.OperationalError:
                 # A lost connection (not a statement timeout, which leaves the connection usable): try another one.
                 if connection is None or not connection.broken or attempt == attempts:
@@ -976,9 +985,11 @@ def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
 
     Migration ``0010`` installs pgvector only when it is available at that moment and the migrating role may install
     it; one installed later, or in a schema this database's ``search_path`` does not include, leaves the runtime
-    ranking the vectors itself. Read-only; ``state`` is one of:
+    ranking the vectors itself. Read-only; the catalog read and the state come from
+    :func:`tabrion.postgres.extension_status` (TABRION MIG-NOD-7), the wording from here. ``state`` is one of:
 
-    - ``active``: the type ``vector`` is usable here; pgvector ranks the vectors.
+    - ``active``: the extension is installed in a schema this connection sees and the type ``vector`` resolves;
+      pgvector ranks the vectors.
     - ``other_schema``: the extension is installed in ``extension_schema``, which this connection does not see (a
       server with ``NODESTRO_DATABASE_SCHEMA`` sets its ``search_path`` to that schema only).
     - ``installable``: the server has pgvector (``available_version``) but this database does not use it.
@@ -988,38 +999,30 @@ def pgvector_status(database: PostgresDatabase) -> dict[str, Any]:
     not a trusted extension), ``None`` when nothing is to be done or the package must be installed first; ``message``
     says it in English for operator output. Processes that already run keep ranking themselves until they restart
     (each knowledge index checks pgvector once, and again after ``PostgresIndex.refresh()``)."""
-    rows = database._query(
-        "SELECT to_regtype('vector') IS NOT NULL, current_schema()::text,"
-        " (SELECT e.extversion::text FROM pg_extension e WHERE e.extname = 'vector'),"
-        " (SELECT n.nspname::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace"
-        "   WHERE e.extname = 'vector'),"
-        " (SELECT a.default_version::text FROM pg_available_extensions a WHERE a.name = 'vector')"
-    )
-    usable, schema, version, extension_schema, available = rows[0] if rows else (False, None, None, None, None)
+    found = database._read(lambda connection: extension_status(connection, "vector", probe_type="vector"))
+    state, version, available = found.state, found.installed_version, found.available_version
+    schema, extension_schema = found.schema, found.extension_schema
+    # The commands name the extension unquoted, as before Tabrion (an operator copies them; the output is unchanged).
     target = '"' + str(schema or "public").replace('"', '""') + '"'
     command: str | None = None
-    if usable:
-        state = "active"
+    if state == "active":
         message = (
             f"pgvector {version} ranks the knowledge vectors" if version else "pgvector ranks the knowledge vectors"
         )
-    elif version is not None:
-        state = "other_schema"
+    elif state == "other_schema":
         command = f"ALTER EXTENSION vector SET SCHEMA {target};"
         message = (
             f"pgvector {version} is installed in schema {extension_schema!r}, which this database's search_path "
             f"({schema!r}) does not include: the runtime ranks the vectors itself. Move it ({command}), unless other "
             "applications of this database use it there, then restart the API and worker processes"
         )
-    elif available is not None:
-        state = "installable"
+    elif state == "installable":
         command = f"CREATE EXTENSION vector SCHEMA {target};"
         message = (
             f"pgvector {available} is available on the PostgreSQL server but not installed in this database: the "
             f"runtime ranks the vectors itself. As a superuser run {command} then restart the API and worker processes"
         )
     else:
-        state = "unavailable"
         message = (
             "The PostgreSQL server has no pgvector: the runtime ranks the vectors itself (semantic search works, but "
             "reads every candidate vector). Install the pgvector package on the server, then check again"
