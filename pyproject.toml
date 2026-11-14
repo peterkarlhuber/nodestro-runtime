@@ -97,6 +97,8 @@ asyncio_default_fixture_loop_scope = "function"
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+# scripts/check_dependency_policy.py is an unchanged, checksummed copy from nodestro-studio (TABRION QA-17), linted there.
+extend-exclude = ["scripts/check_dependency_policy.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
