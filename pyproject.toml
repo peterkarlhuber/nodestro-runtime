@@ -7,7 +7,7 @@ name = "nodestro-runtime"
 version = "0.2.0"
 description = "Nodestro Runtime – the multi-agent workflow engine of Nodestro, built on Orkexa, usable without server or interface."
 readme = "README.md"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Peter Karlhuber" }]
