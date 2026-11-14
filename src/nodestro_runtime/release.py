@@ -36,7 +36,7 @@ from orkexa.skills import SkillPackage, package_digest, parse_skill
 from pydantic import BaseModel, Field, StringConstraints
 
 from .sandbox_policy import TrustClass
-from .schemas import Skill, Workflow, now
+from .schemas import Skill, SkillStatus, Workflow, now
 from .tool_provenance import MemoryProvenance
 
 FORMAT = "nodestro-release"
@@ -72,7 +72,10 @@ class SkillSnapshot(BaseModel):
     files: dict[str, str] = Field(default_factory=dict)
 
     def package(self) -> SkillPackage:
+        """The frozen package; :class:`KeyError` when its files no longer match the digest (L4)."""
         package = parse_skill({path: base64.b64decode(data) for path, data in self.files.items()})
+        if package_digest(package) != self.digest:
+            raise KeyError(f"{self.skill_id} v{self.version}: the files do not match the release's digest")
         return package.model_copy(update={"directory": self.name})
 
 
@@ -215,16 +218,29 @@ class ReleaseBundle(BaseModel):
                         agent.pop(key, None)
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
-    def skill_source(self) -> Callable[[str, int], tuple[Skill, SkillPackage]]:
+    def skill_source(
+        self, status: Callable[[str], SkillStatus | None] | None = None
+    ) -> Callable[[str, int], tuple[Skill, SkillPackage]]:
         """Resolves the bundle's frozen skills for an agent builder (:attr:`AgentBuilder.skill_source`); a skill
-        that is not in the bundle is unknown, whatever the workspace holds now."""
+        that is not in the bundle is unknown, whatever the workspace holds now.
+
+        ``status`` is the kill switch (internal review M3): it names the workspace's current status of a skill
+        (``None``: the skill is not in the workspace any more); a skill disabled or archived there stops running in
+        every release that froze it, so a harmful skill can be stopped without unpublishing."""
         frozen = {(item.skill_id, item.version): item for item in self.skills}
 
         def resolve(skill_id: str, version: int) -> tuple[Skill, SkillPackage]:
             item = frozen.get((skill_id, version))
             if item is None:
                 raise KeyError(skill_id)
-            skill = Skill(id=item.skill_id, name=item.name, version=item.version, origin=item.origin)
+            current = status(skill_id) if status is not None else None
+            skill = Skill(
+                id=item.skill_id,
+                name=item.name,
+                version=item.version,
+                origin=item.origin,
+                status=current or "active",
+            )
             return skill, item.package()
 
         return resolve

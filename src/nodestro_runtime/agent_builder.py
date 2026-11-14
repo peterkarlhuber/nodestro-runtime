@@ -498,10 +498,13 @@ class AgentBuilder:
 
         tool_choice = _tool_choice(config)
         system_prompt = config.system_prompt.strip() or "You are a helpful assistant."
-        if skills is not None and skills.prompt:
-            system_prompt = f"{system_prompt}\n\n{skills.prompt}"
-        if tools or server_tools or memory is not None or files is not None or index is not None or context_blocks:
+        skill_prompt = skills.prompt if skills is not None else ""
+        reads_data = tools or server_tools or memory is not None or files is not None or index is not None
+        if skill_prompt or reads_data or context_blocks:
             system_prompt = f"{system_prompt}\n\n{UNTRUSTED_DATA_NOTICE}"
+        if skill_prompt:
+            # After the security note: skill text never ranks above it (internal review M1).
+            system_prompt = f"{system_prompt}\n\n{skill_prompt}"
 
         agent: Agent[Any] = Agent(
             name=name or config.name,

@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+import hashlib
+import re
 
 from orkexa.skills import (
-    SKILL_FILE,
     SkillIssue,
     SkillLimits,
     SkillPackage,
-    is_text_path,
     package_digest,
     parse_skill,
     validate,
@@ -47,11 +47,10 @@ def _warning_issue(code: str, message: str, *, path: str, **params: str | int) -
 
 def check(package: SkillPackage) -> list[SkillIssue]:
     """The findings of the specification (:func:`orkexa.skills.validate`) plus a warning for each text file that
-    seems to contain a credential (a skill is shared and exported; it should never carry one)."""
+    seems to contain a credential (a skill is shared and exported; it should never carry one). Every file that is
+    UTF-8 text is scanned, scripts and configuration files included (internal review L5)."""
     issues = validate(package, limits=LIMITS)
     for item in package.files:
-        if item.path != SKILL_FILE and not is_text_path(item.path):
-            continue
         try:
             text = item.data.decode("utf-8")
         except UnicodeDecodeError:
@@ -67,6 +66,19 @@ def check(package: SkillPackage) -> list[SkillIssue]:
                 )
             )
     return issues
+
+
+_LANGUAGE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?")
+
+
+def _language(package: SkillPackage) -> str | None:
+    """``metadata.language`` when it looks like a language tag, else ``None`` (it is only a label)."""
+    value = package.metadata.get("language", "").strip()
+    return value if _LANGUAGE.fullmatch(value) else None
+
+
+def is_import(origin: str) -> bool:
+    return origin.startswith("import:")
 
 
 def errors_of(issues: list[SkillIssue]) -> list[SkillIssue]:
@@ -120,8 +132,15 @@ class Skills:
             raw = self.store.get_raw(BLOBS, ref.sha256)
             if not isinstance(raw, dict) or not isinstance(raw.get("data"), str):
                 raise KeyError(f"{skill_id} v{version}: {ref.path}")
-            files[ref.path] = base64.b64decode(raw["data"])
-        return parse_skill(files, limits=LIMITS).model_copy(update={"directory": stored.name})
+            data = base64.b64decode(raw["data"])
+            # A stored file must still be the bytes its version names (a restored backup is not trusted; L4).
+            if hashlib.sha256(data).hexdigest() != ref.sha256:
+                raise KeyError(f"{skill_id} v{version}: {ref.path} does not match its hash")
+            files[ref.path] = data
+        package = parse_skill(files, limits=LIMITS).model_copy(update={"directory": stored.name})
+        if package_digest(package) != stored.digest:
+            raise KeyError(f"{skill_id} v{version}: the files do not match the version's digest")
+        return package
 
     def resolver(self) -> Callable[[str, int], tuple[Skill, SkillPackage]]:
         """What an agent builder resolves an assigned skill with (:attr:`AgentBuilder.skill_source`)."""
@@ -175,7 +194,7 @@ class Skills:
             skill = Skill(
                 name=package.name,
                 description=package.description.strip(),
-                language=package.metadata.get("language"),
+                language=_language(package),
                 origin=origin,
                 has_scripts=package.has_scripts,
             )
@@ -183,10 +202,15 @@ class Skills:
             self.store.put(SKILLS, skill.id, skill)
         return skill
 
-    def save(self, skill_id: str, package: SkillPackage, *, note: str = "", created_by: str = "") -> Skill:
+    def save(
+        self, skill_id: str, package: SkillPackage, *, origin: str | None = None, note: str = "", created_by: str = ""
+    ) -> Skill:
         """Store a changed package as the skill's next version; an unchanged one returns the skill as it is.
 
-        The new version keeps the skill's origin. Raises :class:`KeyError` for an unknown skill."""
+        ``origin`` is where the new content came from (an import: ``import:<sha256>``); without it the version keeps
+        the skill's origin. Imported content marks the skill as imported for good, so the warnings about imported
+        skills never get lost by editing or importing into another skill (internal review M2). Raises
+        :class:`KeyError` for an unknown skill."""
         _raise_invalid(check(package))
         with self.store.transaction():
             self.store.lock(SKILLS, "names")
@@ -199,12 +223,14 @@ class Skills:
                 return current
             self._check_name(package.name, skill_id)
             number = current.version + 1
-            self._store_version(skill_id, number, package, origin=current.origin, note=note, created_by=created_by)
+            source = origin or current.origin
+            self._store_version(skill_id, number, package, origin=source, note=note, created_by=created_by)
             changed = current.model_copy(
                 update={
                     "name": package.name,
                     "description": package.description.strip(),
-                    "language": package.metadata.get("language"),
+                    "origin": source if is_import(source) else current.origin,
+                    "language": _language(package),
                     "has_scripts": package.has_scripts,
                     "version": number,
                     "updated_at": now(),

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Hardened skills after the internal security review of the import path (NAL-B3): skill text cannot close its
+  `<skill_content>`/`<skill_file>` frame; the skills block follows the security note; `read_skill_file` returns at
+  most 50 KB per call and 400 KB per step; imported content keeps a skill marked as imported (`Skills.save(origin=)`);
+  `ReleaseBundle.skill_source(status=)` stops frozen skills that are disabled or archived in the workspace; stored
+  files and frozen skills are checked against their hashes; every UTF-8 file is scanned for credentials; a
+  `metadata.language` that is no language tag is dropped instead of failing the import.
 - Added (NAL-B3, skill library): skills in the Agent Skills format (`orkexa.skills`).
   - `skills.Skills` stores them in immutable versions (`skills`, `skill_versions`, file contents by SHA-256 in
     `skill_blobs`). Names are unique, and an unchanged save makes no version. `check()` warns about credentials in

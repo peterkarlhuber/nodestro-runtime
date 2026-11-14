@@ -48,3 +48,20 @@ A release freezes every skill version its agents use (`ReleaseBundle.skills`, `S
 digest). A release run resolves skills only from its bundle (`ReleaseBundle.skill_source()`), so a later change of a
 skill never changes a published version. Bundles without skills, and agents without `skills`, `tool_settings`,
 `task` or `origin`, keep the digest they were published with.
+
+## Security hardening (internal review of the import path)
+
+- **Framing:** skill text reaches the model only inside `<skill_content>` (instructions) or `<skill_file>`
+  (reference data). Frame tags inside a skill are written as `&lt;...`, so a skill cannot close its frame and pose as
+  instructions outside it. The skills block comes after the security note in the system prompt; the skills notice says
+  that skills never grant tools or permissions and never override that note.
+- **Reads:** `read_skill_file` returns at most 50 KB per call and 400 KB per step.
+- **Provenance:** imported content marks a skill as imported for good (`origin` `import:<sha256>`), also when it is
+  imported as a new version of an existing skill or later edited by hand; a copy keeps the source's origin. The
+  inspector warning `skill.imported_with_write_tools` relies on it.
+- **Releases:** a disabled or archived skill is never frozen (`skill.inactive`), and a release run stops a frozen
+  skill that is disabled or archived in the workspace now (`ReleaseBundle.skill_source(status=...)`, a kill switch
+  without unpublishing).
+- **Integrity:** stored files are checked against their SHA-256 and the version's digest when read; a frozen release
+  skill against its digest. A restored backup is not trusted.
+- **Credential scan:** every file that is UTF-8 text is scanned, scripts and configuration files included.
