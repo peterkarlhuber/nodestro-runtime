@@ -16,6 +16,28 @@ Both return their result marked as external content (`[External web content <non
 ledger (`Run.sources`, ids `S1`, `S2` ...; see `source_ledger.py`). A structured result field with
 `source="ledger"` must cite those ids or addresses (`output.unknown_source` otherwise).
 
+## Result fields from the source ledger (NAL-B2)
+
+A structured result field (`OutputField.source`, text fields only: `string` or `string_list`) can tie the result to
+the ledger in four ways:
+
+| `source` | Written by | Rule |
+|---|---|---|
+| `ledger` | the model | every value names a source of the ledger, by id (`S3`) or address |
+| `ledger_cited` | the model | every statement cites at least one source inline, `[S1]` or `[S1, S3]`, and every cited id is in the ledger; an empty list is allowed (nothing found) |
+| `ledger_list` | the runtime | after the step: one line per cited source, `S1 · <title> · <address> · <retrieved, ISO 8601 UTC>` (a text field gets the lines joined by line breaks) |
+| `ledger_range` | the runtime | after the step: when the cited sources were retrieved, `<first>/<last>` in ISO 8601 UTC (one time when equal; empty without sources) |
+
+`ledger` and `ledger_cited` are checked when the step ends; a failure is sent back to the agent once (the correction
+names the problem and lists the run's sources as external data), a second failure fails the step with
+`output.unknown_source` (`reason`: `missing`, `unknown` or `uncited`). The filled fields are left out of the answer
+format the model gets, so the model supplies ids only and can neither invent a source's title, address or date nor
+the retrieval time; whatever stood in them is replaced. "Cited" means the ids and addresses of the step's `ledger`
+and `ledger_cited` fields; a result without such a field lists every source of the run. The workflow check treats
+all four like `ledger` (`check.ledger_source_type` for other field types, `check.ledger_source_no_tool` without a
+web tool up to the step). Titles come from web pages: the filled lines are data like any other result text. The
+agent test (`AgentTestIn`) has no ledger, so it neither checks nor fills these fields.
+
 ## Providers (connection `search`, `provider`)
 
 | Provider | Key | Price booked | Modes | Notes |

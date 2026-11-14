@@ -8,6 +8,14 @@
   every other read (`PostgresDatabase._read`: on the transaction's connection inside one, else repeated on another
   pooled connection when one was lost). Only a type named `vector` that pgvector did not create no longer counts as
   `active`.
+- Added (NAL-B2, web research): result fields filled from the run's source ledger (`docs/web-tools.md`). New values
+  of `OutputField.source`, additive: `ledger_cited` (every statement of a text field cites ledger ids inline, `[S1]`
+  or `[S1, S3]`; checked like `ledger`, new failure reason `uncited`), `ledger_list` and `ledger_range` (filled by the
+  runtime after the step: one line per cited source with id, title, address and retrieval time, and the retrieval
+  time range, all from the ledger; left out of the model's answer format, so the model supplies ids only). New
+  helpers in `source_ledger`: `citing_fields`, `filled_fields`, `model_output`, `cited_entries`, `fill_from_ledger`.
+  The workflow check covers the new sources with the existing codes `check.ledger_source_type` and
+  `check.ledger_source_no_tool`.
 - Changed (NAL-A2): the MCP network guard and the address rules of service connections use Orkexa's shared egress
   guard (`orkexa.net.guard`, Orkexa ADR 0017) instead of their own copy: `net_address` re-exports its rules and
   `mcp.netguard.GuardedBackend` is Orkexa's backend with MCP's error codes (`mcp.address_refused`, `mcp.dns_failed`)
