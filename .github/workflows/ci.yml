@@ -104,12 +104,13 @@ jobs:
 
 
   # DC-NR-1 (dependency confusion): the test job's install with every installer's index replaced by a poisoned one
-  # (scripts/check_tabrion_source.py, a checksummed copy from nodestro-studio). It serves tabrion 0.1.99 (a wheel and
-  # an sdist that run code; the wheel forges a direct_url.json naming the locked commit) and redirects every other
-  # name to PyPI. Red when pip asks that index for tabrion at all (the proof; direct_url.json checks only detect an
-  # accidental index install), when the install never used the index or an index option would bypass it, when
-  # poisoned code ran, or when tabrion's direct_url.json is not the lock's; its positive control first shows that a
-  # plain "pip install tabrion" would take the poisoned release. No pip cache: every request is seen. ci-ok reports it.
+  # (scripts/check_tabrion_source.py, a checksummed copy from nodestro-studio). It serves tabrion 0.2.99 (inside
+  # >=0.2,<0.3 and above the locked 0.2.1; a wheel and an sdist that run code; the wheel forges a direct_url.json naming
+  # the locked commit) and redirects every other name to PyPI. Red when pip asks that index for tabrion at all (the
+  # proof; direct_url.json checks only detect an accidental index install), when the install never used the index or an
+  # index option would bypass it, when poisoned code ran, or when tabrion's direct_url.json is not the lock's; its
+  # positive control first shows that a plain "pip install tabrion" would take the poisoned release. No pip cache: every
+  # request is seen. ci-ok reports it.
   tabrion-source:
     name: tabrion source (poisoned index)
     runs-on: ubuntu-latest
