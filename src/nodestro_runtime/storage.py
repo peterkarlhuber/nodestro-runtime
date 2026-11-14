@@ -391,8 +391,9 @@ class ModeRepair:
     - ``skipped`` (never touched; ``reason``: ``symlink``, ``other_owner``, ``not_a_file``, ``hard_link``,
       ``changed_during_repair``, or ``other_file_refused`` when another file of the database stopped the repair).
     - ``failed`` (``reason``: why; the mode is as before unless the file system says otherwise, see ``new_mode``).
-    - ``rolled_back``: changed by this call, then set back to ``old_mode`` because another file failed;
-      ``rollback_failed``: that could not be done (``reason``; the file keeps ``new_mode``).
+    - ``rolled_back``: changed by this call, then set back to ``old_mode`` because another file failed (or this
+      one: after ``fchmod`` it showed neither mode, ``reason`` says so); ``rollback_failed``: that could not be done
+      (``reason``; the file keeps ``new_mode``).
     - ``restored``: :func:`restore_desktop_database_modes` set ``old_mode`` again.
 
     ``dev`` and ``ino`` are the identity the check saw (``st_dev``, ``st_ino``); a caller passes them back as
@@ -415,8 +416,11 @@ _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLO
 _OPEN_FLAGS |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
 
 
-def _set_mode(path: Path, identity: FileIdentity, uid: int, mode: int) -> tuple[str | None, int | None]:
-    """Set ``mode`` on the regular file ``path`` of ``uid`` with one name, only while it is still ``identity``:
+def _set_mode(
+    path: Path, identity: FileIdentity, uid: int, mode: int, *, current: int | None = None
+) -> tuple[str | None, int | None]:
+    """Set ``mode`` on the regular file ``path`` of ``uid`` with one name, only while it is still ``identity`` (and,
+    with ``current``, only while its mode is still ``current``: a later ``chmod`` is never overwritten):
     ``(None, mode)`` on success, else ``(why, the mode now or None)``.
 
     The file itself, never what a link put in its place: ``O_NOFOLLOW`` (and ``O_NONBLOCK``, so a FIFO never
@@ -431,6 +435,8 @@ def _set_mode(path: Path, identity: FileIdentity, uid: int, mode: int) -> tuple[
             return "changed_during_repair", None
         if opened.st_nlink != 1:
             return "hard_link", None
+        if current is not None and stat.S_IMODE(opened.st_mode) != current:
+            return "changed_during_repair", None
         os.fchmod(descriptor, mode)
         now = stat.S_IMODE(os.fstat(descriptor).st_mode)
     except OSError as exc:
@@ -438,7 +444,7 @@ def _set_mode(path: Path, identity: FileIdentity, uid: int, mode: int) -> tuple[
     finally:
         os.close(descriptor)
     if now != mode:  # some network file systems accept chmod and ignore it
-        return "the file system kept the old mode", now
+        return "the file system did not take the new mode", now
     return None, now
 
 
@@ -549,10 +555,12 @@ def repair_desktop_database_modes(
             results.append(dataclasses.replace(item, status="changed"))
             continue
         stopped = True
-        status: RepairStatus = "failed" if why not in ("changed_during_repair", "hard_link") else "skipped"
-        if now is not None and now != item.old_mode:
-            status = "failed"  # the file system changed something: say so, with the mode it has now
         logger.warning("Could not restrict %s to its owner (mode %s): %s", item.path, oct(item.old_mode), why)
+        if now is not None and now != item.old_mode:
+            # fchmod took effect, but the file system shows neither mode: set the old one back like any other change.
+            results.append(dataclasses.replace(item, status="changed", new_mode=now, reason=why))
+            continue
+        status: RepairStatus = "failed" if why not in ("changed_during_repair", "hard_link") else "skipped"
         results.append(dataclasses.replace(item, status=status, new_mode=now, reason=why))
     if stopped:
         results = [_roll_back(item, uid) if item.status == "changed" else item for item in results]
@@ -562,7 +570,7 @@ def repair_desktop_database_modes(
 def _roll_back(item: ModeRepair, uid: int) -> ModeRepair:
     """Set a file this repair changed back to its old mode (all or nothing)."""
     assert item.identity is not None and item.old_mode is not None
-    why, now = _set_mode(item.path, item.identity, uid, item.old_mode)
+    why, now = _set_mode(item.path, item.identity, uid, item.old_mode, current=item.new_mode)
     if why is None:
         logger.info("Set %s back to mode %s: another file could not be repaired", item.path, oct(item.old_mode))
         return dataclasses.replace(item, status="rolled_back", new_mode=item.old_mode)
@@ -582,7 +590,8 @@ def restore_desktop_database_modes(results: Iterable[ModeRepair]) -> list[ModeRe
     """Set the old modes again after a confirmed repair (``results``: its ``changed`` items; other items are left
     out), for example when the caller's check after the repair fails. Same checks as the repair: the file must still
     be the regular file of the running user with one name that was changed (``dev``, ``ino``), opened with
-    ``O_NOFOLLOW``; otherwise it is ``skipped`` (``changed_during_repair``, ``hard_link``) or ``failed``, with a
+    ``O_NOFOLLOW``, and still have the mode the repair set (``new_mode``: a later ``chmod`` is never overwritten);
+    otherwise it is ``skipped`` (``changed_during_repair``, ``hard_link``) or ``failed``, with a
     warning. It never raises. Windows: empty."""
     if os.name != "posix":
         return []
@@ -591,10 +600,10 @@ def restore_desktop_database_modes(results: Iterable[ModeRepair]) -> list[ModeRe
     for item in results:
         if item.status != "changed":
             continue
-        if item.identity is None or item.old_mode is None:
+        if item.identity is None or item.old_mode is None or item.new_mode is None:
             restored.append(dataclasses.replace(item, status="skipped", reason="changed_during_repair"))
             continue
-        why, now = _set_mode(item.path, item.identity, uid, item.old_mode)
+        why, now = _set_mode(item.path, item.identity, uid, item.old_mode, current=item.new_mode)
         if why is None:
             logger.info("Restored %s to mode %s", item.path, oct(item.old_mode))
             restored.append(dataclasses.replace(item, status="restored", new_mode=item.old_mode))

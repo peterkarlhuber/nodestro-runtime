@@ -264,7 +264,7 @@ def test_a_file_system_that_ignores_chmod_is_a_failure(tmp_path: Path, monkeypat
     monkeypatch.setattr(storage.os, "fchmod", lambda *_args, **_kwargs: None)
     [result] = repair_desktop_database_modes(database, confirmed=True)
     assert result.status == "failed" and result.new_mode == 0o664
-    assert result.reason == "the file system kept the old mode"
+    assert result.reason == "the file system did not take the new mode"
 
 
 def test_windows_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -576,3 +576,57 @@ def test_restore_refuses_a_swapped_file(tmp_path: Path) -> None:
     database.symlink_to(elsewhere)
     [result] = storage.restore_desktop_database_modes([changed])
     assert result.status == "failed" and _mode(elsewhere) == 0o600  # O_NOFOLLOW: the link is not followed
+
+
+def _odd_fchmod(monkeypatch: pytest.MonkeyPatch, database: Path, *, always: bool) -> None:
+    """``fchmod`` on ``database`` succeeds but leaves 0o640 (neither the old nor the target mode); with ``always``
+    also when the old mode is set back."""
+    fchmod = os.fchmod
+    first = [True]
+
+    def odd(descriptor: int, mode: int) -> None:
+        if os.fstat(descriptor).st_ino == os.lstat(database).st_ino and (always or first[0]):
+            first[0] = False
+            fchmod(descriptor, 0o640)
+            return
+        fchmod(descriptor, mode)
+
+    monkeypatch.setattr(storage.os, "fchmod", odd)
+
+
+@posix_only
+def test_an_unexpected_mode_after_fchmod_is_rolled_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = _database(tmp_path / "data", 0o664, sides=("-wal",))
+    _odd_fchmod(monkeypatch, database, always=False)
+    results = repair_desktop_database_modes(database, confirmed=True)
+    monkeypatch.undo()
+    assert [(r.path.name, r.status, r.new_mode, r.reason) for r in results] == [
+        ("nodestro.db", "rolled_back", 0o664, "the file system did not take the new mode"),
+        ("nodestro.db-wal", "skipped", None, "other_file_refused"),
+    ]
+    assert _mode(database) == 0o664 and _mode(tmp_path / "data" / "nodestro.db-wal") == 0o664
+
+
+@posix_only
+def test_an_unexpected_mode_that_cannot_be_rolled_back_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path / "data", 0o664)
+    _odd_fchmod(monkeypatch, database, always=True)
+    [result] = repair_desktop_database_modes(database, confirmed=True)
+    monkeypatch.undo()
+    assert (result.status, result.new_mode) == ("rollback_failed", 0o640)
+    assert _mode(database) == 0o640
+
+
+@posix_only
+def test_restore_never_overwrites_a_later_chmod(tmp_path: Path) -> None:
+    database = _database(tmp_path / "data", 0o664, sides=("-wal",))
+    results = repair_desktop_database_modes(database, confirmed=True)
+    os.chmod(database, 0o400)  # the user changed it after the repair
+    restored = storage.restore_desktop_database_modes(results)
+    assert [(r.path.name, r.status, r.reason) for r in restored] == [
+        ("nodestro.db", "skipped", "changed_during_repair"),
+        ("nodestro.db-wal", "restored", None),
+    ]
+    assert _mode(database) == 0o400 and _mode(tmp_path / "data" / "nodestro.db-wal") == 0o664

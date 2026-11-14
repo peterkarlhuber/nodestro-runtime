@@ -18,7 +18,8 @@
   touches only the files the user was shown (a different, unlisted or vanished file is `changed_during_repair`). All
   or nothing: when any file is skipped or fails, nothing is changed, and files this call already changed are set
   back to their old mode under the same checks. `storage.restore_desktop_database_modes(results)` sets the old
-  modes of `changed` results again (for a caller whose check after the repair fails). Windows: no-op (no POSIX
+  modes of `changed` results again, only while a file still has the mode the repair set (for a caller whose
+  check after the repair fails). Windows: no-op (no POSIX
   modes). No API endpoint or interface yet. A
   `Workspace` whose database is refused no longer keeps its data directory locked, so the same process can open it
   again after the repair.
