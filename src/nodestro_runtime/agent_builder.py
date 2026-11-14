@@ -15,7 +15,7 @@ streaming, reasoning effort, the documented maximum output ...); such errors app
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import keyword
 import re
@@ -66,6 +66,8 @@ from .providers import (
 )
 from .schemas import MAX_TOKENS_BOUND, AgentConfig, OutputConfig, OutputField, Skill, SkillUse
 from .skill_tools import AssignedSkill, SkillSet
+from .skills_select import Candidate
+from .skills_select import select as select_skills
 from .source_ledger import model_output
 from .tool_library import ToolLibrary
 from .tool_policy import server_tool_capability
@@ -315,8 +317,19 @@ class AgentBuilder:
         #: resolves from its frozen skills. ``None``: no skills here (an agent with skills cannot be built).
         self.skill_source: Callable[[str, int], tuple[Skill, SkillPackage]] | None = None
 
-    def skill_set(self, config: AgentConfig, on_use: Callable[[SkillUse], None] | None = None) -> SkillSet | None:
+    def skill_set(
+        self,
+        config: AgentConfig,
+        on_use: Callable[[SkillUse], None] | None = None,
+        *,
+        query: str = "",
+        recommended: Sequence[str] = (),
+    ) -> SkillSet | None:
         """The agent's skills in their fixed versions (``None`` without skills).
+
+        With many ``on_demand`` skills only a preselection for ``query`` (the step's prompt) is offered, and the
+        ``recommended`` names of an orchestrator the agent has are always offered, marked (NAL-B4,
+        :mod:`nodestro_runtime.skills_select`). Every assigned skill is resolved and checked all the same.
 
         Raises :class:`NodestroError` for a skill that is missing (``skill.not_found``), disabled or archived
         (``skill.inactive``), or two skills of the same name (``skill.duplicate_name``)."""
@@ -344,7 +357,18 @@ class AgentBuilder:
                     "skill.duplicate_name", f"The skill {package.name} is assigned twice", name=package.name
                 )
             assigned.append(AssignedSkill(binding.skill_id, binding.version, binding.mode, package))
-        return SkillSet(assigned, on_use)
+        selection = select_skills(
+            query,
+            [Candidate(item.package.name, item.package.description, item.mode) for item in assigned],
+            recommended=recommended,
+        )
+        offered = set(selection.offered)
+        return SkillSet(
+            [item for item in assigned if item.package.name in offered],
+            on_use,
+            recommended=tuple(selection.recommended),
+            selection=selection,
+        )
 
     def output_limit(self, operation: str, model: str, connection: Connection | None = None) -> EffectiveLimit:
         """The output limit one of Nodestro's own AI operations sends to ``model``: the workspace setting, else the

@@ -1,0 +1,101 @@
+"""A fixed corpus for the skill preselection (NAL-B4): 30 skills of a quality team and 50 tasks, each with the skill
+a careful person would pick. English and German, as people write them; the tasks were written from the skill's
+purpose, not from its description text."""
+
+from __future__ import annotations
+
+SKILLS: dict[str, str] = {
+    "five-whys": "Find the root cause of a problem by asking why five times in a row.",
+    "fishbone-diagram": "Ishikawa cause and effect diagram: sort possible causes into man, machine, method, "
+    "material, measurement and environment.",
+    "fmea": "Failure mode and effects analysis: rate severity, occurrence and detection of each failure mode "
+    "and compute the risk priority number.",
+    "8d-report": "Write an 8D report for a customer complaint: team, containment, root cause, corrective and "
+    "preventive actions.",
+    "pareto-analysis": "Pareto chart: rank defect categories by frequency and find the vital few causes.",
+    "control-chart": "Statistical process control: control limits, run rules and out-of-control signals in a "
+    "control chart.",
+    "process-capability": "Process capability indices Cp and Cpk from measurements and specification limits.",
+    "measurement-system-analysis": "Gage R&R: repeatability and reproducibility of a measurement system.",
+    "audit-checklist": "Prepare an internal audit checklist for ISO 9001 clauses and record audit findings.",
+    "supplier-evaluation": "Rate suppliers on quality, delivery and price and decide on approval or development.",
+    "kaizen-event": "Plan and run a kaizen workshop for continuous improvement on the shop floor.",
+    "5s-workplace": "5S: sort, set in order, shine, standardize and sustain a workplace.",
+    "value-stream-mapping": "Map the value stream of a process, lead times and waste, and design the future state.",
+    "poka-yoke": "Design mistake proofing so errors cannot happen or are detected immediately.",
+    "pdca-cycle": "Plan, do, check, act: run an improvement as a PDCA cycle with measurable targets.",
+    "a3-report": "A3 problem solving on one page: background, current condition, target, analysis, countermeasures.",
+    "complaint-handling": "Answer a customer complaint politely, record it and agree on next steps.",
+    "risk-assessment": "Assess occupational safety hazards at a workplace and define protective measures.",
+    "calibration-plan": "Plan calibration intervals for test equipment and track due dates.",
+    "first-article-inspection": "First article inspection: check a first production part against the drawing "
+    "and every characteristic.",
+    "sampling-plan": "Acceptance sampling: choose sample size and acceptance number by AQL for incoming inspection.",
+    "deviation-request": "Request a deviation or concession for a nonconforming product and document approval.",
+    "change-management": "Engineering change management: assess, approve and implement a product change.",
+    "training-matrix": "Track employee qualifications and training needs in a skills matrix.",
+    "kpi-dashboard": "Define quality key performance indicators such as scrap rate, first pass yield and PPM.",
+    "lessons-learned": "Collect lessons learned after a project and turn them into rules for the next one.",
+    "design-of-experiments": "Design of experiments: factorial designs to find which factors affect a result.",
+    "regression-analysis": "Linear regression of a response on predictors with residual checks.",
+    "hypothesis-test": "Choose and run a statistical hypothesis test such as t-test or chi-square and read the "
+    "p-value.",
+    "meeting-minutes": "Write clear minutes of a meeting with decisions, owners and due dates.",
+}
+
+#: (task, the skill a careful person picks)
+TASKS: list[tuple[str, str]] = [
+    ("Why does the pump keep failing? Ask why until we reach the root cause.", "five-whys"),
+    ("Warum fällt die Maschine immer wieder aus? Finde die eigentliche Ursache mit der Warum-Methode.", "five-whys"),
+    ("Draw an Ishikawa diagram for the paint defects.", "fishbone-diagram"),
+    ("Sort the possible causes of the leak into machine, method, material and measurement.", "fishbone-diagram"),
+    ("Run an FMEA for the new brake assembly and compute the RPN.", "fmea"),
+    ("Rate severity, occurrence and detection for each failure mode of the valve.", "fmea"),
+    ("Write the 8D report for the complaint from our customer about cracked housings.", "8d-report"),
+    ("Erstelle einen 8D-Report zur Kundenreklamation.", "8d-report"),
+    ("Which defect categories cause most of the scrap? Make a Pareto chart.", "pareto-analysis"),
+    ("Rank the defects by frequency to find the vital few.", "pareto-analysis"),
+    ("Is the filling process out of control? Check the control chart against the run rules.", "control-chart"),
+    ("Set up statistical process control limits for the diameter.", "control-chart"),
+    ("Compute Cpk for these shaft measurements against the specification limits.", "process-capability"),
+    ("Ist der Prozess fähig? Berechne Cp und Cpk.", "process-capability"),
+    ("Do a gage R&R study for the new caliper.", "measurement-system-analysis"),
+    ("How good is our measurement system? Check repeatability and reproducibility.", "measurement-system-analysis"),
+    ("Prepare the checklist for next week's internal ISO 9001 audit.", "audit-checklist"),
+    ("Record the findings of the internal audit in production.", "audit-checklist"),
+    ("Rate our three suppliers of castings on quality and delivery.", "supplier-evaluation"),
+    ("Bewerte die Lieferanten nach Qualität, Lieferung und Preis.", "supplier-evaluation"),
+    ("Plan a kaizen workshop for the assembly line.", "kaizen-event"),
+    ("Organise a continuous improvement workshop on the shop floor.", "kaizen-event"),
+    ("Introduce 5S at the packing workplace.", "5s-workplace"),
+    ("Sort and standardize the tools at the workplace so it stays tidy.", "5s-workplace"),
+    ("Map the value stream from order to delivery and show the waste.", "value-stream-mapping"),
+    (
+        "Where is the lead time lost in our process? Draw the current and future state value stream.",
+        "value-stream-mapping",
+    ),
+    ("How can we make it impossible to insert the connector the wrong way? Design mistake proofing.", "poka-yoke"),
+    ("Suggest a poka-yoke for the label printer.", "poka-yoke"),
+    ("Plan the improvement as a PDCA cycle with measurable targets.", "pdca-cycle"),
+    ("Plan, do, check, act for reducing setup time.", "pdca-cycle"),
+    ("Summarise the problem on one page as an A3 report with countermeasures.", "a3-report"),
+    ("Write an A3 for the late deliveries.", "a3-report"),
+    ("Reply politely to the customer complaint about the late parcel and agree next steps.", "complaint-handling"),
+    ("Beantworte die Reklamation des Kunden höflich.", "complaint-handling"),
+    ("Assess the safety hazards at the welding workplace and define protective measures.", "risk-assessment"),
+    ("Erstelle eine Gefährdungsbeurteilung für den Arbeitsplatz an der Presse.", "risk-assessment"),
+    ("Plan calibration intervals for our test equipment.", "calibration-plan"),
+    ("Which gauges are due for calibration next month?", "calibration-plan"),
+    ("Check the first production part against the drawing, every characteristic.", "first-article-inspection"),
+    ("Do the first article inspection for the new bracket.", "first-article-inspection"),
+    ("Which sample size and acceptance number do we need for incoming inspection at AQL 1.0?", "sampling-plan"),
+    ("Set up an acceptance sampling plan for the screws.", "sampling-plan"),
+    ("Request a concession to ship the nonconforming batch.", "deviation-request"),
+    ("Document the deviation request and its approval.", "deviation-request"),
+    ("Assess and approve the engineering change to the housing material.", "change-management"),
+    ("Who still needs training on the new machine? Update the qualification matrix.", "training-matrix"),
+    ("Define the quality KPIs scrap rate, first pass yield and PPM for the dashboard.", "kpi-dashboard"),
+    ("Collect the lessons learned from the launch project.", "lessons-learned"),
+    ("Which factors affect the weld strength? Plan a factorial experiment.", "design-of-experiments"),
+    ("Is the new supplier's mean different? Run a t-test and read the p-value.", "hypothesis-test"),
+]
