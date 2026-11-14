@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 28 |
+| P3 Low | 29 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -52,6 +52,20 @@ None known.
   still puts it into the next independent review brief (D1, with NAL-A2), together with the call-time network guard
   (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
 - **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
+
+### RT-078 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-6 (this change), MIG-NOD-9 (E-NOD-PERM),
+  findings B-06-3 and B-06-5, `storage.SQLITE_PROFILE`, `tests/test_sqlite_store_snapshots.py`
+- **What:** `SQLiteStore`, `sqlite_tables.memory_totals` and `postgres_import.import_desktop_database` open SQLite
+  through `tabrion.sqlite` (new files and snapshots `0600`, symbolic links refused, a file of another user or one
+  writable by group or others refused). Open: (1) existing world-readable `nodestro.db` files keep their mode until
+  MIG-NOD-9; (2) the refusals raise `tabrion.errors.UnsafePath` (codes `sqlite.symlink`, `sqlite.unsafe_mode`,
+  `sqlite.unsafe_owner`, `sqlite.unsafe_path`), which the desktop and the api show as an unexpected error today; a
+  Nodestro problem code for them needs an `error_codes.json` change; (3) `secure_delete` is on in the profile
+  (doc 06 field 4 says off), because the Linux SQLite builds had it on before; decide whether to keep it.
+- **Next step:** MIG-NOD-9 tightens the existing files; the api maps `UnsafePath` with its desktop/diagnostics part
+  of MIG-NOD-6 (`API/diagnostics.py` `quick_check`, `API/backup.py` `integrity_check`).
 
 Items that need an independent or external review (an internal audit does not replace it):
 

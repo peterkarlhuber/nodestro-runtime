@@ -6,8 +6,22 @@ is used.
 
 | Name | Used in |
 |---|---|
+| `tabrion.errors.BackupFailed` | `src/nodestro_runtime/storage.py` |
+| `tabrion.errors.BackupRequired` | `src/nodestro_runtime/storage.py` |
+| `tabrion.errors.MigrationFailed` | `src/nodestro_runtime/storage.py` |
+| `tabrion.errors.MigrationMissing` | `src/nodestro_runtime/storage.py` |
+| `tabrion.errors.SchemaTooNew` | `src/nodestro_runtime/storage.py` |
 | `tabrion.errors.StatementError` | `tests/test_error_texts.py` |
 | `tabrion.errors.TabrionError` | `src/nodestro_runtime/error_texts.py` |
+| `tabrion.errors.UnsafePath` | `tests/test_sqlite_store_snapshots.py` |
 | `tabrion.errors.classify` | `tests/test_error_texts.py` |
 | `tabrion.errors.safe_message` | `src/nodestro_runtime/error_texts.py` |
+| `tabrion.sqlite` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.JournalMode.WAL` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.SQLiteProfile` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.Synchronous.FULL` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.backup` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.connect` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.migrate` | `src/nodestro_runtime/storage.py` |
+| `tabrion.sqlite.write_transaction` | `src/nodestro_runtime/storage.py` |
 | `tabrion.testing.configure` | `tests/postgres_support.py` |

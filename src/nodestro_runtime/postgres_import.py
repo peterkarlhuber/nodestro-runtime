@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from .postgres_tables import search_words
 from .problems import NodestroError
-from .storage import SCHEMA_VERSION
+from .storage import SCHEMA_VERSION, open_sqlite
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
 
 #: Document collections that are never imported (see the module documentation).
@@ -80,9 +80,16 @@ def import_desktop_database(source: str | Path, database: PostgresDatabase, tena
     database.require_current_schema()
     report = ImportReport(tenant_id=tenant_id)
     try:
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
+        # Read-only, under the desktop's profile (TABRION MIG-NOD-6); the resolved path, as before, so a source given
+        # through a symbolic link is still read (the link itself is not opened).
+        connection = open_sqlite(path.resolve(), read_only=True)
+    except sqlite3.OperationalError as exc:
         raise NodestroError("storage.import_source", f"Cannot open {path}: {exc}", path=str(path)) from exc
+    except sqlite3.DatabaseError as exc:
+        # Opening reads the file header now (journal mode); before, the first read below failed the same way.
+        raise NodestroError(
+            "storage.import_source", f"{path} is not a Nodestro database: {exc}", path=str(path)
+        ) from exc
     with closing(connection) as sqlite:
         try:
             sqlite.execute("BEGIN")  # one consistent read of the whole source

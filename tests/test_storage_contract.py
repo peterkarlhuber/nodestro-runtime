@@ -610,7 +610,37 @@ def test_no_module_outside_storage_touches_a_connection() -> None:
                 offenders.append(f"{path.name}:{node.lineno} sqlite3.connect")
             if isinstance(node, ast.Import | ast.ImportFrom) and _imports_sqlite3(node):
                 offenders.append(f"{path.name}:{node.lineno} import sqlite3")
+            # TABRION MIG-NOD-6: Tabrion's SQLite connections, and the store's way to open one, stay here too.
+            if isinstance(node, ast.Import | ast.ImportFrom) and _imports_tabrion_sqlite(node):
+                offenders.append(f"{path.name}:{node.lineno} import tabrion.sqlite")
+            if isinstance(node, ast.Name | ast.Attribute) and _name_of(node) == "open_sqlite":
+                offenders.append(f"{path.name}:{node.lineno} open_sqlite")
+            if isinstance(node, ast.alias) and node.name == "open_sqlite":
+                offenders.append(f"{path.name} import open_sqlite")
     assert offenders == []
+
+
+def _imports_tabrion_sqlite(node: ast.Import | ast.ImportFrom) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        return node.module == "tabrion.sqlite" or (
+            node.module == "tabrion" and any(alias.name == "sqlite" for alias in node.names)
+        )
+    return any(alias.name == "tabrion.sqlite" for alias in node.names)
+
+
+def _name_of(node: ast.Name | ast.Attribute) -> str:
+    return node.id if isinstance(node, ast.Name) else node.attr
+
+
+def test_the_guard_sees_tabrion_sqlite() -> None:
+    """Mutation probe of the guard above (the forms a module outside the storage modules could use)."""
+    for source in ("import tabrion.sqlite", "from tabrion import sqlite", "from tabrion.sqlite import connect"):
+        assert any(
+            _imports_tabrion_sqlite(node)
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Import | ast.ImportFrom)
+        ), source
+    assert not _imports_tabrion_sqlite(ast.parse("from tabrion import errors").body[0])  # type: ignore[arg-type]
 
 
 def _is_sqlite3(node: ast.expr) -> bool:
