@@ -216,6 +216,9 @@ JobStatus = Literal["running", "awaiting_dependencies", "awaiting_approval", "ap
 class ToolJob(BaseModel):
     id: str = Field(default_factory=lambda: new_id("job"))
     requirement: str
+    #: Where the requirement came from, e.g. ``skill:<name>@<version>/<path>`` for a skill script (NAL-B4); ``None``:
+    #: written by a person. It changes nothing in the chain: check, tests, isolation and approval stay the same.
+    origin: str | None = None
     status: JobStatus = "running"
     #: The current step: ``message_code``/``message_params`` for the UI, ``message`` in English.
     message: str = "The Coding Agent is writing code and tests"
@@ -1164,8 +1167,11 @@ class ToolLibrary:
         model: str,
         usage_tracker: UsageTracker | None = None,
         on_finished: Callable[[ToolJob, UsageTracker], None] | None = None,
+        origin: str | None = None,
     ) -> ToolJob:
         """Start generating a tool in a background thread and return its job.
+
+        ``origin`` records where the requirement came from (a skill script, NAL-B4); the job runs the same way.
 
         ``on_finished(job, tracker)`` runs when the job ends, e.g. to record its usage. ``connection``
         belongs to the provider of ``model``.
@@ -1174,7 +1180,7 @@ class ToolLibrary:
             raise NodestroError("tool.requirement_missing", "Please describe what the tool should do")
         # The Coding Agent's tests run automatically: without isolation nothing is generated at all.
         self._require("untrusted", self.registry.sandbox, "")
-        job = ToolJob(requirement=requirement.strip())
+        job = ToolJob(requirement=requirement.strip(), origin=origin)
         decision = _Decision()
         with self._lock:
             self.jobs[job.id] = job

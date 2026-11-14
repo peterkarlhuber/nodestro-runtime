@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Added (NAL-B4, skill resources and run-time selection; requires orkexa with `Member.skills`):
+  - **Groups:** `SkillGroup` in `skill_groups` (`Skills.groups/group/save_group/delete_group`), and
+    `SkillBinding.group_id` as a label. Groups are never resolved at run time.
+  - **Limit:** `MAX_AGENT_SKILLS` is 100.
+  - **Preselection** (`skills_select.py`, BM25, deterministic): above 20 `on_demand` skills a step offers the best 8
+    plus `always` and recommended skills. It is recorded as `NodeRun.skill_selection` and the `skills_selected` event.
+  - **Orchestrator recommendations:**
+    - Pool members list their agents' skills.
+    - A delegation may recommend up to 8 (`skills` decision field and prompt, only when a team has skills).
+    - `Run.recommended_skills` holds them, and agents mark them `<recommended>true</recommended>`.
+    - Unknown names go to `orchestration_delegated.ignored_skills`.
+  - **Usage:** `skill_stats.skill_stats(runs)`.
+  - **Script drafts:** `skill_tools.script_requirement` and `script_origin`, and `ToolJob.origin` with
+    `ToolLibrary.start_job(origin=)`. The tool chain is unchanged (isolation and a person's approval).
+  - See `docs/skills.md`.
 - Added (QA-17 (AC-2): dependency policy check, 2026-11-14): `dependency-policy.json` is this repository's copy of the
   dependency policy K-33 from nodestro-studio (only its outgoing edges: `orkexa[all,pdf,local,convert,web]` and
   `tabrion` in the core, `orkexa[postgres]`, `axentra[oidc]` and `tabrion[postgres]` in the extra `postgres`,
