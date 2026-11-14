@@ -153,6 +153,21 @@ integration can never make its tool look harmless to the approval rules.
 - Cost booking of `cost_unit` into the run budget arrives with the first priced tool (NAL-A2); the spec field and the
   connection's price setting exist now.
 
+## Amendment NAL-A2 (2026-11-14): additive, contract stays 1
+
+- `ConnectionType.keyless_providers`: providers usable without a secret although the type needs one (`search`:
+  `ddgs`, `searxng`); `needs_secret(provider)` replaces direct reads of `secret_required` (the `test` search provider
+  still needs a secret, so the A1 secret path stays covered).
+- `ConnectionType.provider_modes` and `offers(provider, mode)`: the per-provider modes agreed for CR-DB above
+  (`ddgs` is never offered on a server; SQLite can use the same field). Creating, changing, resolving or configuring
+  a connection of a provider not offered in the mode fails with `connection.provider_unsupported_mode`.
+- `add_search_provider(name, host=, keyless=, modes=)`: a search provider's fixed API host becomes its egress
+  (`api.search.brave.com:443`) when no `endpoint` is set; connections stored before keep their stored egress.
+- The search check stays offline: the `test` provider answers, every other provider gets a configuration check
+  (secret, SearXNG endpoint). A check that sends a real search needs the owner's approval (E-3) and is not built.
+- Cost booking: a priced built-in tool books `units x price` through `tool_spec.RunServices.book` into the run's
+  tracker as one token-free usage record (`model = "<cost_unit>:<provider>"`, counted in `web_search_requests`).
+
 ## Tests
 
 `tests/test_connections_contract.py` (contract: fields, secret rules, tenant binding, egress, versioning, reserved

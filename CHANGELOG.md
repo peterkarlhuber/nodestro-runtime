@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
+  `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
+  `SEARCH_WEB_SPEC` and `FETCH_WEB_PAGE_SPEC` (read + external, never offline, call and time limits, binding
+  parameters for hosts, defaults and `max_calls`). Results are marked as external content with a per-call nonce,
+  recorded in the run's source ledger and errors reach the model as codes only. Search providers `test`, `ddgs`
+  (keyless, never on a server, extra `web-ddgs`), `brave`, `tavily`, `mojeek` and `searxng` (keyless, self-hosted);
+  none is a default, a paid provider without a known price is not called (`search.price_unknown`), and the
+  connection check sends no real search. The web tools are not offered in the server profile
+  (`check.tool_mode_unsupported`, calls refused with `tool.mode_unsupported`) unless `NODESTRO_WEB_TOOLS_SERVER=1`
+  (RT-078). Connection contract, additive (ADR-0001 amendment): `keyless_providers`, `provider_modes`,
+  `offers()`/`needs_secret()`, `add_search_provider(host=, keyless=, modes=)`, problem
+  `connection.provider_unsupported_mode`. A built-in tool not offered in the installation's mode now refuses every
+  call, not only the workflow check. The base dependency becomes `orkexa[all,pdf,local,convert,web]`.
+
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

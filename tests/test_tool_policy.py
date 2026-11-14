@@ -14,10 +14,11 @@ from nodestro_runtime.tool_policy import (
     parse_capability,
     server_tool_capability,
 )
+from nodestro_runtime.web_tools import WEB_TOOLS
 
 
 def test_every_builtin_and_provider_tool_has_a_statement() -> None:
-    assert {tool.name for tool in BUILTIN_TOOLS} == set(BUILTIN_CAPABILITIES)
+    assert {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS)} == set(BUILTIN_CAPABILITIES)
     for key in SERVER_TOOLS:
         assert server_tool_capability(key).source == "nodestro"
     assert capability_of(name="calculator", kind="builtin") == ToolCapability(

@@ -22,7 +22,8 @@ classifiers = [
 dependencies = [
     # The agent library. Every orkexa requirement in this file names the same version range; the exact commit
     # Nodestro is validated with lives in the studio lock (nodestro-studio platform/internal-server.txt).
-    "orkexa[all,pdf,local,convert]>=0.2.0.dev0,<0.3",
+    # web: the egress guard and the web search and page reading of the built-in web tools (NAL-A2, web_tools.py).
+    "orkexa[all,pdf,local,convert,web]>=0.2.0.dev0,<0.3",
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
@@ -53,10 +54,13 @@ postgres = [
     # Tabrion's PostgreSQL part (doc 06 N-1, N-2): imported only in server-profile modules, guarded like psycopg.
     "tabrion[postgres]>=0.1,<0.2",
 ]
+# The DDGS metasearch provider of search connections (NAL-A2): free, without a key and without guarantees; opt-in,
+# never a default and never offered on a server.
+web-ddgs = ["orkexa[web-ddgs]>=0.2.0.dev0,<0.3"]
 dev = [
     # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's
     # own parser pglast; tests/test_tenant_filters.py, tests/test_sql_catalog.py).
-    "orkexa[postgres,sqlcheck]>=0.2.0.dev0,<0.3",
+    "orkexa[postgres,sqlcheck,web-ddgs]>=0.2.0.dev0,<0.3",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc]>=0.1.0.dev0,<0.2",

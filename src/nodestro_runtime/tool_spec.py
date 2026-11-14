@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from decimal import Decimal
+import os
 import re
 import threading
 from typing import Any, Literal
@@ -38,9 +39,14 @@ Network = Literal["none", "external"]
 SpecMode = Literal["desktop", "local-container", "server", "export"]
 ALL_MODES: frozenset[SpecMode] = frozenset({"desktop", "local-container", "server", "export"})
 
-#: Names of built-in tools that later packages add (NAL-A2): no own or generated tool may take them now, so a stored
-#: tool never shadows them when they arrive.
+#: Names of built-in tools that later packages add: no own or generated tool may take them, so a stored tool never
+#: shadows them when they arrive. The NAL-A2 web tools arrived and keep their names reserved.
 PLANNED_BUILTIN_NAMES: frozenset[str] = frozenset({"search_web", "fetch_web_page"})
+#: The environment variable that offers the web tools (NAL-A2) in the server profile. Off unless set to ``1``: the
+#: owner enables them only after the independent review of the egress guard (D1, RT-077).
+WEB_TOOLS_SERVER_ENV = "NODESTRO_WEB_TOOLS_SERVER"
+#: The modes the web tools run in without that switch (never ``server``).
+_WEB_MODES: frozenset[SpecMode] = frozenset({"desktop", "local-container", "export"})
 
 _ID = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 #: Upper bound of a spec's time limit; a call that needs longer belongs in a job, not in a tool round.
@@ -107,7 +113,58 @@ def _builtin(tool_id: str, category: Category) -> ToolSpec:
     return ToolSpec(id=tool_id, category=category, capability=BUILTIN_CAPABILITIES[tool_id], timeout_seconds=30.0)
 
 
-#: The specs of Nodestro's built-in tools (``builtin_tools.BUILTIN_TOOLS``), by tool name.
+_HOSTS = {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 253}, "maxItems": 100}
+
+#: ``search_web`` (NAL-A2): the search provider of a ``search`` connection; binding parameters narrow what the model
+#: may ask for and which hits it gets.
+SEARCH_WEB_SPEC = ToolSpec(
+    id="search_web",
+    category="web",
+    capability=BUILTIN_CAPABILITIES["search_web"],
+    network="external",
+    offline=False,
+    connection_type="search",
+    cost_unit="search_request",
+    modes=_WEB_MODES,
+    timeout_seconds=20.0,
+    max_calls_per_run=10,
+    params_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
+            "region": {"type": "string", "pattern": "^[A-Za-z]{2}$"},
+            "language": {"type": "string", "pattern": "^[A-Za-z]{2}$"},
+            "time_range": {"enum": ["day", "week", "month", "year"]},
+            "allow_hosts": _HOSTS,
+            "deny_hosts": _HOSTS,
+            "max_calls": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+    },
+)
+#: ``fetch_web_page`` (NAL-A2): reads one page through the egress guard; no connection.
+FETCH_WEB_PAGE_SPEC = ToolSpec(
+    id="fetch_web_page",
+    category="web",
+    capability=BUILTIN_CAPABILITIES["fetch_web_page"],
+    network="external",
+    offline=False,
+    modes=_WEB_MODES,
+    timeout_seconds=30.0,
+    max_calls_per_run=20,
+    params_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "allow_hosts": _HOSTS,
+            "deny_hosts": _HOSTS,
+            "max_chars": {"type": "integer", "minimum": 500, "maximum": 50_000},
+            "max_calls": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+    },
+)
+
+#: The specs of Nodestro's built-in tools (``builtin_tools.BUILTIN_TOOLS`` and ``web_tools.WEB_TOOLS``), by name.
 BUILTIN_SPECS: dict[str, ToolSpec] = {
     spec.id: spec
     for spec in (
@@ -116,8 +173,20 @@ BUILTIN_SPECS: dict[str, ToolSpec] = {
         _builtin("days_between", "compute"),
         _builtin("text_statistics", "data"),
         _builtin("table_totals", "data"),
+        SEARCH_WEB_SPEC,
+        FETCH_WEB_PAGE_SPEC,
     )
 }
+
+
+def offered(spec: ToolSpec, mode: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether ``spec``'s tool runs in ``mode``. The web tools join the server profile only with
+    ``NODESTRO_WEB_TOOLS_SERVER=1`` (:data:`WEB_TOOLS_SERVER_ENV`)."""
+    if mode in spec.modes:
+        return True
+    if mode == "server" and spec.id in PLANNED_BUILTIN_NAMES:
+        return (environ if environ is not None else os.environ).get(WEB_TOOLS_SERVER_ENV, "").strip() == "1"
+    return False
 
 
 #: The time limit of an integration's tool without a spec (contract 1): generous, since such tools (e.g. recognising a
@@ -199,6 +268,12 @@ class RunServices:
     book: Callable[[str, str, int, Decimal | None], None] | None = None
     #: Raises when the run's budget is used up (asked before a priced call).
     check_budget: Callable[[], None] | None = None
+    #: The installation's mode (``desktop``, ``local-container``, ``server``, ``export``).
+    mode: str = "desktop"
+    #: Set when the tool is not offered in ``mode``: every call is refused with this code.
+    refused: str | None = None
+    #: Pages a run's tools already read (url -> result), so a page is fetched once per step; memory only.
+    cache: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -282,11 +357,23 @@ class SpecTool(Tool):
     def definition(self) -> Any:
         return self.inner.definition()
 
+    @property
+    def call_limit(self) -> int | None:
+        """The spec's call limit, lowered by the binding's ``max_calls`` (never raised)."""
+        limit = self.spec.max_calls_per_run
+        wanted = self.params.get("max_calls")
+        if isinstance(wanted, int) and not isinstance(wanted, bool) and wanted >= 1:
+            limit = wanted if limit is None else min(limit, wanted)
+        return limit
+
     def _context(self) -> ToolContext:
-        if not self._counter.take(self.spec.id, self.spec.max_calls_per_run):
+        if self.services.refused is not None:
+            raise ToolResultError(f"Error: {self.name} is not offered here ({self.services.refused})")
+        limit = self.call_limit
+        if not self._counter.take(self.spec.id, limit):
             raise ToolResultError(
-                f"Error: the call limit of {self.name} is reached ({self.spec.max_calls_per_run} per run, "
-                "tool.call_limit); answer with what you have"
+                f"Error: the call limit of {self.name} is reached ({limit} per run, tool.call_limit); answer with "
+                "what you have"
             )
         return ToolContext(
             spec=self.spec, params=self.params, connection=self._resolve_connection(), services=self.services
@@ -369,8 +456,11 @@ def bind_tool(
 __all__ = [
     "ALL_MODES",
     "BUILTIN_SPECS",
+    "FETCH_WEB_PAGE_SPEC",
     "HOST_TOOL_TIMEOUT_SECONDS",
     "PLANNED_BUILTIN_NAMES",
+    "SEARCH_WEB_SPEC",
+    "WEB_TOOLS_SERVER_ENV",
     "CallCounter",
     "RunServices",
     "SettingsProblem",
@@ -382,5 +472,6 @@ __all__ = [
     "builtin_spec",
     "current_tool_context",
     "host_tool_spec",
+    "offered",
     "settings_problems",
 ]
