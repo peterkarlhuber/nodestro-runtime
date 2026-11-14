@@ -19,6 +19,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+import dataclasses
 from datetime import UTC, datetime
 import json
 import logging
@@ -29,6 +30,8 @@ import threading
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
+from tabrion import sqlite as tabrion_sqlite
+from tabrion.errors import BackupFailed, BackupRequired, MigrationFailed, MigrationMissing, SchemaTooNew, UnsafePath
 
 from .error_texts import failure_text
 from .problems import NodestroError
@@ -41,7 +44,10 @@ logger = logging.getLogger(__name__)
 #: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
 SCHEMA_VERSION = 2
 #: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
-#: transaction :meth:`SQLiteStore.migrate` opened (it must not commit).
+#: transaction :meth:`SQLiteStore.migrate` opened (it must not commit, nor run ``executescript``, which commits).
+#: Foreign keys are on (:data:`SQLITE_PROFILE`), and ``PRAGMA foreign_keys = OFF`` has no effect inside a
+#: transaction: a step that rebuilds a table (create, copy, drop, rename) must keep every reference valid at each
+#: statement, or use ``PRAGMA defer_foreign_keys = ON``, which holds the checks until the commit.
 Migration = Callable[[sqlite3.Connection], None]
 #: The fields :meth:`SQLiteStore.find` looks up on hot paths (runs by status at start-up, runs of a publication).
 INDEXED_FIELDS = ("status", "trigger_ref")
@@ -256,6 +262,83 @@ class DamagedDocuments:
             logger.warning("Damaged document %s/%s is left out of listings: %s", collection, key, reason)
 
 
+#: How the desktop opens its SQLite database (TABRION MIG-NOD-6, ``tabrion.sqlite.connect``): WAL, ``synchronous=FULL``
+#: (durability as before), busy timeout 30 s, foreign keys on (``PRAGMA foreign_key_check`` must stay empty),
+#: ``trusted_schema`` off, ``secure_delete`` on. Before, ``secure_delete`` was the build's default and never set: on
+#: with the SQLite of Linux distributions (Debian, Ubuntu), off with the SQLite of python.org, macOS and Windows and
+#: in the desktop bundles; the profile now sets it on everywhere (a change on those platforms: deleted content is
+#: overwritten). New files are created ``0600``; an existing file keeps its mode (MIG-NOD-9 tightens it), but must
+#: belong to the running user and not be writable by group or others, and no symbolic link is followed
+#: (``storage.unsafe_file``, :func:`open_sqlite`).
+SQLITE_PROFILE = tabrion_sqlite.SQLiteProfile(
+    journal_mode=tabrion_sqlite.JournalMode.WAL,
+    synchronous=tabrion_sqlite.Synchronous.FULL,
+    foreign_keys=True,
+    busy_timeout=30.0,
+    secure_delete=True,
+)
+
+
+def _detail(error: Any, name: str, default: int) -> int:
+    """A whole-number detail of a Tabrion error (``found``, ``step``, ``missing``), else ``default``."""
+    value = error.details.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+#: The import source of a server (``postgres_import``): a copied desktop database may belong to another user or have
+#: a looser mode, which does not matter for a read-only copy; symbolic links stay refused.
+SHARED_SOURCE_PROFILE = dataclasses.replace(SQLITE_PROFILE, allow_shared_file=True)
+
+#: What a refused file is, and what the user does about it (``storage.unsafe_file``, parameter ``reason``).
+_UNSAFE_FILE = {
+    "sqlite.symlink": (
+        "symlink",
+        "is a symbolic link, or one of its -wal, -shm or -journal files is; Nodestro does not follow links. Move the "
+        "real file into the data directory in place of the link",
+    ),
+    "sqlite.unsafe_mode": (
+        "writable_by_others",
+        "may be changed by other users (group or others have write permission). Remove that permission "
+        "(chmod go-w on the file and its -wal and -shm files), then start again",
+    ),
+    "sqlite.unsafe_owner": (
+        "other_owner",
+        "belongs to another user. Give it to the user who runs Nodestro (chown), or run Nodestro as its owner",
+    ),
+}
+
+
+_UNSAFE_PATH = ("unsafe_path", "is not a regular file this user may open. Check the path and its permissions")
+
+
+def unsafe_advice(error: UnsafePath) -> tuple[str, str]:
+    """``(reason, what the file is and what to do)`` for a file that ``tabrion.sqlite`` refused."""
+    return _UNSAFE_FILE.get(error.code, _UNSAFE_PATH)
+
+
+def unsafe_file(error: UnsafePath, database: str | Path) -> NodestroError:
+    """The Nodestro problem for a database file that ``tabrion.sqlite`` refused (``storage.unsafe_file``)."""
+    reason, advice = unsafe_advice(error)
+    return NodestroError("storage.unsafe_file", f"The database {database} {advice}", reason=reason)
+
+
+def open_sqlite(
+    database: str | Path,
+    *,
+    read_only: bool = False,
+    profile: tabrion_sqlite.SQLiteProfile = SQLITE_PROFILE,
+    refusal: Callable[[UnsafePath], Exception] | None = None,
+) -> sqlite3.Connection:
+    """A connection to the desktop's SQLite file ``database`` under ``profile`` (default :data:`SQLITE_PROFILE`;
+    autocommit, usable from every thread; the caller serializes its use). ``read_only`` never creates or changes the
+    file. A file ``tabrion.sqlite`` refuses (a symbolic link, another owner, writable by others) raises
+    ``storage.unsafe_file`` with what to do about it, or what ``refusal`` makes of the refusal."""
+    try:
+        return tabrion_sqlite.connect(database, profile=profile, read_only=read_only, check_same_thread=False)
+    except UnsafePath as exc:
+        raise (refusal(exc) if refusal is not None else unsafe_file(exc, database)) from None
+
+
 def _like(prefix: str) -> str:
     """A LIKE pattern (escape character ``\\``) for ids starting with ``prefix``."""
     return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -278,9 +361,7 @@ class SQLiteStore:
         self._closed = False
         #: Documents that listings left out because they cannot be read (C-10).
         self.damaged = DamagedDocuments()
-        self._connection = sqlite3.connect(self.database, isolation_level=None, check_same_thread=False, timeout=30)
-        if self.database != ":memory:":
-            self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection = open_sqlite(self.database)
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS nodestro_documents ("
             " collection TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,"
@@ -319,16 +400,12 @@ class SQLiteStore:
                 finally:
                     self._depth -= 1
                 return
-            self._connection.execute("BEGIN IMMEDIATE")
-            self._depth = 1
-            try:
-                yield self._connection
-            except BaseException:
-                self._depth = 0
-                self._connection.execute("ROLLBACK")
-                raise
-            self._depth = 0
-            self._connection.execute("COMMIT")
+            with tabrion_sqlite.write_transaction(self._connection) as connection:
+                self._depth = 1
+                try:
+                    yield connection
+                finally:
+                    self._depth = 0
 
     def lock(self, collection: str, key: str) -> None:
         """Nothing more to do inside :meth:`transaction`: ``BEGIN IMMEDIATE`` already holds the database's write lock
@@ -587,53 +664,68 @@ class SQLiteStore:
             current = self.schema_version
             if current == target:
                 return current
-            if current > target:
+            versions = {"found": current, "supported": target}
+
+            def backup(found: int, supported: int) -> None:
+                assert before_migration is not None  # tabrion calls it only when one was given
+                before_migration(found, supported)
+
+            try:
+                tabrion_sqlite.migrate(
+                    self._connection,
+                    migrations,
+                    target=target,
+                    backup=None if before_migration is None else backup,
+                    is_fresh=lambda _connection: self._is_empty(),
+                )
+            except SchemaTooNew as exc:
+                found = _detail(exc, "found", current)
                 raise NodestroError(
                     "storage.schema_too_new",
-                    f"The database {self.database} has schema version {current}; this Nodestro release reads "
+                    f"The database {self.database} has schema version {found}; this Nodestro release reads "
                     f"version {target}. Use the newer release, or restore a backup made with this one",
-                    found=current,
+                    found=found,
                     supported=target,
-                )
-            missing = [version for version in range(current + 1, target + 1) if version not in migrations]
-            if missing:
+                ) from None
+            except MigrationMissing as exc:
                 raise NodestroError(
                     "storage.migration_missing",
-                    f"No migration to schema version {missing[0]}",
-                    found=current,
+                    f"No migration to schema version {_detail(exc, 'missing', current + 1)}",
+                    found=_detail(exc, "found", current),
                     supported=target,
-                )
-            fresh = self._is_empty()
-            if before_migration is None and not fresh:
+                ) from None
+            except BackupRequired:
                 raise NodestroError(
                     "storage.backup_required",
                     "A schema migration needs a backup first; none was configured",
-                    found=current,
-                    supported=target,
-                )
-            try:
-                if not fresh and before_migration is not None:
-                    before_migration(current, target)
-            except Exception as exc:
+                    **versions,
+                ) from None
+            except BackupFailed as exc:
+                original = exc.original
                 raise NodestroError(
                     "storage.backup_failed",
-                    f"The backup before the schema migration failed, so nothing was changed: {failure_text(exc)}",
-                    found=current,
-                    supported=target,
-                ) from exc
-            step = current
-            try:
-                with self._transaction() as db:
-                    for step in range(current + 1, target + 1):
-                        migrations[step](db)
-                    db.execute(f"PRAGMA user_version = {int(target)}")
-            except Exception as exc:
+                    "The backup before the schema migration failed, so nothing was changed: "
+                    f"{failure_text(original if original is not None else exc)}",
+                    **versions,
+                ) from original
+            except MigrationFailed as exc:
+                original = exc.original
+                step = _detail(exc, "step", current)
                 raise NodestroError(
                     "storage.migration_failed",
-                    f"The schema migration to version {step} failed; the database is unchanged: {failure_text(exc)}",
-                    found=current,
-                    supported=target,
+                    f"The schema migration to version {step} failed; the database is unchanged: "
+                    f"{failure_text(original if original is not None else exc)}",
+                    **versions,
                     step=step,
+                ) from original
+            except sqlite3.Error as exc:
+                # BEGIN IMMEDIATE failed (busy for longer than the timeout, a read-only file): as before, a failed
+                # migration that changed nothing.
+                raise NodestroError(
+                    "storage.migration_failed",
+                    f"The schema migration to version {current} failed; the database is unchanged: {failure_text(exc)}",
+                    **versions,
+                    step=current,
                 ) from exc
             return current
 
@@ -650,13 +742,15 @@ class SQLiteStore:
     def snapshot(self, target: str | Path) -> None:
         """Copy the whole database, consistently, to the SQLite file ``target`` (an online backup).
 
-        Writes of this store wait until the copy is complete; other connections may keep reading."""
-        destination = sqlite3.connect(str(target))
-        try:
-            with self._lock:
-                self._connection.backup(destination)
-        finally:
-            destination.close()
+        Writes of this store wait until the copy is complete; other connections may keep reading. The copy
+        (:func:`tabrion.sqlite.backup`, TABRION MIG-NOD-6) is written to a ``0600`` temporary file next to ``target``,
+        checked (``quick_check``), synced and renamed over ``target``; it is one self-contained file
+        (``journal_mode=DELETE``), and a symbolic link as ``target`` is refused."""
+        with self._lock:
+            try:
+                tabrion_sqlite.backup(self._connection, target, overwrite=True)
+            except UnsafePath as exc:
+                raise unsafe_file(exc, target) from None
 
     @contextmanager
     def maintenance(self) -> Iterator[sqlite3.Connection]:

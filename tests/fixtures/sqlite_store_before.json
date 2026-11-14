@@ -1,0 +1,228 @@
+{
+  "files": {
+    "symlink": {
+      "ok": "opened"
+    },
+    "umask_002": {
+      "snapshot": "0o644",
+      "snapshot_journal": "wal",
+      "snapshot_side_files": [],
+      "store": {
+        "nodestro.db": "0o644",
+        "nodestro.db-shm": "0o644",
+        "nodestro.db-wal": "0o644"
+      }
+    },
+    "umask_022": {
+      "snapshot": "0o644",
+      "snapshot_journal": "wal",
+      "snapshot_side_files": [],
+      "store": {
+        "nodestro.db": "0o644",
+        "nodestro.db-shm": "0o644",
+        "nodestro.db-wal": "0o644"
+      }
+    }
+  },
+  "import_source": {
+    "empty_file": {
+      "cause": null,
+      "code": "storage.import_source",
+      "message": "<dir>/empty.db is not a Nodestro database of this release (schema version 0, needed 2); open it with this desktop release first",
+      "params": {
+        "found": 0,
+        "path": "<dir>/empty.db",
+        "supported": 2
+      }
+    },
+    "missing": {
+      "cause": null,
+      "code": "storage.import_source",
+      "message": "<dir>/none.db is not a file",
+      "params": {
+        "path": "<dir>/none.db"
+      }
+    },
+    "no_documents": {
+      "cause": null,
+      "code": "storage.import_source",
+      "message": "<dir>/plain.db is not a Nodestro database of this release (schema version 0, needed 2); open it with this desktop release first",
+      "params": {
+        "found": 0,
+        "path": "<dir>/plain.db",
+        "supported": 2
+      }
+    },
+    "not_a_database": {
+      "cause": "DatabaseError",
+      "code": "storage.import_source",
+      "message": "<dir>/junk.db is not a Nodestro database: file is not a database",
+      "params": {
+        "path": "<dir>/junk.db"
+      }
+    },
+    "old_schema": {
+      "cause": null,
+      "code": "storage.import_source",
+      "message": "<dir>/old.db is not a Nodestro database of this release (schema version 0, needed 2); open it with this desktop release first",
+      "params": {
+        "found": 0,
+        "path": "<dir>/old.db",
+        "supported": 2
+      }
+    }
+  },
+  "memory_totals": {
+    "columns": [
+      "namespace",
+      "path",
+      "content",
+      "updated_at"
+    ],
+    "empty": [],
+    "filled": [
+      [
+        "space:a",
+        2,
+        8
+      ]
+    ]
+  },
+  "migrate": {
+    "backup_calls": [
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        3
+      ]
+    ],
+    "backup_failed": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 1
+      },
+      "cause": "OSError",
+      "code": "storage.backup_failed",
+      "message": "The backup before the schema migration failed, so nothing was changed: OSError (ENOSPC: No space left on device)",
+      "params": {
+        "found": 1,
+        "supported": 3
+      }
+    },
+    "backup_required": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 1
+      },
+      "cause": null,
+      "code": "storage.backup_required",
+      "message": "A schema migration needs a backup first; none was configured",
+      "params": {
+        "found": 1,
+        "supported": 3
+      }
+    },
+    "current": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 3
+      },
+      "ok": 3
+    },
+    "fresh_no_backup": {
+      "after": {
+        "tables": [
+          "nodestro_documents",
+          "t1",
+          "t2",
+          "t3"
+        ],
+        "version": 3
+      },
+      "ok": 0
+    },
+    "inside_transaction": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 0
+      },
+      "raised": "RuntimeError"
+    },
+    "migration_failed": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 1
+      },
+      "cause": "RuntimeError",
+      "code": "storage.migration_failed",
+      "message": "The schema migration to version 3 failed; the database is unchanged: RuntimeError",
+      "params": {
+        "found": 1,
+        "step": 3,
+        "supported": 3
+      }
+    },
+    "migration_missing": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 0
+      },
+      "cause": null,
+      "code": "storage.migration_missing",
+      "message": "No migration to schema version 2",
+      "params": {
+        "found": 0,
+        "supported": 3
+      }
+    },
+    "schema_too_new": {
+      "after": {
+        "tables": [
+          "nodestro_documents"
+        ],
+        "version": 5
+      },
+      "cause": null,
+      "code": "storage.schema_too_new",
+      "message": "The database <dir>/newer.db has schema version 5; this Nodestro release reads version 3. Use the newer release, or restore a backup made with this one",
+      "params": {
+        "found": 5,
+        "supported": 3
+      }
+    },
+    "with_backup": {
+      "after": {
+        "tables": [
+          "nodestro_documents",
+          "t2",
+          "t3"
+        ],
+        "version": 3
+      },
+      "ok": 1
+    }
+  },
+  "pragmas": {
+    "busy_timeout": 30000,
+    "foreign_keys": 0,
+    "journal_mode": "wal",
+    "secure_delete": 1,
+    "synchronous": 2,
+    "trusted_schema": 1
+  }
+}

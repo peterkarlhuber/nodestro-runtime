@@ -11,10 +11,11 @@ operations for its own tables.
 
 from __future__ import annotations
 
-import sqlite3
 from typing import Any
 
 from orkexa import SQLiteIndex, SQLiteMemory
+
+from .storage import open_sqlite
 
 #: The table ``SQLiteMemory`` creates on first use (created here too, so totals work on a new database).
 _MEMORY_TABLE = (
@@ -77,8 +78,9 @@ def clear_memory(memory: SQLiteMemory) -> None:
 def memory_totals(database: str, prefix: str) -> list[tuple[str, int, int]]:
     """``(namespace, files, bytes)`` of every memory namespace starting with ``prefix``, by namespace.
 
-    Uses a short-lived connection of its own (the spaces may not be open)."""
-    connection = sqlite3.connect(database, timeout=30)
+    Uses a short-lived connection of its own (the spaces may not be open), opened like the store's
+    (:func:`~nodestro_runtime.storage.open_sqlite`, TABRION MIG-NOD-6)."""
+    connection = open_sqlite(database)
     try:
         connection.execute(_MEMORY_TABLE)
         rows = connection.execute(

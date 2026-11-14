@@ -53,6 +53,24 @@ None known.
   (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
 - **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
 
+### RT-080 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-6 (this change, security review of #171),
+  MIG-NOD-9 (E-NOD-PERM), findings B-06-3 and B-06-5, `storage.SQLITE_PROFILE`, `tests/test_sqlite_store_snapshots.py`
+- **What:** `SQLiteStore`, `sqlite_tables.memory_totals` and `postgres_import.import_desktop_database` open SQLite
+  through `tabrion.sqlite` (new files and snapshots `0600`, symbolic links refused; the desktop's database also when
+  it belongs to another user or is writable by group or others). A refusal is `storage.unsafe_file` (parameter
+  `reason`: `symlink`, `writable_by_others`, `other_owner`, `unsafe_path`) with what to do (`chmod go-w`, `chown`);
+  an import source is read whatever its owner and mode (`SHARED_SOURCE_PROFILE`, links still refused). Open:
+  (1) existing world-readable `nodestro.db` files keep their mode until MIG-NOD-9; (2) the api part of MIG-NOD-6
+  (`API/diagnostics.py` `quick_check`, `API/backup.py` `integrity_check`) and the api's text for
+  `storage.unsafe_file`; (3) Windows: Tabrion's `_is_link` treats every reparse point as a link, and OneDrive or
+  Dropbox placeholders (cloud files) are reparse points, so a data directory inside OneDrive may be refused as
+  `symlink`. Test a data directory in OneDrive (files on demand) with the desktop build, and propose that Tabrion
+  refuse only `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT`.
+- **Next step:** MIG-NOD-9 tightens the existing files; (2) with the api pin of MIG-NOD-6; (3) a Windows desktop-build
+  check before W6 ships, then a Tabrion issue for the reparse tags.
+
 ### RT-079 · Runtime role checks: gaps left after MIG-NOD-5
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-5 (#169) and its security review,
