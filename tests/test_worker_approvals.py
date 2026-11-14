@@ -438,6 +438,10 @@ async def test_07_cancelling_a_waiting_run_ends_the_wait(
         assert done.status == "cancelled"
         stored = api.process.approvals("alpha").get(a.id, request.id)
         assert stored is not None and stored.status == "cancelled"
+        for _ in range(100):  # the job is finished before the held task's done callback releases it
+            if worker.held == 0:
+                break
+            await asyncio.sleep(0.01)
         assert worker.held == 0 and worker.slots.waiting == 0
     finally:
         await serving.close()
