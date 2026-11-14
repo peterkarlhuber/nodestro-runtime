@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Changed (TABRION MIG-NOD-4, MIG-NOD-8): `PostgresDatabase` configures every connection with
+  `tabrion.postgres.configure` (statement and idle-in-transaction time limits and the schema, as before; no
+  `lock_timeout`, `application_name` or `TimeZone`, so `SHOW ALL` is unchanged) and keeps its session-level advisory
+  locks (`try_session_lock`, `holds_session_lock`, `release_session_lock`, the scheduler's `LeaderLock`) in a
+  `tabrion.postgres.SessionLock`. The public API is unchanged: a lock lost with its connection is still taken again by a
+  later `try_session_lock` when it is free. The lock connection is now fork-safe (a child process never uses the
+  parent's session).
 - Added (TABRION DC-NR-1, dependency confusion): new CI job `tabrion source (poisoned index)`, reported by ci-ok, runs
   the install with `scripts/check_tabrion_source.py` (an unchanged, checksummed copy from nodestro-studio): a poisoned
   index must get no request for `tabrion`, which proves that the lock's direct-URL pin keeps a foreign `tabrion` out.
