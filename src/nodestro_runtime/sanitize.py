@@ -228,6 +228,15 @@ def sanitize_run(run: dict[str, Any], *, personal_data: bool = True, contents: b
     return copy
 
 
+def credential_kinds(text: str) -> list[str]:
+    """The kinds of credentials ``text`` seems to contain (``api_key``, ``token``, ``private_key``, ``password``),
+    without assignments like ``password: x``, which documentation mentions often. Used to warn, never to block."""
+    kinds = {kind for kind, pattern in _SECRETS if pattern.search(text)}
+    if any(pattern.search(text) for pattern in _PREFIXED):
+        kinds.add("password")
+    return sorted(kinds)
+
+
 def redact_secrets(value: Any) -> Any:
     """Only credentials, e.g. for showing request options in the context preview."""
     return Sanitizer(personal_data=False).value(value)

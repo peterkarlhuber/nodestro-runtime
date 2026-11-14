@@ -12,7 +12,9 @@ A release bundle holds everything a reproducible run needs and nothing secret:
   them, so later changes to them are visible, never hidden;
 - the request and result schemas and the runtime versions it was published with;
 - the MCP tools its agents use, frozen at their approved definitions (server id and slug, hash, classification);
-  never a server address or a token.
+  never a server address or a token;
+- the skills its agents use, in the assigned versions with all their files (NAL-B3): a later change of a skill
+  never changes the release.
 
 API keys, the Anthropic key and settings are never part of a bundle. The bundle is used by
 Nodestro's direct API (:mod:`nodestro_api.publishing`) and is the ``workflow/release.json`` of an
@@ -21,6 +23,7 @@ exported project (:mod:`nodestro_api.standalone`); both run it with the same eng
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from dataclasses import asdict
 import hashlib
@@ -29,10 +32,11 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from orkexa.dynamic import ToolRecord
+from orkexa.skills import SkillPackage, package_digest, parse_skill
 from pydantic import BaseModel, Field, StringConstraints
 
 from .sandbox_policy import TrustClass
-from .schemas import Workflow, now
+from .schemas import Skill, SkillStatus, Workflow, now
 from .tool_provenance import MemoryProvenance
 
 FORMAT = "nodestro-release"
@@ -55,6 +59,45 @@ class McpToolRef(BaseModel):
     access: Literal["read", "write", "destructive"]
     #: The approved definition (name, title, description, schemas, annotations), for review and comparison.
     definition: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillSnapshot(BaseModel):
+    """A skill frozen in a release bundle (NAL-B3): one version with every file, base64-encoded, and its digest."""
+
+    skill_id: str
+    version: int
+    name: str
+    digest: str
+    origin: str = "user"
+    files: dict[str, str] = Field(default_factory=dict)
+
+    def package(self) -> SkillPackage:
+        """The frozen package; :class:`KeyError` when its files no longer match the digest (L4)."""
+        package = parse_skill({path: base64.b64decode(data) for path, data in self.files.items()})
+        if package_digest(package) != self.digest:
+            raise KeyError(f"{self.skill_id} v{self.version}: the files do not match the release's digest")
+        return package.model_copy(update={"directory": self.name})
+
+
+def freeze_skill(skill_id: str, version: int, origin: str, package: SkillPackage) -> SkillSnapshot:
+    return SkillSnapshot(
+        skill_id=skill_id,
+        version=version,
+        name=package.name,
+        digest=package_digest(package),
+        origin=origin,
+        files={item.path: base64.b64encode(item.data).decode("ascii") for item in package.files},
+    )
+
+
+def skill_bindings(workflows: list[Workflow]) -> list[tuple[str, int]]:
+    """Every ``(skill_id, version)`` the agents of ``workflows`` use, in order, once."""
+    found: dict[tuple[str, int], None] = {}
+    for workflow in workflows:
+        for node in workflow.nodes:
+            for binding in node.agent.skills if node.agent is not None else []:
+                found[(binding.skill_id, binding.version)] = None
+    return list(found)
 
 
 class SubworkflowSnapshot(BaseModel):
@@ -132,6 +175,8 @@ class ReleaseBundle(BaseModel):
     #: hash, classification, definition; never an address or a token. A run uses them only while the tenant's
     #: approval still matches (:class:`~nodestro_runtime.mcp.pinned.PinnedMcp`).
     mcp_tools: dict[str, McpToolRef] = Field(default_factory=dict)
+    #: The skills of its agents in their assigned versions, with all files (NAL-B3).
+    skills: list[SkillSnapshot] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
     python: list[PythonLock] = Field(default_factory=list)
     knowledge: list[KnowledgeRef] = Field(default_factory=list)
@@ -144,8 +189,9 @@ class ReleaseBundle(BaseModel):
     def digest(self) -> str:
         """SHA-256 of the content (without the creation time): equal bundles, equal digest.
 
-        Empty ``tool_trust``, ``mcp_tools``, ``builtin_versions``, ``required_connections`` and agent
-        ``tool_settings`` are left out, so bundles published before they existed keep their digest."""
+        Empty ``tool_trust``, ``mcp_tools``, ``builtin_versions``, ``required_connections``, ``skills`` and agent
+        ``tool_settings``, ``skills``, ``task`` and ``origin`` are left out, so bundles published before they existed
+        keep their digest."""
         exclude = {"created_at"}
         if not self.tool_trust:
             exclude.add("tool_trust")
@@ -155,13 +201,49 @@ class ReleaseBundle(BaseModel):
             exclude.add("builtin_versions")
         if not self.required_connections:
             exclude.add("required_connections")
+        if not self.skills:
+            exclude.add("skills")
         data = self.model_dump(mode="json", exclude=exclude)
         for workflow in [data["workflow"], *(item["workflow"] for item in data.get("subworkflows", []))]:
             for node in workflow.get("nodes", []):
                 agent = node.get("agent")
-                if isinstance(agent, dict) and not agent.get("tool_settings"):
-                    agent.pop("tool_settings", None)  # agents published before NAL-A1 keep their digest
+                if not isinstance(agent, dict):
+                    continue
+                # Agents published before NAL-A1, NAL-B1 and NAL-B3 keep their digest.
+                for key in ("tool_settings", "skills"):
+                    if not agent.get(key):
+                        agent.pop(key, None)
+                for key in ("task", "origin"):
+                    if agent.get(key) is None:
+                        agent.pop(key, None)
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def skill_source(
+        self, status: Callable[[str], SkillStatus | None] | None = None
+    ) -> Callable[[str, int], tuple[Skill, SkillPackage]]:
+        """Resolves the bundle's frozen skills for an agent builder (:attr:`AgentBuilder.skill_source`); a skill
+        that is not in the bundle is unknown, whatever the workspace holds now.
+
+        ``status`` is the kill switch (internal review M3): it names the workspace's current status of a skill
+        (``None``: the skill is not in the workspace any more); a skill disabled or archived there stops running in
+        every release that froze it, so a harmful skill can be stopped without unpublishing."""
+        frozen = {(item.skill_id, item.version): item for item in self.skills}
+
+        def resolve(skill_id: str, version: int) -> tuple[Skill, SkillPackage]:
+            item = frozen.get((skill_id, version))
+            if item is None:
+                raise KeyError(skill_id)
+            current = status(skill_id) if status is not None else None
+            skill = Skill(
+                id=item.skill_id,
+                name=item.name,
+                version=item.version,
+                origin=item.origin,
+                status=current or "active",
+            )
+            return skill, item.package()
+
+        return resolve
 
     def all_workflows(self) -> list[Workflow]:
         return [self.workflow, *(item.workflow for item in self.subworkflows)]

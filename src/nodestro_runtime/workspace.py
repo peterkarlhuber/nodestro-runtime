@@ -119,6 +119,7 @@ from .schemas import (
     now,
 )
 from .server_settings import TenantSecrets, is_encrypted
+from .skills import Skills
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_adoption import audit_revocation
 from .tool_approvals import (
@@ -414,6 +415,9 @@ class Workspace:
         self.connections.used_by = self._connection_users
         self.tools.mcp = self.mcp
         self.builder = AgentBuilder(self.tools, self.knowledge, self.memory)
+        # The skill library (NAL-B3): agents resolve their assigned skill versions from it.
+        self.skills = Skills(self.store)
+        self.builder.skill_source = self.skills.resolver()
         self.builder.resolve_connection = self.connections.resolve
         self.builder.find_connection = self.connections.find
         self.builder.mode = self.connections.mode
