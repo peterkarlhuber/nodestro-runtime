@@ -337,7 +337,14 @@ class Workspace:
         self._secrets: TenantSecrets | None = None
         if storage is None:
             database = data_dir / DATABASE
-            self._sqlite = Store(database)
+            try:
+                self._sqlite = Store(database)
+            except BaseException:
+                # A refused database (storage.unsafe_file) must not keep the directory locked: once the user repaired
+                # it (storage.repair_desktop_database_modes), the same process opens the workspace again.
+                if self._directory_lock is not None:
+                    self._directory_lock.release()
+                raise
             self.store = self._sqlite
             self.tenant_id = LOCAL_TENANT
             fresh = self._sqlite._is_empty()

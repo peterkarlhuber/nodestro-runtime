@@ -23,11 +23,13 @@ import dataclasses
 from datetime import UTC, datetime
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 from tabrion import sqlite as tabrion_sqlite
@@ -267,9 +269,9 @@ class DamagedDocuments:
 #: ``trusted_schema`` off, ``secure_delete`` on. Before, ``secure_delete`` was the build's default and never set: on
 #: with the SQLite of Linux distributions (Debian, Ubuntu), off with the SQLite of python.org, macOS and Windows and
 #: in the desktop bundles; the profile now sets it on everywhere (a change on those platforms: deleted content is
-#: overwritten). New files are created ``0600``; an existing file keeps its mode (MIG-NOD-9 tightens it), but must
-#: belong to the running user and not be writable by group or others, and no symbolic link is followed
-#: (``storage.unsafe_file``, :func:`open_sqlite`).
+#: overwritten). New files are created ``0600``; an existing file keeps its mode (nothing changes it without the
+#: user's confirmation, :func:`repair_desktop_database_modes`), but must belong to the running user and not be
+#: writable by group or others, and no symbolic link is followed (``storage.unsafe_file``, :func:`open_sqlite`).
 SQLITE_PROFILE = tabrion_sqlite.SQLiteProfile(
     journal_mode=tabrion_sqlite.JournalMode.WAL,
     synchronous=tabrion_sqlite.Synchronous.FULL,
@@ -317,9 +319,24 @@ def unsafe_advice(error: UnsafePath) -> tuple[str, str]:
 
 
 def unsafe_file(error: UnsafePath, database: str | Path) -> NodestroError:
-    """The Nodestro problem for a database file that ``tabrion.sqlite`` refused (``storage.unsafe_file``)."""
+    """The Nodestro problem for a database file that ``tabrion.sqlite`` refused (``storage.unsafe_file``).
+
+    Parameter ``fixable`` (TABRION MIG-NOD-9): ``True`` only for ``writable_by_others`` when every existing file of
+    the database is a regular file of the running user, so that :func:`repair_desktop_database_modes` can repair it
+    once the user confirms; the message then names the files and both ways to repair them."""
     reason, advice = unsafe_advice(error)
-    return NodestroError("storage.unsafe_file", f"The database {database} {advice}", reason=reason)
+    fixable = False
+    if reason == "writable_by_others":
+        planned = repair_desktop_database_modes(database, confirmed=False)
+        files = [item.path for item in planned if item.status == "not_confirmed"]
+        fixable = bool(files) and all(item.status in ("not_confirmed", "unchanged") for item in planned)
+        if fixable:
+            names = " ".join(str(path) for path in files)
+            advice = (
+                "may be changed by other users (group or others have permissions on it). Confirm the repair of its "
+                f"permissions in the app, or run chmod 600 {names}, then start again"
+            )
+    return NodestroError("storage.unsafe_file", f"The database {database} {advice}", reason=reason, fixable=fixable)
 
 
 def open_sqlite(
@@ -337,6 +354,102 @@ def open_sqlite(
         return tabrion_sqlite.connect(database, profile=profile, read_only=read_only, check_same_thread=False)
     except UnsafePath as exc:
         raise (refusal(exc) if refusal is not None else unsafe_file(exc, database)) from None
+
+
+#: The files SQLite keeps next to a database (their suffixes).
+SIDE_FILES = ("-wal", "-shm", "-journal")
+#: The mode a repaired database file gets: read and write for its owner only.
+PRIVATE_MODE = 0o600
+#: What :func:`repair_desktop_database_modes` did with one file.
+RepairStatus = Literal["changed", "unchanged", "not_confirmed", "skipped", "failed"]
+
+
+@dataclasses.dataclass(frozen=True)
+class ModeRepair:
+    """The result of :func:`repair_desktop_database_modes` for one existing file.
+
+    ``status``: ``changed`` (``old_mode`` -> ``new_mode``), ``unchanged`` (already private: no permission for group
+    or others), ``not_confirmed`` (would be changed to ``new_mode``; nothing was done), ``skipped`` (``reason``:
+    ``symlink``, ``other_owner``, ``not_a_file``; never touched) or ``failed`` (``reason``: why; the mode is as
+    before unless the file system says otherwise, see ``new_mode``)."""
+
+    path: Path
+    status: RepairStatus
+    old_mode: int | None = None
+    new_mode: int | None = None
+    reason: str | None = None
+
+
+def _repair_one(path: Path, uid: int, *, confirmed: bool) -> ModeRepair | None:
+    """The repair of one file (``None``: it does not exist)."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return ModeRepair(path, "failed", reason=exc.strerror or str(exc))
+    old = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        return ModeRepair(path, "skipped", reason="symlink")
+    if not stat.S_ISREG(info.st_mode):
+        return ModeRepair(path, "skipped", old_mode=old, reason="not_a_file")
+    if info.st_uid != uid:
+        return ModeRepair(path, "skipped", old_mode=old, reason="other_owner")
+    if not old & 0o077:
+        return ModeRepair(path, "unchanged", old_mode=old, new_mode=old)
+    if not confirmed:
+        return ModeRepair(path, "not_confirmed", old_mode=old, new_mode=PRIVATE_MODE)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
+    try:
+        # The file itself, never what a link put in its place since the check: O_NOFOLLOW, then fstat and fchmod.
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        return ModeRepair(path, "failed", old_mode=old, reason=exc.strerror or str(exc))
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid:
+            return ModeRepair(path, "skipped", old_mode=old, reason="changed_during_repair")
+        os.fchmod(descriptor, PRIVATE_MODE)
+        now = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    except OSError as exc:
+        return ModeRepair(path, "failed", old_mode=old, reason=exc.strerror or str(exc))
+    finally:
+        os.close(descriptor)
+    if now != PRIVATE_MODE:  # some network file systems accept chmod and ignore it
+        return ModeRepair(path, "failed", old_mode=old, new_mode=now, reason="the file system kept the old mode")
+    return ModeRepair(path, "changed", old_mode=old, new_mode=PRIVATE_MODE)
+
+
+def repair_desktop_database_modes(database: str | Path, *, confirmed: bool) -> list[ModeRepair]:
+    """Restrict an existing desktop database and its ``-wal``, ``-shm`` and ``-journal`` files to their owner
+    (``0600``), only after the user confirmed it (TABRION MIG-NOD-9, decision E-NOD-PERM); one :class:`ModeRepair`
+    per existing file, in that order.
+
+    Without ``confirmed=True`` nothing is changed: the result says what a repair would do (``not_confirmed``). A file
+    with any permission for group or others is set to ``0600``; only its mode changes, never its content. A symbolic
+    link, a file of another user or anything but a regular file is never touched (``skipped``). A failed change
+    (``chmod`` refused, or a file system that ignores it) is ``failed`` with the reason and logged as a warning; it
+    never raises. Each change is logged with the old mode. Call it while the database is not open in this process
+    (the repair opens each file briefly, which would drop SQLite's POSIX locks of an open connection). Windows has
+    no POSIX modes: the result is empty there."""
+    if os.name != "posix":
+        return []
+    path = Path(database)
+    uid = os.geteuid()
+    results: list[ModeRepair] = []
+    for candidate in (path, *(path.with_name(path.name + suffix) for suffix in SIDE_FILES)):
+        result = _repair_one(candidate, uid, confirmed=confirmed)
+        if result is None:
+            continue
+        results.append(result)
+        old = "unknown" if result.old_mode is None else oct(result.old_mode)
+        if result.status == "changed":
+            logger.info("Restricted %s to its owner: mode %s, was %s (confirmed by the user)", candidate, "0o600", old)
+        elif result.status == "failed":
+            logger.warning("Could not restrict %s to its owner (mode %s): %s", candidate, old, result.reason)
+        elif result.status == "skipped" and confirmed:
+            logger.warning("Left %s as it is (mode %s): %s", candidate, old, result.reason)
+    return results
 
 
 def _like(prefix: str) -> str:

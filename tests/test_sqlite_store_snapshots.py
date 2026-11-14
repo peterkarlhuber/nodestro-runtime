@@ -47,7 +47,7 @@ if POSIX:
                 "code": "storage.unsafe_file",
                 "message": "The database <dir>/link.db is a symbolic link, or one of its -wal, -shm or -journal files "
                 "is; Nodestro does not follow links. Move the real file into the data directory in place of the link",
-                "params": {"reason": "symlink"},
+                "params": {"fixable": False, "reason": "symlink"},
             },
             "symbolic links refused, with what to do (storage.unsafe_file)",
         )
@@ -109,7 +109,7 @@ def test_the_profile_keeps_durability_and_secure_delete() -> None:
 
 @pytest.mark.skipif(not POSIX, reason="file modes are POSIX only")
 def test_an_existing_world_readable_database_keeps_its_mode(tmp_path: Path) -> None:
-    """Existing files are not changed with chmod (doc 06 MIG-NOD-6 field 10; MIG-NOD-9 tightens them)."""
+    """Existing files are not changed with chmod (doc 06 MIG-NOD-6 field 10; MIG-NOD-9 only with consent)."""
     database = tmp_path / "nodestro.db"
     sqlite3.connect(database).close()
     os.chmod(database, 0o644)
@@ -128,8 +128,11 @@ def test_a_database_writable_by_others_is_refused(tmp_path: Path) -> None:
     os.chmod(database, 0o666)
     with pytest.raises(NodestroError) as caught:
         SQLiteStore(database)
-    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "writable_by_others"}
-    assert "chmod go-w" in str(caught.value)
+    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {
+        "reason": "writable_by_others",
+        "fixable": True,
+    }
+    assert f"chmod 600 {database}" in str(caught.value) and "Confirm the repair" in str(caught.value)
 
 
 @pytest.mark.skipif(not POSIX, reason="file owners are POSIX only")
@@ -141,7 +144,7 @@ def test_a_database_of_another_user_is_refused_with_advice(tmp_path: Path, monke
     monkeypatch.setattr(os, "geteuid", lambda: real + 1)  # the file now belongs to "someone else"
     with pytest.raises(NodestroError) as caught:
         SQLiteStore(database)
-    assert caught.value.params == {"reason": "other_owner"} and "chown" in str(caught.value)
+    assert caught.value.params == {"reason": "other_owner", "fixable": False} and "chown" in str(caught.value)
 
 
 @pytest.mark.skipif(not POSIX, reason="symbolic links need privileges on Windows")
@@ -153,7 +156,7 @@ def test_a_linked_wal_file_is_refused(tmp_path: Path) -> None:
     (tmp_path / "nodestro.db-wal").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(NodestroError) as caught:
         SQLiteStore(database)
-    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "symlink"}
+    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "symlink", "fixable": False}
 
 
 def test_foreign_key_check_is_empty_after_the_migrations(tmp_path: Path) -> None:
@@ -183,7 +186,10 @@ def test_a_snapshot_replaces_an_existing_target_and_refuses_a_link(tmp_path: Pat
             link.symlink_to(tmp_path / "victim.db")
             with pytest.raises(NodestroError) as caught:
                 store.snapshot(link)
-            assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "symlink"}
+            assert caught.value.code == "storage.unsafe_file" and caught.value.params == {
+                "reason": "symlink",
+                "fixable": False,
+            }
             assert not (tmp_path / "victim.db").exists()
         assert sorted(p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")) == []
     finally:
