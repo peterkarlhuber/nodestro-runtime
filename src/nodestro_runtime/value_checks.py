@@ -47,6 +47,7 @@ from .schemas import OutputConfig, ToolCallRecord
 __all__ = [
     "COMPUTING_BUILTINS",
     "Unverified",
+    "as_result_dict",
     "checked_fields",
     "computes",
     "computing_call",
@@ -100,7 +101,8 @@ def checked_fields(output: OutputConfig) -> list[str]:
     return [item.name for item in output.fields if item.source == "tool" and item.type in _NUMERIC]
 
 
-def _as_dict(value: Any) -> Mapping[str, Any] | None:
+def as_result_dict(value: Any) -> Mapping[str, Any] | None:
+    """A structured result as a mapping (a model, a mapping or its JSON text); ``None`` otherwise."""
     if isinstance(value, BaseModel):
         return value.model_dump()
     if isinstance(value, Mapping):
@@ -318,7 +320,7 @@ def unverified_fields(
     names = checked_fields(output)
     if not names:
         return []
-    values = _as_dict(result)
+    values = as_result_dict(result)
     records = list(calls)
     required = {item.name: item.required for item in output.fields}
     failed: list[Unverified] = []
