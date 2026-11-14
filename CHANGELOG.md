@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed (TABRION QA-7): `scripts/check_tabrion_api.py --surface` no longer reports a `__x__` name such as
+  `tabrion.postgres.SessionSettings.__dataclass_fields__` (axentra) as missing from Tabrion's
+  `docs/api/surface.json`. Such names are public (the `__all__` check already skipped them) and have no entry of
+  their own; `--surface` now checks the name before the first `__x__` part (here the stable
+  `tabrion.postgres.SessionSettings`). The docstring names tabrion-studio's copy as the source and nodestro-api as
+  a new copy holder; the test has a case for dunder names and pins the new SHA-256 (`e48cc7f230c1…`), the same in
+  tabrion-studio, axentra, orkexa, nodestro-runtime and nodestro-api. Tooling only.
 - Added (QA-17 (AC-2): dependency policy check, 2026-11-14): `dependency-policy.json` is this repository's copy of the
   dependency policy K-33 from nodestro-studio (only its outgoing edges: `orkexa[all,pdf,local,convert,web]` and
   `tabrion` in the core, `orkexa[postgres]`, `axentra[oidc]` and `tabrion[postgres]` in the extra `postgres`,
