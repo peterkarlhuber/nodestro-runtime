@@ -30,6 +30,7 @@ from orkexa import Tool, ToolResultError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .connections import ResolvedConnection
+from .mail import Attachment
 from .schemas import ToolSettings
 from .source_ledger import SourceLedger
 from .tool_policy import BUILTIN_CAPABILITIES, ToolCapability
@@ -174,6 +175,33 @@ NOTIFY_USER_SPEC = ToolSpec(
     max_calls_per_run=3,
 )
 
+#: ``draft_email`` / ``draft_webhook`` (NAL-A4): a draft file in the run, no network, no connection. The sender of an
+#: e-mail draft and the schema of a webhook payload are binding parameters (never visible to the model).
+DRAFT_EMAIL_SPEC = ToolSpec(
+    id="draft_email",
+    category="communication",
+    capability=BUILTIN_CAPABILITIES["draft_email"],
+    timeout_seconds=20.0,
+    max_calls_per_run=10,
+    params_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"from_address": {"type": "string", "minLength": 3, "maxLength": 254}},
+    },
+)
+DRAFT_WEBHOOK_SPEC = ToolSpec(
+    id="draft_webhook",
+    category="communication",
+    capability=BUILTIN_CAPABILITIES["draft_webhook"],
+    timeout_seconds=10.0,
+    max_calls_per_run=10,
+    params_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"payload_schema": {"type": "object"}},
+    },
+)
+
 #: The specs of Nodestro's built-in tools (``builtin_tools.BUILTIN_TOOLS`` and ``web_tools.WEB_TOOLS``), by name.
 BUILTIN_SPECS: dict[str, ToolSpec] = {
     spec.id: spec
@@ -186,6 +214,8 @@ BUILTIN_SPECS: dict[str, ToolSpec] = {
         SEARCH_WEB_SPEC,
         FETCH_WEB_PAGE_SPEC,
         NOTIFY_USER_SPEC,
+        DRAFT_EMAIL_SPEC,
+        DRAFT_WEBHOOK_SPEC,
     )
 }
 
@@ -291,6 +321,11 @@ class RunServices:
     #: Leaves an internal message for the run's starter (NAL-A3): ``(title, text, level) -> message id``; raises
     #: ``ValueError`` with a code. ``None``: no inbox here (outside a run, or a server with Axentra's inbox).
     notify: Callable[[str, str, str], str] | None = None
+    #: Stores a draft of NAL-A4 with the top-level run: ``(name, format, data, preview) -> "<file name> (<id>)"``.
+    #: ``None``: no run files here (outside a run, an imported run).
+    save_file: Callable[[str, str, bytes, dict[str, Any]], str] | None = None
+    #: A file of the run by its file name (input or result file), read for an attachment; ``None`` if unknown.
+    run_file: Callable[[str], Attachment | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -484,6 +519,8 @@ def bind_tool(
 __all__ = [
     "ALL_MODES",
     "BUILTIN_SPECS",
+    "DRAFT_EMAIL_SPEC",
+    "DRAFT_WEBHOOK_SPEC",
     "FETCH_WEB_PAGE_SPEC",
     "HOST_TOOL_TIMEOUT_SECONDS",
     "PLANNED_BUILTIN_NAMES",

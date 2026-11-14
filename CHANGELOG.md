@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Added (NAL-A4, e-mail and webhook drafts; see `docs/drafts.md`):
+  - Built-in tools `draft_email` (an `.eml` result file) and `draft_webhook` (a `.json` result file): `write` +
+    `internal`, no network, offline. Binding parameters `from_address` and `payload_schema`. Nothing is sent.
+  - `mail.py`: plain addresses, one-line subjects, an HTML allowlist with a generated text alternative, attachments
+    only from the run's own files, size limits, a JSON Schema subset for payloads and the `Nodestro-Signature`
+    HMAC. Ported from Levuvo Mail (`f532039`).
+  - `mail_transport.py`: real `smtp` and `webhook` connection checks (TLS 1.2+, checked addresses, no redirects)
+    and `ConnectionService.test_send` (a person's test to the connection's own `test_address`, or a payload marked
+    `test: true`), at most 5 per connection and hour, audited as `test_sent`.
+  - `ResultFile.source = "tool"`, `ResultFile.preview`, format `eml` (`reports.TOOL_FORMATS`) and
+    `ResultFiles.add_tool_file`; `RunServices.save_file` and `run_file`.
+  - Connection contract (additive, contract stays 1): `ResolvedConnection.mode`, `SmtpSettings.test_address`,
+    event kind `test_sent`. ADR-0001 amendment NAL-A4.
+  - New codes `mail.*`, `webhook.*` and `connection.*` for checks and test sends.
+
 - Added (NAL-A3, internal notifications; see `docs/notifications.md`):
   - `Workflow.notifications` (`NotificationRules`: `events`, `recipients`); default `run_failed` and
     `approval_pending`. Stored workflows read with the default.
