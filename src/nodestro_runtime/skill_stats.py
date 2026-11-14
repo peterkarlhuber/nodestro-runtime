@@ -8,7 +8,7 @@ a quality check (``evaluation``), whether the check passed: an indication, not p
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 
 from pydantic import Field
 
@@ -37,6 +37,11 @@ class SkillStats(_Model):
     recommended: int = 0
     versions: list[int] = Field(default_factory=list)
     last_used: datetime | None = None
+
+
+def _aware(moment: datetime) -> datetime:
+    """Runs of earlier versions may carry naive times; they are UTC."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _steps(state: NodeRun) -> Iterable[NodeRun]:
@@ -72,7 +77,7 @@ def skill_stats(runs: Iterable[Run]) -> list[SkillStats]:
                         loaded.add(use.name)
                     else:
                         stats.files_read += 1
-                    when = step.finished_at or step.started_at or run.created_at
+                    when = _aware(step.finished_at or step.started_at or run.created_at)
                     if stats.last_used is None or when > stats.last_used:
                         stats.last_used = when
                 for name in loaded:

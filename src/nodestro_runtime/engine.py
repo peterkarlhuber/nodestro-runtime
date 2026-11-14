@@ -3548,10 +3548,14 @@ class RunManager:
         if source is None:
             return ()
         names: dict[str, None] = {}
+        seen: set[tuple[str, int]] = set()
         for entry in snapshot.nodes:
             if entry.agent is None:
                 continue
             for binding in entry.agent.skills:
+                if (binding.skill_id, binding.version) in seen:
+                    continue
+                seen.add((binding.skill_id, binding.version))
                 try:
                     _skill, package = source(binding.skill_id, binding.version)
                 except (KeyError, NodestroError):

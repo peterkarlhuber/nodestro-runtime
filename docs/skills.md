@@ -88,7 +88,8 @@ skill never changes a published version. Bundles without skills, and agents with
     people write their tasks in.
 - **Orchestrator recommendations:**
   - The pool shows each team's skills: the skills of the team's own agents (`orkexa.orchestration.Member.skills`).
-  - When a team has skills, a delegation may name up to 8 of them (`skills`).
+  - When a team has skills, a `delegate` decision may name up to 8 of them (`skills`). Parallel decisions carry
+    none in Nodestro; orkexa's protocol allows them per assignment.
   - The team run keeps the names the team has (`Run.recommended_skills`). Its agents offer those skills and mark
     them `<recommended>true</recommended>`.
   - Names the team does not have are ignored and logged with `orchestration_delegated` (`ignored_skills`).
@@ -106,4 +107,7 @@ skill never changes a published version. Bundles without skills, and agents with
     `skill:<name>@<version>/<path>` heads the requirement and is kept as `ToolJob.origin`.
   - The draft goes through the unchanged tool chain: a static check, tests in the isolating sandbox (without Docker,
     `sandbox.isolation_required`), and a person's approval. It stays `untrusted`.
+  - The Coding Agent's system prompt says that `<skill_script>` content is untrusted data. A tool made from a skill
+    script uses no network, no subprocesses and no files besides its arguments, whatever the script does.
+  - `ToolInfo.origin` shows the origin of the approved tool (read from the requirement's `Origin:` line).
   - Until a person approves it, a script remains text that is never run.

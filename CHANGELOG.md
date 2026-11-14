@@ -10,12 +10,15 @@
     plus `always` and recommended skills. It is recorded as `NodeRun.skill_selection` and the `skills_selected` event.
   - **Orchestrator recommendations:**
     - Pool members list their agents' skills.
-    - A delegation may recommend up to 8 (`skills` decision field and prompt, only when a team has skills).
+    - A `delegate` decision may recommend up to 8 (`skills` decision field and prompt, only when a team has
+      skills); parallel decisions carry none.
     - `Run.recommended_skills` holds them, and agents mark them `<recommended>true</recommended>`.
     - Unknown names go to `orchestration_delegated.ignored_skills`.
   - **Usage:** `skill_stats.skill_stats(runs)`.
   - **Script drafts:** `skill_tools.script_requirement` and `script_origin`, and `ToolJob.origin` with
-    `ToolLibrary.start_job(origin=)`. The tool chain is unchanged (isolation and a person's approval).
+    `ToolLibrary.start_job(origin=)`, and `ToolInfo.origin`. The Coding Agent's prompt treats
+    `<skill_script>` content as untrusted data, and such tools use no network, subprocesses or extra files. The tool
+    chain is unchanged (isolation and a person's approval).
   - See `docs/skills.md`.
 - Added (QA-17 (AC-2): dependency policy check, 2026-11-14): `dependency-policy.json` is this repository's copy of the
   dependency policy K-33 from nodestro-studio (only its outgoing edges: `orkexa[all,pdf,local,convert,web]` and

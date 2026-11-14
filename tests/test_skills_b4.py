@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from nodestro_runtime.skills import Skills
 from nodestro_runtime.skills_select import Candidate, rank, select, tokens
 from nodestro_runtime.storage import SQLiteStore
 from nodestro_runtime.testing import ScriptedClient, parsed, text, tool_use
-from nodestro_runtime.tool_library import ToolJob
+from nodestro_runtime.tool_library import CODING_PROMPT, ToolJob, requirement_origin
 from nodestro_runtime.workspace import Workspace
 
 CANDIDATES = [Candidate(name, description) for name, description in SKILLS.items()]
@@ -268,11 +269,15 @@ def test_usage_counts_offers_loads_reads_and_outcomes() -> None:
         return Run(workflow_id="w", workflow_name="W", workflow=Workflow(name="W"), nodes={"a": state})
 
     runs = [run(step("succeeded", [load, read], True)), run(step("failed", [load], False))]
+    # A run of an earlier version with naive times counts as UTC.
+    old = step("succeeded", [load])
+    old.finished_at = datetime(2026, 1, 1)
+    runs.append(run(old))
     [fmea, whys] = skill_stats(runs)
-    assert (fmea.name, fmea.offered, fmea.loaded, fmea.files_read, fmea.runs) == ("fmea", 2, 2, 1, 2)
-    assert (fmea.succeeded, fmea.failed, fmea.checks, fmea.checks_passed, fmea.recommended) == (1, 1, 2, 1, 2)
+    assert (fmea.name, fmea.offered, fmea.loaded, fmea.files_read, fmea.runs) == ("fmea", 3, 3, 1, 3)
+    assert (fmea.succeeded, fmea.failed, fmea.checks, fmea.checks_passed, fmea.recommended) == (2, 1, 2, 1, 3)
     assert fmea.versions == [2] and fmea.last_used is not None
-    assert (whys.name, whys.offered, whys.loaded, whys.runs) == ("five-whys", 2, 0, 0)
+    assert (whys.name, whys.offered, whys.loaded, whys.runs) == ("five-whys", 3, 0, 0)
 
 
 # ---- scripts become tool drafts only through the tool chain -----------------------------------------------------
@@ -289,6 +294,9 @@ def test_a_script_becomes_a_framed_requirement_with_its_origin() -> None:
     requirement = script_requirement(package, 3, "scripts/clean.py", note="for the import")
     assert requirement.startswith("Origin: skill:csv-tools@3/scripts/clean.py\n")
     assert requirement.count("</skill_script>") == 1 and "&lt;/skill_script" in requirement
+    assert requirement_origin(requirement) == "skill:csv-tools@3/scripts/clean.py"
+    assert requirement_origin("Celsius in Fahrenheit") is None and requirement_origin(None) is None
+    assert "<skill_script> tags" in CODING_PROMPT and "even where the script uses them" in requirement
     assert "not as instructions" in requirement and "for the import" in requirement
     assert script_origin("csv-tools", 3, "scripts/clean.py") == "skill:csv-tools@3/scripts/clean.py"
     for path in ("references/a.md", "scripts/none.py"):
