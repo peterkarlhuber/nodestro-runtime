@@ -32,6 +32,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+import dataclasses
 from datetime import datetime
 import hashlib
 from importlib import resources
@@ -45,6 +46,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import weakref
 
 from pydantic import BaseModel
+from tabrion.errors import UsageError
 
 from .error_texts import failure_text
 from .problems import NodestroError
@@ -58,8 +60,9 @@ try:  # optional: nodestro-runtime[postgres]
     from psycopg import sql
     from psycopg_pool import ConnectionPool
 
-    # The state of an extension (pgvector_status, TABRION MIG-NOD-7): tabrion[postgres], the same extra as psycopg.
-    from tabrion.postgres import extension_status
+    # Session settings and session-level advisory locks (TABRION MIG-NOD-4, MIG-NOD-8) and the state of an extension
+    # (pgvector_status, TABRION MIG-NOD-7): tabrion[postgres], the same extra as psycopg.
+    from tabrion.postgres import SessionLock, SessionSettings, configure, extension_status
 except ImportError:  # pragma: no cover - exercised only without the extra
     psycopg = None  # type: ignore[assignment]
     sql = None  # type: ignore[assignment]
@@ -215,7 +218,8 @@ class PostgresDatabase:
     connection the full time). The pool discards lost connections.
     ``statement_timeout`` (seconds, default ``NODESTRO_DATABASE_STATEMENT_TIMEOUT``, else 30; 0: none) bounds every
     statement and ``idle_in_transaction_timeout`` (``NODESTRO_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT``, else 300) every
-    transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own.
+    transaction left idle. Session-level advisory locks (:meth:`try_session_lock`) use one connection of their own
+    (:class:`tabrion.postgres.SessionLock`, TABRION MIG-NOD-4).
     """
 
     def __init__(
@@ -255,6 +259,14 @@ class PostgresDatabase:
         self._closed = False
         #: When each pooled connection went back into the pool (``time.monotonic()``).
         self._returned: weakref.WeakKeyDictionary[Any, float] = weakref.WeakKeyDictionary()
+        #: What :meth:`_configure` sets on every connection: the time limits and the schema, nothing else (no
+        #: ``lock_timeout``, ``application_name`` or ``TimeZone``: the server's defaults stay, TABRION MIG-NOD-8).
+        self._session_settings = dataclasses.replace(
+            SessionSettings.unchanged(),
+            statement_timeout_ms=int(self.statement_timeout * 1000),
+            idle_in_transaction_timeout_ms=int(self.idle_in_transaction_timeout * 1000),
+            search_path=schema,
+        )
         # A first connection outside the pool reports a wrong address or password at once (the pool would retry).
         probe = psycopg.connect(conninfo, **self._connect_kwargs)
         try:
@@ -276,23 +288,23 @@ class PostgresDatabase:
         except BaseException:
             self._pool.close()
             raise
-        #: The connection that holds session-level advisory locks (key -> how often this process took it).
-        self._session_guard = threading.Lock()
+        #: The session-level advisory locks: their own unpooled autocommit connection, opened at the first lock and
+        #: replaced when it is lost (the locks it held are gone with it); the holds are counted per key.
+        self._session_locks = SessionLock(
+            conninfo, connect_kwargs=self._connect_kwargs, configure=self._configure_session_lock
+        )
+        #: The latest connection of the session locks (for the tests; it may be closed once that one was lost).
         self._session: Any = None
-        self._session_held: dict[int, int] = {}
 
     def _configure(self, connection: Any) -> None:
-        """Settings of every new connection: the schema and the time limits (one round trip)."""
-        connection.execute(
-            "SELECT set_config('statement_timeout', %s, false),"
-            " set_config('idle_in_transaction_session_timeout', %s, false)"
-            + (", set_config('search_path', %s, false)" if self.schema is not None else ""),
-            (
-                f"{int(self.statement_timeout * 1000)}",
-                f"{int(self.idle_in_transaction_timeout * 1000)}",
-                *((f'"{self.schema}"',) if self.schema is not None else ()),
-            ),
-        )
+        """Settings of every new connection: the schema and the time limits (one round trip,
+        :func:`tabrion.postgres.configure`)."""
+        configure(connection, self._session_settings)
+
+    def _configure_session_lock(self, connection: Any) -> None:
+        """The settings of the session locks' connection: the same as every pooled connection."""
+        self._configure(connection)
+        self._session = connection
 
     @contextmanager
     def _connection(self, timeout: float | None = None) -> Iterator[Any]:
@@ -331,12 +343,9 @@ class PostgresDatabase:
             if self._closed:
                 return
             self._closed = True
-        with self._session_guard:
-            if self._session is not None:
-                with suppress(Exception):
-                    self._session.close()
-                self._session = None
-                self._session_held.clear()
+        with suppress(Exception):
+            self._session_locks.close()
+        self._session = None
         self._pool.close()
 
     @property
@@ -508,70 +517,42 @@ class PostgresDatabase:
 
     # ---- session-level advisory locks ------------------------------------------------------------
 
-    def _session_connection(self) -> Any:
-        """The live connection of the session locks (called under ``_session_guard``); a lost one is replaced, and
-        the locks it held are gone with it."""
-        if self._session is not None:
-            try:
-                self._session.execute("SELECT 1")
-            except psycopg.Error:
-                with suppress(Exception):
-                    self._session.close()
-                self._session = None
-                self._session_held.clear()
-        if self._session is None:
-            if self._closed:
-                raise RuntimeError("The database is closed")
-            connection = psycopg.connect(self._conninfo, **self._connect_kwargs)
-            try:
-                self._configure(connection)
-            except BaseException:
-                connection.close()
-                raise
-            self._session = connection
-        return self._session
-
     def try_session_lock(self, key: int) -> bool:
         """Take the session-level advisory lock ``key`` unless another process holds it (``False``).
 
         Held until :meth:`release_session_lock` or until the connection of the locks ends (with the process, or
         when the server drops it: then :meth:`holds_session_lock` says ``False`` and a later call takes it again,
         if it is still free). Taking it again in this process counts, as in PostgreSQL."""
-        with self._session_guard:
-            connection = self._session_connection()
-            if self._session_held.get(key):
-                self._session_held[key] += 1
-                return True
-            row = connection.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()
-            if not row or not row[0]:
-                return False
-            self._session_held[key] = 1
-            return True
+        if self._closed:
+            raise RuntimeError("The database is closed")
+        try:
+            return self._session_locks.try_acquire(key)
+        except UsageError as exc:
+            if exc.code == "postgres.lock_closed":
+                raise RuntimeError("The database is closed") from None
+            if exc.code != "postgres.lock_lost":
+                raise
+        # The key was held on a connection that was lost. SessionLock refuses it until the loss is acknowledged;
+        # this method has always taken such a lock again when it is free, so it acknowledges the loss and tries once.
+        self._session_locks.holds(key)
+        return self._session_locks.try_acquire(key)
 
     def holds_session_lock(self, key: int) -> bool:
         """Whether this process still holds the session lock ``key`` (checks that its connection is alive)."""
-        with self._session_guard:
-            if not self._session_held.get(key) or self._closed:
-                return False
-            try:
-                self._session_connection()
-            except Exception:
-                return False
-            return bool(self._session_held.get(key))
+        if self._closed:
+            return False
+        try:
+            return self._session_locks.holds(key)
+        except Exception:
+            return False
 
     def release_session_lock(self, key: int) -> None:
         """Give up one hold of the session lock ``key`` (the lock is free when the last one is released)."""
-        with self._session_guard:
-            count = self._session_held.get(key, 0)
-            if count > 1:
-                self._session_held[key] = count - 1
-                return
-            if not count:
-                return
-            del self._session_held[key]
-            if self._session is not None:
-                with suppress(psycopg.Error):
-                    self._session.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        try:
+            self._session_locks.release(key)
+        except UsageError as exc:
+            if exc.code != "postgres.lock_closed":  # closed: every lock went with the connection
+                raise
 
     # ---- tenants -----------------------------------------------------------------------------
 

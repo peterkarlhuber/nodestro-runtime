@@ -8,6 +8,39 @@
   every other read (`PostgresDatabase._read`: on the transaction's connection inside one, else repeated on another
   pooled connection when one was lost). Only a type named `vector` that pgvector did not create no longer counts as
   `active`.
+- Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
+  `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
+  `SEARCH_WEB_SPEC` and `FETCH_WEB_PAGE_SPEC` (read + external, never offline, call and time limits, binding
+  parameters for hosts, defaults and `max_calls`). Results are marked as external content with a per-call nonce,
+  recorded in the run's source ledger and errors reach the model as codes only. Search providers `test`, `ddgs`
+  (keyless, never on a server, extra `web-ddgs`), `brave`, `tavily`, `mojeek` and `searxng` (keyless, self-hosted);
+  none is a default, a paid provider without a known price is not called (`search.price_unknown`), and the
+  connection check sends no real search. The web tools are not offered in the server profile
+  (`check.tool_mode_unsupported`, calls refused with `tool.mode_unsupported`) unless `NODESTRO_WEB_TOOLS_SERVER=1`
+  (RT-078). Connection contract, additive (ADR-0001 amendment): `keyless_providers`, `provider_modes`,
+  `offers()`/`needs_secret()`, `add_search_provider(host=, keyless=, modes=)`, problem
+  `connection.provider_unsupported_mode`. A built-in tool not offered in the installation's mode now refuses every
+  call, not only the workflow check. The base dependency becomes `orkexa[all,pdf,local,convert,web]`.
+  Internal review fixes: on a server a SearXNG endpoint must not resolve to private or loopback addresses;
+  `AgentBuilder.mode` defaults to `server` (hosts that build agents set their mode); search hits and ledger entries
+  with whitespace or control characters in the address are left out, and the correction prompt lists the run's
+  sources inside the external-content marker; a run-wide cap (`RUN_CALL_FACTOR` x the per-step limit) per tool; host
+  patterns follow the fetch guard (`*.example.com` matches example.com itself only in deny lists); source ids are
+  matched by normalized address.
+
+- Changed (TABRION MIG-NOD-4, MIG-NOD-8): `PostgresDatabase` configures every connection with
+  `tabrion.postgres.configure` (statement and idle-in-transaction time limits and the schema, as before; no
+  `lock_timeout`, `application_name` or `TimeZone`, so `SHOW ALL` is unchanged) and keeps its session-level advisory
+  locks (`try_session_lock`, `holds_session_lock`, `release_session_lock`, the scheduler's `LeaderLock`) in a
+  `tabrion.postgres.SessionLock`. The public API is unchanged: a lock lost with its connection is still taken again by a
+  later `try_session_lock` when it is free. The lock connection is now fork-safe (a child process never uses the
+  parent's session).
+- Added (TABRION DC-NR-1, dependency confusion): new CI job `tabrion source (poisoned index)`, reported by ci-ok, runs
+  the install with `scripts/check_tabrion_source.py` (an unchanged, checksummed copy from nodestro-studio): a poisoned
+  index must get no request for `tabrion`, which proves that the lock's direct-URL pin keeps a foreign `tabrion` out.
+  `tests/test_tabrion_pin.py` requires the installed Tabrion's `direct_url.json` to name a git commit, the studio
+  lock's when `NODESTRO_STUDIO_LOCK` names the lock (CI sets it): it detects an accidental index install, but it is
+  no proof of origin (a wheel can forge the file). README: the checkout install names the lock too.
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
   `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no

@@ -30,6 +30,7 @@ from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
 from .source_ledger import LEDGER_FIELD_TYPES, WEB_TOOL_NAMES
+from .tool_spec import offered
 from .value_checks import computes
 
 if TYPE_CHECKING:
@@ -405,7 +406,7 @@ def _tool_spec_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssu
             spec = nodestro.tools.specs.get(name) if name in nodestro.tools.builtin else None
             if spec is None:
                 continue
-            if mode not in spec.modes:
+            if not offered(spec, mode):
                 found.append(
                     _issue(
                         "check.tool_mode_unsupported",

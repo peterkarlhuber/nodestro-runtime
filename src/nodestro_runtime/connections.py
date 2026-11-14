@@ -159,6 +159,18 @@ class ConnectionType:
     addresses: Callable[[_Settings, Mode], list[dict[str, str]]] | None = None
     #: The modes a connection of this type can be used in.
     modes: frozenset[Mode] = frozenset({"desktop", "local-container", "server"})
+    #: Providers that work without a secret although the type needs one (NAL-A2: ``ddgs``, a self-hosted SearXNG).
+    keyless_providers: frozenset[str] = frozenset()
+    #: Providers offered only in some modes (NAL-A2: ``ddgs`` never on a server); others follow ``modes``.
+    provider_modes: Mapping[str, frozenset[Mode]] = field(default_factory=dict)
+
+    def needs_secret(self, provider: str) -> bool:
+        """Whether a connection of ``provider`` needs a secret before it can be used."""
+        return self.secret_required and provider not in self.keyless_providers
+
+    def offers(self, provider: str, mode: Mode) -> bool:
+        """Whether ``provider`` may be used in ``mode``."""
+        return mode in self.modes and mode in self.provider_modes.get(provider, self.modes)
 
     def describe(self) -> dict[str, Any]:
         """The type for the API: name, providers, secret, settings schema (no values)."""
@@ -170,6 +182,8 @@ class ConnectionType:
             "settings_schema": self.settings.model_json_schema(),
             "modes": sorted(self.modes),
             "checkable": self.check is not None,
+            "keyless_providers": sorted(self.keyless_providers),
+            "provider_modes": {name: sorted(modes) for name, modes in sorted(self.provider_modes.items())},
         }
 
 
@@ -284,10 +298,15 @@ def _address_issues(settings: _Settings, *, mode: Mode, kind: ConnectionType | N
     return found
 
 
-def _search_egress(_provider: str, settings: _Settings) -> list[str]:
+#: The API host of each search provider with a fixed service (NAL-A2, :func:`add_search_provider`).
+_SEARCH_HOSTS: dict[str, str] = {}
+
+
+def _search_egress(provider: str, settings: _Settings) -> list[str]:
     assert isinstance(settings, SearchSettings)
     if not settings.endpoint:
-        return []  # the adapter's own hosts (NAL-A2); the test provider reaches nothing
+        host = _SEARCH_HOSTS.get(provider)
+        return [f"{host}:443"] if host else []  # the test provider and DDGS name no host
     host, port = _host_port(settings.endpoint, default_port=443)
     return [f"{host}:{port}"]
 
@@ -305,16 +324,21 @@ def _webhook_egress(_provider: str, settings: _Settings) -> list[str]:
 
 
 def _check_search(connection: ResolvedConnection) -> CheckResult:
-    """Without the network guard of NAL-A2 only the offline test provider is contacted."""
+    """The offline test provider answers; for every other provider only the configuration is checked (a request to
+    the service would be a real, possibly paid search: it needs the owner's approval, NAL-A2 E-3)."""
     if connection.provider == "test":
         return CheckResult(ok=True, kind="service")
-    return CheckResult(ok=False, code="connection.check_unavailable", detail="provider")
+    if connection.secret is None and connection_type(connection.type).needs_secret(connection.provider):
+        return CheckResult(ok=False, code="connection.secret_missing")
+    if connection.provider == "searxng" and not connection.settings.get("endpoint"):
+        return CheckResult(ok=False, code="connection.endpoint_missing")
+    return CheckResult(ok=True)
 
 
 def _check_configuration(connection: ResolvedConnection) -> CheckResult:
     """A configuration check: the settings are complete and the secret is there. Contacting the service needs the
     network guard (NAL-A2) and comes with the tools that send (NAL-A4)."""
-    if connection.secret is None and connection_type(connection.type).secret_required:
+    if connection.secret is None and connection_type(connection.type).needs_secret(connection.provider):
         return CheckResult(ok=False, code="connection.secret_missing")
     return CheckResult(ok=True)
 
@@ -342,13 +366,26 @@ for _item in (SEARCH, SMTP, WEBHOOK):
     register_connection_type(_item)
 
 
-def add_search_provider(name: str) -> None:
-    """Allow ``name`` as provider of ``search`` connections (the adapters of NAL-A2 call this)."""
+def add_search_provider(
+    name: str, *, host: str | None = None, keyless: bool = False, modes: frozenset[Mode] | None = None
+) -> None:
+    """Allow ``name`` as provider of ``search`` connections (the adapters of NAL-A2 call this). ``host``: the
+    provider's fixed API host (its egress when no ``endpoint`` is set); ``keyless``: usable without a secret;
+    ``modes``: the modes it is offered in (default: the type's)."""
     if not _PROVIDER.match(name):
         raise ValueError(f"invalid provider name {name!r}")
+    if host is not None:
+        _SEARCH_HOSTS[name] = host.lower()
     current = connection_type("search")
+    changes: dict[str, Any] = {}
     if name not in current.providers:
-        register_connection_type(dataclasses.replace(current, providers=(*current.providers, name)), replace=True)
+        changes["providers"] = (*current.providers, name)
+    if keyless and name not in current.keyless_providers:
+        changes["keyless_providers"] = current.keyless_providers | {name}
+    if modes is not None:
+        changes["provider_modes"] = {**current.provider_modes, name: frozenset(modes)}
+    if changes:
+        register_connection_type(dataclasses.replace(current, **changes), replace=True)
 
 
 # ---- stored model -------------------------------------------------------------------------------------------------
@@ -559,6 +596,14 @@ class ConnectionService:
                 provider=provider,
                 type=kind.name,
             )
+        if not kind.offers(provider, self.mode):
+            raise NodestroError(
+                "connection.provider_unsupported_mode",
+                f"Provider {provider!r} is not offered in this mode",
+                provider=provider,
+                type=kind.name,
+                mode=self.mode,
+            )
         try:
             parsed = kind.settings.model_validate(dict(settings))
         except ValidationError as exc:
@@ -712,7 +757,15 @@ class ConnectionService:
         secret = self._secret(item)
         if item.secret_storage == "vault" and secret is None:
             raise NodestroError("connection.secret_unreadable", "The secret cannot be read; enter it again", id=item.id)
-        if kind.secret_required and secret is None:
+        if not kind.offers(item.provider, self.mode):
+            raise NodestroError(
+                "connection.provider_unsupported_mode",
+                f"Provider {item.provider!r} is not offered in this mode",
+                provider=item.provider,
+                type=item.type,
+                mode=self.mode,
+            )
+        if kind.needs_secret(item.provider) and secret is None:
             raise NodestroError("connection.secret_missing", "The connection has no secret yet", id=item.id)
         return ResolvedConnection(
             id=item.id,
@@ -826,6 +879,10 @@ class StaticConnections:
         provider = str(entry.get("provider") or "generic")
         if provider not in (kind.providers or ("generic",)):
             raise NodestroError("connection.provider_unknown", "Unknown provider", provider=provider, type=kind.name)
+        if not kind.offers(provider, mode):
+            raise NodestroError(
+                "connection.provider_unsupported_mode", "Not offered in this mode", provider=provider, type=kind.name
+            )
         try:
             settings = kind.settings.model_validate(dict(entry.get("settings") or {}))
         except ValidationError:
@@ -859,7 +916,7 @@ class StaticConnections:
                 type=found.type,
                 expected=expected_type,
             )
-        if connection_type(found.type).secret_required and not found.secret:
+        if connection_type(found.type).needs_secret(found.provider) and not found.secret:
             raise NodestroError("connection.secret_missing", "The connection has no secret yet", id=connection_id)
         return found
 
