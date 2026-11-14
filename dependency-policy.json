@@ -1,0 +1,128 @@
+{
+  "comment": "Copy of nodestro-studio platform/dependency-policy.json for nodestro-runtime (TABRION K-33, QA-17): only its outgoing edges. Never edit by hand; regenerate with python scripts/check_dependency_policy.py --copy nodestro-runtime in nodestro-studio.",
+  "component": "nodestro-runtime",
+  "schema": 1,
+  "namespaces": [
+    "tabrion",
+    "axentra",
+    "orkexa",
+    "nodestro",
+    "levuvo"
+  ],
+  "components": {
+    "tabrion": {
+      "kind": "foundation",
+      "no_direct_url": true,
+      "comment": "RC-1: every component requires it by one version range; the studio lock holds its commit (RC-2)"
+    },
+    "axentra": {
+      "kind": "library"
+    },
+    "orkexa": {
+      "kind": "library"
+    },
+    "nodestro-runtime": {
+      "kind": "platform"
+    },
+    "nodestro-examples": {
+      "kind": "platform"
+    },
+    "nodestro-integrations": {
+      "kind": "platform"
+    },
+    "nodestro-api": {
+      "kind": "platform"
+    },
+    "nodestro-sdk": {
+      "kind": "platform",
+      "distribution": "nodestro-client"
+    },
+    "nodestro-studio": {
+      "kind": "studio",
+      "distribution": "nodestro",
+      "studio_of": [
+        "nodestro-api",
+        "nodestro-runtime",
+        "nodestro-examples",
+        "nodestro-integrations"
+      ]
+    },
+    "tabrion-studio": {
+      "kind": "studio",
+      "studio_of": [
+        "tabrion"
+      ]
+    },
+    "axentra-studio": {
+      "kind": "studio",
+      "studio_of": [
+        "axentra"
+      ]
+    }
+  },
+  "edges": [
+    {
+      "from": "nodestro-runtime",
+      "to": "orkexa[all,pdf,local,convert,web]",
+      "kind": "required",
+      "extra": null,
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "orkexa[postgres]",
+      "kind": "optional",
+      "extra": "postgres",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "orkexa[web-ddgs]",
+      "kind": "optional",
+      "extra": "web-ddgs",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "axentra[oidc]",
+      "kind": "optional",
+      "extra": "postgres",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "tabrion[postgres]",
+      "kind": "optional",
+      "extra": "postgres",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "tabrion",
+      "kind": "required",
+      "extra": null,
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "orkexa[postgres,sqlcheck,web-ddgs]",
+      "kind": "dev",
+      "extra": "dev",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "axentra[oidc]",
+      "kind": "dev",
+      "extra": "dev",
+      "status": "active"
+    },
+    {
+      "from": "nodestro-runtime",
+      "to": "tabrion[testing,postgres]",
+      "kind": "dev",
+      "extra": "dev",
+      "status": "active"
+    }
+  ]
+}

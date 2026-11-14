@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Added (QA-17 (AC-2): dependency policy check, 2026-11-14): `dependency-policy.json` is this repository's copy of the
+  dependency policy K-33 from nodestro-studio (only its outgoing edges: `orkexa[all,pdf,local,convert,web]` and
+  `tabrion` in the core, `orkexa[postgres]`, `axentra[oidc]` and `tabrion[postgres]` in the extra `postgres`,
+  `orkexa[web-ddgs]` in `web-ddgs`, and `orkexa[postgres,sqlcheck,web-ddgs]`, `axentra[oidc]` and
+  `tabrion[testing,postgres]` in `dev`), and `scripts/check_dependency_policy.py` is the unchanged checker from there;
+  `scripts/DEPENDENCY_POLICY_SOURCE.md` records their origin and SHA-256. `python scripts/check_dependency_policy.py`
+  checks `pyproject.toml` (core, every extra and dependency group) against the copy. `tests/test_dependency_policy.py`
+  checks the checksums, runs the checker and probes forbidden requirements (nodestro-api, the core edge with extras,
+  the wrong extra, the studio, an unknown Levuvo package). Ruff skips the vendored script (it is linted in
+  nodestro-studio). No CI workflow change.
+
 - Test for the fallback reason `unsafe_path` of `storage.unsafe_file` (a database path that is no regular file,
   for the store and `memory_totals`); RT-080 brought up to date after the re-check of the #171 review conditions
   (TABRION MIG-NOD-6, 2026-11-14).
