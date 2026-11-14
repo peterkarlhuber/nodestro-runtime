@@ -8,6 +8,19 @@
   `tests/test_tabrion_pin.py` requires the installed Tabrion's `direct_url.json` to name a git commit, the studio
   lock's when `NODESTRO_STUDIO_LOCK` names the lock (CI sets it): it detects an accidental index install, but it is
   no proof of origin (a wheel can forge the file). README: the checkout install names the lock too.
+- Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
+  `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,
+  `S2` ... in the order first seen, one entry per normalized address: lower-case scheme and host, no default port, no
+  fragment, no `utm_*` parameters; reading a page upgrades a search hit to `fetched`; at most 1000 per run); each new
+  or upgraded entry emits the run event `source_recorded`. The ledger holds addresses and metadata only and never
+  leaves its run. A structured result field may declare `source="ledger"` (`string` or `string_list`): each value must
+  name a recorded source by id or address; otherwise the agent gets one correction (event `sources_unknown`) and the
+  step then fails with `output.unknown_source`, so a made-up source is never delivered. The workflow check reports
+  `check.ledger_source_type` (not a text field) and `check.ledger_source_no_tool` (no web tool up to the agent).
+  `tool_spec.RunServices` also lends tools the booking of their own cost into the run budget (a token-free usage
+  record counted in `web_search_requests`) and a budget check before a priced call. The sanitized trace export with
+  `contents` removes source addresses and titles. The web tools that use it follow in the next NAL-A2 change.
+
 - Security (TABRION MIG-NOD-3, finding B-06-2): the messages of `storage.backup_failed` and
   `storage.migration_failed` (SQLite and PostgreSQL) no longer end with the error's text, which for PostgreSQL held the
   server's `DETAIL` values. `error_texts.failure_text` gives Tabrion's value-free `safe_message` for a database error in
