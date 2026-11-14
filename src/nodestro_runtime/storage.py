@@ -363,109 +363,246 @@ SIDE_FILES = ("-wal", "-shm", "-journal")
 #: What a repaired database file keeps of its mode (``old & PRIVATE_MODE``): at most read and write for its owner;
 #: group, others, execute, set-user-ID, set-group-ID and sticky bits are dropped, and nothing is added.
 PRIVATE_MODE = 0o600
-#: What :func:`repair_desktop_database_modes` did with one file.
-RepairStatus = Literal["changed", "unchanged", "not_confirmed", "skipped", "failed"]
+#: What :func:`repair_desktop_database_modes` or :func:`restore_desktop_database_modes` did with one file.
+RepairStatus = Literal[
+    "changed",
+    "unchanged",
+    "not_confirmed",
+    "skipped",
+    "failed",
+    "rolled_back",
+    "rollback_failed",
+    "restored",
+]
+#: A file's identity: ``(st_dev, st_ino)``.
+FileIdentity = tuple[int, int]
+#: Why a repair left a file alone because another file of the same database could not be repaired (all or nothing).
+OTHER_FILE_REFUSED = "other_file_refused"
 
 
 @dataclasses.dataclass(frozen=True)
 class ModeRepair:
-    """The result of :func:`repair_desktop_database_modes` for one existing file.
+    """The result of :func:`repair_desktop_database_modes` (or :func:`restore_desktop_database_modes`) for one file.
 
-    ``status``: ``changed`` (``old_mode`` -> ``new_mode``), ``unchanged`` (nothing besides read and write for the
-    owner), ``not_confirmed`` (would be changed to ``new_mode``; nothing was done), ``skipped`` (``reason``:
-    ``symlink``, ``other_owner``, ``not_a_file``, ``hard_link``, ``changed_during_repair``; never touched) or
-    ``failed`` (``reason``: why; the mode is as before unless the file system says otherwise, see ``new_mode``)."""
+    ``status``:
+
+    - ``changed``: ``old_mode`` -> ``new_mode``; ``unchanged``: nothing besides read and write for the owner;
+      ``not_confirmed``: would be changed to ``new_mode``, nothing was done.
+    - ``skipped`` (never touched; ``reason``: ``symlink``, ``other_owner``, ``not_a_file``, ``hard_link``,
+      ``changed_during_repair``, or ``other_file_refused`` when another file of the database stopped the repair).
+    - ``failed`` (``reason``: why; the mode is as before unless the file system says otherwise, see ``new_mode``).
+    - ``rolled_back``: changed by this call, then set back to ``old_mode`` because another file failed;
+      ``rollback_failed``: that could not be done (``reason``; the file keeps ``new_mode``).
+    - ``restored``: :func:`restore_desktop_database_modes` set ``old_mode`` again.
+
+    ``dev`` and ``ino`` are the identity the check saw (``st_dev``, ``st_ino``); a caller passes them back as
+    ``expected`` so that the confirmed repair touches only the files the user was shown."""
 
     path: Path
     status: RepairStatus
     old_mode: int | None = None
     new_mode: int | None = None
     reason: str | None = None
+    dev: int | None = None
+    ino: int | None = None
+
+    @property
+    def identity(self) -> FileIdentity | None:
+        return None if self.dev is None or self.ino is None else (self.dev, self.ino)
 
 
-def _repair_one(path: Path, uid: int, *, confirmed: bool) -> ModeRepair | None:
-    """The repair of one file (``None``: it does not exist)."""
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+_OPEN_FLAGS |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
+
+
+def _set_mode(path: Path, identity: FileIdentity, uid: int, mode: int) -> tuple[str | None, int | None]:
+    """Set ``mode`` on the regular file ``path`` of ``uid`` with one name, only while it is still ``identity``:
+    ``(None, mode)`` on success, else ``(why, the mode now or None)``.
+
+    The file itself, never what a link put in its place: ``O_NOFOLLOW`` (and ``O_NONBLOCK``, so a FIFO never
+    blocks), then ``fstat`` (type, owner, device, inode, link count), then ``fchmod``."""
+    try:
+        descriptor = os.open(path, _OPEN_FLAGS)
+    except OSError as exc:
+        return exc.strerror or str(exc), None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid or (opened.st_dev, opened.st_ino) != identity:
+            return "changed_during_repair", None
+        if opened.st_nlink != 1:
+            return "hard_link", None
+        os.fchmod(descriptor, mode)
+        now = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    except OSError as exc:
+        return exc.strerror or str(exc), None
+    finally:
+        os.close(descriptor)
+    if now != mode:  # some network file systems accept chmod and ignore it
+        return "the file system kept the old mode", now
+    return None, now
+
+
+def _expected_identity(expected: Mapping[str | Path, FileIdentity], path: Path) -> FileIdentity | None:
+    for key in (str(path), path.name):
+        if key in expected:
+            value = expected[key]
+            return (int(value[0]), int(value[1]))
+    for listed, value in expected.items():
+        if not isinstance(listed, str) and Path(listed) == path:
+            return (int(value[0]), int(value[1]))
+    return None
+
+
+def _check_one(path: Path, uid: int, expected: Mapping[str | Path, FileIdentity] | None) -> ModeRepair | None:
+    """What a repair would do with one file, without changing it (``None``: it does not exist and was not expected)."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
+        if expected is not None and _expected_identity(expected, path) is not None:
+            return ModeRepair(path, "skipped", reason="changed_during_repair")  # gone since the user saw it
         return None
     except OSError as exc:
         return ModeRepair(path, "failed", reason=exc.strerror or str(exc))
     old = stat.S_IMODE(info.st_mode)
     if stat.S_ISLNK(info.st_mode):
-        return ModeRepair(path, "skipped", reason="symlink")
+        return ModeRepair(path, "skipped", reason="symlink", dev=info.st_dev, ino=info.st_ino)
     if not stat.S_ISREG(info.st_mode):
-        return ModeRepair(path, "skipped", old_mode=old, reason="not_a_file")
+        return ModeRepair(path, "skipped", old_mode=old, reason="not_a_file", dev=info.st_dev, ino=info.st_ino)
     if info.st_uid != uid:
-        return ModeRepair(path, "skipped", old_mode=old, reason="other_owner")
+        return ModeRepair(path, "skipped", old_mode=old, reason="other_owner", dev=info.st_dev, ino=info.st_ino)
     if info.st_nlink != 1:  # another name for the same file, maybe outside the data directory
-        return ModeRepair(path, "skipped", old_mode=old, reason="hard_link")
+        return ModeRepair(path, "skipped", old_mode=old, reason="hard_link", dev=info.st_dev, ino=info.st_ino)
+    if expected is not None and _expected_identity(expected, path) != (info.st_dev, info.st_ino):
+        # Another file than the one the user was shown (or one the user was not shown at all).
+        return ModeRepair(
+            path, "skipped", old_mode=old, reason="changed_during_repair", dev=info.st_dev, ino=info.st_ino
+        )
     new = old & PRIVATE_MODE  # only narrowed: no permission is ever added
     if new == old:
-        return ModeRepair(path, "unchanged", old_mode=old, new_mode=old)
-    if not confirmed:
-        return ModeRepair(path, "not_confirmed", old_mode=old, new_mode=new)
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
-    try:
-        # The file itself, never what a link put in its place since the check: O_NOFOLLOW, then fstat and fchmod.
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        return ModeRepair(path, "failed", old_mode=old, reason=exc.strerror or str(exc))
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid or opened.st_ino != info.st_ino:
-            return ModeRepair(path, "skipped", old_mode=old, reason="changed_during_repair")
-        if opened.st_nlink != 1:
-            return ModeRepair(path, "skipped", old_mode=old, reason="hard_link")
-        os.fchmod(descriptor, new)
-        now = stat.S_IMODE(os.fstat(descriptor).st_mode)
-    except OSError as exc:
-        return ModeRepair(path, "failed", old_mode=old, reason=exc.strerror or str(exc))
-    finally:
-        os.close(descriptor)
-    if now != new:  # some network file systems accept chmod and ignore it
-        return ModeRepair(path, "failed", old_mode=old, new_mode=now, reason="the file system kept the old mode")
-    return ModeRepair(path, "changed", old_mode=old, new_mode=new)
+        return ModeRepair(path, "unchanged", old_mode=old, new_mode=old, dev=info.st_dev, ino=info.st_ino)
+    return ModeRepair(path, "not_confirmed", old_mode=old, new_mode=new, dev=info.st_dev, ino=info.st_ino)
 
 
-def repair_desktop_database_modes(database: str | Path, *, confirmed: bool) -> list[ModeRepair]:
+def _blocked(item: ModeRepair) -> ModeRepair:
+    """A file left alone because another file stopped the repair."""
+    if item.status != "not_confirmed":
+        return item
+    return dataclasses.replace(item, status="skipped", new_mode=None, reason=OTHER_FILE_REFUSED)
+
+
+def repair_desktop_database_modes(
+    database: str | Path, *, confirmed: bool, expected: Mapping[str | Path, FileIdentity] | None = None
+) -> list[ModeRepair]:
     """Restrict an existing desktop database and its ``-wal``, ``-shm`` and ``-journal`` files to their owner
     (``old & 0o600``, normally ``0600``), only after the user confirmed it (TABRION MIG-NOD-9, decision
     E-NOD-PERM); one :class:`ModeRepair` per existing file, in that order.
 
-    Without ``confirmed=True`` nothing is changed: the result says what a repair would do (``not_confirmed``). A file
-    with any bit besides read and write for its owner gets ``old & 0o600`` (``0644`` and ``0664`` become ``0600``,
-    ``0444`` becomes ``0400``; no bit is ever added); only its mode changes, never its content. A symbolic link, a
-    file of another user, a file with more than one name (hard link) or anything but a regular file is never touched
-    (``skipped``); the file is opened with ``O_NOFOLLOW`` and ``O_NONBLOCK`` (a FIFO put in its place never blocks)
-    and checked again with ``fstat`` before ``fchmod``. A failed change
-    (``chmod`` refused, or a file system that ignores it) is ``failed`` with the reason and logged as a warning; it
-    never raises. Each change is logged with the old mode. Call it while the database is not open in this process
-    (the repair opens each file briefly, which would drop SQLite's POSIX locks of an open connection). Windows has
-    no POSIX modes: the result is empty there."""
+    Without ``confirmed=True`` nothing is changed: the result says what a repair would do (``not_confirmed``) and the
+    identity of each file (``dev``, ``ino``). A file with any bit besides read and write for its owner gets
+    ``old & 0o600`` (``0644`` and ``0664`` become ``0600``, ``0444`` becomes ``0400``; no bit is ever added); only
+    its mode changes, never its content. A symbolic link, a file of another user, a file with more than one name
+    (hard link) or anything but a regular file is never touched (``skipped``); each file is opened with
+    ``O_NOFOLLOW`` and ``O_NONBLOCK`` and checked again with ``fstat`` (type, owner, ``st_dev``, ``st_ino``, link
+    count) before ``fchmod``.
+
+    ``expected`` (``{path or file name: (st_dev, st_ino)}``, from the dry run the user confirmed): every file must
+    still be the one listed there; a different file, a file that is not listed or a listed file that is gone is
+    ``skipped`` with ``changed_during_repair``.
+
+    All or nothing: when any file is ``skipped`` or ``failed``, no file is changed (the others are ``skipped`` with
+    ``other_file_refused``), and a file this call already changed is set back to its old mode under the same checks
+    (``rolled_back``, or ``rollback_failed`` with a warning). It never raises. Each change is logged with the old
+    mode. Call it while the database is not open in this process (the repair opens each file briefly, which would
+    drop SQLite's POSIX locks of an open connection). Windows has no POSIX modes: the result is empty there."""
     if os.name != "posix":
         return []
     path = Path(database)
     uid = os.geteuid()
-    results: list[ModeRepair] = []
+    planned: list[ModeRepair] = []
     for candidate in (path, *(path.with_name(path.name + suffix) for suffix in SIDE_FILES)):
-        result = _repair_one(candidate, uid, confirmed=confirmed)
-        if result is None:
+        checked = _check_one(candidate, uid, expected)
+        if checked is not None:
+            planned.append(checked)
+    refused = [item for item in planned if item.status in ("skipped", "failed")]
+    if not confirmed:
+        return planned
+    if refused:
+        for item in refused:
+            old = "unknown" if item.old_mode is None else oct(item.old_mode)
+            logger.warning("Did not restrict %s to its owner (mode %s): %s", item.path, old, item.reason)
+        return [_blocked(item) for item in planned]
+    results: list[ModeRepair] = []
+    stopped = False
+    for item in planned:
+        if item.status != "not_confirmed" or stopped:
+            results.append(_blocked(item) if stopped else item)
             continue
-        results.append(result)
-        old = "unknown" if result.old_mode is None else oct(result.old_mode)
-        if result.status == "changed":
+        assert item.identity is not None and item.new_mode is not None and item.old_mode is not None
+        why, now = _set_mode(item.path, item.identity, uid, item.new_mode)
+        if why is None:
             logger.info(
                 "Restricted %s to its owner: mode %s, was %s (confirmed by the user)",
-                candidate,
-                oct(result.new_mode or 0),
-                old,
+                item.path,
+                oct(item.new_mode),
+                oct(item.old_mode),
             )
-        elif result.status == "failed":
-            logger.warning("Could not restrict %s to its owner (mode %s): %s", candidate, old, result.reason)
-        elif result.status == "skipped" and confirmed:
-            logger.warning("Left %s as it is (mode %s): %s", candidate, old, result.reason)
+            results.append(dataclasses.replace(item, status="changed"))
+            continue
+        stopped = True
+        status: RepairStatus = "failed" if why not in ("changed_during_repair", "hard_link") else "skipped"
+        if now is not None and now != item.old_mode:
+            status = "failed"  # the file system changed something: say so, with the mode it has now
+        logger.warning("Could not restrict %s to its owner (mode %s): %s", item.path, oct(item.old_mode), why)
+        results.append(dataclasses.replace(item, status=status, new_mode=now, reason=why))
+    if stopped:
+        results = [_roll_back(item, uid) if item.status == "changed" else item for item in results]
     return results
+
+
+def _roll_back(item: ModeRepair, uid: int) -> ModeRepair:
+    """Set a file this repair changed back to its old mode (all or nothing)."""
+    assert item.identity is not None and item.old_mode is not None
+    why, now = _set_mode(item.path, item.identity, uid, item.old_mode)
+    if why is None:
+        logger.info("Set %s back to mode %s: another file could not be repaired", item.path, oct(item.old_mode))
+        return dataclasses.replace(item, status="rolled_back", new_mode=item.old_mode)
+    logger.warning(
+        "Could not set %s back to mode %s (it keeps mode %s): %s",
+        item.path,
+        oct(item.old_mode),
+        oct(item.new_mode or 0) if now is None else oct(now),
+        why,
+    )
+    return dataclasses.replace(
+        item, status="rollback_failed", new_mode=item.new_mode if now is None else now, reason=why
+    )
+
+
+def restore_desktop_database_modes(results: Iterable[ModeRepair]) -> list[ModeRepair]:
+    """Set the old modes again after a confirmed repair (``results``: its ``changed`` items; other items are left
+    out), for example when the caller's check after the repair fails. Same checks as the repair: the file must still
+    be the regular file of the running user with one name that was changed (``dev``, ``ino``), opened with
+    ``O_NOFOLLOW``; otherwise it is ``skipped`` (``changed_during_repair``, ``hard_link``) or ``failed``, with a
+    warning. It never raises. Windows: empty."""
+    if os.name != "posix":
+        return []
+    uid = os.geteuid()
+    restored: list[ModeRepair] = []
+    for item in results:
+        if item.status != "changed":
+            continue
+        if item.identity is None or item.old_mode is None:
+            restored.append(dataclasses.replace(item, status="skipped", reason="changed_during_repair"))
+            continue
+        why, now = _set_mode(item.path, item.identity, uid, item.old_mode)
+        if why is None:
+            logger.info("Restored %s to mode %s", item.path, oct(item.old_mode))
+            restored.append(dataclasses.replace(item, status="restored", new_mode=item.old_mode))
+            continue
+        logger.warning("Could not restore %s to mode %s: %s", item.path, oct(item.old_mode), why)
+        status: RepairStatus = "skipped" if why in ("changed_during_repair", "hard_link") else "failed"
+        restored.append(dataclasses.replace(item, status=status, new_mode=now, reason=why))
+    return restored
 
 
 def _like(prefix: str) -> str:

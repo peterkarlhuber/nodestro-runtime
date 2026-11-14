@@ -11,9 +11,15 @@
   without `confirmed=True` (it reports what it would do); confirmed, it narrows the mode of each of those files to
   `old & 0o600` (`0644` and `0664` become `0600`, `0444` becomes `0400`; no bit is ever added), never for a symbolic
   link, a hard link, a file of another user or anything but a regular file (opened with `O_NOFOLLOW` and
-  `O_NONBLOCK`, checked again with `fstat`, changed with `fchmod`), changes the mode only, logs the old mode and
-  returns one result per file (`changed`, `unchanged`, `not_confirmed`, `skipped` with a reason, `failed`
-  with a reason; a failure never raises). Windows: no-op (no POSIX modes). No API endpoint or interface yet. A
+  `O_NONBLOCK`, checked again with `fstat` for type, owner, `st_dev`, `st_ino` and link count, changed with
+  `fchmod`), changes the mode only, logs the old mode and returns one `ModeRepair` per file (`changed`,
+  `unchanged`, `not_confirmed`, `skipped` or `failed` with a reason, `rolled_back`, `rollback_failed`; it never
+  raises). Each result carries the identity seen (`dev`, `ino`); passed back as `expected`, the confirmed repair
+  touches only the files the user was shown (a different, unlisted or vanished file is `changed_during_repair`). All
+  or nothing: when any file is skipped or fails, nothing is changed, and files this call already changed are set
+  back to their old mode under the same checks. `storage.restore_desktop_database_modes(results)` sets the old
+  modes of `changed` results again (for a caller whose check after the repair fails). Windows: no-op (no POSIX
+  modes). No API endpoint or interface yet. A
   `Workspace` whose database is refused no longer keeps its data directory locked, so the same process can open it
   again after the repair.
 - Security (TABRION MIG-NOD-6, findings B-06-3 and B-06-5): the desktop's SQLite connections (`SQLiteStore`,
