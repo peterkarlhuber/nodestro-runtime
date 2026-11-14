@@ -197,6 +197,13 @@ class ToolSettings(_Model):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class TemplateRef(_Model):
+    """An agent template in one of its versions (NAL-B1): where an agent of a workflow was copied from."""
+
+    template_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+
+
 class AgentConfig(_Model):
     """Everything about one agent node; mirrors the arguments of ``orkexa.Agent``.
 
@@ -245,6 +252,11 @@ class AgentConfig(_Model):
     fallbacks: list[str] = Field(default_factory=list)
     on_refusal: Literal["raise", "return"] = "raise"
     request_options: dict[str, Any] = Field(default_factory=dict)
+    #: The task profile of the agent (a key of :data:`nodestro_runtime.local_models.TASKS`, e.g. ``tool_agent``):
+    #: what kind of work it does, so a model can be suggested for it. ``None``: not stated.
+    task: str | None = Field(default=None, max_length=40)
+    #: The agent template version this agent was made from (NAL-B1); history, never followed automatically.
+    origin: TemplateRef | None = None
 
 
 # ---- workflows ------------------------------------------------------------------
@@ -607,14 +619,81 @@ class WorkflowSummary(_Model):
     contract: list[str] = Field(default_factory=list)
 
 
+#: What an agent template may say it needs of its model (NAL-B1).
+TemplateCapability = Literal["tools", "vision", "structured_output", "long_context"]
+#: Where an agent template comes from: ``user`` (made or changed here), ``builtin:<package>@<version>/<id>`` (shipped
+#: with an examples package) or ``import:<sha256 of the imported file>``.
+TEMPLATE_ORIGIN_PATTERN = r"^(user|builtin:[a-z0-9_.-]+@[A-Za-z0-9_.+-]+/[a-z0-9-]+|import:[0-9a-f]{64})$"
+
+
+class TemplateRequirements(_Model):
+    """What an agent template needs to work; checked before it is used, never enforced by the runtime."""
+
+    #: What the model must support.
+    capabilities: list[TemplateCapability] = Field(default_factory=list, max_length=4)
+    #: The weakest model tier the template works with (``None``: any).
+    min_tier: Literal["fast", "standard", "strong"] | None = None
+    #: Tools the agent uses (catalog names).
+    tools: list[str] = Field(default_factory=list, max_length=50)
+    #: Kinds of service connection the tools need (e.g. ``search``).
+    services: list[str] = Field(default_factory=list, max_length=20)
+    #: Whether the agent works without internet access (with a local model).
+    offline_capable: bool = True
+
+
+class TemplateTest(_Model):
+    """A test case of an agent template: an input and what a good answer does (checked by a judge or a person)."""
+
+    name: str = Field(min_length=1, max_length=120)
+    input: str = Field(max_length=20_000)
+    expectations: list[str] = Field(default_factory=list, max_length=20)
+
+
+class TemplateMeta(_Model):
+    """The description of an agent template besides its agent (NAL-B1)."""
+
+    category: str = Field(default="", max_length=60)
+    summary: str = Field(default="", max_length=500)
+    requirements: TemplateRequirements = Field(default_factory=TemplateRequirements)
+    origin: str = Field(default="user", pattern=TEMPLATE_ORIGIN_PATTERN)
+    #: Example requests to try the agent with.
+    examples: list[str] = Field(default_factory=list, max_length=20)
+    tests: list[TemplateTest] = Field(default_factory=list, max_length=50)
+    #: The language of the template's texts (``de``, ``en``, ...); ``None``: not stated.
+    locale: str | None = Field(default=None, max_length=10)
+
+
 class AgentTemplateIn(_Model):
     agent: AgentConfig
+    meta: TemplateMeta = Field(default_factory=TemplateMeta)
+    #: A note of the user for the version this save makes ("shorter answers").
+    note: str = Field(default="", max_length=200)
 
 
-class AgentTemplate(AgentTemplateIn):
+class AgentTemplate(_Model):
+    """A saved agent template in its latest version; every save that changes it makes a new version (NAL-B1).
+
+    A template stored before versions existed has ``version`` 1 and ``meta`` with ``origin`` ``user``."""
+
+    agent: AgentConfig
+    meta: TemplateMeta = Field(default_factory=TemplateMeta)
     id: str = Field(default_factory=lambda: new_id("tpl"))
+    version: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=now)
     updated_at: datetime = Field(default_factory=now)
+
+
+class AgentTemplateVersion(_Model):
+    """One version of an agent template; never changed once stored."""
+
+    template_id: str
+    version: int = Field(ge=1)
+    agent: AgentConfig
+    meta: TemplateMeta = Field(default_factory=TemplateMeta)
+    note: str = ""
+    created_at: datetime = Field(default_factory=now)
+    #: Who saved it (the user id on a server, empty on the desktop).
+    created_by: str = ""
 
 
 # ---- runs -----------------------------------------------------------------------

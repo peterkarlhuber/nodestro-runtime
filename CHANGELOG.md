@@ -35,6 +35,21 @@
   meantime is noticed after `BEGIN IMMEDIATE`) with the same codes, parameters and messages; a snapshot is checked
   (`quick_check`), synced and renamed into place and is one self-contained file (rollback journal). Everything else
   is unchanged (`tests/fixtures/sqlite_store_before.json`, recorded from the code before).
+- Fixed (TABRION MIG-NOD-5): `RoleMissing` and `RoleUnsafe` come from `tabrion.errors` (standard library only, always
+  installed) outside the optional `postgres` import, so `except RoleMissing` works when psycopg is present but another
+  part of the extra is missing (studio components job).
+- Added (NAL-B1): versions of agent templates. `nodestro_runtime.agent_templates.AgentTemplates` stores every save that
+  changes a template as an immutable version (`agent_template_versions`, numbered, under the lock of the template's
+  versions, like workflow versions); a template from before versions counts as version 1 and its next save stores
+  that state as `v1` first, so nothing is lost and no start-up migration runs. New models: `TemplateMeta` (category,
+  summary, requirements, origin `user` / `builtin:<package>@<version>/<id>` / `import:<sha256>`, example requests,
+  test cases, locale), `TemplateRequirements`, `TemplateTest`, `AgentTemplateVersion`, `TemplateRef`.
+  `AgentTemplate` gains `meta` and `version`; `AgentTemplateIn` gains `meta` and `note` (both optional, so older
+  clients and stored documents still validate). `AgentConfig` gains `task` (the agent's task profile) and `origin`
+  (the template version it was copied from; history, never followed automatically).
+- Fixed (TABRION MIG-NOD-7): without the `postgres` extra, `storage_postgres` now defines `SessionLock`,
+  `SessionSettings`, `configure`, `extension_status` and the MIG-NOD-5 role names as `None`, like `psycopg`, so the module's names are the same
+  with and without the extra (`tests/test_pgvector_status.py` patches `extension_status` and failed without psycopg).
 - Security (TABRION MIG-NOD-5): `inspect_role`, `grant_runtime_role` and `PostgresDatabase.role_info` read and grant
   through `tabrion.postgres` (`inspect_role`, `grant_runtime_role` with the schema versions as protected tables,
   `role_info(owner_scope="schema")`); the dicts, codes (`storage.role_missing`, `storage.role_unsafe`) and messages
