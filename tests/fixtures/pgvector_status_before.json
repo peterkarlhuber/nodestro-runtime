@@ -1,0 +1,56 @@
+{
+  "active": {
+    "available_version": "<version>",
+    "command": null,
+    "extension_schema": "nodestro",
+    "message": "pgvector <version> ranks the knowledge vectors",
+    "schema": "nodestro",
+    "state": "active",
+    "version": "<version>"
+  },
+  "installable": {
+    "available_version": "<version>",
+    "command": "CREATE EXTENSION vector SCHEMA \"nodestro\";",
+    "extension_schema": null,
+    "message": "pgvector <version> is available on the PostgreSQL server but not installed in this database: the runtime ranks the vectors itself. As a superuser run CREATE EXTENSION vector SCHEMA \"nodestro\"; then restart the API and worker processes",
+    "schema": "nodestro",
+    "state": "installable",
+    "version": null
+  },
+  "installable_no_current_schema": {
+    "available_version": "<version>",
+    "command": "CREATE EXTENSION vector SCHEMA \"public\";",
+    "extension_schema": null,
+    "message": "pgvector <version> is available on the PostgreSQL server but not installed in this database: the runtime ranks the vectors itself. As a superuser run CREATE EXTENSION vector SCHEMA \"public\"; then restart the API and worker processes",
+    "schema": null,
+    "state": "installable",
+    "version": null
+  },
+  "installable_quoted_schema": {
+    "available_version": "<version>",
+    "command": "CREATE EXTENSION vector SCHEMA \"odd\"\"name\";",
+    "extension_schema": null,
+    "message": "pgvector <version> is available on the PostgreSQL server but not installed in this database: the runtime ranks the vectors itself. As a superuser run CREATE EXTENSION vector SCHEMA \"odd\"\"name\"; then restart the API and worker processes",
+    "schema": "odd\"name",
+    "state": "installable",
+    "version": null
+  },
+  "other_schema": {
+    "available_version": "<version>",
+    "command": "ALTER EXTENSION vector SET SCHEMA \"nodestro\";",
+    "extension_schema": "elsewhere",
+    "message": "pgvector <version> is installed in schema 'elsewhere', which this database's search_path ('nodestro') does not include: the runtime ranks the vectors itself. Move it (ALTER EXTENSION vector SET SCHEMA \"nodestro\";), unless other applications of this database use it there, then restart the API and worker processes",
+    "schema": "nodestro",
+    "state": "other_schema",
+    "version": "<version>"
+  },
+  "unavailable": {
+    "available_version": null,
+    "command": null,
+    "extension_schema": null,
+    "message": "The PostgreSQL server has no pgvector: the runtime ranks the vectors itself (semantic search works, but reads every candidate vector). Install the pgvector package on the server, then check again",
+    "schema": "nodestro",
+    "state": "unavailable",
+    "version": null
+  }
+}
