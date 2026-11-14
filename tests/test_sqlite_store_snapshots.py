@@ -17,8 +17,8 @@ from typing import Any
 
 import pytest
 import sqlite_store_snapshots
-from tabrion.errors import UnsafePath
 
+from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.storage import SQLITE_PROFILE, SQLiteStore
 
 POSIX = os.name == "posix"
@@ -38,7 +38,28 @@ if POSIX:
         INTENDED.append(
             (("files", f"umask_{mask}", "snapshot_journal"), "wal", "rollback", "tabrion.sqlite.backup: one file")
         )
-    INTENDED.append((("files", "symlink"), {"ok": "opened"}, {"raised": "UnsafePath"}, "symbolic links refused"))
+    INTENDED.append(
+        (
+            ("files", "symlink"),
+            {"ok": "opened"},
+            {
+                "cause": None,
+                "code": "storage.unsafe_file",
+                "message": "The database <dir>/link.db is a symbolic link, or one of its -wal, -shm or -journal files "
+                "is; Nodestro does not follow links. Move the real file into the data directory in place of the link",
+                "params": {"reason": "symlink"},
+            },
+            "symbolic links refused, with what to do (storage.unsafe_file)",
+        )
+    )
+
+#: Differences that depend on the platform's SQLite build, so the baseline (written with Ubuntu's SQLite) does not
+#: show them: the old code never set ``secure_delete`` and got the build's default, on with the SQLite of Linux
+#: distributions (the baseline's 1), off with the SQLite of python.org, macOS and Windows and in the desktop bundles.
+#: The profile sets it on everywhere, so on those platforms deleted content is now overwritten.
+PLATFORM_DEPENDENT: list[tuple[tuple[str, ...], str, Any, str]] = [
+    (("pragmas", "secure_delete"), "the build's default (1 on Debian/Ubuntu, 0 elsewhere)", 1, "SQLITE_PROFILE"),
+]
 
 
 def _set(data: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
@@ -75,6 +96,11 @@ def test_everything_else_is_unchanged(current: dict[str, Any]) -> None:
     assert sqlite_store_snapshots.dumps(current) == sqlite_store_snapshots.dumps(expected)
 
 
+def test_the_platform_dependent_values(current: dict[str, Any]) -> None:
+    for path, _before, after, _reason in PLATFORM_DEPENDENT:
+        assert _get(current, path) == after, path
+
+
 def test_the_profile_keeps_durability_and_secure_delete() -> None:
     assert SQLITE_PROFILE.journal_mode == "wal" and SQLITE_PROFILE.synchronous == "full"
     assert SQLITE_PROFILE.busy_timeout == 30.0 and SQLITE_PROFILE.secure_delete is True
@@ -100,9 +126,22 @@ def test_a_database_writable_by_others_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "nodestro.db"
     sqlite3.connect(database).close()
     os.chmod(database, 0o666)
-    with pytest.raises(UnsafePath) as caught:
+    with pytest.raises(NodestroError) as caught:
         SQLiteStore(database)
-    assert caught.value.code == "sqlite.unsafe_mode" and str(tmp_path) not in str(caught.value)
+    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "writable_by_others"}
+    assert "chmod go-w" in str(caught.value)
+
+
+@pytest.mark.skipif(not POSIX, reason="file owners are POSIX only")
+def test_a_database_of_another_user_is_refused_with_advice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = tmp_path / "nodestro.db"
+    sqlite3.connect(database).close()
+    os.chmod(database, 0o644)
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)  # the file now belongs to "someone else"
+    with pytest.raises(NodestroError) as caught:
+        SQLiteStore(database)
+    assert caught.value.params == {"reason": "other_owner"} and "chown" in str(caught.value)
 
 
 @pytest.mark.skipif(not POSIX, reason="symbolic links need privileges on Windows")
@@ -112,8 +151,9 @@ def test_a_linked_wal_file_is_refused(tmp_path: Path) -> None:
     (tmp_path / "elsewhere").write_bytes(b"")
     (tmp_path / "nodestro.db-wal").unlink(missing_ok=True)
     (tmp_path / "nodestro.db-wal").symlink_to(tmp_path / "elsewhere")
-    with pytest.raises(UnsafePath):
+    with pytest.raises(NodestroError) as caught:
         SQLiteStore(database)
+    assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "symlink"}
 
 
 def test_foreign_key_check_is_empty_after_the_migrations(tmp_path: Path) -> None:
@@ -141,9 +181,56 @@ def test_a_snapshot_replaces_an_existing_target_and_refuses_a_link(tmp_path: Pat
         if POSIX:
             link = tmp_path / "link.db"
             link.symlink_to(tmp_path / "victim.db")
-            with pytest.raises(UnsafePath):
+            with pytest.raises(NodestroError) as caught:
                 store.snapshot(link)
+            assert caught.value.code == "storage.unsafe_file" and caught.value.params == {"reason": "symlink"}
             assert not (tmp_path / "victim.db").exists()
         assert sorted(p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")) == []
     finally:
         store.close()
+
+
+# ---- the import source of a server (security review of #171, C1) ------------------------------------------------
+
+
+def _import_refusal(source: Path) -> NodestroError:
+    pytest.importorskip("psycopg")
+    from nodestro_runtime.postgres_import import import_desktop_database
+
+    with pytest.raises(NodestroError) as caught:
+        import_desktop_database(source, sqlite_store_snapshots._NoServer(), "t1")  # type: ignore[arg-type]
+    return caught.value
+
+
+def _old_source(tmp_path: Path) -> Path:
+    source = tmp_path / "copied.db"
+    SQLiteStore(source).close()  # schema version 0: refused for its version, after it was opened
+    return source
+
+
+@pytest.mark.skipif(not POSIX, reason="file modes and owners are POSIX only")
+def test_an_import_source_writable_by_group_is_read(tmp_path: Path) -> None:
+    source = _old_source(tmp_path)
+    os.chmod(source, 0o664)
+    error = _import_refusal(source)
+    assert error.code == "storage.import_source" and "schema version 0" in str(error)  # opened and read
+
+
+@pytest.mark.skipif(not POSIX, reason="file owners are POSIX only")
+def test_an_import_source_of_another_user_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _old_source(tmp_path)
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+    error = _import_refusal(source)
+    assert error.code == "storage.import_source" and "schema version 0" in str(error)
+
+
+@pytest.mark.skipif(not POSIX, reason="symbolic links need privileges on Windows")
+def test_an_import_source_with_a_linked_side_file_is_refused(tmp_path: Path) -> None:
+    source = _old_source(tmp_path)
+    (tmp_path / "elsewhere").write_bytes(b"")
+    (tmp_path / "copied.db-wal").unlink(missing_ok=True)
+    (tmp_path / "copied.db-wal").symlink_to(tmp_path / "elsewhere")
+    error = _import_refusal(source)
+    assert error.code == "storage.import_source" and error.params == {"path": str(source)}
+    assert "symbolic link" in str(error)

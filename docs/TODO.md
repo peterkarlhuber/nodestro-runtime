@@ -55,17 +55,21 @@ None known.
 
 ### RT-078 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
 
-- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-6 (this change), MIG-NOD-9 (E-NOD-PERM),
-  findings B-06-3 and B-06-5, `storage.SQLITE_PROFILE`, `tests/test_sqlite_store_snapshots.py`
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-6 (this change, security review of #171),
+  MIG-NOD-9 (E-NOD-PERM), findings B-06-3 and B-06-5, `storage.SQLITE_PROFILE`, `tests/test_sqlite_store_snapshots.py`
 - **What:** `SQLiteStore`, `sqlite_tables.memory_totals` and `postgres_import.import_desktop_database` open SQLite
-  through `tabrion.sqlite` (new files and snapshots `0600`, symbolic links refused, a file of another user or one
-  writable by group or others refused). Open: (1) existing world-readable `nodestro.db` files keep their mode until
-  MIG-NOD-9; (2) the refusals raise `tabrion.errors.UnsafePath` (codes `sqlite.symlink`, `sqlite.unsafe_mode`,
-  `sqlite.unsafe_owner`, `sqlite.unsafe_path`), which the desktop and the api show as an unexpected error today; a
-  Nodestro problem code for them needs an `error_codes.json` change; (3) `secure_delete` is on in the profile
-  (doc 06 field 4 says off), because the Linux SQLite builds had it on before; decide whether to keep it.
-- **Next step:** MIG-NOD-9 tightens the existing files; the api maps `UnsafePath` with its desktop/diagnostics part
-  of MIG-NOD-6 (`API/diagnostics.py` `quick_check`, `API/backup.py` `integrity_check`).
+  through `tabrion.sqlite` (new files and snapshots `0600`, symbolic links refused; the desktop's database also when
+  it belongs to another user or is writable by group or others). A refusal is `storage.unsafe_file` (parameter
+  `reason`: `symlink`, `writable_by_others`, `other_owner`, `unsafe_path`) with what to do (`chmod go-w`, `chown`);
+  an import source is read whatever its owner and mode (`SHARED_SOURCE_PROFILE`, links still refused). Open:
+  (1) existing world-readable `nodestro.db` files keep their mode until MIG-NOD-9; (2) the api part of MIG-NOD-6
+  (`API/diagnostics.py` `quick_check`, `API/backup.py` `integrity_check`) and the api's text for
+  `storage.unsafe_file`; (3) Windows: Tabrion's `_is_link` treats every reparse point as a link, and OneDrive or
+  Dropbox placeholders (cloud files) are reparse points, so a data directory inside OneDrive may be refused as
+  `symlink`. Test a data directory in OneDrive (files on demand) with the desktop build, and propose that Tabrion
+  refuse only `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT`.
+- **Next step:** MIG-NOD-9 tightens the existing files; (2) with the api pin of MIG-NOD-6; (3) a Windows desktop-build
+  check before W6 ships, then a Tabrion issue for the reparse tags.
 
 Items that need an independent or external review (an internal audit does not replace it):
 

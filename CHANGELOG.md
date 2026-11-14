@@ -5,10 +5,12 @@
 - Security (TABRION MIG-NOD-6, findings B-06-3 and B-06-5): the desktop's SQLite connections (`SQLiteStore`,
   `sqlite_tables.memory_totals`, `postgres_import.import_desktop_database`) open through `tabrion.sqlite`. A new
   `nodestro.db` (with `-wal` and `-shm`) and every `SQLiteStore.snapshot` copy are `0600` whatever the umask (before
-  `0644`); a symbolic link as the database, its side files or a snapshot target is refused, and so is a database of
-  another user or one writable by group or others (`tabrion.errors.UnsafePath`). Existing files keep their mode.
-  Foreign keys are enforced and `trusted_schema` is off; WAL, `synchronous=FULL`, the 30 s busy timeout and
-  `secure_delete` stay. `SQLiteStore.migrate` runs on `tabrion.sqlite.migrate` (a second process that migrated in the
+  `0644`); a symbolic link as the database, its side files or a snapshot target is refused, and so is a desktop
+  database of another user or one writable by group or others (new code `storage.unsafe_file`, parameter `reason`,
+  with what to do); an import source is read whatever its owner and mode. Existing files keep their mode. Foreign keys
+  are enforced and `trusted_schema` is off; WAL, `synchronous=FULL` and the 30 s busy timeout stay. `secure_delete` is
+  now set on everywhere: before it was the SQLite build's default, on with Linux distributions' SQLite and off with
+  the SQLite of python.org, macOS and Windows and in the desktop bundles, where deleted content is now overwritten. `SQLiteStore.migrate` runs on `tabrion.sqlite.migrate` (a second process that migrated in the
   meantime is noticed after `BEGIN IMMEDIATE`) with the same codes, parameters and messages; a snapshot is checked
   (`quick_check`), synced and renamed into place and is one self-contained file (rollback journal). Everything else
   is unchanged (`tests/fixtures/sqlite_store_before.json`, recorded from the code before).

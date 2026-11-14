@@ -610,6 +610,7 @@
   "storage.schema_mismatch": ["found", "problems", "supported"],
   "storage.schema_too_new": ["found", "supported"],
   "storage.settings_invalid": ["variable"],
+  "storage.unsafe_file": ["reason"],
   "tool.adoption_desktop_only": ["name", "profile"],
   "tool.adoption_forbidden": ["name"],
   "tool.adoption_not_applicable": ["name"],

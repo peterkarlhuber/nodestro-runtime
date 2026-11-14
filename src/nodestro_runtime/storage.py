@@ -19,6 +19,7 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+import dataclasses
 from datetime import UTC, datetime
 import json
 import logging
@@ -30,7 +31,7 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 from tabrion import sqlite as tabrion_sqlite
-from tabrion.errors import BackupFailed, BackupRequired, MigrationFailed, MigrationMissing, SchemaTooNew
+from tabrion.errors import BackupFailed, BackupRequired, MigrationFailed, MigrationMissing, SchemaTooNew, UnsafePath
 
 from .error_texts import failure_text
 from .problems import NodestroError
@@ -43,7 +44,10 @@ logger = logging.getLogger(__name__)
 #: The schema version this release reads and writes (``PRAGMA user_version``; earlier releases wrote 0).
 SCHEMA_VERSION = 2
 #: One migration step: changes the schema from version ``n - 1`` to ``n`` on the given connection, inside the
-#: transaction :meth:`SQLiteStore.migrate` opened (it must not commit).
+#: transaction :meth:`SQLiteStore.migrate` opened (it must not commit, nor run ``executescript``, which commits).
+#: Foreign keys are on (:data:`SQLITE_PROFILE`), and ``PRAGMA foreign_keys = OFF`` has no effect inside a
+#: transaction: a step that rebuilds a table (create, copy, drop, rename) must keep every reference valid at each
+#: statement, or use ``PRAGMA defer_foreign_keys = ON``, which holds the checks until the commit.
 Migration = Callable[[sqlite3.Connection], None]
 #: The fields :meth:`SQLiteStore.find` looks up on hot paths (runs by status at start-up, runs of a publication).
 INDEXED_FIELDS = ("status", "trigger_ref")
@@ -260,10 +264,12 @@ class DamagedDocuments:
 
 #: How the desktop opens its SQLite database (TABRION MIG-NOD-6, ``tabrion.sqlite.connect``): WAL, ``synchronous=FULL``
 #: (durability as before), busy timeout 30 s, foreign keys on (``PRAGMA foreign_key_check`` must stay empty),
-#: ``trusted_schema`` off. ``secure_delete`` stays on: the SQLite of Linux distributions had it on by default, so the
-#: profile keeps that and no longer depends on the build. New files are created ``0600``; an existing file keeps its
-#: mode (MIG-NOD-9 tightens it), but must belong to the running user and not be writable by group or others, and no
-#: symbolic link is followed (``tabrion.errors.UnsafePath``).
+#: ``trusted_schema`` off, ``secure_delete`` on. Before, ``secure_delete`` was the build's default and never set: on
+#: with the SQLite of Linux distributions (Debian, Ubuntu), off with the SQLite of python.org, macOS and Windows and
+#: in the desktop bundles; the profile now sets it on everywhere (a change on those platforms: deleted content is
+#: overwritten). New files are created ``0600``; an existing file keeps its mode (MIG-NOD-9 tightens it), but must
+#: belong to the running user and not be writable by group or others, and no symbolic link is followed
+#: (``storage.unsafe_file``, :func:`open_sqlite`).
 SQLITE_PROFILE = tabrion_sqlite.SQLiteProfile(
     journal_mode=tabrion_sqlite.JournalMode.WAL,
     synchronous=tabrion_sqlite.Synchronous.FULL,
@@ -279,10 +285,58 @@ def _detail(error: Any, name: str, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
-def open_sqlite(database: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
-    """A connection to the desktop's SQLite file ``database`` under :data:`SQLITE_PROFILE` (autocommit, usable from
-    every thread; the caller serializes its use). ``read_only`` never creates or changes the file."""
-    return tabrion_sqlite.connect(database, profile=SQLITE_PROFILE, read_only=read_only, check_same_thread=False)
+#: The import source of a server (``postgres_import``): a copied desktop database may belong to another user or have
+#: a looser mode, which does not matter for a read-only copy; symbolic links stay refused.
+SHARED_SOURCE_PROFILE = dataclasses.replace(SQLITE_PROFILE, allow_shared_file=True)
+
+#: What a refused file is, and what the user does about it (``storage.unsafe_file``, parameter ``reason``).
+_UNSAFE_FILE = {
+    "sqlite.symlink": (
+        "symlink",
+        "is a symbolic link, or one of its -wal, -shm or -journal files is; Nodestro does not follow links. Move the "
+        "real file into the data directory in place of the link",
+    ),
+    "sqlite.unsafe_mode": (
+        "writable_by_others",
+        "may be changed by other users (group or others have write permission). Remove that permission "
+        "(chmod go-w on the file and its -wal and -shm files), then start again",
+    ),
+    "sqlite.unsafe_owner": (
+        "other_owner",
+        "belongs to another user. Give it to the user who runs Nodestro (chown), or run Nodestro as its owner",
+    ),
+}
+
+
+_UNSAFE_PATH = ("unsafe_path", "is not a regular file this user may open. Check the path and its permissions")
+
+
+def unsafe_advice(error: UnsafePath) -> tuple[str, str]:
+    """``(reason, what the file is and what to do)`` for a file that ``tabrion.sqlite`` refused."""
+    return _UNSAFE_FILE.get(error.code, _UNSAFE_PATH)
+
+
+def unsafe_file(error: UnsafePath, database: str | Path) -> NodestroError:
+    """The Nodestro problem for a database file that ``tabrion.sqlite`` refused (``storage.unsafe_file``)."""
+    reason, advice = unsafe_advice(error)
+    return NodestroError("storage.unsafe_file", f"The database {database} {advice}", reason=reason)
+
+
+def open_sqlite(
+    database: str | Path,
+    *,
+    read_only: bool = False,
+    profile: tabrion_sqlite.SQLiteProfile = SQLITE_PROFILE,
+    refusal: Callable[[UnsafePath], Exception] | None = None,
+) -> sqlite3.Connection:
+    """A connection to the desktop's SQLite file ``database`` under ``profile`` (default :data:`SQLITE_PROFILE`;
+    autocommit, usable from every thread; the caller serializes its use). ``read_only`` never creates or changes the
+    file. A file ``tabrion.sqlite`` refuses (a symbolic link, another owner, writable by others) raises
+    ``storage.unsafe_file`` with what to do about it, or what ``refusal`` makes of the refusal."""
+    try:
+        return tabrion_sqlite.connect(database, profile=profile, read_only=read_only, check_same_thread=False)
+    except UnsafePath as exc:
+        raise (refusal(exc) if refusal is not None else unsafe_file(exc, database)) from None
 
 
 def _like(prefix: str) -> str:
@@ -693,7 +747,10 @@ class SQLiteStore:
         checked (``quick_check``), synced and renamed over ``target``; it is one self-contained file
         (``journal_mode=DELETE``), and a symbolic link as ``target`` is refused."""
         with self._lock:
-            tabrion_sqlite.backup(self._connection, target, overwrite=True)
+            try:
+                tabrion_sqlite.backup(self._connection, target, overwrite=True)
+            except UnsafePath as exc:
+                raise unsafe_file(exc, target) from None
 
     @contextmanager
     def maintenance(self) -> Iterator[sqlite3.Connection]:

@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from .postgres_tables import search_words
 from .problems import NodestroError
-from .storage import SCHEMA_VERSION, open_sqlite
+from .storage import SCHEMA_VERSION, SHARED_SOURCE_PROFILE, open_sqlite, unsafe_advice
 from .storage_postgres import TENANT_ID, PostgresDatabase, _encode
 
 #: Document collections that are never imported (see the module documentation).
@@ -80,9 +80,19 @@ def import_desktop_database(source: str | Path, database: PostgresDatabase, tena
     database.require_current_schema()
     report = ImportReport(tenant_id=tenant_id)
     try:
-        # Read-only, under the desktop's profile (TABRION MIG-NOD-6); the resolved path, as before, so a source given
-        # through a symbolic link is still read (the link itself is not opened).
-        connection = open_sqlite(path.resolve(), read_only=True)
+        # Read-only (TABRION MIG-NOD-6); the resolved path, as before, so a source given through a symbolic link is
+        # still read (the link itself is not opened). A copied source may belong to another user or have a looser
+        # mode (SHARED_SOURCE_PROFILE); a linked side file is refused.
+        connection = open_sqlite(
+            path.resolve(),
+            read_only=True,
+            profile=SHARED_SOURCE_PROFILE,
+            refusal=lambda error: NodestroError(
+                "storage.import_source", f"Cannot open {path}: it {unsafe_advice(error)[1]}", path=str(path)
+            ),
+        )
+    except FileNotFoundError:
+        raise NodestroError("storage.import_source", f"{path} is not a file", path=str(path)) from None
     except sqlite3.OperationalError as exc:
         raise NodestroError("storage.import_source", f"Cannot open {path}: {exc}", path=str(path)) from exc
     except sqlite3.DatabaseError as exc:
