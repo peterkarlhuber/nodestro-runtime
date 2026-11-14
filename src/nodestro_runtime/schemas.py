@@ -133,7 +133,10 @@ class OutputField(_Model):
     #: Where a number must come from (agents' results only; a contract ignores it). ``model``: the agent's answer.
     #: ``tool``: a key figure that later steps rely on; it must be the result of a tool call of this step or an
     #: earlier one (:mod:`nodestro_runtime.value_checks`), otherwise the step fails with ``run.value_unverified``.
-    source: Literal["model", "tool"] = "model"
+    #: ``ledger`` (a ``string`` or ``string_list`` field): every value must name a source of the run's source ledger,
+    #: by id (``S3``) or URL (:mod:`nodestro_runtime.source_ledger`), otherwise the step fails with
+    #: ``output.unknown_source`` after one correction.
+    source: Literal["model", "tool", "ledger"] = "model"
 
 
 class OutputConfig(_Model):
@@ -690,6 +693,28 @@ class ToolCallRecord(_Model):
     approval: ToolCallApproval | None = None
 
 
+class SourceEntry(_Model):
+    """One web source a run's tools saw (:mod:`nodestro_runtime.source_ledger`): a search hit or a page that was read.
+    The ledger holds addresses and metadata only, never the page text, and it lives in its run: nothing carries it to
+    another run (search providers' terms forbid storing results)."""
+
+    #: ``S1``, ``S2`` ... in the order the run first saw the source.
+    id: str
+    url: str
+    #: The address after redirects, when the page was read.
+    final_url: str | None = None
+    title: str = ""
+    #: ``search``: only a search hit; ``fetched``: the page was read (a later read upgrades a hit).
+    origin: Literal["search", "fetched"] = "search"
+    #: The search provider of a hit (``test``, ``brave`` ...); ``None`` for a page read directly.
+    provider: str | None = None
+    retrieved_at: datetime = Field(default_factory=now)
+    #: SHA-256 of the content that was read (``fetched`` only).
+    sha256: str | None = None
+    #: The step whose tool call recorded it first.
+    node_id: str | None = None
+
+
 class RunCause(_Model):
     """Why a failed run failed (AD-02): the step that failed first and its problem, so that a run list or a banner
     can say "<step>: <reason>" without reading every step. Set together with ``error_code`` ``run.nodes_failed``;
@@ -922,6 +947,8 @@ class Run(_Model):
     warnings: list[RunWarning] = Field(default_factory=list)
     output: Any = None
     nodes: dict[str, NodeRun] = Field(default_factory=dict)
+    #: The run's source ledger (NAL-A2): every web source its tools saw; empty for runs without web tools.
+    sources: list[SourceEntry] = Field(default_factory=list)
     #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
     #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
     flow_state: dict[str, Any] | None = None

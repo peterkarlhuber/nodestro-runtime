@@ -74,3 +74,19 @@ def test_sanitize_run_without_personal_data_keeps_emails() -> None:
     copy = sanitize_run(run, personal_data=False)
     assert copy["input"].startswith("a@example.com [API_KEY_1]")
     assert run["input"].startswith("a@example.com sk-ant")
+
+
+def test_the_contents_mode_removes_what_the_source_ledger_looked_up() -> None:
+    source = {
+        "id": "S1",
+        "url": "https://example.com/a?q=salary",
+        "final_url": None,
+        "title": "Salary",
+        "origin": "search",
+    }
+    run = {"input": "", "nodes": {}, "workflow": {"nodes": []}, "sources": [source]}
+    [kept] = sanitize_run(run)["sources"]
+    assert kept["url"] == source["url"]
+    [removed] = sanitize_run(run, contents=True)["sources"]
+    assert removed["id"] == "S1" and removed["origin"] == "search"
+    assert removed["url"].startswith("[REMOVED") and removed["title"].startswith("[REMOVED")

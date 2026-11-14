@@ -199,6 +199,13 @@ back in `AgentTestResult.value_warnings` (a step that copies a figure from an ea
 number proves where the value came from, not that the agent chose the right inputs for the tool;
 figures inside free text are not checked.
 
+**Cited sources (NAL-A2).** Every run keeps a source ledger (`Run.sources`, `nodestro_runtime.source_ledger`): the web
+sources its built-in web tools saw, numbered `S1`, `S2` ... and announced with the run event `source_recorded`. A text
+field of a structured result marked `source="ledger"` (`string` or `string_list`) must name recorded sources, by id or
+address; a value that does not goes back to the agent once (event `sources_unknown`), and a second failure fails the
+step with `output.unknown_source`, so a made-up source is never delivered. The ledger holds addresses and metadata
+only and never leaves its run.
+
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).
@@ -281,7 +288,8 @@ copy. Runs without a readable `created_at` (and damaged documents) are not liste
 
 **PostgreSQL (server profile, preview).** `nodestro_runtime.storage_postgres` implements the same protocol on
 PostgreSQL; it needs the optional dependency `postgres` (psycopg 3; with the studio lock as above,
-`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `-e ".[dev,postgres]"` in a checkout) and is not
+`pip install -c <lock URL> "nodestro-runtime[postgres]"`, or `pip install -c <lock URL> -e ".[dev,postgres]"` in a
+checkout, with pip >= 26.1; never without the lock, which pins Tabrion and the other internal packages) and is not
 used by the desktop. `PostgresDatabase(conninfo, schema=...)` owns a pool of connections (`pool_size`, default
 `NODESTRO_DATABASE_POOL_SIZE`, else 8) shared by every tenant's store; `database.store(tenant_id)` gives
 the documents of one tenant. Every row carries `tenant_id` and every query filters on it, so one tenant's store
@@ -462,4 +470,4 @@ Open work (release blockers, known bugs, security follow-ups, debt) is listed in
 ## Provenance and license
 
 Extracted from `nodestro` 0.1 (15e2076); see [PROVENANCE.md](PROVENANCE.md) and [CHANGELOG.md](CHANGELOG.md).
-MIT, see [LICENSE](LICENSE).
+Proprietary: Copyright (c) 2026 Levuvo. All rights reserved. See [LICENSE](LICENSE).

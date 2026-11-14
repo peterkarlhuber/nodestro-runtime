@@ -20,6 +20,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
+from decimal import Decimal
 import re
 import threading
 from typing import Any, Literal
@@ -29,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .connections import ResolvedConnection
 from .schemas import ToolSettings
+from .source_ledger import SourceLedger
 from .tool_policy import BUILTIN_CAPABILITIES, ToolCapability
 
 Category = Literal["compute", "data", "files", "web", "communication"]
@@ -186,12 +188,27 @@ def settings_problems(name: str, spec: ToolSpec | None, settings: ToolSettings) 
 
 
 @dataclass(frozen=True)
+class RunServices:
+    """What a run lends the built-in tools of one step (NAL-A2): its source ledger and the booking of a tool's own
+    cost into the run's budget. Outside a run (the agent test, validation) a tool gets none."""
+
+    #: The run's source ledger and the step that records into it.
+    ledger: SourceLedger | None = None
+    node_id: str | None = None
+    #: Books ``units`` of the tool's ``cost_unit`` at ``cost_usd`` in total (``None``: unknown) for ``provider``.
+    book: Callable[[str, str, int, Decimal | None], None] | None = None
+    #: Raises when the run's budget is used up (asked before a priced call).
+    check_budget: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
 class ToolContext:
     """What a built-in tool sees about its binding while it runs (never part of the model's input)."""
 
     spec: ToolSpec
     params: Mapping[str, Any]
     connection: ResolvedConnection | None = None
+    services: RunServices = field(default_factory=RunServices)
 
 
 _CONTEXT: ContextVar[ToolContext | None] = ContextVar("nodestro_tool_context", default=None)
@@ -239,6 +256,7 @@ class SpecTool(Tool):
         params: Mapping[str, Any] | None = None,
         connection: Callable[[], ResolvedConnection | None] | None = None,
         counter: CallCounter | None = None,
+        services: RunServices | None = None,
     ) -> None:
         super().__init__(name=inner.name, strict=inner.strict)
         self.inner = inner
@@ -246,6 +264,7 @@ class SpecTool(Tool):
         self.params: Mapping[str, Any] = dict(params or {})
         self._resolve_connection = connection or (lambda: None)
         self._counter = counter or CallCounter()
+        self.services = services or RunServices()
         self.description = inner.description
         self.return_description = inner.return_description
         self.input_schema = inner.input_schema
@@ -269,7 +288,9 @@ class SpecTool(Tool):
                 f"Error: the call limit of {self.name} is reached ({self.spec.max_calls_per_run} per run, "
                 "tool.call_limit); answer with what you have"
             )
-        return ToolContext(spec=self.spec, params=self.params, connection=self._resolve_connection())
+        return ToolContext(
+            spec=self.spec, params=self.params, connection=self._resolve_connection(), services=self.services
+        )
 
     def _timed_out(self) -> ToolResultError:
         return ToolResultError(
@@ -316,6 +337,7 @@ def bind_tool(
     *,
     resolve: Callable[[str, str], ResolvedConnection] | None,
     counter: CallCounter,
+    services: RunServices | None = None,
 ) -> SpecTool:
     """``tool`` under ``spec`` with an agent's ``settings``. The connection is resolved at each call (a changed secret
     applies to the next call), through ``resolve(connection_id, connection_type)``."""
@@ -340,6 +362,7 @@ def bind_tool(
         params=settings.params if settings is not None else None,
         connection=connection,
         counter=counter,
+        services=services,
     )
 
 
@@ -349,6 +372,7 @@ __all__ = [
     "HOST_TOOL_TIMEOUT_SECONDS",
     "PLANNED_BUILTIN_NAMES",
     "CallCounter",
+    "RunServices",
     "SettingsProblem",
     "SpecTool",
     "ToolContext",
