@@ -147,6 +147,21 @@ def test_a_database_of_another_user_is_refused_with_advice(tmp_path: Path, monke
     assert caught.value.params == {"reason": "other_owner", "fixable": False} and "chown" in str(caught.value)
 
 
+def test_a_database_path_that_is_no_regular_file_is_refused_as_unsafe_path(tmp_path: Path) -> None:
+    """The fallback reason (RT-080): a refusal without its own advice is ``unsafe_path``, for the store and for
+    ``memory_totals`` alike."""
+    from nodestro_runtime.sqlite_tables import memory_totals
+
+    database = tmp_path / "nodestro.db"
+    database.mkdir()  # a directory where the database file belongs
+    for open_it in (lambda: SQLiteStore(database), lambda: memory_totals(str(database), "")):
+        with pytest.raises(NodestroError) as caught:
+            open_it()
+        assert caught.value.code == "storage.unsafe_file"
+        assert caught.value.params == {"reason": "unsafe_path", "fixable": False}
+        assert "is not a regular file" in str(caught.value)
+
+
 @pytest.mark.skipif(not POSIX, reason="symbolic links need privileges on Windows")
 def test_a_linked_wal_file_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "nodestro.db"
