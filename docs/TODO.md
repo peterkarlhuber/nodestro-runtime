@@ -53,7 +53,7 @@ None known.
   (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
 - **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
 
-### RT-078 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
+### RT-080 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-6 (this change, security review of #171),
   MIG-NOD-9 (E-NOD-PERM), findings B-06-3 and B-06-5, `storage.SQLITE_PROFILE`, `tests/test_sqlite_store_snapshots.py`
@@ -70,6 +70,22 @@ None known.
   refuse only `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT`.
 - **Next step:** MIG-NOD-9 tightens the existing files; (2) with the api pin of MIG-NOD-6; (3) a Windows desktop-build
   check before W6 ships, then a Tabrion issue for the reparse tags.
+
+### RT-079 · Runtime role checks: gaps left after MIG-NOD-5
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-5 (#169) and its security review,
+  `storage_postgres.grant_runtime_role`, nodestro-api `server.py` (pre-migrate role check, ≈ `:876-891`)
+- **What:** The role tools follow Tabrion's rule I-20 since MIG-NOD-5 (a role that can become a superuser, a
+  `BYPASSRLS` role, the owner role or the schema's owner is refused). Found in the review: (1) done in #169: a member
+  of `pg_write_all_data` (PostgreSQL 14+) is refused before anything is granted, and `grant_runtime_role` fails
+  (`storage.role_unsafe`) when the role can still write a schema-version table afterwards (`pg_read_all_data` is
+  still worth a warning); still open: (2) `CREATEROLE` on PostgreSQL 15 and older lets a role grant itself
+  membership of any non-superuser role, the owner role included, so it is as good as the owner (refuse it there);
+  (3) the api's pre-migrate check of the runtime role reads `inspect_role` and decides with its own flags, so it does
+  not know the new "can become the owner role or the schema's owner" refusal, which only `grant_runtime_role`
+  raises; it should use the same rule (the api part of MIG-NOD-5).
+- **Next step:** (2) needs Tabrion support (a check in `tabrion.postgres.inspect_role`/`grant_runtime_role`) or a
+  Nodestro pre-check with a test; (3) goes with the api pin of MIG-NOD-5.
 
 Items that need an independent or external review (an internal audit does not replace it):
 
@@ -445,16 +461,24 @@ Items that need an independent or external review (an internal audit does not re
   purpose (plan v1.1, NAL-A1 §4).
 - **Next step:** Migrate on first start with a key store, keep reading the old form, test on desktop and Local Docker.
 
-### RT-076 · Service connections: network check and cost booking (with NAL-A2)
+### RT-076 · Service connections: live checks of search providers (NAL-A2 follow-up)
 
-- **Priority:** P3 Low · **Status:** Blocked (NAL-A2 not released yet) · **Refs:** ADR-0001 D-1/D-3,
-  `connections.py` (`_check_search`, `_check_configuration`), `tool_spec.ToolSpec.cost_unit`
-- **What:** Until the network guard of NAL-A2 exists, a connection check contacts no service (only the offline
-  `test` search provider; SMTP and webhook connections get a configuration check). `cost_unit` and
-  `price_per_request_usd` exist, but no tool books a cost into the run budget yet, because no built-in tool has a
-  cost before NAL-A2.
-- **Next step:** With NAL-A2: checks through the guarded transport (egress list, private ranges at call time), and
-  book `cost_unit` x price into the run's tracker as `tool:<id>` (counted by BUDGET-1).
+- **Priority:** P3 Low · **Status:** Blocked (owner approval for real searches, E-3) · **Refs:** ADR-0001 amendment
+  NAL-A2, `connections._check_search`, `web_tools.PROVIDERS`
+- **What:** NAL-A2 added the egress guard and the cost booking (`RunServices.book`). The check of a search
+  connection still contacts no service: a real search may be paid and needs the owner's approval. The Mojeek and
+  SearXNG adapters are tested against hand-written answers from the public API documentation, not recordings.
+- **Next step:** With approval: one live smoke per provider with a cost limit (plan v1.1 NAL-A2 step 12), then a
+  check that sends one small search through the guard.
+
+### RT-078 · Web tools in the server profile (NAL-A2)
+
+- **Priority:** P2 Medium · **Status:** Blocked (independent review D1, RT-077) · **Refs:** `tool_spec.offered`,
+  `NODESTRO_WEB_TOOLS_SERVER`, orkexa ADR 0017
+- **What:** `search_web` and `fetch_web_page` are not offered in the server profile: the workflow check reports
+  `check.tool_mode_unsupported` and every call is refused (`tool.mode_unsupported`) unless the operator sets
+  `NODESTRO_WEB_TOOLS_SERVER=1`. The owner's approval of NAL-A2 does not enable them on servers.
+- **Next step:** After the independent review of `orkexa.net.guard` and the web tools (D1): the owner decides.
 
 ### RT-041 · Similarity hint for pasted code that resembles AI-generated code (R-4)
 
@@ -536,6 +560,18 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Tests and quality assurance
 
+### RT-078 · Dependency confusion: the poisoned-index job and the studio origin commit (TABRION DC-NR-1)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION DC-NR-1, `scripts/check_tabrion_source.py` (checksummed
+  copy from nodestro-studio, `tests/test_tabrion_source_check.py`), `tests/test_tabrion_pin.py`, CI job
+  `tabrion source (poisoned index)`
+- **What:** the CI install runs under a poisoned index that serves `tabrion` and must get no request for it (the
+  proof that the lock pin works); `tests/test_tabrion_pin.py` checks that the installed Tabrion's `direct_url.json`
+  names the studio lock's commit (`NODESTRO_STUDIO_LOCK`), which only detects an accidental index install. The job is
+  in `.github/ci-manifest.json` and reported by ci-ok. Open: the copy names an unmerged studio commit as its origin
+  until nodestro-studio's DC-NS-2 branch is merged.
+- **Next step:** after the studio merge, update the origin commit; close this entry.
+
 ### RT-072 · Rollback snapshots before and after each TABRION MIG-NOD step
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION QA-13 (this change), Tabrion plan documents 06 and 11
@@ -544,10 +580,11 @@ Items that need an independent or external review (an internal audit does not re
   `grant_runtime_role`, role decision table of eight variants, error answers of the database paths, `SHOW` extract per
   kind of connection, schema dump) are in place and checked by `tests/test_rollback_snapshots.py`. The steps that use
   them: MIG-NOD-3 (error texts, done; it rewrote `errors.json`, whose backup and migration messages carried the
-  canary value of finding B-06-2), and still to come MIG-NOD-4 (session configuration, `settings.json`), MIG-NOD-5
-  (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not covered: it records its own "before"
-  output of `pgvector_status` in pg-a and pg-b first (review L-6). Review fix round (`qa-13-25-review.md` M-1, M-2,
-  M-6, L-1, L-2, L-7): `catalog.json` names Axentra's tables (RLS/FORCE flags, privileges, counts) and holds every
+  canary value of finding B-06-2), MIG-NOD-4 (session configuration and session locks, done; `settings.json`
+  unchanged), and still to come MIG-NOD-5 (roles, `catalog.json`, `roles.json`). MIG-NOD-7 (extension status) is not
+  covered by these files: it has its own baseline `tests/fixtures/pgvector_status_before.json` (review L-6). Review fix
+  round (`qa-13-25-review.md` M-1, M-2, M-6, L-1, L-2, L-7): `catalog.json` names Axentra's tables (RLS/FORCE flags,
+  privileges, counts) and holds every
   policy, function and ACL entry of the schema and the run roles' memberships, with one detection test per kind of
   change (column grant, `WITH GRANT OPTION`, `PUBLIC`, membership, RLS or FORCE off on `axentra_tenants`); an Axentra
   pin that changes Axentra's tables rewrites `catalog.json` in the pin pull request. Random password per run;
@@ -560,6 +597,8 @@ Items that need an independent or external review (an internal audit does not re
   `pytest tests/test_rollback_snapshots.py` once as the superuser and once with `NODESTRO_TEST_RUNTIME_ROLE=1`;
   nightly is enough (E-QA1). The schema dump already leaves out PostgreSQL 18's catalogued NOT NULL constraints
   (`contype = 'n'`, also in `columns`); a remaining difference on 18 is a finding for that pull request.
+  MIG-NOD-5 (role tools through Tabrion) has `catalog.json` byte-identical on PostgreSQL 16 (local, superuser and
+  runtime role mode) and 17 (CI); 18 is still unchecked until this job exists.
 - **Next step:** Each of these pull requests states the `check` result before and after the change and the reason
   for every rewritten golden file; remove this entry with the last of them.
 
@@ -599,8 +638,9 @@ Items that need an independent or external review (an internal audit does not re
   `tests/test_tabrion_pin.py` requires that every Tabrion requirement here names the same minor range
   `>=0.N,<0.(N+1)` and that the installed Tabrion is a final version inside it (the exact commit lives in the studio
   lock since the CI-FAST pin switch).
-- **Next step:** MIG-NOD-7 (or the first step that uses `require_extension`) switches the pgvector variable in the
-  same pull request as its `.github` change.
+- **Next step:** the first step that uses `require_extension` switches the pgvector variable in the same pull request
+  as its `.github` change (MIG-NOD-7 does not: `pgvector_status` uses `extension_status`, the fixtures stay as they
+  are).
 
 ### RT-056 · The test double answers in German in every language
 
@@ -782,6 +822,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-077 | nodestro-api, tabrion | API-065 (connection API), CR-DB NOD-CR-2 (`database` type) | ADR-0001 is the shared connection contract; CR-DB registers `database` instead of its own model (owner decision E-2) |
+| RT-078 | nodestro-studio, nodestro-api | NAL-A2 server switch | `NODESTRO_WEB_TOOLS_SERVER` stays off until the owner decides after D1 |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |

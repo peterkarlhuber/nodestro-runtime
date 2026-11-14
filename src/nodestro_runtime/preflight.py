@@ -29,7 +29,8 @@ from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
 from .schemas import Workflow
-from .source_ledger import LEDGER_FIELD_TYPES, WEB_TOOL_NAMES
+from .source_ledger import CHECKED_SOURCES, FILLED_SOURCES, LEDGER_FIELD_TYPES, WEB_TOOL_NAMES
+from .tool_spec import offered
 from .value_checks import computes
 
 if TYPE_CHECKING:
@@ -405,7 +406,7 @@ def _tool_spec_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssu
             spec = nodestro.tools.specs.get(name) if name in nodestro.tools.builtin else None
             if spec is None:
                 continue
-            if mode not in spec.modes:
+            if not offered(spec, mode):
                 found.append(
                     _issue(
                         "check.tool_mode_unsupported",
@@ -1149,7 +1150,7 @@ def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
         if node.type != "agent" or agent is None:
             continue
         for item in agent.output.fields:
-            if item.source == "ledger":
+            if item.source in CHECKED_SOURCES | FILLED_SOURCES:
                 found.extend(_ledger_field_issues(workflow, node.id, agent.output.mode, item.name, item.type))
                 continue
             if item.source != "tool":
@@ -1183,8 +1184,9 @@ def _checked_value_issues(workflow: Workflow) -> list[CheckIssue]:
 
 
 def _ledger_field_issues(workflow: Workflow, node_id: str, mode: str, name: str, kind: str) -> list[CheckIssue]:
-    """A field whose values must name sources of the run's source ledger (``source="ledger"``, NAL-A2): only text
-    fields of a structured result are checked, and some agent up to this one must have a web tool that records
+    """A field whose values must name or cite sources of the run's source ledger, or that the run fills from it
+    (``source="ledger"``, ``ledger_cited``, ``ledger_list``, ``ledger_range``; NAL-A2, NAL-B2): only text fields of a
+    structured result are checked or filled, and some agent up to this one must have a web tool that records
     sources."""
     if mode != "structured" or kind not in LEDGER_FIELD_TYPES:
         return [

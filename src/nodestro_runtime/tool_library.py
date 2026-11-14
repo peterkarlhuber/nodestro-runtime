@@ -78,6 +78,7 @@ from .schemas import new_id, now
 from .tool_policy import UNKNOWN, ToolCapability, capability_of
 from .tool_provenance import MemoryProvenance, ToolAdoption, ToolProvenance, code_digest, content_hash
 from .tool_spec import BUILTIN_SPECS, PLANNED_BUILTIN_NAMES, ToolSpec
+from .web_tools import WEB_TOOLS
 
 if TYPE_CHECKING:
     from .docker_status import DockerStatus
@@ -534,7 +535,7 @@ class ToolLibrary:
         self.provenance: ToolProvenance = provenance or MemoryProvenance()
         self._lock = threading.RLock()
         self.builtin: dict[str, Tool] = {}
-        for tool in (*BUILTIN_TOOLS, *extra_tools):
+        for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *extra_tools):
             assert tool.name is not None
             self.builtin[tool.name] = tool
         #: The specs of built-in tools (NAL-A1): Nodestro's own and those integrations handed in (contract 2).

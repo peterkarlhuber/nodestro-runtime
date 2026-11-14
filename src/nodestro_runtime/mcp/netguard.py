@@ -13,13 +13,16 @@ variables are ignored; the HTTP client is built with ``trust_env=False``.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import ipaddress
 import os
-import socket
 from typing import Any, cast
 from urllib.parse import urlsplit
+
+# The connection step is Orkexa's shared egress guard since NAL-A2 (one implementation for MCP and the web tools).
+from orkexa.net.guard import GuardedBackend as _CoreBackend
+from orkexa.net.guard import Resolver as Resolver
+from orkexa.net.guard import system_resolver as system_resolver
 
 # The address rules live in the core since NAL-A1 (service connections use them too); re-exported unchanged.
 from ..net_address import METADATA_ADDRESSES as METADATA_ADDRESSES
@@ -40,8 +43,6 @@ _LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhos
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 ENDPOINTS_ENV = "NODESTRO_MCP_ENDPOINTS"
-
-Resolver = Callable[[str, int], Awaitable[list[str]]]
 
 
 def _normal_origin(url: str) -> tuple[str, str, int]:
@@ -155,100 +156,21 @@ def _is_loopback_literal(host: str) -> bool:
     return literal is not None and address_problem(literal, allow_loopback=True) is None and literal.is_loopback
 
 
-async def system_resolver(host: str, port: int) -> list[str]:
-    import anyio
-
-    infos = await anyio.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    return [str(info[4][0]) for info in infos]
-
-
 @dataclass
-class GuardedBackend:
-    """An ``httpcore2`` network backend that connects only to checked addresses (see the module documentation)."""
+class GuardedBackend(_CoreBackend):
+    """An ``httpcore2`` network backend that connects only to checked addresses (see the module documentation).
 
-    allow_loopback: bool = False
-    resolver: Resolver = system_resolver
-    #: Every address connected to, for tests and the audit trail.
-    connected: list[str] = field(default_factory=list)
-    #: HTTP status codes of the answers (the SDK does not always pass them on; used for stable error codes).
-    statuses: list[int] = field(default_factory=list)
+    Orkexa's shared backend (:class:`orkexa.net.guard.GuardedBackend`, NAL-A2) with MCP's error codes
+    (``mcp.address_refused``, ``mcp.dns_failed``) and the ``httpcore2`` fork the MCP SDK uses."""
 
-    async def resolve(self, host: str, port: int) -> list[IPAddress]:
-        literal = _literal(host)
-        if literal is not None:
-            candidates = [literal]
-        else:
-            if host.lower().rstrip(".") in METADATA_HOSTS:
-                raise NodestroError(
-                    "mcp.address_refused", f"The address {host} is refused", host=host, reason="metadata"
-                )
-            try:
-                answers = await self.resolver(host, port)
-            except OSError as exc:
-                raise NodestroError("mcp.dns_failed", f"The name {host} cannot be resolved", host=host) from exc
-            candidates = []
-            for answer in answers:
-                parsed = _literal(answer.split("%")[0]) if "%" in answer else _literal(answer)
-                if parsed is None:
-                    continue
-                if "%" in answer:  # a scoped (link-local) answer
-                    raise NodestroError(
-                        "mcp.address_refused", f"{host} resolves to a scoped address", host=host, reason="scoped"
-                    )
-                candidates.append(parsed)
-        if not candidates:
-            raise NodestroError("mcp.dns_failed", f"The name {host} has no address", host=host)
-        for candidate in candidates:
-            reason = address_problem(candidate, allow_loopback=self.allow_loopback)
-            if reason is not None:
-                # One refused answer refuses the name: a mix of public and internal answers is an attack pattern.
-                raise NodestroError(
-                    "mcp.address_refused",
-                    f"{host} resolves to a refused address ({reason})",
-                    host=host,
-                    reason=reason,
-                )
-        return candidates
+    httpcore_module: str = "httpcore2"
 
-    async def connect_tcp(
-        self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: Iterable[Any] | None = None,
-    ) -> Any:
-        import anyio
-        from httpcore2 import ConnectError, ConnectTimeout
-        from httpcore2._backends.anyio import AnyIOStream
-
-        addresses = await self.resolve(host, port)
-        last: Exception | None = None
-        for address in addresses:
-            try:
-                with anyio.fail_after(timeout):
-                    stream = await anyio.connect_tcp(str(address), port, local_host=local_address)
-            except TimeoutError as exc:
-                last = ConnectTimeout(str(exc))
-                continue
-            except OSError as exc:
-                last = ConnectError(str(exc))
-                continue
-            for option in socket_options or ():
-                stream._raw_socket.setsockopt(*option)
-            # The connected peer is the checked address: anyio connected to the literal address, no new lookup.
-            self.connected.append(str(address))
-            return AnyIOStream(stream)
-        assert last is not None
-        raise last
-
-    async def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options: Any = None) -> Any:
-        raise NodestroError("mcp.address_refused", "Unix sockets are refused", host=path, reason="unix")
-
-    async def sleep(self, seconds: float) -> None:
-        import anyio
-
-        await anyio.sleep(seconds)
+    def error(self, code: str, message: str, **details: Any) -> Exception:
+        # The guard raises exactly these two; written out so the error code catalog finds both.
+        host = details.get("host", "")
+        if code == "dns_failed":
+            return NodestroError("mcp.dns_failed", message, host=host)
+        return NodestroError("mcp.address_refused", message, host=host, reason=details.get("reason", ""))
 
 
 def redact_url(url: str) -> str:

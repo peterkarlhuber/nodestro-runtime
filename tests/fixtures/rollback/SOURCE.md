@@ -23,10 +23,15 @@ The snapshots in this directory are the "before" picture of the server-profile s
 `DETAIL` text (`message_has_canary: true`). MIG-NOD-3 closed B-06-2 and rewrote `errors.json` with the tool (only
 those three messages changed: they now end with Tabrion's value-free text; the other four files were identical) and
 the expectation in `tests/test_rollback_snapshots.py`. A revert of MIG-NOD-3 restores the old `errors.json` with it.
+MIG-NOD-5 (role tools through Tabrion) rewrote `roles.json` with the tool: only the `superuser` variant changed, which
+now reports `bypass_rls: true` (Tabrion contract I-20: a superuser can become the bootstrap superuser, which has
+`BYPASSRLS`) and names it in the refusal message; `catalog.json` (every grant and ACL entry) and the other files were
+byte-identical. A revert of MIG-NOD-5 restores the old `roles.json` with it.
 A pull request that changes another snapshot on purpose (for example a new migration) rewrites the file with the tool
 and says why. A rollback (revert pull request) is verified by the same files: after the revert, `check` reports
 "snapshots identical" again.
 
 MIG-NOD-7 (extension status) is **not** covered by these files: `schema.json` leaves extension objects out, and no
-file records `pgvector_status`, whose answer depends on the server (pgvector mode A or B). MIG-NOD-7 writes its own
-"before" output of `pgvector_status` in both CI modes (pg-a, pg-b) from the old code first (review L-6).
+file records `pgvector_status`, whose answer depends on the server (pgvector mode A or B). MIG-NOD-7 has its own
+baseline instead (review L-6): `tests/fixtures/pgvector_status_before.json`, written by the old code
+(`tests/fixtures/make_pgvector_status.py`) and compared in both CI modes (pg-a, pg-b) by `tests/test_pgvector_status.py`.
