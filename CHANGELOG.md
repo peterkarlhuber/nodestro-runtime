@@ -13,6 +13,9 @@
   the wrong extra, the studio, an unknown Levuvo package). Ruff skips the vendored script (it is linted in
   nodestro-studio). No CI workflow change.
 
+- Test for the fallback reason `unsafe_path` of `storage.unsafe_file` (a database path that is no regular file,
+  for the store and `memory_totals`); RT-080 brought up to date after the re-check of the #171 review conditions
+  (TABRION MIG-NOD-6, 2026-11-14).
 - Hardened skills after the internal security review of the import path (NAL-B3): skill text cannot close its
   `<skill_content>`/`<skill_file>` frame; the skills block follows the security note; `read_skill_file` returns at
   most 50 KB per call and 400 KB per step; imported content keeps a skill marked as imported (`Skills.save(origin=)`);
