@@ -148,7 +148,7 @@ from .tool_approvals import (
     reclassified,
     tool_facts,
 )
-from .tool_spec import RunServices
+from .tool_spec import CallCounter, RunServices
 from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
@@ -901,6 +901,8 @@ class _RunContext:
         self.flow_stop: flow.Stop | None = None
         #: Set when the run's time limit was reached and its running nodes were cancelled.
         self.timed_out = False
+        #: Calls of built-in tools across all steps of the run (NAL-A2: a run-wide cap besides the per-step one).
+        self.tool_calls = CallCounter()
         #: Set (root context) when the process stops gracefully (SIGTERM, quitting the app): the run ends as
         #: interrupted, not as cancelled by a person (AD-10).
         self.shutting_down = False
@@ -4042,6 +4044,7 @@ class RunManager:
             node_id=node_id,
             book=book,
             check_budget=context.tracker.check,
+            run_calls=context.root.tool_calls,
         )
 
     def _check_sources(

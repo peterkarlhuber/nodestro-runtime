@@ -274,6 +274,9 @@ class RunServices:
     refused: str | None = None
     #: Pages a run's tools already read (url -> result), so a page is fetched once per step; memory only.
     cache: dict[str, Any] = field(default_factory=dict)
+    #: Calls per tool across all steps of the run; each tool may make at most :data:`RUN_CALL_FACTOR` times its
+    #: per-step limit in one run (``None`` outside a run).
+    run_calls: CallCounter | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +304,10 @@ def _bound(context: ToolContext) -> Any:
         yield
     finally:
         _CONTEXT.reset(token)
+
+
+#: A run may call a built-in tool at most this many times its per-step limit, across all its steps and loops.
+RUN_CALL_FACTOR = 5
 
 
 class CallCounter:
@@ -374,6 +381,13 @@ class SpecTool(Tool):
             raise ToolResultError(
                 f"Error: the call limit of {self.name} is reached ({limit} per run, tool.call_limit); answer with "
                 "what you have"
+            )
+        run_calls = self.services.run_calls
+        cap = None if self.spec.max_calls_per_run is None else self.spec.max_calls_per_run * RUN_CALL_FACTOR
+        if run_calls is not None and not run_calls.take(self.spec.id, cap):
+            raise ToolResultError(
+                f"Error: the call limit of {self.name} for the whole run is reached ({cap} calls over all steps, "
+                "tool.call_limit); answer with what you have"
             )
         return ToolContext(
             spec=self.spec, params=self.params, connection=self._resolve_connection(), services=self.services

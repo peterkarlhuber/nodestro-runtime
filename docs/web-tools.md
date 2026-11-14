@@ -25,7 +25,7 @@ ledger (`Run.sources`, ids `S1`, `S2` ...; see `source_ledger.py`). A structured
 | `brave` | yes | 0.005 USD per request (documented), or the connection's price | all | Results must not be stored (terms): the ledger keeps addresses only, per run |
 | `tavily` | yes | the connection's `price_per_request_usd` (required) | all | Billed in plan credits |
 | `mojeek` | yes | the connection's `price_per_request_usd` (required) | all | Operated in Europe |
-| `searxng` | optional bearer token | 0 | all | A self-hosted instance at `endpoint`; private addresses allowed for that host only |
+| `searxng` | optional bearer token | 0 | all | A self-hosted instance at `endpoint`; private addresses allowed for that host only, never on a server |
 
 No provider is chosen automatically (owner decision pending, E-3). A paid provider without a known price is not
 called (`search.price_unknown`). The connection check never sends a real search (RT-076).
@@ -46,6 +46,12 @@ as codes (`web.address_refused, loopback`, `fetch.unsupported_type` ...), never 
 - Budget: a paid search checks the run budget first and books `units x price` as a token-free usage record
   (`web_search_requests`).
 - Pages read in one step are kept in memory for that step only (`RunServices.cache`); nothing is stored across runs.
+- Call limits: per step (the spec's `max_calls_per_run`, lowered by the binding's `max_calls`) and per run across
+  all steps and loops (`RUN_CALL_FACTOR` = 5 times the spec's limit).
+- Host lists (`allow_hosts`, `deny_hosts`): `example.com` matches that name only, `*.example.com` every name below
+  it; in a deny list it also matches example.com itself. Search filters and the fetch guard use the same rule.
+- A host that builds agents sets `AgentBuilder.mode`; without it the builder assumes `server`.
+- HTML is read in a separate, time- and memory-limited process within the rest of the request's deadline (Orkexa).
 
 Not included: image and video search, crawling, JavaScript rendering, sign-in on web pages, OpenAI and Gemini native
 web search (RT-065).

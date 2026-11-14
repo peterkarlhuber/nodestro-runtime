@@ -15,6 +15,12 @@
   `offers()`/`needs_secret()`, `add_search_provider(host=, keyless=, modes=)`, problem
   `connection.provider_unsupported_mode`. A built-in tool not offered in the installation's mode now refuses every
   call, not only the workflow check. The base dependency becomes `orkexa[all,pdf,local,convert,web]`.
+  Internal review fixes: on a server a SearXNG endpoint must not resolve to private or loopback addresses;
+  `AgentBuilder.mode` defaults to `server` (hosts that build agents set their mode); search hits and ledger entries
+  with whitespace or control characters in the address are left out, and the correction prompt lists the run's
+  sources inside the external-content marker; a run-wide cap (`RUN_CALL_FACTOR` x the per-step limit) per tool; host
+  patterns follow the fetch guard (`*.example.com` matches example.com itself only in deny lists); source ids are
+  matched by normalized address.
 
 - Added (NAL-A2, source ledger): every run has a source ledger (`Run.sources`, `schemas.SourceEntry`,
   `source_ledger`). Built-in tools record the web sources they see through `ToolContext.services.ledger` (ids `S1`,

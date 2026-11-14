@@ -301,7 +301,10 @@ class AgentBuilder:
         self.find_connection: Callable[[str], Any] = lambda _connection_id: None
         #: The installation's mode for the tool specs (``desktop``, ``local-container``, ``server``, ``export``): a
         #: built-in tool not offered in it refuses every call (``tool.mode_unsupported``), whatever started the run.
-        self.mode: str = "desktop"
+        # The installation's mode decides which built-in tools are offered (tool_spec.offered). A host that does not
+        # set it gets the strictest reading, "server" (NAL-A2 review): the workspace sets its connections' mode, a
+        # portable package sets "export".
+        self.mode: str = "server"
 
     def output_limit(self, operation: str, model: str, connection: Connection | None = None) -> EffectiveLimit:
         """The output limit one of Nodestro's own AI operations sends to ``model``: the workspace setting, else the

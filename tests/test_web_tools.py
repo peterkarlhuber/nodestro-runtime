@@ -395,3 +395,41 @@ async def test_provider_errors_are_explained_without_the_providers_text(
         assert "sk-secret" not in (call.output or "") and "test-key-not-real" not in json.dumps(
             result.model_dump(), default=str
         )
+
+
+# ---- internal review findings ------------------------------------------------------------------------------------
+
+
+def test_searxng_on_a_server_refuses_private_networks(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nodestro_runtime.connections import ResolvedConnection
+    from nodestro_runtime.tool_spec import RunServices, ToolContext, _bound
+
+    connection = ResolvedConnection(
+        id="c",
+        type="search",
+        provider="searxng",
+        name="SearXNG",
+        settings={"endpoint": "https://searx.example"},
+        egress=("searx.example:443",),
+    )
+    for mode, private in (("server", False), ("desktop", True), ("local-container", True)):
+        context = ToolContext(spec=BUILTIN_SPECS["search_web"], params={}, services=RunServices(mode=mode))
+        with _bound(context):
+            provider = web_tools.PROVIDERS["searxng"].build(connection)
+        assert provider.policy.allow_private is private, mode
+    assert web_tools.PROVIDERS["searxng"].build(connection).policy.allow_private is False  # no context: server
+
+
+def test_the_host_rule_matches_the_fetch_guard() -> None:
+    allow = frozenset({"*.example.com"})
+    assert web_tools._listed("a.example.com", allow, apex=False)
+    assert not web_tools._listed("example.com", allow, apex=False)
+    assert web_tools._listed("example.com", allow, apex=True)
+    assert not web_tools._listed("badexample.com", allow, apex=True)
+
+
+def test_an_agent_builder_without_a_mode_is_a_server() -> None:
+    from nodestro_runtime.agent_builder import AgentBuilder
+
+    builder = AgentBuilder(None, None, None)  # type: ignore[arg-type]
+    assert builder.mode == "server"
