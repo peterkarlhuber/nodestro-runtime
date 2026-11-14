@@ -206,6 +206,11 @@ address; a value that does not goes back to the agent once (event `sources_unkno
 step with `output.unknown_source`, so a made-up source is never delivered. The ledger holds addresses and metadata
 only and never leaves its run.
 
+**Web tools (NAL-A2).** `search_web` asks the search provider of the agent's `search` connection (none is chosen
+automatically) and `fetch_web_page` reads one page through Orkexa's egress guard; both mark their results as external
+content and fill the source ledger. They are refused in the strict offline mode and not offered in the server profile
+unless `NODESTRO_WEB_TOOLS_SERVER=1`. Details: [docs/web-tools.md](docs/web-tools.md).
+
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
 installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).

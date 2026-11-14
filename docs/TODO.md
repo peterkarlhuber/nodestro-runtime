@@ -427,16 +427,24 @@ Items that need an independent or external review (an internal audit does not re
   purpose (plan v1.1, NAL-A1 §4).
 - **Next step:** Migrate on first start with a key store, keep reading the old form, test on desktop and Local Docker.
 
-### RT-076 · Service connections: network check and cost booking (with NAL-A2)
+### RT-076 · Service connections: live checks of search providers (NAL-A2 follow-up)
 
-- **Priority:** P3 Low · **Status:** Blocked (NAL-A2 not released yet) · **Refs:** ADR-0001 D-1/D-3,
-  `connections.py` (`_check_search`, `_check_configuration`), `tool_spec.ToolSpec.cost_unit`
-- **What:** Until the network guard of NAL-A2 exists, a connection check contacts no service (only the offline
-  `test` search provider; SMTP and webhook connections get a configuration check). `cost_unit` and
-  `price_per_request_usd` exist, but no tool books a cost into the run budget yet, because no built-in tool has a
-  cost before NAL-A2.
-- **Next step:** With NAL-A2: checks through the guarded transport (egress list, private ranges at call time), and
-  book `cost_unit` x price into the run's tracker as `tool:<id>` (counted by BUDGET-1).
+- **Priority:** P3 Low · **Status:** Blocked (owner approval for real searches, E-3) · **Refs:** ADR-0001 amendment
+  NAL-A2, `connections._check_search`, `web_tools.PROVIDERS`
+- **What:** NAL-A2 added the egress guard and the cost booking (`RunServices.book`). The check of a search
+  connection still contacts no service: a real search may be paid and needs the owner's approval. The Mojeek and
+  SearXNG adapters are tested against hand-written answers from the public API documentation, not recordings.
+- **Next step:** With approval: one live smoke per provider with a cost limit (plan v1.1 NAL-A2 step 12), then a
+  check that sends one small search through the guard.
+
+### RT-078 · Web tools in the server profile (NAL-A2)
+
+- **Priority:** P2 Medium · **Status:** Blocked (independent review D1, RT-077) · **Refs:** `tool_spec.offered`,
+  `NODESTRO_WEB_TOOLS_SERVER`, orkexa ADR 0017
+- **What:** `search_web` and `fetch_web_page` are not offered in the server profile: the workflow check reports
+  `check.tool_mode_unsupported` and every call is refused (`tool.mode_unsupported`) unless the operator sets
+  `NODESTRO_WEB_TOOLS_SERVER=1`. The owner's approval of NAL-A2 does not enable them on servers.
+- **Next step:** After the independent review of `orkexa.net.guard` and the web tools (D1): the owner decides.
 
 ### RT-041 · Similarity hint for pasted code that resembles AI-generated code (R-4)
 
@@ -776,6 +784,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | — | orkexa | ORK-003 (A-05, ORK3-10): redirects and loopback rules when `orkexa.Agent` is used directly | Compatible endpoints refuse redirects in the pinned orkexa `f89102c`; the loopback rules stay with orkexa. Runtime's server path already refuses redirects |
 | RT-010 | nodestro-api | API-005 (operator command for key rotation) | Runtime provides `SecretBox` support |
 | RT-077 | nodestro-api, tabrion | API-065 (connection API), CR-DB NOD-CR-2 (`database` type) | ADR-0001 is the shared connection contract; CR-DB registers `database` instead of its own model (owner decision E-2) |
+| RT-078 | nodestro-studio, nodestro-api | NAL-A2 server switch | `NODESTRO_WEB_TOOLS_SERVER` stays off until the owner decides after D1 |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |

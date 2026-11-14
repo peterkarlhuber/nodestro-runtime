@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Added (NAL-A2, web tools; `docs/web-tools.md`): built-in tools `search_web` (web and news through the provider of a
+  `search` connection) and `fetch_web_page` (HTML, text and PDF through Orkexa's egress guard), specs
+  `SEARCH_WEB_SPEC` and `FETCH_WEB_PAGE_SPEC` (read + external, never offline, call and time limits, binding
+  parameters for hosts, defaults and `max_calls`). Results are marked as external content with a per-call nonce,
+  recorded in the run's source ledger and errors reach the model as codes only. Search providers `test`, `ddgs`
+  (keyless, never on a server, extra `web-ddgs`), `brave`, `tavily`, `mojeek` and `searxng` (keyless, self-hosted);
+  none is a default, a paid provider without a known price is not called (`search.price_unknown`), and the
+  connection check sends no real search. The web tools are not offered in the server profile
+  (`check.tool_mode_unsupported`, calls refused with `tool.mode_unsupported`) unless `NODESTRO_WEB_TOOLS_SERVER=1`
+  (RT-078). Connection contract, additive (ADR-0001 amendment): `keyless_providers`, `provider_modes`,
+  `offers()`/`needs_secret()`, `add_search_provider(host=, keyless=, modes=)`, problem
+  `connection.provider_unsupported_mode`. A built-in tool not offered in the installation's mode now refuses every
+  call, not only the workflow check. The base dependency becomes `orkexa[all,pdf,local,convert,web]`.
+  Internal review fixes: on a server a SearXNG endpoint must not resolve to private or loopback addresses;
+  `AgentBuilder.mode` defaults to `server` (hosts that build agents set their mode); search hits and ledger entries
+  with whitespace or control characters in the address are left out, and the correction prompt lists the run's
+  sources inside the external-content marker; a run-wide cap (`RUN_CALL_FACTOR` x the per-step limit) per tool; host
+  patterns follow the fetch guard (`*.example.com` matches example.com itself only in deny lists); source ids are
+  matched by normalized address.
+
 - Changed (TABRION MIG-NOD-4, MIG-NOD-8): `PostgresDatabase` configures every connection with
   `tabrion.postgres.configure` (statement and idle-in-transaction time limits and the schema, as before; no
   `lock_timeout`, `application_name` or `TimeZone`, so `SHOW ALL` is unchanged) and keeps its session-level advisory
