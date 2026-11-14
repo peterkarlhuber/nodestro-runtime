@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed (TABRION MIG-NOD-5): `RoleMissing` and `RoleUnsafe` come from `tabrion.errors` (standard library only, always
+  installed) outside the optional `postgres` import, so `except RoleMissing` works when psycopg is present but another
+  part of the extra is missing (studio components job).
 - Fixed (TABRION MIG-NOD-7): without the `postgres` extra, `storage_postgres` now defines `SessionLock`,
   `SessionSettings`, `configure`, `extension_status` and the MIG-NOD-5 role names as `None`, like `psycopg`, so the module's names are the same
   with and without the extra (`tests/test_pgvector_status.py` patches `extension_status` and failed without psycopg).
