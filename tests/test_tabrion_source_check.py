@@ -24,7 +24,7 @@ SCRIPT = ROOT / "scripts" / "check_tabrion_source.py"
 #: SHA-256 of ``scripts/check_tabrion_source.py``, the same in every repository that carries it.
 SCRIPT_SHA256 = "8496bd63327dbee897966bd9d99296d479e2c1c0c55baa9018ee8dba50ab177f"
 URL = "https://github.com/peterkarlhuber/tabrion.git"
-SHA = "d5821faa8742dea012abda3b663549c038d76543"
+SHA = "af0458d54467571abfc1afdd44d76e1f4d727c06"
 HAS_PIP = subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True, check=False).returncode == 0
 
 
@@ -39,6 +39,8 @@ def test_an_install_by_range_takes_the_forged_tabrion_and_only_the_requests_are_
     target = tmp_path / "site"
     install = [sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir", "--target", str(target)]
     script = [sys.executable, "-I", str(SCRIPT), "--lock", str(lock), "--path", str(target), "--"]
+    # The shared script's poisoned release is 0.1.0 (POISON_VERSION, unchanged copy), so the install by range asks
+    # for the 0.1 line here, not the package's current >=0.2,<0.3: a range must include the poisoned version.
     result = subprocess.run([*script, *install, "tabrion>=0.1,<0.2"], capture_output=True, text=True, check=False)
     out = result.stdout
     assert result.returncode == 1, out
