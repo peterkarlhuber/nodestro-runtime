@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed (NAL-A2): the MCP network guard and the address rules of service connections use Orkexa's shared egress
+  guard (`orkexa.net.guard`, Orkexa ADR 0017) instead of their own copy: `net_address` re-exports its rules and
+  `mcp.netguard.GuardedBackend` is Orkexa's backend with MCP's error codes (`mcp.address_refused`, `mcp.dns_failed`)
+  on `httpcore2`. Behavior is unchanged: `tests/test_mcp_netguard.py` runs unchanged, and
+  `tests/test_net_address_parity.py` compares every address vector with the earlier rules.
+
 - Security (TABRION MIG-NOD-3, finding B-06-2): the messages of `storage.backup_failed` and
   `storage.migration_failed` (SQLite and PostgreSQL) no longer end with the error's text, which for PostgreSQL held the
   server's `DETAIL` values. `error_texts.failure_text` gives Tabrion's value-free `safe_message` for a database error in
