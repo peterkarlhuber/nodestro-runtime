@@ -579,7 +579,8 @@ Items that need an independent or external review (an internal audit does not re
   names the studio lock's commit (`NODESTRO_STUDIO_LOCK`), which only detects an accidental index install. The job is
   in `.github/ci-manifest.json` and reported by ci-ok. Open: the copy names an unmerged studio commit as its origin
   until nodestro-studio's DC-NS-2 branch is merged.
-- **Next step:** after the studio merge, update the origin commit; close this entry.
+- **Next step:** after the studio merge, update the origin commit; close this entry. Since the poisoned-0.2.99 copy
+  (nodestro-studio #198) the origin commit is that PR's head `c036a29`; it moves to the merge commit too.
 
 ### RT-072 · Rollback snapshots before and after each TABRION MIG-NOD step
 
