@@ -16,6 +16,7 @@ from nodestro_runtime.builtin_tools import BUILTIN_TOOLS
 from nodestro_runtime.connections import ConnectionIn, ResolvedConnection
 from nodestro_runtime.extensions import CONTRACT, SUPPORTED_CONTRACTS, ExtensionError, Extensions, Integration
 from nodestro_runtime.launcher import external_tools
+from nodestro_runtime.notifications import NOTIFY_TOOLS
 from nodestro_runtime.preflight import preflight
 from nodestro_runtime.release import ReleaseBundle
 from nodestro_runtime.schemas import AgentConfig, SettingsIn, ToolSettings, Workflow
@@ -99,8 +100,13 @@ def workflow(agent: AgentConfig) -> Workflow:
 
 def test_the_five_tools_keep_capability_and_schema() -> None:
     """Snapshot: specs add metadata only; what the model sees and what the approval rules read is unchanged."""
-    # The five tools of NAL-A1 plus the two web tools of NAL-A2 (tests/test_web_tools.py covers those).
-    assert set(BUILTIN_SPECS) == {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS)} == set(BUILTIN_CAPABILITIES)
+    # The five tools of NAL-A1, the two web tools of NAL-A2 (tests/test_web_tools.py covers those) and notify_user
+    # of NAL-A3 (tests/test_notifications.py).
+    assert (
+        set(BUILTIN_SPECS)
+        == {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS)}
+        == set(BUILTIN_CAPABILITIES)
+    )
     for tool in BUILTIN_TOOLS:
         assert tool.name is not None
         item = BUILTIN_SPECS[tool.name]

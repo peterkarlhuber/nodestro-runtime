@@ -577,6 +577,35 @@ class WorkflowLimits(_Model):
     max_steps: int | None = Field(default=None, ge=1, le=MAX_STEPS_LIMIT)
 
 
+NotificationEvent = Literal["run_finished", "run_failed", "approval_pending", "budget_pending", "quality_failed"]
+#: The events a workflow's notification rule may name (NAL-A3), in the order interfaces list them.
+NOTIFY_EVENTS: tuple[NotificationEvent, ...] = (
+    "run_failed",
+    "approval_pending",
+    "budget_pending",
+    "quality_failed",
+    "run_finished",
+)
+#: What notifies when a workflow sets nothing else: failed runs and steps that wait for a person.
+DEFAULT_NOTIFY_EVENTS: tuple[NotificationEvent, ...] = ("run_failed", "approval_pending")
+
+
+class NotificationRules(_Model):
+    """Which events of a workflow's top-level runs notify in the internal inbox, and whom (NAL-A3,
+    :mod:`nodestro_runtime.notifications`): ``members`` (everyone who may read the workspace) or ``starter`` (the
+    person who started the run; everyone when that is not known). An empty ``events`` list notifies nothing."""
+
+    events: list[NotificationEvent] = Field(
+        default_factory=lambda: list(DEFAULT_NOTIFY_EVENTS), max_length=len(NOTIFY_EVENTS)
+    )
+    recipients: Literal["members", "starter"] = "members"
+
+    @field_validator("events")
+    @classmethod
+    def _known_once(cls, value: list[NotificationEvent]) -> list[NotificationEvent]:
+        return [event for event in NOTIFY_EVENTS if event in value]
+
+
 class WorkflowIn(_Model):
     #: The default name is part of the published API schema (OpenAPI) and of stored workflows; it stays German.
     name: str = "Neuer Workflow"
@@ -588,6 +617,8 @@ class WorkflowIn(_Model):
     #: What the workflow can do as a team, e.g. ``research`` or ``translate`` (up to 20 short tags). They travel
     #: with the workflow (versions, export) and help to find a fitting team; they grant nothing.
     capabilities: list[str] = Field(default_factory=list, max_length=MAX_CAPABILITIES)
+    #: Which run events notify in the internal inbox (NAL-A3); workflows of earlier versions get the default.
+    notifications: NotificationRules = Field(default_factory=NotificationRules)
 
     @field_validator("capabilities")
     @classmethod

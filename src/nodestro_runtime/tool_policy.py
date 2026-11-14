@@ -67,6 +67,8 @@ BUILTIN_CAPABILITIES: dict[str, ToolCapability] = {
     # NAL-A2: they read from the internet (the query or the address leaves the computer), never write.
     "search_web": ToolCapability(access="read", reach="external", source="nodestro"),
     "fetch_web_page": ToolCapability(access="read", reach="external", source="nodestro"),
+    # NAL-A3: leaves a message in Nodestro's own inbox; nothing leaves Nodestro.
+    "notify_user": ToolCapability(access="write", reach="internal", source="nodestro"),
 }
 
 #: The provider's server tools (``catalog.SERVER_TOOLS``). They run at the provider and never pass Nodestro's tool
