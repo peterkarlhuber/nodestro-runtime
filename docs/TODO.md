@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 28 |
+| P3 Low | 29 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -52,6 +52,22 @@ None known.
   still puts it into the next independent review brief (D1, with NAL-A2), together with the call-time network guard
   (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
 - **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
+
+### RT-079 · Runtime role checks: gaps left after MIG-NOD-5
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION MIG-NOD-5 (#169) and its security review,
+  `storage_postgres.grant_runtime_role`, nodestro-api `server.py` (pre-migrate role check, ≈ `:876-891`)
+- **What:** The role tools follow Tabrion's rule I-20 since MIG-NOD-5 (a role that can become a superuser, a
+  `BYPASSRLS` role, the owner role or the schema's owner is refused). Still open, found in the review: (1) a member of
+  the predefined role `pg_write_all_data` (PostgreSQL 14+) passes the check, yet can write every table, the
+  schema-version tables included, so it can fake the schema gate (gap from before MIG-NOD-5; refuse it, and
+  `pg_read_all_data` is worth a warning); (2) `CREATEROLE` on PostgreSQL 15 and older lets a role grant itself
+  membership of any non-superuser role, the owner role included, so it is as good as the owner (refuse it there);
+  (3) the api's pre-migrate check of the runtime role reads `inspect_role` and decides with its own flags, so it does
+  not know the new "can become the owner role or the schema's owner" refusal, which only `grant_runtime_role`
+  raises; it should use the same rule (the api part of MIG-NOD-5).
+- **Next step:** (1) and (2) need Tabrion support (a check in `tabrion.postgres.inspect_role`/`grant_runtime_role`)
+  or a Nodestro pre-check with a test per case; (3) goes with the api pin of MIG-NOD-5.
 
 Items that need an independent or external review (an internal audit does not replace it):
 
