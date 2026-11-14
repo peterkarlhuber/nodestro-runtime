@@ -28,12 +28,13 @@ from orkexa.skills import (
 
 from .problems import NodestroError
 from .sanitize import credential_kinds
-from .schemas import Skill, SkillFileRef, SkillStatus, SkillVersion, now
+from .schemas import Skill, SkillFileRef, SkillGroup, SkillStatus, SkillVersion, now
 from .storage import DocumentStore
 
 SKILLS = "skills"
 VERSIONS = "skill_versions"
 BLOBS = "skill_blobs"
+GROUPS = "skill_groups"
 LIMITS = SkillLimits()
 
 
@@ -260,7 +261,53 @@ class Skills:
             for item in dropped:
                 self.store.delete(VERSIONS, _key(skill_id, item.version))
             self.store.delete(SKILLS, skill_id)
+            for group in self.groups():
+                if skill_id in group.skill_ids:
+                    remaining = [item for item in group.skill_ids if item != skill_id]
+                    self.store.put(GROUPS, group.id, group.model_copy(update={"skill_ids": remaining}))
             used = {ref.sha256 for _key, other in self.store.items(VERSIONS, SkillVersion) for ref in other.files}
             for sha in {ref.sha256 for item in dropped for ref in item.files} - used:
                 self.store.delete(BLOBS, sha)
+        return True
+
+    # ---- groups (NAL-B4) -------------------------------------------------------------------------------------
+
+    def groups(self) -> list[SkillGroup]:
+        return sorted((group for _key, group in self.store.items(GROUPS, SkillGroup)), key=lambda item: item.name)
+
+    def group(self, group_id: str) -> SkillGroup | None:
+        return self.store.get(GROUPS, group_id, SkillGroup)
+
+    def save_group(self, group: SkillGroup) -> SkillGroup:
+        """Store a group (new or changed). Its members must be skills of this library, each once; names are unique.
+
+        Raises :class:`NodestroError` ``skill.group_name_taken`` or ``skill.not_found``."""
+        members = list(dict.fromkeys(group.skill_ids))
+        with self.store.transaction():
+            if any(other.name == group.name and other.id != group.id for other in self.groups()):
+                raise NodestroError(
+                    "skill.group_name_taken", f"A skill group named {group.name} exists", name=group.name
+                )
+            missing = [skill_id for skill_id in members if self.get(skill_id) is None]
+            if missing:
+                raise NodestroError(
+                    "skill.not_found", f"The skill {missing[0]} does not exist", skill_id=missing[0], version=0
+                )
+            existing = self.group(group.id)
+            stored = group.model_copy(
+                update={
+                    "skill_ids": members,
+                    "created_at": existing.created_at if existing is not None else group.created_at,
+                    "updated_at": now(),
+                }
+            )
+            self.store.put(GROUPS, stored.id, stored)
+        return stored
+
+    def delete_group(self, group_id: str) -> bool:
+        """Delete a group; agents keep the skills they were given with it (bindings never depend on a group)."""
+        with self.store.transaction():
+            if self.group(group_id) is None:
+                return False
+            self.store.delete(GROUPS, group_id)
         return True

@@ -3538,6 +3538,31 @@ class RunManager:
         """A run stopped without its process (interrupted, crashed, lost lease): its open questions expire."""
         ToolApprovals(self.store).expire_run(run_id)
 
+    @staticmethod
+    def _team_skills(context: _RunContext, snapshot: Workflow) -> tuple[str, ...]:
+        """The names of the skills a team's agents have (NAL-B4), in order, for the orchestrator's recommendations.
+
+        Only the team's own agents count (not those of nested teams); a skill that does not resolve is left out here
+        and fails where its agent runs."""
+        source = context.env.builder.skill_source
+        if source is None:
+            return ()
+        names: dict[str, None] = {}
+        seen: set[tuple[str, int]] = set()
+        for entry in snapshot.nodes:
+            if entry.agent is None:
+                continue
+            for binding in entry.agent.skills:
+                if (binding.skill_id, binding.version) in seen:
+                    continue
+                seen.add((binding.skill_id, binding.version))
+                try:
+                    _skill, package = source(binding.skill_id, binding.version)
+                except (KeyError, NodestroError):
+                    continue
+                names[package.name] = None
+        return tuple(names)[:200]
+
     def _orchestration_pool(
         self, context: _RunContext, node: Node
     ) -> tuple[orchestration.Pool, dict[str, tuple[Workflow, int | None]]]:
@@ -3573,6 +3598,7 @@ class RunManager:
                     capabilities=tuple(snapshot.capabilities),
                     contract=tuple(field.name for field in contracts.contract_of(snapshot)),
                     parameters=member_parameters(start_fields(snapshot)) if config.allow_values else (),
+                    skills=self._team_skills(context, snapshot),
                 )
             )
         if not members:
@@ -3609,6 +3635,8 @@ class RunManager:
         label = node_label(node)
         prior = state.usage.model_copy() if state.status in WAITING_NODE_STATUSES else None
         pool, teams = self._orchestration_pool(context, node)
+        #: Whether a team's agents have skills: only then may a decision recommend some (NAL-B4).
+        hints = any(member.skills for member in pool.members)
         limits = orchestration.OrchestrationLimits(
             max_decisions=config.max_decisions,
             max_per_member=config.max_per_member,
@@ -3649,7 +3677,7 @@ class RunManager:
             # A safe decision boundary (LRC-1): the instructions that arrived until now join this decision's prompt;
             # a model call that already started, a running team and the record are never changed by them.
             guidance = await self._in_run_thread(self._guidance, context, node, next_step[0])
-            answer = await self._in_run_thread(self._decide_sync, context, node, prompt + guidance)
+            answer = await self._in_run_thread(self._decide_sync, context, node, prompt + guidance, hints)
             state.current_decision = _shown_decision(answer)
             return answer
 
@@ -3675,6 +3703,8 @@ class RunManager:
                 parent_run_id=run.id,
                 parent_node_id=node.id,
                 workflow_version=version,
+                # Only names the team's agents have (orkexa checked them against the member); a hint, no right.
+                recommended_skills=list(item.skills),
             )
             self.store.put("runs", child.id, child)
             state.child_run_ids.append(child.id)
@@ -3687,6 +3717,8 @@ class RunManager:
                 child_run_id=child.id,
                 step=item.step,
                 slot=item.slot,
+                skills=list(item.skills),
+                ignored_skills=list(item.ignored_skills),
             )
             self._save(context)
             return child
@@ -3910,8 +3942,10 @@ class RunManager:
             raise RuntimeError(f"{member.name} failed: {child.error or child.status}")
         raise orchestration.DelegationEnded(status, f"{member.name}: {child.error or status}", ref=child.id)
 
-    def _decide_sync(self, context: _RunContext, node: Node, prompt: str) -> Any:
-        """One decision of an orchestrator, in a worker thread: a tool-less agent with a structured answer."""
+    def _decide_sync(self, context: _RunContext, node: Node, prompt: str, skills: bool = False) -> Any:
+        """One decision of an orchestrator, in a worker thread: a tool-less agent with a structured answer.
+
+        ``skills``: some team has skills, so a delegation may recommend some of them (NAL-B4)."""
         config = node.orchestrator
         assert config is not None
 
@@ -3927,9 +3961,9 @@ class RunManager:
             agent = AgentConfig(
                 name=node_label(node),
                 model=config.model,
-                system_prompt=orchestrator_prompt(config)
+                system_prompt=orchestrator_prompt(config, skills=skills)
                 + (f"\n\nInstructions:\n{config.instructions}" if config.instructions else ""),
-                output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config)),
+                output=OutputConfig(mode="structured", name="Decision", fields=decision_fields(config, skills=skills)),
                 effort=connection.effort(config.model, "medium"),
                 max_tool_rounds=0,
                 max_tokens=context.env.builder.output_limit("orchestrator", config.model, connection).value,
@@ -4280,9 +4314,16 @@ class RunManager:
 
         # The agent's skills in their fixed versions (NAL-B3); their tools only read those versions, so they are the
         # run's own tools like the ones above and the per-call gate does not ask about them.
-        skills = context.env.builder.skill_set(config, skill_used)
+        # Many skills: only a preselection for this prompt is offered, plus the ones an orchestrator recommended for
+        # this team run (NAL-B4); recorded with the step.
+        skills = context.env.builder.skill_set(
+            config, skill_used, query=prompt, recommended=context.run.recommended_skills
+        )
         if skills is not None:
             extra_tools += skills.tools
+            if skills.selection is not None:
+                state.skill_selection = skills.selection
+                self._emit(context, "skills_selected", node_id, **skills.selection.model_dump(mode="json"))
         suspended = False
         interruptible: _Interruptible | None = None
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).

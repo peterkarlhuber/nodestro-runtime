@@ -207,8 +207,13 @@ class TemplateRef(_Model):
 #: How an assigned skill reaches the model (NAL-B3): ``always`` puts its instructions into the system prompt,
 #: ``on_demand`` only its name and description; the model loads the instructions with the ``load_skill`` tool.
 SkillMode = Literal["always", "on_demand"]
-#: The most skills one agent may have.
-MAX_AGENT_SKILLS = 20
+#: The most skills one agent may have (NAL-B4: up to 100; skill groups make large sets practical).
+MAX_AGENT_SKILLS = 100
+#: Above this many ``on_demand`` skills, a run step offers only a preselection of them (NAL-B4,
+#: :mod:`nodestro_runtime.skills_select`); ``always`` skills and recommended ones are always offered.
+SKILL_SELECTION_THRESHOLD = 20
+#: How many ``on_demand`` skills a preselection offers.
+SKILL_SELECTION_SIZE = 8
 
 
 class SkillBinding(_Model):
@@ -217,6 +222,8 @@ class SkillBinding(_Model):
     skill_id: str = Field(min_length=1, max_length=64)
     version: int = Field(ge=1)
     mode: SkillMode = "on_demand"
+    #: The skill group it was assigned with (NAL-B4); only a label for the editor, the binding is what counts.
+    group_id: str | None = Field(default=None, max_length=64)
 
 
 class AgentConfig(_Model):
@@ -957,6 +964,45 @@ class KnowledgeProposal(_Model):
     adopted_file_id: str | None = None
 
 
+class SkillGroup(_Model):
+    """A named set of skills of the library (NAL-B4), e.g. "Quality methods". Assigning a group to an agent adds
+    each member as an ordinary binding in its version at that moment; the group itself is never resolved at run
+    time, so a change of the group never changes an agent or a release."""
+
+    id: str = Field(default_factory=lambda: new_id("skg"))
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    skill_ids: list[str] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
+
+
+class SkillCandidate(_Model):
+    """One skill a preselection scored (NAL-B4)."""
+
+    name: str
+    score: float
+    chosen: bool = False
+
+
+class SkillSelection(_Model):
+    """How a step chose the skills it offered (NAL-B4): deterministic, recorded so the choice can be explained.
+
+    ``method`` ``all``: every assigned skill was offered (at most :data:`SKILL_SELECTION_THRESHOLD` on demand);
+    ``bm25``: the ``on_demand`` skills were ranked by name and description against the step's prompt and the best
+    :data:`SKILL_SELECTION_SIZE` offered, plus the ``always`` and recommended ones."""
+
+    method: Literal["all", "bm25"] = "all"
+    assigned: int = 0
+    offered: list[str] = Field(default_factory=list)
+    #: Names the orchestrator recommended for this run that the agent has (offered and marked as recommended).
+    recommended: list[str] = Field(default_factory=list)
+    #: Recommended names the agent does not have: ignored.
+    ignored: list[str] = Field(default_factory=list)
+    #: ``bm25`` only: the best-scored candidates (at most 20), highest first.
+    candidates: list[SkillCandidate] = Field(default_factory=list)
+
+
 class SkillUse(_Model):
     """A skill an agent loaded (``path`` ``None``) or one of its files it read, during one step (NAL-B3)."""
 
@@ -1035,6 +1081,8 @@ class NodeRun(_Model):
     proposals: list[KnowledgeProposal] = Field(default_factory=list)
     #: Agents: the skills the agent loaded and the skill files it read (NAL-B3), in order.
     skills: list[SkillUse] = Field(default_factory=list)
+    #: Agents with skills: which of them the step offered and why (NAL-B4).
+    skill_selection: SkillSelection | None = None
     #: Inside loops: the iteration of every loop around the node, outermost first, counted from 0
     #: (empty outside loops). The state above is the node's latest execution.
     iteration: list[int] = Field(default_factory=list)
@@ -1139,6 +1187,9 @@ class Run(_Model):
     #: A sub-workflow's run: the run and node it belongs to (its cost is counted there).
     parent_run_id: str | None = None
     parent_node_id: str | None = None
+    #: A team run of an orchestrator: the skills it recommended for the task (NAL-B4). Agents of the team that have
+    #: one of them offer it marked as recommended; nothing else changes and no right is granted.
+    recommended_skills: list[str] = Field(default_factory=list, max_length=8)
     #: The saved version of the workflow this run executed, when known.
     workflow_version: int | None = None
     #: A run of a published API: the immutable release it executed (see :mod:`nodestro_api.publishing`).

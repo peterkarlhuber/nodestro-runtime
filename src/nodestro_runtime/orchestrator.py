@@ -59,6 +59,10 @@ _VALUES_PROMPT = """
 Some teams list parameters: set them in "values" as a JSON object (for "parallel": an object per team id).
 Leave out parameters you do not need."""
 
+_SKILLS_PROMPT = """
+Some teams list skills (instructions their agents can load). When you delegate, you may name up to 8 of that team's
+skills that suit the task in "skills"; the team's agents see them as recommended. Name only skills the team lists."""
+
 _REJECTED_PROMPT = """
 A team that waits for a person's approval pauses everything until the decision; "rejected", "expired" and
 "cancelled" mean the team ended without a result. Never try to get around a rejection with another team."""
@@ -79,8 +83,9 @@ _KEYS = {
 }
 
 
-def orchestrator_prompt(config: OrchestratorConfig) -> str:
-    """The system prompt of an orchestrator: the decisions its configuration allows."""
+def orchestrator_prompt(config: OrchestratorConfig, *, skills: bool = False) -> str:
+    """The system prompt of an orchestrator: the decisions its configuration allows (``skills``: a team has skills,
+    so a delegation may recommend some; NAL-B4)."""
     text = ORCHESTRATOR_PROMPT
     extra = ""
     if config.max_parallel > 1:
@@ -91,11 +96,14 @@ def orchestrator_prompt(config: OrchestratorConfig) -> str:
         text = text.replace('- "finish":', extra.strip("\n") + '\n- "finish":', 1)
     if config.allow_values:
         text += "\n" + _VALUES_PROMPT
+    if skills:
+        text += "\n" + _SKILLS_PROMPT
     return text + "\n" + _REJECTED_PROMPT
 
 
-def decision_fields(config: OrchestratorConfig) -> list[OutputField]:
-    """The structured answer of one decision under ``config`` (only the fields its decisions use)."""
+def decision_fields(config: OrchestratorConfig, *, skills: bool = False) -> list[OutputField]:
+    """The structured answer of one decision under ``config`` (only the fields its decisions use; ``skills``: a
+    delegation may recommend skills of the team)."""
     actions = ['"delegate"', '"finish"']
     fields = [field.model_copy() for field in DECISION_FIELDS]
     if config.max_parallel > 1:
@@ -117,6 +125,15 @@ def decision_fields(config: OrchestratorConfig) -> list[OutputField]:
             OutputField(
                 name="values",
                 description="delegate: parameters as a JSON object; parallel: a JSON object per team id",
+                required=False,
+            )
+        )
+    if skills:
+        fields.append(
+            OutputField(
+                name="skills",
+                type="string_list",
+                description="delegate: up to 8 skills of the team that suit the task (optional)",
                 required=False,
             )
         )
@@ -152,6 +169,10 @@ def decision_of(value: Any) -> Any:
     values = _values(value.get("values"))
     if action == "delegate" and values:
         found["values"] = values
+    hints = value.get("skills")
+    if action == "delegate" and isinstance(hints, list) and hints:
+        # Only text names, at most 8; orkexa ignores the ones the team does not have (NAL-B4).
+        found["skills"] = [str(name) for name in hints if isinstance(name, str) and name.strip()][:8]
     if action == "parallel":
         members, tasks = value.get("members") or [], value.get("tasks") or []
         if len(members) != len(tasks):

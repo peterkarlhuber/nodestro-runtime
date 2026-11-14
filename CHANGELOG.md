@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Added (NAL-B4, skill resources and run-time selection; requires orkexa with `Member.skills`):
+  - **Groups:** `SkillGroup` in `skill_groups` (`Skills.groups/group/save_group/delete_group`), and
+    `SkillBinding.group_id` as a label. Groups are never resolved at run time.
+  - **Limit:** `MAX_AGENT_SKILLS` is 100.
+  - **Preselection** (`skills_select.py`, BM25, deterministic): above 20 `on_demand` skills a step offers the best 8
+    plus `always` and recommended skills. It is recorded as `NodeRun.skill_selection` and the `skills_selected` event.
+  - **Orchestrator recommendations:**
+    - Pool members list their agents' skills.
+    - A `delegate` decision may recommend up to 8 (`skills` decision field and prompt, only when a team has
+      skills); parallel decisions carry none.
+    - `Run.recommended_skills` holds them, and agents mark them `<recommended>true</recommended>`.
+    - Unknown names go to `orchestration_delegated.ignored_skills`.
+  - **Usage:** `skill_stats.skill_stats(runs)`.
+  - **Script drafts:** `skill_tools.script_requirement` and `script_origin`, and `ToolJob.origin` with
+    `ToolLibrary.start_job(origin=)`, and `ToolInfo.origin`. The Coding Agent's prompt treats
+    `<skill_script>` content as untrusted data, and such tools use no network, subprocesses or extra files. The tool
+    chain is unchanged (isolation and a person's approval).
+  - See `docs/skills.md`.
+
 - Changed (TABRION DC-NR-1 follow-up, 2026-11-14): `scripts/check_tabrion_source.py` is nodestro-studio's new copy
   (#198, SHA-256 `f1edfc71b5da4986547abe0824833fb73bba532cb5e6a00e202c9ff317747456`): the poisoned `tabrion` is
   0.2.99 (was 0.1.0), inside the package's range `>=0.2,<0.3` and above the locked 0.2.1, so an install by range
