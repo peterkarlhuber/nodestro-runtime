@@ -58,6 +58,7 @@ from .connections import ConnectionService
 from .container_images import ContainerImages, RuntimeImageSandbox
 from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
+from .draft_tools import DRAFT_TOOLS
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
 from .input_files import FileCatalog, InputFiles
@@ -332,7 +333,7 @@ class Workspace:
         self.extensions = Extensions(
             discover() if integrations is None else integrations,
             strict=integrations is not None,
-            reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS) if tool.name},
+            reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS) if tool.name},
         )
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
@@ -533,6 +534,7 @@ class Workspace:
         self.runs.inputs = self.inputs
         self.runs.file_names = self.file_catalog
         self.files = ResultFiles(self.store)
+        self.runs.result_files = self.files
         self.runs.after_run = self.files.write_outputs
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None

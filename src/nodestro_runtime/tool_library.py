@@ -70,6 +70,7 @@ from . import sandbox_cancel
 from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
+from .draft_tools import DRAFT_TOOLS
 from .mcp_access import is_mcp_tool
 from .notifications import NOTIFY_TOOLS
 from .output_limits import OPERATIONS
@@ -96,7 +97,10 @@ _APPROVAL_TIMEOUT_SECONDS = 3600
 #: Also the names of built-in tools that later packages add (``tool_spec.PLANNED_BUILTIN_NAMES``), so a stored tool
 #: never shadows them when they arrive.
 RESERVED_NAMES: frozenset[str] = (
-    RESERVED_TOOL_NAMES | {MEMORY_TOOL_NAME} | PLANNED_BUILTIN_NAMES | {tool.name for tool in NOTIFY_TOOLS if tool.name}
+    RESERVED_TOOL_NAMES
+    | {MEMORY_TOOL_NAME}
+    | PLANNED_BUILTIN_NAMES
+    | {tool.name for tool in (*NOTIFY_TOOLS, *DRAFT_TOOLS) if tool.name}
 )
 
 # Tools are technical artefacts: whatever language the requirement is written in, the code, the
@@ -559,7 +563,7 @@ class ToolLibrary:
         self.provenance: ToolProvenance = provenance or MemoryProvenance()
         self._lock = threading.RLock()
         self.builtin: dict[str, Tool] = {}
-        for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *extra_tools):
+        for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *extra_tools):
             assert tool.name is not None
             self.builtin[tool.name] = tool
         #: The specs of built-in tools (NAL-A1): Nodestro's own and those integrations handed in (contract 2).

@@ -42,7 +42,7 @@ from .conditions import parse_result
 from .office import to_docx, to_xlsx
 from .problems import NodestroError
 from .sanitize import Sanitizer
-from .schemas import ReportFormat, ResultFileSpec, Run, new_id, now
+from .schemas import FileFormat, ReportFormat, ResultFileSpec, Run, new_id, now
 from .storage import DocumentStore
 
 
@@ -50,7 +50,7 @@ from .storage import DocumentStore
 class ReportFormatInfo:
     """What a result file format is: the one place that names its extension, media type and preview."""
 
-    id: ReportFormat
+    id: FileFormat
     #: The file name extension (without dot).
     extension: str
     #: The ``Content-Type`` of a download.
@@ -62,7 +62,7 @@ class ReportFormatInfo:
 #: Every result file format, in the order the interface offers them. The ids are stored in workflows
 #: (``ResultFileSpec.format``) and runs (``ResultFile.format``) and never change; the studio mirrors this table
 #: (frontend/src/lib/resultFormats.ts, checked against it by its tests).
-REPORT_FORMATS: dict[ReportFormat, ReportFormatInfo] = {
+REPORT_FORMATS: dict[FileFormat, ReportFormatInfo] = {
     info.id: info
     for info in (
         ReportFormatInfo("md", "md", "text/markdown; charset=utf-8", inline=True),
@@ -74,6 +74,8 @@ REPORT_FORMATS: dict[ReportFormat, ReportFormatInfo] = {
         ReportFormatInfo("xlsx", "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     )
 }
+#: Formats only tools write (NAL-A4): never offered for result nodes or later files, never shown inline.
+TOOL_FORMATS: dict[FileFormat, ReportFormatInfo] = {"eml": ReportFormatInfo("eml", "eml", "message/rfc822")}
 MEDIA_TYPES: dict[str, str] = {key: info.media_type for key, info in REPORT_FORMATS.items()}
 #: The formats a browser may show inline (Markdown as text, HTML without scripts, PDF).
 INLINE_FORMATS: frozenset[str] = frozenset(key for key, info in REPORT_FORMATS.items() if info.inline)
@@ -91,13 +93,16 @@ class ResultFile(BaseModel):
     id: str = Field(default_factory=lambda: new_id("file"))
     run_id: str
     name: str
-    format: ReportFormat
+    format: FileFormat
     media_type: str
     size: int = 0
     created_at: datetime = Field(default_factory=now)
-    #: ``output``: written by a result node at the end of the run; ``manual``: created later.
-    source: Literal["output", "manual"] = "manual"
+    #: ``output``: written by a result node at the end of the run; ``manual``: created later; ``tool``: written by a
+    #: built-in tool during the run (the drafts of NAL-A4).
+    source: Literal["output", "manual", "tool"] = "manual"
     node_id: str | None = None
+    #: What a tool's file is about, for the run view (a draft: recipients, subject, sizes; never a body).
+    preview: dict[str, Any] = Field(default_factory=dict)
     sanitized: bool = False
     #: Set when the file could not be written; the file then has no content.
     error_code: str | None = None
@@ -670,6 +675,28 @@ class ResultFiles:
         entry.size = len(data)
         self.store.put_raw(DATA, f"{run.id}:{entry.id}", base64.b64encode(data).decode("ascii"))
         self.store.put(FILES, f"{run.id}:{entry.id}", entry)
+        return entry
+
+    def add_tool_file(
+        self, run_id: str, name: str, fmt: FileFormat, data: bytes, *, node_id: str | None, preview: dict[str, Any]
+    ) -> ResultFile:
+        """Store ``data`` written by a built-in tool as a file of run ``run_id`` (the name made unique)."""
+        if len(data) > MAX_BYTES:
+            raise ReportError("report.too_large", "The file is larger than 10 MB", limit_mb=MAX_BYTES // (1024 * 1024))
+        info = REPORT_FORMATS[fmt] if fmt in REPORT_FORMATS else TOOL_FORMATS[fmt]
+        taken = {entry.name for entry in self.list(run_id)}
+        entry = ResultFile(
+            run_id=run_id,
+            name=_unique(file_name(name, "draft", info.extension), taken),
+            format=fmt,
+            media_type=info.media_type,
+            size=len(data),
+            source="tool",
+            node_id=node_id,
+            preview=preview,
+        )
+        self.store.put_raw(DATA, f"{run_id}:{entry.id}", base64.b64encode(data).decode("ascii"))
+        self.store.put(FILES, f"{run_id}:{entry.id}", entry)
         return entry
 
     def write_outputs(self, run: Run) -> builtins.list[ResultFile]:

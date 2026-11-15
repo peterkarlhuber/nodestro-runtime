@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import ipaddress
 import logging
@@ -56,19 +56,29 @@ MAX_EVENTS = 2000
 #: Types other work packages register; creating one before it is registered is refused
 #: (``connection.type_unavailable``).
 RESERVED_TYPES: frozenset[str] = frozenset({"database"})
+#: A person's test sends per connection and hour (NAL-A4); each attempt counts once.
+TEST_SENDS_PER_HOUR = 5
+#: A person's test sends per tenant and hour, over all connections (new connections are not a way around the limit).
+TEST_SENDS_PER_TENANT_HOUR = 20
+TEST_SEND_WINDOW = timedelta(hours=1)
+#: The attempts of the last hour, per tenant (key = connection id, and ``*`` for the tenant).
+TEST_SENDS = "connection_test_sends"
+#: Settings that say how a secret is used: changing one clears the secret like a new address does.
+#: (A new path on the same host keeps it: ADR-0001's rule is per ``host:port``.)
+_SECRET_BOUND = ("auth", "security", "username")
 #: The longest secret accepted (API keys, passwords, signing keys; not files).
 MAX_SECRET_LENGTH = 8192
 
 SecretStorage = Literal["none", "vault", "session"]
 CheckStatus = Literal["unchecked", "ok", "failed"]
-EventKind = Literal["created", "updated", "deleted", "secret_set", "secret_cleared", "checked"]
+EventKind = Literal["created", "updated", "deleted", "secret_set", "secret_cleared", "checked", "test_sent"]
 Mode = Literal["desktop", "local-container", "server"]
 
 _TYPE_NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 _LABEL = r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(\.{_LABEL})*$")
-_EMAIL = re.compile(r"^[^@\s<>\"',;]{1,64}@[A-Za-z0-9.-]{1,253}$")
+_EMAIL = re.compile(r"^[^@\s<>\"',;]{1,64}@[A-Za-z0-9.-]{1,253}\Z")
 _LOOPBACK_NAMES = frozenset({"localhost"})
 #: The form of a connection id (``new_id("conn")``); releases and exported packages accept no other.
 CONNECTION_ID = re.compile(r"^conn_[0-9a-f]{12}$")
@@ -106,11 +116,13 @@ class SmtpSettings(_Settings):
     from_address: str = Field(min_length=3, max_length=320)
     #: How the secret is used: an SMTP password, or an OAuth 2.0 refresh token (XOAUTH2; flows come with NAL-A5).
     auth: Literal["password", "oauth2"] = "password"
+    #: The person's own address for a test send from the studio (NAL-A4); a test goes nowhere else.
+    test_address: str | None = Field(default=None, max_length=320)
 
-    @field_validator("from_address")
+    @field_validator("from_address", "test_address")
     @classmethod
-    def _address(cls, value: str) -> str:
-        if not _EMAIL.match(value):
+    def _address(cls, value: str | None) -> str | None:
+        if value is not None and not _EMAIL.match(value):
             raise ValueError("not an e-mail address")
         return value
 
@@ -335,12 +347,18 @@ def _check_search(connection: ResolvedConnection) -> CheckResult:
     return CheckResult(ok=True)
 
 
-def _check_configuration(connection: ResolvedConnection) -> CheckResult:
-    """A configuration check: the settings are complete and the secret is there. Contacting the service needs the
-    network guard (NAL-A2) and comes with the tools that send (NAL-A4)."""
-    if connection.secret is None and connection_type(connection.type).needs_secret(connection.provider):
-        return CheckResult(ok=False, code="connection.secret_missing")
-    return CheckResult(ok=True)
+def _check_smtp(connection: ResolvedConnection) -> CheckResult:
+    """Connect, secure (TLS 1.2+), log in and quit; nothing is sent (NAL-A4, :mod:`nodestro_runtime.mail_transport`)."""
+    from .mail_transport import check_smtp
+
+    return check_smtp(connection)
+
+
+def _check_webhook(connection: ResolvedConnection) -> CheckResult:
+    """``HEAD`` the target through the egress guard; nothing is posted (NAL-A4)."""
+    from .mail_transport import check_webhook
+
+    return check_webhook(connection)
 
 
 SEARCH = ConnectionType(
@@ -352,7 +370,7 @@ SEARCH = ConnectionType(
     check=_check_search,
 )
 SMTP = ConnectionType(
-    name="smtp", settings=SmtpSettings, secret_label="password", egress=_smtp_egress, check=_check_configuration
+    name="smtp", settings=SmtpSettings, secret_label="password", egress=_smtp_egress, check=_check_smtp
 )
 WEBHOOK = ConnectionType(
     name="webhook",
@@ -360,7 +378,7 @@ WEBHOOK = ConnectionType(
     secret_required=False,
     secret_label="signing_key",
     egress=_webhook_egress,
-    check=_check_configuration,
+    check=_check_webhook,
 )
 for _item in (SEARCH, SMTP, WEBHOOK):
     register_connection_type(_item)
@@ -495,6 +513,9 @@ class ResolvedConnection:
     egress: tuple[str, ...]
     secret: str | None = field(default=None, repr=False)
     tenant_id: str = ""
+    #: The installation's mode (contract 1, additive): checks and test sends apply its address rules. The default is
+    #: the strictest one, so a caller that forgets it never allows loopback on a server.
+    mode: Mode = "server"
 
     def __repr__(self) -> str:
         return f"ResolvedConnection(id={self.id!r}, type={self.type!r}, provider={self.provider!r}, secret=<hidden>)"
@@ -663,8 +684,12 @@ class ConnectionService:
             if data.name is not None:
                 self._unique_name(data.name, except_id=item.id)
             changed_target = provider != item.provider or settings.model_dump(mode="json") != item.settings
-            # A secret only goes where it was entered for: a new address drops it (ADR-0001, write-only secrets).
-            moved = sorted(egress) != sorted(item.egress)
+            # A secret only goes where it was entered for: a new address drops it (ADR-0001, write-only secrets), and
+            # so does a new way of using it (NAL-A4 review M2: a signing key must not become a bearer token, a password
+            # must not be sent with other transport security or for another user).
+            moved = sorted(egress) != sorted(item.egress) or any(
+                settings.model_dump(mode="json").get(name) != item.settings.get(name) for name in _SECRET_BOUND
+            )
             if moved:
                 self._session.pop(item.id, None)
             item = item.model_copy(
@@ -776,6 +801,7 @@ class ConnectionService:
             egress=tuple(item.egress),
             secret=secret,
             tenant_id=self.tenant_id,
+            mode=self.mode,
         )
 
     def check(self, connection_id: str, *, actor: str | None = None) -> ServiceConnection:
@@ -807,6 +833,48 @@ class ConnectionService:
             self.store.put(CONNECTIONS, item.id, item)
         self.event("checked", item, actor=actor, status=item.check.status, code=result.code)
         return item
+
+    def test_send(self, connection_id: str, *, actor: str | None = None) -> dict[str, Any]:
+        """A person's test send (NAL-A4): ``smtp`` mails a fixed text to the connection's own ``test_address``,
+        ``webhook`` posts a payload marked ``test: true``. At most :data:`TEST_SENDS_PER_HOUR` per connection and hour;
+        every attempt is an audit event (``test_sent`` with ``outcome`` and the error code, never an address)."""
+        from .mail_transport import TransportError, send_smtp_test, send_webhook_test
+
+        item = self.get(connection_id)
+        senders: dict[str, Callable[[ResolvedConnection], dict[str, Any]]] = {
+            "smtp": send_smtp_test,
+            "webhook": send_webhook_test,
+        }
+        if item.type not in senders:
+            raise NodestroError(
+                "connection.test_send_unsupported", "This connection type has no test send", type=item.type
+            )
+        with self._lock, self.store.transaction():
+            since = now() - TEST_SEND_WINDOW
+            counts: dict[str, list[str]] = {}
+            for key, limit in ((item.id, TEST_SENDS_PER_HOUR), ("*", TEST_SENDS_PER_TENANT_HOUR)):
+                stored = self.store.get_raw(TEST_SENDS, key)
+                recent = [at for at in (stored or []) if datetime.fromisoformat(at) >= since]
+                if len(recent) >= limit:
+                    raise NodestroError(
+                        "connection.test_send_limit", f"At most {limit} test sends per hour", limit=limit
+                    )
+                counts[key] = [*recent, now().isoformat()]
+            # Booked before sending, so parallel requests cannot pass the limit together; a record of its own, so
+            # trimming the audit events cannot reset it (review L1).
+            for key, times in counts.items():
+                self.store.put_raw(TEST_SENDS, key, times)
+        self.event("test_sent", item, actor=actor, outcome="started")
+        try:
+            result = senders[item.type](self.resolve(item.id))
+        except TransportError as exc:
+            self.event("test_sent", item, actor=actor, outcome="failed", code=exc.code)
+            raise NodestroError(exc.code, "The test send failed", **exc.params) from None
+        except NodestroError as exc:  # the stored settings cannot be used (e.g. no secret): still audited
+            self.event("test_sent", item, actor=actor, outcome="failed", code=exc.code)
+            raise
+        self.event("test_sent", item, actor=actor, outcome="sent")
+        return {"ok": True, **result}
 
     # ---- audit ---------------------------------------------------------------------------------------------------
 
@@ -900,6 +968,7 @@ class StaticConnections:
             settings=settings.model_dump(mode="json"),
             egress=tuple(sorted(dict.fromkeys(kind.egress(provider, settings)))),
             secret=str(secret) if secret else None,
+            mode=mode,
         )
 
     def find(self, connection_id: str) -> ResolvedConnection | None:

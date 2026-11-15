@@ -69,6 +69,9 @@ BUILTIN_CAPABILITIES: dict[str, ToolCapability] = {
     "fetch_web_page": ToolCapability(access="read", reach="external", source="nodestro"),
     # NAL-A3: leaves a message in Nodestro's own inbox; nothing leaves Nodestro.
     "notify_user": ToolCapability(access="write", reach="internal", source="nodestro"),
+    # NAL-A4: drafts are files of the run; nothing leaves Nodestro (sending is NAL-A5).
+    "draft_email": ToolCapability(access="write", reach="internal", source="nodestro"),
+    "draft_webhook": ToolCapability(access="write", reach="internal", source="nodestro"),
 }
 
 #: The provider's server tools (``catalog.SERVER_TOOLS``). They run at the provider and never pass Nodestro's tool

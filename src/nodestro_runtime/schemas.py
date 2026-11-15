@@ -492,6 +492,8 @@ class OrchestratorConfig(_Model):
 
 
 ReportFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx"]
+#: Formats of result files: the report formats and the e-mail draft (``eml``, written only by ``draft_email``).
+FileFormat = Literal["md", "json", "csv", "html", "pdf", "docx", "xlsx", "eml"]
 
 
 class ResultFileSpec(_Model):

@@ -84,6 +84,7 @@ from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
+from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
 from .notifications import RunNotifier
 from .orchestrator import (
@@ -99,6 +100,7 @@ from .pricing import PricingService
 from .problems import CheckIssue, NodestroError, Problem, library_problem, price_problem, problem
 from .providers import Connection, check_model, interrupt_client, model_id, provider_of
 from .reasoning import ReasoningKind, ReasoningTrace, reasoning_hook
+from .reports import ResultFiles
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
     DEFAULT_ASSISTANT_MODEL,
@@ -988,6 +990,8 @@ class RunManager:
         #: The internal inbox (NAL-A3): notified by its rules when a run stops (it is one of ``listeners``) or is found
         #: interrupted after a restart, and the sink of ``notify_user``. ``None``: no local inbox here.
         self.notifier: RunNotifier | None = None
+        #: The result files of runs, for the draft tools (NAL-A4); ``None``: drafts are not available.
+        self.result_files: ResultFiles | None = None
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
@@ -4094,6 +4098,7 @@ class RunManager:
                 """``notify_user``: a message of the top-level run (its starter, its limit)."""
                 return notifier.message(top, node_id, title, text, level)
 
+        save_file, run_file = self._draft_files(top, node_id)
         return RunServices(
             ledger=SourceLedger(context.run.sources, lock=context.lock, on_recorded=recorded),
             node_id=node_id,
@@ -4101,7 +4106,44 @@ class RunManager:
             check_budget=context.tracker.check,
             run_calls=context.root.tool_calls,
             notify=notify,
+            save_file=save_file,
+            run_file=run_file,
         )
+
+    def _draft_files(self, top: Run, node_id: str) -> tuple[Any, Any]:
+        """``save_file`` and ``run_file`` of the draft tools (NAL-A4): drafts belong to the top-level run (the run a
+        person looks at); attachments are its input files and the result files it wrote so far, by name."""
+        files = self.result_files
+        if files is None or top.imported_at is not None:
+            return None, None
+
+        def save_file(name: str, fmt: str, data: bytes, preview: dict[str, Any]) -> str:
+            entry = files.add_tool_file(top.id, name, fmt, data, node_id=node_id, preview=preview)  # type: ignore[arg-type]
+            return f"{entry.name} ({entry.id})"
+
+        def run_file(name: str, max_bytes: int) -> Attachment | None:
+            """The run's file ``name``; a file larger than ``max_bytes`` is refused before it is read."""
+
+            def too_large() -> DraftError:
+                return DraftError("mail.too_large", "The attachments are larger than 10 MB", limit=MAX_MESSAGE_BYTES)
+
+            for entry in files.list(top.id):
+                if entry.name == name and not entry.error_code:
+                    if entry.size > max_bytes:
+                        raise too_large()
+                    _, data = files.content(top.id, entry.id)
+                    return Attachment(entry.name, entry.media_type, data)
+            inputs = self.inputs
+            if inputs is not None:
+                for file_id in top.file_ids:
+                    stored = inputs.find(file_id)
+                    if stored is not None and stored.name == name:
+                        if stored.size > max_bytes:
+                            raise too_large()
+                        return Attachment(stored.name, inputs.download_type(file_id), inputs.data(file_id))
+            return None
+
+        return save_file, run_file
 
     def _check_sources(
         self,

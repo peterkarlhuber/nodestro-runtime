@@ -168,6 +168,25 @@ integration can never make its tool look harmless to the approval rules.
 - Cost booking: a priced built-in tool books `units x price` through `tool_spec.RunServices.book` into the run's
   tracker as one token-free usage record (`model = "<cost_unit>:<provider>"`, counted in `web_search_requests`).
 
+## Amendment NAL-A4 (2026-11-15): additive, contract stays 1
+
+- `ResolvedConnection.mode`: the installation's mode, set by `ConnectionService.resolve` and `StaticConnections`;
+  checks and test sends apply its address rules (loopback only outside `server`). Existing callers keep working
+  (default `desktop`).
+- `SmtpSettings.test_address` (optional): the person's own address for a test send; a test goes nowhere else.
+- The `smtp` and `webhook` checks now contact the service (`kind = "service"`): SMTP connects to a checked address,
+  requires TLS 1.2+ (implicit TLS or STARTTLS; plain only on loopback outside the server profile), logs in and quits
+  without sending; a webhook gets a `HEAD` through Orkexa's guarded client, without redirects. Results carry codes
+  only (`connection.tls_failed`, `connection.auth_failed`, `connection.address_refused`, ...). OAuth 2.0 SMTP stays
+  unsupported until NAL-A5 (`connection.auth_unsupported`).
+- `ConnectionService.test_send(id, actor=)` and the event kind `test_sent` (`outcome`: `started`, `sent`, `failed`
+  with `code`): a person's test send, at most 5 per connection and hour. No tool or agent reaches it
+  (`mail_transport.py` is imported only by `connections.py`).
+- Secret binding tightened: besides a new `host:port`, a change of the settings `auth`, `security` or `username`
+  clears the secret (a signing key must not become a bearer token, a password must not move to another user or
+  transport). A new path on the same host still keeps it. `ResolvedConnection.mode` defaults to `server`, the
+  strictest rules.
+
 ## Tests
 
 `tests/test_connections_contract.py` (contract: fields, secret rules, tenant binding, egress, versioning, reserved

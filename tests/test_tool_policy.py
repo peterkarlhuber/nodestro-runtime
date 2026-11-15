@@ -6,6 +6,7 @@ import pytest
 
 from nodestro_runtime.builtin_tools import BUILTIN_TOOLS
 from nodestro_runtime.catalog import SERVER_TOOLS
+from nodestro_runtime.draft_tools import DRAFT_TOOLS
 from nodestro_runtime.notifications import NOTIFY_TOOLS
 from nodestro_runtime.tool_policy import (
     BUILTIN_CAPABILITIES,
@@ -19,7 +20,9 @@ from nodestro_runtime.web_tools import WEB_TOOLS
 
 
 def test_every_builtin_and_provider_tool_has_a_statement() -> None:
-    assert {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS)} == set(BUILTIN_CAPABILITIES)
+    assert {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS)} == set(
+        BUILTIN_CAPABILITIES
+    )
     for key in SERVER_TOOLS:
         assert server_tool_capability(key).source == "nodestro"
     assert capability_of(name="calculator", kind="builtin") == ToolCapability(
