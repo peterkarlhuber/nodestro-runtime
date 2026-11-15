@@ -51,7 +51,9 @@ None known.
   new address drops the secret, release connection ids validated, check errors logged by type only). Plan v1.1
   still puts it into the next independent review brief (D1, with NAL-A2), together with the call-time network guard
   (resolve, pin the address, no redirects) that NAL-A2 adds. No feature flag depends on it; it gates nothing today.
-- **Next step:** Include in the D1 brief; fix findings before NAL-A2 is activated broadly.
+- **Next step:** Included in the D1 brief P-Web (nodestro-studio `docs/security/nal/p-web.md`, ST-064), together
+  with `web_tools.py` and the MCP guard on `orkexa.net.guard`. The brief is prepared, not commissioned (the owner
+  decides). Fix findings before NAL-A2 is activated broadly; `NODESTRO_WEB_TOOLS_SERVER` stays off until then.
 
 ### RT-080 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
 
