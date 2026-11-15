@@ -930,6 +930,9 @@ _UNSAFE_REASONS = {
     "predefined_role": "is or can become a member of a predefined role (pg_*)",
     "protected_writable": "can still write the schema versions after the grant (a privilege of PUBLIC or of a role it"
     " is a member of)",
+    # Before PostgreSQL 16, CREATEROLE lets a role grant itself any non-superuser role (D-127).
+    "createrole": "has CREATEROLE or can become a role that has it, which before PostgreSQL 16 lets it grant itself"
+    " other roles",
 }
 
 
