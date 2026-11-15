@@ -17,7 +17,7 @@ import pytest
 from smtp_support import TestSmtpServer, loopback_resolver, self_signed
 
 from nodestro_runtime import mail_transport
-from nodestro_runtime.connections import ConnectionIn, ConnectionService, ResolvedConnection
+from nodestro_runtime.connections import ConnectionIn, ConnectionPatch, ConnectionService, ResolvedConnection
 from nodestro_runtime.mail import SIGNATURE_HEADER, verify_signature
 from nodestro_runtime.mail_transport import (
     SmtpOptions,
@@ -233,3 +233,72 @@ def test_test_sends_are_limited_and_audited(
             service.test_send(search.id)
     finally:
         store.close()
+
+
+def test_a_changed_use_of_the_secret_clears_it(tmp_path: Path) -> None:
+    """Review M2: a signing key must not become a bearer token; a path on the same host keeps it (ADR-0001)."""
+    store = SQLiteStore(tmp_path / "store.db")
+    try:
+        service = ConnectionService(store, TokenVault(SecretBox(os.urandom(32)), "local", namespace="connection"))
+        hook = service.create(
+            ConnectionIn(type="webhook", name="Hook", settings={"url": "https://hooks.example.com/a"})
+        )
+        for change in ({"auth": "bearer"}, {"auth": "none"}):
+            service.set_secret(hook.id, "signing-key")
+            current = dict(service.get(hook.id).settings)
+            changed = service.update(hook.id, ConnectionPatch(settings={**current, **change}))
+            assert not service.secret_set(changed), change
+        service.set_secret(hook.id, "signing-key")
+        kept = service.update(hook.id, ConnectionPatch(description="only a note"))
+        assert service.secret_set(kept)
+        current = dict(service.get(hook.id).settings)
+        path = service.update(hook.id, ConnectionPatch(settings={**current, "url": "https://hooks.example.com/b"}))
+        assert service.secret_set(path)
+    finally:
+        store.close()
+
+
+def test_the_limit_is_kept_apart_from_the_audit_events(
+    tmp_path: Path, receiver: tuple[int, list[dict[str, Any]], type[_Receiver]]
+) -> None:
+    """Review L1: trimming events does not reset the limit; new connections share a tenant limit."""
+    port, seen, _ = receiver
+    store = SQLiteStore(tmp_path / "store.db")
+    try:
+        service = ConnectionService(store, TokenVault(SecretBox(os.urandom(32)), "local", namespace="connection"))
+        hooks = [
+            service.create(
+                ConnectionIn(
+                    type="webhook", name=f"Hook {n}", settings={"url": f"http://127.0.0.1:{port}/{n}", "auth": "none"}
+                )
+            )
+            for n in range(5)
+        ]
+        for _ in range(5):
+            service.test_send(hooks[0].id)
+        store.delete_prefix("connection_events", "")
+        with pytest.raises(NodestroError, match="per hour"):
+            service.test_send(hooks[0].id)
+        for hook in hooks[1:]:
+            for _ in range(5):
+                try:
+                    service.test_send(hook.id)
+                except NodestroError as exc:
+                    assert exc.params["limit"] == 20
+        assert len(seen) == 20
+    finally:
+        store.close()
+
+
+def test_server_checks_reach_mail_ports_only() -> None:
+    result = check_smtp(_smtp(22, mode="server"), SmtpOptions(resolver=lambda _h, _p: ["93.184.215.14"]))
+    assert result.code == "connection.port_refused"
+
+
+def test_settings_addresses_refuse_a_trailing_line_break() -> None:
+    from pydantic import ValidationError
+
+    from nodestro_runtime.connections import SmtpSettings
+
+    with pytest.raises(ValidationError):
+        SmtpSettings(host="mail.example.com", from_address="bot@example.com", test_address="me@example.com\n")

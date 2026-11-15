@@ -17,7 +17,17 @@ from typing import Any
 
 from orkexa import Tool, ToolResultError
 
-from .mail import MAX_PAYLOAD_BYTES, Attachment, DraftError, MailDraft, build_mail, payload_bytes
+from .mail import (
+    MAX_ATTACHMENTS,
+    MAX_MESSAGE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    Attachment,
+    DraftError,
+    MailDraft,
+    build_mail,
+    payload_bytes,
+)
+from .problems import NodestroError
 
 #: The most draft files one run writes per tool (the spec's per-run limit says the same).
 MAX_DRAFTS_PER_RUN = 10
@@ -38,17 +48,34 @@ def _draft_error(exc: DraftError) -> ToolResultError:
 
 
 def _attachments(context: Any, names: list[str]) -> tuple[Attachment, ...]:
+    """The named run files, read one by one: the count, duplicates and every size are checked before a file is read,
+    and the total after each one (review M1: a long list must not read large files again and again)."""
+    wanted = list(dict.fromkeys(name.strip() for name in names))
+    if len(wanted) > MAX_ATTACHMENTS:
+        raise ToolResultError(f"Error: at most {MAX_ATTACHMENTS} attachments (mail.too_many_attachments)")
     found: list[Attachment] = []
     reader = context.services.run_file
-    for name in names:
-        item = reader(name) if reader is not None else None
+    total = 0
+    for name in wanted:
+        try:
+            item = reader(name, MAX_MESSAGE_BYTES - total) if reader is not None else None
+        except DraftError as exc:
+            raise _draft_error(exc) from None
         if item is None:
             raise ToolResultError(
                 f"Error: {name!r} is not a file of this run (mail.attachment_unknown); attach only files the run "
                 "was given or wrote"
             )
+        total += len(item.data)
         found.append(item)
     return tuple(found)
+
+
+def _save(context: Any, name: str, fmt: str, data: bytes, preview: dict[str, Any]) -> str:
+    try:
+        return str(context.services.save_file(name, fmt, data, preview))
+    except NodestroError as exc:
+        raise ToolResultError(f"Error: the draft cannot be stored ({exc.code})") from None
 
 
 @Tool
@@ -92,7 +119,7 @@ def draft_email(
         )
     except DraftError as exc:
         raise _draft_error(exc) from None
-    saved = context.services.save_file(file_name or subject or "email", "eml", built.data, built.preview)
+    saved = _save(context, file_name or subject or "email", "eml", built.data, built.preview)
     attached = ", ".join(item["name"] for item in built.preview["attachments"]) or "none"
     return (
         f"Draft saved as {saved}. Not sent: a person opens and sends it.\n"
@@ -119,14 +146,14 @@ def draft_webhook(payload_json: str, file_name: str = "") -> str:
         raise ToolResultError("Error: the payload is larger than 256 KB (webhook.payload_too_large)")
     try:
         payload = json.loads(payload_json)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ToolResultError("Error: payload_json is not valid JSON (webhook.payload_invalid)") from None
     try:
         data = payload_bytes(payload, schema if isinstance(schema, dict) else None)
     except DraftError as exc:
         raise _draft_error(exc) from None
     preview = {"kind": "webhook", "size": len(data), "schema": isinstance(schema, dict)}
-    saved = context.services.save_file(file_name or "webhook", "json", data, preview)
+    saved = _save(context, file_name or "webhook", "json", data, preview)
     return f"Draft saved as {saved}. Not sent: a person checks and sends it."
 
 

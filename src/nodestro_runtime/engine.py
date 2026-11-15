@@ -84,7 +84,7 @@ from .file_delivery import collect, deliver
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
-from .mail import Attachment
+from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
 from .notifications import RunNotifier
 from .orchestrator import (
@@ -4121,17 +4121,25 @@ class RunManager:
             entry = files.add_tool_file(top.id, name, fmt, data, node_id=node_id, preview=preview)  # type: ignore[arg-type]
             return f"{entry.name} ({entry.id})"
 
-        def run_file(name: str) -> Attachment | None:
-            wanted = name.strip()
+        def run_file(name: str, max_bytes: int) -> Attachment | None:
+            """The run's file ``name``; a file larger than ``max_bytes`` is refused before it is read."""
+
+            def too_large() -> DraftError:
+                return DraftError("mail.too_large", "The attachments are larger than 10 MB", limit=MAX_MESSAGE_BYTES)
+
             for entry in files.list(top.id):
-                if entry.name == wanted and not entry.error_code:
+                if entry.name == name and not entry.error_code:
+                    if entry.size > max_bytes:
+                        raise too_large()
                     _, data = files.content(top.id, entry.id)
                     return Attachment(entry.name, entry.media_type, data)
             inputs = self.inputs
             if inputs is not None:
                 for file_id in top.file_ids:
                     stored = inputs.find(file_id)
-                    if stored is not None and stored.name == wanted:
+                    if stored is not None and stored.name == name:
+                        if stored.size > max_bytes:
+                            raise too_large()
                         return Attachment(stored.name, inputs.download_type(file_id), inputs.data(file_id))
             return None
 

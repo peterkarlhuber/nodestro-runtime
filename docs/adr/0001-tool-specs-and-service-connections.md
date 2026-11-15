@@ -182,6 +182,10 @@ integration can never make its tool look harmless to the approval rules.
 - `ConnectionService.test_send(id, actor=)` and the event kind `test_sent` (`outcome`: `started`, `sent`, `failed`
   with `code`): a person's test send, at most 5 per connection and hour. No tool or agent reaches it
   (`mail_transport.py` is imported only by `connections.py`).
+- Secret binding tightened: besides a new `host:port`, a change of the settings `auth`, `security` or `username`
+  clears the secret (a signing key must not become a bearer token, a password must not move to another user or
+  transport). A new path on the same host still keeps it. `ResolvedConnection.mode` defaults to `server`, the
+  strictest rules.
 
 ## Tests
 

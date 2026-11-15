@@ -42,6 +42,8 @@ from .schemas import now
 
 #: Seconds for each SMTP network step (connect, greeting, TLS, login, data).
 SMTP_TIMEOUT = 20.0
+#: The SMTP ports a server profile may contact (submission, implicit TLS, relay, the common alternative).
+SERVER_SMTP_PORTS = frozenset({25, 465, 587, 2525})
 #: Seconds for a whole webhook exchange.
 WEBHOOK_TIMEOUT = 15.0
 TEST_SUBJECT = "Nodestro test message"
@@ -149,6 +151,9 @@ def smtp_session(connection: ResolvedConnection, options: SmtpOptions | None = N
     implicit = settings.get("security") == "tls"
     if settings.get("auth") == "oauth2":
         raise TransportError("connection.auth_unsupported")
+    if connection.mode == "server" and port not in SERVER_SMTP_PORTS:
+        # On a shared server a check must not become a port scanner (review L2).
+        raise TransportError("connection.port_refused", port=port)
     addresses = checked_addresses(host, port, mode=connection.mode, resolver=options.resolver)
     context = options.tls or _tls_context()
     client: smtplib.SMTP | None = None

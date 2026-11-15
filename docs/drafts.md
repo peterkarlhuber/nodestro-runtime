@@ -57,6 +57,30 @@ Not reachable from tools. `ConnectionService.check` and `ConnectionService.test_
   (`outcome` `started`, then `sent` or `failed` with the code) with the acting person. Results and events never
   carry the service's own text, an address or the secret.
 
+## Internal security review (2026-11-15)
+
+No Critical or High findings; no path from an agent to sending was found. Fixed:
+
+- **M1** attachment lists: at most 10 names, duplicates removed, every file's size checked before it is read and the
+  total after each one.
+- **M2** a secret goes only where and how it was entered: besides a new `host:port` (ADR-0001), changing `auth`,
+  `security` or `username` clears it, so a signing key never becomes a bearer token. A new path on the same host
+  keeps the secret (ADR-0001 rule, accepted).
+- **L1** the test-send limit lives in its own record (`connection_test_sends`), not in the audit events that are
+  trimmed, plus 20 per tenant and hour over all connections.
+- **L2** on a server an SMTP check or test send reaches only the ports 25, 465, 587 and 2525
+  (`connection.port_refused`).
+- **L3** payloads deeper than 64 levels and JSON that is too deep to parse are errors, not crashes; a draft that
+  cannot be stored is reported as an error.
+- **L4** addresses in connection settings refuse a trailing line break; settings that cannot be used are audited as
+  a failed test send.
+- **L5** `message/*` and `multipart/*` run files are attached as `application/octet-stream`.
+- `ResolvedConnection.mode` defaults to `server` (the strictest rules); `enum` and `const` compare JSON kinds.
+
+Accepted residual risks: the per-process lock around the limit record (two server workers may each pass one extra
+test); checks are limited to administrators but not counted; Python's `HTMLParser` takes a few seconds on some 2 MB
+inputs (bounded by the size cap and the tool's 20 s limit); `test_address` is not verified as the person's own.
+
 ## Tests
 
 `tests/test_draft_tools.py` (addresses, header injection, limits, HTML allowlist, the `.eml` file, payload schema,

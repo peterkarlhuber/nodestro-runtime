@@ -144,6 +144,7 @@
   "connection.mode_unsupported": ["type"],
   "connection.name_taken": ["name"],
   "connection.not_found": ["id"],
+  "connection.port_refused": ["port"],
   "connection.provider_invalid": ["provider"],
   "connection.provider_unknown": ["provider", "type"],
   "connection.provider_unsupported_mode": ["mode", "provider", "type"],

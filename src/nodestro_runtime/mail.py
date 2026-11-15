@@ -338,8 +338,12 @@ class BuiltMail:
 
 
 def _media_type(value: str) -> tuple[str, str]:
+    """The attachment's type; containers (``multipart/*``, ``message/*``) become plain bytes, so an attachment can
+    never be shown as a nested message that skipped the HTML cleaning (review L5)."""
     main, _, sub = (value or "").split(";", 1)[0].strip().lower().partition("/")
     if not re.match(r"^[a-z0-9][a-z0-9.+-]{0,62}$", main) or not re.match(r"^[a-z0-9][a-z0-9.+-]{0,126}$", sub):
+        return "application", "octet-stream"
+    if main in ("multipart", "message"):
         return "application", "octet-stream"
     return main, sub
 
@@ -469,6 +473,14 @@ def schema_issue(schema: Any, *, path: str = "", depth: int = 0) -> str | None:
     return None
 
 
+def _same(left: Any, right: Any) -> bool:
+    """JSON equality: ``true`` is not ``1`` and ``1.0`` equals ``1`` only as numbers of the same JSON kind."""
+    kinds = {_type_of(left), _type_of(right)}
+    if kinds <= {"integer", "number"}:
+        return bool(left == right)
+    return _type_of(left) == _type_of(right) and json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+
 def _type_of(value: Any) -> str:
     if value is None:
         return "null"
@@ -503,9 +515,9 @@ def schema_problems(value: Any, schema: Mapping[str, Any], *, path: str = "") ->
             if not _matches_type(item, names):
                 problems.append(f"{where}: type")
                 return
-        if "const" in rule and item != rule["const"]:
+        if "const" in rule and not _same(item, rule["const"]):
             problems.append(f"{where}: const")
-        if "enum" in rule and item not in rule["enum"]:
+        if "enum" in rule and not any(_same(item, option) for option in rule["enum"]):
             problems.append(f"{where}: enum")
         if isinstance(item, str):
             if "minLength" in rule and len(item) < rule["minLength"]:
@@ -548,13 +560,27 @@ def _pointer(name: str) -> str:
     return str(name).replace("~", "~0").replace("/", "~1")[:100]
 
 
+#: The deepest nesting of a payload (objects and arrays).
+MAX_PAYLOAD_DEPTH = 64
+
+
 def _finite(value: Any) -> bool:
-    if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, list):
-        return all(_finite(item) for item in value)
-    if isinstance(value, dict):
-        return all(isinstance(key, str) and _finite(item) for key, item in value.items())
+    """Whether ``value`` holds only finite numbers and string keys, at most :data:`MAX_PAYLOAD_DEPTH` deep (checked
+    without recursion, so a deeply nested payload is an error, not a crash)."""
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            return False
+        if isinstance(item, list | dict):
+            if depth >= MAX_PAYLOAD_DEPTH:
+                return False
+            if isinstance(item, dict):
+                if not all(isinstance(key, str) for key in item):
+                    return False
+                pending.extend((inner, depth + 1) for inner in item.values())
+            else:
+                pending.extend((inner, depth + 1) for inner in item)
     return True
 
 
@@ -563,7 +589,10 @@ def payload_bytes(payload: Any, schema: Mapping[str, Any] | None = None) -> byte
     Raises :class:`DraftError` (``webhook.payload_invalid``, ``webhook.payload_too_large``, ``webhook.schema_mismatch``,
     ``webhook.schema_invalid``)."""
     if not isinstance(payload, dict | list) or not _finite(payload):
-        raise DraftError("webhook.payload_invalid", "The payload must be a JSON object or array of finite values")
+        raise DraftError(
+            "webhook.payload_invalid",
+            f"The payload must be a JSON object or array of finite values, at most {MAX_PAYLOAD_DEPTH} levels deep",
+        )
     if schema is not None:
         issue = schema_issue(schema)
         if issue is not None:
@@ -608,6 +637,7 @@ __all__ = [
     "MAX_HTML_BYTES",
     "MAX_MESSAGE_BYTES",
     "MAX_PAYLOAD_BYTES",
+    "MAX_PAYLOAD_DEPTH",
     "MAX_RECIPIENTS",
     "MAX_SUBJECT",
     "SCHEMA_KEYWORDS",

@@ -351,3 +351,73 @@ async def test_drafts_written_in_a_step_can_be_attached_later(tmp_path: Path) ->
         assert eml.preview["html"] is True and eml.preview["from"] is None
     finally:
         workspace.close()
+
+
+# ---- review findings (internal security review of NAL-A4) ---------------------------------------------------------
+
+
+def test_containers_are_attached_as_plain_bytes() -> None:
+    for media_type in ("message/rfc822", "multipart/mixed; boundary=x"):
+        built = build_mail(
+            MailDraft(
+                to=("a@example.com",), subject="x", body_text="x", attachments=(Attachment("m", media_type, b"x"),)
+            )
+        )
+        assert built.preview["attachments"][0]["media_type"] == "application/octet-stream"
+
+
+def test_deep_payloads_are_an_error_not_a_crash() -> None:
+    deep: Any = []
+    for _ in range(mail.MAX_PAYLOAD_DEPTH + 1):
+        deep = [deep]
+    assert _code(lambda: payload_bytes(deep)) == "webhook.payload_invalid"
+    very_deep: Any = {}
+    for _ in range(5000):
+        very_deep = {"a": very_deep}
+    assert _code(lambda: payload_bytes(very_deep)) == "webhook.payload_invalid"
+
+
+def test_enum_and_const_compare_json_kinds() -> None:
+    schema = {"type": "object", "properties": {"flag": {"enum": [1]}, "n": {"const": 2}}}
+    assert _code(lambda: payload_bytes({"flag": True}, schema)) == "webhook.schema_mismatch"
+    assert payload_bytes({"flag": 1, "n": 2.0}, schema)
+
+
+async def test_attachment_lists_are_checked_before_reading(tmp_path: Path) -> None:
+    calls = [
+        tool_use(
+            "draft_email",
+            {"to": ["a@example.com"], "subject": "x", "body_text": "x", "attachments": ["big.txt"] * 3000},
+            call_id="t1",
+        ),
+        tool_use(
+            "draft_email",
+            {
+                "to": ["a@example.com"],
+                "subject": "x",
+                "body_text": "x",
+                "attachments": [f"f{n}.txt" for n in range(11)],
+            },
+            call_id="t2",
+        ),
+        tool_use(
+            "draft_email",
+            {"to": ["a@example.com"], "subject": "x", "body_text": "x", "attachments": ["big.txt", "big.txt"]},
+            call_id="t3",
+        ),
+        tool_use("draft_webhook", {"payload_json": "[" * 100_000 + "]" * 100_000}, call_id="t4"),
+    ]
+    workspace = _workspace(tmp_path, {"MANY": [*calls, text("Done.")]})
+    try:
+        big = workspace.inputs.add(b"0" * (mail.MAX_MESSAGE_BYTES + 1), name="big.txt", origin="test")
+        flow = workspace.save_workflow(_flow("MANY", ["draft_email", "draft_webhook"], {}))
+        run = await workspace.wait((await workspace.run(flow, RunIn(input="go", file_ids=[big.id]))).id, timeout=20)
+        assert run.status == "succeeded", run.error
+        outputs = [str(call.output) for call in run.nodes["a"].tool_calls]
+        assert "mail.too_large" in outputs[0]  # deduplicated, then refused by size before reading
+        assert "mail.too_many_attachments" in outputs[1]
+        assert "mail.too_large" in outputs[2]
+        assert "webhook.payload_invalid" in outputs[3] or "webhook.payload_too_large" in outputs[3]
+        assert workspace.files.list(run.id) == []
+    finally:
+        workspace.close()

@@ -58,7 +58,14 @@ MAX_EVENTS = 2000
 RESERVED_TYPES: frozenset[str] = frozenset({"database"})
 #: A person's test sends per connection and hour (NAL-A4); each attempt counts once.
 TEST_SENDS_PER_HOUR = 5
+#: A person's test sends per tenant and hour, over all connections (new connections are not a way around the limit).
+TEST_SENDS_PER_TENANT_HOUR = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
+#: The attempts of the last hour, per tenant (key = connection id, and ``*`` for the tenant).
+TEST_SENDS = "connection_test_sends"
+#: Settings that say how a secret is used: changing one clears the secret like a new address does.
+#: (A new path on the same host keeps it: ADR-0001's rule is per ``host:port``.)
+_SECRET_BOUND = ("auth", "security", "username")
 #: The longest secret accepted (API keys, passwords, signing keys; not files).
 MAX_SECRET_LENGTH = 8192
 
@@ -71,7 +78,7 @@ _TYPE_NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 _LABEL = r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _HOST = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(\.{_LABEL})*$")
-_EMAIL = re.compile(r"^[^@\s<>\"',;]{1,64}@[A-Za-z0-9.-]{1,253}$")
+_EMAIL = re.compile(r"^[^@\s<>\"',;]{1,64}@[A-Za-z0-9.-]{1,253}\Z")
 _LOOPBACK_NAMES = frozenset({"localhost"})
 #: The form of a connection id (``new_id("conn")``); releases and exported packages accept no other.
 CONNECTION_ID = re.compile(r"^conn_[0-9a-f]{12}$")
@@ -506,8 +513,9 @@ class ResolvedConnection:
     egress: tuple[str, ...]
     secret: str | None = field(default=None, repr=False)
     tenant_id: str = ""
-    #: The installation's mode (contract 1, additive): checks and test sends apply its address rules.
-    mode: Mode = "desktop"
+    #: The installation's mode (contract 1, additive): checks and test sends apply its address rules. The default is
+    #: the strictest one, so a caller that forgets it never allows loopback on a server.
+    mode: Mode = "server"
 
     def __repr__(self) -> str:
         return f"ResolvedConnection(id={self.id!r}, type={self.type!r}, provider={self.provider!r}, secret=<hidden>)"
@@ -676,8 +684,12 @@ class ConnectionService:
             if data.name is not None:
                 self._unique_name(data.name, except_id=item.id)
             changed_target = provider != item.provider or settings.model_dump(mode="json") != item.settings
-            # A secret only goes where it was entered for: a new address drops it (ADR-0001, write-only secrets).
-            moved = sorted(egress) != sorted(item.egress)
+            # A secret only goes where it was entered for: a new address drops it (ADR-0001, write-only secrets), and
+            # so does a new way of using it (NAL-A4 review M2: a signing key must not become a bearer token, a password
+            # must not be sent with other transport security or for another user).
+            moved = sorted(egress) != sorted(item.egress) or any(
+                settings.model_dump(mode="json").get(name) != item.settings.get(name) for name in _SECRET_BOUND
+            )
             if moved:
                 self._session.pop(item.id, None)
             item = item.model_copy(
@@ -837,29 +849,30 @@ class ConnectionService:
             raise NodestroError(
                 "connection.test_send_unsupported", "This connection type has no test send", type=item.type
             )
-        with self._lock:
+        with self._lock, self.store.transaction():
             since = now() - TEST_SEND_WINDOW
-            recent = [
-                event
-                for event in self.events(limit=MAX_EVENTS)
-                if event.kind == "test_sent"
-                and event.details.get("outcome") == "started"
-                and event.connection_id == item.id
-                and event.at >= since
-            ]
-            if len(recent) >= TEST_SENDS_PER_HOUR:
-                raise NodestroError(
-                    "connection.test_send_limit",
-                    f"At most {TEST_SENDS_PER_HOUR} test sends per connection and hour",
-                    limit=TEST_SENDS_PER_HOUR,
-                )
-            # Booked before sending, so parallel requests cannot pass the limit together.
-            self.event("test_sent", item, actor=actor, outcome="started")
+            counts: dict[str, list[str]] = {}
+            for key, limit in ((item.id, TEST_SENDS_PER_HOUR), ("*", TEST_SENDS_PER_TENANT_HOUR)):
+                stored = self.store.get_raw(TEST_SENDS, key)
+                recent = [at for at in (stored or []) if datetime.fromisoformat(at) >= since]
+                if len(recent) >= limit:
+                    raise NodestroError(
+                        "connection.test_send_limit", f"At most {limit} test sends per hour", limit=limit
+                    )
+                counts[key] = [*recent, now().isoformat()]
+            # Booked before sending, so parallel requests cannot pass the limit together; a record of its own, so
+            # trimming the audit events cannot reset it (review L1).
+            for key, times in counts.items():
+                self.store.put_raw(TEST_SENDS, key, times)
+        self.event("test_sent", item, actor=actor, outcome="started")
         try:
             result = senders[item.type](self.resolve(item.id))
         except TransportError as exc:
             self.event("test_sent", item, actor=actor, outcome="failed", code=exc.code)
             raise NodestroError(exc.code, "The test send failed", **exc.params) from None
+        except NodestroError as exc:  # the stored settings cannot be used (e.g. no secret): still audited
+            self.event("test_sent", item, actor=actor, outcome="failed", code=exc.code)
+            raise
         self.event("test_sent", item, actor=actor, outcome="sent")
         return {"ok": True, **result}
 

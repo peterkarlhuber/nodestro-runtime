@@ -324,8 +324,9 @@ class RunServices:
     #: Stores a draft of NAL-A4 with the top-level run: ``(name, format, data, preview) -> "<file name> (<id>)"``.
     #: ``None``: no run files here (outside a run, an imported run).
     save_file: Callable[[str, str, bytes, dict[str, Any]], str] | None = None
-    #: A file of the run by its file name (input or result file), read for an attachment; ``None`` if unknown.
-    run_file: Callable[[str], Attachment | None] | None = None
+    #: A file of the run by its file name (input or result file), read for an attachment: ``(name, max_bytes)``;
+    #: ``None`` if unknown, ``DraftError("mail.too_large")`` above ``max_bytes`` (checked before reading).
+    run_file: Callable[[str, int], Attachment | None] | None = None
 
 
 @dataclass(frozen=True)
