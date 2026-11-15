@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Changed (TABRION TB-150 follow-up): `storage.role_unsafe` words Tabrion 0.2.2's new `grant_runtime_role` refusal
+  reasons `predefined_role` (a member of a predefined role such as `pg_read_all_data`) and `protected_writable` (the
+  schema versions stay writable through PUBLIC or another role after the REVOKE) and `createrole` (CREATEROLE before
+  PostgreSQL 16) instead of naming the bare code.
+  No change with the pinned Tabrion 0.2.1; the local `pg_write_all_data` refusal stays.
 - Added (NAL-A4, e-mail and webhook drafts; see `docs/drafts.md`):
   - Built-in tools `draft_email` (an `.eml` result file) and `draft_webhook` (a `.json` result file): `write` +
     `internal`, no network, offline. Binding parameters `from_address` and `payload_schema`. Nothing is sent.
