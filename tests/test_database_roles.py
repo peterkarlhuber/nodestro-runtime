@@ -281,7 +281,9 @@ def test_grant_refuses_a_member_of_pg_write_all_data(roles: Roles, extra_roles: 
 
 
 def test_grant_fails_when_the_schema_versions_stay_writable(roles: Roles, extra_roles: list[str]) -> None:
-    """A write privilege on the schema versions inherited from another role survives the REVOKE: refused after it."""
+    """A write privilege on the schema versions inherited from another role survives the REVOKE: refused. Tabrion 0.2.2
+    refuses it in the grant itself (reason ``protected_writable``); the runtime's own check after the grant names the
+    table and stays for older Tabrion versions."""
     writer = _create_role(extra_roles)
     member = _create_role(extra_roles)
     with psycopg.connect(roles.owner_dsn, autocommit=True) as owner_connection:
@@ -297,7 +299,8 @@ def test_grant_fails_when_the_schema_versions_stay_writable(roles: Roles, extra_
         with pytest.raises(NodestroError) as caught:
             grant_runtime_role(owner, member)
         assert caught.value.code == "storage.role_unsafe"
-        assert "can still write the schema versions (nodestro_schema_migrations)" in str(caught.value)
+        assert caught.value.params == {"role": member}
+        assert "can still write the schema versions" in str(caught.value)
     finally:
         owner.close()
 
