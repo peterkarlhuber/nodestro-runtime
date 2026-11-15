@@ -925,6 +925,11 @@ _UNSAFE_REASONS = {
     "superuser": "is a superuser or can become one (SET ROLE)",
     "bypass_rls": "has BYPASSRLS or can become a role that has it (SET ROLE)",
     "table_owner": "is or can become the owner role or the owner of the schema (SET ROLE)",
+    # Tabrion 0.2.2 (TB-150, D-124/D-125): a member of a predefined role such as pg_read_all_data, and a role that can
+    # still write the schema versions after the REVOKE (a grant to PUBLIC or to a role it is a member of).
+    "predefined_role": "is or can become a member of a predefined role (pg_*)",
+    "protected_writable": "can still write the schema versions after the grant (a privilege of PUBLIC or of a role it"
+    " is a member of)",
 }
 
 
