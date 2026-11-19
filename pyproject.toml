@@ -34,6 +34,10 @@ dependencies = [
     # The MCP client (ADR-0007): the official SDK with its own protocol version negotiation.
     "mcp>=2.3,<3",
     "tzdata>=2024.1; sys_platform == 'win32'",
+    # AES-GCM and HKDF of the secret store (server_settings.SecretBox): MCP tokens, connection secrets and, with a
+    # keychain or operator key, provider API keys on the desktop (security fix N-03). Declared here, not only reached
+    # through another package, because the desktop and Local Docker seal secrets without the postgres extra.
+    "cryptography>=42",
     # Value-free database error messages (tabrion.errors, standard library only; TABRION MIG-NOD-3, doc 06 N-1). Every
     # Tabrion requirement in this file names the same minor range (VER-1, tests/test_tabrion_pin.py); the exact commit
     # lives in the studio locks (nodestro-studio platform/internal-server.txt and, from PIN-W2, platform/internal.txt).
@@ -41,7 +45,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The server profile: PostgreSQL, encryption of tenant secrets (server_settings.SecretBox) and the Axentra platform
+# The server profile: PostgreSQL, the tenant secrets of a server (server_settings.SecretBox) and the Axentra platform
 # services (axentra_platform, off unless NODESTRO_AXENTRA=on). The desktop and Local Docker never install this extra:
 # Axentra is not a base dependency, and without it the server profile works and switching it on is refused.
 # Every Axentra requirement below names the same version range (MUP-ONA B0); the exact commit lives in the studio lock.

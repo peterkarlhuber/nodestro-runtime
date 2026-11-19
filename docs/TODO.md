@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 6 |
-| P3 Low | 29 |
+| P3 Low | 30 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -54,6 +54,21 @@ None known.
 - **Next step:** Included in the D1 brief P-Web (nodestro-studio `docs/security/nal/p-web.md`, ST-064), together
   with `web_tools.py` and the MCP guard on `orkexa.net.guard`. The brief is prepared, not commissioned (the owner
   decides). Fix findings before NAL-A2 is activated broadly; `NODESTRO_WEB_TOOLS_SERVER` stays off until then.
+
+### RT-081 · Independent review of the security fixes N-03 and N-07
+
+- **Priority:** P3 Low · **Status:** Needs external review · **Refs:** runtime #191 (`10dd28e`) and this PR,
+  nodestro-api #152 (`e7c6ce8`), nodestro-studio #207 (`d18178b`), owner decisions E-P-4 and E-P-6 (2026-11-19),
+  `tests/test_desktop_provider_keys.py`, nodestro-desktop `scripts/smoke_inside.sh` (`provider_key_check`)
+- **What:** N-03: with the desktop's keychain key (or `NODESTRO_VAULT_KEY`) provider API keys are sealed with
+  `SecretBox` like MCP tokens and connection secrets; plain keys of earlier releases are sealed when the workspace
+  opens; a sealed key without the right key counts as missing and never reaches a provider. N-07: a person's rejection
+  comment no longer reaches the model (fixed text `REJECTED_CALL`). Internal tests, including the desktop bundle's
+  restart test, pass; they do not replace the independent review (E-P-5: bundled, paid orders need the owner's consent,
+  done before any public deployment). Residual risk: without a key store (command line, Local Docker without the
+  variable) provider keys stay in plain text in the user-only database file (AR-3 in nodestro-studio MUP-ONA).
+- **Next step:** Put both fixes into the next bundled independent review brief. The separate, explicit "note to the
+  agent" feature allowed by E-P-4 is planned, not built.
 
 ### RT-080 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
 

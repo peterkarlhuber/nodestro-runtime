@@ -199,3 +199,13 @@ def test_a_malformed_keychain_key_is_refused(tmp_path: Path) -> None:
     with pytest.raises(NodestroError) as caught:
         Workspace(tmp_path / "data", integrations=[], vault_key="short")
     assert caught.value.code == "profile.invalid"
+
+
+def test_the_secret_store_library_is_a_declared_base_dependency() -> None:
+    """The desktop and Local Docker seal secrets without the postgres extra, so ``cryptography`` must not reach them
+    only through another package."""
+    import tomllib
+
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    base = [requirement.split(";")[0].replace(" ", "") for requirement in pyproject["project"]["dependencies"]]
+    assert any(requirement.startswith("cryptography>=") for requirement in base), base
