@@ -48,7 +48,7 @@ from orkexa.local import OllamaError, check_model_name
 from orkexa.providers.base import redact
 
 from . import bedrock as bedrock_auth
-from . import docker_status, output_limits, run_budget, sandbox_selection
+from . import docker_status, local_vault, output_limits, run_budget, sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -288,6 +288,7 @@ class Workspace:
         before_migration: BeforeMigration | None = None,
         storage: WorkspaceStorage | None = None,
         vault_key: str | None = None,
+        verify_vault_key: bool = False,
     ) -> None:
         """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
         OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`).
@@ -297,6 +298,10 @@ class Workspace:
         key, provider API keys, MCP tokens and the secrets of service connections are stored only encrypted, and
         provider keys stored in plain text by an earlier release are encrypted when the workspace opens. A server
         tenant always uses its own secret box from ``storage`` and ignores ``vault_key``.
+
+        ``verify_vault_key`` (Nodestro Local Docker) requires such a key (``secrets.vault_key_missing``) and refuses one
+        that does not fit the secrets already sealed in the data directory (``secrets.vault_key_mismatch``), before
+        anything is migrated or written (:mod:`nodestro_runtime.local_vault`).
 
         ``profile`` chooses the operating profile (:mod:`nodestro_runtime.profile`); without one, the desktop
         profile on ``data_dir`` is used, as before. Given both, ``data_dir`` must be the profile's data
@@ -373,6 +378,16 @@ class Workspace:
             self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(database)
             self._store_model_defaults(fresh=fresh)
+            if verify_vault_key:
+                try:
+                    if local_box is None:
+                        raise local_vault.missing()
+                    local_vault.verify_store(self._sqlite, local_box, LOCAL_TENANT)
+                except BaseException:
+                    self._sqlite.close()
+                    if self._directory_lock is not None:
+                        self._directory_lock.release()
+                    raise
             if local_box is not None:
                 self._secrets = local_box
                 self._seal_plain_provider_keys()

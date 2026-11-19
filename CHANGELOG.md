@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security (LD-020): the key of a local data directory (`nodestro_runtime.local_vault`), for Nodestro Local Docker's
+  key file on the host.
+  - `Workspace(verify_vault_key=True)` requires a key (`secrets.vault_key_missing`) and stores a check value sealed
+    with it on the first opening (`local_vault/check`); a key that cannot open it is refused before anything is
+    migrated or written (`secrets.vault_key_mismatch`), so a new key is never laid over secrets sealed with another.
+    Data without a check value is refused when it holds sealed secrets and none of them opens.
+  - `local_vault.rekey(data_dir, old, new)` seals provider keys, MCP tokens, pending MCP sign-ins and connection
+    secrets of a stopped data directory with a new key in one transaction (no schema migration, so it also works on
+    the copy an update keeps for a rollback). A secret neither key opens stops it with nothing changed; running it
+    again after an interruption is safe. Freed pages are overwritten and the write-ahead log is emptied.
+  - `local_vault.discard_unreadable(data_dir, key)`: the explicit answer to a lost key; removes the secrets the key
+    cannot open and makes it the data directory's key.
 - `cryptography` is a declared base dependency (follow-up of N-03): the secret store seals MCP tokens, connection
   secrets and provider keys on the desktop and in Local Docker, which never install the postgres extra. Before, it
   arrived only through another package.
