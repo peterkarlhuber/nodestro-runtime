@@ -55,6 +55,17 @@ None known.
   with `web_tools.py` and the MCP guard on `orkexa.net.guard`. The brief is prepared, not commissioned (the owner
   decides). Fix findings before NAL-A2 is activated broadly; `NODESTRO_WEB_TOOLS_SERVER` stays off until then.
 
+### RT-082 · Independent review of the local data directory key (LD-020)
+
+- **Priority:** P3 Low · **Status:** Needs external review · **Refs:** `nodestro_runtime.local_vault`,
+  `tests/test_local_vault.py`, nodestro-api `nodestro-local boot`, nodestro-local-docker LD-020, owner decision
+  LD-020 (2026-11-19)
+- **What:** Nodestro Local Docker keeps its key in a file on the host; the workspace refuses a missing key and a key
+  that does not fit the sealed secrets (check value `local_vault/check`), `rekey` rotates provider keys, MCP tokens and
+  connection secrets in one transaction, `discard_unreadable` is the explicit answer to a lost key. Internal tests
+  pass; they do not replace the independent review (E-P-5, bundled with RT-081).
+- **Next step:** Add to the next bundled independent review brief.
+
 ### RT-081 · Independent review of the security fixes N-03 and N-07
 
 - **Priority:** P3 Low · **Status:** Needs external review · **Refs:** runtime #191 (`10dd28e`) and this PR,
