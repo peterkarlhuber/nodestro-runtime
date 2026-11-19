@@ -70,7 +70,7 @@ from .mcp.hub import McpHub, McpLimits
 from .mcp.models import SERVERS as MCP_SERVERS
 from .mcp.netguard import EgressPolicy
 from .mcp.service import McpService
-from .mcp.vault import TokenVault, vault_box_from_env
+from .mcp.vault import VAULT_KEY_ENV, TokenVault, vault_box_from_env
 from .mcp_access import unattended_mcp_enabled
 from .memory_spaces import MemorySpaces, MemoryTables
 from .notifications import NOTIFY_TOOLS, LocalInbox, RunNotifier, local_inbox_enabled
@@ -287,9 +287,16 @@ class Workspace:
         profile: RuntimeProfile | None = None,
         before_migration: BeforeMigration | None = None,
         storage: WorkspaceStorage | None = None,
+        vault_key: str | None = None,
     ) -> None:
         """``client_factory(provider)`` replaces the SDK clients, ``python_runner`` uv, ``ocr_runner`` the
         OCR (tests). ``integrations`` replaces the installed ones (:func:`~nodestro_runtime.extensions.discover`).
+
+        ``vault_key`` is the key from the operating system's keychain that the desktop app hands to the backend
+        (base64, see :mod:`nodestro_runtime.mcp.vault`); without it, ``NODESTRO_VAULT_KEY`` is looked up. With such a
+        key, provider API keys, MCP tokens and the secrets of service connections are stored only encrypted, and
+        provider keys stored in plain text by an earlier release are encrypted when the workspace opens. A server
+        tenant always uses its own secret box from ``storage`` and ignores ``vault_key``.
 
         ``profile`` chooses the operating profile (:mod:`nodestro_runtime.profile`); without one, the desktop
         profile on ``data_dir`` is used, as before. Given both, ``data_dir`` must be the profile's data
@@ -338,7 +345,12 @@ class Workspace:
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
         self._secrets: TenantSecrets | None = None
+        # The desktop's key box (keychain key): seals provider keys, MCP tokens and connection secrets of this data
+        # directory. ``None`` without a key: MCP tokens and connection secrets are kept for the session only, provider
+        # keys are stored as before (see _seal).
+        local_box = None
         if storage is None:
+            local_box = vault_box_from_env({VAULT_KEY_ENV: vault_key}) if vault_key else vault_box_from_env()
             database = data_dir / DATABASE
             try:
                 self._sqlite = Store(database)
@@ -361,6 +373,9 @@ class Workspace:
             self.knowledge = KnowledgeBase(database, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(database)
             self._store_model_defaults(fresh=fresh)
+            if local_box is not None:
+                self._secrets = local_box
+                self._seal_plain_provider_keys()
         else:
             self.store = storage.store
             self.tenant_id = storage.tenant_id
@@ -399,7 +414,7 @@ class Workspace:
         self._apply_sandbox_mode()
         # MCP (ADR-0007): the egress policy is the operator's (process environment), tokens are sealed with the
         # tenant's secret box on a server and with the keychain key from the desktop app; one hub per workspace.
-        secret_box = storage.secrets if storage is not None else vault_box_from_env()
+        secret_box = storage.secrets if storage is not None else local_box
         self.mcp = McpService(
             self.store,
             McpHub(
@@ -740,8 +755,10 @@ class Workspace:
     def _providers(self, values: dict[str, Any] | None = None, *, sealed: bool = False) -> dict[str, dict[str, Any]]:
         """The stored settings per provider; a top-level ``api_key`` counts as Anthropic's key.
 
-        With a secret box (server tenants), keys are stored encrypted and returned decrypted, unless ``sealed``. A key
-        that cannot be decrypted (or was stored in plain text) counts as missing: it has to be entered again."""
+        With a secret box (server tenants, and a desktop with its keychain key), keys are stored encrypted and returned
+        decrypted, unless ``sealed``. A key that cannot be decrypted (or was stored in plain text) counts as missing: it
+        has to be entered again. Without a box, an encrypted key (written while a keychain key was available) counts as
+        missing too: it is never handed to a provider as if it were the key itself."""
         values = values if values is not None else (self.store.get_raw("settings", "app") or {})
         providers: dict[str, dict[str, Any]] = {
             name: dict(item) for name, item in (values.get("providers") or {}).items() if isinstance(item, dict)
@@ -757,10 +774,47 @@ class Workspace:
                     except NodestroError:
                         logger.warning("The stored %s key of tenant %s is unreadable", name, self.tenant_id)
                         entry.pop("api_key")
+        elif self._secrets is None and not sealed:
+            for name, entry in providers.items():
+                if entry.get("api_key") and is_encrypted(entry["api_key"]):
+                    logger.warning("The stored %s key is encrypted and no key store is available", name)
+                    entry.pop("api_key")
         return providers
+
+    def _seal_plain_provider_keys(self) -> None:
+        """Encrypt provider keys that an earlier release (or a session without the keychain) stored in plain text.
+
+        Runs once per opening, inside one transaction: every plain key is replaced by its encrypted form, or nothing
+        changes. Keys that are already encrypted stay as they are; a key that cannot be encrypted is never dropped."""
+        if self._secrets is None:
+            return
+        with self.store.transaction():
+            values = self.store.get_raw("settings", "app") or {}
+            providers = values.get("providers") or {}
+            legacy = values.get("api_key")
+            changed: list[str] = []
+            if isinstance(legacy, str) and legacy:
+                # The top-level key of old releases is Anthropic's; it moves into the provider settings (as on update).
+                anthropic = providers.setdefault("anthropic", {})
+                if not anthropic.get("api_key"):
+                    anthropic["api_key"] = legacy
+                values.pop("api_key")
+                changed.append("api_key")
+            for name, entry in providers.items():
+                key = entry.get("api_key") if isinstance(entry, dict) else None
+                if isinstance(key, str) and key and not is_encrypted(key):
+                    entry["api_key"] = self._secrets.encrypt(self.tenant_id, _key_field(name), key)
+                    changed.append(name)
+            if not changed:
+                return
+            values["providers"] = providers
+            self.store.put_raw("settings", "app", values)
+        logger.info("Encrypted %d stored provider key(s) with the keychain key", len(changed))
 
     def _seal(self, provider: str, key: str) -> str:
         if self._secrets is None:
+            # No key store (no desktop keychain key, no NODESTRO_VAULT_KEY): stored as before, in the database file
+            # that only this user can read (tabrion's 0600 profile). The desktop app always hands its keychain key.
             return key
         return self._secrets.encrypt(self.tenant_id, _key_field(provider), key)
 
@@ -866,7 +920,7 @@ class Workspace:
             self.sandbox_policy.check_construction("none")  # before anything is stored
         # A top-level ``api_key`` is Anthropic's key; it moves into the provider settings (once, idempotent).
         providers = self._providers(values, sealed=True)
-        if self._secrets is not None:  # a key stored in plain text is never kept on a server (enter it again)
+        if self._secrets is not None:  # with a key store a plain-text key is never kept (it is entered again)
             for entry in providers.values():
                 if entry.get("api_key") and not is_encrypted(entry["api_key"]):
                     entry.pop("api_key")
