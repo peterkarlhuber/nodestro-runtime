@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `cryptography` is a declared base dependency (follow-up of N-03): the secret store seals MCP tokens, connection
+  secrets and provider keys on the desktop and in Local Docker, which never install the postgres extra. Before, it
+  arrived only through another package.
 - Security (N-03): provider API keys on a desktop are stored only encrypted when the keychain key is available.
   - `Workspace(vault_key=...)` takes the key the desktop app hands over (otherwise `NODESTRO_VAULT_KEY`); the same
     `SecretBox` then seals provider keys, MCP tokens and the secrets of service connections. Before, the connection
