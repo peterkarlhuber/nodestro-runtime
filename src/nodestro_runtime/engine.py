@@ -171,6 +171,12 @@ _EVENT_SEQ = "run_event_seq"
 _MAX_SUBSCRIBER_BACKLOG = 10_000
 #: How long :meth:`RunManager.shutdown` waits for runs to stop by themselves.
 _SHUTDOWN_GRACE_SECONDS = 5.0
+
+#: What the model is told when a person rejected one of its tool calls. Deliberately terse and fixed: the person's
+#: comment is for people only (it stays in the call's approval record, the run's events and the audit trail) and never
+#: reaches a model, a sub-agent or an MCP server, because it can name paths, people or the security reasoning behind a
+#: decision (decisions Z-4 and E-P-4). Guidance for the agent would need its own, explicit feature.
+REJECTED_CALL = "A person rejected this call"
 #: Threads that execute the agents and orchestrator decisions of one :class:`RunManager`'s runs, including agents
 #: that wait in their thread for a tool approval (C-08). Configurable with :data:`RUN_THREADS_ENV`. The pool is
 #: separate from asyncio's default executor, so busy or waiting agents never delay the application's other
@@ -3200,7 +3206,7 @@ class RunManager:
                 shown,
             )
         if final.status == "rejected":
-            return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
+            return REJECTED_CALL
         if final.status == "expired":
             return "Nobody approved this call in time, so it was not made"
         context.check()
@@ -3410,7 +3416,7 @@ class RunManager:
         if final.status == "approved":
             return None
         if final.status == "rejected":
-            return "A person rejected this call" + (f": {final.comment}" if final.comment else "")
+            return REJECTED_CALL
         if final.status == "expired":
             return "Nobody approved this call in time, so it was not made"
         return "The question about this call was closed, so it was not made"

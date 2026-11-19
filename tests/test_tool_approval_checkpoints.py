@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+import json
 from pathlib import Path
 from typing import Any
 
@@ -160,10 +161,13 @@ async def test_a_run_pauses_at_the_call_and_continues_after_the_approval(make: M
 
 async def test_a_rejected_call_is_not_made(make: Make) -> None:
     workspace = make()
-    done = await decide(workspace, await paused_run(workspace), approved=False, comment="No")
+    comment = "Not in /home/alice/private: the reviewer keeps that folder closed"
+    done = await decide(workspace, await paused_run(workspace), approved=False, comment=comment)
     assert done.status == "succeeded", done.error
-    assert call(done).is_error and "No" in (call(done).output or "")
-    assert call(done).approval.status == "rejected"
+    assert call(done).is_error and call(done).output == "Tool call denied: A person rejected this call"
+    assert call(done).approval.status == "rejected" and call(done).approval.comment == comment
+    # Z-4 / E-P-4: the person's comment stays with people; no request to the model ever carried it.
+    assert "alice" not in json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
     # Closed when the run continued, so a later continue of the run never audits it again.
     assert requests(workspace, done.id)[0].use == "closed"
     assert kinds(workspace).count("resumed") == 1

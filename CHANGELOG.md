@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Security (N-03): provider API keys on a desktop are stored only encrypted when the keychain key is available.
+  - `Workspace(vault_key=...)` takes the key the desktop app hands over (otherwise `NODESTRO_VAULT_KEY`); the same
+    `SecretBox` then seals provider keys, MCP tokens and the secrets of service connections. Before, the connection
+    secrets of a desktop started by the app were kept for the session only, because the API replaced only the MCP vault.
+  - Keys that an earlier release stored in plain text (including the top-level `api_key` of the oldest releases) are
+    encrypted in one transaction when the workspace opens; the migration is idempotent and never drops a key.
+  - Without a key store an encrypted key counts as missing and is never handed to a provider; it is kept for the next
+    start with the keychain. Without any key store the earlier storage stays (plain key in the 0600 database file,
+    risk AR-3); a different keychain key makes stored keys missing (enter them again), never readable.
+- Security (N-07): a person's comment on a rejected tool call no longer reaches the model. The model, sub-agents and
+  MCP servers get the fixed text "A person rejected this call" (`engine.REJECTED_CALL`); the comment stays in the
+  call's approval record, the run's events and the audit trail for people.
+
 - Changed (TABRION TB-150 follow-up): `storage.role_unsafe` words Tabrion 0.2.2's new `grant_runtime_role` refusal
   reasons `predefined_role` (a member of a predefined role such as `pg_read_all_data`) and `protected_writable` (the
   schema versions stay writable through PUBLIC or another role after the REVOKE) and `createrole` (CREATEROLE before

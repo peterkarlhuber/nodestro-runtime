@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+import json
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ def make(tmp_path: Path) -> Iterator[Make]:
         script = {"AGENT": [tool_use(TOOL, {"celsius": 100}), text("done")]}
         fake = ScriptedClient(script)
         workspace = Workspace(tmp_path / f"data{len(opened)}", client_factory=lambda _provider: fake, integrations=[])
+        workspace.fake = fake  # type: ignore[attr-defined]
         opened.append(workspace)
         result, _ = workspace.tools.save_custom(
             CUSTOM_TOOL_TEMPLATE,
@@ -121,18 +123,23 @@ async def test_an_approved_call_runs_with_the_shown_arguments(make: Make) -> Non
     assert record.approval.capability == {"access": "write", "reach": "external", "source": "default"}
 
 
-async def test_a_rejected_call_is_denied_with_the_comment(make: Make) -> None:
+async def test_a_rejected_call_is_denied_and_the_comment_stays_with_people(make: Make) -> None:
     workspace = make()
     started = await start(workspace)
     request = await pending(workspace, started.id)
+    comment = "Wrong unit, and C:\\Users\\bob\\secrets stays closed"
     ToolApprovals(workspace.store).decide(
-        started.id, request.id, approved=False, by="usr_1", arguments=request.arguments_hash, comment="Wrong unit"
+        started.id, request.id, approved=False, by="usr_1", arguments=request.arguments_hash, comment=comment
     )
     done = await workspace.wait(started.id, timeout=20)
     assert done.status == "succeeded", done.error
     record = call_of(done)
-    assert record.is_error and "Wrong unit" in (record.output or "")
+    # Z-4 / E-P-4: the model gets the fixed, terse denial; the comment is shown to people only.
+    assert record.is_error and record.output == "Tool call denied: A person rejected this call"
     assert record.approval.status == "rejected" and record.approval.code == "tool.approval_rejected"
+    assert record.approval.comment == comment
+    sent = json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
+    assert "Wrong unit" not in sent and "bob" not in sent
     # AD-03: the run succeeded without the call, and says so.
     assert [(item.code, item.tool, item.count) for item in done.warnings] == [
         ("tool.approval_rejected", record.name, 1)
