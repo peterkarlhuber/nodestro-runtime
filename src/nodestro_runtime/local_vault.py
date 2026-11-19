@@ -167,6 +167,9 @@ def _offline(data_dir: Path) -> Iterator[sqlite3.Connection | None]:
     """The database of a stopped data directory in one write transaction (``None``: there is no database yet)."""
     from .workspace import DATABASE, DataDirectoryLock
 
+    if not data_dir.is_dir():  # a volume that never held a data directory (an update's copy of a fresh install)
+        yield None
+        return
     lock = DataDirectoryLock(data_dir)
     try:
         database = data_dir / DATABASE

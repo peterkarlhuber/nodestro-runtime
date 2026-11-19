@@ -271,6 +271,8 @@ def test_rotation_of_an_empty_data_directory_does_nothing(tmp_path: Path) -> Non
     (tmp_path / "data").mkdir()
     assert local_vault.rekey(tmp_path / "data", new_key(), new_key()) == {"provider": 0, "mcp": 0, "connection": 0}
     assert not (tmp_path / "data" / DATABASE).exists()
+    assert local_vault.discard_unreadable(tmp_path / "none", new_key())["provider"] == 0
+    assert not (tmp_path / "none").exists()
 
 
 # ---- key loss -----------------------------------------------------------------------------------------------------
