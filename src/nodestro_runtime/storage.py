@@ -1040,6 +1040,50 @@ class SQLiteStore:
 
 
 #: The name of :class:`SQLiteStore` in Nodestro 0.1 and 0.2 (imports and type hints keep working).
+class RawDocuments:
+    """The raw JSON documents of four collections of a stopped desktop database, in one write transaction
+    (:func:`stopped_documents`)."""
+
+    def __init__(self, connection: sqlite3.Connection, collections: tuple[str, str, str, str]) -> None:
+        self._connection = connection
+        rows = connection.execute(
+            "SELECT collection, id, data FROM nodestro_documents WHERE collection IN (?, ?, ?, ?)", collections
+        ).fetchall()
+        self.documents: dict[tuple[str, str], str] = {(collection, key): data for collection, key, data in rows}
+
+    def put(self, collection: str, key: str, data: str) -> None:
+        self._connection.execute(
+            "INSERT INTO nodestro_documents (collection, id, data) VALUES (?, ?, ?)"
+            " ON CONFLICT (collection, id) DO UPDATE SET data = excluded.data,"
+            " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            (collection, key, data),
+        )
+
+
+@contextmanager
+def stopped_documents(database: Path, collections: tuple[str, str, str, str]) -> Iterator[RawDocuments | None]:
+    """The documents of ``collections`` in the database file of a stopped data directory (the caller holds its
+    directory lock), without a schema migration, in one write transaction: everything written is stored, or nothing.
+    ``None`` when the file does not exist. Freed pages are overwritten (``secure_delete``) and the write-ahead log is
+    emptied afterwards, so replaced values do not stay in the file (:mod:`nodestro_runtime.local_vault`)."""
+    if not database.is_file():
+        yield None
+        return
+    connection = sqlite3.connect(database, isolation_level=None, timeout=30)
+    try:
+        connection.execute("PRAGMA secure_delete = ON")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield RawDocuments(connection, collections)
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+
+
 Store = SQLiteStore
 
 __all__ = [
@@ -1051,6 +1095,8 @@ __all__ = [
     "DocumentStore",
     "Migration",
     "ModelT",
+    "RawDocuments",
     "SQLiteStore",
     "Store",
+    "stopped_documents",
 ]

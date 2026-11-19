@@ -27,18 +27,20 @@ a schema migration, so they also work on the copy of an earlier release's data t
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import sqlite3
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
 from .problems import NodestroError
 from .server_settings import ENCRYPTED_PREFIX, SecretBox
+from .storage import RawDocuments, stopped_documents
 
 #: Where the check value is stored (a collection of its own: backups and restores keep the current one).
 CHECK_COLLECTION = "local_vault"
@@ -163,8 +165,8 @@ def verify_store(store: Any, box: SecretBox, tenant_id: str) -> None:
 
 
 @contextmanager
-def _offline(data_dir: Path) -> Iterator[sqlite3.Connection | None]:
-    """The database of a stopped data directory in one write transaction (``None``: there is no database yet)."""
+def _offline(data_dir: Path) -> Iterator[RawDocuments | None]:
+    """The documents of a stopped data directory in one write transaction (``None``: there is no database yet)."""
     from .workspace import DATABASE, DataDirectoryLock
 
     if not data_dir.is_dir():  # a volume that never held a data directory (an update's copy of a fresh install)
@@ -172,38 +174,17 @@ def _offline(data_dir: Path) -> Iterator[sqlite3.Connection | None]:
         return
     lock = DataDirectoryLock(data_dir)
     try:
-        database = data_dir / DATABASE
-        if not database.is_file():
-            yield None
-            return
-        connection = sqlite3.connect(database, isolation_level=None, timeout=30)
-        try:
-            # Overwrite what is freed, so that replaced ciphertexts do not stay in free pages of the file.
-            connection.execute("PRAGMA secure_delete = ON")
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield connection
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            connection.execute("COMMIT")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            connection.close()
+        with stopped_documents(data_dir / DATABASE, (*COLLECTIONS, CHECK_COLLECTION)) as documents:
+            yield documents
     finally:
         lock.release()
 
 
-def _documents(connection: sqlite3.Connection) -> dict[tuple[str, str], Any]:
-    marks = ", ".join("?" for _ in COLLECTIONS)
-    rows = connection.execute(
-        f"SELECT collection, id, data FROM nodestro_documents WHERE collection IN ({marks}, ?)",
-        (*COLLECTIONS, CHECK_COLLECTION),
-    ).fetchall()
+def _documents(raw: RawDocuments) -> dict[tuple[str, str], Any]:
     documents: dict[tuple[str, str], Any] = {}
-    for collection, key, data in rows:
+    for key, data in raw.documents.items():
         try:
-            documents[(collection, key)] = json.loads(data)
+            documents[key] = json.loads(data)
         except ValueError:
             continue  # a damaged document holds no secret this module could read
     return documents
@@ -219,21 +200,20 @@ def _set(document: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
         target[path[-1]] = value
 
 
-def _write(connection: sqlite3.Connection, collection: str, key: str, data: Any) -> None:
-    connection.execute(
-        "INSERT INTO nodestro_documents (collection, id, data) VALUES (?, ?, ?) ON CONFLICT (collection, id) DO UPDATE"
-        " SET data = excluded.data, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        (collection, key, json.dumps(data, separators=(",", ":"))),
-    )
+def _write(raw: RawDocuments, collection: str, key: str, data: Any) -> None:
+    raw.put(collection, key, json.dumps(data, separators=(",", ":")))
 
 
 def _box(key: str) -> SecretBox:
-    from .mcp.vault import VAULT_KEY_ENV, vault_box_from_env
-
-    box = vault_box_from_env({VAULT_KEY_ENV: key})
-    if box is None:
-        raise missing()
-    return box
+    """The box of a key file's key (base64, at least 32 bytes), as ``nodestro_runtime.mcp.vault`` reads it."""
+    text = key.strip()
+    try:
+        raw = base64.b64decode(text + "=" * (-len(text) % 4), altchars=b"-_", validate=False)
+    except (binascii.Error, ValueError):
+        raw = b""
+    if len(raw) < 32:
+        raise NodestroError("secrets.vault_key_invalid", "The key is not 32 random bytes, base64-encoded")
+    return SecretBox(raw)
 
 
 def rekey(data_dir: str | Path, old_key: str, new_key: str, *, tenant_id: str = "local") -> dict[str, int]:
@@ -241,10 +221,10 @@ def rekey(data_dir: str | Path, old_key: str, new_key: str, *, tenant_id: str = 
     documentation); returns how many secrets of each kind were sealed again."""
     old, new = _box(old_key), _box(new_key)
     counts = {"provider": 0, "mcp": 0, "connection": 0}
-    with _offline(Path(data_dir)) as connection:
-        if connection is None:
+    with _offline(Path(data_dir)) as raw:
+        if raw is None:
             return counts
-        documents = _documents(connection)
+        documents = _documents(raw)
         check = documents.pop((CHECK_COLLECTION, CHECK_ID), None)
         if check is not None and not (_check_opens(old, tenant_id, check) or _check_opens(new, tenant_id, check)):
             raise mismatch(sum(len(sealed_in(c, k, d)) for (c, k), d in documents.items()))
@@ -270,8 +250,8 @@ def rekey(data_dir: str | Path, old_key: str, new_key: str, *, tenant_id: str = 
                 unreadable=unreadable,
             )
         for collection, key in sorted(changed):
-            _write(connection, collection, key, documents[(collection, key)])
-        _write(connection, CHECK_COLLECTION, CHECK_ID, check_value(new, tenant_id))
+            _write(raw, collection, key, documents[(collection, key)])
+        _write(raw, CHECK_COLLECTION, CHECK_ID, check_value(new, tenant_id))
     return counts
 
 
@@ -280,10 +260,10 @@ def discard_unreadable(data_dir: str | Path, key: str, *, tenant_id: str = "loca
     directory's key (the explicit answer to a lost key); returns how many secrets of each kind were removed."""
     box = _box(key)
     counts = {"provider": 0, "mcp": 0, "connection": 0}
-    with _offline(Path(data_dir)) as connection:
-        if connection is None:
+    with _offline(Path(data_dir)) as raw:
+        if raw is None:
             return counts
-        documents = _documents(connection)
+        documents = _documents(raw)
         documents.pop((CHECK_COLLECTION, CHECK_ID), None)
         for (collection, doc_key), data in documents.items():
             dropped = [
@@ -297,8 +277,8 @@ def discard_unreadable(data_dir: str | Path, key: str, *, tenant_id: str = "loca
                     data["secret_storage"] = "none"
                 counts[item.kind] += 1
             if dropped:
-                _write(connection, collection, doc_key, data)
-        _write(connection, CHECK_COLLECTION, CHECK_ID, check_value(box, tenant_id))
+                _write(raw, collection, doc_key, data)
+        _write(raw, CHECK_COLLECTION, CHECK_ID, check_value(box, tenant_id))
     return counts
 
 
