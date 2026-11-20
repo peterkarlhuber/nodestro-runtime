@@ -193,6 +193,38 @@ def test_the_first_start_with_a_key_seals_plain_provider_keys(tmp_path: Path) ->
             workspace.close()
 
 
+def test_sealing_plain_keys_also_scrubs_pages_an_earlier_release_freed(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    old = Workspace(data, integrations=[])
+    try:
+        old.update_settings(SettingsIn(providers={"anthropic": ProviderSettingsIn(api_key=SECRET)}))
+    finally:
+        old.close()
+    # An earlier release without secure_delete rewrote the document: copies of the plain key stay in free pages.
+    connection = sqlite3.connect(data / DATABASE)
+    connection.execute("PRAGMA secure_delete = OFF")
+    (document,) = connection.execute(
+        "SELECT data FROM nodestro_documents WHERE collection = 'settings' AND id = 'app'"
+    ).fetchone()
+    for size in (3000, 6000, 9000):
+        values = json.loads(document)
+        values["padding"] = "x" * size
+        connection.execute(
+            "UPDATE nodestro_documents SET data = ? WHERE collection = 'settings' AND id = 'app'",
+            (json.dumps(values),),
+        )
+        connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    assert raw(data).count(SECRET.encode()) > 1
+    workspace = open_workspace(data, new_key())
+    try:
+        assert SECRET.encode() not in raw(data)
+        assert workspace.provider_settings("anthropic")["api_key"] == SECRET
+    finally:
+        workspace.close()
+
+
 # ---- rotation -----------------------------------------------------------------------------------------------------
 
 

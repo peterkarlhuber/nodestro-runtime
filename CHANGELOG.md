@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Security (LD-020 follow-up 2): `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE`
+  checkpoint), called once after plain provider keys are sealed. Data of earlier releases without `secure_delete`
+  kept copies of a plain key in free pages that the checkpoint alone does not overwrite; found by
+  nodestro-local-docker's upgrade test from an image of the first backend audit, reproduced in a unit test.
 - Security (LD-020 follow-up): sealing plain provider keys on opening ends with a WAL checkpoint
   (`SQLiteStore.checkpoint()`, `PRAGMA wal_checkpoint(TRUNCATE)`), so the plain keys leave the write-ahead log and the
   database file's old page at once, not only at SQLite's next automatic checkpoint. Found by nodestro-local-docker's
