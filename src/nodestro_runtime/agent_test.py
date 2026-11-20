@@ -22,7 +22,7 @@ from decimal import Decimal
 import threading
 from typing import Any, Literal
 
-from orkexa import EphemeralMemory, MaxToolCallsError, MaxToolRoundsError, MemoryBackend, ToolCall
+from orkexa import Denial, EphemeralMemory, MaxToolCallsError, MaxToolRoundsError, MemoryBackend, ToolCall
 from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
@@ -195,12 +195,13 @@ class AgentTester:
 
         gate = self.tool_gate()
 
-        def before_tool(call: ToolCall) -> str | None:
+        def before_tool(call: ToolCall) -> Denial | None:
             record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
             with lock:
                 calls[call.id] = record
                 result.tool_calls.append(record)
-            return self._gate(gate, config, call, record, result.id)
+            denial = self._gate(gate, config, call, record, result.id)
+            return None if denial is None else Denial(model_text=f"Tool call denied: {denial}")
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             record = calls.get(call.id)

@@ -123,7 +123,21 @@ async def test_an_approved_call_runs_with_the_shown_arguments(make: Make) -> Non
     assert record.approval.capability == {"access": "write", "reach": "external", "source": "default"}
 
 
-async def test_a_rejected_call_is_denied_and_the_comment_stays_with_people(make: Make) -> None:
+async def test_a_rejected_call_is_denied_and_the_comment_stays_with_people(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # W0-3 (L-4): the hook answers with orkexa's Denial, never with a plain string (which orkexa deprecates).
+    import warnings
+
+    plain: list[str] = []
+    original = warnings.warn
+
+    def spy(message: object, *args: object, **kwargs: object) -> None:
+        if str(message).startswith("A before_tool hook returned a string"):
+            plain.append(str(message))
+        original(message, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(warnings, "warn", spy)
     workspace = make()
     started = await start(workspace)
     request = await pending(workspace, started.id)
@@ -145,6 +159,7 @@ async def test_a_rejected_call_is_denied_and_the_comment_stays_with_people(make:
         ("tool.approval_rejected", record.name, 1)
     ]
     assert done.warnings[0].node_id in done.nodes
+    assert plain == []
 
 
 async def test_an_unanswered_call_is_denied_at_the_deadline(make: Make) -> None:

@@ -92,6 +92,24 @@ class McpAgentTool(Tool):
     def _call(self, **kwargs: Any) -> str:
         return str(self.execute(kwargs))
 
+    def _error_text(self, exc: NodestroError) -> str:
+        """What the model reads about a failed call: the stable code and Nodestro's own sentence.
+
+        A text the server wrote (``detail`` of ``mcp.protocol_error``) is third-party data like a result, so it goes
+        to the model only between the same markers (Phase 0R finding L-3); the run record keeps the code.
+        """
+        detail = exc.params.get("detail") if exc.code == "mcp.protocol_error" else None
+        if not isinstance(detail, str) or not detail:
+            return f"{exc.code}: {exc}"
+        server = str(exc.params.get("server") or "")
+        nonce = secrets.token_hex(6)
+        return (
+            f"{exc.code}: {server or 'the MCP service'} reported an error.\n"
+            + _MARK.format(server=server, tool=self.mcp_name, nonce=nonce)
+            + detail
+            + _END.format(nonce=nonce)
+        )
+
     def execute(self, payload: dict[str, Any]) -> Any:
         self._validate(payload)
         try:
@@ -99,8 +117,7 @@ class McpAgentTool(Tool):
                 self.tool_name, payload, cancelled=self.cancelled, gated=self.gated
             )
         except NodestroError as exc:
-            # The model sees a short, stable reason; the run record keeps the code.
-            raise ToolResultError(f"{exc.code}: {exc}") from exc
+            raise ToolResultError(self._error_text(exc)) from exc
         nonce = secrets.token_hex(6)
         text = _MARK.format(server=server.name, tool=self.mcp_name, nonce=nonce) + result.text
         if result.truncated:

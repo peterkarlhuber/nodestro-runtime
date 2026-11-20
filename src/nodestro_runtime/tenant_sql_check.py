@@ -8,7 +8,7 @@ run time, and its parser (``pglast``, PostgreSQL's own grammar) is a test depend
 Architecture (MUP-ONA B4, B6): the check has two parts. This module is Nodestro's part: it finds the tenant tables in
 the migrations, rebuilds the statements from Python source (and decides which texts are candidates at all), applies
 the allowlist and the skipped modules, and reports ``dynamic`` and ``stale`` findings. Whether one rebuilt statement is
-bound to one tenant is decided by Orkexa's rule engine :mod:`orkexa.testing.sqlcheck` (extra ``orkexa[sqlcheck]``;
+bound to one tenant is decided by Orkexa's rule engine :mod:`orkexa.testing.sqlcheck` (``pglast`` from the dev extra;
 B4 separated it from this module as ``nodestro_runtime.sqlcheck_rules``, B5 took it over into orkexa unchanged and B6
 removed Nodestro's copy). The engine knows no Nodestro constant, no allowlist and no source code (the partition
 column, the tenant tables and the placeholder style are its parameters). Its ``leak``, ``unparsed`` and

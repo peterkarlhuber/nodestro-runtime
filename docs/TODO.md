@@ -84,7 +84,7 @@ None known.
 - **What:** N-03: with the desktop's keychain key (or `NODESTRO_VAULT_KEY`) provider API keys are sealed with
   `SecretBox` like MCP tokens and connection secrets; plain keys of earlier releases are sealed when the workspace
   opens; a sealed key without the right key counts as missing and never reaches a provider. N-07: a person's rejection
-  comment no longer reaches the model (fixed text `REJECTED_CALL`). Internal tests, including the desktop bundle's
+  comment no longer reaches the model (fixed text `REJECTED_CALL`). Welle 0 (W0-3): an MCP server's error message reaches the model only between the external-data markers (L-3), and the tool hooks answer with orkexa's `Denial` (L-4; orkexa ORK-044 then stops sending plain-string reasons). Internal tests, including the desktop bundle's
   restart test, pass; they do not replace the independent review (E-P-5: bundled, paid orders need the owner's consent,
   done before any public deployment). Residual risk: without a key store (command line, Local Docker without the
   variable) provider keys stay in plain text in the user-only database file (AR-3 in nodestro-studio MUP-ONA).
