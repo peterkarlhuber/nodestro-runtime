@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 32 |
+| P3 Low | 33 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -569,6 +569,20 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
+
+### RT-089 · Conversations with own agents (N-04): follow-ups
+
+- **Priority:** P3 Low · **Status:** In progress · **Refs:** development plan N-04,
+  [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
+- **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
+  - an answer's run is a run of the tenant: on a server, members who may read runs see its input (the conversation
+    so far), while the conversation itself is its owner's only;
+  - the history goes to the model as text in the run's input; N-05 compacts long conversations;
+  - earlier files of a conversation are not offered to later answers (only the files sent with a message);
+  - only agent templates answer, not agent nodes of a workflow;
+  - the provenance field is a placeholder until N-08, the offline flag only refuses cloud models until N-09;
+  - one answer runs at a time per process; two API processes may start two answers of one conversation at once.
+- **Next step:** Decide the run visibility with the studio UI for conversations; N-05, N-08 and N-09 build on it.
 
 ### RT-084 · Activity log: API endpoints, server retention and remaining sources (N-13)
 

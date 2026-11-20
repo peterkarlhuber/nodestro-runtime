@@ -56,6 +56,7 @@ from .builtin_tools import BUILTIN_TOOLS
 from .catalog import models
 from .connections import ConnectionService
 from .container_images import ContainerImages, RuntimeImageSandbox
+from .conversations import Conversations
 from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
@@ -575,6 +576,9 @@ class Workspace:
         self.runs.file_names = self.file_catalog
         self.files = ResultFiles(self.store)
         self.runs.result_files = self.files
+        #: Conversations with own agents (N-04): each answer is a run of this manager; the API serves them only while
+        #: ``NODESTRO_CONVERSATIONS=1``.
+        self.conversations = Conversations(self)
         self.runs.after_run = self.files.write_outputs
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None
