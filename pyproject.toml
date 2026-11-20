@@ -62,9 +62,11 @@ postgres = [
 # never a default and never offered on a server.
 web-ddgs = ["orkexa[web-ddgs]>=0.2.0.dev0,<0.3"]
 dev = [
-    # orkexa[sqlcheck]: the rule engine of the static tenant-isolation check (orkexa.testing.sqlcheck with PostgreSQL's
-    # own parser pglast; tests/test_tenant_filters.py, tests/test_sql_catalog.py).
-    "orkexa[postgres,sqlcheck,web-ddgs]>=0.2.0.dev0,<0.3",
+    # pglast: PostgreSQL's own parser under the rule engine of the static tenant-isolation check
+    # (orkexa.testing.sqlcheck; tests/test_tenant_filters.py, tests/test_sql_catalog.py). A development dependency only:
+    # orkexa names it in no public extra since Welle 0 (W0-4, pglast is GPL).
+    "orkexa[postgres,web-ddgs]>=0.2.0.dev0,<0.3",
+    "pglast>=7,<9",
     "psycopg[binary,pool]>=3.2",
     "cryptography>=42",
     "axentra[oidc]>=0.1.0.dev0,<0.2",
