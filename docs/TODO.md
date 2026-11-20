@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 33 |
+| P3 Low | 34 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -584,6 +584,15 @@ Items that need an independent or external review (an internal audit does not re
   - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
     deleted by hand.
 - **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
+
+### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `tests/test_mcp_stdio.py`, `mcp_stdio.py`
+- **What:** A CI run during the N-04 work (2026-11-20) reported the test failing with `mcp.timeout` instead of
+  `mcp.stdio_failed` or `mcp.protocol_error`: the flooding server apparently reached the 20-second timeout before the
+  stdio limit stopped it. It did not reproduce. The test was not changed.
+- **Next step:** If it fails again, look at the order of the timeout and the output limit under a slow runner, and
+  decide whether `mcp.timeout` is an acceptable stable code for a flooding server.
 
 ### RT-084 · Activity log: API endpoints, server retention and remaining sources (N-13)
 

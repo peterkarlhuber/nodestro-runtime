@@ -59,6 +59,7 @@ from .schemas import (
     NotificationRules,
     Run,
     RunIn,
+    RunSummary,
     SourceEntry,
     TemplateRef,
     ToolCallApproval,
@@ -92,6 +93,9 @@ _TITLE_LENGTH = 60
 #: A reserved answer whose run never started (the process ended between the reservation and the launch) counts as
 #: failed after this long, so the conversation takes messages again.
 RESERVATION_TIMEOUT = timedelta(minutes=10)
+#: The ``run_id`` of a reserved answer whose run is starting. The send that reserved it and a reader that finds it
+#: expired both replace it only while it is still this value (a compare-and-set), so exactly one of them wins (N-4).
+RESERVED = ""
 #: How long deleting a conversation waits for its cancelled answer to stop before it deletes the answer's run.
 DELETE_WAIT_SECONDS = 10.0
 
@@ -197,7 +201,8 @@ class ConversationMessage(BaseModel):
     #: Answers: the usage and cost of the answer's run.
     usage: Usage | None = None
     cost_usd: float | None = None
-    #: Answers: the run that wrote it, and the approval requests it waits for.
+    #: Answers: the run that wrote it (``""`` while it is reserved and its run starts), and the approval requests it
+    #: waits for.
     run_id: str | None = None
     approval_ids: list[str] = Field(default_factory=list)
     reply_to: str | None = None
@@ -389,15 +394,22 @@ class Conversations:
         ``conversation``, or a run below one) belongs to its conversation: only who sees the conversation sees the
         run, and the run of a deleted conversation is seen by nobody. Every other run (and an unknown id) is left to
         the run routes."""
-        run = self.store.get("runs", run_id, Run)
+        run = self.store.get("runs", run_id, RunSummary)
         seen: set[str] = set()
         while run is not None and run.parent_run_id and run.id not in seen:
             seen.add(run.id)
-            parent = self.store.get("runs", run.parent_run_id, Run)
+            parent = self.store.get("runs", run.parent_run_id, RunSummary)
             if parent is None:
                 break
             run = parent
-        if run is None or run.trigger != "conversation":
+        return run is None or self.summary_visible(run, owner)
+
+    def summary_visible(self, run: RunSummary | Run, owner: str | None) -> bool:
+        """:meth:`run_visible` for a run at hand (a run list's summary): a top-level run that is not an answer needs
+        no read, an answer's run one (its conversation), a run below another one the walk to its top (N-2)."""
+        if run.parent_run_id:
+            return self.run_visible(run.id, owner)
+        if run.trigger != "conversation":
             return True
         found = self.store.get(COLLECTION, run.trigger_ref or "", Conversation)
         return found is not None and found.tenant_id == self.workspace.tenant_id and visible(found, owner)
@@ -701,7 +713,13 @@ class Conversations:
                 self.workspace.cancel(run.id)
                 raise ConversationNotFound(conversation_id)
             answer = answer.model_copy(update={"run_id": run.id, "agent": ref, "model": model})
-            self.store.put(MESSAGES, _key(conversation_id, answer.seq), answer)
+            if not self.store.replace_if(
+                MESSAGES, _key(conversation_id, answer.seq), answer, field="run_id", expected=RESERVED
+            ):
+                # The reservation expired while the run started (a reader failed it, and another answer may run
+                # now): this run must not become a second answer (N-4).
+                self.workspace.cancel(run.id)
+                raise NodestroError("conversation.answer_running", "Wait until the current answer is finished")
             changed: dict[str, Any] = {"updated_at": now()}
             if current.auto_title and not current.title:
                 changed["title"] = make_title(content) or (user.attachments[0].name if user.attachments else "")
@@ -756,6 +774,7 @@ class Conversations:
                 status="queued",
                 agent=conversation.agent,
                 model=conversation.model,
+                run_id=RESERVED,
                 reply_to=user.id,
             )
             for message in (user, answer):
@@ -783,7 +802,7 @@ class Conversations:
     def cancel(self, conversation_id: str, owner: str | None, message_id: str) -> ConversationMessage:
         """Cancel a running answer: its run is cancelled, which closes the model connection."""
         found = self.message(conversation_id, owner, message_id)
-        if found.status not in FINAL and found.run_id is not None:
+        if found.status not in FINAL and found.run_id:
             self.workspace.cancel(found.run_id)
         return self.message(conversation_id, owner, message_id)
 
@@ -791,13 +810,25 @@ class Conversations:
         """An answer as its run is now; stored once the run's status changed (a final one, a pause)."""
         if message.role != "assistant" or message.status in FINAL:
             return message
-        if message.run_id is None:
+        if message.run_id == RESERVED:
             created = message.created_at if message.created_at.tzinfo else message.created_at.replace(tzinfo=UTC)
             if now() - created < RESERVATION_TIMEOUT:
                 return message  # reserved; its run is starting
-            run = None
-        else:
-            run = self.workspace.runs.get(message.run_id)
+            expired = message.model_copy(
+                update={
+                    "status": "failed",
+                    "run_id": None,
+                    "error": problem("conversation.run_missing", "The answer's run never started"),
+                    "finished_at": now(),
+                }
+            )
+            key = _key(message.conversation_id, message.seq)
+            if self.store.replace_if(MESSAGES, key, expired, field="run_id", expected=RESERVED):
+                return expired
+            # The send wrote its run in the meantime: the answer is that run's.
+            stored = self.store.get(MESSAGES, key, ConversationMessage)
+            return message if stored is None or stored.run_id == RESERVED else self._sync(stored)
+        run = self.workspace.runs.get(message.run_id) if message.run_id else None
         if run is None:
             updated = message.model_copy(
                 update={
@@ -880,7 +911,7 @@ class Conversations:
     def run_of(self, conversation_id: str, owner: str | None, message_id: str) -> str:
         """The run of an answer (its events are the answer's stream)."""
         found = self.message(conversation_id, owner, message_id)
-        if found.run_id is None:
+        if not found.run_id:
             raise ConversationNotFound(message_id)
         return found.run_id
 

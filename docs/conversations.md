@@ -62,7 +62,10 @@ Every answer is one run of the engine (`RunManager`), never a second agent loop:
   two message keys are written only when free (`put_raw_if_absent`). The run starts after that; if it cannot start,
   the reservation is removed and nothing stays stored. A message while an answer runs is refused
   (`conversation.answer_running`). A reservation whose run never started (the process ended in between) counts as
-  failed after `RESERVATION_TIMEOUT` (10 minutes, `conversation.run_missing`).
+  failed after `RESERVATION_TIMEOUT` (10 minutes, `conversation.run_missing`). A reserved answer has `run_id` `""`;
+  the send that writes its run and a reader that fails it both replace it only while `run_id` is still `""` (a
+  compare-and-set), so exactly one wins. A send that loses (its launch took longer than the timeout) cancels its run
+  and answers `conversation.answer_running`, so two answers never run (N-4).
 - Every change of a conversation (rename, switch, files) is made on the stored document under the same lock, so it
   never writes back an older one (M-1). No state per conversation is kept in memory.
 - An answer message follows its run when it is read: its status, text, tool calls, sources and usage come from the
@@ -89,6 +92,8 @@ An answer's run holds the conversation (its input), the answer (its output) and 
 to the conversation (H-1):
 
 - `Conversations.run_visible(run_id, owner)`: only who sees the conversation sees its runs (also the runs below one).
+  `summary_visible(run, owner)` does the same for a run at hand (a run list's summary): a top-level run that is not an
+  answer needs no store read, an answer's run one (N-2).
   The API checks it on every route with a run id (runs, export, files, cancel, resume, approvals, tool approvals,
   budget, inputs, run chat, events) and in the lists of runs and pending approvals; another user gets
   `404 run.not_found`. A run whose conversation is gone is seen by nobody.
@@ -97,6 +102,9 @@ to the conversation (H-1):
   going then stays, hidden). The usage ledger keeps the cost.
 - The run's workflow is named `Conversation`, never the conversation's title, because the run list and the usage
   report show the name to every member.
+- Aggregates still count the answers' runs (N-3, by design): the usage report (by workflow, keyed by the conversation
+  id, named `Conversation`) and the skill usage statistics. They show numbers and the conversation id, never the
+  messages, the answers or the files.
 
 ## Models
 

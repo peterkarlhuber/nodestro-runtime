@@ -726,3 +726,80 @@ async def test_l7_a_conversation_without_owner_is_seen_by_nobody_on_a_server(mak
     assert workspace.conversations.summaries("usr_alice") == []
     with pytest.raises(ConversationNotFound):
         workspace.conversations.get(conversation_id, "usr_alice")
+
+
+# ---- re-review fixes ---------------------------------------------------------------------------------------------
+
+
+async def test_n4_a_send_whose_reservation_expired_while_its_run_started_writes_no_second_answer(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-4: the launch took longer than RESERVATION_TIMEOUT, a reader failed the reservation (and another answer may
+    have started). The late send must not write its run into the answer: its run is cancelled instead."""
+    from datetime import timedelta
+
+    from nodestro_runtime import conversations as module
+    from nodestro_runtime.conversations import RESERVATION_TIMEOUT
+    from nodestro_runtime.schemas import now
+
+    workspace = make({"AGENT": [text("Late.")]})
+    conversation_id = start(workspace, template(workspace))
+    real_launch = module.launch
+    started: list[str] = []
+
+    async def slow_launch(*args: Any, **kwargs: Any) -> Run:
+        run = await real_launch(*args, **kwargs)
+        started.append(run.id)
+        key = f"{conversation_id}:000002"
+        raw = workspace.store.get_raw(MESSAGES, key)
+        old = (now() - RESERVATION_TIMEOUT - timedelta(seconds=1)).isoformat()
+        workspace.store.put_raw(MESSAGES, key, {**raw, "created_at": old})
+        workspace.conversations.messages(conversation_id, None)  # a reader in the meantime
+        return run
+
+    monkeypatch.setattr(module, "launch", slow_launch)
+    with pytest.raises(NodestroError) as caught:
+        await workspace.conversations.send(conversation_id, None, MessageIn(content="hi"))
+    assert caught.value.code == "conversation.answer_running"
+    answer = workspace.conversations.messages(conversation_id, None)[-1]
+    assert (answer.status, answer.run_id) == ("failed", None)
+    assert answer.error is not None and answer.error.code == "conversation.run_missing"
+    [run_id] = started
+    finished = await workspace.wait(run_id, timeout=20)
+    assert finished.status == "cancelled"
+
+
+def test_n2_a_run_at_hand_that_is_no_answer_needs_no_read(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    """N-2: run lists filter their summaries without a store read per run; only answers' runs read their
+    conversation."""
+    from nodestro_runtime.schemas import RunSummary, Usage, now
+
+    workspace = make()
+    conversation_id = start(workspace, template(workspace))
+
+    def summary(trigger: str, ref: str | None = None) -> RunSummary:
+        return RunSummary(
+            id="run_x",
+            workflow_id="wf",
+            workflow_name="W",
+            status="succeeded",
+            input="",
+            usage=Usage(),
+            created_at=now(),
+            trigger=trigger,
+            trigger_ref=ref,  # type: ignore[arg-type]
+        )
+
+    reads: list[tuple[str, str]] = []
+    real_get = workspace.store.get
+
+    def counting(collection: str, key: str, model: Any) -> Any:
+        reads.append((collection, key))
+        return real_get(collection, key, model)
+
+    monkeypatch.setattr(workspace.store, "get", counting)
+    assert workspace.conversations.summary_visible(summary("manual"), "usr_bob") is True
+    assert reads == []
+    assert workspace.conversations.summary_visible(summary("conversation", conversation_id), None) is True
+    assert workspace.conversations.summary_visible(summary("conversation", conversation_id), "usr_bob") is False
+    assert reads == [(COLLECTION, conversation_id)] * 2
