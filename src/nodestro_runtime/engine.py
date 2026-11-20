@@ -1227,18 +1227,29 @@ class RunManager:
             record_refusal(self.store, found, resource, actor=actor)
             raise access_error(found, resource, show_source=is_person(actor))
 
-    def check_cloud_access(self, provider: str, *, actor: str = "system", run_id: str | None = None) -> None:
+    def check_cloud_access(
+        self,
+        provider: str,
+        *,
+        actor: str = "system",
+        run_id: str | None = None,
+        attended: bool = True,
+        audit: bool = True,
+    ) -> None:
         """Refuse a model request outside an agent's turn (the live run chat, the assistants and every other caller of
-        :meth:`~nodestro_runtime.workspace.Workspace.connect_model`: attended, no agent) to a cloud model the access
-        model v2 blocks (N-06), audited with its source. Only a person (``actor``) sees the source in the error.
-        Nothing happens while the switch is off or for the local model server."""
+        :meth:`~nodestro_runtime.workspace.Workspace.connect_model`; no agent) to a cloud model the access model v2
+        blocks (N-06). ``attended``: a person waits for the answer (a benchmark judge does not). ``audit``: record the
+        refusal with its source (``False`` for a probe that only asks whether a model can be used). Only a person
+        (``actor``) sees the source in the error. Nothing happens while the switch is off or for the local model
+        server."""
         gate = self.tool_gate
         if gate is None or gate.access is None or provider == "ollama":
             return
         resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
-        found = gate.site_refusal(resource, attended=True, agent=None, conversation_id=run_id)
+        found = gate.site_refusal(resource, attended=attended, agent=None, conversation_id=run_id)
         if found is not None:
-            record_refusal(self.store, found, resource, actor=actor, run_id=run_id)
+            if audit:
+                record_refusal(self.store, found, resource, actor=actor, run_id=run_id)
             raise access_error(found, resource, show_source=is_person(actor))
 
     def _check_site_access(
