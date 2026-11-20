@@ -1078,7 +1078,12 @@ class AccessRules:
             return found  # revoked already, or a once grant used before
         revoked = found.model_copy(update={"status": "revoked", "revoked_at": at, "revoked_by": by.id})
         if not self.store.replace_if(collection, record_id, revoked, field="status", expected="active"):
-            return self.store.get(collection, record_id, model) or found  # used or revoked in the meantime
+            raw = self.store.get_raw(collection, record_id)
+            if not isinstance(raw, dict) or "status" in raw:
+                return self.store.get(collection, record_id, model) or found  # used or revoked in the meantime
+            # A record stored before ``status`` existed: the compare-and-set cannot see it. Nothing can use such a
+            # record (``use`` compares ``status`` too), so writing the revocation directly loses no use.
+            self.store.put(collection, record_id, revoked)
         self._audit(kind, revoked, by=by.id, at=at)
         return revoked
 

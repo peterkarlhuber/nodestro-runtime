@@ -257,7 +257,9 @@ SYSTEM_FOLDERS: tuple[str, ...] = (
 _SYSTEM_FOLDER_ENV = ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData")
 #: Host names of the own computer in a UNC path (``\\localhost\C$`` is drive ``C:``).
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "."})
-_WINDOWS = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+#: A Windows path: a drive, or two leading separators of either kind (UNC, ``\\?\``, ``\\.\``; also ``//host/...``,
+#: which Windows reads as UNC; on POSIX such a path is taken as UNC too, which fails closed).
+_WINDOWS = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
 _DRIVE = re.compile(r"^[A-Za-z]:\\")
 _ADMIN_SHARE = re.compile(r"^[a-z]\$$")
 #: An 8.3 short name (``PROGRA~1``): another spelling of a long name that only the file system can resolve.
@@ -297,10 +299,12 @@ def folder_parts(path: str) -> tuple[str, ...]:
     with leading or trailing white space, a NUL, a Windows device path (``\\.\``) or an 8.3 short name.
 
     Windows paths (``C:\...``, UNC, ``\\?\``) accept both separators, lose trailing dots and spaces per component (as
-    Windows does) and are case-folded throughout; ``\\?\C:\x`` is ``C:\x``, and an administrative share of the own
-    computer (``\\localhost\C$``) is its drive. This is a comparison of names, not a guard on the file system: links,
-    hard links and junctions are resolved by the caller before it asks (``os.path.realpath``), and the file-system
-    guard itself is N-10."""
+    Windows does) and are lower-cased throughout (denies and limits compare case-folded on top); ``\\?\C:\x`` is
+    ``C:\x``, and an administrative share of the own computer (``\\localhost\C$``) is its drive. Two leading
+    separators of either kind always mean a Windows path (``//host/share`` is UNC), and on Windows a path without a
+    drive or share is refused. This is a comparison of names, not a guard on the file system: links, hard links and
+    junctions are resolved by the caller before it asks (``os.path.realpath``), and the file-system guard itself is
+    N-10."""
     if not path or path != path.strip():
         raise ValueError("A folder path must not start or end with white space")
     text = unicodedata.normalize("NFC", path)
@@ -308,6 +312,9 @@ def folder_parts(path: str) -> tuple[str, ...]:
         raise ValueError("A folder path must not contain NUL")
     if _WINDOWS.match(text):
         return _windows_parts(text)
+    if os.name == "nt":
+        # On Windows ``\Windows`` or ``/Windows`` is relative to the current drive: it names no fixed folder.
+        raise ValueError("On Windows a folder path names a drive or a UNC share")
     if not text.startswith("/"):
         raise ValueError("A folder path must be absolute")
     normal = posixpath.normpath(text)
@@ -329,12 +336,12 @@ def _windows_parts(text: str) -> tuple[str, ...]:
     if text.startswith("\\\\"):
         host, _, rest = text[2:].partition("\\")
         share, _, rest = rest.partition("\\")
-        host, share = host.casefold(), share.rstrip(" .").casefold()
+        host, share = host.lower(), share.rstrip(" .").lower()
         if not host or not share:
             raise ValueError("A UNC path names a host and a share")
         head = f"{share[0]}:" if _ADMIN_SHARE.match(share) and host in _LOCAL_HOSTS else f"//{host}/{share}"
     else:
-        head, rest = text[:2].casefold(), text[3:]
+        head, rest = text[:2].lower(), text[3:]
     parts: list[str] = []
     for part in rest.split("\\"):
         if part == "..":
@@ -346,7 +353,9 @@ def _windows_parts(text: str) -> tuple[str, ...]:
         name = part.rstrip(" .")
         if not name or ":" in name or _SHORT_NAME.search(name):
             raise ValueError("A Windows path component cannot be compared by name")
-        parts.append(name.casefold())
+        # ``lower()``, not ``casefold()``: Windows compares names letter by letter, so ``straße`` and ``STRASSE`` are
+        # two folders and a grant for one must not cover the other. Denies and limits still compare case-folded.
+        parts.append(name.lower())
     return (head, *parts)
 
 

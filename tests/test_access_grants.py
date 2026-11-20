@@ -540,6 +540,12 @@ def test_a_tool_grant_holds_only_for_the_tool_version_classification_and_definit
         ("/root/.ssh", "protected_folder"),
         ("/private/var/db/x", "protected_folder"),
         ("/lib/x", "protected_folder"),
+        # Re-review N-2: forward-slash UNC and device paths are Windows paths too.
+        ("//localhost/C$/Windows", "protected_folder"),
+        ("//server/c$/Windows/System32", "protected_folder"),
+        ("//?/C:/Windows", "protected_folder"),
+        ("//./C:/Windows", "unresolvable_path"),
+        ("\\/localhost/C$/Windows", "protected_folder"),
     ],
 )
 def test_other_spellings_of_a_protected_folder_hit_the_safety_limit(path: str, limit: str) -> None:
@@ -727,3 +733,46 @@ def test_run_own_tools_cannot_be_denied(rules: AccessRules) -> None:
             rules.deny(resource=tool(name), actions=["execute"], by=ALICE)
         assert error.value.code == "access.deny_not_enforced"
     assert rules.denies() == []
+
+
+def test_a_root_relative_path_names_no_folder_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-review N-2: on Windows ``/Windows`` is relative to the current drive, so it is refused."""
+    from nodestro_runtime import tool_policy
+
+    assert folder_parts("/Windows") == ("/", "Windows")
+    monkeypatch.setattr(tool_policy.os, "name", "nt")
+    for path in ("/Windows", "/Windows/System32"):
+        with pytest.raises(ValueError):
+            folder_parts(path)
+    assert folder_parts("C:/Windows") == ("c:", "windows")
+
+
+def test_windows_grants_compare_letters_and_denies_fold() -> None:
+    """Re-review N-3: ``straße`` and ``STRASSE`` are two folders on Windows; a grant for one does not cover the
+    other, while a deny on one still blocks both (fail closed)."""
+    assert folder_parts("C:\\Users\\a\\stra\u00dfe") != folder_parts("C:\\Users\\a\\STRASSE")
+    assert folder_parts("C:\\Users\\A\\Docs") == folder_parts("c:\\users\\a\\docs")
+    granted = grant(folder("C:\\Users\\a\\stra\u00dfe"), "read")
+    assert read("C:\\Users\\a\\STRASSE\\x", grants=[granted]).kind == "missing_grant"
+    assert read("C:\\Users\\a\\Stra\u00dfe\\x", grants=[granted]).allowed
+    blocked = deny(folder("C:\\Users\\a\\stra\u00dfe"), "read")
+    assert read("C:\\Users\\a\\STRASSE\\x", denies=[blocked]).kind == "denied"
+
+
+@pytest.mark.parametrize("collection", ["access_denies", "access_grants"])
+def test_a_record_stored_before_status_existed_can_be_revoked(rules: AccessRules, collection: str) -> None:
+    """Re-review N-4: a record of the first head of #201 has no ``status`` key; revoking it must not be a no-op."""
+    docs = folder("/home/alice/docs")
+    if collection == "access_denies":
+        stored: Any = rules.deny(resource=docs, actions=["read"], by=ALICE)
+    else:
+        stored = rules.grant(resource=docs, actions=["read"], duration="until_revoked", by=ALICE)
+    raw = rules.store.get_raw(collection, stored.id)
+    raw.pop("status")
+    rules.store.put_raw(collection, stored.id, raw)
+    revoke = rules.revoke_deny if collection == "access_denies" else rules.revoke_grant
+    revoked = revoke(stored.id, by=ALICE)
+    assert revoked.status == "revoked" and revoked.revoked_at is not None
+    assert rules.store.get_raw(collection, stored.id)["status"] == "revoked"
+    kinds = [event.kind for _, event in rules.store.items(AUDIT, ToolApprovalEvent)]
+    assert kinds.count("access_deny_revoked" if collection == "access_denies" else "access_grant_revoked") == 1

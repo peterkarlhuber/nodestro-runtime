@@ -28,7 +28,12 @@
     - the grant or deny is recorded on the call (`ToolCallApproval.access_source`, left out when unset);
     - agent tests never run a tool on a grant;
     - denies on run-own tools are refused;
-    - desktop imports skip grants and denies.
+    - desktop imports skip grants and denies;
+    - `access_source` is left out when unset by `Field(exclude_if=...)`, which keeps the OpenAPI schema typed.
+      The runtime now needs pydantic 2.12 or later;
+    - `//host/share` paths are UNC, root-relative paths are refused on Windows, and Windows grants compare
+      lower-cased names;
+    - records stored before `status` existed can be revoked.
 
 - Security (LD-020 follow-up 2): plain provider keys do not stay readable next to their sealed form.
   - `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE` checkpoint), called once

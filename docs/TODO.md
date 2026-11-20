@@ -54,8 +54,12 @@ None known.
   - folder comparison by NFC-normalized components;
   - the tool gate: deny and safety limit first (re-checked after a person approves a waiting call), and a grant
     bound to the tool version, classification and MCP definition instead of the question;
-  - the review findings of #201 (H-1, H-2, M-1..M-3, L-1..L-7), fixed in the same PR.
+  - the review findings of #201 (H-1, H-2, M-1..M-3, L-1..L-7) and of its re-review (N-1..N-4), fixed in the same
+    PR.
 - **Next step:**
+  - nodestro-api: regenerate `openapi/nodestro-api.json` and `nodestro-api-server.json` when it moves to this
+    runtime. The only differences are intended: `ToolCallApproval.access_source` and four new audit kinds
+    (`access_*`).
   - nodestro-api: the query "who may do what and why" (BER-1) over `AccessRules.current()` and `evaluate`, and
     write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
   - nodestro-studio: scope and duration on `ToolApprovalCard.tsx` (N-16 candidate), the overview, texts of the

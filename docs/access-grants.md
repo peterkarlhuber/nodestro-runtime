@@ -29,7 +29,8 @@ record, key = record id). On PostgreSQL they are rows of `nodestro_documents` wi
 | who, when | `granted_by`, `created_at`, `revoked_at`, `revoked_by` | `denied_by`, same |
 
 All times carry a time zone. Using a `once` grant (`AccessRules.use`) and revoking any record are each one
-compare-and-set of `status` from `active`. So exactly one of them wins, a revoked or expired grant is never used, and
+compare-and-set of `status` from `active`. A record stored before `status` existed is revoked by a direct write;
+nothing can use it, since `use` also compares `status`. So exactly one of them wins, a revoked or expired grant is never used, and
 a revocation is never lost.
 
 Desktop-to-server imports (`postgres_import`) skip both collections: grants never move silently into another trust
@@ -130,12 +131,17 @@ The path is never trimmed: one with leading or trailing white space is refused.
 
 Windows paths (`C:\...`, UNC, `\\?\`) get more normalization:
 - both separators are accepted, and `\\?\C:\x` is `C:\x`;
+- two leading separators of either kind always mean a Windows path, so `//host/share` is UNC (fail closed on POSIX
+  too);
 - trailing dots and spaces of a component are dropped, as Windows does;
-- every component is case-folded;
+- every component is lower-cased (`lower()`, not `casefold()`): `straße` and `STRASSE` stay two folders, so a grant
+  for one never covers the other;
 - `\\localhost\C$` is drive `C:`.
 
-On POSIX, denies and safety limits compare case-insensitively and grants exactly. Both choices fail closed on
-case-insensitive file systems.
+On Windows, a path without a drive or share (`/Windows`) is refused, because it depends on the current drive.
+
+Denies and safety limits compare case-folded on top. Grants compare the normalized names exactly. Both choices fail
+closed on case-insensitive file systems.
 
 This is a comparison of names, not a guard on the file system. Callers resolve links before they ask
 (`os.path.realpath`). Hard links, junctions, rename races and network drives are open points of the W0-6 spike for
@@ -155,8 +161,8 @@ the root run.
   refuses it, and the approval is audited `stale` (spec 7.3 (7)).
 - A matching grant allows a call that S-2 would otherwise ask about, or refuse because nobody can answer.
   - The grant is recorded on the call (`access_source`, `grant:<id>`) and in a `tool_access_granted` event.
-  - `access_source` is left out of stored records when unset, so records stay byte-identical while the switch is
-    off.
+  - `access_source` is left out of stored records when unset (`Field(exclude_if=...)`, pydantic 2.12 or later), so
+    records stay byte-identical while the switch is off. Its OpenAPI schema stays typed.
 - A grant never lifts these rules: an orchestrator's narrowing (`tool.not_granted`), an `always` binding, the MCP
   rules (a changing MCP call is always asked) and the question before a destructive tool.
 - A `once` grant does not count in the gate: one confirmed tool call is the S-2 approval itself.
