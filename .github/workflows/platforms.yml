@@ -45,6 +45,8 @@ jobs:
       # studio lock (nodestro-studio platform/internal-server.txt), minus this package itself.
       - name: Studio lock
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}  # read-only; scripts/studio_lock.sh asks GitHub for lock lag
         run: |
           python -m pip install "pip>=26.1"
           bash scripts/studio_lock.sh "$RUNNER_TEMP/lock-all.txt" # paired studio lock on pull requests, lock lag on master pushes
