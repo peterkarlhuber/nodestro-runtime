@@ -109,7 +109,7 @@ class ConversationNotFound(KeyError):
     """No conversation, message or file with this id for this owner (another owner's is not found either)."""
 
 
-class ConversationFile(BaseModel):
+class AgentConversationFile(BaseModel):
     """A file of the conversation: an input file of origin ``conversation``."""
 
     id: str
@@ -139,7 +139,7 @@ class Conversation(BaseModel):
     provenance: ProvenanceStatus = "unchecked"
     #: The conversation's budget in USD over all its answers (``None``: each answer has the default budget).
     budget_usd: float | None = Field(default=None, ge=0)
-    files: list[ConversationFile] = Field(default_factory=list)
+    files: list[AgentConversationFile] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now)
     updated_at: datetime = Field(default_factory=now)
     last_seq: int = 0
@@ -200,7 +200,7 @@ class ConversationMessage(BaseModel):
     finished_at: datetime | None = None
 
 
-class ConversationSummary(BaseModel):
+class AgentConversationSummary(BaseModel):
     id: str
     title: str
     agent: TemplateRef
@@ -212,7 +212,7 @@ class ConversationSummary(BaseModel):
     updated_at: datetime
 
 
-class ConversationDetail(Conversation):
+class AgentConversationDetail(Conversation):
     messages: list[ConversationMessage] = Field(default_factory=list)
     #: The sum of the usage of every answer's run.
     usage: Usage = Field(default_factory=Usage)
@@ -252,7 +252,7 @@ class MessageIn(BaseModel):
     file_ids: list[str] = Field(default_factory=list, max_length=MAX_FILES_PER_MESSAGE)
 
 
-class SentMessage(BaseModel):
+class SentConversationMessage(BaseModel):
     user: ConversationMessage
     assistant: ConversationMessage
 
@@ -353,7 +353,7 @@ class Conversations:
         """The conversation; :class:`ConversationNotFound` for an unknown id and for another owner's."""
         return self._stored(conversation_id, owner)
 
-    def summaries(self, owner: str | None) -> list[ConversationSummary]:
+    def summaries(self, owner: str | None) -> list[AgentConversationSummary]:
         """The conversations ``owner`` sees, most recently changed first."""
         items = [
             item
@@ -365,7 +365,7 @@ class Conversations:
         for item in items:
             messages = self.messages(item.id, owner)
             result.append(
-                ConversationSummary(
+                AgentConversationSummary(
                     id=item.id,
                     title=item.title,
                     agent=item.agent,
@@ -391,11 +391,11 @@ class Conversations:
             raise ConversationNotFound(message_id)
         return found
 
-    def detail(self, conversation_id: str, owner: str | None) -> ConversationDetail:
+    def detail(self, conversation_id: str, owner: str | None) -> AgentConversationDetail:
         conversation = self._stored(conversation_id, owner)
         messages = self.messages(conversation_id, owner)
         answering = next((item.id for item in messages if item.status not in FINAL), None)
-        return ConversationDetail(
+        return AgentConversationDetail(
             **conversation.model_dump(), messages=messages, usage=self._usage(messages), answering=answering
         )
 
@@ -450,7 +450,7 @@ class Conversations:
             )
         return qualified
 
-    def create(self, request: ConversationIn, *, owner: str | None) -> ConversationDetail:
+    def create(self, request: ConversationIn, *, owner: str | None) -> AgentConversationDetail:
         ref, config = self._agent(request.agent)
         model = request.model if request.model else self._default_model(config)
         conversation = Conversation(
@@ -466,7 +466,7 @@ class Conversations:
         self.store.put(COLLECTION, conversation.id, conversation)
         return self.detail(conversation.id, owner)
 
-    def update(self, conversation_id: str, owner: str | None, change: ConversationChange) -> ConversationDetail:
+    def update(self, conversation_id: str, owner: str | None, change: ConversationChange) -> AgentConversationDetail:
         """Rename it, switch its agent or model, its offline flag or budget; only the fields sent change."""
         sent = change.model_fields_set
         with self._lock:
@@ -511,7 +511,7 @@ class Conversations:
         name: str,
         media_type: str | None,
         uploaded_by: str,
-    ) -> ConversationFile:
+    ) -> AgentConversationFile:
         """Check, read and store an upload as a file of the conversation; it waits for a message. Raises
         :class:`~nodestro_runtime.file_formats.FileFormatError` or ``conversation.too_many_files``."""
         self._room(self._stored(conversation_id, owner))
@@ -521,7 +521,7 @@ class Conversations:
         try:
             with self._lock:
                 conversation = self._room(self._stored(conversation_id, owner))
-                attached = ConversationFile(
+                attached = AgentConversationFile(
                     id=item.id, name=item.name, format=item.format, media_type=item.media_type, size=item.size
                 )
                 conversation.files.append(attached)
@@ -542,13 +542,13 @@ class Conversations:
             )
         return conversation
 
-    def file(self, conversation_id: str, owner: str | None, file_id: str) -> ConversationFile:
+    def file(self, conversation_id: str, owner: str | None, file_id: str) -> AgentConversationFile:
         found = next((item for item in self._stored(conversation_id, owner).files if item.id == file_id), None)
         if found is None:
             raise ConversationNotFound(file_id)
         return found
 
-    def remove_file(self, conversation_id: str, owner: str | None, file_id: str) -> ConversationDetail:
+    def remove_file(self, conversation_id: str, owner: str | None, file_id: str) -> AgentConversationDetail:
         """Remove a file from the conversation and delete it; sent messages keep its name."""
         with self._lock:
             conversation = self._stored(conversation_id, owner)
@@ -565,7 +565,7 @@ class Conversations:
 
     async def send(
         self, conversation_id: str, owner: str | None, request: MessageIn, *, actor: str = "local"
-    ) -> SentMessage:
+    ) -> SentConversationMessage:
         """Store the message and start its answer as a run; follow it with the run's events.
 
         Nothing is stored when the answer cannot start (an unknown file, a running answer, the budget is used up, a
@@ -644,7 +644,7 @@ class Conversations:
                 self.store.put(MESSAGES, _key(conversation_id, user.seq), user)
                 self.store.put(MESSAGES, _key(conversation_id, answer.seq), answer)
                 self.store.put(COLLECTION, conversation_id, current)
-        return SentMessage(user=user, assistant=self._sync(answer))
+        return SentConversationMessage(user=user, assistant=self._sync(answer))
 
     def cancel(self, conversation_id: str, owner: str | None, message_id: str) -> ConversationMessage:
         """Cancel a running answer: its run is cancelled, which closes the model connection."""
@@ -802,19 +802,19 @@ __all__ = [
     "CONVERSATIONS_ENV",
     "MESSAGES",
     "AgentChoice",
+    "AgentConversationDetail",
+    "AgentConversationFile",
+    "AgentConversationSummary",
     "Conversation",
     "ConversationChange",
-    "ConversationDetail",
-    "ConversationFile",
     "ConversationIn",
     "ConversationMessage",
     "ConversationNotFound",
-    "ConversationSummary",
     "Conversations",
     "MessageFile",
     "MessageIn",
     "MessageStatus",
-    "SentMessage",
+    "SentConversationMessage",
     "ToolCallView",
     "answer_agent",
     "answer_input",
