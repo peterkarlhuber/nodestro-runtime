@@ -29,18 +29,21 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
 from .problems import NodestroError
-from .server_settings import ENCRYPTED_PREFIX, SecretBox
+from .server_settings import ENCRYPTED_PREFIX, SecretBox, is_encrypted
 from .storage import RawDocuments, stopped_documents
+
+logger = logging.getLogger(__name__)
 
 #: Where the check value is stored (a collection of its own: backups and restores keep the current one).
 CHECK_COLLECTION = "local_vault"
@@ -159,6 +162,57 @@ def verify_store(store: Any, box: SecretBox, tenant_id: str) -> None:
     new = verify(documents, store.get_raw(CHECK_COLLECTION, CHECK_ID), box, tenant_id)
     if new is not None:
         store.put_raw(CHECK_COLLECTION, CHECK_ID, new)
+
+
+def seal_plain_provider_keys(values: dict[str, Any], encrypt: Callable[[str, str], str]) -> list[str]:
+    """Seal the plain provider keys of a settings document (``settings/app``) in place with ``encrypt(field,
+    plain)``; the top-level key of old releases (Anthropic's) moves into the provider settings. Returns what was
+    sealed (provider names, ``api_key`` for the old top-level key); keys already sealed stay as they are."""
+    providers = values.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    changed: list[str] = []
+    legacy = values.get("api_key")
+    if isinstance(legacy, str) and legacy:
+        anthropic = providers.setdefault("anthropic", {})
+        if isinstance(anthropic, dict) and not anthropic.get("api_key"):
+            anthropic["api_key"] = legacy
+        values.pop("api_key")
+        changed.append("api_key")
+    for name, entry in providers.items():
+        key = entry.get("api_key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key and not is_encrypted(key):
+            entry["api_key"] = encrypt(f"providers.{name}.api_key", key)
+            changed.append(name)
+    if changed:
+        values["providers"] = providers
+    return changed
+
+
+#: Where a data directory keeps copies of its database (the backups before a schema migration).
+COPIES = "backups"
+
+
+def seal_plain_copies(data_dir: Path, box: Any, tenant_id: str) -> int:
+    """Seal the plain provider keys in the database copies of an open data directory (``backups/*.db``, written
+    before a schema migration by a release that stored them in plain text), so a sealed key does not stay readable
+    in a copy next to it. A copy that cannot be read is left as it is (logged). Returns how many keys were sealed."""
+    sealed = 0
+    for path in sorted((data_dir / COPIES).glob("*.db")):
+        try:
+            with stopped_documents(path, (*COLLECTIONS, CHECK_COLLECTION)) as raw:
+                if raw is None or (SETTINGS, "app") not in raw.documents:
+                    continue
+                values = json.loads(raw.documents[(SETTINGS, "app")])
+                if not isinstance(values, dict):
+                    continue
+                changed = seal_plain_provider_keys(values, lambda field, plain: box.encrypt(tenant_id, field, plain))
+                if changed:
+                    _write(raw, SETTINGS, "app", values)
+                    sealed += len(changed)
+        except Exception as error:
+            logger.warning("The database copy %s was left as it is: %s", path.name, type(error).__name__)
+    return sealed
 
 
 # ---- maintenance on a stopped data directory ----------------------------------------------------------------------
@@ -291,6 +345,8 @@ __all__ = [
     "mismatch",
     "missing",
     "rekey",
+    "seal_plain_copies",
+    "seal_plain_provider_keys",
     "sealed_in",
     "verify",
     "verify_store",

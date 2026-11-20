@@ -300,8 +300,9 @@ class Workspace:
         tenant always uses its own secret box from ``storage`` and ignores ``vault_key``.
 
         ``verify_vault_key`` (Nodestro Local Docker) requires such a key (``secrets.vault_key_missing``) and refuses one
-        that does not fit the secrets already sealed in the data directory (``secrets.vault_key_mismatch``), before
-        anything is migrated or written (:mod:`nodestro_runtime.local_vault`).
+        that does not fit the secrets already sealed in the data directory (``secrets.vault_key_mismatch``), after the
+        schema migration (which touches no secret) and before any secret is sealed or written
+        (:mod:`nodestro_runtime.local_vault`).
 
         ``profile`` chooses the operating profile (:mod:`nodestro_runtime.profile`); without one, the desktop
         profile on ``data_dir`` is used, as before. Given both, ``data_dir`` must be the profile's data
@@ -803,32 +804,25 @@ class Workspace:
         changes. Keys that are already encrypted stay as they are; a key that cannot be encrypted is never dropped."""
         if self._secrets is None:
             return
+        secrets = self._secrets
         with self.store.transaction():
             values = self.store.get_raw("settings", "app") or {}
-            providers = values.get("providers") or {}
-            legacy = values.get("api_key")
-            changed: list[str] = []
-            if isinstance(legacy, str) and legacy:
-                # The top-level key of old releases is Anthropic's; it moves into the provider settings (as on update).
-                anthropic = providers.setdefault("anthropic", {})
-                if not anthropic.get("api_key"):
-                    anthropic["api_key"] = legacy
-                values.pop("api_key")
-                changed.append("api_key")
-            for name, entry in providers.items():
-                key = entry.get("api_key") if isinstance(entry, dict) else None
-                if isinstance(key, str) and key and not is_encrypted(key):
-                    entry["api_key"] = self._secrets.encrypt(self.tenant_id, _key_field(name), key)
-                    changed.append(name)
-            if not changed:
-                return
-            values["providers"] = providers
-            self.store.put_raw("settings", "app", values)
-        # The plain keys must not stay in the write-ahead log or in the database file's old page until SQLite's next
-        # automatic checkpoint.
-        checkpoint = getattr(self.store, "checkpoint", None)
-        if callable(checkpoint):
-            checkpoint()
+            changed = local_vault.seal_plain_provider_keys(
+                values, lambda field, plain: secrets.encrypt(self.tenant_id, field, plain)
+            )
+            if changed:
+                self.store.put_raw("settings", "app", values)
+        # Copies of the database from before a schema migration may hold the same keys in plain text.
+        copies = local_vault.seal_plain_copies(self.data_dir, secrets, self.tenant_id)
+        if copies:
+            logger.info("Encrypted %d provider key(s) in copies of the database", copies)
+        if not changed:
+            return
+        # The plain keys must not stay in the write-ahead log, in the database file's old page or in pages an earlier
+        # release freed without secure_delete (once: only when plain keys were sealed).
+        scrub = getattr(self.store, "scrub", None)
+        if callable(scrub):
+            scrub()
         logger.info("Encrypted %d stored provider key(s) with the keychain key", len(changed))
 
     def _seal(self, provider: str, key: str) -> str:

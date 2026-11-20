@@ -655,11 +655,14 @@ class SQLiteStore:
     def closed(self) -> bool:
         return self._closed
 
-    def checkpoint(self) -> None:
-        """Copy the write-ahead log into the database file and empty it: a value that was just overwritten (a plain
-        secret that is now sealed) stays neither in the log nor in the file's old page (``secure_delete``)."""
+    def scrub(self) -> None:
+        """Rewrite the database file without its free pages and empty the write-ahead log (``VACUUM``, then a
+        ``TRUNCATE`` checkpoint): a value that was just overwritten (a plain secret that is now sealed) stays neither
+        in the log, nor in the file's old page, nor in pages that an earlier release freed without ``secure_delete``.
+        Rewrites the whole file: for one-time migrations only."""
         with self._lock:
             if not self._depth and self.database != ":memory:":
+                self._connection.execute("VACUUM")
                 self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @contextmanager
