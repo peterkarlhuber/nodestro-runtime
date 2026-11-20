@@ -42,6 +42,8 @@ class PendingApproval(BaseModel):
     instructions: str = ""
     allow_comment: bool = True
     require_comment_on_reject: bool = False
+    #: Whether the person may write a note to the later agents (``agent_note``; the comment is for people only).
+    allow_agent_note: bool = True
     on_reject: str = "branch"
     #: Whether a rejection has a path to follow (else the rejected branch simply ends).
     has_rejected_branch: bool = False
@@ -89,7 +91,8 @@ def approvals_in(runs: RunManager, run: Run) -> list[PendingApproval]:
         if state.status != "awaiting_approval" or state.approval is not None:
             continue
         config = node.approval or ApprovalConfig()
-        inputs, _absent = runs._inputs(run, node.id)
+        # Read by the person who decides: an earlier approval shows its comment and its note to the agents.
+        inputs, _absent = runs._inputs(run, node.id, approvals="person")
         shown = {node_label(item) for item in run.workflow.nodes if item.id in config.show}
         labels = {node_label(item): item.id for item in run.workflow.nodes}
         items = [
@@ -111,6 +114,7 @@ def approvals_in(runs: RunManager, run: Run) -> list[PendingApproval]:
                 instructions=config.instructions,
                 allow_comment=config.allow_comment,
                 require_comment_on_reject=config.require_comment_on_reject,
+                allow_agent_note=config.allow_agent_note is not False,
                 on_reject=config.on_reject,
                 has_rejected_branch="rejected" in handles,
                 has_approved_branch="approved" in handles,

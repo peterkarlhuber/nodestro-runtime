@@ -22,13 +22,13 @@ from pydantic import BaseModel
 from . import contracts, graph
 from .agent_builder import ConfigIssue
 from .engine import _PLACEHOLDER, MAX_DEPTH, _usable_team, check_workflow, node_label, start_fields
-from .graph import BRANCHING, ancestors, comment_sources, data_sources, workflow_refs
+from .graph import BRANCHING, WORKING, ancestors, data_sources, note_sources, workflow_refs
 from .local_service import LOCAL_CONTEXT_LENGTH, SMALL_CONTEXT, InstalledModel
 from .orchestrator import select_teams
 from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
 from .providers import PROVIDERS, MissingApiKeyError, model_id, provider_of
-from .schemas import Workflow
+from .schemas import Node, Workflow
 from .source_ledger import CHECKED_SOURCES, FILLED_SOURCES, LEDGER_FIELD_TYPES, WEB_TOOL_NAMES
 from .tool_spec import offered
 from .value_checks import computes
@@ -228,7 +228,7 @@ def _node_issues(
             )
         upstream = {
             labels[source].strip().lower()
-            for source in [*data_sources(workflow, node.id), *comment_sources(workflow, node.id)]
+            for source in [*data_sources(workflow, node.id), *note_sources(workflow, node.id)]
         }
         everyone = {value.strip().lower() for key, value in labels.items() if key != node.id}
         for match in _PLACEHOLDER.finditer(config.task_template or ""):
@@ -294,6 +294,62 @@ def _node_issues(
                         model=model,
                     )
                 )
+    return found
+
+
+def _templates(node: Node) -> list[str]:
+    """The texts of a node whose placeholders are filled with what arrives at it (and then reach a model)."""
+    if node.agent is not None:
+        return [node.agent.task_template or ""]
+    if node.subworkflow is not None:
+        return [node.subworkflow.input_template or "", *node.subworkflow.values.values()]
+    if node.orchestrator is not None:
+        return [node.orchestrator.task_template or ""]
+    return []
+
+
+def _approval_note_issues(workflow: Workflow) -> list[CheckIssue]:
+    """A warning per model step and approval whose decision reached it as the reviewer's comment before (E-0R-1 A).
+
+    The comment of an approval is for people only now; the step reads only the person's note to the agents. An
+    approval saved before the note existed (``allow_agent_note`` is ``None``) gets the warning until the workflow is
+    saved with ``allow_agent_note`` set, so the change is pointed out once instead of passing silently.
+    """
+    found: list[CheckIssue] = []
+    nodes = {node.id: node for node in workflow.nodes}
+    labels = {node.id: node_label(node) for node in workflow.nodes}
+    for node in workflow.nodes:
+        if node.type not in WORKING:
+            continue
+        reaching = list(note_sources(workflow, node.id))
+        for edge in graph.loop_edges(workflow):
+            if edge.target == node.id:
+                head = [edge.source] if nodes[edge.source].type == "approval" else []
+                reaching += [*head, *note_sources(workflow, edge.source)]
+        named = {
+            match.group(1).strip().lower(): match.group(1).strip()
+            for template in _templates(node)
+            for match in _PLACEHOLDER.finditer(template)
+        }
+        for source in dict.fromkeys(reaching):
+            config = nodes[source].approval
+            if config is not None and config.allow_agent_note is not None:
+                continue
+            approval = labels[source]
+            placeholder = named.get(approval.strip().lower(), "")
+            where = f"{{{{{placeholder}}}}} in {labels[node.id]}" if placeholder else labels[node.id]
+            found.append(
+                _issue(
+                    "check.approval_comment_not_forwarded",
+                    f"{where} no longer receives the reviewer's comment from {approval}: the comment is for people "
+                    "only. Later agents read only the note to the agent (agent_note); save the approval with the "
+                    "note to the agent allowed or turned off to confirm",
+                    node_id=node.id,
+                    name=labels[node.id],
+                    approval=approval,
+                    placeholder=placeholder,
+                )
+            )
     return found
 
 
@@ -1244,6 +1300,7 @@ def preflight(nodestro: Workspace, workflow: Workflow, *, pending_tools: set[str
             ),
         ),
         *_flow_issues(workflow),
+        *_approval_note_issues(workflow),
         *_subworkflow_issues(nodestro, workflow),
         *_orchestrator_issues(nodestro, workflow),
         *_contract_issues(workflow),

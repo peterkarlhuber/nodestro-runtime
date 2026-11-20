@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .engine import _PLACEHOLDER, as_text, node_label, render_task, start_fields
+from .engine import _PLACEHOLDER, approval_note, as_text, node_label, render_task, start_fields
 from .file_delivery import collect, plan
 from .forms import check_values, prompt_values
-from .graph import comment_sources, data_sources
+from .graph import data_sources, note_sources
 from .problems import NodestroError
 from .run_views import workflow_runs
 from .sanitize import redact_secrets
@@ -142,8 +142,8 @@ def build_preview(
     config = node.agent
     labels = {item.id: node_label(item) for item in workflow.nodes}
     # Decision and approval nodes pass results through: the agent gets what arrives at them.
-    # An approval passes its comment on as well (named after the approval).
-    sources = [*data_sources(workflow, node_id), *comment_sources(workflow, node_id)]
+    # An approval passes its note to the agents on as well (named after the approval); never its comment (E-0R-1 A).
+    sources = [*data_sources(workflow, node_id), *note_sources(workflow, node_id)]
     starts = [item for item in workflow.nodes if item.type == "start"]
     fields = start_fields(workflow)
     if given_values is not None:
@@ -172,11 +172,7 @@ def build_preview(
             text: str | None = as_text(form_values) if form_values else run_input
         elif item.type == "approval":
             approval = state.approval if state is not None else None
-            text = (
-                as_text({"decision": approval.decision, "comment": approval.comment})
-                if approval is not None and approval.comment
-                else None
-            )
+            text = approval_note(labels[source], approval)
         elif state is not None and state.status == "succeeded":
             text = as_text(state.output)
         else:

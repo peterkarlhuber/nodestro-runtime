@@ -152,11 +152,35 @@ orchestrator decisions execute in a thread pool of the run manager, separate fro
 included); further agents wait for a free thread.
 
 **Approvals.** An approval node pauses the run (`status == "paused"`, the node is `awaiting_approval`) until
-a person decides with `workspace.decide(run_id, node_id, "approved" | "rejected", comment)`. Nothing is ever
-approved automatically, a decision is recorded once (also when two processes of a server decide at the same
+a person decides with `workspace.decide(run_id, node_id, "approved" | "rejected", comment, agent_note=...)`. Nothing
+is ever approved automatically, a decision is recorded once (also when two processes of a server decide at the same
 moment: the second gets `approval.not_pending`), and a pending approval survives restarts. `decide`,
 `cancel` and starting a run may also be called from another thread while the event loop runs; they are
 carried out on that loop.
+
+A decision carries two separate texts (owner decision E-0R-1 A):
+
+- `comment` is for people only: the run's view, the next reviewer's view and the audit trail
+  (`NodeRun.approval.comment`, at most 4,000 characters). No model ever reads it, whatever the decision: not a later
+  agent, not a sub-workflow, an orchestrator or its teams, not the run chat, not after a restart or a continued run.
+  Result nodes, result files and decision nodes never received it and still do not.
+- `agent_note` ("Note to the agent") is the only text of a decision that later agents read. It is plain text of at
+  most 2,000 characters (control and text direction characters are removed; a longer note is refused with
+  `approval.agent_note_too_long`). Agents, sub-workflows and orchestrators behind the approval receive it under the
+  approval's name (`{{<approval name>}}`, or appended to the task like any other input), labeled as a person's note
+  with the decision and framed as data (`<untrusted_data source="note of a person at the approval ...">`). Without a
+  note the placeholder reads `-`. `ApprovalConfig.allow_agent_note = False` turns the note off for an approval (a note
+  is then refused with `approval.agent_note_disabled`); the waiting approval's view says so in `allow_agent_note`.
+
+**Behavior change (E-0R-1 A).** Before this change the comment itself was passed to later agents (as
+`{"decision": ..., "comment": ...}` under the approval's name). It no longer is; a workflow that relied on it must
+ask reviewers to use the note to the agent. Workflows and runs stored before load unchanged: a decision without
+`agent_note` passes nothing on to a model, and a workflow whose approval has no `allow_agent_note` yet
+(`None`) behaves as if it were `True`. The workflow check warns once per model step that receives such an approval
+(`check.approval_comment_not_forwarded`, params `name`, `node_id`, `approval`, `placeholder`; `placeholder` names
+the `{{...}}` reference, empty when the decision arrived through `{{input}}`, `{{feedback}}` or the appended inputs)
+until the workflow is saved with `allow_agent_note` set to `True` or `False`. Fingerprints of continued runs do not
+change unless the note is turned off.
 
 **Continuing.** `await workspace.resume(run_id)` continues a failed or cancelled run as a new linked run. A
 step's earlier result is reused only when its fingerprint (configuration, connections, tool code, inputs and

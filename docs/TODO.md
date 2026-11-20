@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 7 |
+| P2 Medium | 8 |
 | P3 Low | 31 |
 | P4 Optional | 14 |
 
@@ -76,6 +76,27 @@ None known.
   pass; they do not replace the independent review (E-P-5, bundled with RT-081).
 - **Next step:** Add to the next bundled independent review brief.
 
+### RT-085 · Approval comments never reach a model; "Note to the agent" in api, sdk and studio (E-0R-1 A, L-1)
+
+- **Priority:** P2 Medium · **Status:** In progress · **Refs:** owner decision E-0R-1 A, Phase 0R gap L-1,
+  `tests/test_approval_agent_note.py`, README "Approvals"
+- **What:** The comment of a workflow approval decision used to reach later agents (also on rejection). The runtime
+  now keeps `comment` for people only and passes on only the separate `agent_note` (`ApprovalRecord.agent_note`,
+  plain text, at most 2,000 characters, labeled and framed as a person's note). `RunManager.decide` /
+  `Workspace.decide` take `agent_note=`; new codes `approval.agent_note_too_long` (param `limit`),
+  `approval.agent_note_disabled` and the warning `check.approval_comment_not_forwarded` (params `name`, `node_id`,
+  `approval`, `placeholder`). `ApprovalConfig.allow_agent_note` (`None` for workflows from before: allowed, with the
+  warning until saved with `True`/`False`); `PendingApproval.allow_agent_note`. The next reviewer's view shows
+  `{"decision", "comment", "agent_note"}` of an earlier approval. Tool-call approvals were separated before (N-07).
+- **Next step:** nodestro-api: accept `agent_note` (string, max 2,000) in the approval decision body next to
+  `comment` and pass it as `runs.decide(..., agent_note=...)`; map `approval.agent_note_too_long` and
+  `approval.agent_note_disabled` to 422; expose `allow_agent_note` in the pending-approval and workflow models.
+  nodestro-sdk: regenerate from the new OpenAPI (`agent_note`, `allow_agent_note`). nodestro-studio: a separate field
+  "Note to the agent" next to the comment in the approval dialog (six languages), the approval node setting, the
+  texts of the three new codes, and saving new approval nodes with `allow_agent_note: true`. Residual: an agent
+  turn paused at a tool call before the upgrade continues from its stored checkpoint, whose prompt may hold an old
+  comment.
+
 ### RT-081 · Independent review of the security fixes N-03 and N-07
 
 - **Priority:** P3 Low · **Status:** Needs external review · **Refs:** runtime #191 (`10dd28e`) and this PR,
@@ -89,7 +110,7 @@ None known.
   done before any public deployment). Residual risk: without a key store (command line, Local Docker without the
   variable) provider keys stay in plain text in the user-only database file (AR-3 in nodestro-studio MUP-ONA).
 - **Next step:** Put both fixes into the next bundled independent review brief. The separate, explicit "note to the
-  agent" feature allowed by E-P-4 is planned, not built.
+  agent" of workflow approvals (E-0R-1 A) is built in the runtime; its api, sdk and studio parts are RT-085.
 
 ### RT-080 · Desktop SQLite on Tabrion: follow-ups of MIG-NOD-6
 
@@ -893,6 +914,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
 | RT-084 | nodestro-api | N-13 API part (activity endpoints, housekeeping) | API serves `activity.query` / `export` and calls `activity.prune` |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
+| RT-085 | nodestro-api, nodestro-sdk, nodestro-studio | E-0R-1 A (approval note to the agent) | api: `agent_note` in the approval decision body; sdk: OpenAPI regeneration; studio: "Note to the agent" field in six languages and the texts of the new codes |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |

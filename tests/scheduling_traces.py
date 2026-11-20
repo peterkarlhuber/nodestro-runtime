@@ -84,7 +84,8 @@ def scenario(
 ) -> dict[str, Any]:
     """``agents``: per agent node ``ok`` (default), ``fail``, ``cancelled``, ``cancel_run`` or a word.
 
-    ``decisions``: ``[node, decision, comment]`` in the order a person makes them.
+    ``decisions``: ``[node, decision, text]`` in the order a person makes them; the text is the decision's comment
+    and its note to the agents.
     ``children``: workflows saved first (sub-workflows refer to them by ``id``).
     """
     return {
@@ -352,7 +353,8 @@ async def play(workspace: Workspace, scripted: Scripted, case: dict[str, Any]) -
         state = target.nodes.get(node_id)
         if state is None or state.status != "awaiting_approval":
             continue
-        workspace.decide(target.id, node_id, decision, comment)
+        # The recorded text goes to the agents as the note (E-0R-1 A: the comment itself never reaches a model).
+        workspace.decide(target.id, node_id, decision, comment, agent_note=comment)
         await asyncio.sleep(0)
         run = await workspace.wait(started.id, timeout=20)
     per_node: dict[str, list[list[Any]]] = {}
