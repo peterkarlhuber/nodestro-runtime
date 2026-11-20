@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Access model v2 at the other call sites (N-06, Welle 2). Still off by default (`NODESTRO_ACCESS_GRANTS=1` with
+  `NODESTRO_TOOL_APPROVALS=1`); switched off, nothing changes. See [docs/access-grants.md](docs/access-grants.md).
+  - A deny or a safety limit now also refuses a workflow start (top level, sub-workflow node, orchestrator team),
+    a tool call through a blocked MCP server or connection (`decide(related=...)`, `ToolGate.related`), and a cloud
+    model request (agent turns, orchestrator decisions, agent tests, the live run chat). Grants on these resources
+    never loosen a question or the MCP rules.
+  - Refusals carry `resource_type`, `resource_id` and `source` and are audited as `access_refused` (new audit kind,
+    outcome `denied`) and shown as the run event `access_refused`.
+  - `tool_policy.explain`, `who_may`, `effect_for`, `site_access` and `site_records`: "who may do what and why"
+    (BER-1) for the api, without I/O.
+
 - Access model v2, groundwork (N-06). It is off by default (`NODESTRO_ACCESS_GRANTS=1`, only together with
   `NODESTRO_TOOL_APPROVALS=1`; activation needs gate G-2). See [docs/access-grants.md](docs/access-grants.md).
   - Stored `Grant` and `Deny` records about a tool, folder, workflow, MCP server, connection or cloud provider, with

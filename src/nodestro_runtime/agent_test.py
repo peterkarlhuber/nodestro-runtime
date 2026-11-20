@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from . import tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode, request_regions
-from .engine import execute_agent, node_problem, render_task, tool_rounds_problem, usage_of
+from .engine import access_error, execute_agent, node_problem, render_task, tool_rounds_problem, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
@@ -160,6 +160,7 @@ class AgentTester:
             at=now(),
             version=version,
             definition_hash=definition,
+            related=gate.related(self.builder.tools, call.name, config.tool_settings),
         )
         shown = capability.model_dump()
         if verdict.action == "allow" and verdict.access_source is not None:
@@ -222,6 +223,18 @@ class AgentTester:
             "after_tool": after_tool,
             "on_event": trace_hook(result.reasoning),
         }
+        connect = self.connect
+        if gate is not None and gate.access is not None:
+            # N-06: a cloud model the access model v2 blocks never gets the test's prompt (no agent: a test agent has
+            # no identity, so a deny for some agents holds here too). The error names the source for the person.
+            def connect(provider: str) -> Connection:
+                if provider != "ollama":
+                    resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
+                    found = gate.site_refusal(resource, attended=True, agent=None)
+                    if found is not None:
+                        raise access_error(found, resource)
+                return self.connect(provider)
+
         try:
             built_config, run_memory, isolated = self._memory(config)
             result.memory_isolated = isolated
@@ -229,7 +242,7 @@ class AgentTester:
                 self.builder,
                 built_config,
                 prompt,
-                connect=self.connect,
+                connect=connect,
                 tracker=tracker,
                 name="agent-test",
                 hooks=hooks,

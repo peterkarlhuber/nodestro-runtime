@@ -24,7 +24,7 @@ compare-and-set), and only within :data:`EXECUTION_WINDOW` after the decision.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -48,6 +48,7 @@ from .tool_policy import (
     UNKNOWN,
     AccessAction,
     AccessContext,
+    AccessDecision,
     AccessMode,
     AccessResource,
     AccessScope,
@@ -61,6 +62,7 @@ from .tool_policy import (
     ToolFacts,
     ToolPreGrant,
     folder_parts,
+    site_access,
 )
 
 COLLECTION = "tool_approvals"
@@ -163,6 +165,8 @@ AuditKind = Literal[
     "access_grant_revoked",
     "access_denied",
     "access_deny_revoked",
+    # N-06: a deny or a safety limit refused a workflow start or a cloud model request (the source is recorded).
+    "access_refused",
 ]
 
 
@@ -230,7 +234,7 @@ def _activity(store: DocumentStore, event: ToolApprovalEvent) -> None:
 
 
 #: Audit kinds of a refused action (mirrored with the outcome ``denied``).
-REFUSALS = frozenset({"decision_refused", "tool_adoption_refused"})
+REFUSALS = frozenset({"decision_refused", "tool_adoption_refused", "access_refused"})
 
 
 def audit_target(event: ToolApprovalEvent) -> tuple[str, str]:
@@ -239,6 +243,8 @@ def audit_target(event: ToolApprovalEvent) -> tuple[str, str]:
         return "run", event.run_id
     if event.kind.startswith("tool_adopt"):
         return "tool", event.tool or ""
+    if event.kind == "access_refused":
+        return str(event.details.get("resource_type", "")), str(event.details.get("resource_id", ""))
     if event.kind.startswith("access_"):
         kind = "access_deny" if event.kind.startswith("access_deny") else "access_grant"
         return kind, str(event.details.get("record_id", ""))
@@ -265,6 +271,34 @@ def audit_events(store: DocumentStore, *, limit: int = 200) -> list[ToolApproval
     for key, _ in items[MAX_AUDIT:]:
         store.delete(AUDIT, key)
     return [event for _, event in items[:limit]]
+
+
+def record_refusal(
+    store: DocumentStore,
+    found: AccessDecision,
+    resource: AccessResource,
+    *,
+    actor: str,
+    run_id: str | None = None,
+    agent: str | None = None,
+) -> ToolApprovalEvent:
+    """Audit a workflow start or a cloud model request the access model v2 refused (``access_refused``), with its
+    source for the person. Like the other access audit events it never names a folder path."""
+    details: dict[str, Any] = {
+        "resource_type": resource.type,
+        "kind": found.kind,
+        "source": found.source,
+    }
+    if resource.type != "folder":
+        details["resource_id"] = resource.id
+    if agent is not None:
+        details["agent"] = agent
+    return record_audit(
+        store,
+        ToolApprovalEvent(
+            at=now(), kind="access_refused", actor=actor, run_id=run_id, outcome=found.code, details=details
+        ),
+    )
 
 
 class ToolApprovalRequest(BaseModel):
@@ -768,6 +802,46 @@ class ToolGate:
             access=self._access(agent, conversation_id),
         )
 
+    def related(self, tools: Any, name: str, settings: Mapping[str, Any] | None = None) -> tuple[AccessResource, ...]:
+        """The MCP server and the connection a call of ``name`` uses, for the access model v2 (N-06); nothing while
+        its switch is off. The connection is the one the agent's tool settings name (``settings``: the agent's
+        ``tool_settings``)."""
+        if self.access is None:
+            return ()
+        found: list[AccessResource] = []
+        try:
+            info = tools.get(name)
+        except KeyError:
+            info = None
+        server = getattr(info, "server_id", None) if getattr(info, "kind", None) == "mcp" else None
+        if server:
+            found.append(AccessResource(type="mcp_server", id=server))
+        connection = getattr((settings or {}).get(name), "connection_id", None)
+        if connection:
+            found.append(AccessResource(type="connection", id=connection))
+        return tuple(found)
+
+    def site_refusal(
+        self,
+        resource: AccessResource,
+        *,
+        attended: bool,
+        agent: str | None,
+        conversation_id: str | None = None,
+    ) -> AccessDecision | None:
+        """The refusal of a workflow start or a cloud model request (N-06), or ``None`` (also while the switch is
+        off). Read at every check, so a revocation or a new deny applies at the next start or request.
+
+        Only a deny, a safety limit or a missing grant the defaults do not cover refuses (a workflow start never
+        lacks a grant: what it does is checked at each call). A grant changes nothing else here."""
+        access = self._access(agent, conversation_id)
+        if access is None:
+            return None
+        found = site_access(resource, access, attended=attended, at=now(), agent=agent)
+        if found.allowed or (resource.type == "workflow" and found.kind == "missing_grant"):
+            return None
+        return found
+
     def _access(self, agent: str | None, conversation_id: str | None) -> AccessContext | None:
         """Read at every call, so a revoked grant or a new deny applies at the next call."""
         if self.access is None:
@@ -1169,6 +1243,7 @@ __all__ = [
     "checkpoints_enabled",
     "max_paused",
     "record_audit",
+    "record_refusal",
     "request_key",
     "tool_facts",
 ]

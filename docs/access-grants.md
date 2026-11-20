@@ -1,6 +1,6 @@
 # Access grants (access model v2, N-06)
 
-Status: **groundwork, off by default.** The switch is `NODESTRO_ACCESS_GRANTS=1`, and it only takes effect together
+Status: **in development, off by default.** The switch is `NODESTRO_ACCESS_GRANTS=1`, and it only takes effect together
 with `NODESTRO_TOOL_APPROVALS=1`. Activating it is a separate owner decision (gate G-2). While it is off, the tool
 gate decides exactly as before: `ToolBinding`, `ToolPreGrant` and the S-2 rules are unchanged.
 
@@ -174,12 +174,75 @@ the root run.
 - The run's own tools (`RUN_OWN_TOOLS`: memory, input files, knowledge proposals, skills) never pass the gate, so
   denies on them are refused.
 
+## At the other call sites
+
+With the switch on, the runtime also evaluates the records where a workflow, an MCP server, a connection or a cloud
+model is used. Each check only adds refusals: a grant on these resources never lifts a question, an MCP rule or a
+per-call approval. While the switch is off, none of them runs (a regression test compares `decide` with and without
+the related resources over the whole S-2 matrix, and runs with stored records behave as before).
+
+| Resource | Where | Action | Effect class | What refuses |
+|---|---|---|---|---|
+| `workflow` | top-level start (`RunManager.start`: manual, schedule, batch, API, resume) | `execute` | `read_internal` | deny, safety limit |
+| `workflow` | sub-workflow node and orchestrator team start | `execute` | `read_internal` | deny, safety limit |
+| `mcp_server` | every call of one of its tools, in the tool gate (`decide(related=...)`) | `execute` | the tool's, always external | deny, safety limit |
+| `connection` | every call of a tool whose `tool_settings` name it, in the tool gate | `execute` | the tool's, always external | deny, safety limit |
+| `cloud_provider` | every connection of an agent's turn, an orchestrator decision, an agent test and the live run chat (every provider but `ollama`) | `submit` | `read_external` | deny, safety limit, missing grant with shared content |
+
+- **Workflow start.** A top-level start is a person's or a trigger's, not an agent's: only records for all agents
+  count there (`tool_policy.site_records`). A sub-workflow or team start names the calling node
+  (`<workflow id>/<node id>`), and every record counts. The effect class is `read_internal`, so a start trips no
+  effect-based limit; what the workflow does is checked at each of its calls (spec 7.2, "by its strongest effect").
+  A missing grant never refuses a start.
+- **MCP servers stay strict.** A deny or a safety limit on the server refuses the call. A grant on the server, like
+  a grant on the tool, never replaces the question before a changing MCP call and never lets an MCP tool run
+  unattended.
+- **Connections** are the ones the agent's tool settings name. A deny for some agents also holds when the gate
+  cannot name the agent (fail closed).
+- **Cloud models.** The default rule of spec 7.2 allows a cloud model without shared content. Nothing marks shared
+  content yet (N-08 provenance), so today only a deny or a safety limit (strict offline: `limit:offline`) refuses.
+  The check runs when a turn connects, so a new deny applies at the next turn. An agent test and the live run chat
+  have no agent: a deny for some agents holds there too.
+- If both a safety limit and a deny apply (on the tool or a related resource), the safety limit is reported.
+
+**Recording a refusal.** A refused tool call records the source as before (`ToolCallApproval.access_source`, run
+event `tool_denied`). A refused workflow start, sub-workflow or team start, or cloud model request:
+
+- raises (or fails the step with) `access.denied`, `access.safety_limit` or `access.missing_grant` with the params
+  `resource_type`, `resource_id` and `source`;
+- writes the audit event `access_refused` (`tool_approval_audit`, outcome `denied` in the activity log and the
+  platform mirror) with resource type, resource id (never a folder path), kind, source and agent;
+- in a run, emits the run event `access_refused` with the same fields.
+
+An orchestrator learns only that a team cannot start; the source goes to the person (event and audit). Agent tests
+show the source in the test result's `error_params`; they have no store to audit into.
+
+## Who may do what and why (BER-1)
+
+`tool_policy.explain(request, grants=..., denies=..., at=...)` is `evaluate` with its reasons. It does no I/O and
+counts the records as the request's call site does (`site_records`: a tool call ignores `once` grants, a top-level
+start ignores records for some agents). The result (`AccessExplanation`) names:
+
+- the request (resource, action, effect class, agent, mode),
+- `allowed`, `kind`, `code` and `source`,
+- the deciding `grant` or `deny`, or the deciding safety `limit` with its text (`limit_text`), or the `default_rule`,
+- `also`: the other active records that address the request but did not decide it (for example a subfolder grant
+  behind a parent deny).
+
+`tool_policy.who_may(grants, denies, at=..., resource=..., agent=..., mode=..., offline=..., protected_folders=...)`
+explains every resource, action, agent and mode an active record names. A record for all agents is explained
+without an agent. A tool is explained as it was granted. Folders are only explained when the caller names the
+protected data folder. `effect_for(resource_type, action, tool=...)` gives the effect class the call sites use.
+
+The api builds its query on `AccessRules(store).current()` and these functions. They are for people and the
+administration only; a model never gets an explanation (N-07).
+
 ## Not in this step
 
-- The api query "who may do what and why" (BER-1).
-- The studio approval cards with scope and duration.
-- Folder, workflow, MCP server, connection and cloud provider checks at their call sites. These need the file-system
-  guard (N-10), the content provenance (N-08) and the run start check.
+- The api query and write routes, and the studio approval cards and overview.
+- Folder checks at their call sites: they need the file-system guard (N-10).
+- Marking shared content (N-08), so a cloud model request with shared content needs a grant.
+- A grant on a workflow, MCP server or connection that lifts a question (spec 7.2 "Freigabe je Dienst/Ziel").
 - The `DenialNotice` type (N-07).
 
-See `docs/TODO.md` RT-086.
+See `docs/TODO.md` RT-086 and RT-088.

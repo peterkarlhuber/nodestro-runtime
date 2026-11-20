@@ -24,13 +24,16 @@ for the answer is :mod:`nodestro_runtime.tool_approvals`.
 The access model v2 (N-06, behind :data:`~nodestro_runtime.tool_approvals.ACCESS_ENV`, default off) extends it with
 stored :class:`Grant` and :class:`Deny` records about a resource (a tool, folder, workflow, MCP server, connection or
 cloud provider), global safety limits that are code (:data:`SAFETY_LIMITS`), and :func:`evaluate`: safety limit, then
-deny, then grant, otherwise a missing grant, with the kind of denial and its source. See ``docs/access-grants.md``.
+deny, then grant, otherwise a missing grant, with the kind of denial and its source. Besides tool calls, workflow
+starts, MCP servers, connections and cloud models are checked (:func:`site_access`, :func:`related_access`), and
+:func:`explain` and :func:`who_may` say who may do what and why (BER-1). See ``docs/access-grants.md``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
+import itertools
 import os
 import posixpath
 import re
@@ -622,6 +625,211 @@ def evaluate(
     return AccessDecision(allowed=False, kind="missing_grant")
 
 
+# ---- N-06: the call sites beyond tool calls, and "who may do what and why" (BER-1) ---------------------------------
+
+#: The action each resource is used with where the runtime checks it today (``docs/access-grants.md``, "Call sites").
+#: Folders are checked by the file-system guard (N-10), which names its own actions.
+SITE_ACTIONS: dict[str, AccessAction] = {
+    "tool": "execute",
+    "workflow": "execute",
+    "mcp_server": "execute",
+    "connection": "execute",
+    "cloud_provider": "submit",
+}
+#: The effect class a request has when the call site has no tool to take it from (spec 7.1). A workflow start is
+#: ``read_internal``: what the workflow then does is checked at each of its calls (spec 7.2 "by its strongest
+#: effect"), so starting it trips no effect-based limit. A cloud model is reached like a web search (spec 7.2, 7.4).
+_SITE_EFFECTS: dict[str, EffectClass] = {
+    "workflow": "read_internal",
+    "cloud_provider": "read_external",
+}
+_FOLDER_EFFECTS: dict[str, EffectClass] = {"read": "read_internal"}
+
+
+def effect_for(resource_type: ResourceType, action: AccessAction, *, tool: ToolFacts | None = None) -> EffectClass:
+    """The effect class of ``action`` on a resource of ``resource_type``, as the call sites evaluate it.
+
+    ``delete`` is always destructive. A tool, MCP server or connection takes the effect of the tool it is used
+    through (``tool``; without one :data:`UNKNOWN`, the worst that is not destructive; MCP servers and connections
+    always reach outside). Folders read internally and otherwise write internally."""
+    if action == "delete":
+        return "destructive"
+    if resource_type in _SITE_EFFECTS:
+        return _SITE_EFFECTS[resource_type]
+    if resource_type == "folder":
+        return _FOLDER_EFFECTS.get(action, "write_internal")
+    access: Access = tool.access if tool is not None else UNKNOWN.access
+    reach: Reach = tool.reach if tool is not None else UNKNOWN.reach
+    if resource_type in ("mcp_server", "connection"):
+        reach = "external"
+    return effect_class(access, reach)
+
+
+def site_records(
+    request: AccessRequest, grants: Sequence[Grant], denies: Sequence[Deny]
+) -> tuple[list[Grant], list[Deny]]:
+    """The records that count for ``request`` at its call site, so the enforcement and the explanation agree.
+
+    - A tool call ignores ``once`` grants: one confirmed call is the per-call approval of S-2 itself.
+    - A workflow start without an agent is a person's or a trigger's (a top-level run): only records for all agents
+      count. A sub-workflow or team start names the calling agent, and then every record counts."""
+    found_grants, found_denies = list(grants), list(denies)
+    if request.resource.type == "tool":
+        found_grants = [grant for grant in found_grants if grant.duration != "once"]
+    if request.resource.type == "workflow" and request.agent is None:
+        found_grants = [grant for grant in found_grants if grant.scope == "all"]
+        found_denies = [deny for deny in found_denies if deny.scope == "all"]
+    return found_grants, found_denies
+
+
+class AccessExplanation(BaseModel):
+    """Why an access is allowed or refused (BER-1, spec 7.3 (8)): the request, the decision and what decided it.
+
+    For the person and the administration only; a model never gets it (N-07)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    resource: AccessResource
+    action: AccessAction
+    effect: EffectClass
+    agent: str | None = None
+    mode: AccessMode = "supervised"
+    allowed: bool
+    #: The kind of refusal (spec 7.6) and its problem code; ``None`` when allowed.
+    kind: DenialKind | None = None
+    code: str | None = None
+    #: ``grant:<id>``, ``deny:<id>``, ``limit:<name>``, ``default:<rule>`` or ``none``.
+    source: str = "none"
+    #: The deciding record, if a record decided.
+    grant: Grant | None = None
+    deny: Deny | None = None
+    #: The deciding safety limit (a key of :data:`SAFETY_LIMITS`) and its text.
+    limit: str | None = None
+    limit_text: str | None = None
+    #: The default rule of spec 7.2 that allowed it.
+    default_rule: str | None = None
+    #: Other active records that address the request but did not decide it (a grant behind a deny, a second grant).
+    also: tuple[str, ...] = ()
+
+
+def explain(
+    request: AccessRequest, *, grants: Sequence[Grant], denies: Sequence[Deny], at: datetime
+) -> AccessExplanation:
+    """:func:`evaluate` with its reasons (no I/O): the deciding grant, deny, safety limit or default rule, and the
+    other active records that address the request. The records count as at the request's call site
+    (:func:`site_records`)."""
+    grants, denies = site_records(request, grants, denies)
+    found = evaluate(request, grants=grants, denies=denies, at=at)
+    kind, _, name = found.source.partition(":")
+    grant = next((item for item in grants if kind == "grant" and item.id == name), None)
+    deny = next((item for item in denies if kind == "deny" and item.id == name), None)
+    effect: EffectClass = "destructive" if request.action == "delete" else request.effect
+    also = [
+        f"deny:{item.id}" for item in denies if item.id != name and item.active_at(at) and _deny_applies(item, request)
+    ]
+    also += [
+        f"grant:{item.id}"
+        for item in grants
+        if item.id != name and item.active_at(at) and _grant_applies(item, request, effect)
+    ]
+    return AccessExplanation(
+        resource=request.resource,
+        action=request.action,
+        effect=request.effect,
+        agent=request.agent,
+        mode=request.mode,
+        allowed=found.allowed,
+        kind=found.kind,
+        code=found.code,
+        source=found.source,
+        grant=grant,
+        deny=deny,
+        limit=name if kind == "limit" else None,
+        limit_text=SAFETY_LIMITS.get(name) if kind == "limit" else None,
+        default_rule=name if kind == "default" else None,
+        also=tuple(also),
+    )
+
+
+def who_may(
+    grants: Sequence[Grant],
+    denies: Sequence[Deny],
+    *,
+    at: datetime,
+    resource: AccessResource | None = None,
+    agent: str | None = None,
+    mode: AccessMode | None = None,
+    offline: bool = False,
+    protected_folders: Sequence[str] = (),
+) -> list[AccessExplanation]:
+    """ "Who may do what and why" (BER-1): for every resource, action, agent and mode an active record names, what
+    decides an access now and why (:func:`explain`). ``resource``, ``agent`` and ``mode`` narrow the answer.
+
+    A record for all agents is explained without an agent (as for an agent no other record names). A tool is
+    explained as it was granted (the grant's ``tool``); with only a deny, as an unknown tool. A folder request names
+    ``protected_folders`` (Nodestro's own data folder); without one, folders are left out."""
+    cases: dict[tuple[str, str, str, str | None, str], AccessRequest] = {}
+    active: list[Grant | Deny] = [*(item for item in grants if item.active_at(at))]
+    active += [item for item in denies if item.active_at(at)]
+    for record in active:
+        if resource is not None and record.resource != resource:
+            continue
+        if record.resource.type == "folder" and not protected_folders:
+            continue
+        agents: tuple[str | None, ...] = record.agents if record.scope != "all" else (None,)
+        if agent is not None:
+            agents = (agent,) if record.scope == "all" or agent in record.agents else ()
+        record_mode = record.mode
+        modes: tuple[AccessMode, ...] = (record_mode,) if record_mode is not None else ("supervised", "unattended")
+        if mode is not None:
+            modes = (mode,) if mode in modes else ()
+        tool = record.tool if isinstance(record, Grant) else None
+        for action, who, how in itertools.product(record.actions, agents, modes):
+            key = (record.resource.type, record.resource.id, action, who, how)
+            if key in cases:
+                continue
+            cases[key] = AccessRequest(
+                resource=record.resource,
+                action=action,
+                effect=effect_for(record.resource.type, action, tool=tool),
+                agent=who,
+                mode=how,
+                conversation_id=record.conversation_id if isinstance(record, Grant) else None,
+                offline=offline,
+                protected_folders=tuple(protected_folders) if record.resource.type == "folder" else (),
+                tool=tool if record.resource.type == "tool" else None,
+            )
+    return [explain(request, grants=grants, denies=denies, at=at) for request in cases.values()]
+
+
+def site_access(
+    resource: AccessResource,
+    access: AccessContext,
+    *,
+    attended: bool,
+    at: datetime,
+    agent: str | None = None,
+    shared_content: bool = False,
+) -> AccessDecision:
+    """:func:`evaluate` for a workflow start or a cloud model request (actions :data:`SITE_ACTIONS`): the records
+    as they count there (:func:`site_records`). ``agent`` overrides the context's agent (``None`` for a top-level
+    start); ``shared_content`` says the conversation holds content from a granted source (N-08 provenance; nothing
+    sets it yet)."""
+    action = SITE_ACTIONS[resource.type]
+    request = AccessRequest(
+        resource=resource,
+        action=action,
+        effect=effect_for(resource.type, action),
+        agent=agent,
+        mode="supervised" if attended else "unattended",
+        conversation_id=access.conversation_id,
+        shared_content=shared_content,
+        offline=access.offline,
+    )
+    grants, denies = site_records(request, access.grants, access.denies)
+    return evaluate(request, grants=grants, denies=denies, at=at)
+
+
 class AccessContext(BaseModel):
     """What the access model v2 knows about a tool call (set only while its switch is on)."""
 
@@ -665,8 +873,33 @@ def tool_access(
         offline=access.offline,
         tool=ToolFacts.of(capability, version=version, definition_hash=definition_hash),
     )
-    grants = [grant for grant in access.grants if grant.duration != "once"]
-    return evaluate(request, grants=grants, denies=access.denies, at=at)
+    grants, denies = site_records(request, access.grants, access.denies)
+    return evaluate(request, grants=grants, denies=denies, at=at)
+
+
+def related_access(
+    resource: AccessResource,
+    capability: ToolCapability,
+    access: AccessContext,
+    *,
+    attended: bool,
+    at: datetime,
+) -> AccessDecision:
+    """:func:`evaluate` for the MCP server or the connection a tool call uses (action ``execute``, the tool's effect
+    class; MCP servers and connections always reach outside). Only its refusals count (:func:`access_refusal`): a
+    grant on them never allows a call, so the MCP rules and the per-call questions stay as they are."""
+    facts = ToolFacts.of(capability, version=None)
+    request = AccessRequest(
+        resource=resource,
+        action=SITE_ACTIONS[resource.type],
+        effect=effect_for(resource.type, "execute", tool=facts),
+        agent=access.agent,
+        mode="supervised" if attended else "unattended",
+        conversation_id=access.conversation_id,
+        offline=access.offline,
+    )
+    grants, denies = site_records(request, access.grants, access.denies)
+    return evaluate(request, grants=grants, denies=denies, at=at)
 
 
 def access_refusal(
@@ -677,8 +910,14 @@ def access_refusal(
     at: datetime,
     version: int | None = None,
     definition_hash: str | None = None,
+    related: Sequence[AccessResource] = (),
 ) -> tuple[GateDecision | None, AccessDecision | None]:
-    """The refusal by a deny or a safety limit, if any, and the evaluation (both ``None`` while the switch is off).
+    """The refusal by a deny or a safety limit, if any, and the evaluation of the tool (both ``None`` while the
+    switch is off).
+
+    ``related`` names the MCP server and the connection the call uses (:func:`related_access`): a deny or a safety
+    limit on one of them refuses the call as well; a grant on them changes nothing. A safety limit wins over a deny,
+    and the tool's own refusal over a related one of the same kind.
 
     Used before a call is decided and again after a person approved a waiting call (spec 7.3 (7)): a deny or a limit
     that appeared while the call waited still refuses it."""
@@ -693,9 +932,15 @@ def access_refusal(
         version=version,
         definition_hash=definition_hash,
     )
-    if found.kind in ("denied", "safety_limit"):
-        reason = _ACCESS_REASONS[found.kind].format(tool=tool)
-        return GateDecision(action="deny", code=found.code, reason=reason, access_source=found.source), found
+    checked = [found]
+    checked += [
+        related_access(resource, capability, context.access, attended=context.attended, at=at) for resource in related
+    ]
+    for kind in ("safety_limit", "denied"):
+        refused = next((item for item in checked if item.kind == kind), None)
+        if refused is not None:
+            reason = _ACCESS_REASONS[kind].format(tool=tool)
+            return GateDecision(action="deny", code=refused.code, reason=reason, access_source=refused.source), found
     return None, found
 
 
@@ -793,6 +1038,7 @@ def decide(
     at: datetime,
     version: int | None = None,
     definition_hash: str | None = None,
+    related: Sequence[AccessResource] = (),
 ) -> GateDecision:
     """Allow, deny or ask for one call (no I/O). The order: grants narrow first, then the binding decides whether to
     ask; an unattended run cannot ask, so it denies unless a matching pre-grant exists. An approval never changes the
@@ -801,8 +1047,12 @@ def decide(
     With the access model v2 (``context.access``, N-06) a safety limit or a deny refuses the call before anything
     else, and a matching grant allows a call that would otherwise be asked or refused for lack of a person. A grant
     never lifts an orchestrator's narrowing, an ``always`` binding, the MCP rules or a destructive tool's question, and
-    holds only for the tool version, classification and MCP definition (``definition_hash``) it was given for."""
-    refused, found = access_refusal(tool, capability, context, at=at, version=version, definition_hash=definition_hash)
+    holds only for the tool version, classification and MCP definition (``definition_hash``) it was given for. A deny
+    or a safety limit on the MCP server or the connection the call uses (``related``) refuses it too; a grant on them
+    never allows it."""
+    refused, found = access_refusal(
+        tool, capability, context, at=at, version=version, definition_hash=definition_hash, related=related
+    )
     if refused is not None:
         return refused
     verdict = _decide_binding(
@@ -870,12 +1120,14 @@ __all__ = [
     "NEW_BINDING",
     "SAFETY_LIMITS",
     "SERVER_TOOL_CAPABILITIES",
+    "SITE_ACTIONS",
     "SYSTEM_FOLDERS",
     "UNKNOWN",
     "Access",
     "AccessAction",
     "AccessContext",
     "AccessDecision",
+    "AccessExplanation",
     "AccessMode",
     "AccessRequest",
     "AccessResource",
@@ -903,14 +1155,20 @@ __all__ = [
     "capability_of",
     "decide",
     "effect_class",
+    "effect_for",
     "effect_of",
     "evaluate",
+    "explain",
     "folder_parts",
     "matching_pre_grant",
     "parse_capability",
+    "related_access",
     "safety_limit",
     "server_tool_capability",
+    "site_access",
+    "site_records",
     "system_folders",
     "tool_access",
     "wants_question",
+    "who_may",
 ]
