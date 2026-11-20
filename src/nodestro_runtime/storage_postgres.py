@@ -413,6 +413,14 @@ class PostgresDatabase:
                 state.connection, state.depth = None, 0
                 connection.execute("COMMIT")
 
+    @contextmanager
+    def savepoint(self) -> Iterator[None]:
+        """A part of the calling thread's transaction (a transaction of its own outside one) that fails alone: an
+        error inside rolls back to the savepoint and propagates, and the enclosing transaction stays usable (an error
+        in PostgreSQL otherwise aborts the whole transaction). For best-effort writes such as the activity log."""
+        with self._transaction() as connection, connection.transaction():
+            yield
+
     def _query(self, query: Query, params: Params = ()) -> builtins.list[tuple[Any, ...]]:
         """The rows of a read. Outside a transaction a lost connection is replaced and the read repeated (RT2-03),
         so a statement that writes never goes through here (:meth:`_write`, :meth:`_write_returning`), except one
@@ -1161,6 +1169,10 @@ class PostgresStore:
 
     def transaction(self) -> Any:
         return self.database.transaction()
+
+    def savepoint(self) -> Any:
+        """:meth:`PostgresDatabase.savepoint`: writes inside fail alone, without aborting the caller's transaction."""
+        return self.database.savepoint()
 
     @property
     def platform_events(self) -> Any:

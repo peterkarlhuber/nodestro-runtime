@@ -37,7 +37,7 @@ _BUILDERS = re.compile(r"(?:Error|Problem|problem|issue|Issue)$")
 #: Keyword arguments of those calls that are not parameters of the code.
 _NOT_PARAMS = frozenset({"message", "level", "field"})
 #: Constants in a code namespace that are not codes: file names, template placeholders, prefixes of a code that is
-#: completed at run time (listed in :func:`dynamic_codes` instead).
+#: completed at run time (listed in :func:`dynamic_codes` instead), actions of the activity log (:mod:`.activity`).
 NOT_CODES = frozenset(
     {
         "document.docx",
@@ -45,8 +45,11 @@ NOT_CODES = frozenset(
         "run.input",
         "run.values",
         "secrets.json",
+        "tool.called",
         "tool.py",
+        "workflow.finished",
         "workflow.input",
+        "workflow.started",
     }
 )
 _PACKAGE = Path(__file__).resolve().parent

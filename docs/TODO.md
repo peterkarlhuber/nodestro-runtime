@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 7 |
-| P3 Low | 30 |
+| P3 Low | 31 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -499,6 +499,23 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Features and enhancements
 
+### RT-084 · Activity log: API endpoints, server retention and remaining sources (N-13)
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `activity.py`, [activity-log.md](activity-log.md),
+  `tests/test_activity.py`, nodestro-api (access audit, API-009), RT-014
+- **What:** The runtime part is in: one event per file, tool, workflow and agent action (`activity.ActivityEvent`),
+  fed at the call sites of the approval audit, the tool journal, the MCP and connection events, the engine and the
+  input and knowledge files; query, JSON Lines and CSV export, retention by days (`NODESTRO_ACTIVITY_RETENTION_DAYS`,
+  default 90), mirroring into Axentra through `platform_events` with reconcile. A failed activity write never aborts
+  the caller's transaction (a savepoint on PostgreSQL, tested in `tests/test_activity_postgres.py`). Open: (1) the
+  HTTP endpoints for query and export in nodestro-api; (2) on a server, the API's housekeeping calls `activity.prune` per tenant (the
+  desktop prunes when the workspace opens); the default period follows the retention decision of RT-014 / API-009;
+  (3) the API's access audit and the assistant (with `conversation_id`) as further sources, and the API passing the
+  actor to `InputFiles.delete` and `KnowledgeBase.add` / `delete`; (4) `query` filters in Python after reading the
+  collection (or the period with `since`): fine for the desktop, an index or a table is needed for large server
+  tenants; (5) the Axentra backlog gauge does not count activity events.
+- **Next step:** Build (1) to (3) with the API part of N-13; measure (4) with RT-020.
+
 ### RT-075 · Desktop model provider keys into the vault (NAL-A1 follow-up)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** ADR-0001 (runtime) "Consequences", `workspace.py` provider
@@ -873,6 +890,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | RT-077 | nodestro-api, tabrion | API-065 (connection API), CR-DB NOD-CR-2 (`database` type) | ADR-0001 is the shared connection contract; CR-DB registers `database` instead of its own model (owner decision E-2) |
 | RT-078 | nodestro-studio, nodestro-api | NAL-A2 server switch | `NODESTRO_WEB_TOOLS_SERVER` stays off until the owner decides after D1 |
 | RT-014 | nodestro-api | API-009 (leader cleanup task) | API calls runtime retention |
+| RT-084 | nodestro-api | N-13 API part (activity endpoints, housekeeping) | API serves `activity.query` / `export` and calls `activity.prune` |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |

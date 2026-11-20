@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from . import activity
 from .net_address import METADATA_HOSTS, address_problem, url_secret_problem
 from .platform_events import platform_events
 from .problems import NodestroError
@@ -903,6 +904,22 @@ class ConnectionService:
                     )
         except Exception:
             logger.exception("Could not store connection event %s", kind)
+            return
+        # The activity log keeps the connection's id and type and the result; never an address or another detail.
+        failed = details.get("outcome") == "failed" or details.get("status") == "failed"
+        code = details.get("code")
+        activity.add(
+            self.store,
+            "connection",
+            f"connection.{kind}",
+            at=record.at,
+            actor=actor,
+            resource_type="service_connection",
+            resource_id=item.id,
+            outcome="failure" if failed else "success",
+            code=code if isinstance(code, str) else None,
+            source_event=record.id,
+        )
 
     def events(self, *, limit: int = 200) -> list[ConnectionEvent]:
         items = self.store.items(EVENTS, ConnectionEvent)

@@ -52,7 +52,7 @@ try:  # POSIX; on Windows (desktop only, one process) the in-process lock is eno
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
-from . import documents
+from . import activity, documents
 from .file_formats import (
     MAX_UPLOAD_MB,
     ArchiveEntry,
@@ -295,6 +295,16 @@ class InputFiles:
         self.store.put(COLLECTION, item.id, item)
         with self._lock:
             self._remember(self._extracted, item.id, extracted)
+        # The id and the format only: a file's name may name a person or a customer (see nodestro_runtime.activity).
+        activity.add(
+            self.store,
+            "file",
+            "file.uploaded",
+            actor=uploaded_by,
+            resource_type="input_file",
+            resource_id=item.id,
+            code=item.format,
+        )
         return item
 
     # ---- reading -----------------------------------------------------------------------
@@ -444,7 +454,7 @@ class InputFiles:
                     continue
             elif item.created_at > moment - GRACE:
                 continue
-            self.delete(item.id, force=True)
+            self.delete(item.id, force=True, actor="system")
             result.removed += 1
             result.freed_bytes += item.size
         return result
@@ -455,12 +465,13 @@ class InputFiles:
         removed = 0
         for file_id in dict.fromkeys(ids):
             if is_input_id(file_id) and file_id not in references and file_id in self:
-                self.delete(file_id, force=True)
+                self.delete(file_id, force=True, actor="system")
                 removed += 1
         return removed
 
-    def delete(self, file_id: str, *, force: bool = False) -> None:
-        """Delete an input file; without ``force`` only when nothing references it."""
+    def delete(self, file_id: str, *, force: bool = False, actor: str | None = None) -> None:
+        """Delete an input file; without ``force`` only when nothing references it. ``actor`` is who deleted it (for
+        the activity log; ``system`` for the cleanup)."""
         item = self.get(file_id)
         if not force and file_id in self.references():
             from .problems import NodestroError
@@ -475,6 +486,7 @@ class InputFiles:
         for blob in (item.blob, item.extract_blob):
             if blob and blob not in remaining and blob in self.blobs:
                 self.blobs.delete(blob)
+        activity.add(self.store, "file", "file.deleted", actor=actor, resource_type="input_file", resource_id=file_id)
 
 
 def _clean_name(name: str) -> str:

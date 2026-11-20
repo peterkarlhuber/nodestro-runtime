@@ -40,11 +40,12 @@ from orkexa.local import OllamaError
 from orkexa.retrieval import RetrievalError, RetrievalMode, split_text
 from pydantic import BaseModel, Field
 
-from . import documents
+from . import activity, documents
 from .extensions import OcrEngine
 from .problems import NodestroError
 from .schemas import KnowledgeConfig
 from .sqlite_tables import KnowledgeChunks
+from .storage import DocumentStore
 
 logger = logging.getLogger(__name__)
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
@@ -282,6 +283,9 @@ class KnowledgeBase:
         #: On a server's API process: where reindex jobs are queued for a worker (:class:`ReindexQueue`, RT-046);
         #: ``None``: a reindex runs in a thread of this process (desktop, Local Docker, tests).
         self.reindex_queue: ReindexQueue | None = None
+        #: The workspace's store, where uploads and deletions are logged (:mod:`nodestro_runtime.activity`);
+        #: ``None``: not logged (a knowledge base outside a workspace).
+        self.activity: DocumentStore | None = None
 
     def ocr_available(self) -> bool:
         return self.runner() is not None
@@ -352,8 +356,9 @@ class KnowledgeBase:
         media_type: str | None = None,
         collection: str = "",
         extra: dict[str, str] | None = None,
+        actor: str | None = None,
     ) -> KnowledgeFile:
-        """Store a file and index its text.
+        """Store a file and index its text (``actor``: who uploaded it, for the activity log).
 
         PDF and text formats are indexed as they are; DOCX and XLSX are converted to
         Markdown first (see :mod:`nodestro_runtime.documents`); a scanned PDF is recognised by
@@ -378,8 +383,9 @@ class KnowledgeBase:
                 self._index_with_fallback(lambda: self._index_new(entry, data, name, converted, pdf))
             except BaseException:
                 # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
-                self.delete(entry.id)
+                self._delete(entry.id)
                 raise
+        self._activity("file.uploaded", entry.id, actor)
         return self.get(entry.id)
 
     def _index_new(
@@ -731,10 +737,21 @@ class KnowledgeBase:
             self.store._save(entry.model_copy(update={"description": description, "metadata": metadata}), None)
         return self.get(file_id)
 
-    def delete(self, file_id: str) -> None:
+    def delete(self, file_id: str, *, actor: str | None = None) -> None:
+        self._delete(file_id)
+        self._activity("file.deleted", file_id, actor)
+
+    def _delete(self, file_id: str) -> None:
         with self._lock:
             self.store.delete(file_id)
             self.index.delete(file_id)
+
+    def _activity(self, action: str, file_id: str, actor: str | None) -> None:
+        """One activity event (:mod:`nodestro_runtime.activity`) with the file's id, never its name or text."""
+        if self.activity is not None:
+            activity.add(
+                self.activity, "file", action, actor=actor, resource_type="knowledge_file", resource_id=file_id
+            )
 
     def search(
         self, query: str, file_ids: Iterable[str] | None = None, k: int = 8, *, mode: RetrievalMode | None = None

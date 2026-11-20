@@ -22,6 +22,7 @@ from typing import Any
 
 from orkexa import Tool
 
+from .. import activity
 from ..docker_status import mcp_owner
 from ..platform_events import platform_events
 from ..problems import NodestroError
@@ -960,6 +961,8 @@ class McpService:
                     )
         except Exception:
             logger.exception("Could not store MCP event %s", kind)
+        else:
+            mcp_activity(self.store, record)
         return record
 
     def events(self, *, limit: int = 200) -> list[McpEvent]:
@@ -969,6 +972,33 @@ class McpService:
             for key, _ in items[MAX_EVENTS:]:
                 self.store.delete(EVENTS, key)
         return [event for _, event in items[:limit]]
+
+
+def mcp_activity(store: DocumentStore, event: McpEvent) -> None:
+    """The activity event of an MCP event (:mod:`nodestro_runtime.activity`): the server and tool ids, the result and
+    a problem code; never an address, a name or another detail."""
+    outcome: activity.Outcome = "success"
+    if event.kind == "call_refused":
+        outcome = "denied"
+    elif event.kind == "oauth_failed":
+        outcome = "failure"
+    if event.tool is not None:
+        resource = ("mcp_tool", f"{event.server_id}/{event.tool}" if event.server_id else event.tool)
+    else:
+        resource = ("mcp_server", event.server_id or "")
+    code = event.details.get("code")
+    activity.add(
+        store,
+        "mcp",
+        f"mcp.{event.kind}",
+        at=event.at,
+        actor=event.actor,
+        resource_type=resource[0],
+        resource_id=resource[1],
+        outcome=outcome,
+        code=code if isinstance(code, str) else None,
+        source_event=event.id,
+    )
 
 
 def mcp_event_details(event: McpEvent) -> dict[str, Any]:

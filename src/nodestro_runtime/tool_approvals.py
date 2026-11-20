@@ -37,6 +37,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
+from . import activity
 from .mcp_access import UNATTENDED_TRIGGERS
 from .platform_events import platform_events
 from .problems import NodestroError
@@ -161,10 +162,12 @@ class ToolApprovalEvent(BaseModel):
 
 
 def record_audit(store: DocumentStore, event: ToolApprovalEvent) -> ToolApprovalEvent:
-    """Store ``event``; with a platform sink (:mod:`.platform_events`) its mirror commits in the same transaction."""
+    """Store ``event``; with a platform sink (:mod:`.platform_events`) its mirror commits in the same transaction.
+    The activity log (:mod:`.activity`) gets one event for it."""
     sink = platform_events(store)
     if sink is None:
         store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
+        _activity(store, event)
         return event
     with store.transaction():
         store.put(AUDIT, f"{event.at.isoformat()}_{event.id}", event)
@@ -179,7 +182,28 @@ def record_audit(store: DocumentStore, event: ToolApprovalEvent) -> ToolApproval
             outcome="denied" if event.kind in REFUSALS else "success",
             details=audit_details(event),
         )
+    _activity(store, event)
     return event
+
+
+def _activity(store: DocumentStore, event: ToolApprovalEvent) -> None:
+    """The activity event of an audit event: ids, the tool, the result; never the arguments or their hash."""
+    target_type, target_id = audit_target(event)
+    if event.tool and target_type == "run":
+        target_type, target_id = "tool", event.tool
+    activity.add(
+        store,
+        "tool_approval",
+        f"tool_approval.{event.kind}",
+        at=event.at,
+        actor=event.actor,
+        resource_type=target_type,
+        resource_id=target_id,
+        outcome="denied" if event.kind in REFUSALS else "success",
+        code=event.outcome,
+        run_id=event.run_id,
+        source_event=event.id,
+    )
 
 
 #: Audit kinds of a refused action (mirrored with the outcome ``denied``).

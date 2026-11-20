@@ -15,7 +15,7 @@ package; the runtime itself depends on neither.
 | Area | Modules |
 | --- | --- |
 | Workflow model | `schemas`, `graph`, `conditions`, `forms`, `catalog`, `versions`, `release` |
-| Execution | `engine` (DAG, parallel branches, live events, budget, cancellation), `launcher`, `preflight`, `resume`, `run_views`, `run_budget` (budget decisions), `usage_log`, `traces`, `error_codes` (catalog of problem codes) |
+| Execution | `engine` (DAG, parallel branches, live events, budget, cancellation), `launcher`, `preflight`, `resume`, `run_views`, `run_budget` (budget decisions), `usage_log`, `traces`, `error_codes` (catalog of problem codes), `activity` (one activity log of file, tool, workflow and agent actions; see [docs/activity-log.md](docs/activity-log.md)) |
 | Orchestration and run chat | `orchestrator` (an orchestrator node that picks teams at run time), `flow_driver`, `run_chat` (live chat with a running workflow) |
 | Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities), `bedrock` (Amazon Bedrock), `model_profile`, `reasoning`, `output_limits`, `pricing`, `pricing_sync`, `cost_tracking`, `reconciliation` (estimates against bills) |
 | Local models | `local_models` (catalog, task- and hardware-aware recommendations), `local_service` (the Ollama server per profile, model jobs); see [docs/local-models.md](docs/local-models.md) |

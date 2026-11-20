@@ -28,7 +28,7 @@ always has the package.
 | `NODESTRO_AXENTRA_ALLOW_SUPERUSER` | `0` | `1` lets Axentra run on a superuser, `BYPASSRLS` or table-owning role (development only). Its row-level security is then no defense in depth. Refused otherwise in every environment: see [Database roles](#database-roles) |
 | `NODESTRO_DATABASE_MIGRATION_URL` / `_FILE` | – | The owner role's connection: `migrate`, the backup and `db grant-runtime-role` use it; `NODESTRO_DATABASE_URL` is then the runtime role. Without it every command uses `NODESTRO_DATABASE_URL` (one role, as before) |
 | `NODESTRO_SECRETS_FORMAT` | `v1` | `axs1`: new tenant secrets are written with the Axentra keyring (rotation). Needs `on` |
-| `NODESTRO_AXENTRA_AUDIT` | `0` | `1`: mirror the approval audit trail and MCP events into Axentra's audit log. Needs `on` |
+| `NODESTRO_AXENTRA_AUDIT` | `0` | `1`: mirror the approval audit trail, MCP events and the activity log into Axentra's audit log. Needs `on` |
 | `NODESTRO_AXENTRA_USAGE` | `0` | `1`: mirror the AI usage ledger into Axentra meters `nodestro.ai.*`. Needs `on` |
 | `NODESTRO_AXENTRA_RUN_USAGE` | `0` | `1`: also settle the usage of finished workflow runs into the same meters, once per run; see [Usage](#usage-end-state-and-run-usage). Needs `NODESTRO_AXENTRA_USAGE=1` |
 | `NODESTRO_AXENTRA_NOTIFY` | `0` | `1`: in-app inbox notifications (failed run, pending tool approval, budget decision) through Axentra's notify module; never e-mail. Needs `on`; see [Notifications](#notifications) |
@@ -363,6 +363,10 @@ are written exactly as before, and the usage dashboard reads them. The mirrors a
   system actor with the Nodestro actor id in `actor_display`. Usage: the meters `nodestro.ai.requests`,
   `nodestro.ai.input_tokens`, `nodestro.ai.output_tokens` and `nodestro.ai.cost_usd` (monthly, sum). The cost is
   mirrored only when it is complete; an unknown or partial cost is never billed as the whole cost.
+- **Activity log** (N-13, [activity-log.md](activity-log.md)): the activity events of tool calls, agent steps, runs
+  and files (`nodestro.tool.called`, `nodestro.agent.finished`, `nodestro.workflow.started` / `.finished`,
+  `nodestro.file.uploaded` / `.deleted`), with ids, outcome and code; reconciled like the other audit events. The
+  activity events of approval, MCP and connection events are not mirrored a second time.
 - **Workflow runs** are mirrored only with `NODESTRO_AXENTRA_RUN_USAGE=1` (see
   [Usage](#usage-end-state-and-run-usage)); otherwise their usage stays in the stored runs only. No limit is
   enforced from Axentra (`enforce=False`).

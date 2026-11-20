@@ -75,7 +75,17 @@ from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
 
-from . import contracts, flow_driver, graph, run_budget, sandbox_cancel, tool_checkpoints, tool_journal, tool_policy
+from . import (
+    activity,
+    contracts,
+    flow_driver,
+    graph,
+    run_budget,
+    sandbox_cancel,
+    tool_checkpoints,
+    tool_journal,
+    tool_policy,
+)
 from .agent_builder import AgentBuilder, BuiltAgent, run_own_tool
 from .bedrock import redact_identity
 from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_problems
@@ -2238,6 +2248,7 @@ class RunManager:
         """Execute a run (also a sub-workflow's run) until it finished or waits for a person."""
         run = context.run
         run.status = "running"
+        first = run.started_at is None
         run.started_at = run.started_at or now()
         run.finished_at = None
         run.error = run.error_code = None
@@ -2246,6 +2257,10 @@ class RunManager:
         self._emit(context, "run_started", status=run.status)
         # Stored at once: other processes (the API of a server) read the run from the database, not this context.
         self._save(context)
+        if first:
+            self._activity(
+                context, "workflow", "workflow.started", resource_type="workflow", resource_id=run.workflow_id
+            )
         try:
             while True:
                 await self._run_graph(context)
@@ -2341,6 +2356,16 @@ class RunManager:
     def _finished(self, context: _RunContext, paused: bool) -> None:
         """What follows a stored end (or pause) of an execution: result files, listeners, the last event."""
         run = context.run
+        if not paused:
+            self._activity(
+                context,
+                "workflow",
+                "workflow.finished",
+                resource_type="workflow",
+                resource_id=run.workflow_id,
+                outcome=activity.outcome_of_status(run.status),
+                code=run.error_code or run.status,
+            )
         if not paused and self.after_run is not None:
             try:
                 self.after_run(run)
@@ -2378,6 +2403,11 @@ class RunManager:
                     )
         context = contextvars.copy_context()
         return await asyncio.get_running_loop().run_in_executor(executor, functools.partial(context.run, call, *args))
+
+    def _activity(self, context: _RunContext, source: activity.Source, action: str, **fields: Any) -> None:
+        """One activity event of the run (:mod:`nodestro_runtime.activity`); its actor is whoever started the
+        top-level run. Never fails the run."""
+        activity.add(self.store, source, action, actor=_run_actor(context.root.run), run_id=context.run.id, **fields)
 
     def _forget_events(self, run_id: str) -> None:
         """Drop the event history of a run that finished: streams only replay events of live runs."""
@@ -2883,6 +2913,19 @@ class RunManager:
             self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming, budget_wait
         )
         self._save(context)
+        # A paused step is logged when it ends; a step of a run another process took over (C-06), by that process.
+        if state.status not in WAITING_NODE_STATUSES and not context.root.fenced_out:
+            self._activity(
+                context,
+                "agent",
+                "agent.finished",
+                agent=config.name,
+                resource_type="node",
+                resource_id=node.id,
+                node_id=node.id,
+                outcome=activity.outcome_of_status(state.status),
+                code=state.error_code or state.status,
+            )
         if state.tool_calls and not context.root.fenced_out:
             # The call records are stored with the node now; the notes written before each call are not needed.
             # A run another process took over (C-06) was not stored here: its notes stay for that process.
@@ -4249,6 +4292,8 @@ class RunManager:
         node_id = node.id
         calls: dict[str, ToolCallRecord] = {}
         released: dict[str, ToolApprovalRequest] = {}
+        #: The problem code of each call the gate refused, for its activity event.
+        denied: dict[str, str | None] = {}
         gate = self.tool_gate
         # A judge refines whole answers, which a checkpoint cannot hold: such agents keep waiting in the thread.
         checkpointing = (
@@ -4331,6 +4376,8 @@ class RunManager:
                 # Stored before the call runs: if the process dies now, the run still shows that this node may
                 # have had effects outside Nodestro, and continuing it asks first (audit B-02).
                 tool_journal.record(self.store, context.run.id, node_id, iteration, call.id, call.name, call.input)
+            if denial is not None:
+                denied[call.id] = _denial_code(record)
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
             # Each reason above is a fixed runtime text; the model reads the same words as before (W0-3, L-4).
             return (
@@ -4346,6 +4393,20 @@ class RunManager:
                 record.output = content[:20_000]
                 record.is_error = is_error
                 record.finished_at = now()
+            # One activity event per call: its tool and result, never its arguments or output.
+            refused = call.id in denied
+            refused_code = denied.pop(call.id, None)
+            self._activity(
+                context,
+                "tool_call",
+                "tool.called",
+                agent=config.name,
+                resource_type="tool",
+                resource_id=call.name,
+                node_id=node_id,
+                outcome="denied" if refused else "failure" if is_error else "success",
+                code=refused_code,
+            )
             self._emit(
                 context, "tool_finished", node_id, id=call.id, name=call.name, output=content[:4000], is_error=is_error
             )
@@ -5048,6 +5109,13 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
     target.error = found.message
     target.error_code = found.code
     target.error_params = found.params
+
+
+def _run_actor(run: Run) -> str:
+    """Who a run acts for in the activity log: who started it, else the API key that did, else ``system``."""
+    if run.started_by:
+        return run.started_by
+    return f"api:{run.api_key_id}" if run.api_key_id else "system"
 
 
 def _is_paused(run: Run) -> bool:
