@@ -529,7 +529,9 @@ def test_installed_integrations_that_do_not_fit_are_left_out(tmp_path: Path, mon
     monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda: found)
     with Workspace(tmp_path / "data") as workspace:
         assert workspace.extensions.integrations == [good]
-        assert "echo_good" in workspace.tools.builtin
+        # Installed tools are locked (Phase 0R S1, E-0R-2 A): foreign code runs only in the Docker sandbox.
+        assert "echo_good" not in workspace.tools.builtin
+        assert workspace.extensions.locked == {"echo_good": "off"}
     # Integrations passed explicitly must fit.
     with pytest.raises(ExtensionError):
         Extensions(found)

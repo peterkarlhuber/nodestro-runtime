@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 6 |
+| P2 Medium | 7 |
 | P3 Low | 30 |
 | P4 Optional | 14 |
 
@@ -54,6 +54,16 @@ None known.
 - **Next step:** Included in the D1 brief P-Web (nodestro-studio `docs/security/nal/p-web.md`, ST-064), together
   with `web_tools.py` and the MCP guard on `orkexa.net.guard`. The brief is prepared, not commissioned (the owner
   decides). Fix findings before NAL-A2 is activated broadly; `NODESTRO_WEB_TOOLS_SERVER` stays off until then.
+
+### RT-083 · Extension tools in the Docker sandbox (N-22)
+
+- **Priority:** P2 Medium · **Status:** Open (Locria plan, phase N-B) · **Refs:** `extensions.py`
+  (`EXTENSION_TOOLS_ENV`, `Extensions.locked`), Locria Phase 0R findings S1 to S3, owner decision E-0R-2 A (2026-11-20)
+- **What:** tools of installed integrations are locked since W0-2 (no host-process fallback); their stated capability
+  counts as unknown. Open: the execution path through `DockerSandbox` (JSON over stdin and stdout, no network without a
+  grant, the time limit stops the container), showing locked tools in the studio, and the release per tool class only
+  after the evidence and an independent review (gate G-6). Until then `NODESTRO_EXTENSION_TOOLS=1` unlocks nothing.
+- **Next step:** with N-22 in phase N-B; nothing to do before.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)
 
