@@ -3227,7 +3227,7 @@ class RunManager:
             node_id=node_id,
             trigger=root.trigger,
             trigger_ref=root.trigger_ref,
-            agent=_agent_ref(context.run.workflow_id, node_id),
+            agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
             conversation_id=root.id,
         )
         verdict = tool_policy.decide(
@@ -3238,10 +3238,21 @@ class RunManager:
             context=situation,
             at=now(),
             version=version,
+            definition_hash=definition,
         )
         shown = capability.model_dump()
         if verdict.action == "allow":
-            record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            record.approval = ToolCallApproval(
+                status="allowed",
+                pre_grant_id=verdict.pre_grant_id,
+                capability=shown,
+                access_source=verdict.access_source,
+            )
+            if verdict.access_source is not None:
+                # N-06: the person sees which grant allowed the call (the agent does not).
+                self._emit(
+                    context, "tool_access_granted", node_id, id=call.id, name=call.name, source=verdict.access_source
+                )
             bind_call(CallBinding(tool=call.name, capability=capability, definition_hash=definition))
             return None
         if verdict.action == "deny":
@@ -3349,6 +3360,36 @@ class RunManager:
                     "tool.approval_stale",
                     "The tool changed while this call waited for its approval, so it was not made",
                     shown,
+                )
+            # N-06 (spec 7.3 (7)): a deny or a safety limit that appeared while the call waited still refuses it; an
+            # approval of the one call never lifts them.
+            root = context.root.run
+            refused, _found = tool_policy.access_refusal(
+                call.name,
+                capability,
+                gate.call_context(
+                    run_id=run_id,
+                    node_id=node_id,
+                    trigger=root.trigger,
+                    trigger_ref=root.trigger_ref,
+                    agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
+                    conversation_id=root.id,
+                ),
+                at=now(),
+                version=_version,
+                definition_hash=definition,
+            )
+            if refused is not None:
+                gate.approvals.audit("stale", final, outcome=refused.code)
+                return self._deny_call(
+                    context,
+                    node_id,
+                    call,
+                    record,
+                    refused.code or "access.denied",
+                    refused.reason or "",
+                    shown,
+                    source=refused.access_source,
                 )
             # The call runs as approved, and only so: an MCP tool checks this again right before it sends the call.
             bind_call(CallBinding(tool=call.name, capability=final.capability, definition_hash=definition))
@@ -3501,7 +3542,7 @@ class RunManager:
             node_id=node_id,
             trigger=root.trigger,
             trigger_ref=root.trigger_ref,
-            agent=_agent_ref(context.run.workflow_id, node_id),
+            agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
             conversation_id=root.id,
         )
         verdict = tool_policy.decide(
@@ -3512,6 +3553,7 @@ class RunManager:
             context=situation,
             at=now(),
             version=version,
+            definition_hash=definition,
         )
         if verdict.action == "deny":
             if approvals.use(found, "stale") is not None:
@@ -3723,7 +3765,7 @@ class RunManager:
     ) -> str:
         """Refuse a call: the agent gets ``reason``; the person's event also names the deny or safety limit
         (``source``, N-06), which never reaches the agent."""
-        record.approval = ToolCallApproval(status="denied", code=code, capability=shown)
+        record.approval = ToolCallApproval(status="denied", code=code, capability=shown, access_source=source)
         extra = {} if source is None else {"source": source}
         self._emit(context, "tool_denied", node_id, id=call.id, name=call.name, code=code, reason=reason, **extra)
         return reason
@@ -5043,11 +5085,6 @@ def _decision_code(final: ToolApprovalRequest) -> str | None:
     if final.status == "expired" and final.closed_because == RECLASSIFIED:
         return "tool.approval_stale"
     return {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
-
-
-def _agent_ref(workflow_id: str, node_id: str) -> str:
-    """How grants and denies of the access model v2 (N-06) name an agent node: ``<workflow id>/<node id>``."""
-    return f"{workflow_id}/{node_id}"
 
 
 def _current_hash(tools: Any, call: ToolCall) -> str:

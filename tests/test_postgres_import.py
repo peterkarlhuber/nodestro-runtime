@@ -50,6 +50,8 @@ def desktop(tmp_path: Path) -> Path:
             },
         )
         workspace.store.put_raw("tool_provenance", "my_tool", {"name": "my_tool", "versions": [1]})
+        workspace.store.put_raw("access_grants", "agr_1", {"id": "agr_1"})
+        workspace.store.put_raw("access_denies", "adn_1", {"id": "adn_1"})
         workspace.knowledge.add("Die Haftung ist begrenzt. Café".encode(), name="vertrag.md")
         workspace.knowledge.add(b"\x89PNG\r\n\x1a\nimage", name="bild.png")
         workspace.memory.open("Team").write("/memories/notes/a.md", "Peter mag Tee")
@@ -63,7 +65,8 @@ def desktop(tmp_path: Path) -> Path:
 def test_a_desktop_database_moves_into_an_empty_tenant(desktop: Path, server: PostgresDatabase) -> None:
     report = import_desktop_database(desktop, server, "acme")
     assert report.files == 2 and report.memory_files == 1 and report.chunks >= 1
-    assert report.skipped == {"tool_provenance": 1}
+    assert report.skipped == {"tool_provenance": 1, "access_grants": 1, "access_denies": 1}
+    assert any(item.startswith("access_grants") for item in report.not_imported)
     assert any(item.startswith("tools/") for item in report.not_imported)
     assert any(item.startswith("tool_provenance") for item in report.not_imported)
 
@@ -77,6 +80,8 @@ def test_a_desktop_database_moves_into_an_empty_tenant(desktop: Path, server: Po
     }
     assert "provider keys (anthropic, openai): enter them again in the server's settings" in report.not_imported
     assert store.get_raw("tool_provenance", "my_tool") is None  # imported tools are untrusted
+    # Grants and denies never move into another trust domain (N-06).
+    assert store.get_raw("access_grants", "agr_1") is None and store.get_raw("access_denies", "adn_1") is None
 
     knowledge = KnowledgeBase(knowledge_tables(server, "acme"))
     assert sorted(item.name for item in knowledge.files()) == ["bild.png", "vertrag.md"]

@@ -24,9 +24,16 @@ record, key = record id). On PostgreSQL they are rows of `nodestro_documents` wi
 | `scope`, `agents` | `agent` (one), `agents` (a list) or `all` | same |
 | `duration` | `once`, `conversation` (with `conversation_id`), `until` (with `expires_at`), `until_revoked` | `until`, `until_revoked` |
 | `mode` | `supervised` (a person watches) or `unattended` (also covers background calls) | `supervised`, `unattended` or none (both) |
+| `tool` | for a tool grant: the tool as it was granted (`ToolFacts`: version, `access`, `reach`, MCP definition hash) | none (a deny holds for every version) |
+| `status` | `active`, `used` (a `once` grant after its use) or `revoked` | `active` or `revoked` |
 | who, when | `granted_by`, `created_at`, `revoked_at`, `revoked_by` | `denied_by`, same |
 
-A `once` grant has `status` `active` until `AccessRules.use` marks it `used` (one compare-and-set).
+All times carry a time zone. Using a `once` grant (`AccessRules.use`) and revoking any record are each one
+compare-and-set of `status` from `active`. So exactly one of them wins, a revoked or expired grant is never used, and
+a revocation is never lost.
+
+Desktop-to-server imports (`postgres_import`) skip both collections: grants never move silently into another trust
+domain.
 
 **Only a person writes records.** `AccessRules.grant`, `deny`, `revoke_grant` and `revoke_deny` take a `Person`.
 `Person` refuses machine principals (`system`, API keys `api:<id>`, anything with a `:`). The writer also refuses to
@@ -40,7 +47,11 @@ The writer also refuses:
 | `access.person_required` | The principal is not a `Person` |
 | `access.in_tool_call` | Called while a tool call runs |
 | `access.grant_destructive` | A grant for `delete`: deleting for good needs a confirmation every time |
-| `access.expiry` | `until` without `expires_at`, an expiry with another duration, or an expiry in the past |
+| `access.tool_facts_required` | A tool grant without `tool` (`ToolFacts.of(capability, version=..., definition_hash=...)`), or `tool` on another resource |
+| `access.unattended_scope` | An unattended grant for more than `read` for all agents: it must name its agents |
+| `access.unattended_too_long` | An unattended grant for more than `read` that lasts longer than `MAX_UNATTENDED_GRANT` (30 days; param `days`) |
+| `access.deny_not_enforced` | A deny on one of the run's own tools (`RUN_OWN_TOOLS`), which never pass the gate (param `tool`) |
+| `access.expiry` | `until` without `expires_at`, an expiry with another duration, an expiry in the past or without a time zone |
 | `access.conversation_required` | `conversation` without `conversation_id`, or a conversation id with another duration |
 | `access.unattended_expiry` | An unattended grant for more than `read` that is not `until` or `once` |
 | `access.folder_path` | A folder that is not an absolute path |
@@ -59,9 +70,13 @@ never name a folder path.
 1. **Safety limit** (`SAFETY_LIMITS`):
    - `offline`: an external effect or a cloud provider while strict offline is on.
    - `destructive_unattended`: a destructive action with nobody watching.
-   - `protected_folder`: a folder in `SYSTEM_FOLDERS` or in the caller's `protected_folders` (Nodestro's own data
-     folder).
-   - `unresolvable_path`: a folder that is not absolute.
+   - `protected_folder`: a folder in `system_folders()` or in the caller's `protected_folders` (Nodestro's own data
+     folder; required for every folder request).
+     - `system_folders()` is `SYSTEM_FOLDERS` plus the Windows folders the environment names (`SystemRoot`,
+       `windir`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`, `ProgramData`).
+     - An administrative share of any host (`\\host\C$`) counts as its drive here.
+   - `unresolvable_path`: a folder that cannot be compared by name: not absolute, leading or trailing white space, a
+     Windows device path (`\\.\`), an 8.3 short name (`PROGRA~1`) or a `:` in a component.
 2. **Deny**: an active deny that addresses the request.
 3. **Destructive actions**: no grant covers them. The result is a missing grant with source
    `limit:destructive_per_call`, so only a confirmation of the one call allows them.
@@ -79,8 +94,12 @@ Further rules:
 
 - **Revocation and expiry** are checked at every evaluation, so a change applies at the next access, also for a
   running background task.
-- **Unattended** requests need a grant with mode `unattended`. Beyond `read_internal`, that grant must also be dated
-  (`until`) or `once` (spec 7.2, D10).
+- **Unattended** requests need a grant with mode `unattended`. Beyond `read_internal`, that grant must also:
+  - be dated (`until`) or `once`,
+  - name its agents,
+  - last at most `MAX_UNATTENDED_GRANT` (spec 7.2, D10).
+- **Tool grants** match only the tool as it was granted. A new version, a reclassification or another MCP
+  definition ends them, as for a pre-grant.
 - **Scope**: a grant for some agents never matches an unknown agent. A deny for some agents does match an unknown
   agent (fail closed).
 - **Effect classes** are the two existing axes (`effect_class(access, reach)`):
@@ -105,10 +124,17 @@ Folders are compared by whole path components, never by string prefix: `/home/a/
 
 - Unicode NFC,
 - `.` and `..` resolved lexically,
-- repeated separators dropped,
-- Windows drive letters in lower case, both separators accepted.
+- repeated separators dropped.
 
-Denies and safety limits compare case-insensitively. Grants compare exactly. Both choices fail closed on
+The path is never trimmed: one with leading or trailing white space is refused.
+
+Windows paths (`C:\...`, UNC, `\\?\`) get more normalization:
+- both separators are accepted, and `\\?\C:\x` is `C:\x`;
+- trailing dots and spaces of a component are dropped, as Windows does;
+- every component is case-folded;
+- `\\localhost\C$` is drive `C:`.
+
+On POSIX, denies and safety limits compare case-insensitively and grants exactly. Both choices fail closed on
 case-insensitive file systems.
 
 This is a comparison of names, not a guard on the file system. Callers resolve links before they ask
@@ -122,14 +148,25 @@ passes them to `tool_policy.decide` through `CallContext.access`. A tool call is
 action `execute`, with the tool's effect class. The agent is named `<workflow id>/<node id>`, and the conversation is
 the root run.
 
-- A safety limit or a deny refuses the call first, with code `access.safety_limit` or `access.denied`. The agent gets
-  a short reason without the source. The run's `tool_denied` event carries `source` for the person.
-- A matching grant allows a call that S-2 would otherwise ask about, or refuse because nobody can answer
-  (`GateDecision.access_source`).
+- A safety limit or a deny refuses the call first, with code `access.safety_limit` or `access.denied`.
+  - The agent gets a short reason without the source.
+  - The call's `ToolCallApproval.access_source` and the run's `tool_denied` event carry the source for the person.
+- The same check runs again after a person approves a waiting call. A deny or limit set while it waited still
+  refuses it, and the approval is audited `stale` (spec 7.3 (7)).
+- A matching grant allows a call that S-2 would otherwise ask about, or refuse because nobody can answer.
+  - The grant is recorded on the call (`access_source`, `grant:<id>`) and in a `tool_access_granted` event.
+  - `access_source` is left out of stored records when unset, so records stay byte-identical while the switch is
+    off.
 - A grant never lifts these rules: an orchestrator's narrowing (`tool.not_granted`), an `always` binding, the MCP
   rules (a changing MCP call is always asked) and the question before a destructive tool.
 - A `once` grant does not count in the gate: one confirmed tool call is the S-2 approval itself.
 - Without a grant or deny, S-2 decides as before.
+- The warning before an unattended start (`tool_preflight`) evaluates the same rules for the named agent. It reports
+  `tool.unattended_access_denied` and `tool.unattended_safety_limit`.
+- An agent test never runs a tool on a grant: it keeps `tool.approval_not_in_test`, since a test agent has no
+  identity and its calls have real effects.
+- The run's own tools (`RUN_OWN_TOOLS`: memory, input files, knowledge proposals, skills) never pass the gate, so
+  denies on them are refused.
 
 ## Not in this step
 

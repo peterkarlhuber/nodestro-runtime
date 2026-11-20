@@ -44,6 +44,7 @@ from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
 from .tool_policy import (
+    MAX_UNATTENDED_GRANT,
     UNKNOWN,
     AccessAction,
     AccessContext,
@@ -57,6 +58,7 @@ from .tool_policy import (
     GrantDuration,
     PreGrantScope,
     ToolCapability,
+    ToolFacts,
     ToolPreGrant,
     folder_parts,
 )
@@ -720,6 +722,7 @@ class ToolGate:
         max_paused: int = DEFAULT_MAX_PAUSED,
         access: Callable[[], tuple[Sequence[Grant], Sequence[Deny]]] | None = None,
         offline: Callable[[], bool] = lambda: False,
+        protected_folders: Sequence[str] = (),
     ) -> None:
         self.approvals = approvals
         #: Pause the run at a call that waits (M6b) instead of waiting in the agent's thread.
@@ -735,6 +738,8 @@ class ToolGate:
         self.access = access
         #: The strict offline setting (a safety limit of the access model v2).
         self.offline = offline
+        #: Nodestro's own data folder: no folder grant opens it.
+        self.protected_folders = tuple(protected_folders)
 
     def call_context(
         self,
@@ -774,6 +779,7 @@ class ToolGate:
             agent=agent,
             conversation_id=conversation_id,
             offline=self.offline(),
+            protected_folders=self.protected_folders,
         )
 
 
@@ -887,6 +893,9 @@ class ToolPreGrants:
 GRANTS = "access_grants"
 DENIES = "access_denies"
 _Record = TypeVar("_Record", Grant, Deny)
+#: The run's own tools (agent memory, input files, knowledge proposals, skills): they never pass the per-call gate
+#: (:func:`~nodestro_runtime.agent_builder.run_own_tool`), so a deny on them is refused instead of silently ignored.
+RUN_OWN_TOOLS = frozenset({"memory", "input_files", "propose_knowledge", "load_skill", "read_skill_file"})
 #: Principals that are not a person: API keys (``api:<id>``) and the runtime itself.
 _NOT_PERSONS = frozenset({"system", "local-system"})
 
@@ -929,9 +938,16 @@ class AccessRules:
         mode: AccessMode = "supervised",
         expires_at: datetime | None = None,
         conversation_id: str | None = None,
+        tool: ToolFacts | None = None,
     ) -> Grant:
+        """Store a grant. A tool grant names the tool as it is now (``tool``, :meth:`ToolFacts.of`); it ends with a
+        new version, another classification or another MCP definition."""
         at = self._check_writer(by)
         _check_resource(resource)
+        if (resource.type == "tool") != (tool is not None):
+            raise NodestroError(
+                "access.tool_facts_required", "A tool grant names the tool's version and classification, and only it"
+            )
         if "delete" in actions:
             raise NodestroError(
                 "access.grant_destructive", "Deleting for good needs a confirmation each time; it cannot be granted"
@@ -941,12 +957,23 @@ class AccessRules:
             raise NodestroError(
                 "access.conversation_required", "A grant for one conversation names that conversation, and only it"
             )
-        if mode == "unattended" and set(actions) != {"read"} and duration not in ("until", "once"):
-            raise NodestroError(
-                "access.unattended_expiry",
-                "An unattended grant for more than reading needs an expiry date",
-                duration=duration,
-            )
+        if mode == "unattended" and set(actions) != {"read"}:
+            if duration not in ("until", "once"):
+                raise NodestroError(
+                    "access.unattended_expiry",
+                    "An unattended grant for more than reading needs an expiry date",
+                    duration=duration,
+                )
+            if scope == "all":
+                raise NodestroError(
+                    "access.unattended_scope", "An unattended grant for more than reading names its agents"
+                )
+            if expires_at is not None and expires_at - at > MAX_UNATTENDED_GRANT:
+                raise NodestroError(
+                    "access.unattended_too_long",
+                    "An unattended grant for more than reading lasts at most the maximum",
+                    days=MAX_UNATTENDED_GRANT.days,
+                )
         found = _build(
             Grant,
             id=new_id("agr"),
@@ -959,6 +986,7 @@ class AccessRules:
             expires_at=expires_at,
             conversation_id=conversation_id,
             created_at=at,
+            tool=tool,
             granted_by=by.id,
         )
         self.store.put(GRANTS, found.id, found)
@@ -979,6 +1007,11 @@ class AccessRules:
     ) -> Deny:
         at = self._check_writer(by)
         _check_resource(resource)
+        if resource.type == "tool" and resource.id in RUN_OWN_TOOLS:
+            # The run's own tools never pass the per-call gate, so such a deny would look effective and not be.
+            raise NodestroError(
+                "access.deny_not_enforced", "This tool belongs to the run and cannot be blocked", tool=resource.id
+            )
         _check_expiry(duration, expires_at, at)
         found = _build(
             Deny,
@@ -1004,9 +1037,11 @@ class AccessRules:
         return self._revoke(DENIES, Deny, deny_id, by=by, kind="access_deny_revoked")
 
     def use(self, grant_id: str) -> bool:
-        """Mark a ``once`` grant used (one compare-and-set): ``True`` for the one caller that may act on it."""
+        """Mark an active ``once`` grant used: ``True`` for the one caller that may act on it. One compare-and-set
+        from ``active``, like a revocation, so a revoked or expired grant is never used and a revocation is never
+        lost."""
         found = self.store.get(GRANTS, grant_id, Grant)
-        if found is None or found.duration != "once":
+        if found is None or found.duration != "once" or not found.active_at(self.clock()):
             return False
         used = found.model_copy(update={"status": "used"})
         return self.store.replace_if(GRANTS, grant_id, used, field="status", expected="active")
@@ -1039,10 +1074,11 @@ class AccessRules:
         found = self.store.get(collection, record_id, model)
         if found is None:
             raise NodestroError("access.not_found", "There is no such grant or deny", id=record_id)
-        if found.revoked_at is not None:
-            return found
-        revoked = found.model_copy(update={"revoked_at": at, "revoked_by": by.id})
-        self.store.put(collection, record_id, revoked)
+        if found.status != "active":
+            return found  # revoked already, or a once grant used before
+        revoked = found.model_copy(update={"status": "revoked", "revoked_at": at, "revoked_by": by.id})
+        if not self.store.replace_if(collection, record_id, revoked, field="status", expected="active"):
+            return self.store.get(collection, record_id, model) or found  # used or revoked in the meantime
         self._audit(kind, revoked, by=by.id, at=at)
         return revoked
 
@@ -1073,6 +1109,8 @@ def _check_resource(resource: AccessResource) -> None:
 
 
 def _check_expiry(duration: str, expires_at: datetime | None, at: datetime) -> None:
+    if expires_at is not None and expires_at.tzinfo is None:
+        raise NodestroError("access.expiry", "An expiry date needs a time zone")
     if (duration == "until") != (expires_at is not None):
         raise NodestroError("access.expiry", "An expiry date belongs to the duration until a date, and only to it")
     if expires_at is not None and expires_at <= at:
@@ -1105,6 +1143,7 @@ __all__ = [
     "MAX_WAIT",
     "PRE_GRANTS",
     "REFUSALS",
+    "RUN_OWN_TOOLS",
     "SWITCH_OFF",
     "AccessRules",
     "ApprovalStatus",

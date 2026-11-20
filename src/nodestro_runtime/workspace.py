@@ -505,6 +505,7 @@ class Workspace:
                 # N-06: the access model v2 (a third switch, default off; activation needs gate G-2).
                 access=AccessRules(self.store).current if access_grants_enabled() else None,
                 offline=self.strict_offline,
+                protected_folders=(str(self.data_dir.resolve()),),
             )
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True

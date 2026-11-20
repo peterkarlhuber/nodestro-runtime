@@ -36,6 +36,7 @@ from nodestro_runtime.tool_policy import (
     Grant,
     ToolBinding,
     ToolCapability,
+    ToolFacts,
     ToolPreGrant,
     decide,
 )
@@ -44,6 +45,8 @@ from nodestro_runtime.workspace import Workspace
 AT = now()
 ALICE = Person("usr_alice")
 TOOL = "celsius_to_fahrenheit"
+#: ``tool_x`` as the grants of these tests were given for it: no version, write + external.
+WRITE_EXTERNAL = ToolFacts(access="write", reach="external")
 
 
 def cap(access: Any, reach: Any = "internal") -> ToolCapability:
@@ -69,6 +72,7 @@ def tool_grant(name: str = "tool_x", **extra: Any) -> Grant:
         "duration": "until_revoked",
         "created_at": AT - timedelta(days=1),
         "granted_by": "usr_alice",
+        "tool": WRITE_EXTERNAL,
     }
     return Grant(**{**values, **extra})
 
@@ -87,32 +91,119 @@ def tool_deny(name: str = "tool_x", **extra: Any) -> Deny:
 # ---- off: the S-2 rules exactly as before ---------------------------------------------------------------------------
 
 
-def test_without_the_access_model_decide_is_the_s2_rule_for_every_combination() -> None:
-    """Regression: ``ToolBinding`` and ``ToolPreGrant`` behave unchanged while the switch is off (``access=None``)."""
-    pre = ToolPreGrant(
-        id="tpg_1", tool="tool_x", version=1, scope="schedule", scope_id="sch_1", granted_by="usr_1", granted_at=AT
+def _decide_a05eef4(
+    *,
+    tool: str,
+    kind: str,
+    capability: ToolCapability,
+    binding: ToolBinding | None,
+    context: CallContext,
+    at: Any,
+    version: int | None = None,
+) -> tool_policy.GateDecision:
+    """``tool_policy.decide`` as it was on master before N-06 (a05eef4), copied verbatim as the reference."""
+    if context.grants is not None and tool not in context.grants:
+        scope = context.grant_scope or "orchestrator"
+        return tool_policy._deny("tool.not_granted", f"The tool {tool} was not granted to this agent (by {scope})")
+    if kind == "mcp" and not context.attended and not (context.mcp_unattended and capability.reads_only):
+        return tool_policy._deny(
+            "tool.approval_unattended", f"The MCP tool {tool} cannot run without a person watching"
+        )
+    if kind == "mcp" and not capability.reads_only:
+        return tool_policy.ASK
+    if not tool_policy.wants_question(capability, binding, version=version):
+        return tool_policy.ALLOW
+    if context.attended:
+        return tool_policy.ASK
+    if kind != "mcp" and capability.access != "destructive":
+        grant = tool_policy.matching_pre_grant(
+            context.pre_grants, tool=tool, version=version, scope=context.scope, at=at
+        )
+        if grant is not None:
+            return tool_policy.GateDecision(action="allow", pre_grant_id=grant.id)
+    return tool_policy._deny(
+        "tool.approval_unattended",
+        f"The tool {tool} needs a person's approval for each call, and nobody can answer in this run",
     )
+
+
+def test_without_the_access_model_decide_is_the_s2_rule_for_every_combination() -> None:
+    """Regression (L-7): while the switch is off (``access=None``), ``decide`` gives exactly what it gave on master
+    before N-06 for every combination of capability, binding (``ToolBinding``), kind, attended, orchestrator narrowing,
+    MCP setting and pre-grant (``ToolPreGrant``: matching, other version, revoked, expired)."""
+    pre_grants = [
+        ToolPreGrant(
+            id="tpg_1", tool="tool_x", version=1, scope="schedule", scope_id="sch_1", granted_by="u", granted_at=AT
+        ),
+        ToolPreGrant(
+            id="tpg_2", tool="tool_x", version=2, scope="schedule", scope_id="sch_1", granted_by="u", granted_at=AT
+        ),
+        ToolPreGrant(
+            id="tpg_3",
+            tool="tool_x",
+            version=1,
+            scope="schedule",
+            scope_id="sch_1",
+            granted_by="u",
+            granted_at=AT,
+            revoked_at=AT - timedelta(seconds=1),
+        ),
+        ToolPreGrant(
+            id="tpg_4",
+            tool="tool_x",
+            version=1,
+            scope="schedule",
+            scope_id="sch_1",
+            granted_by="u",
+            granted_at=AT,
+            expires_at=AT,
+        ),
+    ]
     bindings = [
         None,
         ToolBinding(ask="always"),
         ToolBinding(ask="never"),
         ToolBinding(ask="never", reason="Writes only into the run's own notes"),
         ToolBinding(ask="never", legacy=True, bound_version=1),
+        ToolBinding(ask="never", legacy=True, bound_version=2),
     ]
     capabilities = [cap(a, r) for a, r in itertools.product(["read", "write", "destructive"], ["internal", "external"])]
     seen = set()
-    for capability, binding, kind, attended, grants in itertools.product(
-        capabilities, bindings, ["custom", "mcp", "builtin"], [True, False], [None, frozenset({"other"})]
+    for capability, binding, kind, attended, grants, mcp, pre, version in itertools.product(
+        capabilities,
+        bindings,
+        ["custom", "mcp", "builtin", "generated"],
+        [True, False],
+        [None, frozenset({"other"}), frozenset({"tool_x"})],
+        [False, True],
+        [(), *((item,) for item in pre_grants)],
+        [1, None],
     ):
-        situation = context(attended=attended, grants=grants, scope=("schedule", "sch_1"), pre_grants=(pre,))
+        situation = context(
+            attended=attended, grants=grants, scope=("schedule", "sch_1"), pre_grants=pre, mcp_unattended=mcp
+        )
         arguments = {"tool": "tool_x", "kind": kind, "capability": capability, "binding": binding, "at": AT}
-        verdict = decide(context=situation, version=1, **arguments)
-        assert verdict == tool_policy._decide_binding(context=situation, version=1, **arguments)
+        verdict = decide(context=situation, version=version, **arguments)
+        assert verdict == _decide_a05eef4(context=situation, version=version, **arguments)
         assert verdict.access_source is None
         seen.add((verdict.action, verdict.code, verdict.pre_grant_id))
     # The matrix reaches every S-2 outcome, including the pre-grant.
     assert {action for action, _, _ in seen} == {"allow", "ask", "deny"}
     assert ("allow", None, "tpg_1") in seen and ("deny", "tool.not_granted", None) in seen
+
+
+def test_a_tool_call_record_is_byte_identical_while_the_access_model_is_off() -> None:
+    """L-1/L-7: the new ``access_source`` is left out of the stored record when unset."""
+    from nodestro_runtime.schemas import ToolCallApproval
+
+    plain = ToolCallApproval(status="allowed", pre_grant_id="tpg_1", capability={"access": "read"})
+    assert "access_source" not in plain.model_dump_json() and "access_source" not in plain.model_dump()
+    assert plain.model_dump_json() == (
+        '{"status":"allowed","request_id":null,"code":null,"deadline":null,"decided_by":null,"decided_at":null,'
+        '"comment":null,"pre_grant_id":"tpg_1","capability":{"access":"read"}}'
+    )
+    granted = plain.model_copy(update={"access_source": "grant:agr_1"})
+    assert ToolCallApproval.model_validate_json(granted.model_dump_json()).access_source == "grant:agr_1"
 
 
 def test_the_switch_is_off_by_default_and_needs_the_approvals(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,22 +302,36 @@ def test_a_grant_replaces_the_question_but_never_the_narrower_rules() -> None:
 
 def test_an_unattended_call_needs_an_unattended_dated_grant() -> None:
     write = cap("write")
-    standing = AccessContext(grants=(tool_grant(mode="unattended"),))
-    dated = AccessContext(grants=(tool_grant(mode="unattended", duration="until", expires_at=AT + timedelta(hours=1)),))
-    expired = AccessContext(
-        grants=(tool_grant(mode="unattended", duration="until", expires_at=AT - timedelta(hours=1)),)
-    )
-    supervised = AccessContext(grants=(tool_grant(),))
-    for access, action in ((standing, "deny"), (dated, "allow"), (expired, "deny"), (supervised, "deny")):
+    narrow = {"tool": ToolFacts(access="write", reach="internal"), "scope": "agent", "agents": ("wf_1/a",)}
+
+    def access(**extra: Any) -> AccessContext:
+        return AccessContext(grants=(tool_grant(**{**narrow, **extra}),), agent="wf_1/a")
+
+    hour = AT + timedelta(hours=1)
+    standing = access(mode="unattended")
+    dated = access(mode="unattended", duration="until", expires_at=hour)
+    expired = access(mode="unattended", duration="until", expires_at=AT - timedelta(hours=1))
+    supervised = access()
+    for_all = access(mode="unattended", duration="until", expires_at=hour, scope="all", agents=())
+    too_long = access(mode="unattended", duration="until", expires_at=AT + timedelta(days=365 * 200))
+    cases = [
+        (standing, "deny"),
+        (dated, "allow"),
+        (expired, "deny"),
+        (supervised, "deny"),
+        (for_all, "deny"),
+        (too_long, "deny"),
+    ]
+    for access_context, action in cases:
         found = decide(
             tool="tool_x",
             kind="custom",
             capability=write,
             binding=None,
-            context=context(attended=False, access=access),
+            context=context(attended=False, access=access_context),
             at=AT,
         )
-        assert found.action == action, access
+        assert found.action == action, access_context
         assert found.code in (None, "tool.approval_unattended")
 
 
@@ -241,7 +346,9 @@ def test_no_tool_and_no_model_path_can_write_grants() -> None:
     found = sorted(
         str(path.relative_to(package)) for path in package.rglob("*.py") if writers.search(path.read_text("utf-8"))
     )
-    assert found == ["tool_approvals.py", "workspace.py"]
+    assert found == ["postgres_import.py", "tool_approvals.py", "workspace.py"]
+    imports = (package / "postgres_import.py").read_text("utf-8")
+    assert re.search(r'SKIPPED_COLLECTIONS = frozenset\(\{[^}]*"access_grants", "access_denies"\}\)', imports)
     workspace_source = (package / "workspace.py").read_text("utf-8")
     assert re.findall(r"AccessRules\([^)]*\)\.(\w+)", workspace_source) == ["current"]  # reads, never writes
 
@@ -259,7 +366,10 @@ def workspace(tmp_path: Path) -> Iterator[Workspace]:
     assert result.ok
     rules = AccessRules(opened.store)
     opened.runs.tool_gate = ToolGate(
-        ToolApprovals(opened.store), pre_grants=ToolPreGrants(opened.store).of_scope, access=rules.current
+        ToolApprovals(opened.store, poll_seconds=0.02),
+        pre_grants=ToolPreGrants(opened.store).of_scope,
+        access=rules.current,
+        protected_folders=(str(opened.data_dir),),
     )
     opened.fake = fake  # type: ignore[attr-defined]
     yield opened
@@ -290,8 +400,10 @@ async def test_grants_and_denies_apply_to_a_running_schedule_at_the_next_call(wo
 
     missing = await approval()
     assert (missing.status, missing.code) == ("denied", "tool.approval_unattended")
+    info = workspace.tools.get(TOOL)
     granted = rules.grant(
         resource=resource,
+        tool=ToolFacts.of(info.capability, version=info.version),
         actions=["execute"],
         duration="until",
         expires_at=now() + timedelta(hours=1),
@@ -312,3 +424,114 @@ async def test_grants_and_denies_apply_to_a_running_schedule_at_the_next_call(wo
     assert (revoked.status, revoked.code) == ("denied", "tool.approval_unattended")
     sent = json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
     assert blocked.id not in sent and granted.id not in sent and "deny:" not in sent
+
+
+def _flow(workspace: Workspace) -> Any:
+    return workspace.save_workflow(
+        WorkflowIn.model_validate(
+            {
+                "name": "Attended",
+                "nodes": [
+                    {"id": "start", "type": "start"},
+                    {"id": "a", "type": "agent", "agent": {"system_prompt": "AGENT", "tools": [TOOL]}},
+                ],
+                "edges": [{"id": "e", "source": "start", "target": "a"}],
+            }
+        )
+    )
+
+
+def _facts(workspace: Workspace) -> ToolFacts:
+    info = workspace.tools.get(TOOL)
+    return ToolFacts.of(info.capability, version=info.version)
+
+
+async def test_a_deny_set_while_a_call_waits_refuses_it_after_the_approval(workspace: Workspace) -> None:
+    """H-2 (spec 7.3 (7), 7.5): a person approves a waiting call, but a deny appeared meanwhile: the call is not made,
+    the approval is audited as stale and the person sees the deny as the source."""
+    import asyncio
+
+    from nodestro_runtime.tool_approvals import audit_events
+
+    started = await workspace.run(_flow(workspace), RunIn(input="x"))
+    approvals = ToolApprovals(workspace.store)
+    for _ in range(500):
+        waiting = approvals.pending(started.id)
+        if waiting:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("no approval request")
+    blocked = AccessRules(workspace.store).deny(
+        resource=AccessResource(type="tool", id=TOOL), actions=["execute"], by=ALICE
+    )
+    approvals.decide(started.id, waiting[0].id, approved=True, by="usr_1", arguments=waiting[0].arguments_hash)
+    done = await workspace.wait(started.id, timeout=20)
+    call = done.nodes["a"].tool_calls[0]
+    assert call.approval is not None
+    assert (call.approval.status, call.approval.code) == ("denied", "access.denied")
+    assert call.approval.access_source == f"deny:{blocked.id}"
+    assert "212" not in (call.output or "")  # the tool did not run
+    stale = [event for event in audit_events(workspace.store) if event.kind == "stale"]
+    assert [event.outcome for event in stale] == ["access.denied"]
+    assert blocked.id not in json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
+
+
+async def test_a_call_allowed_by_a_grant_records_the_grant(workspace: Workspace) -> None:
+    """L-1: the person sees which grant allowed a call, on the call and in the run's events."""
+    granted = AccessRules(workspace.store).grant(
+        resource=AccessResource(type="tool", id=TOOL),
+        tool=_facts(workspace),
+        actions=["execute"],
+        duration="until_revoked",
+        by=ALICE,
+    )
+    started = await workspace.run(_flow(workspace), RunIn(input="x"))
+    done = await workspace.wait(started.id, timeout=20)
+    call = done.nodes["a"].tool_calls[0]
+    assert call.approval is not None and call.approval.status == "allowed"
+    assert call.approval.access_source == f"grant:{granted.id}" and call.approval.pre_grant_id is None
+    assert granted.id not in json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
+
+
+def test_an_agent_test_never_runs_a_tool_on_a_grant(workspace: Workspace) -> None:
+    """L-4: a grant for all agents does not stand in for a person in an agent test (its calls have real effects)."""
+    from nodestro_runtime.agent_test import AgentTestIn
+    from nodestro_runtime.schemas import AgentConfig
+
+    AccessRules(workspace.store).grant(
+        resource=AccessResource(type="tool", id=TOOL),
+        tool=_facts(workspace),
+        actions=["execute"],
+        duration="until_revoked",
+        by=ALICE,
+    )
+    agent = AgentConfig(name="A", system_prompt="AGENT", tools=[TOOL])
+    result, _tracker = workspace.tester.run(AgentTestIn(agent=agent, input="x"))
+    call = result.tool_calls[0]
+    assert call.approval is not None and call.approval.code == "tool.approval_not_in_test"
+    assert "212" not in (call.output or "")
+
+
+def test_the_unattended_warning_names_the_agent_and_the_deny(workspace: Workspace) -> None:
+    """L-4: the warning before an unattended start evaluates grants for the named agent and reports a deny as such."""
+    from nodestro_runtime.tool_preflight import unattended_tool_issues
+
+    flow = _flow(workspace)
+    rules = AccessRules(workspace.store)
+    rules.grant(
+        resource=AccessResource(type="tool", id=TOOL),
+        tool=_facts(workspace),
+        actions=["execute"],
+        duration="until",
+        expires_at=now() + timedelta(days=1),
+        mode="unattended",
+        scope="agent",
+        agents=[tool_policy.agent_ref(flow.id, "a")],
+        by=ALICE,
+    )
+    assert unattended_tool_issues(workspace, flow, trigger="schedule", trigger_ref="sch_1") == []
+    rules.deny(resource=AccessResource(type="tool", id=TOOL), actions=["execute"], by=ALICE)
+    issues = unattended_tool_issues(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    assert [issue.code for issue in issues] == ["tool.unattended_access_denied"]
+    assert issues[0].params["denial"] == "access.denied"

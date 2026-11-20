@@ -16,7 +16,19 @@
     components (NFC).
   - When switched on, the tool gate refuses on a deny or safety limit first, and a matching grant replaces the
     question. Switched off, nothing changes.
-  - New problem codes `access.*`.
+  - New problem codes `access.*`, `tool.unattended_access_denied` and `tool.unattended_safety_limit`.
+  - Review fixes before merge:
+    - tool grants are bound to the tool version, classification and MCP definition;
+    - deny and safety limit are checked again after a person approves a waiting call;
+    - Windows path spellings (`\\?\`, trailing dots and spaces, 8.3 names, administrative shares) and more
+      system folders are handled, and the data folder is required for folder requests;
+    - `use` and `revoke` cannot overwrite each other;
+    - unattended grants for more than reading name their agents and last at most 30 days;
+    - times must carry a time zone;
+    - the grant or deny is recorded on the call (`ToolCallApproval.access_source`, left out when unset);
+    - agent tests never run a tool on a grant;
+    - denies on run-own tools are refused;
+    - desktop imports skip grants and denies.
 
 - Security (LD-020 follow-up 2): plain provider keys do not stay readable next to their sealed form.
   - `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE` checkpoint), called once

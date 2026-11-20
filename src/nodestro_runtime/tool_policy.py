@@ -30,14 +30,14 @@ deny, then grant, otherwise a missing grant, with the kind of denial and its sou
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime
-import ntpath
+from datetime import datetime, timedelta
+import os
 import posixpath
 import re
 from typing import Any, Literal
 import unicodedata
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from .sandbox_policy import Isolation
 
@@ -223,29 +223,51 @@ SAFETY_LIMITS: dict[str, str] = {
     "unresolvable_path": "A folder that is not an absolute path is never open to agents",
 }
 
-#: System folders no grant opens (compared case-insensitively, component by component). Nodestro's own data folder
-#: is protected as well; the caller names it (``AccessRequest.protected_folders``), since only it knows where it is.
+#: System folders no grant opens (compared case-insensitively, component by component). The Windows folders named by
+#: the environment (``SystemRoot``, ``ProgramFiles`` ...) are added at run time (:func:`system_folders`). Nodestro's
+#: own data folder is protected as well; the caller names it (``AccessRequest.protected_folders``, required for folder
+#: requests), since only it knows where it is.
 SYSTEM_FOLDERS: tuple[str, ...] = (
     "/bin",
     "/boot",
     "/dev",
     "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
     "/proc",
+    "/root",
+    "/run",
     "/sbin",
     "/sys",
     "/usr",
+    "/var/db",
     "/var/lib",
+    "/var/root",
     "/Library",
     "/System",
     "/private/etc",
-    "/private/var/db",
+    "/private/var",
     "C:\\Windows",
     "C:\\Program Files",
     "C:\\Program Files (x86)",
     "C:\\ProgramData",
 )
-
+#: Environment variables that name Windows system folders (on another drive than ``C:`` too).
+_SYSTEM_FOLDER_ENV = ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData")
+#: Host names of the own computer in a UNC path (``\\localhost\C$`` is drive ``C:``).
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "."})
 _WINDOWS = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_DRIVE = re.compile(r"^[A-Za-z]:\\")
+_ADMIN_SHARE = re.compile(r"^[a-z]\$$")
+#: An 8.3 short name (``PROGRA~1``): another spelling of a long name that only the file system can resolve.
+_SHORT_NAME = re.compile(r"~\d")
+
+
+def system_folders() -> tuple[str, ...]:
+    """:data:`SYSTEM_FOLDERS` and the Windows system folders the environment names."""
+    found = [os.environ.get(name, "") for name in _SYSTEM_FOLDER_ENV]
+    return (*SYSTEM_FOLDERS, *(path for path in found if path))
 
 
 _EFFECTS: dict[tuple[str, str], EffectClass] = {
@@ -268,25 +290,74 @@ def effect_of(capability: ToolCapability) -> EffectClass:
 
 
 def folder_parts(path: str) -> tuple[str, ...]:
-    """The normalized components of an absolute folder path, for comparing folders component by component.
+    r"""The normalized components of an absolute folder path, for comparing folders component by component.
 
     Unicode NFC (a name typed on macOS and on Linux compares equal), ``.`` and ``..`` resolved lexically, repeated
-    separators dropped. Windows paths (``C:\\...``, UNC) use both separators and a lower-case drive. Raises
-    :class:`ValueError` for a path that is not absolute. This is a comparison of names, not a guard on the file system:
-    links, hard links and junctions are resolved by the caller before it asks (``os.path.realpath``), and the
-    file-system guard itself is N-10."""
-    text = unicodedata.normalize("NFC", path.strip())
+    separators dropped. Raises :class:`ValueError` for a path that is not absolute or cannot be compared by name: one
+    with leading or trailing white space, a NUL, a Windows device path (``\\.\``) or an 8.3 short name.
+
+    Windows paths (``C:\...``, UNC, ``\\?\``) accept both separators, lose trailing dots and spaces per component (as
+    Windows does) and are case-folded throughout; ``\\?\C:\x`` is ``C:\x``, and an administrative share of the own
+    computer (``\\localhost\C$``) is its drive. This is a comparison of names, not a guard on the file system: links,
+    hard links and junctions are resolved by the caller before it asks (``os.path.realpath``), and the file-system
+    guard itself is N-10."""
+    if not path or path != path.strip():
+        raise ValueError("A folder path must not start or end with white space")
+    text = unicodedata.normalize("NFC", path)
     if "\x00" in text:
         raise ValueError("A folder path must not contain NUL")
     if _WINDOWS.match(text):
-        normal = ntpath.normpath(text.replace("/", "\\"))
-        drive, rest = ntpath.splitdrive(normal)
-        head = drive.lower().replace("\\", "/")
-        return (head, *(part for part in rest.split("\\") if part))
+        return _windows_parts(text)
     if not text.startswith("/"):
         raise ValueError("A folder path must be absolute")
     normal = posixpath.normpath(text)
     return ("/", *(part for part in normal.split("/") if part))
+
+
+def _windows_parts(text: str) -> tuple[str, ...]:
+    text = text.replace("/", "\\")
+    if text.startswith("\\\\.\\"):
+        raise ValueError("A Windows device path cannot be compared by name")
+    if text.startswith("\\\\?\\"):
+        rest = text[4:]
+        if rest[:4].casefold() == "unc\\":
+            text = "\\\\" + rest[4:]
+        elif _DRIVE.match(rest):
+            text = rest
+        else:
+            raise ValueError("A Windows device path cannot be compared by name")
+    if text.startswith("\\\\"):
+        host, _, rest = text[2:].partition("\\")
+        share, _, rest = rest.partition("\\")
+        host, share = host.casefold(), share.rstrip(" .").casefold()
+        if not host or not share:
+            raise ValueError("A UNC path names a host and a share")
+        head = f"{share[0]}:" if _ADMIN_SHARE.match(share) and host in _LOCAL_HOSTS else f"//{host}/{share}"
+    else:
+        head, rest = text[:2].casefold(), text[3:]
+    parts: list[str] = []
+    for part in rest.split("\\"):
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        if part in ("", "."):
+            continue
+        name = part.rstrip(" .")
+        if not name or ":" in name or _SHORT_NAME.search(name):
+            raise ValueError("A Windows path component cannot be compared by name")
+        parts.append(name.casefold())
+    return (head, *parts)
+
+
+def _drive_form(parts: tuple[str, ...]) -> tuple[str, ...]:
+    """An administrative share of any host (``//host/c$``) as its drive, for the protected-folder check only."""
+    head = parts[0]
+    if head.startswith("//"):
+        share = head.rsplit("/", 1)[-1]
+        if _ADMIN_SHARE.match(share):
+            return (f"{share[0]}:", *parts[1:])
+    return parts
 
 
 def _within(inner: tuple[str, ...], outer: tuple[str, ...], *, fold: bool) -> bool:
@@ -308,6 +379,27 @@ class AccessResource(BaseModel):
     id: str = Field(min_length=1, max_length=4096)
 
 
+#: The longest an unattended grant for more than reading may last (spec 7.2: narrow and dated, D10).
+MAX_UNATTENDED_GRANT = timedelta(days=30)
+
+
+class ToolFacts(BaseModel):
+    """The tool a grant was given for: its version, classification and MCP definition hash. A tool grant matches only
+    while the tool is still exactly this one, like a pre-grant (:func:`matching_pre_grant`): a new version, a changed
+    classification or another MCP definition ends it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    version: int | None = None
+    access: Access
+    reach: Reach
+    definition_hash: str | None = None
+
+    @classmethod
+    def of(cls, capability: ToolCapability, *, version: int | None, definition_hash: str | None = None) -> ToolFacts:
+        return cls(version=version, access=capability.access, reach=capability.reach, definition_hash=definition_hash)
+
+
 class _AccessRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -317,9 +409,9 @@ class _AccessRecord(BaseModel):
     scope: AccessScope = "all"
     #: The agents of ``agent`` (exactly one) or ``agents`` (one or more); empty for ``all``.
     agents: tuple[str, ...] = ()
-    created_at: datetime
-    expires_at: datetime | None = None
-    revoked_at: datetime | None = None
+    created_at: AwareDatetime
+    expires_at: AwareDatetime | None = None
+    revoked_at: AwareDatetime | None = None
     revoked_by: str | None = None
 
     @model_validator(mode="after")
@@ -331,6 +423,8 @@ class _AccessRecord(BaseModel):
 
     def active_at(self, at: datetime) -> bool:
         """Not revoked and not expired at ``at``: checked at every evaluation, so a change applies at the next one."""
+        if getattr(self, "status", "active") != "active":
+            return False
         if self.revoked_at is not None and self.revoked_at <= at:
             return False
         return self.expires_at is None or self.expires_at > at
@@ -351,33 +445,35 @@ class _AccessRecord(BaseModel):
 class Grant(_AccessRecord):
     """A person's permission (spec 7.1): resource, actions, scope, duration and mode. Written only by a person
     (through the rule store of :mod:`~nodestro_runtime.tool_approvals`), never by a model. Holds for a folder and
-    every folder below it; a subfolder can be granted without its parent."""
+    every folder below it; a subfolder can be granted without its parent. A tool grant holds only for the tool as it
+    was (``tool``)."""
 
     duration: GrantDuration
     #: ``supervised`` covers only calls a person watches; ``unattended`` covers background calls as well.
     mode: AccessMode = "supervised"
     #: The conversation of a ``conversation`` grant.
     conversation_id: str | None = None
-    #: A ``once`` grant is ``used`` after its one use.
-    status: Literal["active", "used"] = "active"
+    #: ``active``; ``used`` after the one use of a ``once`` grant; ``revoked``. Use and revocation are both one
+    #: compare-and-set from ``active``, so exactly one of them wins.
+    status: Literal["active", "used", "revoked"] = "active"
+    #: The tool as it was granted (required for a tool grant to match).
+    tool: ToolFacts | None = None
     granted_by: str
-
-    def active_at(self, at: datetime) -> bool:
-        return self.status == "active" and super().active_at(at)
 
 
 class Deny(_AccessRecord):
     """An explicit block (spec 7.1), addressed like a :class:`Grant`. Holds for a folder and every folder below it,
     also against a grant of a subfolder; folders compare case-insensitively here, so a deny never misses because of
-    the spelling. ``mode`` ``None`` blocks in both modes."""
+    the spelling. A tool deny holds for every version of the tool. ``mode`` ``None`` blocks in both modes."""
 
     duration: DenyDuration = "until_revoked"
     mode: AccessMode | None = None
+    status: Literal["active", "revoked"] = "active"
     denied_by: str
 
 
 class AccessRequest(BaseModel):
-    """One access to evaluate."""
+    """One access to evaluate. A folder request names the protected data folder (``protected_folders``)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -390,8 +486,16 @@ class AccessRequest(BaseModel):
     #: The conversation or task holds content from a granted source (folder, knowledge, memory; N-08).
     shared_content: bool = False
     offline: bool = False
-    #: Folders no grant opens besides :data:`SYSTEM_FOLDERS` (Nodestro's own data folder).
+    #: Folders no grant opens besides :func:`system_folders` (Nodestro's own data folder); required for folders.
     protected_folders: tuple[str, ...] = ()
+    #: The tool as it is now (tool requests); a tool grant must name the same.
+    tool: ToolFacts | None = None
+
+    @model_validator(mode="after")
+    def _check_folder(self) -> AccessRequest:
+        if self.resource.type == "folder" and not self.protected_folders:
+            raise ValueError("A folder request names the protected data folder (protected_folders)")
+        return self
 
 
 class AccessDecision(BaseModel):
@@ -436,10 +540,11 @@ def safety_limit(request: AccessRequest) -> str | None:
     if request.resource.type == "folder":
         try:
             parts = folder_parts(request.resource.id)
-            protected = [folder_parts(path) for path in (*SYSTEM_FOLDERS, *request.protected_folders)]
+            protected = [folder_parts(path) for path in (*system_folders(), *request.protected_folders)]
         except ValueError:
             return "unresolvable_path"
-        if any(_within(parts, folder, fold=True) for folder in protected):
+        forms = {parts, _drive_form(parts)}
+        if any(_within(form, folder, fold=True) for form in forms for folder in protected):
             return "protected_folder"
     return None
 
@@ -447,12 +552,17 @@ def safety_limit(request: AccessRequest) -> str | None:
 def _grant_applies(grant: Grant, request: AccessRequest, effect: EffectClass) -> bool:
     if not grant._addresses(request, fold=False, agent_unknown=False):
         return False
+    if request.resource.type == "tool" and (grant.tool is None or grant.tool != request.tool):
+        return False  # another version, classification or MCP definition than the one granted
     if request.mode == "unattended":
         if grant.mode != "unattended":
             return False
         # Unattended writing, external calls and cloud models need a narrow, dated grant (spec 7.2, D10).
-        if effect != "read_internal" and grant.duration not in ("until", "once"):
-            return False
+        if effect != "read_internal":
+            if grant.scope == "all" or grant.duration not in ("until", "once"):
+                return False
+            if grant.expires_at is not None and grant.expires_at - grant.created_at > MAX_UNATTENDED_GRANT:
+                return False
     if grant.duration == "conversation":
         return request.conversation_id is not None and grant.conversation_id == request.conversation_id
     return True
@@ -482,7 +592,9 @@ def evaluate(
     """Evaluate one access (no I/O): a safety limit, then a deny, then a grant, otherwise a missing grant.
 
     Destructive actions are never covered by a grant (only by a person's confirmation of the one call). Revoked and
-    expired records do not count, so a revocation applies at the next evaluation."""
+    expired records do not count, so a revocation applies at the next evaluation. ``at`` must carry a time zone."""
+    if at.tzinfo is None:
+        raise ValueError("evaluate() needs a time with a time zone")
     limit = safety_limit(request)
     if limit is not None:
         return AccessDecision(allowed=False, kind="safety_limit", source=f"limit:{limit}")
@@ -511,12 +623,27 @@ class AccessContext(BaseModel):
     agent: str | None = None
     conversation_id: str | None = None
     offline: bool = False
+    #: Nodestro's own data folder (for folder requests; tool calls do not use it).
+    protected_folders: tuple[str, ...] = ()
+
+
+def agent_ref(workflow_id: str, node_id: str) -> str:
+    """How grants and denies name an agent node: ``<workflow id>/<node id>`` (until agents have their own ids)."""
+    return f"{workflow_id}/{node_id}"
 
 
 def tool_access(
-    tool: str, capability: ToolCapability, access: AccessContext, *, attended: bool, at: datetime
+    tool: str,
+    capability: ToolCapability,
+    access: AccessContext,
+    *,
+    attended: bool,
+    at: datetime,
+    version: int | None = None,
+    definition_hash: str | None = None,
 ) -> AccessDecision:
-    """:func:`evaluate` for a tool call: resource ``tool:<name>``, action ``execute``, the tool's effect class.
+    """:func:`evaluate` for a tool call: resource ``tool:<name>``, action ``execute``, the tool's effect class, and the
+    tool as it is now (a grant for another version or classification does not match).
 
     ``once`` grants do not count here: one confirmed tool call is the per-call approval of S-2 itself."""
     request = AccessRequest(
@@ -527,9 +654,40 @@ def tool_access(
         mode="supervised" if attended else "unattended",
         conversation_id=access.conversation_id,
         offline=access.offline,
+        tool=ToolFacts.of(capability, version=version, definition_hash=definition_hash),
     )
     grants = [grant for grant in access.grants if grant.duration != "once"]
     return evaluate(request, grants=grants, denies=access.denies, at=at)
+
+
+def access_refusal(
+    tool: str,
+    capability: ToolCapability,
+    context: CallContext,
+    *,
+    at: datetime,
+    version: int | None = None,
+    definition_hash: str | None = None,
+) -> tuple[GateDecision | None, AccessDecision | None]:
+    """The refusal by a deny or a safety limit, if any, and the evaluation (both ``None`` while the switch is off).
+
+    Used before a call is decided and again after a person approved a waiting call (spec 7.3 (7)): a deny or a limit
+    that appeared while the call waited still refuses it."""
+    if context.access is None:
+        return None, None
+    found = tool_access(
+        tool,
+        capability,
+        context.access,
+        attended=context.attended,
+        at=at,
+        version=version,
+        definition_hash=definition_hash,
+    )
+    if found.kind in ("denied", "safety_limit"):
+        reason = _ACCESS_REASONS[found.kind].format(tool=tool)
+        return GateDecision(action="deny", code=found.code, reason=reason, access_source=found.source), found
+    return None, found
 
 
 class CallContext(BaseModel):
@@ -625,6 +783,7 @@ def decide(
     context: CallContext,
     at: datetime,
     version: int | None = None,
+    definition_hash: str | None = None,
 ) -> GateDecision:
     """Allow, deny or ask for one call (no I/O). The order: grants narrow first, then the binding decides whether to
     ask; an unattended run cannot ask, so it denies unless a matching pre-grant exists. An approval never changes the
@@ -632,13 +791,11 @@ def decide(
 
     With the access model v2 (``context.access``, N-06) a safety limit or a deny refuses the call before anything
     else, and a matching grant allows a call that would otherwise be asked or refused for lack of a person. A grant
-    never lifts an orchestrator's narrowing, an ``always`` binding, the MCP rules or a destructive tool's question."""
-    found: AccessDecision | None = None
-    if context.access is not None:
-        found = tool_access(tool, capability, context.access, attended=context.attended, at=at)
-        if found.kind in ("denied", "safety_limit"):
-            reason = _ACCESS_REASONS[found.kind].format(tool=tool)
-            return GateDecision(action="deny", code=found.code, reason=reason, access_source=found.source)
+    never lifts an orchestrator's narrowing, an ``always`` binding, the MCP rules or a destructive tool's question, and
+    holds only for the tool version, classification and MCP definition (``definition_hash``) it was given for."""
+    refused, found = access_refusal(tool, capability, context, at=at, version=version, definition_hash=definition_hash)
+    if refused is not None:
+        return refused
     verdict = _decide_binding(
         tool=tool, kind=kind, capability=capability, binding=binding, context=context, at=at, version=version
     )
@@ -700,6 +857,7 @@ __all__ = [
     "ALLOW",
     "ASK",
     "BUILTIN_CAPABILITIES",
+    "MAX_UNATTENDED_GRANT",
     "NEW_BINDING",
     "SAFETY_LIMITS",
     "SERVER_TOOL_CAPABILITIES",
@@ -729,7 +887,10 @@ __all__ = [
     "ResourceType",
     "ToolBinding",
     "ToolCapability",
+    "ToolFacts",
     "ToolPreGrant",
+    "access_refusal",
+    "agent_ref",
     "capability_of",
     "decide",
     "effect_class",
@@ -740,6 +901,7 @@ __all__ = [
     "parse_capability",
     "safety_limit",
     "server_tool_capability",
+    "system_folders",
     "tool_access",
     "wants_question",
 ]

@@ -52,7 +52,9 @@ None known.
   - the safety limits (`SAFETY_LIMITS`) and `evaluate`, which returns the kind of refusal and its source;
   - the effect classes as `access` x `reach`;
   - folder comparison by NFC-normalized components;
-  - the tool gate: deny and safety limit first, a grant instead of the question.
+  - the tool gate: deny and safety limit first (re-checked after a person approves a waiting call), and a grant
+    bound to the tool version, classification and MCP definition instead of the question;
+  - the review findings of #201 (H-1, H-2, M-1..M-3, L-1..L-7), fixed in the same PR.
 - **Next step:**
   - nodestro-api: the query "who may do what and why" (BER-1) over `AccessRules.current()` and `evaluate`, and
     write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
@@ -61,7 +63,8 @@ None known.
   - Runtime: call `evaluate` where folders (N-10 file-system guard), workflows (run start), MCP servers,
     connections and cloud providers (N-08 provenance, model selection) are used.
   - Runtime: name agents by a stable agent id once agents have one (today `<workflow id>/<node id>`).
-  - Runtime: record which grant allowed a call on the call itself.
+  - Runtime: Windows folder checks remain by name. Hard links, junctions, network drives and the computer's own
+    name in UNC paths (only `localhost`, `127.0.0.1` and `::1` map to the drive) need the N-10 guard.
   - Runtime: the `DenialNotice` type (N-07).
   - Owner: activation after gate G-2, and the internal security check (the independent review goes with RT-001).
 

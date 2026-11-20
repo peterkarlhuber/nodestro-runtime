@@ -29,6 +29,7 @@ from nodestro_runtime.tool_policy import (
     EffectClass,
     Grant,
     ToolCapability,
+    ToolFacts,
     effect_class,
     evaluate,
     folder_parts,
@@ -37,6 +38,9 @@ from nodestro_runtime.tool_policy import (
 AT = datetime(2026, 11, 20, 12, 0, tzinfo=now().tzinfo)
 ALICE = Person("usr_alice")
 AGENT = "wf_1/writer"
+DATA = "/data/nodestro"
+#: The search tool as it is (a built-in tool: no version).
+SEARCH = ToolFacts(access="read", reach="external")
 OTHER = "wf_1/reviewer"
 
 
@@ -56,6 +60,7 @@ def grant(resource: AccessResource, *actions: Any, **extra: Any) -> Grant:
         "duration": "until_revoked",
         "created_at": AT - timedelta(days=1),
         "granted_by": ALICE.id,
+        "tool": SEARCH if resource.type == "tool" else None,
     }
     return Grant(**{**values, **extra})
 
@@ -81,6 +86,10 @@ def check(
     at: datetime = AT,
     **extra: Any,
 ) -> AccessDecision:
+    if resource.type == "folder":
+        extra.setdefault("protected_folders", (DATA,))
+    if resource.type == "tool":
+        extra.setdefault("tool", SEARCH)
     request = AccessRequest(resource=resource, action=action, effect=effect, **{"agent": AGENT, **extra})
     return evaluate(request, grants=grants, denies=denies, at=at)
 
@@ -245,7 +254,7 @@ def test_safety_limits_are_not_lifted_by_any_grant(request_values: dict[str, Any
         ),
         grant(folder("C:\\"), "read", id="agr_drive"),
     ]
-    found = check(grants=everything, **{"agent": AGENT, **request_values})
+    found = check(grants=everything, **request_values)
     assert (found.allowed, found.kind, found.source) == (False, "safety_limit", f"limit:{limit}")
     assert limit in SAFETY_LIMITS
 
@@ -279,7 +288,15 @@ def test_unattended_access_needs_an_unattended_grant_and_a_date_for_more_than_re
     assert check(reports, "write", "write_internal", grants=[standing_write], mode="unattended").kind == (
         "missing_grant"
     )
-    dated = grant(reports, "write", mode="unattended", duration="until", expires_at=AT + timedelta(hours=1))
+    dated = grant(
+        reports,
+        "write",
+        mode="unattended",
+        duration="until",
+        expires_at=AT + timedelta(hours=1),
+        scope="agent",
+        agents=(AGENT,),
+    )
     assert check(reports, "write", "write_internal", grants=[dated], mode="unattended").allowed
 
 
@@ -324,7 +341,7 @@ def test_a_deny_ignores_case_and_a_grant_does_not() -> None:
 
 
 def test_windows_paths_compare_by_component() -> None:
-    assert folder_parts("C:\\Users\\Alice\\..\\Bob") == folder_parts("c:/Users/Bob") == ("c:", "Users", "Bob")
+    assert folder_parts("C:\\Users\\Alice\\..\\Bob") == folder_parts("c:/users/BOB") == ("c:", "users", "bob")
     assert folder_parts("\\\\server\\share\\a") == ("//server/share", "a")
     assert read("C:\\Users\\Alice\\a.txt", grants=[grant(folder("C:\\Users\\Alice"), "read")]).allowed
     with pytest.raises(ValueError):
@@ -475,3 +492,238 @@ def test_nothing_running_inside_a_tool_call_writes_grants(rules: AccessRules) ->
     finally:
         bind_call(None)
     assert rules.grants() == [] and rules.denies() == [stored]
+
+
+# ---- review of #201 ------------------------------------------------------------------------------------------------
+
+
+def tool_request(facts: ToolFacts, **extra: Any) -> AccessRequest:
+    effect = effect_class(facts.access, facts.reach)
+    return AccessRequest(resource=tool("tool_x"), action="execute", effect=effect, agent=AGENT, tool=facts, **extra)
+
+
+def test_a_tool_grant_holds_only_for_the_tool_version_classification_and_definition_it_was_given_for() -> None:
+    """H-1: like a pre-grant, a tool grant ends with a new version, a reclassification or another MCP definition."""
+    given = ToolFacts(version=1, access="write", reach="internal", definition_hash="h1")
+    stored = grant(tool("tool_x"), "execute", tool=given)
+
+    def found(facts: ToolFacts) -> AccessDecision:
+        return evaluate(tool_request(facts), grants=[stored], denies=[], at=AT)
+
+    assert found(given).source == "grant:agr_1"
+    assert found(given.model_copy(update={"version": 7})).kind == "missing_grant"
+    assert found(given.model_copy(update={"version": None})).kind == "missing_grant"
+    assert found(given.model_copy(update={"reach": "external"})).kind == "missing_grant"
+    assert found(given.model_copy(update={"definition_hash": "h2"})).kind == "missing_grant"
+    unbound = grant(tool("tool_x"), "execute", tool=None)
+    assert evaluate(tool_request(given), grants=[unbound], denies=[], at=AT).kind == "missing_grant"
+    # A deny holds for every version.
+    blocked = deny(tool("tool_x"), "execute")
+    assert evaluate(tool_request(given.model_copy(update={"version": 9})), grants=[], denies=[blocked], at=AT).kind == (
+        "denied"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "limit"),
+    [
+        ("\\\\?\\C:\\Windows\\System32", "protected_folder"),
+        ("\\\\?\\UNC\\localhost\\C$\\Windows", "protected_folder"),
+        ("C:\\Windows.\\System32", "protected_folder"),
+        ("C:\\Windows \\System32", "protected_folder"),
+        ("C:\\WINDOWS\\system32", "protected_folder"),
+        ("\\\\localhost\\C$\\Windows", "protected_folder"),
+        ("\\\\fileserver\\c$\\Program Files\\x", "protected_folder"),
+        ("\\\\.\\C:\\Windows", "unresolvable_path"),
+        ("C:\\PROGRA~1\\x", "unresolvable_path"),
+        ("C:\\Users\\a\\file.txt:secret", "unresolvable_path"),
+        ("/root/.ssh", "protected_folder"),
+        ("/private/var/db/x", "protected_folder"),
+        ("/lib/x", "protected_folder"),
+    ],
+)
+def test_other_spellings_of_a_protected_folder_hit_the_safety_limit(path: str, limit: str) -> None:
+    """M-1: Windows prefixes, trailing dots and spaces, case, 8.3 names, administrative shares, more POSIX roots."""
+    found = read(path, grants=[grant(folder("/"), "read"), grant(folder("C:\\"), "read", id="agr_2")])
+    assert (found.kind, found.source) == ("safety_limit", f"limit:{limit}")
+
+
+def test_system_folders_named_by_the_environment_are_protected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SystemRoot", "D:\\WinNT")
+    monkeypatch.setenv("ProgramFiles", "E:\\Apps")
+    assert read("D:\\winnt\\system32").source == "limit:protected_folder"
+    assert read("E:\\Apps\\tool").source == "limit:protected_folder"
+    monkeypatch.delenv("SystemRoot")
+    assert read("D:\\winnt\\system32").kind == "missing_grant"
+
+
+def test_a_folder_request_names_the_protected_data_folder() -> None:
+    """M-1: the data folder limit cannot be forgotten by a caller."""
+    with pytest.raises(ValueError):
+        AccessRequest(resource=folder("/home/alice"), action="read", effect="read_internal")
+    assert read(f"{DATA}/nodestro.db", grants=[grant(folder("/"), "read")]).source == "limit:protected_folder"
+
+
+@pytest.mark.parametrize("path", ["/home/a/x ", " /home/a/x", "/home/a/x\n", ""])
+def test_folder_paths_with_outer_white_space_are_refused(path: str) -> None:
+    """L-3: ``/home/a/x `` is another folder than ``/home/a/x``; it is refused, not trimmed."""
+    with pytest.raises(ValueError):
+        folder_parts(path)
+    if path:
+        assert read(path, grants=[grant(folder("/home/a"), "read")]).source == "limit:unresolvable_path"
+
+
+def test_a_revoked_or_expired_once_grant_is_never_used(rules: AccessRules) -> None:
+    """M-2."""
+    revoked = rules.grant(resource=folder("/home/alice/docs"), actions=["read"], duration="once", by=ALICE)
+    rules.revoke_grant(revoked.id, by=ALICE)
+    assert rules.use(revoked.id) is False
+    used = rules.grant(resource=folder("/home/alice/docs"), actions=["read"], duration="once", by=ALICE)
+    assert rules.use(used.id) is True
+    assert rules.revoke_grant(used.id, by=ALICE).status == "used"  # nothing left to revoke, nothing audited
+    kinds = [event.kind for _, event in rules.store.items(AUDIT, ToolApprovalEvent)]
+    assert kinds.count("access_grant_revoked") == 1
+
+
+def test_a_revocation_between_reading_and_using_a_once_grant_wins(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M-2 (review PoC): ``use`` read the grant, a person revoked it, then ``use`` wrote: the revocation stays."""
+    store = SQLiteStore(tmp_path / "db.sqlite")
+    rules = AccessRules(store)
+    once = rules.grant(
+        resource=AccessResource(type="workflow", id="wf_1"), actions=["execute"], duration="once", by=ALICE
+    )
+    real_get = store.get
+
+    def get_then_revoke(collection: str, key: str, model: Any) -> Any:
+        found = real_get(collection, key, model)
+        monkeypatch.setattr(store, "get", real_get)
+        rules.revoke_grant(once.id, by=ALICE)
+        return found
+
+    monkeypatch.setattr(store, "get", get_then_revoke)
+    assert rules.use(once.id) is False
+    stored = real_get("access_grants", once.id, Grant)
+    assert stored is not None and stored.status == "revoked" and stored.revoked_at is not None
+
+
+def _race(rules: AccessRules, grant_id: str) -> list[object]:
+    """Four uses and two revocations of one grant, started together."""
+    import threading
+
+    results: list[object] = []
+    barrier = threading.Barrier(6)
+
+    def use() -> None:
+        barrier.wait()
+        results.append(rules.use(grant_id))
+
+    def revoke() -> None:
+        barrier.wait()
+        results.append(rules.revoke_grant(grant_id, by=ALICE).status)
+
+    threads = [threading.Thread(target=use) for _ in range(4)] + [threading.Thread(target=revoke) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def test_use_and_revoke_racing_have_exactly_one_winner(tmp_path: Any) -> None:
+    """M-2: concurrent uses and revocations of one once grant (one SQLite file, several threads)."""
+    store = SQLiteStore(tmp_path / "db.sqlite")
+    rules = AccessRules(store)
+    for _ in range(10):
+        once = rules.grant(
+            resource=AccessResource(type="workflow", id="wf_1"), actions=["execute"], duration="once", by=ALICE
+        )
+        uses = _race(rules, once.id).count(True)
+        stored = store.get("access_grants", once.id, Grant)
+        assert stored is not None
+        if stored.status == "used":
+            assert uses == 1 and stored.revoked_at is None
+        else:
+            assert stored.status == "revoked" and uses == 0
+
+
+def test_unattended_grants_name_their_agents_and_end_within_the_maximum(rules: AccessRules) -> None:
+    """M-3: an unattended grant for more than reading is narrow (named agents) and dated (at most 30 days)."""
+    common: dict[str, Any] = {
+        "resource": folder("/srv/reports"),
+        "actions": ["write"],
+        "mode": "unattended",
+        "by": ALICE,
+    }
+    soon = AT + timedelta(days=1)
+    for extra, code in (
+        ({"duration": "until", "expires_at": soon}, "access.unattended_scope"),
+        (
+            {"duration": "until", "expires_at": AT + timedelta(days=31), "scope": "agent", "agents": [AGENT]},
+            "access.unattended_too_long",
+        ),
+    ):
+        with pytest.raises(NodestroError) as error:
+            rules.grant(**common, **extra)
+        assert error.value.code == code
+    stored = rules.grant(**common, duration="until", expires_at=soon, scope="agent", agents=[AGENT])
+    assert stored.expires_at == soon
+    far = grant(
+        folder("/srv/reports"),
+        "write",
+        mode="unattended",
+        duration="until",
+        expires_at=AT + timedelta(days=365),
+        scope="agent",
+        agents=(AGENT,),
+    )
+    assert check(folder("/srv/reports"), "write", "write_internal", grants=[far], mode="unattended").kind == (
+        "missing_grant"
+    )
+
+
+def test_times_must_carry_a_time_zone(rules: AccessRules) -> None:
+    """L-2: naive times are refused with a clear error, never a TypeError at evaluation."""
+    naive = datetime(2999, 1, 1)
+    with pytest.raises(ValueError):
+        grant(folder("/home/alice"), "read", duration="until", expires_at=naive)
+    with pytest.raises(NodestroError) as error:
+        rules.grant(resource=folder("/home/alice"), actions=["read"], duration="until", expires_at=naive, by=ALICE)
+    assert error.value.code == "access.expiry"
+    with pytest.raises(ValueError):
+        read("/home/alice", at=naive)
+
+
+def test_tool_grants_name_the_tool_and_only_tool_grants_do(rules: AccessRules) -> None:
+    with pytest.raises(NodestroError) as error:
+        rules.grant(resource=tool("search_web"), actions=["execute"], duration="until_revoked", by=ALICE)
+    assert error.value.code == "access.tool_facts_required"
+    with pytest.raises(NodestroError) as error:
+        rules.grant(resource=folder("/home/a"), actions=["read"], duration="until_revoked", by=ALICE, tool=SEARCH)
+    assert error.value.code == "access.tool_facts_required"
+    stored = rules.grant(
+        resource=tool("search_web"), actions=["execute"], duration="until_revoked", by=ALICE, tool=SEARCH
+    )
+    assert stored.tool == SEARCH
+
+
+def test_run_own_tools_cannot_be_denied(rules: AccessRules) -> None:
+    """L-5: the run's own tools never pass the gate, so a deny on them is refused instead of silently ignored."""
+    from orkexa.memory import MEMORY_TOOL_NAME
+
+    from nodestro_runtime import file_delivery, skill_tools
+    from nodestro_runtime.tool_approvals import RUN_OWN_TOOLS
+
+    assert {
+        MEMORY_TOOL_NAME,
+        file_delivery.TOOL_NAME,
+        "propose_knowledge",
+        skill_tools.LOAD_TOOL,
+        skill_tools.READ_TOOL,
+    } == RUN_OWN_TOOLS
+    for name in sorted(RUN_OWN_TOOLS):
+        with pytest.raises(NodestroError) as error:
+            rules.deny(resource=tool(name), actions=["execute"], by=ALICE)
+        assert error.value.code == "access.deny_not_enforced"
+    assert rules.denies() == []

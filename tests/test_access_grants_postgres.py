@@ -44,10 +44,34 @@ def test_grants_and_denies_are_kept_per_tenant(database: PostgresDatabase) -> No
 
 
 def test_a_once_grant_is_used_exactly_once_on_postgres(database: PostgresDatabase) -> None:
+    """Concurrent uses on separate connections, and a revocation racing them: exactly one winner (M-2, L-7)."""
+    import threading
+
     rules = AccessRules(database.store("alpha"))
-    once = rules.grant(
-        resource=AccessResource(type="workflow", id="wf_1"), actions=["execute"], duration="once", by=ALICE
-    )
-    assert rules.use(once.id) is True
-    assert rules.use(once.id) is False
-    assert rules.grants()[0].status == "used"
+    for revoking in (False, True):
+        once = rules.grant(
+            resource=AccessResource(type="workflow", id="wf_1"), actions=["execute"], duration="once", by=ALICE
+        )
+        results: list[object] = []
+        barrier = threading.Barrier(9 if revoking else 8)
+
+        def use(grant_id: str = once.id, gate: threading.Barrier = barrier, out: list[object] = results) -> None:
+            gate.wait()
+            out.append(rules.use(grant_id))
+
+        def revoke(grant_id: str = once.id, gate: threading.Barrier = barrier, out: list[object] = results) -> None:
+            gate.wait()
+            out.append(rules.revoke_grant(grant_id, by=ALICE).status)
+
+        threads = [threading.Thread(target=use) for _ in range(8)]
+        if revoking:
+            threads.append(threading.Thread(target=revoke))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        stored = next(item for item in rules.grants() if item.id == once.id)
+        if stored.status == "used":
+            assert results.count(True) == 1 and stored.revoked_at is None
+        else:
+            assert revoking and stored.status == "revoked" and results.count(True) == 0
