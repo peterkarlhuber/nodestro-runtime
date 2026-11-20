@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Security (LD-020 follow-up): sealing plain provider keys on opening ends with a WAL checkpoint
+  (`SQLiteStore.checkpoint()`, `PRAGMA wal_checkpoint(TRUNCATE)`), so the plain keys leave the write-ahead log and the
+  database file's old page at once, not only at SQLite's next automatic checkpoint. Found by nodestro-local-docker's
+  upgrade test; the unit test now checks the files while the workspace is open.
 - Security (LD-020): the key of a local data directory (`nodestro_runtime.local_vault`), for Nodestro Local Docker's
   key file on the host.
   - `Workspace(verify_vault_key=True)` requires a key (`secrets.vault_key_missing`) and stores a check value sealed
