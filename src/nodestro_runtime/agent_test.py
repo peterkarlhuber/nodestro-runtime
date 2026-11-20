@@ -159,8 +159,13 @@ class AgentTester:
             context=situation,
             at=now(),
             version=version,
+            definition_hash=definition,
         )
         shown = capability.model_dump()
+        if verdict.action == "allow" and verdict.access_source is not None:
+            # N-06: a stored grant stands in for a person in a run, not in a test: a test agent has no identity of
+            # its own (a grant for all agents would match it) and its calls must not have effects nobody approved.
+            verdict = tool_policy.ASK
         if verdict.action == "allow":
             record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
             bind_call(CallBinding(tool=call.name, capability=capability, definition_hash=definition))

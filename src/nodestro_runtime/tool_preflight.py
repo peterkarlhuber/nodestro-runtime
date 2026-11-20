@@ -31,7 +31,7 @@ from .graph import workflow_refs
 from .problems import CheckIssue
 from .schemas import Workflow, now
 from .tool_approvals import tool_facts
-from .tool_policy import ToolBinding, decide
+from .tool_policy import ToolBinding, agent_ref, decide
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -50,6 +50,9 @@ CODES = {
     "pre_grant_outdated": "tool.unattended_pre_grant_outdated",
     "pre_grant_missing": "tool.unattended_pre_grant_missing",
     "not_granted": "tool.unattended_denied",
+    # N-06 (access model v2, only while it is switched on): a deny, or a global safety limit.
+    "access_denied": "tool.unattended_access_denied",
+    "safety_limit": "tool.unattended_safety_limit",
 }
 
 
@@ -96,9 +99,15 @@ def unattended_tool_issues(
     found: list[CheckIssue] = []
     reported: set[tuple[str, str, str]] = set()
     for flow, root, node_id, label, tools, bindings in _agents(ctx, workflow):
-        situation = gate.call_context(run_id="preflight", node_id=node_id, trigger=trigger, trigger_ref=trigger_ref)
+        situation = gate.call_context(
+            run_id="preflight",
+            node_id=node_id,
+            trigger=trigger,
+            trigger_ref=trigger_ref,
+            agent=agent_ref(flow.id, node_id),
+        )
         for name in tools:
-            capability, version, kind, _ = tool_facts(ctx.tools, name)
+            capability, version, kind, definition = tool_facts(ctx.tools, name)
             verdict = decide(
                 tool=name,
                 kind=kind,
@@ -107,6 +116,7 @@ def unattended_tool_issues(
                 context=situation,
                 at=at,
                 version=version,
+                definition_hash=definition,
             )
             if verdict.action != "deny":
                 continue
@@ -114,7 +124,11 @@ def unattended_tool_issues(
             if key in reported:
                 continue
             reported.add(key)
-            if verdict.code != "tool.approval_unattended":
+            if verdict.code == "access.denied":
+                why = "access_denied"
+            elif verdict.code == "access.safety_limit":
+                why = "safety_limit"
+            elif verdict.code != "tool.approval_unattended":
                 why = "not_granted"
             elif kind == "mcp":
                 why = "mcp"

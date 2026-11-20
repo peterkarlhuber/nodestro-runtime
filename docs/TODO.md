@@ -11,8 +11,8 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 8 |
-| P3 Low | 31 |
+| P2 Medium | 9 |
+| P3 Low | 32 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -40,6 +40,37 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+### RT-086 · Access model v2 (N-06): api query, studio cards and the remaining call sites
+
+- **Priority:** P2 Medium · **Status:** In progress · **Refs:** development plan N-06 (spec 7.1-7.3, 7.5, 7.6),
+  [docs/access-grants.md](access-grants.md), `tests/test_access_grants.py`, `tests/test_access_grants_gate.py`,
+  `tests/test_access_grants_postgres.py`
+- **What:** The runtime groundwork is in, off by default (`NODESTRO_ACCESS_GRANTS`, only together with
+  `NODESTRO_TOOL_APPROVALS`):
+  - `Grant` and `Deny` records, written only by a `Person` through `AccessRules` and audited;
+  - the safety limits (`SAFETY_LIMITS`) and `evaluate`, which returns the kind of refusal and its source;
+  - the effect classes as `access` x `reach`;
+  - folder comparison by NFC-normalized components;
+  - the tool gate: deny and safety limit first (re-checked after a person approves a waiting call), and a grant
+    bound to the tool version, classification and MCP definition instead of the question;
+  - the review findings of #201 (H-1, H-2, M-1..M-3, L-1..L-7) and of its re-review (N-1..N-4), fixed in the same
+    PR.
+- **Next step:**
+  - nodestro-api: regenerate `openapi/nodestro-api.json` and `nodestro-api-server.json` when it moves to this
+    runtime. The only differences are intended: `ToolCallApproval.access_source` and four new audit kinds
+    (`access_*`).
+  - nodestro-api: the query "who may do what and why" (BER-1) over `AccessRules.current()` and `evaluate`, and
+    write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
+  - nodestro-studio: scope and duration on `ToolApprovalCard.tsx` (N-16 candidate), the overview, texts of the
+    `access.*` codes.
+  - Runtime: call `evaluate` where folders (N-10 file-system guard), workflows (run start), MCP servers,
+    connections and cloud providers (N-08 provenance, model selection) are used.
+  - Runtime: name agents by a stable agent id once agents have one (today `<workflow id>/<node id>`).
+  - Runtime: Windows folder checks remain by name. Hard links, junctions, network drives and the computer's own
+    name in UNC paths (only `localhost`, `127.0.0.1` and `::1` map to the drive) need the N-10 guard.
+  - Runtime: the `DenialNotice` type (N-07).
+  - Owner: activation after gate G-2, and the internal security check (the independent review goes with RT-001).
 
 ### RT-077 · Independent review of the service connection API and secret handling (NAL-A1)
 
@@ -387,6 +418,16 @@ Items that need an independent or external review (an internal audit does not re
   Decide whether the gateway should exempt MCP containers from `max_lifetime` or give them their own limit.
 
 ## Bugs and reliability
+
+### RT-087 · Flaky test in `tests/test_mcp_reclassification.py` (race)
+
+- **Priority:** P3 Low · **Status:** Open (owner open) · **Refs:** failed on master 2026-11-19 (`84038b2`) and
+  2026-11-14 (`3c11de4`); passed on rerun
+- **What:** A test in `tests/test_mcp_reclassification.py` fails now and then on CI. It looks like a timing race
+  between the reclassification and the waiting call, not a product defect. Which test fails, and the exact
+  interleaving, still have to be read from the two CI logs.
+- **Next step:** Find the failing test in the CI logs of both commits. Make it wait on the stored state instead of on
+  time. Do not weaken its assertions.
 
 ### RT-071 · Follow-ups of the JQ-3 re-review (N-1..N-5)
 
@@ -915,6 +956,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 | RT-084 | nodestro-api | N-13 API part (activity endpoints, housekeeping) | API serves `activity.query` / `export` and calls `activity.prune` |
 | — | nodestro-api | API-021 (region in usage views) | Runtime records the region since round 4 (`UsageEntry.region`, `Usage.regions`, RT-015 done); the API can add it to its views |
 | RT-085 | nodestro-api, nodestro-sdk, nodestro-studio | E-0R-1 A (approval note to the agent) | api: `agent_note` in the approval decision body; sdk: OpenAPI regeneration; studio: "Note to the agent" field in six languages and the texts of the new codes |
+| RT-086 | nodestro-api, nodestro-studio | N-06 api query "who may do what and why", approval cards with scope and duration | Runtime groundwork behind `NODESTRO_ACCESS_GRANTS`; api builds `Person` only from signed-in users |
 | RT-001 | nodestro-api, nodestro-studio, nodestro-server | S-2 approval routes, approval UI, SRV-004 | One review covers the whole approval flow; only this entry tracks it |
 | RT-003 | nodestro-local-docker | LD-001 (gateway review), LD-012 (container escape) | Gateway code and hardening live here |
 | RT-008, RT-020 | nodestro-server | SRV-013 (PostgreSQL load test) | Load test runs there; results feed back here |

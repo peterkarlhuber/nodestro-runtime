@@ -27,7 +27,7 @@ dependencies = [
     # Semantic knowledge search on SQLite (vector and hybrid modes); no wheel for Windows on ARM, where the knowledge
     # base stays on full-text search and reports its semantic index as unavailable.
     "sqlite-vec>=0.1.6; sys_platform != 'win32' or platform_machine != 'ARM64'",
-    "pydantic>=2.6,<3",
+    "pydantic>=2.12,<3",  # Field(exclude_if=...) (ToolCallApproval.access_source)
     # Builds the Python environments of tools with third-party libraries (see python_envs.py).
     "uv>=0.5",
     "packaging>=23",

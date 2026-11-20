@@ -877,6 +877,10 @@ class ToolCallApproval(_Model):
     pre_grant_id: str | None = None
     #: The capability the rules saw (``access``, ``reach``, ``source``).
     capability: dict[str, str] = Field(default_factory=dict)
+    #: N-06 (access model v2): the grant that allowed the call or the deny or safety limit that refused it
+    #: (``grant:<id>``, ``deny:<id>``, ``limit:<name>``). Left out of the stored record when unset, so records stay
+    #: byte-identical while the access model is off.
+    access_source: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ToolCallRecord(_Model):

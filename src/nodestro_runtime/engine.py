@@ -3223,7 +3223,12 @@ class RunManager:
         capability, version, kind, definition = tool_facts(context.env.builder.tools, call.name)
         root = context.root.run
         situation = gate.call_context(
-            run_id=context.run.id, node_id=node_id, trigger=root.trigger, trigger_ref=root.trigger_ref
+            run_id=context.run.id,
+            node_id=node_id,
+            trigger=root.trigger,
+            trigger_ref=root.trigger_ref,
+            agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
+            conversation_id=root.id,
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -3233,15 +3238,33 @@ class RunManager:
             context=situation,
             at=now(),
             version=version,
+            definition_hash=definition,
         )
         shown = capability.model_dump()
         if verdict.action == "allow":
-            record.approval = ToolCallApproval(status="allowed", pre_grant_id=verdict.pre_grant_id, capability=shown)
+            record.approval = ToolCallApproval(
+                status="allowed",
+                pre_grant_id=verdict.pre_grant_id,
+                capability=shown,
+                access_source=verdict.access_source,
+            )
+            if verdict.access_source is not None:
+                # N-06: the person sees which grant allowed the call (the agent does not).
+                self._emit(
+                    context, "tool_access_granted", node_id, id=call.id, name=call.name, source=verdict.access_source
+                )
             bind_call(CallBinding(tool=call.name, capability=capability, definition_hash=definition))
             return None
         if verdict.action == "deny":
             return self._deny_call(
-                context, node_id, call, record, verdict.code or "tool.denied_by_policy", verdict.reason or "", shown
+                context,
+                node_id,
+                call,
+                record,
+                verdict.code or "tool.denied_by_policy",
+                verdict.reason or "",
+                shown,
+                source=verdict.access_source,
             )
         run_id = context.run.id
         if suspend:
@@ -3337,6 +3360,36 @@ class RunManager:
                     "tool.approval_stale",
                     "The tool changed while this call waited for its approval, so it was not made",
                     shown,
+                )
+            # N-06 (spec 7.3 (7)): a deny or a safety limit that appeared while the call waited still refuses it; an
+            # approval of the one call never lifts them.
+            root = context.root.run
+            refused, _found = tool_policy.access_refusal(
+                call.name,
+                capability,
+                gate.call_context(
+                    run_id=run_id,
+                    node_id=node_id,
+                    trigger=root.trigger,
+                    trigger_ref=root.trigger_ref,
+                    agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
+                    conversation_id=root.id,
+                ),
+                at=now(),
+                version=_version,
+                definition_hash=definition,
+            )
+            if refused is not None:
+                gate.approvals.audit("stale", final, outcome=refused.code)
+                return self._deny_call(
+                    context,
+                    node_id,
+                    call,
+                    record,
+                    refused.code or "access.denied",
+                    refused.reason or "",
+                    shown,
+                    source=refused.access_source,
                 )
             # The call runs as approved, and only so: an MCP tool checks this again right before it sends the call.
             bind_call(CallBinding(tool=call.name, capability=final.capability, definition_hash=definition))
@@ -3485,7 +3538,12 @@ class RunManager:
             )
         root = context.root.run
         situation = gate.call_context(
-            run_id=run_id, node_id=node_id, trigger=root.trigger, trigger_ref=root.trigger_ref
+            run_id=run_id,
+            node_id=node_id,
+            trigger=root.trigger,
+            trigger_ref=root.trigger_ref,
+            agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
+            conversation_id=root.id,
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -3495,12 +3553,20 @@ class RunManager:
             context=situation,
             at=now(),
             version=version,
+            definition_hash=definition,
         )
         if verdict.action == "deny":
             if approvals.use(found, "stale") is not None:
                 approvals.audit("stale", found, outcome=verdict.code or "tool.denied_by_policy")
             return self._deny_call(
-                context, node_id, call, record, verdict.code or "tool.denied_by_policy", verdict.reason or "", shown
+                context,
+                node_id,
+                call,
+                record,
+                verdict.code or "tool.denied_by_policy",
+                verdict.reason or "",
+                shown,
+                source=verdict.access_source,
             )
         marked = approvals.use(found, "executed")
         if marked is None:
@@ -3694,9 +3760,14 @@ class RunManager:
         code: str,
         reason: str,
         shown: dict[str, str],
+        *,
+        source: str | None = None,
     ) -> str:
-        record.approval = ToolCallApproval(status="denied", code=code, capability=shown)
-        self._emit(context, "tool_denied", node_id, id=call.id, name=call.name, code=code, reason=reason)
+        """Refuse a call: the agent gets ``reason``; the person's event also names the deny or safety limit
+        (``source``, N-06), which never reaches the agent."""
+        record.approval = ToolCallApproval(status="denied", code=code, capability=shown, access_source=source)
+        extra = {} if source is None else {"source": source}
+        self._emit(context, "tool_denied", node_id, id=call.id, name=call.name, code=code, reason=reason, **extra)
         return reason
 
     def _expire_approvals(self, run_id: str) -> None:

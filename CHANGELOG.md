@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Access model v2, groundwork (N-06). It is off by default (`NODESTRO_ACCESS_GRANTS=1`, only together with
+  `NODESTRO_TOOL_APPROVALS=1`; activation needs gate G-2). See [docs/access-grants.md](docs/access-grants.md).
+  - Stored `Grant` and `Deny` records about a tool, folder, workflow, MCP server, connection or cloud provider, with
+    actions, scope, duration and mode (`tool_approvals.AccessRules`, collections `access_grants` and
+    `access_denies`).
+  - Only a `Person` writes them, and never from inside a tool call. Every change is audited (`access_*`) and goes to
+    the activity log.
+  - Global safety limits are code (`tool_policy.SAFETY_LIMITS`).
+  - `tool_policy.evaluate` checks safety limit, then deny, then grant, otherwise a missing grant. It reports the
+    kind of refusal (`access.missing_grant`, `access.denied`, `access.safety_limit`) and its source.
+  - The five effect classes are combinations of the `access` and `reach` axes. Folders compare by normalized path
+    components (NFC).
+  - When switched on, the tool gate refuses on a deny or safety limit first, and a matching grant replaces the
+    question. Switched off, nothing changes.
+  - New problem codes `access.*`, `tool.unattended_access_denied` and `tool.unattended_safety_limit`.
+  - Review fixes before merge:
+    - tool grants are bound to the tool version, classification and MCP definition;
+    - deny and safety limit are checked again after a person approves a waiting call;
+    - Windows path spellings (`\\?\`, trailing dots and spaces, 8.3 names, administrative shares) and more
+      system folders are handled, and the data folder is required for folder requests;
+    - `use` and `revoke` cannot overwrite each other;
+    - unattended grants for more than reading name their agents and last at most 30 days;
+    - times must carry a time zone;
+    - the grant or deny is recorded on the call (`ToolCallApproval.access_source`, left out when unset);
+    - agent tests never run a tool on a grant;
+    - denies on run-own tools are refused;
+    - desktop imports skip grants and denies;
+    - `access_source` is left out when unset by `Field(exclude_if=...)`, which keeps the OpenAPI schema typed.
+      The runtime now needs pydantic 2.12 or later;
+    - `//host/share` paths are UNC, root-relative paths are refused on Windows, and Windows grants compare
+      lower-cased names;
+    - records stored before `status` existed can be revoked.
+
 - Security (LD-020 follow-up 2): plain provider keys do not stay readable next to their sealed form.
   - `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE` checkpoint), called once
     after plain provider keys are sealed: data of releases without `secure_delete` kept copies of a plain key in free

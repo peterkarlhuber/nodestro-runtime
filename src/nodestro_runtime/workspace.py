@@ -125,10 +125,12 @@ from .skills import Skills
 from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
 from .tool_adoption import audit_revocation
 from .tool_approvals import (
+    AccessRules,
     ToolApprovalEvent,
     ToolApprovals,
     ToolGate,
     ToolPreGrants,
+    access_grants_enabled,
     approvals_enabled,
     checkpoints_enabled,
     max_paused,
@@ -500,6 +502,10 @@ class Workspace:
                 # M6b: pause runs at a waiting call instead of waiting in a thread (a second switch, default off).
                 checkpoints=checkpoints_enabled(),
                 max_paused=max_paused(),
+                # N-06: the access model v2 (a third switch, default off; activation needs gate G-2).
+                access=AccessRules(self.store).current if access_grants_enabled() else None,
+                offline=self.strict_offline,
+                protected_folders=(str(self.data_dir.resolve()),),
             )
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True

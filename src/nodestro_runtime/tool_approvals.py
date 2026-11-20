@@ -33,7 +33,7 @@ import json
 import os
 import threading
 import time
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, Field
 
@@ -43,7 +43,25 @@ from .platform_events import platform_events
 from .problems import NodestroError
 from .schemas import new_id, now
 from .storage import DocumentStore
-from .tool_policy import UNKNOWN, CallContext, PreGrantScope, ToolCapability, ToolPreGrant
+from .tool_policy import (
+    MAX_UNATTENDED_GRANT,
+    UNKNOWN,
+    AccessAction,
+    AccessContext,
+    AccessMode,
+    AccessResource,
+    AccessScope,
+    CallContext,
+    Deny,
+    DenyDuration,
+    Grant,
+    GrantDuration,
+    PreGrantScope,
+    ToolCapability,
+    ToolFacts,
+    ToolPreGrant,
+    folder_parts,
+)
 
 COLLECTION = "tool_approvals"
 #: The longest a call waits for a decision on a server (D10d; longer waits need an agent checkpoint).
@@ -140,6 +158,11 @@ AuditKind = Literal[
     "tool_adopted",
     "tool_adoption_refused",
     "tool_adoption_revoked",
+    # N-06: a person stored or revoked a grant or a deny of the access model v2.
+    "access_granted",
+    "access_grant_revoked",
+    "access_denied",
+    "access_deny_revoked",
 ]
 
 
@@ -216,6 +239,9 @@ def audit_target(event: ToolApprovalEvent) -> tuple[str, str]:
         return "run", event.run_id
     if event.kind.startswith("tool_adopt"):
         return "tool", event.tool or ""
+    if event.kind.startswith("access_"):
+        kind = "access_deny" if event.kind.startswith("access_deny") else "access_grant"
+        return kind, str(event.details.get("record_id", ""))
     return "tool_pre_grant", event.pre_grant_id or ""
 
 
@@ -607,6 +633,10 @@ class ToolApprovals:
 #: Switches per-call approvals on (``1``). Off by default: activating them is a separate, explicit step after the
 #: security acceptance (D10); while off, runs behave exactly as before S-2.
 ENABLE_ENV = "NODESTRO_TOOL_APPROVALS"
+#: Switches the access model v2 on (``1``; N-06, default off): stored grants and denies and the global safety limits
+#: take part in every tool call's decision. Only effective together with :data:`ENABLE_ENV`; activating it needs the
+#: owner's gate G-2. While off, the gate decides exactly as before.
+ACCESS_ENV = "NODESTRO_ACCESS_GRANTS"
 #: Pauses runs at a call that waits for a decision instead of waiting in a thread (``1``; M6b, default off). Only
 #: effective together with :data:`ENABLE_ENV`; activation is a separate decision like the approvals themselves.
 CHECKPOINTS_ENV = "NODESTRO_TOOL_APPROVAL_CHECKPOINTS"
@@ -619,6 +649,11 @@ DESKTOP_MAX_WAITING = 3
 
 def approvals_enabled() -> bool:
     return os.environ.get(ENABLE_ENV, "").strip() == "1"
+
+
+def access_grants_enabled() -> bool:
+    """Whether the access model v2 takes part in the gate (both switches on)."""
+    return approvals_enabled() and os.environ.get(ACCESS_ENV, "").strip() == "1"
 
 
 def checkpoints_enabled() -> bool:
@@ -685,6 +720,9 @@ class ToolGate:
         mcp_unattended: Callable[[], bool] = lambda: False,
         checkpoints: bool = False,
         max_paused: int = DEFAULT_MAX_PAUSED,
+        access: Callable[[], tuple[Sequence[Grant], Sequence[Deny]]] | None = None,
+        offline: Callable[[], bool] = lambda: False,
+        protected_folders: Sequence[str] = (),
     ) -> None:
         self.approvals = approvals
         #: Pause the run at a call that waits (M6b) instead of waiting in the agent's thread.
@@ -696,8 +734,23 @@ class ToolGate:
         self.pre_grants = pre_grants
         #: ADR-0007 D-7 (read-only MCP tools unattended), only after the MCP security acceptance.
         self.mcp_unattended = mcp_unattended
+        #: N-06: the stored grants and denies (:meth:`AccessRules.current`); ``None`` while the switch is off.
+        self.access = access
+        #: The strict offline setting (a safety limit of the access model v2).
+        self.offline = offline
+        #: Nodestro's own data folder: no folder grant opens it.
+        self.protected_folders = tuple(protected_folders)
 
-    def call_context(self, *, run_id: str, node_id: str, trigger: str, trigger_ref: str | None) -> CallContext:
+    def call_context(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        trigger: str,
+        trigger_ref: str | None,
+        agent: str | None = None,
+        conversation_id: str | None = None,
+    ) -> CallContext:
         """The situation of a call in a run started by ``trigger`` (the root run's): the one place that says
         whether a person can answer and which pre-grants count. The engine's gate and the warning before an
         unattended start (:mod:`nodestro_runtime.tool_preflight`) both use it, so they cannot disagree."""
@@ -712,6 +765,21 @@ class ToolGate:
             scope=scope,
             pre_grants=tuple(self.pre_grants(*scope)) if scope is not None else (),
             mcp_unattended=self.mcp_unattended(),
+            access=self._access(agent, conversation_id),
+        )
+
+    def _access(self, agent: str | None, conversation_id: str | None) -> AccessContext | None:
+        """Read at every call, so a revoked grant or a new deny applies at the next call."""
+        if self.access is None:
+            return None
+        grants, denies = self.access()
+        return AccessContext(
+            grants=tuple(grants),
+            denies=tuple(denies),
+            agent=agent,
+            conversation_id=conversation_id,
+            offline=self.offline(),
+            protected_folders=self.protected_folders,
         )
 
 
@@ -820,31 +888,280 @@ class ToolPreGrants:
         return revoked
 
 
+# ---- N-06: grants and denies of the access model v2 --------------------------------------------------------------
+
+GRANTS = "access_grants"
+DENIES = "access_denies"
+_Record = TypeVar("_Record", Grant, Deny)
+#: The run's own tools (agent memory, input files, knowledge proposals, skills): they never pass the per-call gate
+#: (:func:`~nodestro_runtime.agent_builder.run_own_tool`), so a deny on them is refused instead of silently ignored.
+RUN_OWN_TOOLS = frozenset({"memory", "input_files", "propose_knowledge", "load_skill", "read_skill_file"})
+#: Principals that are not a person: API keys (``api:<id>``) and the runtime itself.
+_NOT_PERSONS = frozenset({"system", "local-system"})
+
+
+@dataclass(frozen=True)
+class Person:
+    """The person who writes a grant or a deny: the only principal :class:`AccessRules` accepts.
+
+    The api builds it from a signed-in user (``local`` on a desktop). Machine principals (``system``, API keys
+    ``api:<id>``, anything with a ``:``) are refused, and no tool, model or agent context builds one: a grant is never
+    written by a model (spec 7.1)."""
+
+    id: str
+
+    def __post_init__(self) -> None:
+        if not self.id or ":" in self.id or self.id in _NOT_PERSONS or len(self.id) > 200 or not self.id.isprintable():
+            raise NodestroError("access.person_required", "Only a person can change grants and denies")
+
+
+class AccessRules:
+    """The grants and denies of one tenant (collections ``access_grants`` and ``access_denies``, key = record id).
+
+    Every change is written by a :class:`Person`, outside any tool call, and audited (:func:`record_audit`, which
+    also writes the activity log). Records are never deleted: a revocation sets ``revoked_at``, and the gate reads the
+    records at every call (:meth:`current`), so a change applies at the next call."""
+
+    def __init__(self, store: DocumentStore, *, clock: Callable[[], datetime] = now) -> None:
+        self.store = store
+        self.clock = clock
+
+    def grant(
+        self,
+        *,
+        resource: AccessResource,
+        actions: Sequence[AccessAction],
+        duration: GrantDuration,
+        by: Person,
+        scope: AccessScope = "all",
+        agents: Sequence[str] = (),
+        mode: AccessMode = "supervised",
+        expires_at: datetime | None = None,
+        conversation_id: str | None = None,
+        tool: ToolFacts | None = None,
+    ) -> Grant:
+        """Store a grant. A tool grant names the tool as it is now (``tool``, :meth:`ToolFacts.of`); it ends with a
+        new version, another classification or another MCP definition."""
+        at = self._check_writer(by)
+        _check_resource(resource)
+        if (resource.type == "tool") != (tool is not None):
+            raise NodestroError(
+                "access.tool_facts_required", "A tool grant names the tool's version and classification, and only it"
+            )
+        if "delete" in actions:
+            raise NodestroError(
+                "access.grant_destructive", "Deleting for good needs a confirmation each time; it cannot be granted"
+            )
+        _check_expiry(duration, expires_at, at)
+        if (duration == "conversation") != (conversation_id is not None):
+            raise NodestroError(
+                "access.conversation_required", "A grant for one conversation names that conversation, and only it"
+            )
+        if mode == "unattended" and set(actions) != {"read"}:
+            if duration not in ("until", "once"):
+                raise NodestroError(
+                    "access.unattended_expiry",
+                    "An unattended grant for more than reading needs an expiry date",
+                    duration=duration,
+                )
+            if scope == "all":
+                raise NodestroError(
+                    "access.unattended_scope", "An unattended grant for more than reading names its agents"
+                )
+            if expires_at is not None and expires_at - at > MAX_UNATTENDED_GRANT:
+                raise NodestroError(
+                    "access.unattended_too_long",
+                    "An unattended grant for more than reading lasts at most the maximum",
+                    days=MAX_UNATTENDED_GRANT.days,
+                )
+        found = _build(
+            Grant,
+            id=new_id("agr"),
+            resource=resource,
+            actions=tuple(dict.fromkeys(actions)),
+            scope=scope,
+            agents=tuple(agents),
+            duration=duration,
+            mode=mode,
+            expires_at=expires_at,
+            conversation_id=conversation_id,
+            created_at=at,
+            tool=tool,
+            granted_by=by.id,
+        )
+        self.store.put(GRANTS, found.id, found)
+        self._audit("access_granted", found, by=by.id, at=at)
+        return found
+
+    def deny(
+        self,
+        *,
+        resource: AccessResource,
+        actions: Sequence[AccessAction],
+        by: Person,
+        scope: AccessScope = "all",
+        agents: Sequence[str] = (),
+        mode: AccessMode | None = None,
+        duration: DenyDuration = "until_revoked",
+        expires_at: datetime | None = None,
+    ) -> Deny:
+        at = self._check_writer(by)
+        _check_resource(resource)
+        if resource.type == "tool" and resource.id in RUN_OWN_TOOLS:
+            # The run's own tools never pass the per-call gate, so such a deny would look effective and not be.
+            raise NodestroError(
+                "access.deny_not_enforced", "This tool belongs to the run and cannot be blocked", tool=resource.id
+            )
+        _check_expiry(duration, expires_at, at)
+        found = _build(
+            Deny,
+            id=new_id("adn"),
+            resource=resource,
+            actions=tuple(dict.fromkeys(actions)),
+            scope=scope,
+            agents=tuple(agents),
+            duration=duration,
+            mode=mode,
+            expires_at=expires_at,
+            created_at=at,
+            denied_by=by.id,
+        )
+        self.store.put(DENIES, found.id, found)
+        self._audit("access_denied", found, by=by.id, at=at)
+        return found
+
+    def revoke_grant(self, grant_id: str, *, by: Person) -> Grant:
+        return self._revoke(GRANTS, Grant, grant_id, by=by, kind="access_grant_revoked")
+
+    def revoke_deny(self, deny_id: str, *, by: Person) -> Deny:
+        return self._revoke(DENIES, Deny, deny_id, by=by, kind="access_deny_revoked")
+
+    def use(self, grant_id: str) -> bool:
+        """Mark an active ``once`` grant used: ``True`` for the one caller that may act on it. One compare-and-set
+        from ``active``, like a revocation, so a revoked or expired grant is never used and a revocation is never
+        lost."""
+        found = self.store.get(GRANTS, grant_id, Grant)
+        if found is None or found.duration != "once" or not found.active_at(self.clock()):
+            return False
+        used = found.model_copy(update={"status": "used"})
+        return self.store.replace_if(GRANTS, grant_id, used, field="status", expected="active")
+
+    def grants(self) -> list[Grant]:
+        """Every grant (revoked, expired and used ones included), newest first."""
+        found = self.store.list(GRANTS, Grant)
+        return sorted(found, key=lambda item: (item.created_at, item.id), reverse=True)
+
+    def denies(self) -> list[Deny]:
+        """Every deny (revoked and expired ones included), newest first."""
+        found = self.store.list(DENIES, Deny)
+        return sorted(found, key=lambda item: (item.created_at, item.id), reverse=True)
+
+    def current(self) -> tuple[list[Grant], list[Deny]]:
+        """What the gate evaluates (:class:`ToolGate` ``access``); :func:`~.tool_policy.evaluate` skips revoked and
+        expired records."""
+        return self.grants(), self.denies()
+
+    def _check_writer(self, by: Person) -> datetime:
+        if not isinstance(by, Person):
+            raise NodestroError("access.person_required", "Only a person can change grants and denies")
+        if _BINDING.get() is not None:
+            # Code that runs inside a tool call acts for a model: it never changes grants or denies.
+            raise NodestroError("access.in_tool_call", "Grants and denies cannot be changed from a tool call")
+        return self.clock()
+
+    def _revoke(self, collection: str, model: type[_Record], record_id: str, *, by: Person, kind: AuditKind) -> _Record:
+        at = self._check_writer(by)
+        found = self.store.get(collection, record_id, model)
+        if found is None:
+            raise NodestroError("access.not_found", "There is no such grant or deny", id=record_id)
+        if found.status != "active":
+            return found  # revoked already, or a once grant used before
+        revoked = found.model_copy(update={"status": "revoked", "revoked_at": at, "revoked_by": by.id})
+        if not self.store.replace_if(collection, record_id, revoked, field="status", expected="active"):
+            raw = self.store.get_raw(collection, record_id)
+            if not isinstance(raw, dict) or "status" in raw:
+                return self.store.get(collection, record_id, model) or found  # used or revoked in the meantime
+            # A record stored before ``status`` existed: the compare-and-set cannot see it. Nothing can use such a
+            # record (``use`` compares ``status`` too), so writing the revocation directly loses no use.
+            self.store.put(collection, record_id, revoked)
+        self._audit(kind, revoked, by=by.id, at=at)
+        return revoked
+
+    def _audit(self, kind: AuditKind, record: Grant | Deny, *, by: str, at: datetime) -> None:
+        """One audit event per change. It names the resource type, never a folder path (paths can name people)."""
+        details: dict[str, Any] = {
+            "record_id": record.id,
+            "resource_type": record.resource.type,
+            "actions": list(record.actions),
+            "scope": record.scope,
+            "duration": record.duration,
+            "mode": record.mode,
+            "expires_at": record.expires_at,
+        }
+        if record.resource.type != "folder":
+            details["resource_id"] = record.resource.id
+        tool = record.resource.id if record.resource.type == "tool" else None
+        record_audit(self.store, ToolApprovalEvent(at=at, kind=kind, actor=by, tool=tool, details=details))
+
+
+def _check_resource(resource: AccessResource) -> None:
+    if resource.type != "folder":
+        return
+    try:
+        folder_parts(resource.id)
+    except ValueError:
+        raise NodestroError("access.folder_path", "A folder is named by its absolute path") from None
+
+
+def _check_expiry(duration: str, expires_at: datetime | None, at: datetime) -> None:
+    if expires_at is not None and expires_at.tzinfo is None:
+        raise NodestroError("access.expiry", "An expiry date needs a time zone")
+    if (duration == "until") != (expires_at is not None):
+        raise NodestroError("access.expiry", "An expiry date belongs to the duration until a date, and only to it")
+    if expires_at is not None and expires_at <= at:
+        raise NodestroError("access.expiry", "The expiry lies in the past")
+
+
+def _build(model: type[_Record], **values: Any) -> _Record:
+    try:
+        return model(**values)
+    except ValueError:
+        # The message of a validation error can quote the input (a folder path): it is not passed on.
+        raise NodestroError("access.invalid", "The grant or deny is not valid") from None
+
+
 __all__ = [
+    "ACCESS_ENV",
     "AUDIT",
     "CHECKPOINTS_ENV",
     "COLLECTION",
     "DEFAULT_MAX_PAUSED",
     "DEFAULT_WAIT",
+    "DENIES",
     "DESKTOP_MAX_WAITING",
     "ENABLE_ENV",
     "EXECUTION_WINDOW",
     "FINAL",
+    "GRANTS",
     "INTERRUPTED",
     "MAX_PAUSED_ENV",
     "MAX_WAIT",
     "PRE_GRANTS",
     "REFUSALS",
+    "RUN_OWN_TOOLS",
     "SWITCH_OFF",
+    "AccessRules",
     "ApprovalStatus",
     "AuditKind",
     "CallUse",
+    "Person",
     "ToolApprovalEvent",
     "ToolApprovalRequest",
     "ToolApprovals",
     "ToolGate",
     "ToolPreGrants",
     "WaitingSlots",
+    "access_grants_enabled",
     "approvals_enabled",
     "arguments_hash",
     "audit_events",
