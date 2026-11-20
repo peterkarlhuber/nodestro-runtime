@@ -21,7 +21,7 @@ from nodestro_runtime.problems import NodestroError
 from nodestro_runtime.providers import ProviderSettingsIn
 from nodestro_runtime.schemas import SettingsIn
 from nodestro_runtime.server_settings import is_encrypted
-from nodestro_runtime.workspace import DATABASE, Workspace
+from nodestro_runtime.workspace import DATABASE, Workspace, backup_migrated_database
 
 SECRET = "sk-ant-canary-0123456789abcdefghij"
 TOKEN = "mcp-token-canary-abcdefghijklmnop"
@@ -223,6 +223,34 @@ def test_sealing_plain_keys_also_scrubs_pages_an_earlier_release_freed(tmp_path:
         assert workspace.provider_settings("anthropic")["api_key"] == SECRET
     finally:
         workspace.close()
+
+
+def test_sealing_plain_keys_also_seals_the_copies_from_before_a_migration(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    old = Workspace(data, integrations=[])
+    try:
+        old.update_settings(SettingsIn(providers={"anthropic": ProviderSettingsIn(api_key=SECRET)}))
+        assert old._sqlite is not None
+        copy = backup_migrated_database(old._sqlite, data / "backups", 0, 2)  # as an upgrade writes it
+    finally:
+        old.close()
+    (data / "backups" / "damaged.db").write_bytes(b"not a database")
+    assert SECRET.encode() in copy.read_bytes()
+    key = new_key()
+    workspace = open_workspace(data, key)
+    try:
+        assert all(SECRET.encode() not in path.read_bytes() for path in (data / "backups").iterdir())
+    finally:
+        workspace.close()
+    connection = sqlite3.connect(copy)
+    (document,) = connection.execute(
+        "SELECT data FROM nodestro_documents WHERE collection = 'settings' AND id = 'app'"
+    ).fetchone()
+    connection.close()
+    sealed = json.loads(document)["providers"]["anthropic"]["api_key"]
+    box = vault_box_from_env({VAULT_KEY_ENV: key})
+    assert box.decrypt("local", "providers.anthropic.api_key", sealed) == SECRET
+    assert (data / "backups" / "damaged.db").read_bytes() == b"not a database"
 
 
 # ---- rotation -----------------------------------------------------------------------------------------------------

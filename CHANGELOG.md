@@ -2,10 +2,17 @@
 
 ## Unreleased
 
-- Security (LD-020 follow-up 2): `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE`
-  checkpoint), called once after plain provider keys are sealed. Data of earlier releases without `secure_delete`
-  kept copies of a plain key in free pages that the checkpoint alone does not overwrite; found by
-  nodestro-local-docker's upgrade test from an image of the first backend audit, reproduced in a unit test.
+- Security (LD-020 follow-up 2): plain provider keys do not stay readable next to their sealed form.
+  - `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE` checkpoint), called once
+    after plain provider keys are sealed: data of releases without `secure_delete` kept copies of a plain key in free
+    pages that a checkpoint does not overwrite.
+  - `local_vault.seal_plain_copies` seals the plain provider keys in the data directory's database copies
+    (`backups/*.db`, written before a schema migration) whenever a workspace with a key opens; a copy that cannot be
+    read is left as it is. `local_vault.seal_plain_provider_keys` is the one sealing step for both.
+  - Found by nodestro-local-docker's upgrade test (the copy `backups/pre-migration-0-to-2-*.db` of an image of the
+    first backend audit held the plain key); both cases have unit tests.
+  - The `Workspace` documentation now says when the key check runs: after the schema migration (which touches no
+    secret), before any secret is sealed or written.
 - Security (LD-020 follow-up): sealing plain provider keys on opening ends with a WAL checkpoint
   (`SQLiteStore.checkpoint()`, `PRAGMA wal_checkpoint(TRUNCATE)`), so the plain keys leave the write-ahead log and the
   database file's old page at once, not only at SQLite's next automatic checkpoint. Found by nodestro-local-docker's
@@ -13,8 +20,8 @@
 - Security (LD-020): the key of a local data directory (`nodestro_runtime.local_vault`), for Nodestro Local Docker's
   key file on the host.
   - `Workspace(verify_vault_key=True)` requires a key (`secrets.vault_key_missing`) and stores a check value sealed
-    with it on the first opening (`local_vault/check`); a key that cannot open it is refused before anything is
-    migrated or written (`secrets.vault_key_mismatch`), so a new key is never laid over secrets sealed with another.
+    with it on the first opening (`local_vault/check`); a key that cannot open it is refused before any secret is
+    sealed or written (`secrets.vault_key_mismatch`), so a new key is never laid over secrets sealed with another.
     Data without a check value is refused when it holds sealed secrets and none of them opens.
   - `local_vault.rekey(data_dir, old, new)` seals provider keys, MCP tokens, pending MCP sign-ins and connection
     secrets of a stopped data directory with a new key in one transaction (no schema migration, so it also works on
