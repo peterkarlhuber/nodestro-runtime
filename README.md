@@ -216,8 +216,17 @@ always in the prompt or loaded on demand with the run's own tools `load_skill` a
 instructions only; they never grant tools or permissions, and their scripts are never run. Releases freeze the
 versions they use. Details: [docs/skills.md](docs/skills.md).
 
-**Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or from an
-installed integration), `user-authored` (every version of it was written by a person in the tool editor) or
+**Tools of installed integrations are locked.** An integration installed through the entry point group
+`nodestro.integrations` keeps its OCR engine, but its tools are not offered: they would run in the host process, which
+sees the environment, the unlocked vault and the whole file system, and a time limit does not stop them. Foreign code
+runs only in the Docker sandbox (owner decision 2026-11-20), and extension tools cannot use it yet (TODO RT-083).
+`NODESTRO_EXTENSION_TOOLS=1` is the switch that path will honour; today it unlocks nothing and only changes the reason
+(`Extensions.locked`: `off` or `isolation_unavailable`, also in `Extensions.summary()`). A capability an installed
+integration states for its tools counts as unknown (write, external), never as the author's word. Integrations passed
+explicitly (`Workspace(integrations=[...])`) are the embedding application's own code and keep their tools.
+
+**Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or passed
+explicitly as an integration), `user-authored` (every version of it was written by a person in the tool editor) or
 `untrusted` (AI-generated, including approved generated tools and tool drafts, or of unknown provenance).
 `nodestro_runtime.sandbox_policy.SandboxPolicy` decides before any code runs: untrusted code runs only in an
 isolating sandbox (a Docker container; on the desktop also the built-in Linux sandbox once this computer passed its

@@ -346,6 +346,7 @@ class Workspace:
         self.extensions = Extensions(
             discover() if integrations is None else integrations,
             strict=integrations is not None,
+            installed=integrations is None,
             reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS) if tool.name},
         )
         self.store: DocumentStore
