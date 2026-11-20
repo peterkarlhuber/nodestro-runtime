@@ -527,6 +527,7 @@
   "run.agent.HistoryConversionError": ["type"],
   "run.agent.IncompleteResponseError": ["type"],
   "run.agent.InvalidRequestError": ["type"],
+  "run.agent.MCPError": ["type"],
   "run.agent.MaxToolCallsError": ["type"],
   "run.agent.MaxToolRoundsError": ["calls", "local", "looping", "repeated", "rounds", "tool", "type"],
   "run.agent.MemoryToolError": ["type"],

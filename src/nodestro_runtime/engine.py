@@ -47,6 +47,7 @@ from orkexa import (
     ContentBlock,
     Criterion,
     DataResidencyError,
+    Denial,
     EphemeralMemory,
     Evaluator,
     IncompleteResponseError,
@@ -4301,7 +4302,7 @@ class RunManager:
             self._check_owned(context)
             context.tracker.check()
 
-        def before_tool(call: ToolCall) -> str | None:
+        def before_tool(call: ToolCall) -> Denial | None:
             context.check()
             # A resumed call keeps the record it got when it was asked about.
             record = next((item for item in state.tool_calls if item.id == call.id), None) if call.resumed else None
@@ -4331,7 +4332,10 @@ class RunManager:
                 # have had effects outside Nodestro, and continuing it asks first (audit B-02).
                 tool_journal.record(self.store, context.run.id, node_id, iteration, call.id, call.name, call.input)
             self._emit(context, "tool_started", node_id, id=call.id, name=call.name, input=call.input)
-            return denial
+            # Each reason above is a fixed runtime text; the model reads the same words as before (W0-3, L-4).
+            return (
+                None if denial is None else Denial(model_text=f"Tool call denied: {denial}", code=_denial_code(record))
+            )
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             request = released.pop(call.id, None)
@@ -5059,6 +5063,11 @@ def _child_ids(run: Run) -> list[str]:
 _CODED_TOOL_ERROR = re.compile(r"^(?P<code>[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+):")
 #: Approval verdicts that mean the call was not made.
 _REFUSED_CALLS = ("rejected", "expired", "denied")
+
+
+def _denial_code(record: ToolCallRecord) -> str | None:
+    """The problem code of a refused call, for the host's records only (``Denial.code`` never reaches a model)."""
+    return record.approval.code if record.approval is not None else None
 
 
 def run_warnings(run: Run) -> list[RunWarning]:
