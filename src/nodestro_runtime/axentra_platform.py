@@ -1600,13 +1600,15 @@ class AxentraEvents:
     # -- reconciliation ------------------------------------------------------------------------------
 
     def reconcile(self, *, dry_run: bool = False, tenant: str | None = None) -> dict[str, Any]:
-        """Write the mirrors that are missing (a failed mirror, records from before the switch was on).
+        """Write the mirrors that are missing (a failed mirror, records from before the switch was on): approval
+        audit events, MCP events, the activity events that mirror themselves (:mod:`.activity`) and usage.
 
         Idempotent and resumable: usage replays its idempotency keys (nothing is counted twice; entries older than
         :data:`USAGE_RECONCILE_DAYS` are reported, not written, because Axentra refuses them); an audit event is
         written only when no Axentra event carries its ``nodestro_event`` id. Nodestro's records are only read."""
         from datetime import datetime, timedelta
 
+        from . import activity
         from .tool_approvals import AUDIT, REFUSALS, ToolApprovalEvent, audit_details, audit_target
         from .usage_log import UsageLog
 
@@ -1673,6 +1675,18 @@ class AxentraEvents:
                                 outcome="success",
                                 details=_stored_mcp_details(data),
                             )
+                # Activity events of sources that are not mirrored by their own record (N-13).
+                for data in self._documents(tenant_id, activity.COLLECTION):
+                    try:
+                        item = activity.ActivityEvent.model_validate(data)
+                    except ValueError:  # a damaged document is left out, never the reconciliation
+                        continue
+                    if item.source in activity.MIRRORED_BY_SOURCE or item.id in known:
+                        continue
+                    report["audit_missing"] += 1
+                    if not dry_run:
+                        with store.transaction():
+                            self.audit(tenant_id, **activity.mirror_audit(item))
             if self.usage_enabled:
                 recorded = self._mirrored_usage(tenant_id)
                 for entry in UsageLog(store).entries():

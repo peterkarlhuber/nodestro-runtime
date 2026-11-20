@@ -336,3 +336,28 @@ def test_older_mcp_events_are_reconciled_without_their_full_address(mirrored: tu
     (row,) = _audit_rows(database)
     assert row[0] == "nodestro.mcp.server_changed" and row[6]["url"] == "https://mcp.example"
     assert row[6]["nodestro_event"] == event.id and events.reconcile(tenant="beta")["audit_missing"] == 0
+
+
+def test_activity_events_are_mirrored_once_and_reconciled(mirrored: tuple[Any, AxentraEvents]) -> None:
+    from nodestro_runtime import activity
+
+    database, events = mirrored
+    store = database.store("alpha")
+    called = activity.add(store, "tool_call", "tool.called", actor="usr_1", resource_type="tool", resource_id="calc")
+    record_audit(store, _event())  # mirrored by its own record, not a second time as an activity event
+    assert called is not None
+    rows = _audit_rows(database)
+    assert sorted(row[0] for row in rows) == ["nodestro.tool.called", "nodestro.tool_approval.decided"]
+    mirrored_call = next(row for row in rows if row[0] == "nodestro.tool.called")
+    assert (mirrored_call[1], mirrored_call[4], mirrored_call[5]) == ("success", "tool", "calc")
+    assert mirrored_call[6]["nodestro_event"] == called.id
+    database.platform_events = None  # stored before the mirror was switched on
+    older = activity.add(store, "file", "file.uploaded", resource_type="input_file", resource_id="in_000000000001")
+    database.platform_events = events
+    assert older is not None
+    report = events.reconcile(tenant="alpha")
+    assert (report["audit_missing"], report["written"]) == (1, 1)
+    assert [row[6]["nodestro_event"] for row in _audit_rows(database) if row[0] == "nodestro.file.uploaded"] == [
+        older.id
+    ]
+    assert events.reconcile(tenant="alpha")["audit_missing"] == 0

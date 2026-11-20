@@ -47,8 +47,8 @@ from orkexa.embeddings import OllamaEmbeddings
 from orkexa.local import OllamaError, check_model_name
 from orkexa.providers.base import redact
 
+from . import activity, docker_status, local_vault, output_limits, run_budget, sandbox_selection
 from . import bedrock as bedrock_auth
-from . import docker_status, local_vault, output_limits, run_budget, sandbox_selection
 from .agent_builder import AgentBuilder
 from .agent_test import AgentTester
 from .builtin_sandbox import LinuxSandbox
@@ -399,6 +399,7 @@ class Workspace:
             self._secrets = storage.secrets
             self.knowledge = KnowledgeBase(storage.knowledge, ocr=ocr_runner, engine=self.extensions.ocr)
             self.memory = MemorySpaces(storage.memory)
+        self.knowledge.activity = self.store  # uploads and deletions go to the activity log
         # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
         self._environ: Mapping[str, str] | None = None if storage is None else {}
         self._endpoints: tuple[str, ...] | None = None if storage is None else storage.endpoints
@@ -592,6 +593,12 @@ class Workspace:
             self.inputs.cleanup()
         except Exception:  # cleaning up is housekeeping; it never stops Nodestro from starting
             logging.getLogger(__name__).exception("Cleaning up input files failed")
+        if storage is None:
+            # Activity events past their retention (a server prunes in its housekeeping, not per workspace).
+            try:
+                activity.prune(self.store, days=activity.retention_days())
+            except Exception:  # housekeeping; it never stops Nodestro from starting
+                logging.getLogger(__name__).exception("Pruning the activity log failed")
 
     def _store_model_defaults(self, *, fresh: bool) -> None:
         """Record once which default models this installation started with (D4): a new installation uses local models,
