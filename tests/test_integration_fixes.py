@@ -16,7 +16,7 @@ from nodestro_runtime.testing import ScriptedClient, text
 from nodestro_runtime.workspace import Workspace
 
 Make = Callable[..., Workspace]
-#: A reviewer's comment that must never reach a result, a result file or a decision.
+#: A reviewer's comment that must never reach a result, a result file, a decision or a model.
 SECRET = "INTERNAL-REVIEW-NOTE-7f3a"
 
 
@@ -108,15 +108,22 @@ async def test_a_rejection_comment_does_not_reach_the_result(make: Make) -> None
     assert SECRET.encode() not in workspace.files.content(done.id, item.id)[1]
 
 
-async def test_a_later_agent_still_reads_the_comment(make: Make) -> None:
+async def test_a_later_agent_reads_the_note_but_never_the_comment(make: Make) -> None:
+    # Formerly test_a_later_agent_still_reads_the_comment: by owner decision E-0R-1 A the comment is for people only,
+    # and later agents read the separate note to the agent (more cases in test_approval_agent_note.py).
     workspace = make({"DRAFT": [text("draft")], "REVISE": [text("revised")]})
     flow = approval_flow(
         [agent("revise", "REVISE", task_template="{{Draft}}\n{{Review}}"), {"id": "out", "type": "output"}],
         [edge("check", "revise", "approved"), edge("revise", "out")],
     )
-    done = await decided(workspace, flow, "approved", "shorten the intro")
+    saved = workspace.save_workflow(flow)
+    paused = await workspace.wait((await workspace.run(saved, RunIn(input="Customer complaint"))).id, timeout=20)
+    workspace.decide(paused.id, "check", "approved", SECRET, agent_note="shorten the intro")
+    done = await workspace.wait(paused.id, timeout=20)
     assert done.output == "revised"
-    assert "shorten the intro" in (done.nodes["revise"].prompt or "")
+    prompt = done.nodes["revise"].prompt or ""
+    assert prompt.count("shorten the intro") == 1 and SECRET not in prompt
+    assert SECRET not in str(workspace.fake.messages.calls)  # type: ignore[attr-defined]
 
 
 async def test_a_decision_after_an_approval_evaluates_the_result_only(make: Make) -> None:

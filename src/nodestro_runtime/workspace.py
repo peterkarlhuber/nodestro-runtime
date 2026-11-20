@@ -1451,9 +1451,11 @@ class Workspace:
             raise KeyError(run_id)
         return found
 
-    def decide(self, run_id: str, node_id: str, decision: str, comment: str = "") -> Run:
-        """Decide a waiting approval (``approved`` or ``rejected``); the run continues by itself."""
-        return self.runs.decide(run_id, node_id, decision, comment)
+    def decide(self, run_id: str, node_id: str, decision: str, comment: str = "", *, agent_note: str = "") -> Run:
+        """Decide a waiting approval (``approved`` or ``rejected``); the run continues by itself.
+
+        ``comment`` is for people only; ``agent_note`` is the only text later agents read (E-0R-1 A)."""
+        return self.runs.decide(run_id, node_id, decision, comment, agent_note=agent_note)
 
     def cancel(self, run_id: str) -> bool:
         """Ask a running run to stop; ``False`` when it is not running."""

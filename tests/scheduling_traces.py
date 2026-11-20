@@ -73,6 +73,11 @@ def edge(source: str, target: str, handle: str | None = None) -> dict[str, Any]:
     return {"id": f"{source}-{target}-{handle or ''}", "source": source, "target": target, "source_handle": handle}
 
 
+def person_only(text: str) -> str:
+    """The comment of a scripted decision: for people only, so never part of a recorded prompt."""
+    return f"{text}-person-only"
+
+
 def scenario(
     name: str,
     nodes: list[dict[str, Any]],
@@ -84,7 +89,8 @@ def scenario(
 ) -> dict[str, Any]:
     """``agents``: per agent node ``ok`` (default), ``fail``, ``cancelled``, ``cancel_run`` or a word.
 
-    ``decisions``: ``[node, decision, comment]`` in the order a person makes them.
+    ``decisions``: ``[node, decision, text]`` in the order a person makes them; the text is the decision's note to
+    the agents, :func:`person_only` of it its comment.
     ``children``: workflows saved first (sub-workflows refer to them by ``id``).
     """
     return {
@@ -352,7 +358,9 @@ async def play(workspace: Workspace, scripted: Scripted, case: dict[str, Any]) -
         state = target.nodes.get(node_id)
         if state is None or state.status != "awaiting_approval":
             continue
-        workspace.decide(target.id, node_id, decision, comment)
+        # The recorded text goes to the agents as the note; the comment differs from it, so a comment that reached a
+        # prompt would show in the trace (E-0R-1 A: the comment never reaches a model).
+        workspace.decide(target.id, node_id, decision, person_only(comment), agent_note=comment)
         await asyncio.sleep(0)
         run = await workspace.wait(started.id, timeout=20)
     per_node: dict[str, list[list[Any]]] = {}

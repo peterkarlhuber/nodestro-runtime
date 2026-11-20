@@ -376,14 +376,25 @@ class ConditionConfig(_Model):
     on_invalid: Literal["default", "fail"] = "default"
 
 
+#: Longest comment of an approval decision (longer ones are cut, as before) and longest note to the later agents (a
+#: longer note is refused: it is model input and must reach the model as written).
+APPROVAL_COMMENT_MAX_CHARS = 4000
+AGENT_NOTE_MAX_CHARS = 2000
+
+
 class ApprovalConfig(_Model):
     """A pause for a person who approves or rejects the results that arrive here."""
 
     instructions: str = ""
     #: Ids of the nodes whose results the person reviews; empty: everything that arrives.
     show: list[str] = Field(default_factory=list)
+    #: The comment is for people only (the run's view, the audit trail); no model ever reads it (E-0R-1 A).
     allow_comment: bool = True
     require_comment_on_reject: bool = False
+    #: Whether the person may write a note to the later agents (``ApprovalRecord.agent_note``), the only text of a
+    #: decision a model reads. ``None``: a workflow saved before the note existed; it is allowed, and the workflow check
+    #: warns once (``check.approval_comment_not_forwarded``) until the workflow is saved with ``True`` or ``False``.
+    allow_agent_note: bool | None = None
     #: After a rejection: follow the ``rejected`` branch (if connected), or end the run as cancelled.
     on_reject: Literal["branch", "stop"] = "branch"
 
@@ -956,7 +967,12 @@ class ApprovalRecord(_Model):
     """A person's decision at an approval node; nothing is ever approved automatically."""
 
     decision: Literal["approved", "rejected"]
+    #: For people only (the run's view, notifications, the audit trail): never part of a model's request (E-0R-1 A).
     comment: str = ""
+    #: The person's note to the later agents: plain text, at most ``AGENT_NOTE_MAX_CHARS`` characters. The only text
+    #: of the decision a model reads, framed as a person's note (``engine.approval_note``). Empty for decisions
+    #: recorded before the note existed.
+    agent_note: str = ""
     decided_at: datetime = Field(default_factory=now)
     #: Who decided: ``local`` (Nodestro has no user accounts: the user of this installation) or
     #: ``api:<key id>`` for a decision sent to a published workflow API.

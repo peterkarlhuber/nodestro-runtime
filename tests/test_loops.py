@@ -185,12 +185,14 @@ async def test_a_rejected_approval_sends_the_draft_back_also_after_a_restart(
     saved = first.save_workflow(approval_loop())
     run = await first.wait((await first.run(saved, RunIn(input="offer"))).id, timeout=10)
     assert run.status == "paused"
-    first.decide(run.id, "check", "rejected", "too long")
+    # The comment is for people only; the note to the agent is what the next iteration reads (E-0R-1 A).
+    first.decide(run.id, "check", "rejected", "reviewer-only remark", agent_note="too long")
     run = await first.wait(run.id, timeout=10)
     assert run.status == "paused"
     assert run.nodes["check"].iteration == [1] and run.nodes["check"].approval is None
     assert run.nodes["check"].earlier[0].approval is not None
     assert "too long" in first.prompts["draft"][1]  # type: ignore[attr-defined]
+    assert "reviewer-only remark" not in first.prompts["draft"][1]  # type: ignore[attr-defined]
     first.close()
 
     # Another process continues the stored run with its stored flow state.

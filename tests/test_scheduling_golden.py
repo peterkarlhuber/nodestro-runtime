@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scheduling_traces import GOLDEN, Scripted, play, scenarios
+from scheduling_traces import GOLDEN, Scripted, person_only, play, scenarios
 
 from nodestro_runtime import engine
 from nodestro_runtime.testing import ScriptedClient
@@ -42,6 +42,10 @@ async def test_trace_matches_the_recorded_one(
         trace = await play(workspace, scripted, case)
     finally:
         workspace.close()
+    recorded_text = json.dumps(trace, ensure_ascii=False)
+    for _node, _decision, text in case["decisions"]:
+        if text:
+            assert person_only(text) not in recorded_text  # a comment never reaches a prompt (E-0R-1 A)
     if os.environ.get("NODESTRO_WRITE_GOLDEN"):
         _written[case["name"]] = trace
         GOLDEN.write_text(json.dumps(_written, indent=1, sort_keys=True) + "\n", encoding="utf-8")

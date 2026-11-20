@@ -23,7 +23,8 @@ Rules of the data flow
   here ignore loop connections: the rest of the graph stays acyclic.
 - Decision and approval nodes pass data through: a node behind them receives the
   results that arrived at them, named after the agents that produced them. An
-  approval's comment is passed on as well.
+  approval passes on the person's note to the agents (``ApprovalRecord.agent_note``) under its
+  own name, never the reviewer's comment, which is for people only (E-0R-1 A).
 """
 
 from __future__ import annotations
@@ -146,8 +147,10 @@ def data_sources(workflow: Workflow | WorkflowIn, node_id: str) -> list[str]:
     return found
 
 
-def comment_sources(workflow: Workflow | WorkflowIn, node_id: str) -> list[str]:
-    """The approval nodes on the way to ``node_id`` whose comment the node receives (by their name)."""
+def note_sources(workflow: Workflow | WorkflowIn, node_id: str) -> list[str]:
+    """The approval nodes on the way to ``node_id`` whose note to the agents the node receives (by their name).
+
+    Only the note (``ApprovalRecord.agent_note``) arrives, never the comment (E-0R-1 A)."""
     nodes = {node.id: node for node in workflow.nodes}
     incoming = predecessors(workflow)
     found: list[str] = []
@@ -165,6 +168,10 @@ def comment_sources(workflow: Workflow | WorkflowIn, node_id: str) -> list[str]:
 
     visit(node_id)
     return found
+
+
+#: The former name of :func:`note_sources` (nodestro-examples uses it); the comment itself no longer arrives.
+comment_sources = note_sources
 
 
 def ancestors(workflow: Workflow | WorkflowIn, node_id: str) -> set[str]:
@@ -254,6 +261,11 @@ def fingerprints(
         if isinstance(agent, dict) and agent.get("thinking_budget") is None:
             # Added later with a default that changes nothing: runs of earlier releases keep their fingerprints.
             agent.pop("thinking_budget", None)
+        approval = config.get("approval")
+        if isinstance(approval, dict) and approval.get("allow_agent_note") is not False:
+            # Added later (E-0R-1 A); unset or allowed it works as before the field existed: earlier runs keep their
+            # fingerprints, also after the workflow was saved with the note allowed.
+            approval.pop("allow_agent_note", None)
         parts: dict[str, Any] = {"node": config}
         parts["inputs"] = sorted(
             (result.get(edge.source, ""), edge.source, edge.source_handle or "") for edge in incoming[node.id]

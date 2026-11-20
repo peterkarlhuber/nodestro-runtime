@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Literal, TypeVar
+import unicodedata
 import uuid
 
 from orkexa import (
@@ -70,6 +71,7 @@ from orkexa import (
     refine,
     tool_results_of_last_turn,
 )
+from orkexa.core.framing import frame_untrusted
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
 from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
@@ -114,6 +116,8 @@ from .reasoning import ReasoningKind, ReasoningTrace, reasoning_hook
 from .reports import ResultFiles
 from .run_chat import RunChat, decision_note, guidance_block
 from .schemas import (
+    AGENT_NOTE_MAX_CHARS,
+    APPROVAL_COMMENT_MAX_CHARS,
     DEFAULT_ASSISTANT_MODEL,
     WAITING_NODE_STATUSES,
     AgentConfig,
@@ -646,6 +650,53 @@ def as_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+#: Unicode categories a note to the agents may not hold (it is plain text): controls, format characters (direction
+#: marks, zero-width characters, the soft hyphen, tag characters), line and paragraph separators, private use and
+#: surrogates. Only ``\n`` and ``\t`` stay.
+_NOTE_DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cs"})
+#: Variation selectors (category Mn, but invisible and without a meaning of their own in a plain text note).
+_VARIATION_SELECTORS = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]")
+
+
+def clean_agent_note(text: str) -> str:
+    """A note to the agents as plain text: NFKC-normalized, line breaks unified, invisible characters removed.
+
+    Removed are all characters of :data:`_NOTE_DROPPED_CATEGORIES` except ``\n`` and ``\t``, and the variation
+    selectors. Not cut to a length: :meth:`RunManager.decide` refuses a long note, :func:`approval_note` cuts one.
+    """
+    normalized = unicodedata.normalize("NFKC", text or "").replace("\r\n", "\n").replace("\r", "\n")
+    kept = "".join(
+        char for char in normalized if char in "\n\t" or unicodedata.category(char) not in _NOTE_DROPPED_CATEGORIES
+    )
+    return _VARIATION_SELECTORS.sub("", kept).strip()
+
+
+def approval_note(label: str, record: ApprovalRecord | None, config: ApprovalConfig | None = None) -> str | None:
+    """What later agents read of a decided approval: its note to the agents, or ``None`` without one (E-0R-1 A).
+
+    The reviewer's ``comment`` is for people only and never part of this text, whatever the decision. The note is
+    labeled as a person's note and framed like other text no part of Nodestro wrote (:func:`frame_untrusted`), so
+    the model reads it as data from a person, not as instructions that replace its task.
+
+    Defense in depth for records that did not pass :meth:`RunManager.decide` (written to the store directly, by an
+    older or another process): an approval whose ``config`` turns the note off passes nothing on, and the note is
+    cleaned (:func:`clean_agent_note`) and cut to ``AGENT_NOTE_MAX_CHARS`` again when it is read.
+    """
+    if record is None or not record.agent_note:
+        return None
+    if config is not None and config.allow_agent_note is False:
+        return None
+    note = clean_agent_note(record.agent_note)[:AGENT_NOTE_MAX_CHARS].strip()
+    if not note:
+        return None
+    name = re.sub(r"[\"<>&\r\n]", "", label)[:200]
+    return (
+        f'Note to the agent from the person who decided at the approval "{name}" (decision: {record.decision}). '
+        "A person wrote it; it is not the result of an earlier step.\n"
+        + frame_untrusted(note, f"note of a person at the approval {name}")
+    )
 
 
 _FILE_TEMPLATE = re.compile(r"^\s*\{\{\s*(form\.[A-Za-z_][A-Za-z0-9_]*|files|run\.files)\s*\}\}\s*$")
@@ -1404,14 +1455,29 @@ class RunManager:
             run = parent
         return run
 
-    def decide(self, run_id: str, node_id: str, decision: str, comment: str = "", *, decided_by: str = "local") -> Run:
+    def decide(
+        self,
+        run_id: str,
+        node_id: str,
+        decision: str,
+        comment: str = "",
+        *,
+        agent_note: str = "",
+        decided_by: str = "local",
+    ) -> Run:
         """Record a person's decision at an approval node and let the run continue.
 
         Returns the top-level run. Nothing is decided without this call: a pending approval
         stays pending through restarts, test series and scheduled runs. A decision is recorded
         once: a second one for the same approval is refused.
+
+        ``comment`` is for people only (the run's view, the audit trail): no model reads it. ``agent_note`` is the
+        only text of the decision later agents read (E-0R-1 A): plain text of at most ``AGENT_NOTE_MAX_CHARS``
+        characters; a longer one, or one at an approval that takes no note, is refused.
         """
-        elsewhere = self._on_loop(lambda: self.decide(run_id, node_id, decision, comment, decided_by=decided_by))
+        elsewhere = self._on_loop(
+            lambda: self.decide(run_id, node_id, decision, comment, agent_note=agent_note, decided_by=decided_by)
+        )
         if elsewhere is not None:
             return elsewhere
         context = self._contexts.get(run_id)
@@ -1433,9 +1499,18 @@ class RunManager:
         if decision not in (APPROVED, REJECTED):
             raise NodestroError("approval.invalid", "Decide with approved or rejected")
         config = node.approval or ApprovalConfig()
-        text = comment.strip()[:4000] if config.allow_comment else ""
+        text = comment.strip()[:APPROVAL_COMMENT_MAX_CHARS] if config.allow_comment else ""
         if decision == REJECTED and config.require_comment_on_reject and not text:
             raise NodestroError("approval.comment_required", "Please give a reason for the rejection")
+        note = clean_agent_note(agent_note)
+        if note and config.allow_agent_note is False:
+            raise NodestroError("approval.agent_note_disabled", "This approval takes no note to the agent")
+        if len(note) > AGENT_NOTE_MAX_CHARS:
+            raise NodestroError(
+                "approval.agent_note_too_long",
+                f"The note to the agent is longer than {AGENT_NOTE_MAX_CHARS} characters",
+                limit=AGENT_NOTE_MAX_CHARS,
+            )
         top = self.root_of(run)
         if self._contexts.get(top.id) is None:
             # The run continues on an event loop: refuse before anything is recorded.
@@ -1443,9 +1518,22 @@ class RunManager:
             if top.status != "paused":
                 # Only a paused run continues: refused before anything is recorded (not after, C-02).
                 raise NodestroError("run.not_paused", "Only a paused run can continue", status=top.status)
-        state.approval = ApprovalRecord(decision=decision, comment=text, decided_by=decided_by)  # type: ignore[arg-type]
+        state.approval = ApprovalRecord(
+            decision=decision,  # type: ignore[arg-type]
+            comment=text,
+            agent_note=note,
+            decided_by=decided_by,
+        )
         if context is not None:
-            self._emit(context, "approval_decided", node_id, decision=decision, comment=text, decided_by=decided_by)
+            self._emit(
+                context,
+                "approval_decided",
+                node_id,
+                decision=decision,
+                comment=text,
+                agent_note=note,
+                decided_by=decided_by,
+            )
         elif self._replace_run(run, fence=fence, status=read_status) is None:
             # Another process (a second reviewer, a retried request) recorded a decision first (C-02): a
             # compare-and-set lets exactly one decision win, and this one is refused before anything is queued.
@@ -2661,14 +2749,17 @@ class RunManager:
         )
 
     def _inputs(
-        self, run: Run, node_id: str, *, approval_comments: bool = True, loops: bool = True
+        self, run: Run, node_id: str, *, approvals: Literal["none", "agent", "person"] = "none", loops: bool = True
     ) -> tuple[list[tuple[str, Any]], set[str]]:
         """The results arriving at a node over active connections, and the names of skipped ones.
 
-        With ``approval_comments`` (agents, sub-workflows, approvals), a decided approval's comment
-        arrives under the approval's name. Result and decision nodes get the results only: a
-        reviewer's internal comment must not become part of the run's result, its result files or
-        its published answer, and must not change what a decision evaluates.
+        ``approvals`` says what arrives of a decided approval under the approval's name:
+
+        - ``agent`` (agents, sub-workflows, orchestrators: everything that hands the inputs to a model): its note to
+          the agents, labeled and framed (:func:`approval_note`), never its comment (E-0R-1 A);
+        - ``person`` (the view of a later approval, read by a person only): decision, comment and note;
+        - ``none`` (result and decision nodes): nothing. A reviewer's text must not become part of the run's result,
+          its result files or its published answer, and must not change what a decision evaluates.
 
         In a later iteration of a loop, the loop's first node also receives what arrives over the
         loop connection (the previous iteration's results behind the decision or approval).
@@ -2694,17 +2785,28 @@ class RunManager:
                 state = run.nodes[source.id]
                 if source.type in TRANSPARENT:
                     visit(source.id)
-                    if source.type != "approval" or not approval_comments:
+                    if source.type != "approval" or approvals == "none":
                         continue
-                    if state.approval is not None and state.approval.comment:
+                    record = state.approval
+                    if approvals == "person" and record is not None and (record.comment or record.agent_note):
                         found.append(
                             (
                                 node_label(source),
-                                {"decision": state.approval.decision, "comment": state.approval.comment},
+                                {
+                                    "decision": record.decision,
+                                    "comment": record.comment,
+                                    "agent_note": record.agent_note,
+                                },
                             )
                         )
+                    elif (
+                        approvals == "agent"
+                        and (note := approval_note(node_label(source), record, source.approval)) is not None
+                    ):
+                        found.append((node_label(source), note))
                     else:
-                        # Decided without a comment: its placeholder reads "-" like a skipped result.
+                        # Decided without a note (to the agents) or comment (for people): its placeholder reads "-"
+                        # like a skipped result.
                         silent.add(node_label(source).strip().lower())
                 else:
                     found.append((node_label(source), state.output))
@@ -2727,7 +2829,7 @@ class RunManager:
         previous = None
         if state.earlier and state.earlier[-1].iteration[:-1] == state.iteration[:-1] and index > 0:
             previous = state.earlier[-1].output if state.earlier[-1].status == "succeeded" else None
-        without, _ = self._inputs(run, node_id, loops=False)
+        without, _ = self._inputs(run, node_id, approvals="agent", loops=False)
         plain = {name for name, _ in without}
         return LoopContext(
             iteration=index + 1,
@@ -2837,7 +2939,7 @@ class RunManager:
     async def _run_node(self, context: _RunContext, node: Node) -> None:
         run = context.run
         state = run.nodes[node.id]
-        inputs, absent = self._inputs(run, node.id, approval_comments=node.type in WORKING)
+        inputs, absent = self._inputs(run, node.id, approvals="agent" if node.type in WORKING else "none")
         # A step that continues after a decision (paused at an approval) keeps when it began (X-02).
         if state.status not in WAITING_NODE_STATUSES or state.started_at is None:
             state.started_at = now()
