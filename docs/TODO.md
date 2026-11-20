@@ -506,8 +506,9 @@ Items that need an independent or external review (an internal audit does not re
 - **What:** The runtime part is in: one event per file, tool, workflow and agent action (`activity.ActivityEvent`),
   fed at the call sites of the approval audit, the tool journal, the MCP and connection events, the engine and the
   input and knowledge files; query, JSON Lines and CSV export, retention by days (`NODESTRO_ACTIVITY_RETENTION_DAYS`,
-  default 90), mirroring into Axentra through `platform_events` with reconcile. Open: (1) the HTTP endpoints for
-  query and export in nodestro-api; (2) on a server, the API's housekeeping calls `activity.prune` per tenant (the
+  default 90), mirroring into Axentra through `platform_events` with reconcile. A failed activity write never aborts
+  the caller's transaction (a savepoint on PostgreSQL, tested in `tests/test_activity_postgres.py`). Open: (1) the
+  HTTP endpoints for query and export in nodestro-api; (2) on a server, the API's housekeeping calls `activity.prune` per tenant (the
   desktop prunes when the workspace opens); the default period follows the retention decision of RT-014 / API-009;
   (3) the API's access audit and the assistant (with `conversation_id`) as further sources, and the API passing the
   actor to `InputFiles.delete` and `KnowledgeBase.add` / `delete`; (4) `query` filters in Python after reading the

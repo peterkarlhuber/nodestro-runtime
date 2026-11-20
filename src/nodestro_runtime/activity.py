@@ -21,9 +21,11 @@ arguments are never stored.
 
 Storage follows the other audit records: one document per event in the tenant's store (collection
 ``activity_log``, key ``<time>_<event id>``, so keys sort by time). Writing an event never fails the action it
-describes; a failure is logged. Sources whose own record is already mirrored into the platform backend (approval
-audit, MCP events, connection events; see :mod:`.platform_events`) are not mirrored a second time; every other event
-is mirrored through the same sink, in the same transaction as its document, as action ``nodestro.<action>``.
+describes: on PostgreSQL it is written in a savepoint, so a failed write rolls back only the event and never aborts
+the caller's transaction; a failure is logged. Sources whose own record is already mirrored into the platform backend
+(approval audit, MCP events, connection events; see :mod:`.platform_events`) are not mirrored a second time; every
+other event is mirrored through the same sink, in the same savepoint as its document, as action
+``nodestro.<action>``.
 
 Retention (:func:`prune` with :func:`retention_days`): events older than :data:`RETENTION_ENV` days (default
 :data:`DEFAULT_RETENTION_DAYS`; ``0`` keeps them without limit) are deleted. The desktop prunes when the workspace
@@ -32,7 +34,8 @@ opens; a server calls :func:`prune` from its housekeeping.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager
 import csv
 from datetime import datetime, timedelta
 import io
@@ -155,16 +158,22 @@ def record(store: DocumentStore, event: ActivityEvent) -> ActivityEvent | None:
     """Store ``event`` (and mirror it, see the module docs); never raises: the action it describes goes on."""
     try:
         sink = None if event.source in MIRRORED_BY_SOURCE else platform_events(store)
-        if sink is None:
+        with _isolated(store):  # the mirror commits with the event (see .platform_events)
             store.put(COLLECTION, event.key, event)
-            return event
-        with store.transaction():  # the mirror commits with the event (see .platform_events)
-            store.put(COLLECTION, event.key, event)
-            sink.audit(str(getattr(store, "tenant_id", "")), **mirror_audit(event))
+            if sink is not None:
+                sink.audit(str(getattr(store, "tenant_id", "")), **mirror_audit(event))
         return event
     except Exception:
         logger.exception("Could not store activity event %s", event.action)
         return None
+
+
+def _isolated(store: DocumentStore) -> AbstractContextManager[Any]:
+    """Where an event is written: a savepoint where the store has one (PostgreSQL), so a failed write rolls back only
+    the event and never aborts the transaction of the action it describes; else the store's (reentrant) transaction.
+    SQLite needs no savepoint: a failed statement there rolls back only itself, and the transaction goes on."""
+    savepoint: Callable[[], AbstractContextManager[Any]] | None = getattr(store, "savepoint", None)
+    return savepoint() if savepoint is not None else store.transaction()
 
 
 def add(store: DocumentStore, source: Source, action: str, **fields: Any) -> ActivityEvent | None:

@@ -49,7 +49,12 @@ The actor of run events is whoever started the top-level run (`Run.started_by`),
 A run that never executes (cancelled while queued, imported) has no events.
 
 Writing an event never fails the action it describes: a store error or an event that cannot be built is logged and
-skipped.
+skipped. On PostgreSQL an error aborts the whole transaction it happens in, so the event (with its Axentra mirror) is
+written in a savepoint (`PostgresDatabase.savepoint`, the same psycopg nested transaction the Axentra mirror uses):
+a failed write rolls back only the event, and the caller's transaction, such as the one that stores an approval audit
+event, goes on and commits. SQLite needs no savepoint, because a failed statement there rolls back only itself; the
+event is written in the store's reentrant transaction. Both cases are tested (`tests/test_activity_postgres.py`,
+`tests/test_activity.py`).
 
 ## What is never stored
 

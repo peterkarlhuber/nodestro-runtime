@@ -111,6 +111,27 @@ def test_writing_never_fails_the_action(store: SQLiteStore) -> None:
     assert activity.add(store, "workflow", "not a code") is None
 
 
+def test_a_failed_activity_write_keeps_the_callers_sqlite_transaction(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQLite rolls back only a failed statement; the caller's transaction goes on (PostgreSQL uses a savepoint, see
+    tests/test_activity_postgres.py)."""
+    real_put = store.put
+
+    def put(collection: str, key: str, model: Any) -> None:
+        if collection == activity.COLLECTION:
+            store._connection.execute("INSERT INTO no_such_table VALUES (1)")
+        real_put(collection, key, model)
+
+    monkeypatch.setattr(store, "put", put)
+    with store.transaction():
+        store.put_raw("notes", "before", {"text": "before"})
+        assert activity.add(store, "workflow", "workflow.started") is None
+        store.put_raw("notes", "after", {"text": "after"})
+    assert store.get_raw("notes", "before") == {"text": "before"} and store.get_raw("notes", "after") is not None
+    assert activity.query(store) == []
+
+
 # ---- query, export, retention ---------------------------------------------------------------------------------
 
 
