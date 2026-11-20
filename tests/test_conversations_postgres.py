@@ -74,3 +74,29 @@ def test_the_module_has_no_sql_of_its_own() -> None:
     assert "nodestro_documents" in tables
     source = inspect.getsource(conversations)
     assert statements_of(source, "nodestro_runtime/conversations.py", tables) == []
+
+
+def test_the_answer_reservation_holds_across_processes(database: PostgresDatabase, tmp_path: Path) -> None:
+    """M-2 on PostgreSQL: two workspaces of one tenant (two API processes) reserve an answer of one conversation;
+    the second is refused under the store lock, and a released reservation frees the conversation again."""
+    from nodestro_runtime.problems import NodestroError
+
+    first = Workspace(tmp_path / "one", integrations=[], storage=tenant_storage(database, "alpha"))
+    second = Workspace(tmp_path / "two", integrations=[], storage=tenant_storage(database, "alpha"))
+    try:
+        template_id = AgentTemplates(first.store).create(AgentConfig(system_prompt="AGENT")).id
+        created = first.conversations.create(
+            ConversationIn(agent=AgentChoice(template_id=template_id), model="anthropic:claude-sonnet-5-5"),
+            owner="usr_alice",
+        )
+        _conversation, user, answer, _budget = first.conversations._reserve(created.id, "usr_alice", "one", [])
+        with pytest.raises(NodestroError) as caught:
+            second.conversations._reserve(created.id, "usr_alice", "two", [])
+        assert caught.value.code == "conversation.answer_running"
+        first.conversations._release(created.id, user, answer)
+        assert second.conversations.messages(created.id, "usr_alice") == []
+        second.conversations._reserve(created.id, "usr_alice", "two", [])
+        assert [item.seq for item in first.conversations.messages(created.id, "usr_alice")] == [3, 4]
+    finally:
+        first.close()
+        second.close()

@@ -39,7 +39,7 @@ from nodestro_runtime.conversations import (
 )
 from nodestro_runtime.local_models import LOCAL_DEFAULT_MODEL
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.schemas import AgentConfig, Run, SettingsIn
+from nodestro_runtime.schemas import AgentConfig, Edge, Node, Run, RunIn, SettingsIn, Workflow
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
 from nodestro_runtime.workspace import Workspace
 
@@ -153,11 +153,10 @@ async def test_create_resume_after_a_restart_rename_delete_and_export(make: Make
     assert "## User" in exported and "Capital of Austria?" in exported and "About 2 million." in exported
     assert f"Run {follow_up.run_id}" in exported
 
-    second.conversations.delete(conversation_id, None)
+    await second.conversations.delete(conversation_id, None)
     with pytest.raises(ConversationNotFound):
         second.conversations.get(conversation_id, None)
     assert second.store.list_prefix(MESSAGES, f"{conversation_id}:", ConversationMessage) == []
-    assert second.runs.get(follow_up.run_id or "") is not None  # the run stays, with its cost
 
 
 async def test_a_conversation_belongs_to_its_owner(make: Make) -> None:
@@ -171,11 +170,12 @@ async def test_a_conversation_belongs_to_its_owner(make: Make) -> None:
     for call in (
         lambda: workspace.conversations.get(mine.id, "usr_bob"),
         lambda: workspace.conversations.update(mine.id, "usr_bob", ConversationChange(title="x")),
-        lambda: workspace.conversations.delete(mine.id, "usr_bob"),
         lambda: workspace.conversations.export_markdown(mine.id, "usr_bob"),
     ):
         with pytest.raises(ConversationNotFound):
             call()
+    with pytest.raises(ConversationNotFound):
+        await workspace.conversations.delete(mine.id, "usr_bob")
     with pytest.raises(ConversationNotFound):
         await workspace.conversations.send(mine.id, "usr_bob", MessageIn(content="hi"))
     # A document of another tenant in this store (a copied database) is never read either.
@@ -419,7 +419,7 @@ async def test_an_image_goes_only_to_a_model_with_image_input(make: Make, monkey
     assert workspace.inputs.references()[added.id] >= {"conversation"}
     with pytest.raises(ConversationNotFound):
         await workspace.conversations.send(conversation_id, None, MessageIn(content="x", file_ids=["in_000000000000"]))
-    workspace.conversations.delete(conversation_id, None)
+    await workspace.conversations.delete(conversation_id, None)
     assert added.id not in workspace.inputs
 
 
@@ -496,3 +496,233 @@ async def test_a_tool_approval_in_a_conversation_and_a_grant_for_this_conversati
     approval = again.tool_calls[0].approval
     assert again.status == "succeeded" and approval is not None
     assert (approval.status, approval.access_source) == ("allowed", f"grant:{granted.id}")
+
+
+# ---- review fixes (independent review of N-04) ---------------------------------------------------------------------
+
+
+async def test_h1_the_runs_of_an_answer_belong_to_the_conversation_and_go_with_it(make: Make) -> None:
+    """H-1: an answer's run holds the conversation (input), the answer (output) and the files. Only who sees the
+    conversation sees the run; deleting the conversation deletes its runs with their files and checkpoints."""
+    workspace = make({"AGENT": [text("Noted."), text("Plain.")]})
+    template_id = template(workspace)
+    mine = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template_id), model=CLOUD), owner="usr_alice"
+    )
+    added = workspace.conversations.add_file(
+        mine.id, "usr_alice", b"secret notes", name="notes.txt", media_type="text/plain", uploaded_by="usr_alice"
+    )
+    sent = await workspace.conversations.send(mine.id, "usr_alice", MessageIn(content="Keep this", file_ids=[added.id]))
+    run_id = sent.assistant.run_id or ""
+    await workspace.wait(run_id, timeout=20)
+    assert workspace.conversations.run_visible(run_id, "usr_alice") is True
+    assert workspace.conversations.run_visible(run_id, None) is True  # the desktop's only person
+    assert workspace.conversations.run_visible(run_id, "usr_bob") is False
+    agent = AgentConfig(name="Plain", system_prompt="AGENT", model=CLOUD)
+    plain = Workflow(
+        name="Plain",
+        nodes=[Node(id="start", type="start"), Node(id="agent", type="agent", agent=agent)],
+        edges=[Edge(id="e1", source="start", target="agent")],
+    )
+    other = await workspace.run(workspace.save_workflow(plain), RunIn(input="x"))
+    await workspace.wait(other.id, timeout=20)
+    assert workspace.conversations.run_visible(other.id, "usr_bob") is True  # other runs are not affected
+    assert workspace.conversations.run_visible("run_unknown", "usr_bob") is True
+
+    await workspace.conversations.delete(mine.id, "usr_alice")
+    assert workspace.runs.get(run_id) is None
+    assert workspace.store.find("runs", "trigger_ref", [mine.id], Run) == []
+    assert added.id not in workspace.inputs
+    assert workspace.conversations.run_visible(run_id, None) is True  # unknown now: the run routes answer 404
+
+
+async def test_h1_a_run_left_by_a_deleted_conversation_is_hidden_from_everyone(make: Make) -> None:
+    workspace = make({"AGENT": [text("Hi.")]})
+    conversation_id = start(workspace, template(workspace))
+    replied = await answer(workspace, conversation_id, "Hello")
+    workspace.store.delete(COLLECTION, conversation_id)  # e.g. a run still going when it was deleted
+    assert workspace.conversations.run_visible(replied.run_id or "", None) is False
+
+
+async def test_l2_deleting_a_conversation_revokes_its_conversation_grants(make: Make) -> None:
+    from nodestro_runtime.tool_approvals import AccessRules, Person
+    from nodestro_runtime.tool_policy import AccessResource, ToolFacts
+
+    workspace = make()
+    conversation_id = start(workspace, template(workspace))
+    info = workspace.tools.get("calculator")
+    rules = AccessRules(workspace.store)
+
+    def grant(conversation: str) -> str:
+        return rules.grant(
+            resource=AccessResource(type="tool", id="calculator"),
+            tool=ToolFacts.of(info.capability, version=info.version),
+            actions=["execute"],
+            duration="conversation",
+            conversation_id=conversation,
+            by=Person("usr_alice"),
+        ).id
+
+    mine, elsewhere = grant(conversation_id), grant("conv_other")
+    await workspace.conversations.delete(conversation_id, None)
+    revoked = rules.revoke_conversation(conversation_id, by=Person("usr_alice"))  # what the delete route does
+    assert [item.id for item in revoked] == [mine]
+    status = {item.id: item.status for item in rules.grants()}
+    assert (status[mine], status[elsewhere]) == ("revoked", "active")
+
+
+def test_h2_no_quality_check_with_a_cloud_judge_in_an_answer() -> None:
+    """H-2: the judge model defaults to a cloud model; a conversation never uses it without being told."""
+    from nodestro_runtime.conversations import answer_agent
+    from nodestro_runtime.schemas import QualityConfig, TemplateRef
+
+    ref = TemplateRef(template_id="tpl_x", version=1)
+    judged = AgentConfig(name="A", quality=QualityConfig(enabled=True))
+    assert not judged.quality.judge_model.startswith("ollama:")
+    assert answer_agent(judged, model=LOCAL_DEFAULT_MODEL, ref=ref).quality.enabled is False
+    local = AgentConfig(name="A", quality=QualityConfig(enabled=True, judge_model=LOCAL_DEFAULT_MODEL))
+    assert answer_agent(local, model=LOCAL_DEFAULT_MODEL, ref=ref).quality.enabled is True
+
+
+async def test_h2_an_answer_runs_without_the_cloud_judge(make: Make) -> None:
+    from nodestro_runtime.schemas import QualityConfig
+
+    workspace = make({"AGENT": [text("Fine.")]})
+    template_id = template(workspace, quality=QualityConfig(enabled=True, judge_model=OTHER_CLOUD))
+    replied = await answer(workspace, start(workspace, template_id), "Check this")
+    run = workspace.runs.get(replied.run_id or "")
+    assert run is not None
+    agent = run.workflow.nodes[1].agent
+    assert agent is not None and agent.quality.enabled is False
+    assert [call["model"] for call in requests(workspace)] == ["claude-sonnet-5-5"]  # no judge request
+
+
+def test_h2_every_model_of_the_answer_is_checked_before_it_starts() -> None:
+    from nodestro_runtime.conversations import check_answer_models
+    from nodestro_runtime.schemas import QualityConfig
+
+    def workflow(model: str, judge: str) -> Workflow:
+        agent = AgentConfig(name="A", model=model, quality=QualityConfig(enabled=True, judge_model=judge))
+        return Workflow(name="W", nodes=[Node(id="start", type="start"), Node(id="agent", type="agent", agent=agent)])
+
+    check_answer_models(workflow(CLOUD, LOCAL_DEFAULT_MODEL), model=CLOUD, offline=False)
+    check_answer_models(workflow(LOCAL_DEFAULT_MODEL, LOCAL_DEFAULT_MODEL), model=LOCAL_DEFAULT_MODEL, offline=True)
+    for given, offline, code in (
+        (workflow(CLOUD, OTHER_CLOUD), False, "conversation.cloud_model_not_chosen"),
+        (workflow(LOCAL_DEFAULT_MODEL, OTHER_CLOUD), True, "conversation.offline_cloud_model"),
+        (workflow(LOCAL_DEFAULT_MODEL, OTHER_CLOUD), False, "conversation.cloud_model_not_chosen"),
+    ):
+        with pytest.raises(NodestroError) as caught:
+            check_answer_models(given, model=LOCAL_DEFAULT_MODEL if offline else CLOUD, offline=offline)
+        assert caught.value.code == code
+
+
+async def test_h2_a_refused_model_check_stores_nothing(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nodestro_runtime import conversations as module
+
+    workspace = make()
+    conversation_id = start(workspace, template(workspace))
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise NodestroError("conversation.cloud_model_not_chosen", "refused")
+
+    monkeypatch.setattr(module, "check_answer_models", refuse)
+    with pytest.raises(NodestroError):
+        await workspace.conversations.send(conversation_id, None, MessageIn(content="hi"))
+    assert workspace.conversations.messages(conversation_id, None) == []
+    assert workspace.conversations.detail(conversation_id, None).answering is None
+
+
+async def test_m1_a_change_never_writes_back_an_older_conversation(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-1: while one process switches the agent, another one attaches a file; the switch must not drop it."""
+    from nodestro_runtime.conversations import Conversations
+
+    workspace = make()
+    first_id, second_id = template(workspace, "FIRST"), template(workspace, "SECOND")
+    conversation_id = start(workspace, first_id)
+    other_process = Conversations(workspace)
+    resolve = workspace.conversations._agent
+
+    def resolve_while_another_process_writes(choice: AgentChoice) -> Any:
+        found = resolve(choice)
+        other_process.add_file(
+            conversation_id, None, b"late", name="late.txt", media_type="text/plain", uploaded_by="local"
+        )
+        return found
+
+    monkeypatch.setattr(workspace.conversations, "_agent", resolve_while_another_process_writes)
+    switched = workspace.conversations.update(
+        conversation_id, None, ConversationChange(agent=AgentChoice(template_id=second_id))
+    )
+    assert switched.agent.template_id == second_id
+    assert [item.name for item in switched.files] == ["late.txt"]
+
+
+async def test_m2_two_processes_never_answer_at_once(make: Make) -> None:
+    """M-2: two sends of different processes (here two objects with their own locks) at the same moment: one answer
+    starts, the other is refused, and the budget is checked under the store lock."""
+    from nodestro_runtime.conversations import Conversations
+
+    workspace = make({"AGENT": [text("One."), text("Two.")]})
+    conversation_id = start(workspace, template(workspace))
+    other_process = Conversations(workspace)
+    results = await asyncio.gather(
+        workspace.conversations.send(conversation_id, None, MessageIn(content="first")),
+        other_process.send(conversation_id, None, MessageIn(content="second")),
+        return_exceptions=True,
+    )
+    refused = [item for item in results if isinstance(item, NodestroError)]
+    started = [item for item in results if not isinstance(item, BaseException)]
+    assert len(started) == 1 and [item.code for item in refused] == ["conversation.answer_running"]
+    runs = workspace.store.find("runs", "trigger_ref", [conversation_id], Run)
+    assert len(runs) == 1
+
+
+async def test_m2_a_taken_message_key_is_never_overwritten(make: Make) -> None:
+    workspace = make()
+    conversation_id = start(workspace, template(workspace))
+    taken = ConversationMessage(conversation_id=conversation_id, seq=1, role="user", content="other process")
+    workspace.store.put(MESSAGES, f"{conversation_id}:000001", taken)  # written with a newer last_seq elsewhere
+    with pytest.raises(NodestroError) as caught:
+        await workspace.conversations.send(conversation_id, None, MessageIn(content="mine"))
+    assert caught.value.code == "conversation.answer_running"
+    kept = workspace.store.get(MESSAGES, f"{conversation_id}:000001", ConversationMessage)
+    assert kept is not None and kept.content == "other process"
+
+
+async def test_m2_a_reservation_whose_run_never_started_expires(make: Make) -> None:
+    from datetime import timedelta
+
+    from nodestro_runtime.conversations import RESERVATION_TIMEOUT
+    from nodestro_runtime.schemas import now
+
+    workspace = make({"AGENT": [text("Back.")]})
+    conversation_id = start(workspace, template(workspace))
+    stale = ConversationMessage(
+        conversation_id=conversation_id,
+        seq=2,
+        role="assistant",
+        status="queued",
+        created_at=now() - RESERVATION_TIMEOUT - timedelta(seconds=1),
+    )
+    workspace.store.put(MESSAGES, f"{conversation_id}:000002", stale)
+    raw = workspace.store.get_raw(COLLECTION, conversation_id)
+    workspace.store.put_raw(COLLECTION, conversation_id, {**raw, "last_seq": 2})
+    [expired] = workspace.conversations.messages(conversation_id, None)
+    assert expired.status == "failed" and expired.error is not None
+    assert expired.error.code == "conversation.run_missing"
+    assert (await answer(workspace, conversation_id, "Again")).content == "Back."
+
+
+def test_l4_no_state_per_conversation_is_kept_in_memory(make: Make) -> None:
+    workspace = make()
+    assert set(vars(workspace.conversations)) == {"workspace", "store", "templates"}
+
+
+async def test_l7_a_conversation_without_owner_is_seen_by_nobody_on_a_server(make: Make) -> None:
+    workspace = make()
+    conversation_id = start(workspace, template(workspace))  # made on a desktop (no owner), restored on a server
+    assert [item.id for item in workspace.conversations.summaries(None)] == [conversation_id]
+    assert workspace.conversations.summaries("usr_alice") == []
+    with pytest.raises(ConversationNotFound):
+        workspace.conversations.get(conversation_id, "usr_alice")

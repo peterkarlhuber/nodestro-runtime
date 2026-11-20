@@ -37,11 +37,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import re
-import threading
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
@@ -50,6 +49,7 @@ from .agent_templates import AgentTemplates
 from .engine import add_usage, as_text
 from .input_files import InputFile
 from .launcher import launch
+from .preflight import agent_models
 from .problems import NodestroError, Problem, problem
 from .providers import check_model, provider_of
 from .schemas import (
@@ -89,6 +89,11 @@ MAX_TOOL_RESULT_CHARS = 20_000
 AGENT_NODE = "agent"
 _START_NODE = "start"
 _TITLE_LENGTH = 60
+#: A reserved answer whose run never started (the process ended between the reservation and the launch) counts as
+#: failed after this long, so the conversation takes messages again.
+RESERVATION_TIMEOUT = timedelta(minutes=10)
+#: How long deleting a conversation waits for its cancelled answer to stop before it deletes the answer's run.
+DELETE_WAIT_SECONDS = 10.0
 
 #: N-08 (outflow protection by content provenance) will record here what the conversation holds; until then every
 #: conversation is ``unchecked``.
@@ -258,9 +263,10 @@ class SentConversationMessage(BaseModel):
 
 
 def visible(conversation: Conversation, owner: str | None) -> bool:
-    """Whether ``owner`` sees the conversation: everyone without an owner (the desktop), else its owner and the
-    conversations stored without one."""
-    return owner is None or conversation.owner in (None, owner)
+    """Whether ``owner`` sees the conversation: everyone without an owner (the desktop), else only its owner. A
+    conversation stored without an owner (made on a desktop and restored on a server) is seen by nobody on a server
+    (fail closed)."""
+    return owner is None or conversation.owner == owner
 
 
 def make_title(text: str) -> str:
@@ -289,12 +295,17 @@ def answer_input(history: list[ConversationMessage], content: str) -> str:
 
 
 def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
-    """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback (a cloud
-    model is never chosen automatically) and the message as its task."""
+    """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback and no
+    quality check with a cloud judge (a cloud model is never chosen automatically; the judge model defaults to a
+    cloud model), and the message as its task. A quality check with a local judge stays."""
+    quality = config.quality
+    if quality.enabled and not is_local(quality.judge_model):
+        quality = quality.model_copy(update={"enabled": False})
     return config.model_copy(
         update={
             "model": model,
             "fallbacks": [item for item in config.fallbacks if is_local(item)],
+            "quality": quality,
             "task_template": "{{input}}",
             "origin": ref,
         },
@@ -302,11 +313,33 @@ def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentC
     )
 
 
+def check_answer_models(workflow: Workflow, *, model: str, offline: bool) -> None:
+    """Every model the answer's run will use (:func:`~nodestro_runtime.preflight.agent_models`: the agent's and its
+    judge's), checked before the run starts: only the conversation's own ``model`` may be a cloud model (the person
+    chose it), and an offline conversation uses local models only."""
+    for used in sorted(agent_models(workflow)):
+        if is_local(used):
+            continue
+        if offline:
+            raise NodestroError(
+                "conversation.offline_cloud_model",
+                "This conversation is offline: only local models can answer",
+                model=used,
+            )
+        if used != model:
+            raise NodestroError(
+                "conversation.cloud_model_not_chosen",
+                "The answer would use a cloud model that nobody chose for this conversation",
+                model=used,
+            )
+
+
 def answer_workflow(conversation: Conversation, config: AgentConfig, budget: float | None) -> Workflow:
     """The workflow one answer runs: the start step and the agent (it notifies nobody; the person waits)."""
     return Workflow(
         id=conversation.id,
-        name=conversation.title or "Conversation",
+        # A fixed name: the run list and the usage report show it to every member, the title only its owner sees.
+        name="Conversation",
         nodes=[
             Node(id=_START_NODE, type="start"),
             Node(id=AGENT_NODE, type="agent", label=config.name, agent=config),
@@ -338,8 +371,6 @@ class Conversations:
         self.workspace = workspace
         self.store = workspace.store
         self.templates = AgentTemplates(workspace.store)
-        self._lock = threading.Lock()
-        self._sending: dict[str, asyncio.Lock] = {}
 
     # ---- reading ------------------------------------------------------------------------------------------------
 
@@ -352,6 +383,24 @@ class Conversations:
     def get(self, conversation_id: str, owner: str | None) -> Conversation:
         """The conversation; :class:`ConversationNotFound` for an unknown id and for another owner's."""
         return self._stored(conversation_id, owner)
+
+    def run_visible(self, run_id: str, owner: str | None) -> bool:
+        """Whether ``owner`` may see run ``run_id`` through the run routes (H-1). An answer's run (trigger
+        ``conversation``, or a run below one) belongs to its conversation: only who sees the conversation sees the
+        run, and the run of a deleted conversation is seen by nobody. Every other run (and an unknown id) is left to
+        the run routes."""
+        run = self.store.get("runs", run_id, Run)
+        seen: set[str] = set()
+        while run is not None and run.parent_run_id and run.id not in seen:
+            seen.add(run.id)
+            parent = self.store.get("runs", run.parent_run_id, Run)
+            if parent is None:
+                break
+            run = parent
+        if run is None or run.trigger != "conversation":
+            return True
+        found = self.store.get(COLLECTION, run.trigger_ref or "", Conversation)
+        return found is not None and found.tenant_id == self.workspace.tenant_id and visible(found, owner)
 
     def summaries(self, owner: str | None) -> list[AgentConversationSummary]:
         """The conversations ``owner`` sees, most recently changed first."""
@@ -467,38 +516,88 @@ class Conversations:
         return self.detail(conversation.id, owner)
 
     def update(self, conversation_id: str, owner: str | None, change: ConversationChange) -> AgentConversationDetail:
-        """Rename it, switch its agent or model, its offline flag or budget; only the fields sent change."""
+        """Rename it, switch its agent or model, its offline flag or budget; only the fields sent change. The change is
+        made on the stored conversation under its lock, so it never writes back an older ``last_seq`` or file list
+        (M-1)."""
         sent = change.model_fields_set
-        with self._lock:
+        agent = self._agent(change.agent)[0] if "agent" in sent and change.agent is not None else None
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
+            updates: dict[str, Any] = {"updated_at": now()}
             if "title" in sent and change.title is not None:
-                conversation.title = change.title.strip()
-                conversation.auto_title = False
-            if "agent" in sent and change.agent is not None:
-                conversation.agent, _config = self._agent(change.agent)
-            if "offline" in sent and change.offline is not None:
-                conversation.offline = change.offline
-            if "model" in sent and change.model:
-                conversation.model = change.model
+                updates.update(title=change.title.strip(), auto_title=False)
+            if agent is not None:
+                updates["agent"] = agent
+            offline = change.offline if "offline" in sent and change.offline is not None else conversation.offline
+            updates["offline"] = offline
+            model = change.model if "model" in sent and change.model else conversation.model
+            updates["model"] = self._checked_model(model, offline=offline)
             if "budget_usd" in sent:
-                conversation.budget_usd = change.budget_usd
-            conversation.model = self._checked_model(conversation.model, offline=conversation.offline)
-            conversation.updated_at = now()
-            self.store.put(COLLECTION, conversation.id, conversation)
+                updates["budget_usd"] = change.budget_usd
+            self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=updates))
         return self.detail(conversation_id, owner)
 
-    def delete(self, conversation_id: str, owner: str | None) -> None:
-        """Delete the conversation with its messages and files; a running answer is cancelled first. The answers'
-        runs stay (they are runs of the tenant, with their cost in the usage ledger)."""
-        conversation = self._stored(conversation_id, owner)
-        for item in self.messages(conversation_id, owner):
-            if item.status not in FINAL and item.run_id is not None:
-                self.workspace.cancel(item.run_id)
-        self.store.delete_prefix(MESSAGES, f"{conversation_id}:")
-        self.store.delete(COLLECTION, conversation_id)
+    async def delete(self, conversation_id: str, owner: str | None) -> None:
+        """Delete the conversation with its messages, files and the answers' runs (H-1: the runs hold the messages as
+        input, the answers as output and the files). A running answer is cancelled first and deleted once it stopped
+        (at most :data:`DELETE_WAIT_SECONDS`; a run that is still going then stays, and :meth:`run_visible` hides it
+        from everyone). The usage ledger keeps the cost. The caller revokes the grants for "this conversation"
+        (``revoke_conversation`` of the tool approval rules, L-2): only a person's request writes
+        grants."""
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
+            conversation = self._stored(conversation_id, owner)
+            messages = self.store.list_prefix(MESSAGES, f"{conversation_id}:", ConversationMessage)
+            self.store.delete_prefix(MESSAGES, f"{conversation_id}:")
+            self.store.delete(COLLECTION, conversation_id)
+        run_ids = {item.run_id for item in messages if item.run_id}
+        run_ids |= {
+            run.id
+            for run in self.store.find("runs", "trigger_ref", [conversation_id], Run)
+            if run.trigger == "conversation"
+        }
+        for run_id in run_ids:
+            self.workspace.cancel(run_id)
+        for run_id in sorted(run_ids):
+            if await self._stopped(run_id):
+                self._delete_run(run_id)
         for file in conversation.files:
             if file.id in self.workspace.inputs:
                 self.workspace.inputs.delete(file.id, force=True)
+
+    async def _stopped(self, run_id: str) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DELETE_WAIT_SECONDS
+        while True:
+            run = self.store.get("runs", run_id, Run)
+            if not self.workspace.runs.is_live(run_id) and (run is None or run.status not in ("queued", "running")):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    def _delete_run(self, run_id: str) -> None:
+        """Delete an answer's run with everything stored for it (as the run API's delete does)."""
+        run = self.store.get("runs", run_id, Run)
+        if run is None:
+            return
+        tree = [run]
+        queue = [run]
+        while queue:
+            parent = queue.pop()
+            for state in parent.nodes.values():
+                for child_id in [state.child_run_id, *state.child_run_ids]:
+                    child = self.store.get("runs", child_id, Run) if child_id else None
+                    if child is not None and child.parent_run_id == parent.id and child not in tree:
+                        tree.append(child)
+                        queue.append(child)
+        for item in tree:
+            self.store.delete("runs", item.id)
+            self.workspace.files.delete_run(item.id)
+            self.workspace.runs.discard_tool_waits(item.id, because="run.deleted")
+        self.workspace.runs.chat.delete_run(run.id)
+        self.workspace.inputs.release([file_id for item in tree for file_id in item.file_ids])
 
     # ---- files --------------------------------------------------------------------------------------------------
 
@@ -518,15 +617,15 @@ class Conversations:
         item: InputFile = self.workspace.inputs.add(
             data, name=name, media_type=media_type, origin="conversation", uploaded_by=uploaded_by
         )
+        attached = AgentConversationFile(
+            id=item.id, name=item.name, format=item.format, media_type=item.media_type, size=item.size
+        )
         try:
-            with self._lock:
+            with self.store.transaction():
+                self.store.lock(COLLECTION, conversation_id)
                 conversation = self._room(self._stored(conversation_id, owner))
-                attached = AgentConversationFile(
-                    id=item.id, name=item.name, format=item.format, media_type=item.media_type, size=item.size
-                )
-                conversation.files.append(attached)
-                conversation.updated_at = now()
-                self.store.put(COLLECTION, conversation.id, conversation)
+                changed = {"files": [*conversation.files, attached], "updated_at": now()}
+                self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=changed))
         except BaseException:
             self.workspace.inputs.delete(item.id, force=True)
             raise
@@ -550,13 +649,13 @@ class Conversations:
 
     def remove_file(self, conversation_id: str, owner: str | None, file_id: str) -> AgentConversationDetail:
         """Remove a file from the conversation and delete it; sent messages keep its name."""
-        with self._lock:
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
             if not any(item.id == file_id for item in conversation.files):
                 raise ConversationNotFound(file_id)
-            conversation.files = [item for item in conversation.files if item.id != file_id]
-            conversation.updated_at = now()
-            self.store.put(COLLECTION, conversation.id, conversation)
+            changed = {"files": [item for item in conversation.files if item.id != file_id], "updated_at": now()}
+            self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=changed))
         if file_id in self.workspace.inputs:
             self.workspace.inputs.delete(file_id, force=True)
         return self.detail(conversation_id, owner)
@@ -568,19 +667,59 @@ class Conversations:
     ) -> SentConversationMessage:
         """Store the message and start its answer as a run; follow it with the run's events.
 
-        Nothing is stored when the answer cannot start (an unknown file, a running answer, the budget is used up, a
-        refused model or workflow start): the message stays with the sender."""
-        lock = self._sending.setdefault(conversation_id, asyncio.Lock())
-        async with lock:
+        The answer is reserved first, in one store transaction under the conversation's lock (M-2): the checks
+        (another answer running, the budget, the files) and the two new messages are one step for every process, and
+        a message key is only written when it is free. The run starts after that; when it cannot start (a refused
+        model or workflow), the reservation is removed again and nothing stays stored."""
+        content = request.content.strip()
+        if not content and not request.file_ids:
+            raise NodestroError("conversation.empty_message", "The message is empty")
+        file_ids = list(dict.fromkeys(request.file_ids))
+        conversation, user, answer, budget = self._reserve(conversation_id, owner, content, file_ids)
+        try:
+            model = self._checked_model(conversation.model, offline=conversation.offline)
+            ref, template_agent = self._agent(
+                AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
+            )
+            workflow = answer_workflow(conversation, answer_agent(template_agent, model=model, ref=ref), budget)
+            check_answer_models(workflow, model=model, offline=conversation.offline)
+            run = await launch(
+                self.workspace,
+                workflow,
+                RunIn(input=answer_input(self._history(conversation_id, user.seq), content), file_ids=file_ids),
+                trigger="conversation",
+                trigger_ref=conversation.id,
+                started_by=actor,
+            )
+        except BaseException:
+            self._release(conversation_id, user, answer)
+            raise
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
+            current = self.store.get(COLLECTION, conversation_id, Conversation)
+            if current is None:  # deleted while the run started: the run goes too
+                self.workspace.cancel(run.id)
+                raise ConversationNotFound(conversation_id)
+            answer = answer.model_copy(update={"run_id": run.id, "agent": ref, "model": model})
+            self.store.put(MESSAGES, _key(conversation_id, answer.seq), answer)
+            changed: dict[str, Any] = {"updated_at": now()}
+            if current.auto_title and not current.title:
+                changed["title"] = make_title(content) or (user.attachments[0].name if user.attachments else "")
+            self.store.put(COLLECTION, conversation_id, current.model_copy(update=changed))
+        return SentConversationMessage(user=user, assistant=self._sync(answer))
+
+    def _reserve(
+        self, conversation_id: str, owner: str | None, content: str, file_ids: list[str]
+    ) -> tuple[Conversation, ConversationMessage, ConversationMessage, float | None]:
+        """Check and store the user's message and a queued answer without a run, in one transaction."""
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
-            content = request.content.strip()
-            if not content and not request.file_ids:
-                raise NodestroError("conversation.empty_message", "The message is empty")
             history = self.messages(conversation_id, owner)
             if any(item.status not in FINAL for item in history):
                 raise NodestroError("conversation.answer_running", "Wait until the current answer is finished")
             files = {item.id: item for item in conversation.files}
-            missing = [file_id for file_id in request.file_ids if file_id not in files]
+            missing = [file_id for file_id in file_ids if file_id not in files]
             if missing:
                 raise ConversationNotFound(missing[0])
             budget: float | None = None
@@ -594,57 +733,52 @@ class Conversations:
                         "The conversation's budget is used up",
                         budget_usd=conversation.budget_usd,
                     )
-            model = self._checked_model(conversation.model, offline=conversation.offline)
-            ref, template_agent = self._agent(
-                AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
+            user = ConversationMessage(
+                conversation_id=conversation_id,
+                seq=conversation.last_seq + 1,
+                role="user",
+                content=content,
+                attachments=[
+                    MessageFile(
+                        file_id=file_id,
+                        name=files[file_id].name,
+                        format=files[file_id].format,
+                        media_type=files[file_id].media_type,
+                        size=files[file_id].size,
+                    )
+                    for file_id in file_ids
+                ],
             )
-            config = answer_agent(template_agent, model=model, ref=ref)
-            file_ids = list(dict.fromkeys(request.file_ids))
-            run = await launch(
-                self.workspace,
-                answer_workflow(conversation, config, budget),
-                RunIn(input=answer_input(history, content), file_ids=file_ids),
-                trigger="conversation",
-                trigger_ref=conversation.id,
-                started_by=actor,
+            answer = ConversationMessage(
+                conversation_id=conversation_id,
+                seq=conversation.last_seq + 2,
+                role="assistant",
+                status="queued",
+                agent=conversation.agent,
+                model=conversation.model,
+                reply_to=user.id,
             )
-            with self.store.transaction():
-                self.store.lock(COLLECTION, conversation_id)
-                current = self._stored(conversation_id, owner)
-                user = ConversationMessage(
-                    conversation_id=conversation_id,
-                    seq=current.last_seq + 1,
-                    role="user",
-                    content=content,
-                    attachments=[
-                        MessageFile(
-                            file_id=file_id,
-                            name=files[file_id].name,
-                            format=files[file_id].format,
-                            media_type=files[file_id].media_type,
-                            size=files[file_id].size,
-                        )
-                        for file_id in file_ids
-                    ],
-                )
-                answer = ConversationMessage(
-                    conversation_id=conversation_id,
-                    seq=current.last_seq + 2,
-                    role="assistant",
-                    status="queued",
-                    agent=ref,
-                    model=model,
-                    run_id=run.id,
-                    reply_to=user.id,
-                )
-                current.last_seq += 2
-                if current.auto_title and not current.title:
-                    current.title = make_title(content) or (user.attachments[0].name if user.attachments else "")
-                current.updated_at = now()
-                self.store.put(MESSAGES, _key(conversation_id, user.seq), user)
-                self.store.put(MESSAGES, _key(conversation_id, answer.seq), answer)
-                self.store.put(COLLECTION, conversation_id, current)
-        return SentConversationMessage(user=user, assistant=self._sync(answer))
+            for message in (user, answer):
+                key = _key(conversation_id, message.seq)
+                if not self.store.put_raw_if_absent(MESSAGES, key, message.model_dump(mode="json")):
+                    raise NodestroError("conversation.answer_running", "Wait until the current answer is finished")
+            reserved = conversation.model_copy(update={"last_seq": answer.seq, "updated_at": now()})
+            self.store.put(COLLECTION, conversation_id, reserved)
+        return reserved, user, answer, budget
+
+    def _release(self, conversation_id: str, user: ConversationMessage, answer: ConversationMessage) -> None:
+        """Remove a reservation whose run did not start (the sequence numbers stay used)."""
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
+            for message in (user, answer):
+                key = _key(conversation_id, message.seq)
+                stored = self.store.get(MESSAGES, key, ConversationMessage)
+                if stored is not None and stored.id == message.id:
+                    self.store.delete(MESSAGES, key)
+
+    def _history(self, conversation_id: str, before: int) -> list[ConversationMessage]:
+        found = self.store.list_prefix(MESSAGES, f"{conversation_id}:", ConversationMessage)
+        return [item for item in sorted(found, key=lambda item: item.seq) if item.seq < before]
 
     def cancel(self, conversation_id: str, owner: str | None, message_id: str) -> ConversationMessage:
         """Cancel a running answer: its run is cancelled, which closes the model connection."""
@@ -655,9 +789,15 @@ class Conversations:
 
     def _sync(self, message: ConversationMessage) -> ConversationMessage:
         """An answer as its run is now; stored once the run's status changed (a final one, a pause)."""
-        if message.role != "assistant" or message.status in FINAL or message.run_id is None:
+        if message.role != "assistant" or message.status in FINAL:
             return message
-        run = self.workspace.runs.get(message.run_id)
+        if message.run_id is None:
+            created = message.created_at if message.created_at.tzinfo else message.created_at.replace(tzinfo=UTC)
+            if now() - created < RESERVATION_TIMEOUT:
+                return message  # reserved; its run is starting
+            run = None
+        else:
+            run = self.workspace.runs.get(message.run_id)
         if run is None:
             updated = message.model_copy(
                 update={
