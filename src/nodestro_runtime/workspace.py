@@ -506,6 +506,7 @@ class Workspace:
                 access=AccessRules(self.store).current if access_grants_enabled() else None,
                 offline=self.strict_offline,
                 protected_folders=(str(self.data_dir.resolve()),),
+                local_mcp=self._local_mcp_servers,
             )
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True
@@ -1574,12 +1575,19 @@ class Workspace:
         keys += [str(item.get("api_key") or "") for item in stored.values()]
         return [key for key in dict.fromkeys(keys) if key]
 
-    def connect_model(self, model: str) -> Connection:
+    def _local_mcp_servers(self) -> set[str]:
+        """The local (``stdio``) MCP servers: they run on this computer, so strict offline does not refuse them."""
+        return {server.id for server in self.mcp.servers() if server.transport == "stdio"}
+
+    def connect_model(self, model: str, *, actor: str = "system") -> Connection:
         """The connection of a model's provider; a cloud model in the strict offline mode is refused first (also
-        when its provider is not configured: a key would not help)."""
+        when its provider is not configured: a key would not help), then one the access model v2 blocks (N-06;
+        ``actor``: who asks, for the audit and whether the error names the source)."""
         provider = provider_of(model)
         if provider != "ollama" and self.strict_offline():
             raise _offline_cloud_model(model, provider)
+        # N-06: a cloud model the access model v2 blocks is refused before anything is sent (only while it is on).
+        self.runs.check_cloud_access(provider, actor=actor)
         return self.connection(provider)
 
     def allowed_models(self) -> list[str]:

@@ -159,6 +159,7 @@ from .tool_approvals import (
     RECLASSIFIED,
     SWITCH_OFF,
     CallBinding,
+    Person,
     ToolApprovalRequest,
     ToolApprovals,
     ToolGate,
@@ -166,6 +167,7 @@ from .tool_approvals import (
     bind_call,
     checkpoints_enabled,
     reclassified,
+    record_refusal,
     tool_facts,
 )
 from .tool_spec import CallCounter, RunServices
@@ -1180,6 +1182,7 @@ class RunManager:
                 "; ".join(item.message for item in problems),
                 problems=[item.model_dump() for item in problems],
             )
+        self._check_start_access(workflow.id, trigger=trigger, actor=started_by or _key_actor(api_key_id))
         prepared = prepare(
             start_fields(workflow),
             request.values,
@@ -1208,6 +1211,84 @@ class RunManager:
         if preset:
             run.nodes.update({node_id: state for node_id, state in preset.items() if node_id in run.nodes})
         return self._launch(run)
+
+    # ---- access model v2 beyond tool calls (N-06; only while its switch is on) ---------------------------------------
+
+    def _check_start_access(self, workflow_id: str, *, trigger: str, actor: str) -> None:
+        """Refuse a top-level start of ``workflow_id`` on a deny or a safety limit (N-06). A top-level start is a
+        person's or a trigger's, so only records for all agents count (:func:`~.tool_policy.site_records`). Nothing
+        happens while the switch is off."""
+        gate = self.tool_gate
+        if gate is None or gate.access is None:
+            return
+        resource = tool_policy.AccessResource(type="workflow", id=workflow_id)
+        found = gate.site_refusal(resource, attended=trigger not in UNATTENDED_TRIGGERS, agent=None)
+        if found is not None:
+            record_refusal(self.store, found, resource, actor=actor)
+            raise access_error(found, resource, show_source=is_person(actor))
+
+    def check_cloud_access(self, provider: str, *, actor: str = "system", run_id: str | None = None) -> None:
+        """Refuse a model request outside an agent's turn (the live run chat, the assistants and every other caller of
+        :meth:`~nodestro_runtime.workspace.Workspace.connect_model`: attended, no agent) to a cloud model the access
+        model v2 blocks (N-06), audited with its source. Only a person (``actor``) sees the source in the error.
+        Nothing happens while the switch is off or for the local model server."""
+        gate = self.tool_gate
+        if gate is None or gate.access is None or provider == "ollama":
+            return
+        resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
+        found = gate.site_refusal(resource, attended=True, agent=None, conversation_id=run_id)
+        if found is not None:
+            record_refusal(self.store, found, resource, actor=actor, run_id=run_id)
+            raise access_error(found, resource, show_source=is_person(actor))
+
+    def _check_site_access(
+        self, context: _RunContext, node_id: str, resource: tool_policy.AccessResource
+    ) -> tool_policy.AccessExplanation | None:
+        """Refuse a sub-workflow or team start, or a cloud model request, of the agent ``node_id`` in a run (N-06):
+        the refusal is audited with its source (``access_refused``) and shown in the run's events; the caller ends
+        the step. ``None``: it may go on (always while the switch is off)."""
+        gate = self.tool_gate
+        if gate is None or gate.access is None:
+            return None
+        root = context.root.run
+        agent = tool_policy.agent_ref(context.run.workflow_id, node_id)
+        found = gate.site_refusal(
+            resource,
+            attended=root.trigger not in UNATTENDED_TRIGGERS,
+            agent=agent,
+            conversation_id=root.id,
+        )
+        if found is None:
+            return None
+        record_refusal(self.store, found, resource, actor=_run_actor(root), run_id=context.run.id, agent=agent)
+        self._emit(
+            context,
+            "access_refused",
+            node_id,
+            resource_type=resource.type,
+            resource_id=resource.id,
+            code=found.code,
+            source=found.source,
+        )
+        return found
+
+    def _checked_connect(self, context: _RunContext, node_id: str) -> Callable[[str], Connection]:
+        """The connections of an agent's turn, refused for a cloud model the access model v2 blocks (N-06): every
+        provider but the local model server counts as a cloud model, as in the strict offline mode. Checked at each
+        connection, so a new deny applies at the next turn. Unchanged while the switch is off."""
+        gate = self.tool_gate
+        if gate is None or gate.access is None:
+            return self.connect
+
+        def connect(provider: str) -> Connection:
+            if provider != "ollama":
+                resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
+                found = self._check_site_access(context, node_id, resource)
+                if found is not None:
+                    raise access_error(found, resource, show_source=is_person(_run_actor(context.root.run)))
+            return self.connect(provider)
+
+        return connect
 
     def tracker(self, budget: float | Decimal | None, *, attended: bool = False) -> PricedTracker:
         """The tracker of one run: the budget in USD (``None``: none), priced with the workspace's catalog.
@@ -3108,6 +3189,11 @@ class RunManager:
                 raise NodestroError(
                     "run.subworkflow_missing", f"The workflow of {label} no longer exists", node=label
                 ) from None
+            target = tool_policy.AccessResource(type="workflow", id=snapshot.id)
+            # Reads the records and may audit: off the event loop (the agents' thread pool).
+            refused = await self._in_run_thread(self._check_site_access, context, node.id, target)
+            if refused is not None:
+                raise access_error(refused, target, show_source=is_person(_run_actor(context.root.run)))
             shown = self._prompt_values(run)
             text = render_task(
                 config.input_template or "{{input}}",
@@ -3239,6 +3325,7 @@ class RunManager:
             at=now(),
             version=version,
             definition_hash=definition,
+            related=gate.related(context.env.builder.tools, call.name, config.tool_settings),
         )
         shown = capability.model_dump()
         if verdict.action == "allow":
@@ -3378,6 +3465,7 @@ class RunManager:
                 at=now(),
                 version=_version,
                 definition_hash=definition,
+                related=gate.related(context.env.builder.tools, call.name, config.tool_settings),
             )
             if refused is not None:
                 gate.approvals.audit("stale", final, outcome=refused.code)
@@ -3554,6 +3642,7 @@ class RunManager:
             at=now(),
             version=version,
             definition_hash=definition,
+            related=gate.related(context.env.builder.tools, call.name, config.tool_settings),
         )
         if verdict.action == "deny":
             if approvals.use(found, "stale") is not None:
@@ -3961,6 +4050,10 @@ class RunManager:
 
         async def execute(item: orchestration.Delegation) -> str:
             if item.ref is None:
+                target = tool_policy.AccessResource(type="workflow", id=teams[item.member.id][0].id)
+                if await self._in_run_thread(self._check_site_access, context, node.id, target) is not None:
+                    # The orchestrator learns only that the team cannot start; the person sees the source (event).
+                    raise orchestration.DelegationEnded("failed", "This team cannot be started for this agent")
                 child = start_child(item)
             else:
                 # Continue the team run that waited; never start it again.
@@ -4189,7 +4282,7 @@ class RunManager:
             self._check_owned(context)
             context.tracker.check()
 
-        interruptible = _Interruptible(context.cancelled, self.connect)
+        interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node.id))
         try:
             # One connection for the decision: it also says whether the model takes a reasoning effort (RT-004), so
             # a model without one (GPT-4o, most compatible or vLLM servers) is asked without instead of refused.
@@ -4640,7 +4733,7 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
-            interruptible = _Interruptible(context.cancelled, self.connect)
+            interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node_id))
             ask = functools.partial(
                 execute_agent,
                 context.env.builder,
@@ -5284,11 +5377,57 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
     target.error_params = found.params
 
 
+def _key_actor(api_key_id: str | None) -> str:
+    return f"api:{api_key_id}" if api_key_id else "system"
+
+
+def access_error(
+    found: tool_policy.AccessExplanation, resource: tool_policy.AccessResource, *, show_source: bool = True
+) -> NodestroError:
+    """The refusal of a workflow start or a cloud model request (N-06). ``show_source`` (for a person) adds the
+    source; a caller that is not a person (an API key, a published app, a trigger) gets none, the audit keeps it."""
+    kind, name = resource.type, resource.id
+    if found.kind == "safety_limit":
+        error = NodestroError(
+            "access.safety_limit",
+            f"This access ({kind}) is not allowed by a fixed safety rule",
+            resource_type=kind,
+            resource_id=name,
+            source=found.source,
+        )
+    elif found.kind == "missing_grant":
+        error = NodestroError(
+            "access.missing_grant",
+            f"This access ({kind}) has not been granted yet",
+            resource_type=kind,
+            resource_id=name,
+            source=found.source,
+        )
+    else:
+        error = NodestroError(
+            "access.denied",
+            f"This access ({kind}) is blocked",
+            resource_type=kind,
+            resource_id=name,
+            source=found.source,
+        )
+    if not show_source:
+        error.params.pop("source", None)
+    return error
+
+
+def is_person(actor: str | None) -> bool:
+    """Whether ``actor`` names a person (not ``system``, an API key ``api:<id>`` or another machine principal)."""
+    try:
+        Person(actor or "")
+    except NodestroError:
+        return False
+    return True
+
+
 def _run_actor(run: Run) -> str:
     """Who a run acts for in the activity log: who started it, else the API key that did, else ``system``."""
-    if run.started_by:
-        return run.started_by
-    return f"api:{run.api_key_id}" if run.api_key_id else "system"
+    return run.started_by or _key_actor(run.api_key_id)
 
 
 def _is_paused(run: Run) -> bool:

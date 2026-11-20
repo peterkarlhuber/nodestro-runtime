@@ -129,8 +129,9 @@ def _decide_a05eef4(
 
 def test_without_the_access_model_decide_is_the_s2_rule_for_every_combination() -> None:
     """Regression (L-7): while the switch is off (``access=None``), ``decide`` gives exactly what it gave on master
-    before N-06 for every combination of capability, binding (``ToolBinding``), kind, attended, orchestrator narrowing,
-    MCP setting and pre-grant (``ToolPreGrant``: matching, other version, revoked, expired)."""
+    before N-06, with or without the related MCP server and connection, for every combination of capability, binding
+    (``ToolBinding``), kind, attended, orchestrator narrowing, MCP setting and pre-grant (``ToolPreGrant``: matching,
+    other version, revoked, expired)."""
     pre_grants = [
         ToolPreGrant(
             id="tpg_1", tool="tool_x", version=1, scope="schedule", scope_id="sch_1", granted_by="u", granted_at=AT
@@ -168,6 +169,7 @@ def test_without_the_access_model_decide_is_the_s2_rule_for_every_combination() 
         ToolBinding(ask="never", legacy=True, bound_version=2),
     ]
     capabilities = [cap(a, r) for a, r in itertools.product(["read", "write", "destructive"], ["internal", "external"])]
+    related = (AccessResource(type="mcp_server", id="mcs_1"), AccessResource(type="connection", id="conn_1"))
     seen = set()
     for capability, binding, kind, attended, grants, mcp, pre, version in itertools.product(
         capabilities,
@@ -186,6 +188,8 @@ def test_without_the_access_model_decide_is_the_s2_rule_for_every_combination() 
         verdict = decide(context=situation, version=version, **arguments)
         assert verdict == _decide_a05eef4(context=situation, version=version, **arguments)
         assert verdict.access_source is None
+        # The MCP server and the connection of a call (N-06 call sites) are not looked at while the switch is off.
+        assert decide(context=situation, version=version, related=related, **arguments) == verdict
         seen.add((verdict.action, verdict.code, verdict.pre_grant_id))
     # The matrix reaches every S-2 outcome, including the pre-grant.
     assert {action for action, _, _ in seen} == {"allow", "ask", "deny"}

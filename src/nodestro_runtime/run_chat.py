@@ -987,6 +987,8 @@ def answer_question(
         try:
             # The answer's effort only where the model takes one (RT-004): GPT-4o, most compatible and vLLM servers
             # would refuse it.
+            # N-06: the snapshot holds the run's content; a blocked cloud model never gets it.
+            manager.check_cloud_access(provider_of(model), run_id=question.run_id, actor=question.author)
             connection = manager.connect(provider_of(model))
             agent = AgentConfig(
                 name="Run chat",

@@ -29,15 +29,15 @@ from typing import TYPE_CHECKING, Literal
 from .engine import MAX_DEPTH, node_label
 from .graph import workflow_refs
 from .problems import CheckIssue
-from .schemas import Workflow, now
+from .schemas import ToolSettings, Workflow, now
 from .tool_approvals import tool_facts
 from .tool_policy import ToolBinding, agent_ref, decide
 
 if TYPE_CHECKING:
     from .workspace import Workspace
 
-#: An agent node as the check sees it: (workflow, is_root, node_id, label, tools, bindings).
-_Agent = tuple[Workflow, bool, str, str, list[str], dict[str, ToolBinding]]
+#: An agent node as the check sees it: (workflow, is_root, node_id, label, tools, bindings, tool settings).
+_Agent = tuple[Workflow, bool, str, str, list[str], dict[str, ToolBinding], dict[str, ToolSettings]]
 
 UnattendedTrigger = Literal["schedule", "batch", "benchmark", "api"]
 
@@ -58,13 +58,22 @@ CODES = {
 
 def _agents(ctx: Workspace, workflow: Workflow) -> Iterator[_Agent]:
     """Every agent node of ``workflow``, its sub-workflows and its named orchestrator teams (as a run would pin
-    them): ``(workflow, is_root, node_id, label, tools, bindings)``."""
+    them): ``(workflow, is_root, node_id, label, tools, bindings, tool settings)``."""
     seen: set[tuple[str, int | None]] = set()
 
     def walk(current: Workflow, depth: int, root: bool) -> Iterator[_Agent]:
         for node in current.nodes:
             if node.type == "agent" and node.agent is not None:
-                yield current, root, node.id, node_label(node), list(node.agent.tools), dict(node.agent.tool_policies)
+                agent = node.agent
+                yield (
+                    current,
+                    root,
+                    node.id,
+                    node_label(node),
+                    list(agent.tools),
+                    dict(agent.tool_policies),
+                    dict(agent.tool_settings),
+                )
             if depth >= MAX_DEPTH:
                 continue
             for ref in workflow_refs(node):
@@ -98,7 +107,7 @@ def unattended_tool_issues(
     at = at or now()
     found: list[CheckIssue] = []
     reported: set[tuple[str, str, str]] = set()
-    for flow, root, node_id, label, tools, bindings in _agents(ctx, workflow):
+    for flow, root, node_id, label, tools, bindings, settings in _agents(ctx, workflow):
         situation = gate.call_context(
             run_id="preflight",
             node_id=node_id,
@@ -117,6 +126,7 @@ def unattended_tool_issues(
                 at=at,
                 version=version,
                 definition_hash=definition,
+                related=gate.related(ctx.tools, name, settings),
             )
             if verdict.action != "deny":
                 continue

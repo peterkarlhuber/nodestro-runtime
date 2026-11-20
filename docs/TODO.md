@@ -55,7 +55,11 @@ None known.
   - the tool gate: deny and safety limit first (re-checked after a person approves a waiting call), and a grant
     bound to the tool version, classification and MCP definition instead of the question;
   - the review findings of #201 (H-1, H-2, M-1..M-3, L-1..L-7) and of its re-review (N-1..N-4), fixed in the same
-    PR.
+    PR;
+  - the other call sites (Welle 2): workflow starts (top level, sub-workflow, team), the MCP server and the
+    connection of every tool call, and cloud model requests (agent turns, orchestrator decisions, agent tests, the
+    live run chat) refuse on a deny or a safety limit; refusals are audited `access_refused` with their source;
+  - `tool_policy.explain` and `who_may` for the api query "who may do what and why" (BER-1).
 - **Next step:**
   - nodestro-api: regenerate `openapi/nodestro-api.json` and `nodestro-api-server.json` when it moves to this
     runtime. The only differences are intended: `ToolCallApproval.access_source` and four new audit kinds
@@ -64,13 +68,28 @@ None known.
     write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
   - nodestro-studio: scope and duration on `ToolApprovalCard.tsx` (N-16 candidate), the overview, texts of the
     `access.*` codes.
-  - Runtime: call `evaluate` where folders (N-10 file-system guard), workflows (run start), MCP servers,
-    connections and cloud providers (N-08 provenance, model selection) are used.
+  - Runtime: call `evaluate` where folders are used (N-10 file-system guard). The other call sites are done; their
+    open points are RT-088.
   - Runtime: name agents by a stable agent id once agents have one (today `<workflow id>/<node id>`).
   - Runtime: Windows folder checks remain by name. Hard links, junctions, network drives and the computer's own
     name in UNC paths (only `localhost`, `127.0.0.1` and `::1` map to the drive) need the N-10 guard.
   - Runtime: the `DenialNotice` type (N-07).
   - Owner: activation after gate G-2, and the internal security check (the independent review goes with RT-001).
+
+### RT-088 · Access model v2 (N-06): what the new call sites leave open
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** RT-086, [docs/access-grants.md](access-grants.md) "At the
+  other call sites", `tests/test_access_grants_sites.py`
+- **What:** The checks at workflow starts, MCP servers, connections and cloud models only refuse. Open:
+  - shared content is never marked yet (N-08 provenance), so a cloud model request with content does not need a
+    grant per provider and agent (spec 7.2) until N-08 sets `shared_content`;
+  - a grant on a workflow, MCP server or connection does not lift a question (spec 7.2 "Freigabe je Dienst", "je
+    Ziel"); MCP stays strict by design;
+  - a cloud model is checked when a turn connects, not before each request of a long turn;
+  - the api passes the signed-in user as `actor` to `connect_model` and `AgentTester.run` (until then their audit
+    actor is `system` and the error has no source);
+  - a top-level workflow start counts only records for all agents (a start is a person's or a trigger's).
+- **Next step:** Decide with N-08 and N-16 which of these the product needs before activation (gate G-2).
 
 ### RT-077 · Independent review of the service connection API and secret handling (NAL-A1)
 
