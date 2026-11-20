@@ -655,6 +655,13 @@ class SQLiteStore:
     def closed(self) -> bool:
         return self._closed
 
+    def checkpoint(self) -> None:
+        """Copy the write-ahead log into the database file and empty it: a value that was just overwritten (a plain
+        secret that is now sealed) stays neither in the log nor in the file's old page (``secure_delete``)."""
+        with self._lock:
+            if not self._depth and self.database != ":memory:":
+                self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """Group writes into one transaction: all of them are stored, or none (also after a crash).

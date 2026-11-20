@@ -179,6 +179,7 @@ def test_the_first_start_with_a_key_seals_plain_provider_keys(tmp_path: Path) ->
         old.update_settings(SettingsIn(providers={"anthropic": ProviderSettingsIn(api_key=SECRET)}))
     finally:
         old.close()
+    assert SECRET.encode() in raw(data)
     key = new_key()
     for _ in range(2):  # idempotent
         workspace = open_workspace(data, key)
@@ -186,12 +187,10 @@ def test_the_first_start_with_a_key_seals_plain_provider_keys(tmp_path: Path) ->
             stored = workspace.store.get_raw("settings", "app")["providers"]["anthropic"]["api_key"]
             assert is_encrypted(stored)
             assert workspace.provider_settings("anthropic")["api_key"] == SECRET
+            # Gone from the database file and its write-ahead log while the studio runs, not only after it stops.
+            assert SECRET.encode() not in raw(data)
         finally:
             workspace.close()
-    connection = sqlite3.connect(data / DATABASE)
-    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    connection.close()
-    assert SECRET.encode() not in raw(data)
 
 
 # ---- rotation -----------------------------------------------------------------------------------------------------

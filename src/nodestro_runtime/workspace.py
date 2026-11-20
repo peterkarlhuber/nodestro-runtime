@@ -824,6 +824,11 @@ class Workspace:
                 return
             values["providers"] = providers
             self.store.put_raw("settings", "app", values)
+        # The plain keys must not stay in the write-ahead log or in the database file's old page until SQLite's next
+        # automatic checkpoint.
+        checkpoint = getattr(self.store, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint()
         logger.info("Encrypted %d stored provider key(s) with the keychain key", len(changed))
 
     def _seal(self, provider: str, key: str) -> str:
