@@ -29,13 +29,13 @@ from pydantic import BaseModel, Field
 from . import tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode, request_regions
-from .engine import access_error, execute_agent, node_problem, render_task, tool_rounds_problem, usage_of
+from .engine import access_error, execute_agent, is_person, node_problem, render_task, tool_rounds_problem, usage_of
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection
 from .reasoning import ReasoningTrace, trace_hook
 from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
-from .tool_approvals import CallBinding, ToolGate, bind_call, tool_facts
+from .tool_approvals import CallBinding, ToolGate, bind_call, record_refusal, tool_facts
 from .value_checks import checked_fields, computing_call, unverified_fields
 
 #: Test results show at most this much of a tool result (the run view keeps 20,000 too).
@@ -182,7 +182,9 @@ class AgentTester:
             "made. Run the workflow to approve the call."
         )
 
-    def run(self, request: AgentTestIn) -> tuple[AgentTestResult, BudgetTracker]:
+    def run(self, request: AgentTestIn, *, actor: str = "system") -> tuple[AgentTestResult, BudgetTracker]:
+        """Run one test. ``actor`` is who asked (N-06: the audit of a refused cloud model, and only a person sees its
+        source in the result)."""
         config = request.agent
         prompt = task_prompt(config, request.input, raw=request.raw)
         budget = self.default_budget()
@@ -226,13 +228,15 @@ class AgentTester:
         connect = self.connect
         if gate is not None and gate.access is not None:
             # N-06: a cloud model the access model v2 blocks never gets the test's prompt (no agent: a test agent has
-            # no identity, so a deny for some agents holds here too). The error names the source for the person.
+            # no identity, so a deny for some agents holds here too). Audited like a run's refusal; only a person sees
+            # the source in the result.
             def connect(provider: str) -> Connection:
                 if provider != "ollama":
                     resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
                     found = gate.site_refusal(resource, attended=True, agent=None)
                     if found is not None:
-                        raise access_error(found, resource)
+                        record_refusal(gate.approvals.store, found, resource, actor=actor)
+                        raise access_error(found, resource, show_source=is_person(actor))
                 return self.connect(provider)
 
         try:

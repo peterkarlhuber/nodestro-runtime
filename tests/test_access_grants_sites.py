@@ -35,6 +35,7 @@ from nodestro_runtime.tool_policy import (
     ToolBinding,
     ToolCapability,
     ToolFacts,
+    ToolNow,
     decide,
     effect_for,
     explain,
@@ -240,11 +241,13 @@ def test_cloud_model_with_shared_content_needs_a_grant_per_provider_and_agent() 
 def test_a_top_level_start_counts_only_records_for_all_agents() -> None:
     workflow = AccessResource(type="workflow", id="wf_1")
     scoped = AccessContext(denies=(deny(workflow, scope="agent", agents=("wf_0/a",)),))
-    assert site_access(workflow, scoped, attended=True, at=AT, agent=None).kind == "missing_grant"
+    # Without a record that counts, a start is allowed (a missing grant never refuses it, M-2 a).
+    plain = site_access(workflow, scoped, attended=True, at=AT, agent=None)
+    assert (plain.allowed, plain.outcome, plain.kind, plain.source) == (True, "allowed", None, "none")
     assert site_access(workflow, scoped, attended=True, at=AT, agent="wf_0/a").kind == "denied"
     everyone = AccessContext(denies=(deny(workflow, mode="unattended"),))
     assert site_access(workflow, everyone, attended=False, at=AT, agent=None).kind == "denied"
-    assert site_access(workflow, everyone, attended=True, at=AT, agent=None).kind == "missing_grant"
+    assert site_access(workflow, everyone, attended=True, at=AT, agent=None).allowed
 
 
 def test_effect_classes_of_the_call_sites() -> None:
@@ -296,11 +299,12 @@ def test_explain_counts_the_records_as_the_call_site_does() -> None:
     tool = AccessResource(type="tool", id="tool_x")
     once = grant(tool, duration="once", tool=facts)
     request = AccessRequest(resource=tool, action="execute", effect="write_internal", tool=facts)
-    assert explain(request, grants=[once], denies=[], at=AT).kind == "missing_grant"
+    ignored = explain(request, grants=[once], denies=[], at=AT)
+    assert (ignored.allowed, ignored.outcome, ignored.grant) == (True, "per_call_rules", None)
     workflow = AccessResource(type="workflow", id="wf_1")
     start = AccessRequest(resource=workflow, action="execute", effect="read_internal")
     scoped = deny(workflow, scope="agent", agents=("wf_0/a",))
-    assert explain(start, grants=[], denies=[scoped], at=AT).kind == "missing_grant"
+    assert explain(start, grants=[], denies=[scoped], at=AT).outcome == "allowed"
     assert explain(start.model_copy(update={"agent": "wf_0/a"}), grants=[], denies=[scoped], at=AT).kind == "denied"
 
 
@@ -376,19 +380,22 @@ async def test_a_deny_on_a_workflow_refuses_its_start_and_records_the_source(wor
     rules = AccessRules(workspace.store)
     resource = AccessResource(type="workflow", id=flow.id)
     rules.deny(resource=resource, actions=["execute"], scope="agent", agents=["other/a"], by=ALICE)
-    started = await workspace.run(flow, RunIn(input="x"))  # a deny for some agents: not a person's start
+    started = await workspace.run(flow, RunIn(input="x"), started_by="usr_bob")  # a deny for some agents: no effect
     assert (await workspace.wait(started.id, timeout=20)).status == "succeeded"
     blocked = rules.deny(resource=resource, actions=["execute"], by=ALICE)
     with pytest.raises(NodestroError) as refused:
-        await workspace.run(flow, RunIn(input="x"))
+        await workspace.run(flow, RunIn(input="x"), started_by="usr_bob")
     assert refused.value.code == "access.denied"
     assert refused.value.params == {"resource_type": "workflow", "resource_id": flow.id, "source": f"deny:{blocked.id}"}
-    (event,) = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
-    assert (event.outcome, event.details["source"], event.details["resource_id"]) == (
-        "access.denied",
-        f"deny:{blocked.id}",
-        flow.id,
-    )
+    # A caller that is not a person (an API key, a trigger) gets no source (L-3); the audit keeps it.
+    with pytest.raises(NodestroError) as keyed:
+        workspace.runs.start(flow, RunIn(input="x"), trigger="api", api_key_id="key_1")
+    assert keyed.value.code == "access.denied" and "source" not in keyed.value.params
+    events = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert sorted(item.actor for item in events) == ["api:key_1", "usr_bob"]
+    assert {(item.outcome, item.details["source"], item.details["resource_id"]) for item in events} == {
+        ("access.denied", f"deny:{blocked.id}", flow.id)
+    }
     rules.revoke_deny(blocked.id, by=ALICE)
     again = await workspace.run(flow, RunIn(input="x"))  # the revocation applies at the next start
     assert (await workspace.wait(again.id, timeout=20)).status == "succeeded"
@@ -431,7 +438,7 @@ async def test_a_sub_workflow_start_is_refused_for_the_calling_agent(workspace: 
     )
     seen: list[Any] = []
     workspace.runs.event_sink = seen.append
-    started = await workspace.run(parent, RunIn(input="x"))
+    started = await workspace.run(parent, RunIn(input="x"), started_by="usr_bob")
     done = await workspace.wait(started.id, timeout=20)
     node = done.nodes["sub"]
     assert (node.status, node.error_code, node.child_run_id) == ("failed", "access.denied", None)
@@ -447,7 +454,7 @@ async def test_a_blocked_cloud_model_never_gets_the_agents_content(workspace: Wo
     flow = _plain(workspace, prompt="CHILD")
     rules = AccessRules(workspace.store)
     blocked = rules.deny(resource=CLOUD, actions=["submit"], scope="agent", agents=[f"{flow.id}/a"], by=ALICE)
-    started = await workspace.run(flow, RunIn(input="SECRET-CONTENT"))
+    started = await workspace.run(flow, RunIn(input="SECRET-CONTENT"), started_by="usr_bob")
     done = await workspace.wait(started.id, timeout=20)
     node = done.nodes["a"]
     assert (node.status, node.error_code) == ("failed", "access.denied")
@@ -467,7 +474,7 @@ async def test_strict_offline_is_a_safety_limit_for_cloud_models(workspace: Work
     flow = _plain(workspace)
     workspace.runs.tool_gate.offline = lambda: True  # type: ignore[union-attr]
     AccessRules(workspace.store).grant(resource=CLOUD, actions=["submit"], duration="until_revoked", by=ALICE)
-    started = await workspace.run(flow, RunIn(input="x"))
+    started = await workspace.run(flow, RunIn(input="x"), started_by="usr_bob")
     node = (await workspace.wait(started.id, timeout=20)).nodes["a"]
     assert (node.error_code, node.error_params["source"]) == ("access.safety_limit", "limit:offline")
 
@@ -476,7 +483,9 @@ def test_an_agent_test_and_the_run_chat_respect_a_cloud_deny(workspace: Workspac
     from nodestro_runtime.agent_test import AgentTestIn
 
     blocked = AccessRules(workspace.store).deny(resource=CLOUD, actions=["submit"], by=ALICE)
-    result, _tracker = workspace.tester.run(AgentTestIn(agent=AgentConfig(name="A", system_prompt="CHILD"), input="x"))
+    result, _tracker = workspace.tester.run(
+        AgentTestIn(agent=AgentConfig(name="A", system_prompt="CHILD"), input="x"), actor="usr_bob"
+    )
     assert (result.status, result.error_code, result.error_params["source"]) == (
         "failed",
         "access.denied",
@@ -486,7 +495,19 @@ def test_an_agent_test_and_the_run_chat_respect_a_cloud_deny(workspace: Workspac
         workspace.runs.check_cloud_access("anthropic", run_id="run_1", actor="usr_bob")
     assert refused.value.code == "access.denied"
     workspace.runs.check_cloud_access("ollama", run_id="run_1", actor="usr_bob")  # the local model server: no check
+    # M-1: every other model use outside a run (assistants, guide, judges, model choice) connects through
+    # connect_model, which checks the same way; a caller that is not a person gets no source.
+    with pytest.raises(NodestroError) as assistant:
+        workspace.connect_model("anthropic:claude-sonnet-5-5", actor="usr_bob")
+    assert (assistant.value.code, assistant.value.params["source"]) == ("access.denied", f"deny:{blocked.id}")
+    with pytest.raises(NodestroError) as keyed:
+        workspace.connect_model("anthropic:claude-sonnet-5-5")
+    assert "source" not in keyed.value.params
     assert _sent(workspace) == "[]"
+    # L-4: the agent test's refusal is audited like the others.
+    audited = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert sorted(item.actor for item in audited) == ["system", "usr_bob", "usr_bob", "usr_bob"]
+    assert {item.details["source"] for item in audited} == {f"deny:{blocked.id}"}
 
 
 async def test_a_deny_on_a_connection_refuses_the_tool_that_uses_it_in_a_run(
@@ -630,3 +651,206 @@ async def test_a_team_start_is_refused_and_the_orchestrator_learns_no_source(tmp
         assert audited.details["source"] == f"deny:{blocked.id}"
     finally:
         opened.close()
+
+
+def test_strict_offline_does_not_refuse_a_local_stdio_mcp_server() -> None:
+    """L-1: a local (stdio) MCP server runs on this computer; a remote one is refused by strict offline."""
+    access = AccessContext(agent="wf/a", offline=True, local_servers=frozenset({"mcs_1"}))
+    arguments: dict[str, Any] = {
+        "tool": "mcp__srv__read",
+        "kind": "mcp",
+        "capability": cap("read", "external"),
+        "binding": None,
+        "context": situation(access),
+        "at": AT,
+    }
+    assert decide(related=(MCP,), **arguments).action == "allow"
+    remote = decide(related=(AccessResource(type="mcp_server", id="mcs_2"),), **arguments)
+    assert (remote.code, remote.access_source) == ("access.safety_limit", "limit:offline")
+    blocked = AccessContext(denies=(deny(MCP),), agent="wf/a", offline=True, local_servers=frozenset({"mcs_1"}))
+    assert decide(related=(MCP,), **{**arguments, "context": situation(blocked)}).code == "access.denied"
+
+
+def test_the_gate_names_local_mcp_servers() -> None:
+    gate = ToolGate(ToolApprovals.__new__(ToolApprovals), access=lambda: ((), ()), local_mcp=lambda: ["mcs_1"])
+    found = gate.call_context(run_id="r", node_id="n", trigger="manual", trigger_ref=None)
+    assert found.access is not None and found.access.local_servers == frozenset({"mcs_1"})
+
+
+def test_who_may_takes_the_tool_as_it_is_now() -> None:
+    """M-2 c/d: a grant for an older version shows as stale, and an MCP tool's grant is noted but never counts."""
+    tool = AccessResource(type="tool", id="t")
+    old = grant(tool, tool=ToolFacts(access="write", reach="internal", version=1))
+    (found,) = who_may(
+        [old], [], at=AT, tools={"t": ToolNow(facts=ToolFacts(access="write", reach="internal", version=2))}
+    )
+    assert (found.allowed, found.outcome, found.grant, found.stale) == (True, "per_call_rules", None, ("agr_1",))
+    mcp = AccessResource(type="tool", id="mcp__s__t")
+    facts = ToolFacts(access="write", reach="external")
+    (noted,) = who_may([grant(mcp, tool=facts)], [], at=AT, tools={"mcp__s__t": ToolNow(facts=facts, kind="mcp")})
+    assert (noted.outcome, noted.grant is not None, noted.grant_enforced) == ("per_call_rules", True, False)
+    (server,) = who_may([grant(MCP)], [], at=AT)
+    assert (server.allowed, server.outcome, server.grant_enforced) == (True, "per_call_rules", False)
+    (web,) = [
+        explain(
+            AccessRequest(
+                resource=AccessResource(type="tool", id="search_web"), action="execute", effect="read_external"
+            ),
+            grants=[],
+            denies=[],
+            at=AT,
+        )
+    ]
+    assert (web.outcome, web.default_rule) == ("per_call_rules", "read_external_without_shared_content")
+
+
+# ---- explain agrees with every call site (M-2) -----------------------------------------------------------------------
+
+
+def _tool_grant(facts: ToolFacts, **extra: Any) -> Grant:
+    return grant(AccessResource(type="tool", id="t"), id="agr_t", tool=facts, **extra)
+
+
+def test_explain_matches_the_outcome_at_every_call_site() -> None:
+    """Property: for every combination of records, mode, offline, agent and tool, ``explain(...).allowed`` is
+    ``False`` exactly when the call site refuses, and ``outcome`` ``granted`` exactly when a grant replaces the
+    question (tool calls) or allows the access (cloud models)."""
+    import itertools as it
+
+    agents = (None, "wf/a", "wf/b")
+    now_facts = ToolFacts(access="write", reach="internal", version=2)
+    tool_records: list[tuple[tuple[Grant, ...], tuple[Deny, ...]]] = [
+        ((), ()),
+        ((_tool_grant(now_facts),), ()),
+        ((_tool_grant(ToolFacts(access="write", reach="internal", version=1)),), ()),  # stale
+        ((_tool_grant(now_facts, scope="agent", agents=("wf/a",)),), ()),
+        ((_tool_grant(now_facts, duration="once"),), ()),
+        (
+            (
+                _tool_grant(
+                    now_facts,
+                    mode="unattended",
+                    duration="until",
+                    expires_at=AT + timedelta(days=1),
+                    scope="agent",
+                    agents=("wf/a",),
+                ),
+            ),
+            (),
+        ),
+        ((_tool_grant(now_facts),), (deny(AccessResource(type="tool", id="t")),)),
+        ((), (deny(AccessResource(type="tool", id="t"), scope="agent", agents=("wf/b",)),)),
+        ((), (deny(AccessResource(type="tool", id="t"), mode="unattended"),)),
+    ]
+    checked = 0
+    seen: set[tuple[str, str]] = set()
+    for (grants, denies), agent, attended, offline, kind in it.product(
+        tool_records, agents, [True, False], [False, True], ["custom", "mcp"]
+    ):
+        capability = ToolCapability(access="write", reach="external" if kind == "mcp" else "internal", source="admin")
+        facts = ToolFacts.of(capability, version=2 if kind == "custom" else None)
+        if kind == "mcp":
+            grants = tuple(
+                item.model_copy(update={"tool": facts if item.tool == now_facts else item.tool}) for item in grants
+            )
+        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline)
+        verdict = decide(
+            tool="t",
+            kind=kind,
+            capability=capability,
+            binding=None,
+            context=situation(access, attended=attended),
+            at=AT,
+            version=facts.version,
+        )
+        request = AccessRequest(
+            resource=AccessResource(type="tool", id="t"),
+            action="execute",
+            effect=effect_for("tool", "execute", tool=facts),
+            agent=agent,
+            mode="supervised" if attended else "unattended",
+            offline=offline,
+            tool=facts,
+        )
+        found = explain(request, grants=grants, denies=denies, at=AT, tool_kind=kind)
+        refused = verdict.action == "deny" and (verdict.code or "").startswith("access.")
+        assert found.allowed is not refused, (found, verdict)
+        assert (found.outcome == "granted") is (verdict.access_source or "").startswith("grant:"), (found, verdict)
+        seen.add((kind, found.outcome))
+        checked += 1
+    # The grid reaches every outcome of a tool call; an MCP tool is never granted.
+    assert seen == {
+        ("custom", "refused"),
+        ("custom", "granted"),
+        ("custom", "per_call_rules"),
+        ("mcp", "refused"),
+        ("mcp", "per_call_rules"),
+    }
+    # MCP servers and connections: only their refusals count.
+    for resource, (grants, denies), agent, attended, offline in it.product(
+        [MCP, CONNECTION],
+        [((), ()), ((grant(MCP), grant(CONNECTION, id="agr_2")), ()), ((), (deny(MCP), deny(CONNECTION, id="adn_2")))],
+        agents,
+        [True, False],
+        [False, True],
+    ):
+        capability = cap("read", "internal")
+        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline)
+        verdict = decide(
+            tool="t",
+            kind="builtin",
+            capability=capability,
+            binding=None,
+            context=situation(access, attended=attended),
+            at=AT,
+            related=(resource,),
+        )
+        request = AccessRequest(
+            resource=resource,
+            action="execute",
+            effect=effect_for(resource.type, "execute", tool=ToolFacts.of(capability, version=None)),
+            agent=agent,
+            mode="supervised" if attended else "unattended",
+            offline=offline,
+        )
+        found = explain(request, grants=grants, denies=denies, at=AT)
+        refused = verdict.action == "deny" and (verdict.code or "").startswith("access.")
+        assert found.allowed is not refused and found.outcome != "granted", (found, verdict)
+        checked += 1
+    # Workflow starts and cloud models: the gate's own check.
+    workflow = AccessResource(type="workflow", id="wf_1")
+    for resource, (grants, denies), agent, attended, offline in it.product(
+        [workflow, CLOUD],
+        [
+            ((), ()),
+            ((grant(workflow), grant(CLOUD, id="agr_2", actions=("submit",))), ()),
+            ((), (deny(workflow), deny(CLOUD, id="adn_2", actions=("submit",)))),
+            (
+                (),
+                (
+                    deny(workflow, scope="agent", agents=("wf/a",)),
+                    deny(CLOUD, id="adn_2", actions=("submit",), scope="agent", agents=("wf/a",)),
+                ),
+            ),
+        ],
+        agents,
+        [True, False],
+        [False, True],
+    ):
+        gate = ToolGate(
+            ToolApprovals.__new__(ToolApprovals), access=lambda g=grants, d=denies: (g, d), offline=lambda o=offline: o
+        )
+        refusal = gate.site_refusal(resource, attended=attended, agent=agent)
+        found = site_access(
+            resource,
+            AccessContext(grants=grants, denies=denies, offline=offline),
+            attended=attended,
+            at=AT,
+            agent=agent,
+        )
+        assert found.allowed is (refusal is None), (resource, found, refusal)
+        seen.add((resource.type, found.outcome))
+        checked += 1
+    assert {("workflow", "allowed"), ("workflow", "refused"), ("cloud_provider", "allowed")} <= seen
+    assert {("cloud_provider", "granted"), ("cloud_provider", "refused")} <= seen
+    assert checked == 9 * 3 * 2 * 2 * 2 + 2 * 3 * 3 * 2 * 2 + 2 * 4 * 3 * 2 * 2

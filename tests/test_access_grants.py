@@ -403,7 +403,9 @@ def test_grants_and_denies_are_stored_revoked_and_audited(rules: AccessRules) ->
     assert revoked.revoked_at is not None and revoked.revoked_by == "usr_bob"
     assert rules.revoke_grant(stored.id, by=ALICE) == revoked  # a second revocation changes nothing
     lifted = rules.revoke_deny(blocked.id, by=ALICE)
-    grants, denies = rules.current()
+    # The gate reads only what is active now (L-2); the full lists keep the revoked records.
+    assert rules.current() == ([], [])
+    grants, denies = rules.grants(), rules.denies()
     assert grants == [revoked] and denies == [lifted]
     assert read("/home/alice/docs/a", grants=grants, denies=denies, at=AT + timedelta(minutes=1)).kind == (
         "missing_grant"

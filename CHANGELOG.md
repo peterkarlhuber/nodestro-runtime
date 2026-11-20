@@ -10,8 +10,15 @@
     never loosen a question or the MCP rules.
   - Refusals carry `resource_type`, `resource_id` and `source` and are audited as `access_refused` (new audit kind,
     outcome `denied`) and shown as the run event `access_refused`.
-  - `tool_policy.explain`, `who_may`, `effect_for`, `site_access` and `site_records`: "who may do what and why"
-    (BER-1) for the api, without I/O.
+  - `tool_policy.explain`, `who_may`, `effect_for`, `site_access`, `site_records` and `site_outcome`: "who may do
+    what and why" (BER-1) for the api, without I/O. The checks use the same `site_outcome`, so an explanation's
+    `allowed` and `outcome` match what the call site does (`granted`, `allowed`, `per_call_rules`, `refused`); stale
+    tool grants and grants that do not count at a site are marked.
+  - Review fixes before merge: `Workspace.connect_model(model, actor=...)` checks cloud models too (assistants,
+    guide, skills, judges, model choice); strict offline does not refuse local (`stdio`) MCP servers; a caller that is
+    not a person gets no `source`; agent tests audit their refusals (`AgentTester.run(..., actor=...)`);
+    `AccessRules.current()` returns only active records; checks at sub-workflow and team starts run off the event
+    loop.
 
 - Access model v2, groundwork (N-06). It is off by default (`NODESTRO_ACCESS_GRANTS=1`, only together with
   `NODESTRO_TOOL_APPROVALS=1`; activation needs gate G-2). See [docs/access-grants.md](docs/access-grants.md).

@@ -187,7 +187,7 @@ the related resources over the whole S-2 matrix, and runs with stored records be
 | `workflow` | sub-workflow node and orchestrator team start | `execute` | `read_internal` | deny, safety limit |
 | `mcp_server` | every call of one of its tools, in the tool gate (`decide(related=...)`) | `execute` | the tool's, always external | deny, safety limit |
 | `connection` | every call of a tool whose `tool_settings` name it, in the tool gate | `execute` | the tool's, always external | deny, safety limit |
-| `cloud_provider` | every connection of an agent's turn, an orchestrator decision, an agent test and the live run chat (every provider but `ollama`) | `submit` | `read_external` | deny, safety limit, missing grant with shared content |
+| `cloud_provider` | every connection of an agent's turn, an orchestrator decision, an agent test, the live run chat and `Workspace.connect_model` (assistants, guide, skills, judges, model choice; every provider but `ollama`) | `submit` | `read_external` | deny, safety limit, missing grant with shared content |
 
 - **Workflow start.** A top-level start is a person's or a trigger's, not an agent's: only records for all agents
   count there (`tool_policy.site_records`). A sub-workflow or team start names the calling node
@@ -197,6 +197,8 @@ the related resources over the whole S-2 matrix, and runs with stored records be
 - **MCP servers stay strict.** A deny or a safety limit on the server refuses the call. A grant on the server, like
   a grant on the tool, never replaces the question before a changing MCP call and never lets an MCP tool run
   unattended.
+- **Local MCP servers.** Strict offline does not refuse the tools of a local (`stdio`) MCP server
+  (`ToolGate(local_mcp=...)`, `AccessContext.local_servers`): it runs on this computer. Its denies still hold.
 - **Connections** are the ones the agent's tool settings name. A deny for some agents also holds when the gate
   cannot name the agent (fail closed).
 - **Cloud models.** The default rule of spec 7.2 allows a cloud model without shared content. Nothing marks shared
@@ -209,33 +211,58 @@ the related resources over the whole S-2 matrix, and runs with stored records be
 event `tool_denied`). A refused workflow start, sub-workflow or team start, or cloud model request:
 
 - raises (or fails the step with) `access.denied`, `access.safety_limit` or `access.missing_grant` with the params
-  `resource_type`, `resource_id` and `source`;
+  `resource_type`, `resource_id` and `source`. Only a person sees `source`: when the caller (or the run's starter)
+  is an API key, a published app or a trigger, the error leaves it out and only the audit keeps it;
 - writes the audit event `access_refused` (`tool_approval_audit`, outcome `denied` in the activity log and the
   platform mirror) with resource type, resource id (never a folder path), kind, source and agent;
 - in a run, emits the run event `access_refused` with the same fields.
 
 An orchestrator learns only that a team cannot start; the source goes to the person (event and audit). Agent tests
-show the source in the test result's `error_params`; they have no store to audit into.
+(`AgentTester.run(..., actor=...)`) audit through the gate's store.
+
+**Reading the records.** `AccessRules.current()` returns only the records active now: grants are looked up by
+`status` in the store (a grant stored before `status` existed no longer counts; grant it again), denies are read in
+full and filtered, so an old deny still holds. The checks at sub-workflow and team starts run in the agents' thread
+pool, not on the event loop.
 
 ## Who may do what and why (BER-1)
 
-`tool_policy.explain(request, grants=..., denies=..., at=...)` is `evaluate` with its reasons. It does no I/O and
-counts the records as the request's call site does (`site_records`: a tool call ignores `once` grants, a top-level
-start ignores records for some agents). The result (`AccessExplanation`) names:
+`tool_policy.explain(request, grants=..., denies=..., at=..., tool_kind=...)` is `evaluate` as the request's call
+site applies it. It does no I/O. The enforcement uses the same two functions, so the explanation and the call site
+cannot disagree (a property test checks every combination):
 
-- the request (resource, action, effect class, agent, mode),
-- `allowed`, `kind`, `code` and `source`,
-- the deciding `grant` or `deny`, or the deciding safety `limit` with its text (`limit_text`), or the `default_rule`,
-- `also`: the other active records that address the request but did not decide it (for example a subfolder grant
-  behind a parent deny).
+- `site_records`: a tool call ignores `once` grants, and a top-level start ignores records for some agents;
+- `site_outcome`: what the evaluation means at the call site.
 
-`tool_policy.who_may(grants, denies, at=..., resource=..., agent=..., mode=..., offline=..., protected_folders=...)`
-explains every resource, action, agent and mode an active record names. A record for all agents is explained
-without an agent. A tool is explained as it was granted. Folders are only explained when the caller names the
-protected data folder. `effect_for(resource_type, action, tool=...)` gives the effect class the call sites use.
+| `outcome` | `allowed` | Meaning |
+|---|---|---|
+| `refused` | `false` | A deny or a safety limit refuses it (and, for a cloud model with shared content or a folder, a missing grant) |
+| `granted` | `true` | A grant allows it where grants count: a tool call S-2 would ask about (not an MCP tool), a cloud model, a folder |
+| `allowed` | `true` | Nothing refuses it: a workflow start (a missing grant never refuses it), a cloud model by default |
+| `per_call_rules` | `true` | The access model does not refuse it; the per-call rules of S-2 decide (tools, MCP servers, connections) |
 
-The api builds its query on `AccessRules(store).current()` and these functions. They are for people and the
-administration only; a model never gets an explanation (N-07).
+The result (`AccessExplanation`) also names:
+
+- the request (resource, action, effect class, agent, mode);
+- `kind` and `code` (only when refused) and `source` (what `evaluate` found);
+- the deciding `grant` or `deny`, and `grant_enforced`: whether that grant counts at this site. It does not count
+  for MCP servers, connections, MCP tools and workflows: it is noted, not enforced;
+- the deciding safety `limit` with its text (`limit_text`), or the `default_rule`;
+- `also`: the other active records that address the request but did not decide it;
+- `stale`: tool grants for this tool that no longer match it (another version, classification or MCP definition).
+
+`tool_policy.who_may(grants, denies, at=..., resource=..., agent=..., mode=..., offline=..., protected_folders=...,
+tools=...)` explains every resource, action, agent and mode an active record names.
+
+- A record for all agents is explained without an agent.
+- A tool is explained as it is now. `tools` maps a tool name to a `ToolNow`: its facts, its kind and whether a local
+  MCP server serves it. Without `tools`, a tool is explained as it was granted.
+- Folders are only explained when the caller names the protected data folder.
+
+`effect_for(resource_type, action, tool=...)` gives the effect class the call sites use.
+
+The api builds its query on `AccessRules(store).current()` and these functions, and passes the tools as they are
+now. They are for people and the administration only; a model never gets an explanation (N-07).
 
 ## Not in this step
 

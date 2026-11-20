@@ -86,7 +86,8 @@ None known.
   - a grant on a workflow, MCP server or connection does not lift a question (spec 7.2 "Freigabe je Dienst", "je
     Ziel"); MCP stays strict by design;
   - a cloud model is checked when a turn connects, not before each request of a long turn;
-  - agent tests show the source of a cloud refusal in the result but do not audit it (no store there);
+  - the api passes the signed-in user as `actor` to `connect_model` and `AgentTester.run` (until then their audit
+    actor is `system` and the error has no source);
   - a top-level workflow start counts only records for all agents (a start is a person's or a trigger's).
 - **Next step:** Decide with N-08 and N-16 which of these the product needs before activation (gate G-2).
 
