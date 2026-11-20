@@ -1252,6 +1252,17 @@ class RunManager:
                 record_refusal(self.store, found, resource, actor=actor, run_id=run_id)
             raise access_error(found, resource, show_source=is_person(actor))
 
+    async def _site_refused(
+        self, context: _RunContext, node_id: str, resource: tool_policy.AccessResource
+    ) -> tool_policy.AccessExplanation | None:
+        """:meth:`_check_site_access` off the event loop (it reads the records), but only while the access model is on:
+        while it is off nothing is awaited, so the teams of a parallel step start in the order of their assignments,
+        as before N-06 (``child_run_ids`` follow the assignments; the studio and the runs' readers rely on it)."""
+        gate = self.tool_gate
+        if gate is None or gate.access is None:
+            return None
+        return await self._in_run_thread(self._check_site_access, context, node_id, resource)
+
     def _check_site_access(
         self, context: _RunContext, node_id: str, resource: tool_policy.AccessResource
     ) -> tool_policy.AccessExplanation | None:
@@ -3202,7 +3213,7 @@ class RunManager:
                 ) from None
             target = tool_policy.AccessResource(type="workflow", id=snapshot.id)
             # Reads the records and may audit: off the event loop (the agents' thread pool).
-            refused = await self._in_run_thread(self._check_site_access, context, node.id, target)
+            refused = await self._site_refused(context, node.id, target)
             if refused is not None:
                 raise access_error(refused, target, show_source=is_person(_run_actor(context.root.run)))
             shown = self._prompt_values(run)
@@ -4062,7 +4073,7 @@ class RunManager:
         async def execute(item: orchestration.Delegation) -> str:
             if item.ref is None:
                 target = tool_policy.AccessResource(type="workflow", id=teams[item.member.id][0].id)
-                if await self._in_run_thread(self._check_site_access, context, node.id, target) is not None:
+                if await self._site_refused(context, node.id, target) is not None:
                     # The orchestrator learns only that the team cannot start; the person sees the source (event).
                     raise orchestration.DelegationEnded("failed", "This team cannot be started for this agent")
                 child = start_child(item)

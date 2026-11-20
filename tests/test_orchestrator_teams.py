@@ -388,6 +388,8 @@ async def test_parallel_teams_with_one_waiting(make: Make) -> None:
     step = done.nodes["lead"].orchestration["steps"][0]
     assert [item["status"] for item in step["outcomes"]] == ["succeeded", "succeeded"]
     assert len(done.nodes["lead"].child_run_ids) == 2  # the finished team did not run again
+    # The teams start in the order of their assignments, so the runs line up with the record (studio e2e, N-06).
+    assert done.nodes["lead"].child_run_ids == [item["ref"] for item in step["outcomes"]]
 
 
 async def test_team_parameters_are_checked_like_a_manual_start(make: Make) -> None:

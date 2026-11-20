@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed (N-06, found by the studio's orchestration browser test): since #202, every team start and sub-workflow start
+  awaited the access check in a worker thread, even while the access model is off. As a result, the teams of a
+  parallel step started in a random order, and `child_run_ids` no longer followed the assignments.
+  - While the access model is off, nothing is awaited now, as before #202.
+  - While it is on, the check still runs off the event loop. The record's outcomes name each team run (`ref`), so
+    readers should match runs by `ref`.
+  - `tests/test_orchestrator_teams.py` checks the order.
 - Access model v2 follow-up (N-06 review, low findings). Still off by default.
   - `explain` and `who_may` count a tool's MCP server and connection like the gate (`ToolNow.related`, `explain(...,
     related=..., local_servers=...)`), and `who_may(local_servers=...)` does not refuse local MCP servers offline.
