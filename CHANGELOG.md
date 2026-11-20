@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Conversations with own agents (N-04, Welle 2): the module `nodestro_runtime.conversations` and
+  `Workspace.conversations`. The API serves them only while `NODESTRO_CONVERSATIONS=1` (default off). See
+  [docs/conversations.md](docs/conversations.md).
+  - `Conversation` (tenant, owner, agent template version, model, offline flag, N-08 provenance placeholder, budget,
+    files) and `ConversationMessage` (role, content, files, tool calls with arguments, result and duration, sources,
+    cost, run and approval references) are documents of the tenant's store; no migration.
+  - Every answer is a run of the engine (new trigger `conversation`, `trigger_ref` = the conversation), with its cost
+    in the run's usage; the conversation's cost is the sum of its runs. Cancelling closes the model connection.
+  - A cloud model is never chosen automatically, and cloud fallbacks are dropped. Images reach only models with
+    image input (the run's file delivery). Markdown export.
+  - A grant with duration `conversation` (N-06) names the conversation for its answers (`engine.conversation_of`);
+    other runs are unchanged.
+  - Input files: origin `conversation`; the collection `conversations` holds its files like the assistant's.
+  - Review fixes:
+    - H-1: an answer's run belongs to its conversation (`Conversations.run_visible`, used by the API on every run
+      route and list), and deleting a conversation deletes its runs.
+    - H-2: no quality check with a cloud judge in an answer, and every model of the answer is checked before it
+      starts (new code `conversation.cloud_model_not_chosen`).
+    - M-1, M-2, L-4: changes and the answer reservation are made in one store transaction under the conversation's
+      lock, with message keys written only when free; no in-memory lock per conversation.
+    - L-2: `AccessRules.revoke_conversation` revokes the grants of a deleted conversation.
+    - L-7: a conversation without an owner is seen by nobody on a server (fail closed).
+    - L-1 is documented: workflow and agent records do not reach conversations.
+
 - Fixed (N-06, found by the studio's orchestration browser test): since #202, every team start and sub-workflow start
   awaited the access check in a worker thread, even while the access model is off. As a result, the teams of a
   parallel step started in a random order, and `child_run_ids` no longer followed the assignments.

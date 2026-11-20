@@ -1278,7 +1278,7 @@ class RunManager:
             resource,
             attended=root.trigger not in UNATTENDED_TRIGGERS,
             agent=agent,
-            conversation_id=root.id,
+            conversation_id=conversation_of(root),
         )
         if found is None:
             return None
@@ -3336,7 +3336,7 @@ class RunManager:
             trigger=root.trigger,
             trigger_ref=root.trigger_ref,
             agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
-            conversation_id=root.id,
+            conversation_id=conversation_of(root),
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -3482,7 +3482,7 @@ class RunManager:
                     trigger=root.trigger,
                     trigger_ref=root.trigger_ref,
                     agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
-                    conversation_id=root.id,
+                    conversation_id=conversation_of(root),
                 ),
                 at=now(),
                 version=_version,
@@ -3653,7 +3653,7 @@ class RunManager:
             trigger=root.trigger,
             trigger_ref=root.trigger_ref,
             agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
-            conversation_id=root.id,
+            conversation_id=conversation_of(root),
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -5397,6 +5397,14 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
     target.error = found.message
     target.error_code = found.code
     target.error_params = found.params
+
+
+def conversation_of(run: Run) -> str:
+    """What a grant for "this conversation" (N-06) names for a top-level run: the conversation an answer belongs to
+    (N-04: trigger ``conversation``, so a grant holds for its later answers too), else the run itself."""
+    if run.trigger == "conversation" and run.trigger_ref:
+        return run.trigger_ref
+    return run.id
 
 
 def _key_actor(api_key_id: str | None) -> str:

@@ -154,6 +154,12 @@ passes them to `tool_policy.decide` through `CallContext.access`. A tool call is
 action `execute`, with the tool's effect class. The agent is named `<workflow id>/<node id>`, and the conversation is
 the root run.
 
+In a conversation with an own agent (N-04, [conversations.md](conversations.md)) the conversation is the conversation
+object: a `conversation` grant names its id and is revoked when it is deleted. Records scoped to a workflow or an
+agent do not carry over to a conversation: the answer's workflow id is the conversation id and its agent is
+`<conversation id>/agent`, whatever template answers. To block a tool in conversations as well, deny the tool with
+scope `all`.
+
 - A safety limit or a deny refuses the call first, with code `access.safety_limit` or `access.denied`.
   - The agent gets a short reason without the source.
   - The call's `ToolCallApproval.access_source` and the run's `tool_denied` event carry the source for the person.

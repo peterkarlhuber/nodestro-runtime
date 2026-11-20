@@ -46,7 +46,9 @@ NodeStatus = Literal[
 WAITING_NODE_STATUSES: frozenset[str] = frozenset({"awaiting_approval", "awaiting_budget"})
 #: What started a run.
 #: ``api``: a published workflow API (:mod:`nodestro_api.serving`); ``trigger_ref`` is the publication.
-RunTrigger = Literal["manual", "schedule", "batch", "benchmark", "subworkflow", "resume", "api"]
+#: ``conversation``: an answer in a conversation with an own agent (N-04, :mod:`nodestro_runtime.conversations`;
+#: ``trigger_ref`` is the conversation).
+RunTrigger = Literal["manual", "schedule", "batch", "benchmark", "subworkflow", "resume", "api", "conversation"]
 
 #: Models are named ``provider:model`` (see :mod:`nodestro_runtime.providers`); a name without a provider
 #: prefix is an Anthropic model.

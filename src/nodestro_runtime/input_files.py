@@ -22,7 +22,8 @@ Runs reference input files by id in their form values and ``file_ids``. A file s
 long as a run, test case, schedule or batch references it; a paused run therefore finds
 its files after a restart. Files a user attaches to a Nodestro Assistant conversation
 (``origin="assistant"``) are input files too: the conversation references them, and they are
-removed with the conversation or when the user removes them from it.
+removed with the conversation or when the user removes them from it. The same holds for the files of a
+conversation with an own agent (``origin="conversation"``, N-04).
 :meth:`InputFiles.cleanup` removes files nobody references (after a grace period for files
 that were uploaded but never used) and, on request, the input files of finished runs older
 than a number of days. Files of queued, running or
@@ -70,14 +71,20 @@ PREFIX = "in_"
 INPUT_ID = re.compile(r"^in_[0-9a-f]{12}$")
 _REFERENCE = re.compile(r"in_[0-9a-f]{12}")
 #: Collections whose documents reference input files.
-_HOLDERS = ("runs", "benchmark_suites", "schedules", "batches", "assistant_conversations")
+_HOLDERS = ("runs", "benchmark_suites", "schedules", "batches", "assistant_conversations", "conversations")
 #: How a holding collection is named in :meth:`InputFiles.references` (runs and batches add their status).
-_HOLDER_NAMES = {"benchmark_suites": "suite", "schedules": "schedule", "assistant_conversations": "conversation"}
+_HOLDER_NAMES = {
+    "benchmark_suites": "suite",
+    "schedules": "schedule",
+    "assistant_conversations": "conversation",
+    "conversations": "conversation",
+}
 #: Uploads that no run uses are kept this long (the run dialog may still be open).
 GRACE = timedelta(hours=24)
 _CACHE = 32
 
-Origin = Literal["studio", "api", "test", "schedule", "batch", "assistant"]
+#: ``conversation``: a file of a conversation with an own agent (N-04, :mod:`nodestro_runtime.conversations`).
+Origin = Literal["studio", "api", "test", "schedule", "batch", "assistant", "conversation"]
 
 
 class FileStoreLike(Protocol):
@@ -403,7 +410,8 @@ class InputFiles:
 
     def references(self) -> dict[str, set[str]]:
         """Input file id -> what references it: ``run:<status>``, ``suite``, ``schedule``, ``batch:<status>``,
-        ``conversation`` (a file attached to a Nodestro Assistant conversation)."""
+        ``conversation`` (a file attached to a Nodestro Assistant conversation or to a conversation with an own
+        agent)."""
         found: dict[str, set[str]] = {}
         for collection, raw in self.store.search_raw(_HOLDERS, "in_"):
             ids = set(_REFERENCE.findall(raw))

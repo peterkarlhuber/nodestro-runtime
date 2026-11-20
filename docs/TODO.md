@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 32 |
+| P3 Low | 34 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -569,6 +569,30 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
+
+### RT-089 · Conversations with own agents (N-04): follow-ups
+
+- **Priority:** P3 Low · **Status:** In progress · **Refs:** development plan N-04,
+  [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
+- **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
+  - the history goes to the model as text in the run's input; N-05 compacts long conversations;
+  - earlier files of a conversation are not offered to later answers (only the files sent with a message);
+  - only agent templates answer, not agent nodes of a workflow;
+  - the provenance field is a placeholder until N-08, the offline flag only refuses cloud models until N-09;
+  - workflow- and agent-scoped grants and denies do not reach conversations (L-1, documented); agent ids of their
+    own close it;
+  - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
+    deleted by hand.
+- **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
+
+### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `tests/test_mcp_stdio.py`, `mcp_stdio.py`
+- **What:** A CI run during the N-04 work (2026-11-20) reported the test failing with `mcp.timeout` instead of
+  `mcp.stdio_failed` or `mcp.protocol_error`: the flooding server apparently reached the 20-second timeout before the
+  stdio limit stopped it. It did not reproduce. The test was not changed.
+- **Next step:** If it fails again, look at the order of the timeout and the output limit under a slow runner, and
+  decide whether `mcp.timeout` is an acceptable stable code for a flooding server.
 
 ### RT-084 · Activity log: API endpoints, server retention and remaining sources (N-13)
 

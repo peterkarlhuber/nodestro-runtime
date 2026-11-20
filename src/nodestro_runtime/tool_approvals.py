@@ -1112,6 +1112,15 @@ class AccessRules:
     def revoke_deny(self, deny_id: str, *, by: Person) -> Deny:
         return self._revoke(DENIES, Deny, deny_id, by=by, kind="access_deny_revoked")
 
+    def revoke_conversation(self, conversation_id: str, *, by: Person) -> list[Grant]:
+        """Revoke every active grant for "this conversation" (duration ``conversation``) of a deleted conversation
+        (N-04 L-2): the id is never used again, and the grants should not outlive it in the list."""
+        return [
+            self.revoke_grant(item.id, by=by)
+            for item in self.grants()
+            if item.conversation_id == conversation_id and item.status == "active"
+        ]
+
     def use(self, grant_id: str) -> bool:
         """Mark an active ``once`` grant used: ``True`` for the one caller that may act on it. One compare-and-set
         from ``active``, like a revocation, so a revoked or expired grant is never used and a revocation is never
