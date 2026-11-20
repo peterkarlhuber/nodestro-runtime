@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install "pip>=26.1"
-          curl -fsSL https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt -o "$RUNNER_TEMP/lock-all.txt" # no pipe: a failed download must fail the step
+          bash scripts/studio_lock.sh "$RUNNER_TEMP/lock-all.txt" # paired studio lock on pull requests, lock lag on master pushes
           grep -v '^nodestro-runtime ' "$RUNNER_TEMP/lock-all.txt" > "$RUNNER_TEMP/lock.txt"
           cat "$RUNNER_TEMP/lock.txt"
       # The Nodestro components and orkexa are public: pip clones them anonymously over https.
