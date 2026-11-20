@@ -165,8 +165,9 @@ A decision carries two separate texts (owner decision E-0R-1 A):
   agent, not a sub-workflow, an orchestrator or its teams, not the run chat, not after a restart or a continued run.
   Result nodes, result files and decision nodes never received it and still do not.
 - `agent_note` ("Note to the agent") is the only text of a decision that later agents read. It is plain text of at
-  most 2,000 characters (control and text direction characters are removed; a longer note is refused with
-  `approval.agent_note_too_long`). Agents, sub-workflows and orchestrators behind the approval receive it under the
+  most 2,000 characters (NFKC-normalized; control, format, separator, private-use characters and variation selectors
+  are removed, only line breaks and tabs stay; a longer note is refused with `approval.agent_note_too_long`, and a
+  stored note is cleaned and cut again whenever it is read). Agents, sub-workflows and orchestrators behind the approval receive it under the
   approval's name (`{{<approval name>}}`, or appended to the task like any other input), labeled as a person's note
   with the decision and framed as data (`<untrusted_data source="note of a person at the approval ...">`). Without a
   note the placeholder reads `-`. `ApprovalConfig.allow_agent_note = False` turns the note off for an approval (a note
@@ -181,6 +182,10 @@ ask reviewers to use the note to the agent. Workflows and runs stored before loa
 the `{{...}}` reference, empty when the decision arrived through `{{input}}`, `{{feedback}}` or the appended inputs)
 until the workflow is saved with `allow_agent_note` set to `True` or `False`. Fingerprints of continued runs do not
 change unless the note is turned off.
+Prompts stored before the upgrade are not rewritten: an orchestrator's stored task (`state.prompt`, also shown in
+the run chat's snapshot) and the checkpoint of an agent turn paused at a tool call before the upgrade may still hold
+an old comment. The model had already seen that text before the upgrade; it is no new path, and every prompt built
+after the upgrade holds only the note.
 
 **Continuing.** `await workspace.resume(run_id)` continues a failed or cancelled run as a new linked run. A
 step's earlier result is reused only when its fingerprint (configuration, connections, tool code, inputs and

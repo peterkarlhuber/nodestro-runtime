@@ -373,6 +373,89 @@ async def test_tool_results_and_retries_never_carry_the_comment(make: Make) -> N
 # ---- the decision API: limits, plain text, compatibility ----------------------------------------------------------
 
 
+#: One invisible character of each class a note may not hold, with the name of its class.
+INVISIBLE = {
+    "\u0000": "control",
+    "\u0085": "C1 control",
+    "\u00ad": "soft hyphen",
+    "\u061c": "Arabic letter mark",
+    "\u200b": "zero-width space",
+    "\u200e": "left-to-right mark",
+    "\u202e": "right-to-left override",
+    "\u2028": "line separator",
+    "\u2029": "paragraph separator",
+    "\u2060": "word joiner",
+    "\u2062": "invisible times",
+    "\u2064": "invisible plus",
+    "\u2066": "left-to-right isolate",
+    "\ufe0f": "variation selector",
+    "\ufeff": "byte order mark",
+    "\ue000": "private use",
+    "\U000e0001": "language tag",
+    "\U000e0041": "tag latin capital A",
+    "\U000e007f": "cancel tag",
+    "\U000e0100": "variation selector supplement",
+    "\U000e01ef": "last variation selector",
+}
+
+
+@pytest.mark.parametrize("char", list(INVISIBLE), ids=list(INVISIBLE.values()))
+def test_every_invisible_character_class_is_removed(char: str) -> None:
+    assert clean_agent_note(f"keep{char}this{char}") == "keepthis"
+
+
+def test_cleaning_normalizes_and_keeps_line_breaks_and_tabs() -> None:
+    # NFKC: full-width letters and ligatures become plain ones; only \n and \t of the white space controls stay.
+    assert clean_agent_note("\uff21\ufb01\tB\r\nC\rD\x0bE") == "Afi\tB\nC\nDE"
+    assert clean_agent_note("\ufe0f\u200b ") == ""
+
+
+async def test_a_note_written_to_the_store_directly_is_cleaned_and_cut_on_read(make: Make) -> None:
+    def broken(_request: dict[str, Any]) -> Any:
+        raise ValueError("model broke")
+
+    workspace = make({"DRAFT": [text("draft")], "REVISE": [broken, text("revised")]})
+    workflow = review_flow(
+        [agent("revise", "REVISE", task_template="{{Review}}"), {"id": "out", "type": "output"}],
+        [edge("check", "revise", "approved"), edge("revise", "out")],
+    )
+    paused = await paused_at_review(workspace, workflow)
+    workspace.decide(paused.id, "check", "approved", CANARY, agent_note="short")
+    failed = await workspace.wait(paused.id, timeout=20)
+    assert failed.status == "failed"
+    # A record that never passed decide(): too long, with invisible characters.
+    raw = workspace.store.get_raw("runs", failed.id)
+    assert raw is not None
+    raw["nodes"]["check"]["approval"]["agent_note"] = "\U000e0041\u2028" + "y" * (AGENT_NOTE_MAX_CHARS + 500)
+    workspace.store.put_raw("runs", failed.id, raw)
+    continued = await workspace.resume(failed.id, mode="continue", confirm=True)
+    done = await workspace.wait(continued.id, timeout=20)
+    assert done.status == "succeeded", done.error
+    prompt = done.nodes["revise"].prompt or ""
+    assert "y" * AGENT_NOTE_MAX_CHARS + "\n</untrusted_data>" in prompt
+    assert "y" * (AGENT_NOTE_MAX_CHARS + 1) not in prompt
+    assert "\U000e0041" not in prompt and "\u2028" not in prompt
+    assert CANARY not in requests(workspace)
+
+
+def test_a_note_at_an_approval_that_takes_none_is_never_read() -> None:
+    record = ApprovalRecord(decision="approved", comment=CANARY, agent_note=NOTE)
+    assert approval_note("Review", record, ApprovalConfig(allow_agent_note=False)) is None
+    assert approval_note("Review", record, ApprovalConfig(allow_agent_note=None)) is not None
+    assert approval_note("Review", ApprovalRecord(decision="approved", agent_note="\u200b\u2060")) is None
+
+
+async def test_the_preview_hides_a_note_the_approval_does_not_take(make: Make) -> None:
+    workspace = make({"DRAFT": [text("draft")]})
+    workflow = review_flow([agent("revise", "REVISE")], [edge("check", "revise", "approved")], allow_agent_note=False)
+    paused = await paused_at_review(workspace, workflow)
+    run = workspace.runs.get(paused.id)
+    assert run is not None
+    run.nodes["check"].approval = ApprovalRecord(decision="approved", comment=CANARY, agent_note=NOTE)
+    dumped = build_preview(workspace, run.workflow, "revise", given_input=None, run=run).model_dump_json()
+    assert CANARY not in dumped and NOTE not in dumped
+
+
 async def test_the_note_is_plain_text_and_bounded(make: Make) -> None:
     workspace = make({"DRAFT": [text("draft")], "REVISE": [text("revised")]})
     workflow = review_flow([agent("revise", "REVISE")], [edge("check", "revise", "approved")])

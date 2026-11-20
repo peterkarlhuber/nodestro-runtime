@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Literal, TypeVar
+import unicodedata
 import uuid
 
 from orkexa import (
@@ -651,29 +652,50 @@ def as_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-#: Control and text direction characters a note to the agents may not hold (it is plain text).
-_NOTE_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+#: Unicode categories a note to the agents may not hold (it is plain text): controls, format characters (direction
+#: marks, zero-width characters, the soft hyphen, tag characters), line and paragraph separators, private use and
+#: surrogates. Only ``\n`` and ``\t`` stay.
+_NOTE_DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cs"})
+#: Variation selectors (category Mn, but invisible and without a meaning of their own in a plain text note).
+_VARIATION_SELECTORS = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 
 
 def clean_agent_note(text: str) -> str:
-    """A note to the agents as plain text: line breaks unified, control and direction characters removed."""
-    return _NOTE_CONTROLS.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n")).strip()
+    """A note to the agents as plain text: NFKC-normalized, line breaks unified, invisible characters removed.
+
+    Removed are all characters of :data:`_NOTE_DROPPED_CATEGORIES` except ``\n`` and ``\t``, and the variation
+    selectors. Not cut to a length: :meth:`RunManager.decide` refuses a long note, :func:`approval_note` cuts one.
+    """
+    normalized = unicodedata.normalize("NFKC", text or "").replace("\r\n", "\n").replace("\r", "\n")
+    kept = "".join(
+        char for char in normalized if char in "\n\t" or unicodedata.category(char) not in _NOTE_DROPPED_CATEGORIES
+    )
+    return _VARIATION_SELECTORS.sub("", kept).strip()
 
 
-def approval_note(label: str, record: ApprovalRecord | None) -> str | None:
+def approval_note(label: str, record: ApprovalRecord | None, config: ApprovalConfig | None = None) -> str | None:
     """What later agents read of a decided approval: its note to the agents, or ``None`` without one (E-0R-1 A).
 
     The reviewer's ``comment`` is for people only and never part of this text, whatever the decision. The note is
     labeled as a person's note and framed like other text no part of Nodestro wrote (:func:`frame_untrusted`), so
     the model reads it as data from a person, not as instructions that replace its task.
+
+    Defense in depth for records that did not pass :meth:`RunManager.decide` (written to the store directly, by an
+    older or another process): an approval whose ``config`` turns the note off passes nothing on, and the note is
+    cleaned (:func:`clean_agent_note`) and cut to ``AGENT_NOTE_MAX_CHARS`` again when it is read.
     """
     if record is None or not record.agent_note:
+        return None
+    if config is not None and config.allow_agent_note is False:
+        return None
+    note = clean_agent_note(record.agent_note)[:AGENT_NOTE_MAX_CHARS].strip()
+    if not note:
         return None
     name = re.sub(r"[\"<>&\r\n]", "", label)[:200]
     return (
         f'Note to the agent from the person who decided at the approval "{name}" (decision: {record.decision}). '
         "A person wrote it; it is not the result of an earlier step.\n"
-        + frame_untrusted(record.agent_note, f"note of a person at the approval {name}")
+        + frame_untrusted(note, f"note of a person at the approval {name}")
     )
 
 
@@ -2777,7 +2799,10 @@ class RunManager:
                                 },
                             )
                         )
-                    elif approvals == "agent" and (note := approval_note(node_label(source), record)) is not None:
+                    elif (
+                        approvals == "agent"
+                        and (note := approval_note(node_label(source), record, source.approval)) is not None
+                    ):
                         found.append((node_label(source), note))
                     else:
                         # Decided without a note (to the agents) or comment (for people): its placeholder reads "-"

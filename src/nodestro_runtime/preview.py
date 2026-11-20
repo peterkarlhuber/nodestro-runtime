@@ -172,7 +172,7 @@ def build_preview(
             text: str | None = as_text(form_values) if form_values else run_input
         elif item.type == "approval":
             approval = state.approval if state is not None else None
-            text = approval_note(labels[source], approval)
+            text = approval_note(labels[source], approval, item.approval)
         elif state is not None and state.status == "succeeded":
             text = as_text(state.output)
         else:
