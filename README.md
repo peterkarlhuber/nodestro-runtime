@@ -20,7 +20,7 @@ package; the runtime itself depends on neither.
 | Agents | `agent_builder` (`AgentConfig` → `orkexa.Agent`), `agent_test`, `providers` (keys, endpoints, capabilities), `bedrock` (Amazon Bedrock), `model_profile`, `reasoning`, `output_limits`, `pricing`, `pricing_sync`, `cost_tracking`, `reconciliation` (estimates against bills) |
 | Local models | `local_models` (catalog, task- and hardware-aware recommendations), `local_service` (the Ollama server per profile, model jobs); see [docs/local-models.md](docs/local-models.md) |
 | Tools | `tool_library`, `builtin_tools`, `tool_drafts`, `tool_provenance`, `tool_adoption`, `python_deps`, `python_envs`, `python_tools`, `value_checks` |
-| Tool approvals | `tool_approvals`, `tool_checkpoints`, `tool_policy`, `tool_preflight`, `tool_journal` (off by default: `NODESTRO_TOOL_APPROVALS`) |
+| Tool approvals | `tool_approvals`, `tool_checkpoints`, `tool_policy`, `tool_preflight`, `tool_journal` (off by default: `NODESTRO_TOOL_APPROVALS`); grants, denies and safety limits of the access model v2 (off by default: `NODESTRO_ACCESS_GRANTS`; see [docs/access-grants.md](docs/access-grants.md)) |
 | Sandboxes | `sandbox_policy` (trust classes, ADR-0006), `sandbox_selection`, `builtin_sandbox` (Linux), `container_images`, `sandbox_gateway`, `sandbox_probes`, `docker_status`, `sandbox_cancel`, `sandbox_confine`, `image_limits` |
 | MCP | `mcp` (client hub, OAuth, stdio servers in containers, network guard), `mcp_access` |
 | Knowledge, memory, files | `knowledge`, `memory_spaces`, `documents`, `input_files`, `file_formats`, `file_delivery`, `office`, `reports`, `adoption`, `sanitize`, `preview` |

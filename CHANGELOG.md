@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Access model v2, groundwork (N-06). It is off by default (`NODESTRO_ACCESS_GRANTS=1`, only together with
+  `NODESTRO_TOOL_APPROVALS=1`; activation needs gate G-2). See [docs/access-grants.md](docs/access-grants.md).
+  - Stored `Grant` and `Deny` records about a tool, folder, workflow, MCP server, connection or cloud provider, with
+    actions, scope, duration and mode (`tool_approvals.AccessRules`, collections `access_grants` and
+    `access_denies`).
+  - Only a `Person` writes them, and never from inside a tool call. Every change is audited (`access_*`) and goes to
+    the activity log.
+  - Global safety limits are code (`tool_policy.SAFETY_LIMITS`).
+  - `tool_policy.evaluate` checks safety limit, then deny, then grant, otherwise a missing grant. It reports the
+    kind of refusal (`access.missing_grant`, `access.denied`, `access.safety_limit`) and its source.
+  - The five effect classes are combinations of the `access` and `reach` axes. Folders compare by normalized path
+    components (NFC).
+  - When switched on, the tool gate refuses on a deny or safety limit first, and a matching grant replaces the
+    question. Switched off, nothing changes.
+  - New problem codes `access.*`.
+
 - Security (LD-020 follow-up 2): plain provider keys do not stay readable next to their sealed form.
   - `SQLiteStore.checkpoint()` becomes `SQLiteStore.scrub()` (`VACUUM`, then a `TRUNCATE` checkpoint), called once
     after plain provider keys are sealed: data of releases without `secure_delete` kept copies of a plain key in free
