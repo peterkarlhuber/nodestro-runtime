@@ -205,6 +205,10 @@ the related resources over the whole S-2 matrix, and runs with stored records be
   content yet (N-08 provenance), so today only a deny or a safety limit (strict offline: `limit:offline`) refuses.
   The check runs when a turn connects, so a new deny applies at the next turn. An agent test and the live run chat
   have no agent: a deny for some agents holds there too.
+- `Workspace.connect_model(model, actor=..., attended=..., probe=...)`: `attended=False` for a caller nobody watches
+  (a benchmark judge), so denies and limits for unattended use apply; `probe=True` for a check whether a model can
+  be used at all (model choice), which is refused like a request but not audited. The connection test of the
+  diagnostics (`Workspace.connection`) is not checked: it sends no content.
 - If both a safety limit and a deny apply (on the tool or a related resource), the safety limit is reported.
 
 **Recording a refusal.** A refused tool call records the source as before (`ToolCallApproval.access_source`, run
@@ -212,7 +216,9 @@ event `tool_denied`). A refused workflow start, sub-workflow or team start, or c
 
 - raises (or fails the step with) `access.denied`, `access.safety_limit` or `access.missing_grant` with the params
   `resource_type`, `resource_id` and `source`. Only a person sees `source`: when the caller (or the run's starter)
-  is an API key, a published app or a trigger, the error leaves it out and only the audit keeps it;
+  is an API key, a published app or a trigger, the error leaves it out and only the audit keeps it. Run records and
+  events (`ToolCallApproval.access_source`, the `source` of `tool_denied`, `tool_access_granted` and
+  `access_refused`) keep it; the api leaves it out when it serves them to a caller that is not a person;
 - writes the audit event `access_refused` (`tool_approval_audit`, outcome `denied` in the activity log and the
   platform mirror) with resource type, resource id (never a folder path), kind, source and agent;
 - in a run, emits the run event `access_refused` with the same fields.
@@ -251,12 +257,18 @@ The result (`AccessExplanation`) also names:
 - `also`: the other active records that address the request but did not decide it;
 - `stale`: tool grants for this tool that no longer match it (another version, classification or MCP definition).
 
+`explain` also takes `related` (the MCP server and connection a tool call uses) and `local_servers`: a deny or a
+safety limit on a related resource refuses the tool row exactly as `access_refusal` refuses the call, and strict
+offline refuses neither a local (`stdio`) MCP server nor its tools.
+
 `tool_policy.who_may(grants, denies, at=..., resource=..., agent=..., mode=..., offline=..., protected_folders=...,
-tools=...)` explains every resource, action, agent and mode an active record names.
+tools=..., local_servers=...)` explains every resource, action, agent and mode an active record names.
 
 - A record for all agents is explained without an agent.
-- A tool is explained as it is now. `tools` maps a tool name to a `ToolNow`: its facts, its kind and whether a local
-  MCP server serves it. Without `tools`, a tool is explained as it was granted.
+- A tool is explained as it is now. `tools` maps a tool name to a `ToolNow`: its facts, its kind and the resources a
+  call uses (`related`: its MCP server, and a connection where the caller knows it). Without `tools`, a tool is
+  explained as it was granted.
+- `local_servers` names the local MCP servers, for MCP server rows and for the tools that use them.
 - Folders are only explained when the caller names the protected data folder.
 
 `effect_for(resource_type, action, tool=...)` gives the effect class the call sites use.

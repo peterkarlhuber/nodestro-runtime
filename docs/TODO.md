@@ -438,16 +438,6 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Bugs and reliability
 
-### RT-087 · Flaky test in `tests/test_mcp_reclassification.py` (race)
-
-- **Priority:** P3 Low · **Status:** Open (owner open) · **Refs:** failed on master 2026-11-19 (`84038b2`) and
-  2026-11-14 (`3c11de4`); passed on rerun
-- **What:** A test in `tests/test_mcp_reclassification.py` fails now and then on CI. It looks like a timing race
-  between the reclassification and the waiting call, not a product defect. Which test fails, and the exact
-  interleaving, still have to be read from the two CI logs.
-- **Next step:** Find the failing test in the CI logs of both commits. Make it wait on the stored state instead of on
-  time. Do not weaken its assertions.
-
 ### RT-071 · Follow-ups of the JQ-3 re-review (N-1..N-5)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION JQ-3 re-review at 61eb9fc (accepted), runtime #143 (TABRION JQ-1..JQ-4, done),

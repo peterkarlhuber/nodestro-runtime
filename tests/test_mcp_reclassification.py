@@ -111,6 +111,32 @@ async def finished(workspace: Workspace, run_id: str) -> Run:
     return await workspace.wait(run_id, timeout=30)
 
 
+class HeldPolls:
+    """Holds the waiting run between two reads of its approval request (RT-087): what the test does meanwhile lands
+    before the engine reads the request again, whatever the timing on the machine. ``held`` waits until the run sits
+    in such a pause; ``release`` lets it read on."""
+
+    def __init__(self, approvals: ToolApprovals) -> None:
+        self._entered = threading.Event()
+        self._release = threading.Event()
+        original = approvals.sleep
+
+        def sleep(seconds: float) -> None:
+            self._entered.set()
+            if not self._release.wait(timeout=30):
+                raise AssertionError("the waiting run was held too long")
+            original(seconds)
+
+        approvals.sleep = sleep
+
+    async def held(self) -> None:
+        # Every pause blocks until ``release``, so once one began the run reads nothing until then.
+        assert await asyncio.to_thread(self._entered.wait, 30), "the run never waited for its approval"
+
+    def release(self) -> None:
+        self._release.set()
+
+
 def the_call(run: Run) -> Any:
     [call] = run.nodes["a"].tool_calls
     return call
@@ -166,14 +192,16 @@ async def test_an_approval_given_before_the_reclassification_is_stale(
     workspace = make_workspace(tmp_path, server)
     gate = workspace.runs.tool_gate
     assert gate is not None
-    gate.approvals.poll_seconds = 0.5  # the decision is read only at the next look
+    polls = HeldPolls(gate.approvals)  # the decision is read only after both changes (RT-087: not a timing guess)
     try:
         run_id = await started(workspace)
         request = await pending(workspace, run_id)
+        await polls.held()
         ToolApprovals(workspace.store).decide(
             run_id, request.id, approved=True, by="operator", arguments=request.arguments_hash
         )
         classify(workspace, "delete_page", "destructive")  # the approved request is not pending any more
+        polls.release()
         done = await finished(workspace, run_id)
         call = the_call(done)
         assert call.is_error and call.approval.code == "tool.approval_stale"
@@ -396,9 +424,16 @@ async def test_a_reclassification_racing_an_approval_never_runs_the_call(
     Whichever wins, the call is never made: either the approval is refused, or the engine finds it stale."""
     monkeypatch.setenv(ENABLE_ENV, "1")
     workspace = make_workspace(tmp_path, server)
+    gate = workspace.runs.tool_gate
+    assert gate is not None
+    # Both land before the waiting run reads its request again (RT-087): the race is between the two people, and the
+    # engine must refuse whichever won; a run that read an approval before the reclassification is another case
+    # (the check right before the request to the MCP server, tested above).
+    polls = HeldPolls(gate.approvals)
     try:
         run_id = await started(workspace)
         request = await pending(workspace, run_id)
+        await polls.held()
         barrier = threading.Barrier(2)
 
         def approve() -> None:
@@ -419,6 +454,7 @@ async def test_a_reclassification_racing_an_approval_never_runs_the_call(
             thread.start()
         for thread in threads:
             thread.join()
+        polls.release()
         call = the_call(await finished(workspace, run_id))
         assert call.is_error and call.approval.code == "tool.approval_stale"
         assert sent(server) == 0

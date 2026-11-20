@@ -1579,15 +1579,21 @@ class Workspace:
         """The local (``stdio``) MCP servers: they run on this computer, so strict offline does not refuse them."""
         return {server.id for server in self.mcp.servers() if server.transport == "stdio"}
 
-    def connect_model(self, model: str, *, actor: str = "system") -> Connection:
+    def connect_model(
+        self, model: str, *, actor: str = "system", attended: bool = True, probe: bool = False
+    ) -> Connection:
         """The connection of a model's provider; a cloud model in the strict offline mode is refused first (also
-        when its provider is not configured: a key would not help), then one the access model v2 blocks (N-06;
-        ``actor``: who asks, for the audit and whether the error names the source)."""
+        when its provider is not configured: a key would not help), then one the access model v2 blocks (N-06).
+
+        ``actor``: who asks (the audit, and whether the error names the source). ``attended``: ``False`` when nobody
+        waits for the answer (a benchmark judge), so unattended denies and limits apply. ``probe``: only asks whether
+        the model can be used (model choice): a refusal is not audited. The connection test of the diagnostics
+        (``connection(provider)``) is not checked: it sends no content."""
         provider = provider_of(model)
         if provider != "ollama" and self.strict_offline():
             raise _offline_cloud_model(model, provider)
         # N-06: a cloud model the access model v2 blocks is refused before anything is sent (only while it is on).
-        self.runs.check_cloud_access(provider, actor=actor)
+        self.runs.check_cloud_access(provider, actor=actor, attended=attended, audit=not probe)
         return self.connection(provider)
 
     def allowed_models(self) -> list[str]:

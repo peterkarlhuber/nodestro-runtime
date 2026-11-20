@@ -31,7 +31,7 @@ starts, MCP servers, connections and cloud models are checked (:func:`site_acces
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 import itertools
 import os
@@ -713,14 +713,50 @@ def site_outcome(resource_type: ResourceType, found: AccessDecision, *, tool_kin
 
 
 class ToolNow(BaseModel):
-    """A tool as it is now, for :func:`who_may`: its facts (``None``: it is gone), its kind, and whether it is a tool
-    of a local (``stdio``) MCP server, which strict offline does not refuse."""
+    """A tool as it is now, for :func:`who_may`: its facts (``None``: it is gone), its kind, and the resources a call
+    of it uses (``related``: its MCP server, and a connection if the caller knows the agent's), as the gate passes them
+    to :func:`access_refusal`."""
 
     model_config = ConfigDict(frozen=True)
 
     facts: ToolFacts | None = None
     kind: str = "custom"
-    local: bool = False
+    related: tuple[AccessResource, ...] = ()
+
+
+def _local_call(related: Sequence[AccessResource], local_servers: Collection[str]) -> bool:
+    """Whether a call goes through a local (``stdio``) MCP server: strict offline does not refuse it."""
+    return any(item.type == "mcp_server" and item.id in local_servers for item in related)
+
+
+def _first_refusal(checked: Sequence[AccessDecision]) -> AccessDecision | None:
+    """The refusal of a tool call among the evaluations of the tool and its related resources: a safety limit wins
+    over a deny, and the tool's own (first) over a related one of the same kind."""
+    for kind in ("safety_limit", "denied"):
+        found = next((item for item in checked if item.kind == kind), None)
+        if found is not None:
+            return found
+    return None
+
+
+def _related_request(resource: AccessResource, tool: ToolFacts | None, request: AccessRequest) -> AccessRequest:
+    """The request for the MCP server or connection a tool call (``request``) uses (:func:`related_access`)."""
+    return AccessRequest(
+        resource=resource,
+        action=SITE_ACTIONS[resource.type],
+        effect=effect_for(resource.type, "execute", tool=tool),
+        agent=request.agent,
+        mode=request.mode,
+        conversation_id=request.conversation_id,
+        offline=request.offline,
+    )
+
+
+def _evaluate_at_site(
+    request: AccessRequest, grants: Sequence[Grant], denies: Sequence[Deny], at: datetime
+) -> AccessDecision:
+    found_grants, found_denies = site_records(request, grants, denies)
+    return evaluate(request, grants=found_grants, denies=found_denies, at=at)
 
 
 class AccessExplanation(BaseModel):
@@ -767,12 +803,33 @@ def explain(
     denies: Sequence[Deny],
     at: datetime,
     tool_kind: str | None = None,
+    related: Sequence[AccessResource] = (),
+    local_servers: Collection[str] = (),
 ) -> AccessExplanation:
     """:func:`evaluate` with its reasons, as the request's call site applies it (no I/O): the records count as there
-    (:func:`site_records`), and ``outcome`` says what happens there (:func:`site_outcome`). A tool request names the
-    tool as it is now (``request.tool``) and its kind (``tool_kind``)."""
+    (:func:`site_records`), and ``outcome`` says what happens there (:func:`site_outcome`).
+
+    A tool request names the tool as it is now (``request.tool``), its kind (``tool_kind``) and the MCP server and
+    connection a call uses (``related``): a deny or a safety limit on one of them refuses the call, as in
+    :func:`access_refusal`. ``local_servers`` are the local (``stdio``) MCP servers: strict offline does not refuse a
+    call through one, nor the server itself."""
+    all_denies = denies
+    local = _local_call(related, local_servers) or (
+        request.resource.type == "mcp_server" and request.resource.id in local_servers
+    )
+    if local and request.offline:
+        request = request.model_copy(update={"offline": False})
     grants, denies = site_records(request, grants, denies)
     found = evaluate(request, grants=grants, denies=denies, at=at)
+    if request.resource.type == "tool" and related:
+        checked = [found]
+        checked += [
+            _evaluate_at_site(_related_request(item, request.tool, request), grants, all_denies, at) for item in related
+        ]
+        refusal = _first_refusal(checked)
+        if refusal is not None:
+            found = refusal
+            denies = list(all_denies)
     outcome = site_outcome(request.resource.type, found, tool_kind=tool_kind)
     refused = outcome == "refused"
     kind, _, name = found.source.partition(":")
@@ -828,6 +885,7 @@ def who_may(
     offline: bool = False,
     protected_folders: Sequence[str] = (),
     tools: Mapping[str, ToolNow] | None = None,
+    local_servers: Collection[str] = (),
 ) -> list[AccessExplanation]:
     """ "Who may do what and why" (BER-1): for every resource, action, agent and mode an active record names, what
     the call site does now and why (:func:`explain`). ``resource``, ``agent`` and ``mode`` narrow the answer.
@@ -835,9 +893,12 @@ def who_may(
     - A record for all agents is explained without an agent (as for an agent no other record names).
     - A tool is explained as it is now (``tools``: name -> :class:`ToolNow`; a grant for another version shows as
       ``stale``). Without ``tools`` it is explained as it was granted (the grant's ``tool``), with only a deny as an
-      unknown tool.
+      unknown tool. A tool's MCP server and connection (``ToolNow.related``) refuse it like at the gate.
+    - ``local_servers`` are the local (``stdio``) MCP servers: strict offline refuses neither them nor their tools.
     - A folder request names ``protected_folders`` (Nodestro's own data folder); without one, folders are left out."""
-    cases: dict[tuple[str, str, str, str | None, str], tuple[AccessRequest, str | None]] = {}
+    cases: dict[
+        tuple[str, str, str, str | None, str], tuple[AccessRequest, str | None, tuple[AccessResource, ...]]
+    ] = {}
     active: list[Grant | Deny] = [*(item for item in grants if item.active_at(at))]
     active += [item for item in denies if item.active_at(at)]
     for record in active:
@@ -854,10 +915,10 @@ def who_may(
             modes = (mode,) if mode in modes else ()
         tool: ToolFacts | None = record.tool if isinstance(record, Grant) else None
         tool_kind: str | None = None
-        local = False
+        related: tuple[AccessResource, ...] = ()
         if record.resource.type == "tool" and tools is not None:
             now_ = tools.get(record.resource.id)
-            tool, tool_kind, local = (now_.facts, now_.kind, now_.local) if now_ is not None else (None, None, False)
+            tool, tool_kind, related = (now_.facts, now_.kind, now_.related) if now_ is not None else (None, None, ())
         for action, who, how in itertools.product(record.actions, agents, modes):
             key = (record.resource.type, record.resource.id, action, who, how)
             if key in cases:
@@ -869,14 +930,22 @@ def who_may(
                 agent=who,
                 mode=how,
                 conversation_id=record.conversation_id if isinstance(record, Grant) else None,
-                offline=offline and not local,
+                offline=offline,
                 protected_folders=tuple(protected_folders) if record.resource.type == "folder" else (),
                 tool=tool if record.resource.type == "tool" else None,
             )
-            cases[key] = (request, tool_kind)
+            cases[key] = (request, tool_kind, related)
     return [
-        explain(request, grants=grants, denies=denies, at=at, tool_kind=tool_kind)
-        for request, tool_kind in cases.values()
+        explain(
+            request,
+            grants=grants,
+            denies=denies,
+            at=at,
+            tool_kind=tool_kind,
+            related=related,
+            local_servers=local_servers,
+        )
+        for request, tool_kind, related in cases.values()
     ]
 
 
@@ -967,18 +1036,17 @@ def related_access(
     """:func:`evaluate` for the MCP server or the connection a tool call uses (action ``execute``, the tool's effect
     class; MCP servers and connections always reach outside). Only its refusals count (:func:`access_refusal`): a
     grant on them never allows a call, so the MCP rules and the per-call questions stay as they are."""
-    facts = ToolFacts.of(capability, version=None)
-    request = AccessRequest(
-        resource=resource,
-        action=SITE_ACTIONS[resource.type],
-        effect=effect_for(resource.type, "execute", tool=facts),
+    call = AccessRequest(
+        resource=AccessResource(type="tool", id="-"),
+        action="execute",
+        effect=effect_of(capability),
         agent=access.agent,
         mode="supervised" if attended else "unattended",
         conversation_id=access.conversation_id,
         offline=access.offline,
     )
-    grants, denies = site_records(request, access.grants, access.denies)
-    return evaluate(request, grants=grants, denies=denies, at=at)
+    request = _related_request(resource, ToolFacts.of(capability, version=None), call)
+    return _evaluate_at_site(request, access.grants, access.denies, at)
 
 
 def access_refusal(
@@ -1003,7 +1071,7 @@ def access_refusal(
     if context.access is None:
         return None, None
     access = context.access
-    if any(item.type == "mcp_server" and item.id in access.local_servers for item in related):
+    if _local_call(related, access.local_servers):
         # A local (stdio) MCP server runs on this computer: strict offline does not refuse its tools.
         access = access.model_copy(update={"offline": False})
     found = tool_access(
@@ -1017,11 +1085,10 @@ def access_refusal(
     )
     checked = [found]
     checked += [related_access(resource, capability, access, attended=context.attended, at=at) for resource in related]
-    for kind in ("safety_limit", "denied"):
-        refused = next((item for item in checked if item.kind == kind), None)
-        if refused is not None:
-            reason = _ACCESS_REASONS[kind].format(tool=tool)
-            return GateDecision(action="deny", code=refused.code, reason=reason, access_source=refused.source), found
+    refused = _first_refusal(checked)
+    if refused is not None:
+        reason = _ACCESS_REASONS[refused.kind or "denied"].format(tool=tool)
+        return GateDecision(action="deny", code=refused.code, reason=reason, access_source=refused.source), found
     return None, found
 
 

@@ -691,6 +691,26 @@ def test_who_may_takes_the_tool_as_it_is_now() -> None:
     assert (noted.outcome, noted.grant is not None, noted.grant_enforced) == ("per_call_rules", True, False)
     (server,) = who_may([grant(MCP)], [], at=AT)
     assert (server.allowed, server.outcome, server.grant_enforced) == (True, "per_call_rules", False)
+    # L-B: a tool row counts the deny on its MCP server, as the gate does.
+    blocked = deny(MCP, id="adn_m")
+    rows = who_may(
+        [grant(mcp, tool=facts)],
+        [blocked],
+        at=AT,
+        tools={"mcp__s__t": ToolNow(facts=facts, kind="mcp", related=(MCP,))},
+        resource=mcp,
+    )
+    assert [(row.allowed, row.code, row.source, row.deny) for row in rows] == [
+        (False, "access.denied", "deny:adn_m", blocked)
+    ]
+    # L-C: strict offline refuses a remote MCP server, not a local one, nor the tools of a local one.
+    (remote,) = who_may([grant(MCP)], [], at=AT, offline=True)
+    assert (remote.allowed, remote.source) == (False, "limit:offline")
+    (local,) = who_may([grant(MCP)], [], at=AT, offline=True, local_servers={"mcs_1"})
+    assert local.allowed
+    tools = {"mcp__s__t": ToolNow(facts=facts, kind="mcp", related=(MCP,))}
+    (tool_row,) = who_may([grant(mcp, tool=facts)], [], at=AT, offline=True, tools=tools, local_servers={"mcs_1"})
+    assert (tool_row.allowed, tool_row.outcome) == (True, "per_call_rules")
     (web,) = [
         explain(
             AccessRequest(
@@ -712,9 +732,10 @@ def _tool_grant(facts: ToolFacts, **extra: Any) -> Grant:
 
 
 def test_explain_matches_the_outcome_at_every_call_site() -> None:
-    """Property: for every combination of records, mode, offline, agent and tool, ``explain(...).allowed`` is
-    ``False`` exactly when the call site refuses, and ``outcome`` ``granted`` exactly when a grant replaces the
-    question (tool calls) or allows the access (cloud models)."""
+    """Property: for every combination of records, mode, offline, agent, tool, related MCP server and connection and
+    local servers, ``explain(...).allowed`` is ``False`` exactly when the call site refuses (with the same source),
+    and ``outcome`` ``granted`` exactly when a grant replaces the question (tool calls) or allows the access (cloud
+    models)."""
     import itertools as it
 
     agents = (None, "wf/a", "wf/b")
@@ -742,18 +763,35 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
         ((), (deny(AccessResource(type="tool", id="t"), scope="agent", agents=("wf/b",)),)),
         ((), (deny(AccessResource(type="tool", id="t"), mode="unattended"),)),
     ]
+    related_records: list[tuple[tuple[Grant, ...], tuple[Deny, ...]]] = [
+        ((), ()),
+        ((), (deny(MCP, id="adn_m"),)),
+        ((), (deny(CONNECTION, id="adn_c", scope="agent", agents=("wf/a",)),)),
+        ((grant(MCP, id="agr_m"), grant(CONNECTION, id="agr_c")), ()),
+    ]
     checked = 0
     seen: set[tuple[str, str]] = set()
-    for (grants, denies), agent, attended, offline, kind in it.product(
-        tool_records, agents, [True, False], [False, True], ["custom", "mcp"]
+    for (tool_grants, tool_denies), (
+        more_grants,
+        more_denies,
+    ), related, local, agent, attended, offline, kind in it.product(
+        tool_records,
+        related_records,
+        [(), (MCP,), (MCP, CONNECTION)],
+        [frozenset(), frozenset({"mcs_1"})],
+        agents,
+        [True, False],
+        [False, True],
+        ["custom", "mcp"],
     ):
+        grants, denies = tool_grants + more_grants, tool_denies + more_denies
         capability = ToolCapability(access="write", reach="external" if kind == "mcp" else "internal", source="admin")
         facts = ToolFacts.of(capability, version=2 if kind == "custom" else None)
         if kind == "mcp":
             grants = tuple(
                 item.model_copy(update={"tool": facts if item.tool == now_facts else item.tool}) for item in grants
             )
-        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline)
+        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline, local_servers=local)
         verdict = decide(
             tool="t",
             kind=kind,
@@ -762,6 +800,7 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
             context=situation(access, attended=attended),
             at=AT,
             version=facts.version,
+            related=related,
         )
         request = AccessRequest(
             resource=AccessResource(type="tool", id="t"),
@@ -772,9 +811,13 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
             offline=offline,
             tool=facts,
         )
-        found = explain(request, grants=grants, denies=denies, at=AT, tool_kind=kind)
+        found = explain(
+            request, grants=grants, denies=denies, at=AT, tool_kind=kind, related=related, local_servers=local
+        )
         refused = verdict.action == "deny" and (verdict.code or "").startswith("access.")
         assert found.allowed is not refused, (found, verdict)
+        if refused:
+            assert (found.code, found.source) == (verdict.code, verdict.access_source), (found, verdict)
         assert (found.outcome == "granted") is (verdict.access_source or "").startswith("grant:"), (found, verdict)
         seen.add((kind, found.outcome))
         checked += 1
@@ -787,15 +830,16 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
         ("mcp", "per_call_rules"),
     }
     # MCP servers and connections: only their refusals count.
-    for resource, (grants, denies), agent, attended, offline in it.product(
+    for resource, (grants, denies), agent, attended, offline, local in it.product(
         [MCP, CONNECTION],
         [((), ()), ((grant(MCP), grant(CONNECTION, id="agr_2")), ()), ((), (deny(MCP), deny(CONNECTION, id="adn_2")))],
         agents,
         [True, False],
         [False, True],
+        [frozenset(), frozenset({"mcs_1"})],
     ):
         capability = cap("read", "internal")
-        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline)
+        access = AccessContext(grants=grants, denies=denies, agent=agent, offline=offline, local_servers=local)
         verdict = decide(
             tool="t",
             kind="builtin",
@@ -813,9 +857,10 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
             mode="supervised" if attended else "unattended",
             offline=offline,
         )
-        found = explain(request, grants=grants, denies=denies, at=AT)
+        found = explain(request, grants=grants, denies=denies, at=AT, local_servers=local)
         refused = verdict.action == "deny" and (verdict.code or "").startswith("access.")
         assert found.allowed is not refused and found.outcome != "granted", (found, verdict)
+        seen.add((resource.type, found.outcome))
         checked += 1
     # Workflow starts and cloud models: the gate's own check.
     workflow = AccessResource(type="workflow", id="wf_1")
@@ -853,4 +898,19 @@ def test_explain_matches_the_outcome_at_every_call_site() -> None:
         checked += 1
     assert {("workflow", "allowed"), ("workflow", "refused"), ("cloud_provider", "allowed")} <= seen
     assert {("cloud_provider", "granted"), ("cloud_provider", "refused")} <= seen
-    assert checked == 9 * 3 * 2 * 2 * 2 + 2 * 3 * 3 * 2 * 2 + 2 * 4 * 3 * 2 * 2
+    assert {("mcp_server", "refused"), ("mcp_server", "per_call_rules"), ("connection", "refused")} <= seen
+    assert checked == 9 * 4 * 3 * 2 * 3 * 2 * 2 * 2 + 2 * 3 * 3 * 2 * 2 * 2 + 2 * 4 * 3 * 2 * 2
+
+
+def test_connect_model_probes_without_audit_and_knows_unattended_callers(workspace: Workspace) -> None:
+    """L-A: a probe (model choice) is refused but not audited; a judge without a person meets unattended denies."""
+    AccessRules(workspace.store).deny(resource=CLOUD, actions=["submit"], mode="unattended", by=ALICE)
+    model = "anthropic:claude-sonnet-5-5"
+    workspace.connect_model(model, actor="usr_bob")  # attended: the deny for unattended use does not apply
+    with pytest.raises(NodestroError) as judged:
+        workspace.connect_model(model, actor="usr_bob", attended=False)
+    assert judged.value.code == "access.denied"
+    with pytest.raises(NodestroError):
+        workspace.connect_model(model, actor="usr_bob", attended=False, probe=True)
+    audited = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert len(audited) == 1  # the probe left no audit event
