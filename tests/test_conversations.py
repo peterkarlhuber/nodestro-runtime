@@ -39,7 +39,7 @@ from nodestro_runtime.conversations import (
 )
 from nodestro_runtime.local_models import LOCAL_DEFAULT_MODEL
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.schemas import AgentConfig, Edge, Node, Run, RunIn, SettingsIn, Workflow
+from nodestro_runtime.schemas import AgentConfig, Edge, Node, Run, RunIn, RunSummary, SettingsIn, Workflow
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
 from nodestro_runtime.workspace import Workspace
 
@@ -772,7 +772,7 @@ async def test_n4_a_send_whose_reservation_expired_while_its_run_started_writes_
 def test_n2_a_run_at_hand_that_is_no_answer_needs_no_read(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
     """N-2: run lists filter their summaries without a store read per run; only answers' runs read their
     conversation."""
-    from nodestro_runtime.schemas import RunSummary, Usage, now
+    from nodestro_runtime.schemas import Usage, now
 
     workspace = make()
     conversation_id = start(workspace, template(workspace))
@@ -803,3 +803,33 @@ def test_n2_a_run_at_hand_that_is_no_answer_needs_no_read(make: Make, monkeypatc
     assert workspace.conversations.summary_visible(summary("conversation", conversation_id), None) is True
     assert workspace.conversations.summary_visible(summary("conversation", conversation_id), "usr_bob") is False
     assert reads == [(COLLECTION, conversation_id)] * 2
+
+
+async def test_low1_a_child_run_whose_parent_is_gone_is_hidden_from_everyone(make: Make) -> None:
+    """Review Low 1: a run below an answer belongs to the answer's conversation. When its parent is missing (deleted
+    while the child stayed), nobody can tell whose it is, so nobody sees it; a loop of parents fails closed too."""
+    workspace = make({"AGENT": [text("Hi.")]})
+    mine = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template(workspace)), model=CLOUD), owner="usr_alice"
+    )
+    sent = await workspace.conversations.send(mine.id, "usr_alice", MessageIn(content="Hello"))
+    run_id = sent.assistant.run_id or ""
+    await workspace.wait(run_id, timeout=20)
+    parent = workspace.runs.get(run_id)
+    assert parent is not None
+    child = parent.model_copy(
+        update={"id": "run_child", "trigger": "subworkflow", "trigger_ref": run_id, "parent_run_id": run_id}
+    )
+    workspace.store.put("runs", child.id, child)
+    assert workspace.conversations.run_visible(child.id, "usr_alice") is True
+    assert workspace.conversations.run_visible(child.id, "usr_bob") is False
+
+    workspace.store.delete("runs", run_id)
+    for owner in ("usr_alice", "usr_bob", None):
+        assert workspace.conversations.run_visible(child.id, owner) is False, owner
+        stored = workspace.store.get("runs", child.id, RunSummary)
+        assert stored is not None and workspace.conversations.summary_visible(stored, owner) is False, owner
+
+    looped = child.model_copy(update={"id": "run_loop", "parent_run_id": "run_loop"})
+    workspace.store.put("runs", looped.id, looped)
+    assert workspace.conversations.run_visible(looped.id, "usr_bob") is False
