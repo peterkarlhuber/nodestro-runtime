@@ -393,22 +393,30 @@ class Conversations:
         """Whether ``owner`` may see run ``run_id`` through the run routes (H-1). An answer's run (trigger
         ``conversation``, or a run below one) belongs to its conversation: only who sees the conversation sees the
         run, and the run of a deleted conversation is seen by nobody. Every other run (and an unknown id) is left to
-        the run routes."""
+        the run routes.
+
+        A run below another one whose top cannot be reached (a parent is missing, or the parents form a loop) is seen
+        by nobody: whether it belongs to a conversation is unknown, so it fails closed."""
         run = self.store.get("runs", run_id, RunSummary)
         seen: set[str] = set()
-        while run is not None and run.parent_run_id and run.id not in seen:
+        while run is not None and run.parent_run_id:
+            if run.id in seen:
+                return False
             seen.add(run.id)
-            parent = self.store.get("runs", run.parent_run_id, RunSummary)
-            if parent is None:
-                break
-            run = parent
-        return run is None or self.summary_visible(run, owner)
+            run = self.store.get("runs", run.parent_run_id, RunSummary)
+            if run is None:
+                return False
+        return run is None or self._top_visible(run, owner)
 
     def summary_visible(self, run: RunSummary | Run, owner: str | None) -> bool:
         """:meth:`run_visible` for a run at hand (a run list's summary): a top-level run that is not an answer needs
         no read, an answer's run one (its conversation), a run below another one the walk to its top (N-2)."""
         if run.parent_run_id:
             return self.run_visible(run.id, owner)
+        return self._top_visible(run, owner)
+
+    def _top_visible(self, run: RunSummary | Run, owner: str | None) -> bool:
+        """Whether ``owner`` sees a top-level run: every run but an answer, and an answer only with its conversation."""
         if run.trigger != "conversation":
             return True
         found = self.store.get(COLLECTION, run.trigger_ref or "", Conversation)

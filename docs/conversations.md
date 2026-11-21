@@ -96,7 +96,9 @@ to the conversation (H-1):
   answer needs no store read, an answer's run one (N-2).
   The API checks it on every route with a run id (runs, export, files, cancel, resume, approvals, tool approvals,
   budget, inputs, run chat, events) and in the lists of runs and pending approvals; another user gets
-  `404 run.not_found`. A run whose conversation is gone is seen by nobody.
+  `404 run.not_found`. A run whose conversation is gone is seen by nobody. So is a run below another one whose top
+  cannot be reached (a parent is missing, or the parents form a loop): whose it is cannot be told, so it fails
+  closed (review Low 1).
 - Deleting a conversation deletes its answers' runs with their result files, tool checkpoints, live chat and the
   input files only they used, after cancelling a running one (it waits up to 10 seconds for it to stop; a run still
   going then stays, hidden). The usage ledger keeps the cost.
