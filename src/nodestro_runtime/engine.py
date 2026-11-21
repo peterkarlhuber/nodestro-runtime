@@ -83,6 +83,7 @@ from . import (
     contracts,
     flow_driver,
     graph,
+    offline,
     run_budget,
     sandbox_cancel,
     tool_checkpoints,
@@ -1042,6 +1043,8 @@ class RunManager:
         self.builder = builder
         #: The connection to a provider (key, endpoint); raises if the provider is not configured.
         self.connect = connect
+        #: Whether a conversation (N-04) is offline now (N-09), by its id; read at every call of its answers' runs.
+        self.conversation_offline: Callable[[str], bool] = lambda _conversation_id: False
         self.default_budget = default_budget
         self.assistant_model = assistant_model
         #: The workspace's price catalog and price mode (PRICING-1); without a catalog Orkexa's built-in prices apply.
@@ -1310,10 +1313,114 @@ class RunManager:
         )
         return found
 
-    def _checked_connect(self, context: _RunContext, node_id: str) -> Callable[[str], Connection]:
+    def offline_scope(self, context: _RunContext, config: AgentConfig | None = None) -> offline.OfflineScope | None:
+        """Whether a call of this step must stay offline (N-09), and why: the conversation the top-level run answers
+        in (read now, so switching it on applies at the next call, also in sub-workflows and team runs below the
+        answer), else the agent's own setting. ``None``: neither (nothing changes)."""
+        root = context.root.run
+        if root.trigger == "conversation" and root.trigger_ref and self.conversation_offline(root.trigger_ref):
+            return "conversation"
+        if config is not None and config.offline:
+            return "agent"
+        return None
+
+    def run_offline(self, run: Run) -> bool:
+        """Whether ``run`` holds content of an offline agent or conversation (N-09): run chat about it then uses
+        local models only. Looks at the run and its top-level run."""
+        runs = [run]
+        top = run
+        seen: set[str] = set()
+        while top.parent_run_id and top.id not in seen:
+            seen.add(top.id)
+            parent = self.get(top.parent_run_id)
+            if parent is None:
+                return True  # its top cannot be reached: fail closed
+            top = parent
+            runs.append(top)
+        if top.trigger == "conversation" and top.trigger_ref and self.conversation_offline(top.trigger_ref):
+            return True
+        return any(node.agent is not None and node.agent.offline for item in runs for node in item.workflow.nodes)
+
+    def content_offline_scope(self, run: Run, _seen: set[str] | None = None) -> offline.OfflineScope | None:
+        """Whether content of ``run`` may only go to local models (N-09), and why: the conversation its top-level run
+        answers in is offline (``conversation``), or an offline agent ran in it, above it or in any run below it
+        (sub-workflows, team runs), whose results its output may hold (``agent``). A continued run (``resumed_from``)
+        and a node result taken over from an earlier run (``reused_from``) hold that run's content, so the earlier run
+        counts the same way. ``None``: neither. For everything that sends a finished run's content to a model outside
+        the run (run chat, the assistant's run attachment, a test series' judge, a conversation's history). Fails
+        closed: a parent, child or earlier run that cannot be read counts as offline."""
+        seen = _seen if _seen is not None else set()
+        if run.id in seen:
+            return None
+        seen.add(run.id)
+        top = run
+        above: set[str] = set()
+        while top.parent_run_id and top.id not in above:
+            above.add(top.id)
+            parent = self.get(top.parent_run_id)
+            if parent is None:
+                return "agent"
+            top = parent
+        if top.trigger == "conversation" and top.trigger_ref and self.conversation_offline(top.trigger_ref):
+            return "conversation"
+        if self.run_offline(run):
+            return "agent"
+        earlier: list[str] = []
+        pending, visited = [run], {run.id}
+        while pending:
+            current = pending.pop()
+            if current.resumed_from:
+                earlier.append(current.resumed_from)
+            for state in current.nodes.values():
+                if state.reused_from:
+                    earlier.append(state.reused_from)
+                for child_id in [*state.child_run_ids, *([state.child_run_id] if state.child_run_id else [])]:
+                    if child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    child = self.get(child_id)
+                    if child is None:
+                        return "agent"
+                    if any(node.agent is not None and node.agent.offline for node in child.workflow.nodes):
+                        return "agent"
+                    pending.append(child)
+        for run_id in dict.fromkeys(earlier):
+            if run_id in seen:
+                continue
+            found = self.get(run_id)
+            if found is None:
+                return "agent"
+            scope = self.content_offline_scope(found, seen)
+            if scope is not None:
+                return scope
+        return None
+
+    def _checked_connect(
+        self, context: _RunContext, node_id: str, config: AgentConfig | None = None
+    ) -> Callable[[str], Connection]:
         """The connections of an agent's turn, refused for a cloud model the access model v2 blocks (N-06): every
         provider but the local model server counts as a cloud model, as in the strict offline mode. Checked at each
-        connection, so a new deny applies at the next turn. Unchanged while the switch is off."""
+        connection, so a new deny applies at the next turn. Unchanged while the switch is off.
+
+        An offline step (N-09, :meth:`offline_scope` with the agent's ``config``) gets local connections only, checked
+        at each connection too: a cloud provider is refused before its connection is resolved, and a local model
+        server that is not on this computer is refused (:func:`~nodestro_runtime.offline.check_connection`)."""
+        connect = self._access_connect(context, node_id)
+        root = getattr(context, "root", None)
+        if not (config is not None and config.offline) and (root is None or root.run.trigger != "conversation"):
+            return connect  # this step can never be offline: unchanged
+
+        def checked(provider: str) -> Connection:
+            scope = self.offline_scope(context, config)
+            if scope is None:
+                return connect(provider)
+            offline.check_provider(provider, scope)
+            return offline.check_connection(connect(provider), scope, docker=self.builder.mode == "local-container")
+
+        return checked
+
+    def _access_connect(self, context: _RunContext, node_id: str) -> Callable[[str], Connection]:
+        """:meth:`_checked_connect` without the offline rules (N-06 only)."""
         gate = self.tool_gate
         if gate is None or gate.access is None:
             return self.connect
@@ -3920,6 +4027,18 @@ class RunManager:
         self._emit(context, "tool_denied", node_id, id=call.id, name=call.name, code=code, reason=reason, **extra)
         return reason
 
+    def _offline_tool(self, context: _RunContext, config: AgentConfig, name: str) -> offline.OfflineToolState | None:
+        """The offline state of the library tool ``name`` when this step is offline and the tool is not available
+        offline (N-09), else ``None``. Asked at every call, so a conversation switched offline applies at the next
+        call. The run's own tools (not in ``config.tools``) never leave Nodestro and are not asked about."""
+        if name not in config.tools or self.offline_scope(context, config) is None:
+            return None
+        # Judged by the sandbox the call really runs in (the workflow's Python environment, review L2).
+        state = offline.tool_state(
+            context.env.builder.tools, name, sandbox=context.env.tool_sandbox(context.run.workflow_id), at_call=True
+        )
+        return None if state.available else state
+
     def _expire_approvals(self, run_id: str) -> None:
         """A run stopped without its process (interrupted, crashed, lost lease): its open questions expire."""
         ToolApprovals(self.store).expire_run(run_id)
@@ -4689,7 +4808,13 @@ class RunManager:
             denial = None
             bind_call(None)  # every call gets its own binding (or none) from the gate below
             own = run_own_tool(config, call.name, extra_tools)
-            if gate is not None and not own:
+            # N-09: an offline step never calls a tool that is not available offline, and nobody is asked about it.
+            unavailable = self._offline_tool(context, config, call.name) if not own else None
+            if unavailable is not None:
+                denial = self._deny_call(
+                    context, node_id, call, record, "offline.tool_unavailable", unavailable.text, {}
+                )
+            elif gate is not None and not own:
                 if checkpointing and call.resumed:
                     denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
                 else:
@@ -4800,7 +4925,14 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
-            interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node_id))
+            scope = self.offline_scope(context, config)
+            if scope is not None and config.server_tools:
+                # N-09: server tools run at the provider and never pass the tool hook, so the step does not start.
+                raise offline.server_tools_error(list(dict.fromkeys(config.server_tools)), scope)
+            if scope is not None and offline.shared_memory(config):
+                # N-09: a memory space or a knowledge proposal would hand the step's content to other (cloud) agents.
+                raise offline.shared_memory_error(offline.shared_memory(config), scope)
+            interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node_id, config))
             ask = functools.partial(
                 execute_agent,
                 context.env.builder,

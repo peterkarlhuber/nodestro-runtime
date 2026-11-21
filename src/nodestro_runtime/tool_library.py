@@ -698,6 +698,16 @@ class ToolLibrary:
         except NodestroError:
             return None
 
+    def call_isolation(self, name: str, sandbox: Sandbox | None = None) -> Isolation | None:
+        """How a call of the own or generated tool ``name`` is isolated when the run passes ``sandbox`` (a workflow's
+        Python environment, as to :meth:`tool`): the sandbox :meth:`tool` actually routes the call to, which can be a
+        host subprocess with network where the library's default (:meth:`isolation`) is a container. ``None`` when the
+        call may not run here."""
+        try:
+            return isolation_of(self._require(self.trust(name), sandbox or self.registry.sandbox, name))
+        except NodestroError:
+            return None
+
     # ---- provenance ---------------------------------------------------------------------
 
     def trust(self, name: str) -> TrustClass:

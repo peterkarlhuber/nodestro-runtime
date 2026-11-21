@@ -75,6 +75,7 @@ from .mcp.vault import VAULT_KEY_ENV, TokenVault, vault_box_from_env
 from .mcp_access import unattended_mcp_enabled
 from .memory_spaces import MemorySpaces, MemoryTables
 from .notifications import NOTIFY_TOOLS, LocalInbox, RunNotifier, local_inbox_enabled
+from .offline import OfflineScope, check_connection, check_provider
 from .pricing import PricingService
 from .problems import NodestroError
 from .profile import RuntimeProfile
@@ -581,6 +582,8 @@ class Workspace:
         self.conversations = Conversations(self)
         # An answer's run whose conversation was deleted while it ran is deleted once it stops (RT-089).
         self.runs.listeners.append(self.conversations.run_stopped)
+        # N-09: the answers' runs read their conversation's offline flag at every call.
+        self.runs.conversation_offline = self.conversations.is_offline
         self.runs.after_run = self.files.write_outputs
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None
@@ -1591,7 +1594,13 @@ class Workspace:
         return {server.id for server in self.mcp.servers() if server.transport == "stdio"}
 
     def connect_model(
-        self, model: str, *, actor: str = "system", attended: bool = True, probe: bool = False
+        self,
+        model: str,
+        *,
+        actor: str = "system",
+        attended: bool = True,
+        probe: bool = False,
+        offline: OfflineScope | None = None,
     ) -> Connection:
         """The connection of a model's provider; a cloud model in the strict offline mode is refused first (also
         when its provider is not configured: a key would not help), then one the access model v2 blocks (N-06).
@@ -1599,13 +1608,21 @@ class Workspace:
         ``actor``: who asks (the audit, and whether the error names the source). ``attended``: ``False`` when nobody
         waits for the answer (a benchmark judge), so unattended denies and limits apply. ``probe``: only asks whether
         the model can be used (model choice): a refusal is not audited. The connection test of the diagnostics
-        (``connection(provider)``) is not checked: it sends no content."""
+        (``connection(provider)``) is not checked: it sends no content.
+
+        ``offline`` (N-09): the content to send is offline content (:meth:`RunManager.content_offline_scope`), so only
+        a local model on this computer is connected; a cloud model is refused before its connection is resolved."""
         provider = provider_of(model)
         if provider != "ollama" and self.strict_offline():
             raise _offline_cloud_model(model, provider)
+        if offline is not None:
+            check_provider(provider, offline)
         # N-06: a cloud model the access model v2 blocks is refused before anything is sent (only while it is on).
         self.runs.check_cloud_access(provider, actor=actor, attended=attended, audit=not probe)
-        return self.connection(provider)
+        connection = self.connection(provider)
+        if offline is not None:
+            check_connection(connection, offline, docker=self.builder.mode == "local-container")
+        return connection
 
     def allowed_models(self) -> list[str]:
         """The models the assistants may choose for new agents: the defaults and the suggested models

@@ -40,7 +40,7 @@ from orkexa.memory import MEMORY_TOOL_NAME
 from orkexa.skills import SkillPackage
 from pydantic import BaseModel, Field, create_model
 
-from . import output_limits
+from . import offline, output_limits
 from .catalog import SERVER_TOOLS
 from .connections import ResolvedConnection
 from .knowledge import KnowledgeBase
@@ -691,6 +691,7 @@ class AgentBuilder:
         issues.extend(self._limit_issues(config))
         issues.extend(self._settings_issues(config))
         issues.extend(self._skill_issues(config))
+        issues.extend(self._offline_issues(config))
         web = {"web_search", "web_fetch"} & set(config.server_tools)
         if web and "code_execution" in config.server_tools:
             issue(
@@ -716,6 +717,14 @@ class AgentBuilder:
                 level="info",
                 field="task_template",
             )
+        return issues
+
+    def _offline_issues(self, config: AgentConfig) -> list[ConfigIssue]:
+        """What an offline agent cannot use (N-09, :func:`~nodestro_runtime.offline.config_issues`): a cloud model or
+        judge and server tools are errors; each tool that is not available offline is a warning with its reason."""
+        issues: list[ConfigIssue] = []
+        for item in offline.config_issues(config, self.tools):
+            issues.append(ConfigIssue(**item))
         return issues
 
     def _skill_issues(self, config: AgentConfig) -> list[ConfigIssue]:

@@ -17,7 +17,7 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 | `title`, `auto_title` | The title; made from the first message until it is set |
 | `agent` | `TemplateRef`: the agent template and its version (`template_id`, `version`) |
 | `model` | The model of the next answer (`provider:model`) |
-| `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`) |
+| `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`). Every call of the answers, and of runs below them, follows the offline rules (N-09, [offline.md](offline.md)) |
 | `provenance` | Placeholder for N-08 (always `unchecked`) |
 | `budget_usd` | The budget over all answers (`None`: each answer has the default budget) |
 | `files` | The conversation's files: input files of origin `conversation` |
@@ -141,6 +141,7 @@ A cloud model is never chosen automatically:
   an offline conversation uses local models only (`conversation.offline_cloud_model`), and the only cloud model an
   answer may use is the conversation's own, chosen by the person (`conversation.cloud_model_not_chosen`).
 - Switching the agent keeps the conversation's model.
+- An offline agent template answers with local models only, also in a conversation that is not offline (N-09).
 
 ## Files
 
@@ -174,6 +175,7 @@ overview is framed as untrusted data and capped (`OUTLINE_FILE_CHARS` per file, 
 | `conversation.agent_not_found` | The agent template or version does not exist (`template_id`) |
 | `conversation.model_required` | No model given, and neither the agent's nor the default model is local |
 | `conversation.offline_cloud_model` | A cloud model for an offline conversation (`model`) |
+| `offline.*` | A call of an offline answer refused at run time (N-09, [offline.md](offline.md)) |
 | `conversation.empty_message` | Neither text nor files |
 | `conversation.answer_running` | Another answer of the conversation is still running |
 | `conversation.budget_exhausted` | The conversation's budget is used up (`budget_usd`) |
