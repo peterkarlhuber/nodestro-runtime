@@ -37,8 +37,10 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 
 Only the owner sees a conversation on a server (another owner's id is not found); on the desktop everyone of the
 workspace does, as for the Nodestro Assistant. A conversation stored without an owner (made on a desktop, then restored
-into a server) is seen by nobody on a server: it fails closed and stays orphaned until it is restored on a desktop
-(L-7). A stored document of another tenant is never read.
+into a server) is seen by nobody on a server, administrators included: it fails closed and stays orphaned until it
+is restored on a desktop (L-7) or the server's operator assigns it an owner who is a member of the tenant
+(`nodestro-server assistant backfill-owners --tenant --user --conversation`, audited; nodestro-api
+`docs/conversations.md`, W3-S1). Reading it never assigns an owner. A stored document of another tenant is never read.
 
 Who asks without an owner identity on a multi-user installation passes `NO_OWNER` (W3-S1): a principal without a
 role in the tenant, such as a service, a machine or anything else that is not a member. It sees no conversation, no
