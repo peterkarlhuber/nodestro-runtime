@@ -24,7 +24,7 @@ from .agent_builder import ConfigIssue
 from .engine import _PLACEHOLDER, MAX_DEPTH, _usable_team, check_workflow, node_label, start_fields
 from .graph import BRANCHING, WORKING, ancestors, data_sources, note_sources, workflow_refs
 from .local_service import LOCAL_CONTEXT_LENGTH, SMALL_CONTEXT, InstalledModel
-from .offline import is_local_endpoint
+from .offline import is_local_endpoint, mcp_available_offline
 from .orchestrator import select_teams
 from .pricing import missing_conditions
 from .problems import CheckIssue, NodestroError
@@ -502,7 +502,7 @@ def _agent_offline_issues(nodestro: Workspace, workflow: Workflow) -> list[Check
         if config is None or not config.offline or not _valid(config.model) or provider_of(config.model) != "ollama":
             continue
         url = nodestro.local_models.ollama_url() or nodestro.provider_settings("ollama").get("base_url") or ""
-        if url and not is_local_endpoint(url):
+        if url and not is_local_endpoint(url, docker=nodestro.profile.kind == "local-container"):
             found.append(
                 _issue(
                     "offline.remote_endpoint",
@@ -536,7 +536,7 @@ def _offline_issues(nodestro: Workspace, workflow: Workflow) -> list[CheckIssue]
             )
     if "ollama" in {provider_of(m) for m in workflow_models(workflow) if _valid(m)}:
         url = nodestro.local_models.ollama_url() or nodestro.provider_settings("ollama").get("base_url") or ""
-        if url and not is_local_endpoint(url):
+        if url and not is_local_endpoint(url, docker=nodestro.profile.kind == "local-container"):
             found.append(
                 _issue(
                     "check.offline_remote_endpoint",
@@ -759,12 +759,13 @@ def _knowledge_mode_issues(nodestro: Workspace, workflow: Workflow) -> list[Chec
 
 
 def _local_mcp(nodestro: Workspace, tool_name: str) -> bool:
-    """A local stdio server (it runs in a sandbox container here) or an HTTP server on this computer."""
+    """A local stdio server (it runs in a sandbox container without network here). An HTTP server is not local even
+    on this computer: it may reach the internet itself, and the strict offline gate refuses its tools too."""
     found = nodestro.mcp.find(tool_name)
     if found is None:
         return True  # an unknown tool is reported by the agent's own check
     server = found[0]
-    return server.transport == "stdio" or is_local_endpoint(server.url)
+    return mcp_available_offline(server) is None
 
 
 def _valid(model: str) -> bool:

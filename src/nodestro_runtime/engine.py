@@ -1325,6 +1325,40 @@ class RunManager:
             return True
         return any(node.agent is not None and node.agent.offline for item in runs for node in item.workflow.nodes)
 
+    def content_offline_scope(self, run: Run) -> offline.OfflineScope | None:
+        """Whether content of ``run`` may only go to local models (N-09), and why: the conversation its top-level run
+        answers in is offline (``conversation``), or an offline agent ran in it, above it or in any run below it
+        (sub-workflows, team runs), whose results its output may hold (``agent``). ``None``: neither. For everything
+        that sends a finished run's content to a model outside the run (run chat, the assistant's run attachment, a
+        test series' judge). Fails closed: a parent or child run that cannot be read counts as offline."""
+        top = run
+        seen: set[str] = set()
+        while top.parent_run_id and top.id not in seen:
+            seen.add(top.id)
+            parent = self.get(top.parent_run_id)
+            if parent is None:
+                return "agent"
+            top = parent
+        if top.trigger == "conversation" and top.trigger_ref and self.conversation_offline(top.trigger_ref):
+            return "conversation"
+        if self.run_offline(run):
+            return "agent"
+        pending, visited = [run], {run.id}
+        while pending:
+            current = pending.pop()
+            for state in current.nodes.values():
+                for child_id in [*state.child_run_ids, *([state.child_run_id] if state.child_run_id else [])]:
+                    if child_id in visited:
+                        continue
+                    visited.add(child_id)
+                    child = self.get(child_id)
+                    if child is None:
+                        return "agent"
+                    if any(node.agent is not None and node.agent.offline for node in child.workflow.nodes):
+                        return "agent"
+                    pending.append(child)
+        return None
+
     def _checked_connect(
         self, context: _RunContext, node_id: str, config: AgentConfig | None = None
     ) -> Callable[[str], Connection]:
@@ -1345,7 +1379,7 @@ class RunManager:
             if scope is None:
                 return connect(provider)
             offline.check_provider(provider, scope)
-            return offline.check_connection(connect(provider), scope)
+            return offline.check_connection(connect(provider), scope, docker=self.builder.mode == "local-container")
 
         return checked
 
@@ -3940,7 +3974,10 @@ class RunManager:
         call. The run's own tools (not in ``config.tools``) never leave Nodestro and are not asked about."""
         if name not in config.tools or self.offline_scope(context, config) is None:
             return None
-        state = offline.tool_state(context.env.builder.tools, name)
+        # Judged by the sandbox the call really runs in (the workflow's Python environment, review L2).
+        state = offline.tool_state(
+            context.env.builder.tools, name, sandbox=context.env.tool_sandbox(context.run.workflow_id), at_call=True
+        )
         return None if state.available else state
 
     def _expire_approvals(self, run_id: str) -> None:

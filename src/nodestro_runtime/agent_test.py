@@ -210,7 +210,8 @@ class AgentTester:
                 result.tool_calls.append(record)
             if config.offline and call.name in config.tools:
                 # N-09: an offline agent never calls a tool that is not available offline, as in a run.
-                state = offline.tool_state(self.builder.tools, call.name)
+                sandbox = self.tool_sandbox(request.workflow_id) if request.workflow_id else None
+                state = offline.tool_state(self.builder.tools, call.name, sandbox=sandbox, at_call=True)
                 if not state.available:
                     record.approval = ToolCallApproval(status="denied", code="offline.tool_unavailable")
                     return Denial(model_text=f"Tool call denied: {state.text}", code="offline.tool_unavailable")
@@ -251,7 +252,9 @@ class AgentTester:
 
             def connect(provider: str) -> Connection:
                 offline.check_provider(provider, "agent")
-                return offline.check_connection(access_connect(provider), "agent")
+                return offline.check_connection(
+                    access_connect(provider), "agent", docker=self.builder.mode == "local-container"
+                )
 
         try:
             if config.offline and config.server_tools:

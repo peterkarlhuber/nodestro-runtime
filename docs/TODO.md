@@ -598,7 +598,12 @@ Items that need an independent or external review (an internal audit does not re
   - an agent's output still goes wherever its workflow sends it (a later agent that is not offline may pass it to a
     cloud model); a workflow-wide flag could mark every step;
   - a local `stdio` MCP server counts as local, as in the strict offline mode (it runs in the sandbox container
-    without network);
+    without network); an HTTP MCP server on `localhost` is refused (`http_mcp`) and there is no explicit
+    allow-switch for one that is known to stay offline;
+  - the S-2 gate's `tool_facts` still reads an own tool's capability from the library's default sandbox; only the
+    offline check judges it by the sandbox of the call;
+  - `local_service._loopback` (hardware detection, not a security check) still treats `127.`-prefixed names as this
+    computer;
   - the tool catalog (`ToolInfo`) does not carry the offline state yet; it is reported through the agent's
     validation.
 - **Next step:** Decide whether a workflow-wide offline flag is wanted.

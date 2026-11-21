@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any, ClassVar
@@ -154,17 +155,23 @@ def test_offline_agent_validation_reports_each_tool_honestly(make: Make) -> None
     workspace = make()
     add_mcp(workspace, REMOTE_MCP, url="https://mcp.example.com/mcp")
     add_mcp(workspace, LOCAL_MCP, url="http://127.0.0.1:8765/mcp")
-    tools = ["calculator", "search_web", "fetch_web_page", REMOTE_MCP, LOCAL_MCP]
+    add_mcp(workspace, STDIO_MCP, url="stdio:lookup_server", transport="stdio")
+    tools = ["calculator", "search_web", "fetch_web_page", REMOTE_MCP, LOCAL_MCP, STDIO_MCP]
     config = AgentConfig(model=CLOUD, tools=tools, offline=True)
     issues = {(item.code, item.params.get("name")): item for item in workspace.builder.validate(config)}
     assert issues[("offline.cloud_model", None)].level == "error"
     assert issues[("offline.cloud_model", None)].field == "model"
-    for name, reason in (("search_web", "network"), ("fetch_web_page", "network"), (REMOTE_MCP, "remote_mcp")):
+    for name, reason in (
+        ("search_web", "network"),
+        ("fetch_web_page", "network"),
+        (REMOTE_MCP, "remote_mcp"),
+        (LOCAL_MCP, "http_mcp"),
+    ):
         found = issues[("offline.tool_unavailable", name)]
         assert (found.level, found.field, found.params["reason"]) == ("warning", "tools", reason)
         assert "not available offline" in found.message
     assert ("offline.tool_unavailable", "calculator") not in issues
-    assert ("offline.tool_unavailable", LOCAL_MCP) not in issues
+    assert ("offline.tool_unavailable", STDIO_MCP) not in issues
     # Not offline: the same agent has none of these issues (unchanged behaviour).
     plain = workspace.builder.validate(config.model_copy(update={"offline": False}))
     assert not [item for item in plain if item.code.startswith("offline.")]
@@ -192,7 +199,9 @@ def test_tool_states(make: Make) -> None:
         )
     }
     assert states["calculator"].available and states["draft_email"].available
-    assert states[LOCAL_MCP].available and states[STDIO_MCP].available
+    assert states[STDIO_MCP].available
+    # An HTTP server on this computer may reach the internet itself: not available offline (fails closed).
+    assert (states[LOCAL_MCP].available, states[LOCAL_MCP].reason) == (False, "http_mcp")
     assert (states["search_web"].available, states["search_web"].reason) == (False, "network")
     assert (states[REMOTE_MCP].available, states[REMOTE_MCP].reason) == (False, "remote_mcp")
     # Fails closed: what cannot be found is not available.
@@ -218,11 +227,37 @@ def test_an_own_tool_that_reaches_outside_is_not_available_offline() -> None:
     assert offline.tool_state(Library(), "outside").reason == "external_reach"
 
 
+def test_an_own_tool_is_judged_by_the_sandbox_of_the_call(tmp_path: Path) -> None:
+    """Review L2: an own tool counts as internal only because the library's sandbox has no network; a workflow's
+    Python environment can be a host subprocess with network, so at call time that sandbox decides."""
+    from orkexa.dynamic import SubprocessSandbox
+
+    from nodestro_runtime.testing import ContainerDouble
+    from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE, ToolLibrary
+
+    name = "celsius_to_fahrenheit"
+    library = ToolLibrary(tmp_path / "tools", sandbox=ContainerDouble())
+    result, _info = library.save_custom(
+        CUSTOM_TOOL_TEMPLATE, CUSTOM_TESTS_TEMPLATE, name, trust=library.editor_trust(name, CUSTOM_TOOL_TEMPLATE)
+    )
+    assert result.ok
+    assert library.get(name).capability.source == "derived"
+    assert offline.tool_state(library, name).available  # the library's default: a container
+    assert offline.tool_state(library, name, at_call=True).available  # the call runs there too
+    host = SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
+    found = offline.tool_state(library, name, sandbox=host, at_call=True)
+    assert (found.available, found.reason) == (False, "external_reach")
+
+
 def test_connections_of_an_offline_call() -> None:
     local = Connection(provider="ollama", base_url="http://127.0.0.1:11434/v1")
     assert offline.check_connection(local, "agent") is local
-    assert offline.check_connection(Connection(provider="ollama", base_url="http://ollama:11434"), "agent")
+    docker = Connection(provider="ollama", base_url="http://ollama:11434")
+    assert offline.check_connection(docker, "agent", docker=True) is docker
     for connection, code in (
+        # The Ollama container's name is local only in the Docker profile; elsewhere it is any host on the network.
+        (docker, "offline.remote_endpoint"),
+        (Connection(provider="ollama", base_url="http://127.0.0.1.nip.io:11434/v1"), "offline.remote_endpoint"),
         (Connection(provider="anthropic", api_key="k"), "offline.cloud_model"),
         (Connection(provider="openai_compatible", base_url="http://127.0.0.1:8000/v1"), "offline.cloud_model"),
         (Connection(provider="ollama", base_url="https://gpu.example.com/v1"), "offline.remote_endpoint"),
@@ -360,16 +395,180 @@ async def test_an_offline_agent_cannot_call_internet_tools_but_internal_ones(mak
     assert {item.code for item in run.warnings if item.node_id == "off"} == {"offline.tool_unavailable"}
 
 
-async def test_an_offline_agent_may_call_a_local_mcp_tool(make: Make) -> None:
-    workspace = make(local={"LOCAL": [(LOCAL_MCP, {}), "used it"]})
-    add_mcp(workspace, LOCAL_MCP, url="http://127.0.0.1:8765/mcp")
+async def test_an_offline_agent_may_call_a_local_stdio_mcp_tool(make: Make) -> None:
+    workspace = make(local={"LOCAL": [(STDIO_MCP, {}), "used it"]})
+    add_mcp(workspace, STDIO_MCP, url="stdio:lookup_server", transport="stdio")
+    called = _answering_mcp(workspace)
+    run = await finished(
+        workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, tools=[STDIO_MCP], offline=True)))
+    )
+    [call] = run.nodes["off"].tool_calls
+    assert call.approval is None and "looked up" in (call.output or "")
+    assert called == [STDIO_MCP]
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8765/mcp", "https://127.0.0.1.nip.io/mcp"])
+async def test_an_offline_agent_never_calls_an_http_mcp_tool(make: Make, url: str) -> None:
+    """An HTTP MCP server is refused even on this computer (it may reach the internet itself), and a DNS name that
+    starts with ``127.`` is not this computer at all."""
+    workspace = make(local={"LOCAL": [(LOCAL_MCP, {}), "done"]})
+    add_mcp(workspace, LOCAL_MCP, url=url)
     called = _answering_mcp(workspace)
     run = await finished(
         workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, tools=[LOCAL_MCP], offline=True)))
     )
     [call] = run.nodes["off"].tool_calls
-    assert call.approval is None and "looked up" in (call.output or "")
-    assert called == [LOCAL_MCP]
+    assert call.approval is not None and call.approval.code == "offline.tool_unavailable"
+    assert called == []
+
+
+# ---- what counts as this computer (review M1) -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434",
+        "http://LOCALHOST.:11434/v1",
+        "http://127.0.0.1:11434",
+        "http://127.8.9.10:11434",
+        "http://[::1]:11434/v1",
+        "http://[::ffff:127.0.0.1]:11434",
+    ],
+)
+def test_loopback_addresses_are_local(url: str) -> None:
+    assert offline.is_local_endpoint(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1.nip.io:11434/v1",
+        "http://127.attacker.example/v1",
+        "http://127.0.0.1.example.com",
+        "http://localhost.example.com",
+        "http://ollama:11434",
+        "http://ollama.example.com",
+        "http://10.0.0.5:11434",
+        "http://[::ffff:10.0.0.5]:11434",
+        "http://0.0.0.0:11434",
+        "http://[not-an-address",
+        "",
+    ],
+)
+def test_names_that_only_look_local_are_not(url: str) -> None:
+    assert not offline.is_local_endpoint(url)
+
+
+def test_the_ollama_container_is_local_in_the_docker_profile_only() -> None:
+    assert offline.is_local_endpoint("http://ollama:11434", docker=True)
+    assert not offline.is_local_endpoint("http://ollama.example.com", docker=True)
+    assert not offline.is_local_endpoint("http://127.0.0.1.nip.io", docker=True)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1.nip.io:11434/v1", "http://127.attacker.example/v1"])
+async def test_an_offline_agent_never_reaches_a_server_whose_name_starts_with_127(make: Make, url: str) -> None:
+    workspace = make(local={"LOCAL": ["sent to a remote host"]})
+    real = workspace.runs.connect
+
+    def remote(provider: str) -> Connection:
+        found = real(provider)
+        return Connection(provider=found.provider, base_url=url, client=found.client)
+
+    workspace.runs.connect = remote
+    run = await finished(workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, offline=True))))
+    assert run.nodes["off"].error_code == "offline.remote_endpoint"
+    assert workspace.local.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("mode", ["desktop", "local-container"])
+async def test_the_ollama_container_name_at_call_time(make: Make, mode: str) -> None:
+    workspace = make(local={"LOCAL": ["local answer"]})
+    workspace.builder.mode = mode
+    real = workspace.runs.connect
+
+    def container(provider: str) -> Connection:
+        found = real(provider)
+        return Connection(provider=found.provider, base_url="http://ollama:11434", client=found.client)
+
+    workspace.runs.connect = container
+    run = await finished(workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, offline=True))))
+    if mode == "local-container":
+        assert run.nodes["off"].output == "local answer"
+    else:
+        assert run.nodes["off"].error_code == "offline.remote_endpoint"
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_the_pre_check_does_not_take_a_127_name_for_this_computer(
+    make: Make, monkeypatch: pytest.MonkeyPatch, strict: bool
+) -> None:
+    from nodestro_runtime.preflight import _offline_issues
+
+    workspace = make()
+    monkeypatch.setattr(workspace.local_models, "ollama_url", lambda: "http://127.0.0.1.nip.io:11434")
+    monkeypatch.setattr(workspace, "strict_offline", lambda: strict)
+    workflow = flow(("off", AgentConfig(model=LOCAL, offline=True)))
+    codes = {item.code for item in _offline_issues(workspace, workflow)}
+    assert ("check.offline_remote_endpoint" if strict else "offline.remote_endpoint") in codes
+    # The Ollama container's name counts only in the Docker profile.
+    monkeypatch.setattr(workspace.local_models, "ollama_url", lambda: "http://ollama:11434")
+    assert {item.code for item in _offline_issues(workspace, workflow)} & {
+        "check.offline_remote_endpoint",
+        "offline.remote_endpoint",
+    }
+    monkeypatch.setattr(workspace, "profile", dataclasses.replace(workspace.profile, kind="local-container"))
+    assert not {item.code for item in _offline_issues(workspace, workflow)} & {
+        "check.offline_remote_endpoint",
+        "offline.remote_endpoint",
+    }
+
+
+def test_the_strict_pre_check_counts_only_stdio_mcp_servers_as_local(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nodestro_runtime.preflight import _offline_issues
+
+    workspace = make()
+    add_mcp(workspace, LOCAL_MCP, url="http://127.0.0.1:8765/mcp")
+    add_mcp(workspace, STDIO_MCP, url="stdio:lookup_server", transport="stdio")
+    monkeypatch.setattr(workspace, "strict_offline", lambda: True)
+    workflow = flow(("a", AgentConfig(model=LOCAL, tools=[LOCAL_MCP, STDIO_MCP])))
+    [found] = [item for item in _offline_issues(workspace, workflow) if item.code == "check.offline_mcp"]
+    assert found.params["names"] == LOCAL_MCP
+
+
+@pytest.mark.parametrize("environment", [False, True])
+async def test_an_own_tool_in_a_workflow_environment_on_the_host_is_not_offline(make: Make, environment: bool) -> None:
+    """Review L2 at call time: the run passes the workflow's Python environment to the tool; a host subprocess
+    there has network, whatever the library's default sandbox is."""
+    from orkexa.dynamic import SubprocessSandbox
+
+    from nodestro_runtime.testing import ContainerDouble
+    from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
+
+    name = "celsius_to_fahrenheit"
+    workspace = make(local={"LOCAL": [(name, {"celsius": 100}), "done"]})
+    workspace.tools.set_sandbox(ContainerDouble())
+    result, _info = workspace.tools.save_custom(
+        CUSTOM_TOOL_TEMPLATE,
+        CUSTOM_TESTS_TEMPLATE,
+        name,
+        trust=workspace.tools.editor_trust(name, CUSTOM_TOOL_TEMPLATE),
+    )
+    assert result.ok
+    if environment:
+        host = SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
+        workspace.runs.tool_sandbox = lambda _workflow_id: host
+    run = await finished(
+        workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, tools=[name], offline=True)))
+    )
+    [call] = run.nodes["off"].tool_calls
+    if environment:
+        assert call.approval is not None and call.approval.code == "offline.tool_unavailable"
+        assert "not available offline" in (call.output or "")
+    else:
+        assert call.approval is None or call.approval.code != "offline.tool_unavailable"
 
 
 async def test_the_tool_check_needs_no_approval_gate_and_comes_before_it(make: Make) -> None:
@@ -596,6 +795,38 @@ def test_run_offline_looks_at_the_run_and_its_parents(make: Make) -> None:
     assert workspace.runs.run_offline(below) is True
     orphan = plain.model_copy(update={"id": "run_orphan", "parent_run_id": "run_gone"})
     assert workspace.runs.run_offline(orphan) is True  # fails closed
+
+
+def test_content_offline_scope_looks_above_and_below_the_run(make: Make) -> None:
+    from nodestro_runtime.schemas import NodeRun
+
+    workspace = make()
+    plain = Run(workflow_id="w", workflow_name="W", workflow=flow(("a", AgentConfig())))
+    marked = Run(workflow_id="w", workflow_name="W", workflow=flow(("a", AgentConfig(offline=True))))
+    assert workspace.runs.content_offline_scope(plain) is None
+    assert workspace.runs.content_offline_scope(marked) == "agent"
+    # A sub-workflow or team run below with an offline agent: its results are in the parent's output.
+    child = marked.model_copy(update={"id": "run_child", "parent_run_id": "run_parent"})
+    workspace.store.put("runs", child.id, child)
+    parent = plain.model_copy(
+        update={"id": "run_parent", "nodes": {"a": NodeRun(node_id="a", child_run_ids=[child.id])}}
+    )
+    workspace.store.put("runs", parent.id, parent)
+    assert workspace.runs.run_offline(parent) is False  # the run itself and above: not enough
+    assert workspace.runs.content_offline_scope(parent) == "agent"
+    gone = plain.model_copy(update={"id": "run_gone_child", "nodes": {"a": NodeRun(node_id="a", child_run_id="x")}})
+    assert workspace.runs.content_offline_scope(gone) == "agent"  # fails closed
+    answer = plain.model_copy(update={"id": "run_answer", "trigger": "conversation", "trigger_ref": "conv_unknown"})
+    assert workspace.runs.content_offline_scope(answer) == "conversation"  # an unknown conversation fails closed
+
+
+def test_connect_model_for_offline_content(make: Make) -> None:
+    workspace = make()
+    assert workspace.connect_model(CLOUD).provider == "anthropic"  # unchanged without ``offline``
+    assert workspace.connect_model(LOCAL, offline="agent").provider == "ollama"
+    with pytest.raises(NodestroError) as caught:
+        workspace.connect_model(CLOUD, offline="conversation")
+    assert (caught.value.code, caught.value.params["scope"]) == ("offline.cloud_model", "conversation")
 
 
 def test_the_agent_test_of_an_offline_agent(make: Make) -> None:

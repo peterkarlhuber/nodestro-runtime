@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from .mcp_access import is_mcp_tool
 from .problems import NodestroError
 from .providers import provider_of
+from .tool_policy import NO_NETWORK
 from .tool_spec import host_tool_spec
 
 if TYPE_CHECKING:
@@ -52,13 +53,14 @@ if TYPE_CHECKING:
 #: Who made a call offline: the agent's own setting or the conversation it answers in.
 OfflineScope = Literal["agent", "conversation"]
 #: Why a tool is not available offline.
-OfflineReason = Literal["network", "remote_mcp", "external_reach", "unknown"]
+OfflineReason = Literal["network", "remote_mcp", "http_mcp", "external_reach", "unknown"]
 #: The provider of local models, the only one an offline agent may use.
 LOCAL_PROVIDER = "ollama"
 
 _REASON_TEXTS: dict[str, str] = {
     "network": "it needs the internet",
     "remote_mcp": "its MCP server is not on this computer",
+    "http_mcp": "its MCP server is reached over HTTP and may reach the internet itself",
     "external_reach": "it may reach outside this computer",
     "unknown": "it is not known whether it needs the network",
 }
@@ -79,33 +81,64 @@ class OfflineToolState(BaseModel):
         return f"{self.name} is not available offline: {_REASON_TEXTS[self.reason or 'unknown']}"
 
 
-def is_local_endpoint(url: str) -> bool:
-    """Whether a model server address is on this computer or in Nodestro Local Docker's internal network."""
+#: The host name of the Ollama container on Nodestro Local Docker's internal network (``local-container`` profile).
+DOCKER_OLLAMA_HOST = "ollama"
+
+
+def is_local_endpoint(url: str, *, docker: bool = False) -> bool:
+    """Whether a model server address is on this computer: ``localhost`` or a loopback IP address (``127.0.0.0/8``,
+    ``::1``). A host name that merely starts with ``127.`` (``127.0.0.1.nip.io``) is a DNS name anywhere and does not
+    count. ``docker`` (the ``local-container`` profile, Nodestro Local Docker) also accepts the Ollama container's
+    host name on the internal network, ``ollama``; nowhere else is that name local."""
+    import ipaddress
     from urllib.parse import urlsplit
 
-    host = (urlsplit(url).hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "::1", "ollama") or host.startswith("127.")
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if host == "localhost" or (docker and host == DOCKER_OLLAMA_HOST):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
+
+
+def mcp_available_offline(server: Any) -> OfflineReason | None:
+    """``None`` when an MCP server can be used offline, otherwise why not. Only a local ``stdio`` server counts: it
+    runs in a sandbox container without network. An HTTP server is refused even on this computer, because the
+    server itself may reach the internet (the strict offline gate also counts only ``stdio`` servers as local)."""
+    if getattr(server, "transport", "http") == "stdio":
+        return None
+    return "http_mcp" if is_local_endpoint(str(getattr(server, "url", "") or "")) else "remote_mcp"
 
 
 def _unavailable(name: str, reason: OfflineReason) -> OfflineToolState:
     return OfflineToolState(name=name, available=False, reason=reason)
 
 
-def tool_state(library: Any, name: str) -> OfflineToolState:
+def tool_state(library: Any, name: str, *, sandbox: Any = None, at_call: bool = False) -> OfflineToolState:
     """Whether the library tool ``name`` can be used offline (see the module documentation).
 
     ``library`` is a :class:`~nodestro_runtime.tool_library.ToolLibrary`. Fails closed: a tool that cannot be found
-    counts as not available (``unknown``)."""
+    counts as not available (``unknown``).
+
+    An own or generated tool counts as internal only because its code runs without network (the reach is derived
+    from the sandbox). ``at_call``: judged by the sandbox the call really runs in, with ``sandbox`` (the workflow's
+    Python environment, ``None``: the library's own), not by the library's default: a workflow's environment can be a
+    host subprocess with network."""
     if is_mcp_tool(name):
         mcp = getattr(library, "mcp", None)
         find = getattr(mcp, "find", None)
         found = find(name) if find is not None else None
         if found is None:
             return _unavailable(name, "unknown")
-        server = found[0]
-        if getattr(server, "transport", "http") == "stdio" or is_local_endpoint(str(getattr(server, "url", ""))):
-            return OfflineToolState(name=name, available=True)
-        return _unavailable(name, "remote_mcp")
+        reason = mcp_available_offline(found[0])
+        return OfflineToolState(name=name, available=True) if reason is None else _unavailable(name, reason)
     if name in getattr(library, "builtin", {}):
         spec = library.specs.get(name) or host_tool_spec(name)
         if spec is None:
@@ -115,9 +148,13 @@ def tool_state(library: Any, name: str) -> OfflineToolState:
         capability = library.get(name).capability
     except (KeyError, ValueError, AttributeError):
         return _unavailable(name, "unknown")
-    if capability.reach == "internal":
-        return OfflineToolState(name=name, available=True)
-    return _unavailable(name, "external_reach")
+    if capability.reach != "internal":
+        return _unavailable(name, "external_reach")
+    if at_call and capability.source == "derived":
+        isolation = getattr(library, "call_isolation", lambda _name, _sandbox: None)(name, sandbox)
+        if isolation not in NO_NETWORK:
+            return _unavailable(name, "external_reach")
+    return OfflineToolState(name=name, available=True)
 
 
 def tool_states(library: Any, names: list[str]) -> list[OfflineToolState]:
@@ -149,10 +186,11 @@ def check_provider(provider: str, scope: OfflineScope) -> None:
         raise cloud_model_error(provider, scope)
 
 
-def check_connection(connection: Connection, scope: OfflineScope) -> Connection:
-    """``connection``, unless it is a cloud provider or a local model server that is not on this computer."""
+def check_connection(connection: Connection, scope: OfflineScope, *, docker: bool = False) -> Connection:
+    """``connection``, unless it is a cloud provider or a local model server that is not on this computer
+    (:func:`is_local_endpoint`; ``docker``: the ``local-container`` profile)."""
     check_provider(connection.provider, scope)
-    if connection.base_url and not is_local_endpoint(connection.base_url):
+    if connection.base_url and not is_local_endpoint(connection.base_url, docker=docker):
         raise NodestroError(
             "offline.remote_endpoint",
             f"The local model server is not on this computer; this {scope} is offline and uses local servers only",

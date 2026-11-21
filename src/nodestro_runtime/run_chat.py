@@ -996,7 +996,7 @@ def answer_question(
             manager.check_cloud_access(provider_of(model), run_id=question.run_id, actor=question.author)
             connection = manager.connect(provider_of(model))
             if scope is not None:
-                check_connection(connection, scope)
+                check_connection(connection, scope, docker=manager.builder.mode == "local-container")
             agent = AgentConfig(
                 name="Run chat",
                 model=model,
@@ -1051,12 +1051,8 @@ def answer_question(
 def _offline_scope(manager: Any, root: Run, target: Run) -> OfflineScope | None:
     """Why run chat about ``target`` (below ``root``) must stay offline (N-09), or ``None``: the snapshot holds the
     results of the orchestrator's teams, so an offline agent anywhere in the run (or above it) counts."""
-    if root.trigger == "conversation" and root.trigger_ref and manager.conversation_offline(root.trigger_ref):
-        return "conversation"
-    runs = [target, *(run for run, _path, _depth in _walk(manager.get, root))]
-    if any(manager.run_offline(run) for run in runs):
-        return "agent"
-    return None
+    found: OfflineScope | None = manager.content_offline_scope(root) or manager.content_offline_scope(target)
+    return found
 
 
 def _usage(tracker: Any, usage_of: Any) -> Usage | None:

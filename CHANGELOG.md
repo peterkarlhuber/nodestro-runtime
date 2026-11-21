@@ -20,6 +20,17 @@
     same rules.
   - `preflight.is_local_endpoint` moved to `offline.is_local_endpoint` (still importable from `preflight`).
   - New codes: `offline.cloud_model`, `offline.remote_endpoint`, `offline.server_tools`, `offline.tool_unavailable`.
+  - Review fixes (security): `is_local_endpoint` parses the host as an IP address and accepts only `localhost` and
+    loopback addresses, so `127.0.0.1.nip.io` or `127.attacker.example` no longer count as this computer (also in the
+    strict offline mode's pre-check); `ollama` counts only in the `local-container` profile
+    (`is_local_endpoint(url, docker=...)`, `check_connection(..., docker=...)`). An MCP server over HTTP is not
+    available offline even on `localhost` (new reason `http_mcp`); the strict offline pre-check counts only `stdio`
+    servers as local, as its approval gate. An own tool's derived `internal` reach is judged at call time by the
+    sandbox the call really runs in (`tool_state(..., sandbox=..., at_call=True)`,
+    `ToolLibrary.call_isolation`). New `RunManager.content_offline_scope(run)` (the run, above and below it, and its
+    conversation; fails closed) and `Workspace.connect_model(..., offline=scope)` for content of a finished run that
+    goes to a model outside the run (run chat; the assistant's run attachment and a test series' judge in
+    nodestro-api).
 
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
