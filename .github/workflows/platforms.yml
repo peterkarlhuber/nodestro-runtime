@@ -2,7 +2,9 @@ name: Platforms
 
 # Nodestro Runtime must import and start on every operating system the desktop supports, also where the built-in
 # Linux sandbox and Docker are missing (then only code that needs isolation is refused). This job runs the
-# platform tests (tests/test_platform_start.py) on real macOS and Windows runners, on both CPU architectures.
+# platform tests (tests/test_platform_start.py) on real macOS and Windows runners, on both CPU architectures, and the
+# folder tools with their attack tests (tests/test_folders.py, N-10/N-63): links, junctions, hard links, swaps during
+# a call, Unicode and case behave differently on each file system.
 on:
   push:
     branches: [master]
@@ -68,7 +70,7 @@ jobs:
         run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
       - name: Import the workspace (the path that failed on macOS)
         run: python -c "import nodestro_runtime.workspace as w; print('imported', w.__name__)"
-      - run: pytest -v --junitxml=junit-platforms.xml tests/test_platform_start.py
+      - run: pytest -v --junitxml=junit-platforms.xml tests/test_platform_start.py tests/test_folders.py
       # MUP-ONA A0: the skipped tests of each system as listed in its expectation file (scripts/check_skips.py).
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-platforms.xml "tests/ci/skipped-platforms-${{ matrix.os }}.txt"

@@ -30,6 +30,7 @@ from orkexa import Tool, ToolResultError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .connections import ResolvedConnection
+from .folders import FolderReader
 from .mail import Attachment
 from .schemas import ToolSettings
 from .source_ledger import SourceLedger
@@ -175,6 +176,38 @@ NOTIFY_USER_SPEC = ToolSpec(
     max_calls_per_run=3,
 )
 
+#: The folder tools (N-10): they read granted folders (:mod:`nodestro_runtime.folders`) on this computer, so they work
+#: offline and only where a person's folders are: the desktop and Nodestro Local Docker, never a server. They are
+#: offered only while ``NODESTRO_FOLDER_GRANTS=1`` (:func:`offered`).
+FOLDER_TOOL_IDS: frozenset[str] = frozenset({"list_folder", "read_file", "search_files"})
+_FOLDER_MODES: frozenset[SpecMode] = frozenset({"desktop", "local-container"})
+LIST_FOLDER_SPEC = ToolSpec(
+    id="list_folder",
+    category="files",
+    capability=BUILTIN_CAPABILITIES["list_folder"],
+    modes=_FOLDER_MODES,
+    timeout_seconds=30.0,
+    max_calls_per_run=100,
+)
+#: PDFs are read in an isolated process within the grant's time budget (at most 60 seconds).
+READ_FILE_SPEC = ToolSpec(
+    id="read_file",
+    category="files",
+    capability=BUILTIN_CAPABILITIES["read_file"],
+    modes=_FOLDER_MODES,
+    timeout_seconds=90.0,
+    max_calls_per_run=100,
+)
+#: A search stops after ``folders.SEARCH_SECONDS`` (30) and returns what it found.
+SEARCH_FILES_SPEC = ToolSpec(
+    id="search_files",
+    category="files",
+    capability=BUILTIN_CAPABILITIES["search_files"],
+    modes=_FOLDER_MODES,
+    timeout_seconds=60.0,
+    max_calls_per_run=30,
+)
+
 #: ``draft_email`` / ``draft_webhook`` (NAL-A4): a draft file in the run, no network, no connection. The sender of an
 #: e-mail draft and the schema of a webhook payload are binding parameters (never visible to the model).
 DRAFT_EMAIL_SPEC = ToolSpec(
@@ -216,13 +249,21 @@ BUILTIN_SPECS: dict[str, ToolSpec] = {
         NOTIFY_USER_SPEC,
         DRAFT_EMAIL_SPEC,
         DRAFT_WEBHOOK_SPEC,
+        LIST_FOLDER_SPEC,
+        READ_FILE_SPEC,
+        SEARCH_FILES_SPEC,
     )
 }
 
 
 def offered(spec: ToolSpec, mode: str, environ: Mapping[str, str] | None = None) -> bool:
     """Whether ``spec``'s tool runs in ``mode``. The web tools join the server profile only with
-    ``NODESTRO_WEB_TOOLS_SERVER=1`` (:data:`WEB_TOOLS_SERVER_ENV`)."""
+    ``NODESTRO_WEB_TOOLS_SERVER=1`` (:data:`WEB_TOOLS_SERVER_ENV`); the folder tools run only while
+    ``NODESTRO_FOLDER_GRANTS=1`` (:data:`~nodestro_runtime.folders.FOLDERS_ENV`)."""
+    if spec.id in FOLDER_TOOL_IDS:
+        from .folders import folders_enabled
+
+        return mode in spec.modes and folders_enabled(environ)
     if mode in spec.modes:
         return True
     if mode == "server" and spec.id in PLANNED_BUILTIN_NAMES:
@@ -327,6 +368,9 @@ class RunServices:
     #: A file of the run by its file name (input or result file), read for an attachment: ``(name, max_bytes)``;
     #: ``None`` if unknown, ``DraftError("mail.too_large")`` above ``max_bytes`` (checked before reading).
     run_file: Callable[[str, int], Attachment | None] | None = None
+    #: The granted folders this step may read (N-10, :class:`~nodestro_runtime.folders.FolderReader`); ``None``:
+    #: none here (the switch is off, outside a run, or not in this mode).
+    folders: FolderReader | None = None
 
 
 @dataclass(frozen=True)
@@ -523,8 +567,12 @@ __all__ = [
     "DRAFT_EMAIL_SPEC",
     "DRAFT_WEBHOOK_SPEC",
     "FETCH_WEB_PAGE_SPEC",
+    "FOLDER_TOOL_IDS",
     "HOST_TOOL_TIMEOUT_SECONDS",
+    "LIST_FOLDER_SPEC",
     "PLANNED_BUILTIN_NAMES",
+    "READ_FILE_SPEC",
+    "SEARCH_FILES_SPEC",
     "SEARCH_WEB_SPEC",
     "WEB_TOOLS_SERVER_ENV",
     "CallCounter",

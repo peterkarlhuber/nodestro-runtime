@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Granted folders (N-10), off by default (`NODESTRO_FOLDER_GRANTS=1`; activation after the independent review). A
+  person grants a folder for reading; agents read it with the new tools `list_folder`, `read_file` and
+  `search_files`. See [docs/folders.md](docs/folders.md).
+  - New modules: `nodestro_runtime.folders` (`FolderGrant`, `FolderLimits`, `FolderReader`), `folder_grants` (the
+    writer, `FolderGrants`, for a `Person` only and imported by no runtime module) and `folder_tools`.
+  - A folder grant is an access grant of the access model v2 (resource `folder`, action `read`) plus name,
+    patterns, limits and the folder's identity: duration, expiry, scope, mode, revocation and the audit are N-06's.
+    Every tool call evaluates the access model (the folder grant's own access grant and every deny) and reads
+    through `orkexa.fs.SafeRoot`. System folders, the home folder, credential folders and the data folder are never
+    grantable (`folder.not_grantable` with `reason`), and the data folder stays closed inside a granted folder.
+  - The tools are `access=read`, `reach=internal`, `source=folder` (new `CapabilitySource` value `folder`), so they
+    stay available offline (N-09). They run on the desktop and in Nodestro Local Docker only. File text is marked as
+    data and comes with its source (`<folder>/<path>`); every file read is the run event `folder_file_read`.
+  - Every call is one activity event (N-13): source `file`, actions `folder.listed`, `folder.read`,
+    `folder.searched`, resource `folder_grant`. `FolderGrants.accesses` returns a grant's access log.
+  - Desktop-to-server imports skip `folder_grants`.
+  - New codes: `folder.disabled`, `folder.failed`, `folder.invalid_name`, `folder.invalid_pattern`,
+    `folder.invalid_query`, `folder.name_taken`, `folder.not_found`, `folder.not_grantable`, `folder.unavailable`,
+    `folder.unknown`, and the `fs.*` codes of the guard the tools return.
+  - Tests: `tests/test_folders.py`, which also runs orkexa's folder grant conformance cases (N-63) through the real
+    tools (attack catalog, link swaps, patterns, limits, revocation, expiry, access log), on Linux, macOS and
+    Windows.
 - Offline per agent and per conversation (N-09): `AgentConfig.offline` (default off, left out of stored agents while
   off) and the existing `Conversation.offline` apply the strict offline mode's rules to one agent or to every answer of
   one conversation, checked at every call. See [docs/offline.md](docs/offline.md).

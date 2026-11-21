@@ -11,7 +11,8 @@ A :class:`ToolCapability` says
 - ``reach``: ``internal`` (stays inside Nodestro) or ``external`` (talks to systems outside it);
 - ``source``: who made the statement: ``nodestro`` (fixed for built-in and provider tools), ``author`` (the person
   who saved the tool), ``admin`` (an administrator's classification, e.g. of an MCP tool), ``derived`` (computed
-  from where the tool runs) or ``default`` (nobody said anything).
+  from where the tool runs), ``folder`` (fixed by Nodestro for the tools that read a granted folder, N-10: what they
+  return is content of a granted source) or ``default`` (nobody said anything).
 
 A missing or unknown statement means ``write`` + ``external`` (:data:`UNKNOWN`): only Nodestro or a person can make
 a tool look harmless, never its own code, its description or a model. The statement is security information, not
@@ -46,7 +47,7 @@ from .sandbox_policy import Isolation
 
 Access = Literal["read", "write", "destructive"]
 Reach = Literal["internal", "external"]
-CapabilitySource = Literal["nodestro", "author", "admin", "derived", "default"]
+CapabilitySource = Literal["nodestro", "author", "admin", "derived", "folder", "default"]
 
 
 class ToolCapability(BaseModel):
@@ -67,6 +68,8 @@ class ToolCapability(BaseModel):
 UNKNOWN = ToolCapability(access="write", reach="external", source="default")
 
 _READ_INTERNAL = ToolCapability(access="read", reach="internal", source="nodestro")
+#: The folder tools (N-10): read-only, on this computer, and their source is a granted folder.
+_FOLDER_READ = ToolCapability(access="read", reach="internal", source="folder")
 
 #: The built-in tools of Nodestro itself (``builtin_tools.BUILTIN_TOOLS``). Tools that extensions add are not in
 #: here: without their own statement they count as :data:`UNKNOWN`.
@@ -84,6 +87,10 @@ BUILTIN_CAPABILITIES: dict[str, ToolCapability] = {
     # NAL-A4: drafts are files of the run; nothing leaves Nodestro (sending is NAL-A5).
     "draft_email": ToolCapability(access="write", reach="internal", source="nodestro"),
     "draft_webhook": ToolCapability(access="write", reach="internal", source="nodestro"),
+    # N-10: they read granted folders on this computer, never write, never leave it; their output is folder content.
+    "list_folder": _FOLDER_READ,
+    "read_file": _FOLDER_READ,
+    "search_files": _FOLDER_READ,
 }
 
 #: The provider's server tools (``catalog.SERVER_TOOLS``). They run at the provider and never pass Nodestro's tool

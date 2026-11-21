@@ -22,7 +22,7 @@ lets a continued run (:mod:`nodestro_runtime.resume`) take over results of an ea
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import concurrent.futures
 from contextlib import suppress
 import contextvars
@@ -95,6 +95,7 @@ from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_proble
 from .cost_tracking import PricedTracker, PriceMode, request_regions, stale_requests
 from .file_delivery import TOOL_NAME as FILES_TOOL_NAME
 from .file_delivery import collect, deliver
+from .folders import FileText, FolderCaller, FolderGrant, FolderReader
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
 from .input_files import InputFiles
@@ -1065,6 +1066,10 @@ class RunManager:
         self.notifier: RunNotifier | None = None
         #: The result files of runs, for the draft tools (NAL-A4); ``None``: drafts are not available.
         self.result_files: ResultFiles | None = None
+        #: The access grants and denies active now, for the folder tools (N-10, read by the workspace); ``None``:
+        #: folder grants are switched off. ``protected_folder`` is Nodestro's data folder.
+        self.folder_records: Callable[[], tuple[Sequence[tool_policy.Grant], Sequence[tool_policy.Deny]]] | None = None
+        self.protected_folder: str | None = None
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
@@ -4516,7 +4521,7 @@ class RunManager:
             fields=[item.field for item in failed],
         )
 
-    def _run_services(self, context: _RunContext, node_id: str) -> RunServices:
+    def _run_services(self, context: _RunContext, node_id: str, agent_name: str | None = None) -> RunServices:
         """The run's source ledger and the booking of tools' own costs, lent to the built-in tools of one step."""
 
         def recorded(entry: SourceEntry, new: bool) -> None:
@@ -4557,6 +4562,7 @@ class RunManager:
 
         save_file, run_file = self._draft_files(top, node_id)
         return RunServices(
+            folders=self._folder_reader(context, node_id, agent_name),
             ledger=SourceLedger(context.run.sources, lock=context.lock, on_recorded=recorded),
             node_id=node_id,
             book=book,
@@ -4566,6 +4572,39 @@ class RunManager:
             save_file=save_file,
             run_file=run_file,
         )
+
+    def _folder_reader(self, context: _RunContext, node_id: str, agent_name: str | None) -> FolderReader | None:
+        """The folder tools' reader of one step (N-10): the agent ``<workflow id>/<node id>``, the conversation of
+        the top-level run, unattended for schedules, batches, benchmarks and API calls. Every file read is
+        announced as the run event ``folder_file_read`` (folder name, grant id, relative path), so the run names its
+        sources; the activity log gets the access without the path."""
+        records, protected = self.folder_records, self.protected_folder
+        top = context.root.run
+        if records is None or protected is None or top.imported_at is not None:
+            return None
+
+        def read(folder: FolderGrant, found: FileText) -> None:
+            self._emit(
+                context,
+                "folder_file_read",
+                node_id,
+                folder=folder.name,
+                grant_id=folder.id,
+                path=found.path,
+                file_kind=found.kind,
+                size=found.size,
+            )
+
+        caller = FolderCaller(
+            agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
+            agent_name=agent_name,
+            mode="unattended" if top.trigger in UNATTENDED_TRIGGERS else "supervised",
+            conversation_id=conversation_of(top),
+            actor=_run_actor(top),
+            run_id=context.run.id,
+            node_id=node_id,
+        )
+        return FolderReader(self.store, records=records, protected=protected, caller=caller, clock=now, on_read=read)
 
     def _draft_files(self, top: Run, node_id: str) -> tuple[Any, Any]:
         """``save_file`` and ``run_file`` of the draft tools (NAL-A4): drafts belong to the top-level run (the run a
@@ -4912,7 +4951,7 @@ class RunManager:
                 refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
-                services=self._run_services(context, node_id),
+                services=self._run_services(context, node_id, config.name),
             )
             outcome = ask(prompt)
             if checked_fields(config.output):

@@ -343,16 +343,25 @@ def test_an_unattended_call_needs_an_unattended_dated_grant() -> None:
 
 
 def test_no_tool_and_no_model_path_can_write_grants() -> None:
-    """Only the store class writes grant and deny records, and only the workspace (for the gate, reading) and the
-    store module know it: no tool, MCP, orchestrator or engine module can reach the writer."""
+    """Only the store class writes grant and deny records, and only the workspace (for the gate, reading), the folder
+    grant writer (N-10, a person's writes) and the store module know it: no tool, MCP, orchestrator or engine module
+    can reach the writer."""
     package = Path(nodestro_runtime.__file__).resolve().parent
     writers = re.compile(r"\bAccessRules\b|\baccess_grants\b|\baccess_denies\b|\bGRANTS\b|\bDENIES\b")
     found = sorted(
         str(path.relative_to(package)) for path in package.rglob("*.py") if writers.search(path.read_text("utf-8"))
     )
-    assert found == ["postgres_import.py", "tool_approvals.py", "workspace.py"]
+    assert found == ["folder_grants.py", "postgres_import.py", "tool_approvals.py", "workspace.py"]
     imports = (package / "postgres_import.py").read_text("utf-8")
-    assert re.search(r'SKIPPED_COLLECTIONS = frozenset\(\{[^}]*"access_grants", "access_denies"\}\)', imports)
+    assert re.search(r'SKIPPED_COLLECTIONS = frozenset\(\s*\{[^}]*"access_grants", "access_denies"\}\s*\)', imports)
+    # The folder grant writer is imported by no module of the package (the api calls it for a logged-in person).
+    importers = re.compile(
+        r"^\s*(from\s+\S*folder_grants\s+import|import\s+\S*folder_grants|from\s+\.\s+import\s+.*\bfolder_grants\b)",
+        re.M,
+    )
+    assert [path.name for path in package.rglob("*.py") if importers.search(path.read_text("utf-8"))] == []
+    folder_writer = (package / "folder_grants.py").read_text("utf-8")
+    assert "Person" in folder_writer and "isinstance(by, Person)" in folder_writer
     workspace_source = (package / "workspace.py").read_text("utf-8")
     assert re.findall(r"AccessRules\([^)]*\)\.(\w+)", workspace_source) == ["current"]  # reads, never writes
 

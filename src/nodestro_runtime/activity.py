@@ -111,7 +111,7 @@ class ActivityEvent(BaseModel):
     #: The agent that acted (its configured name), for tool calls and agent steps.
     agent: str | None = None
     #: What the action concerned: ``tool``, ``run``, ``workflow``, ``node``, ``input_file``, ``knowledge_file``,
-    #: ``mcp_server``, ``mcp_tool``, ``service_connection``, ``tool_pre_grant``.
+    #: ``mcp_server``, ``mcp_tool``, ``service_connection``, ``tool_pre_grant``, ``folder_grant``.
     resource_type: str = ""
     #: The resource's Nodestro id or name (never a file path or file name).
     resource_id: str = ""

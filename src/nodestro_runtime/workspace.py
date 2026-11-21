@@ -62,6 +62,8 @@ from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import RunManager
 from .extensions import Extensions, Integration, discover
+from .folder_tools import FOLDER_TOOLS
+from .folders import folders_enabled
 from .input_files import FileCatalog, InputFiles
 from .knowledge import KnowledgeBase, KnowledgeTables
 from .launcher import launch
@@ -351,7 +353,7 @@ class Workspace:
             discover() if integrations is None else integrations,
             strict=integrations is not None,
             installed=integrations is None,
-            reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS) if tool.name},
+            reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *FOLDER_TOOLS) if tool.name},
         )
         self.store: DocumentStore
         self._sqlite: SQLiteStore | None = None
@@ -495,6 +497,12 @@ class Workspace:
             self.inbox = LocalInbox(self.store)
             self.runs.notifier = RunNotifier(self.inbox)
             self.runs.listeners.append(self.runs.notifier)
+        #: The access grants and denies active now (N-06), read at every use by the tool gate and the folder tools.
+        access_records = AccessRules(self.store).current
+        if folders_enabled():
+            # N-10: the folder tools read granted folders (their own switch, default off).
+            self.runs.folder_records = access_records
+            self.runs.protected_folder = str(self.data_dir.resolve())
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
             self.runs.tool_gate = ToolGate(
@@ -505,7 +513,7 @@ class Workspace:
                 checkpoints=checkpoints_enabled(),
                 max_paused=max_paused(),
                 # N-06: the access model v2 (a third switch, default off; activation needs gate G-2).
-                access=AccessRules(self.store).current if access_grants_enabled() else None,
+                access=access_records if access_grants_enabled() else None,
                 offline=self.strict_offline,
                 protected_folders=(str(self.data_dir.resolve()),),
                 local_mcp=self._local_mcp_servers,

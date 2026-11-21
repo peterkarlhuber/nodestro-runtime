@@ -68,11 +68,12 @@ None known.
     write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
   - nodestro-studio: scope and duration on `ToolApprovalCard.tsx` (N-16 candidate), the overview, texts of the
     `access.*` codes.
-  - Runtime: call `evaluate` where folders are used (N-10 file-system guard). The other call sites are done; their
-    open points are RT-088.
+  - Done (N-10, 2026-11-21): the folder tools call `evaluate` at every call and read through `orkexa.fs.SafeRoot`
+    (RT-093). The other call sites are done; their open points are RT-088.
   - Runtime: name agents by a stable agent id once agents have one (today `<workflow id>/<node id>`).
-  - Runtime: Windows folder checks remain by name. Hard links, junctions, network drives and the computer's own
-    name in UNC paths (only `localhost`, `127.0.0.1` and `::1` map to the drive) need the N-10 guard.
+  - Runtime: Windows folder checks of the access model remain by name. The folder tools add the N-10 guard (hard
+    links, junctions, network drives refused); the computer's own name in UNC paths (only `localhost`, `127.0.0.1`
+    and `::1` map to the drive) is still compared by name.
   - Runtime: the `DenialNotice` type (N-07).
   - Owner: activation after gate G-2, and the internal security check (the independent review goes with RT-001).
 
@@ -612,6 +613,27 @@ Items that need an independent or external review (an internal audit does not re
   - the tool catalog (`ToolInfo`) does not carry the offline state yet; it is reported through the agent's
     validation.
 - **Next step:** Decide whether a workflow-wide offline flag is wanted.
+
+### RT-093 · Granted folders (N-10): activation and follow-ups
+
+- **Priority:** P2 Medium · **Status:** In progress · **Refs:** development plan N-10, N-63,
+  [docs/folders.md](folders.md), `tests/test_folders.py`, `tests/folder_support.py`
+- **What:** Folder grants and the read-only tools `list_folder`, `read_file` and `search_files` are in, behind
+  `NODESTRO_FOLDER_GRANTS` (off). Open:
+  - the independent review of N-10 (security-relevant), then the owner's activation decision;
+  - on macOS, `tool_policy.SYSTEM_FOLDERS` contains `/private/var`, so folders below the temporary folder cannot be
+    granted although `orkexa.fs` allows them (fails closed; decide whether `/private/var/folders` should be
+    grantable);
+  - files with several hard links are always refused; there is no opt-in;
+  - `FolderGrant.index` is stored only; indexing a granted folder is a later step;
+  - the run event `folder_file_read` names a run's sources live; a stored list of sources per answer is not built
+    yet (the tool results name them);
+  - an own or integration tool already named `list_folder`, `read_file` or `search_files` is shadowed by the built-in
+    tool once the switch is on (the names are reserved);
+  - the tool library reads the switch when it is built; changing it needs a restart;
+  - search snippets are short excerpts of file content returned without the data markers of `read_file`.
+- **Next step:** Independent review; nodestro-api routes (`/api/folders`) and the studio texts are in the same
+  change.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 

@@ -7,6 +7,7 @@ import pytest
 from nodestro_runtime.builtin_tools import BUILTIN_TOOLS
 from nodestro_runtime.catalog import SERVER_TOOLS
 from nodestro_runtime.draft_tools import DRAFT_TOOLS
+from nodestro_runtime.folder_tools import FOLDER_TOOLS
 from nodestro_runtime.notifications import NOTIFY_TOOLS
 from nodestro_runtime.tool_policy import (
     BUILTIN_CAPABILITIES,
@@ -20,9 +21,13 @@ from nodestro_runtime.web_tools import WEB_TOOLS
 
 
 def test_every_builtin_and_provider_tool_has_a_statement() -> None:
-    assert {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS)} == set(
+    assert {tool.name for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *FOLDER_TOOLS)} == set(
         BUILTIN_CAPABILITIES
     )
+    # The folder tools (N-10) read only granted folders on this computer.
+    for tool in FOLDER_TOOLS:
+        assert tool.name is not None
+        assert BUILTIN_CAPABILITIES[tool.name] == ToolCapability(access="read", reach="internal", source="folder")
     for key in SERVER_TOOLS:
         assert server_tool_capability(key).source == "nodestro"
     assert capability_of(name="calculator", kind="builtin") == ToolCapability(
