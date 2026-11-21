@@ -89,7 +89,7 @@ def test_the_answer_reservation_holds_across_processes(database: PostgresDatabas
             ConversationIn(agent=AgentChoice(template_id=template_id), model="anthropic:claude-sonnet-5-5"),
             owner="usr_alice",
         )
-        _conversation, user, answer, _budget = first.conversations._reserve(created.id, "usr_alice", "one", [])
+        _, user, answer, _, _ = first.conversations._reserve(created.id, "usr_alice", "one", [])
         with pytest.raises(NodestroError) as caught:
             second.conversations._reserve(created.id, "usr_alice", "two", [])
         assert caught.value.code == "conversation.answer_running"
