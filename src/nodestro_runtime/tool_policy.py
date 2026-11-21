@@ -284,6 +284,19 @@ def system_folders() -> tuple[str, ...]:
     return (*SYSTEM_FOLDERS, *(path for path in found if path))
 
 
+def _system_parts() -> list[tuple[str, ...]]:
+    """The components of every system folder that names a folder on this system. On Windows a POSIX folder
+    (``/bin``) names none (it would be relative to the current drive), so it is left out instead of making every
+    folder unresolvable; on POSIX the Windows folders still compare (fail closed for UNC-like spellings)."""
+    found: list[tuple[str, ...]] = []
+    for path in system_folders():
+        try:
+            found.append(folder_parts(path))
+        except ValueError:
+            continue
+    return found
+
+
 _EFFECTS: dict[tuple[str, str], EffectClass] = {
     ("read", "internal"): "read_internal",
     ("write", "internal"): "write_internal",
@@ -561,9 +574,10 @@ def safety_limit(request: AccessRequest) -> str | None:
     if request.resource.type == "folder":
         try:
             parts = folder_parts(request.resource.id)
-            protected = [folder_parts(path) for path in (*system_folders(), *request.protected_folders)]
+            protected = [folder_parts(path) for path in request.protected_folders]
         except ValueError:
             return "unresolvable_path"
+        protected += _system_parts()
         forms = {parts, _drive_form(parts)}
         if any(_within(form, folder, fold=True) for form in forms for folder in protected):
             return "protected_folder"

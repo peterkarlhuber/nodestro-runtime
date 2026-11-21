@@ -18,6 +18,9 @@
   - Every call is one activity event (N-13): source `file`, actions `folder.listed`, `folder.read`,
     `folder.searched`, resource `folder_grant`. `FolderGrants.accesses` returns a grant's access log.
   - Desktop-to-server imports skip `folder_grants`.
+  - Fix (N-06, found on the Windows runners): on Windows the POSIX system folders (`/bin` ...) made every folder
+    `limit:unresolvable_path`, so no folder access could ever be allowed there. They are now left out on Windows;
+    the Windows system folders, the data folder and an unresolvable request still hold.
   - New codes: `folder.disabled`, `folder.failed`, `folder.invalid_name`, `folder.invalid_pattern`,
     `folder.invalid_query`, `folder.name_taken`, `folder.not_found`, `folder.not_grantable`, `folder.unavailable`,
     `folder.unknown`, and the `fs.*` codes of the guard the tools return.
