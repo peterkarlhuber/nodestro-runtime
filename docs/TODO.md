@@ -107,8 +107,9 @@ None known.
 
 ### RT-083 · Extension tools in the Docker sandbox (N-22)
 
-- **Priority:** P2 Medium · **Status:** Open (Locria plan, phase N-B) · **Refs:** `extensions.py`
-  (`EXTENSION_TOOLS_ENV`, `Extensions.locked`), Locria Phase 0R findings S1 to S3, owner decision E-0R-2 A (2026-11-20)
+- **Priority:** P2 Medium · **Status:** Open (platform plan, phase N-B) · **Refs:** `extensions.py`
+  (`EXTENSION_TOOLS_ENV`, `Extensions.locked`), security review 2026-11 (phase 0R) findings S1 to S3, owner decision
+  E-0R-2 A (2026-11-20)
 - **What:** tools of installed integrations are locked since W0-2 (no host-process fallback); their stated capability
   counts as unknown. Open: the execution path through `DockerSandbox` (JSON over stdin and stdout, no network without a
   grant, the time limit stops the container), showing locked tools in the studio, and the release per tool class only

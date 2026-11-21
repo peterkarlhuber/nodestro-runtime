@@ -20,8 +20,9 @@ Every integration states the contract version it was written for (:data:`CONTRAC
 for another version is refused with a clear message instead of failing later. Nothing here
 starts a service or opens a network connection: an integration is code the runtime calls.
 
-Tools of *installed* integrations are locked (Locria Phase 0R, finding S1; owner decision E-0R-2 A): such code would
-run in the host process, which sees the environment, the unlocked vault and the whole file system, and the time
+Tools of *installed* integrations are locked (security review 2026-11 (phase 0R), finding S1; owner decision
+E-0R-2 A): such code would run in the host process, which sees the environment, the unlocked vault and the whole
+file system, and the time
 limit does not stop it. Foreign code may only run in the Docker sandbox, and that path does not exist yet (N-22), so
 :data:`EXTENSION_TOOLS_ENV` cannot unlock them either: it is the switch N-22 will honour, and today it only changes the
 reason a locked tool reports. The integrations' OCR engines are not affected. Integrations passed explicitly
