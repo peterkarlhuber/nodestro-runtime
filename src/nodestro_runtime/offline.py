@@ -15,15 +15,18 @@ What an offline agent or conversation may not use:
 - **Tools with external reach** (:func:`tool_state`): a built-in tool whose spec is not ``offline``, an integration's
   tool without a spec, an MCP tool of a server that is neither ``stdio`` nor on this computer, and an own or
   generated tool whose capability reaches outside (an unstated capability counts as external; a tool in a sandbox
-  without network is internal). The run's own tools (input files, memory, knowledge search, skills, knowledge
-  proposals) stay: they never leave Nodestro.
+  without network is internal). The run's own tools (input files, run memory, knowledge search, skills) stay.
+- **Shared memory** (:func:`shared_memory`): a persistent memory space is read by every agent of the space, cloud
+  agents too, and a knowledge proposal becomes knowledge any agent searches. An offline agent gets run memory only and
+  no knowledge proposals (``offline.shared_memory``), as an answer in a conversation.
 
 Where it is enforced, at call time (``engine.RunManager``):
 
 - every model connection of a step (agent turns, retries, the quality judge, an orchestrator's decision) goes through
   :func:`check_connection`;
 - every tool call is refused before it runs (``offline.tool_unavailable``), before any approval question;
-- an agent with server tools does not start (``offline.server_tools``).
+- an agent with server tools does not start (``offline.server_tools``), nor one with a persistent memory space or
+  knowledge proposals (``offline.shared_memory``).
 
 An offline conversation makes every run below its answers offline (sub-workflows and team runs too), and the
 conversation's flag is read at every call, so switching it on applies at the next call of a running answer. Run chat
@@ -208,6 +211,27 @@ def server_tools_error(names: list[str], scope: OfflineScope) -> NodestroError:
     )
 
 
+def shared_memory(config: AgentConfig) -> list[str]:
+    """What of ``config`` keeps content beyond its run where other agents (cloud agents too) read it: a persistent
+    memory space (``memory``) and knowledge proposals (``knowledge_proposals``). An offline agent may use neither."""
+    found = []
+    if config.memory.mode == "persistent":
+        found.append("memory")
+    if config.knowledge_proposals.enabled:
+        found.append("knowledge_proposals")
+    return found
+
+
+def shared_memory_error(fields: list[str], scope: OfflineScope) -> NodestroError:
+    return NodestroError(
+        "offline.shared_memory",
+        f"A persistent memory space and knowledge proposals are read by other agents, cloud agents too; this {scope} "
+        "is offline and uses run memory only",
+        fields=", ".join(fields),
+        scope=scope,
+    )
+
+
 def config_issues(config: AgentConfig, library: Any) -> list[dict[str, Any]]:
     """What an offline agent cannot use, as issue fields for :class:`~nodestro_runtime.agent_builder.ConfigIssue`
     (``code``, ``message``, ``level``, ``field``, ``params``); empty while ``config.offline`` is off."""
@@ -238,6 +262,15 @@ def config_issues(config: AgentConfig, library: Any) -> list[dict[str, Any]]:
             level="error",
             field="server_tools",
             names=names,
+            scope="agent",
+        )
+    for field in shared_memory(config):
+        issue(
+            "offline.shared_memory",
+            str(shared_memory_error([field], "agent")),
+            level="error",
+            field=field,
+            fields=field,
             scope="agent",
         )
     for state in tool_states(library, list(config.tools)):

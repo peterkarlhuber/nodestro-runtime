@@ -31,6 +31,11 @@
     conversation; fails closed) and `Workspace.connect_model(..., offline=scope)` for content of a finished run that
     goes to a model outside the run (run chat; the assistant's run attachment and a test series' judge in
     nodestro-api).
+  - Re-review fixes: an offline agent gets run memory only. A persistent memory space or knowledge proposals are an
+    error in its validation and stop the step at run time and in the agent test (new code `offline.shared_memory`,
+    `fields`, `scope`); an offline conversation answer proposes no knowledge. A conversation whose earlier answers
+    are offline content stays on local models after its offline switch is off (`offline.cloud_model`,
+    `Conversations.offline_history`). `content_offline_scope` follows `resumed_from` and a node's `reused_from`.
 
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or

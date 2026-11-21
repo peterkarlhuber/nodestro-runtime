@@ -15,6 +15,7 @@ Module: `nodestro_runtime.offline`.
 | A local model server elsewhere | The server must be on this computer (`offline.is_local_endpoint`, below) | `offline.remote_endpoint` (`scope`) |
 | Server tools | They run at the provider and never pass the tool hook | `offline.server_tools` (`names`, `scope`) |
 | Tools with external reach | See the per-tool state below | `offline.tool_unavailable` (`name`, `reason`) |
+| Shared memory | A persistent memory space (`memory.mode = persistent`) is read by every agent of the space, cloud agents too, and a knowledge proposal becomes knowledge any agent searches. An offline agent gets run memory only and no knowledge proposals, as an answer in a conversation | `offline.shared_memory` (`fields`: `memory`, `knowledge_proposals`; `scope`) |
 
 `scope` is `agent` or `conversation`: which setting refused the call.
 
@@ -36,14 +37,18 @@ host name `ollama` (the Ollama container on Nodestro Local Docker's internal net
 | Own or generated tool | its capability's `reach` is `internal` (stated, or derived from a sandbox without network); an unstated capability counts as external. At call time a derived `internal` is judged again by the sandbox the call really runs in (the workflow's Python environment can be a host subprocess with network) | `external_reach` |
 | A tool that cannot be found | never (fails closed) | `unknown` |
 
-The run's own tools (input files, memory, knowledge search, skills, knowledge proposals) are not library tools of the
-agent and stay available: they never leave Nodestro. The knowledge search embeds its query with the local model server,
-which an offline step only reaches when it is local.
+The run's own tools (input files, run memory, knowledge search, skills) are not library tools of the agent and stay
+available: what they write stays in the run. Memory and knowledge proposals are the exception above: a persistent
+memory space and a knowledge proposal outlive the run and other agents read them, so an offline agent uses neither
+(`offline.shared_memory`). The knowledge search embeds its query with the local model server, which an offline step
+only reaches when it is local.
 
 The agent's validation (`AgentBuilder.validate`, so the pre-check and the agent editor) reports, while `offline` is on:
 
 - `offline.cloud_model` as an error for a cloud model (`field` `model`) or a cloud judge (`field` `quality`);
 - `offline.server_tools` as an error;
+- `offline.shared_memory` as an error for a persistent memory space (`field` `memory`) or knowledge proposals
+  (`field` `knowledge_proposals`);
 - `offline.tool_unavailable` as a **warning** for each tool that is not available offline, with its reason. The agent
   keeps the tool; a call of it is refused at run time and the model reads that the tool is not available offline.
 
@@ -62,6 +67,10 @@ tool or model reached in another way, a retry or a resumed run is refused too:
   the per-call approval gate (S-2) is asked, and also when the gate is off. The call record has
   `approval.status = denied` and `approval.code = offline.tool_unavailable`, and the run's warnings list it.
 - **Server tools**: an offline step with server tools does not start (`offline.server_tools`).
+- **Shared memory**: an offline step with a persistent memory space or knowledge proposals does not start
+  (`offline.shared_memory`), so nothing of it is written where other agents read. This also holds for an agent below
+  an offline conversation (a team or sub-workflow agent); the answer's own agent already has run memory, and an
+  offline answer proposes no knowledge (`answer_agent`).
 
 Which steps are offline (`RunManager.offline_scope`):
 
@@ -79,7 +88,9 @@ and an offline agent template answers with local models only, also in a conversa
 
 Content of a finished run goes to a model outside the run in a few places. Each one asks
 `RunManager.content_offline_scope(run)`: the run answers an offline conversation (`conversation`), or an offline agent
-ran in it, above it or in any run below it (`agent`); a parent or child run that cannot be read counts as offline.
+ran in it, above it or in any run below it (`agent`). A continued run (`resumed_from`) and a node result taken over
+from an earlier run (`reused_from`) hold that run's content, so the earlier run counts the same way. A parent, child
+or earlier run that cannot be read counts as offline.
 Then only a local model on this computer gets the content: `Workspace.connect_model(model, offline=scope)` refuses a
 cloud model before its connection is resolved (`offline.cloud_model`) and a local model server elsewhere
 (`offline.remote_endpoint`).
@@ -87,6 +98,11 @@ cloud model before its connection is resolved (`offline.cloud_model`) and a loca
 - **Run chat** (`run_chat.answer_question`): a question about such a run is answered by local models only, because
   the snapshot holds the step's content.
 - **The assistant's run attachment** and **a test series' AI judge** (nodestro-api) use the same rule.
+- **A conversation's history** (`Conversations.send`): every answer gets the earlier messages as its input
+  (`answer_input`). If an earlier answer is offline content (`Conversations.offline_history`), the conversation stays
+  on local models even after its offline switch is turned off: a cloud model is refused with `offline.cloud_model`
+  before anything is stored or sent, and a local answer is offline again. An answer whose run cannot be read counts
+  as offline.
 - **Agent test** (`AgentTester.run`): the same model, server tool and tool rules as a run.
 - **Strict offline mode**: unchanged. It still refuses cloud models in `Workspace.connection` and checks tools in the
   pre-check and in the approval gate.

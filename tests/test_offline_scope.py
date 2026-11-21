@@ -630,6 +630,38 @@ async def test_an_offline_agent_template_answers_with_local_models_only(make: Ma
     workspace.conversations.update(created.id, None, ConversationChange(title="Renamed"))  # other changes still work
 
 
+async def test_a_conversation_stays_local_after_offline_is_switched_off(make: Make) -> None:
+    """Review: the next answer gets the earlier answers as its history, so offline answers stay on local models."""
+    workspace = make({"AGENT": [text("never")]}, local={"AGENT": ["SECRET-OFFLINE-ANSWER"]})
+    agent = template(workspace, model=LOCAL)
+    created = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=agent), model=LOCAL, offline=True), owner=None
+    )
+    sent = await workspace.conversations.send(created.id, None, MessageIn(content="first"))
+    assert (await workspace.wait(sent.assistant.run_id or "", timeout=20)).status == "succeeded"
+    workspace.conversations.update(created.id, None, ConversationChange(offline=False))
+    workspace.conversations.update(created.id, None, ConversationChange(model=CLOUD))
+    with pytest.raises(NodestroError) as caught:
+        await workspace.conversations.send(created.id, None, MessageIn(content="second"))
+    assert (caught.value.code, caught.value.params["scope"]) == ("offline.cloud_model", "agent")
+    assert systems(workspace) == []  # nothing reached the cloud model
+    # A conversation without offline answers keeps its cloud model.
+    plain = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=agent), model=CLOUD), owner=None
+    )
+    assert workspace.conversations.offline_history(workspace.conversations.messages(plain.id, None)) is None
+
+
+def test_an_offline_answer_proposes_no_knowledge() -> None:
+    from nodestro_runtime.conversations import answer_agent
+    from nodestro_runtime.schemas import KnowledgeProposalConfig, TemplateRef
+
+    config = AgentConfig(knowledge_proposals=KnowledgeProposalConfig(enabled=True))
+    ref = TemplateRef(template_id="tpl_x", version=1)
+    assert answer_agent(config, model=LOCAL, ref=ref).knowledge_proposals.enabled is True
+    assert answer_agent(config, model=LOCAL, ref=ref, offline=True).knowledge_proposals.enabled is False
+
+
 def _child_flow(workspace: Workspace) -> Workflow:
     child = workspace.save_workflow(
         WorkflowIn.model_validate(
@@ -827,6 +859,93 @@ def test_connect_model_for_offline_content(make: Make) -> None:
     with pytest.raises(NodestroError) as caught:
         workspace.connect_model(CLOUD, offline="conversation")
     assert (caught.value.code, caught.value.params["scope"]) == ("offline.cloud_model", "conversation")
+
+
+# ---- shared memory (re-review) -----------------------------------------------------------------------------------
+
+
+async def test_an_offline_agents_memory_never_reaches_a_cloud_agent(make: Make) -> None:
+    """A persistent memory space is read by every agent of the space; an offline agent gets run memory only."""
+    from nodestro_runtime.schemas import MemoryConfig
+
+    note = {"command": "create", "path": "/memories/n.md", "file_text": "SECRET-FROM-OFFLINE"}
+    workspace = make(
+        {"ONLINE": [tool_use("memory", {"command": "view", "path": "/memories/n.md"}), text("ok")]},
+        local={"LOCAL": [("memory", note), "stored"]},
+    )
+    space = MemoryConfig(mode="persistent", space="Team")
+    first = await finished(
+        workspace, flow(("off", AgentConfig(system_prompt="LOCAL", model=LOCAL, memory=space, offline=True)))
+    )
+    assert first.nodes["off"].status == "failed"
+    assert first.nodes["off"].error_code == "offline.shared_memory"
+    assert first.nodes["off"].error_params == {"fields": "memory", "scope": "agent"}
+    assert workspace.local.calls == []  # type: ignore[attr-defined]  # the step never started
+    await finished(workspace, flow(("on", AgentConfig(system_prompt="ONLINE", model=CLOUD, memory=space))))
+    assert "SECRET-FROM-OFFLINE" not in json.dumps(workspace.fake.messages.calls, default=str)  # type: ignore[attr-defined]
+    # Run memory stays.
+    run_memory = AgentConfig(system_prompt="LOCAL", model=LOCAL, memory=MemoryConfig(mode="run"), offline=True)
+    workspace.local.script["LOCAL"] = ["fine"]  # type: ignore[attr-defined]
+    assert (await finished(workspace, flow(("off", run_memory)))).nodes["off"].output == "fine"
+
+
+async def test_an_offline_agent_proposes_no_knowledge(make: Make) -> None:
+    from nodestro_runtime.schemas import KnowledgeProposalConfig
+
+    workspace = make(local={"LOCAL": ["never"]})
+    config = AgentConfig(
+        system_prompt="LOCAL", model=LOCAL, knowledge_proposals=KnowledgeProposalConfig(enabled=True), offline=True
+    )
+    run = await finished(workspace, flow(("off", config)))
+    assert run.nodes["off"].error_code == "offline.shared_memory"
+    assert run.nodes["off"].proposals == []
+    # Also below an offline conversation: a team or sub-workflow agent with a memory space does not start.
+
+
+def test_the_validation_refuses_shared_memory_of_an_offline_agent(make: Make) -> None:
+    from nodestro_runtime.schemas import KnowledgeProposalConfig, MemoryConfig
+
+    workspace = make()
+    config = AgentConfig(
+        model=LOCAL,
+        memory=MemoryConfig(mode="persistent", space="Team"),
+        knowledge_proposals=KnowledgeProposalConfig(enabled=True),
+        offline=True,
+    )
+    found = [(item.code, item.level, item.field) for item in workspace.builder.validate(config)]
+    assert ("offline.shared_memory", "error", "memory") in found
+    assert ("offline.shared_memory", "error", "knowledge_proposals") in found
+    plain = workspace.builder.validate(config.model_copy(update={"offline": False}))
+    assert not [item for item in plain if item.code == "offline.shared_memory"]
+
+
+def test_the_agent_test_refuses_shared_memory_of_an_offline_agent(make: Make) -> None:
+    from nodestro_runtime.schemas import MemoryConfig
+
+    workspace = make(local={"LOCAL": ["never"]})
+    config = AgentConfig(
+        system_prompt="LOCAL", model=LOCAL, memory=MemoryConfig(mode="persistent", space="Team"), offline=True
+    )
+    result, _tracker = workspace.tester.run(AgentTestIn(agent=config, input="go"))
+    assert result.error_code == "offline.shared_memory"
+    assert workspace.local.calls == []  # type: ignore[attr-defined]
+
+
+def test_content_offline_scope_follows_continued_and_reused_runs(make: Make) -> None:
+    from nodestro_runtime.schemas import NodeRun
+
+    workspace = make()
+    plain = Run(workflow_id="w", workflow_name="W", workflow=flow(("a", AgentConfig())))
+    earlier = Run(workflow_id="w", workflow_name="W", workflow=flow(("a", AgentConfig(offline=True))))
+    workspace.store.put("runs", earlier.id, earlier)
+    continued = plain.model_copy(update={"id": "run_continued", "resumed_from": earlier.id})
+    assert workspace.runs.content_offline_scope(continued) == "agent"
+    reused = plain.model_copy(update={"id": "run_reused", "nodes": {"a": NodeRun(node_id="a", reused_from=earlier.id)}})
+    assert workspace.runs.content_offline_scope(reused) == "agent"
+    gone = plain.model_copy(update={"id": "run_gone_earlier", "resumed_from": "run_gone"})
+    assert workspace.runs.content_offline_scope(gone) == "agent"  # fails closed
+    loop = plain.model_copy(update={"id": "run_loop", "resumed_from": "run_loop"})
+    assert workspace.runs.content_offline_scope(loop) is None
 
 
 def test_the_agent_test_of_an_offline_agent(make: Make) -> None:

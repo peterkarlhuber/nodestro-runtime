@@ -259,6 +259,8 @@ class AgentTester:
         try:
             if config.offline and config.server_tools:
                 raise offline.server_tools_error(list(dict.fromkeys(config.server_tools)), "agent")
+            if config.offline and offline.shared_memory(config):
+                raise offline.shared_memory_error(offline.shared_memory(config), "agent")
             built_config, run_memory, isolated = self._memory(config)
             result.memory_isolated = isolated
             outcome = execute_agent(

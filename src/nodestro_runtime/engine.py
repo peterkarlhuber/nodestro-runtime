@@ -1325,16 +1325,22 @@ class RunManager:
             return True
         return any(node.agent is not None and node.agent.offline for item in runs for node in item.workflow.nodes)
 
-    def content_offline_scope(self, run: Run) -> offline.OfflineScope | None:
+    def content_offline_scope(self, run: Run, _seen: set[str] | None = None) -> offline.OfflineScope | None:
         """Whether content of ``run`` may only go to local models (N-09), and why: the conversation its top-level run
         answers in is offline (``conversation``), or an offline agent ran in it, above it or in any run below it
-        (sub-workflows, team runs), whose results its output may hold (``agent``). ``None``: neither. For everything
-        that sends a finished run's content to a model outside the run (run chat, the assistant's run attachment, a
-        test series' judge). Fails closed: a parent or child run that cannot be read counts as offline."""
+        (sub-workflows, team runs), whose results its output may hold (``agent``). A continued run (``resumed_from``)
+        and a node result taken over from an earlier run (``reused_from``) hold that run's content, so the earlier run
+        counts the same way. ``None``: neither. For everything that sends a finished run's content to a model outside
+        the run (run chat, the assistant's run attachment, a test series' judge, a conversation's history). Fails
+        closed: a parent, child or earlier run that cannot be read counts as offline."""
+        seen = _seen if _seen is not None else set()
+        if run.id in seen:
+            return None
+        seen.add(run.id)
         top = run
-        seen: set[str] = set()
-        while top.parent_run_id and top.id not in seen:
-            seen.add(top.id)
+        above: set[str] = set()
+        while top.parent_run_id and top.id not in above:
+            above.add(top.id)
             parent = self.get(top.parent_run_id)
             if parent is None:
                 return "agent"
@@ -1343,10 +1349,15 @@ class RunManager:
             return "conversation"
         if self.run_offline(run):
             return "agent"
+        earlier: list[str] = []
         pending, visited = [run], {run.id}
         while pending:
             current = pending.pop()
+            if current.resumed_from:
+                earlier.append(current.resumed_from)
             for state in current.nodes.values():
+                if state.reused_from:
+                    earlier.append(state.reused_from)
                 for child_id in [*state.child_run_ids, *([state.child_run_id] if state.child_run_id else [])]:
                     if child_id in visited:
                         continue
@@ -1357,6 +1368,15 @@ class RunManager:
                     if any(node.agent is not None and node.agent.offline for node in child.workflow.nodes):
                         return "agent"
                     pending.append(child)
+        for run_id in dict.fromkeys(earlier):
+            if run_id in seen:
+                continue
+            found = self.get(run_id)
+            if found is None:
+                return "agent"
+            scope = self.content_offline_scope(found, seen)
+            if scope is not None:
+                return scope
         return None
 
     def _checked_connect(
@@ -4864,6 +4884,9 @@ class RunManager:
             if scope is not None and config.server_tools:
                 # N-09: server tools run at the provider and never pass the tool hook, so the step does not start.
                 raise offline.server_tools_error(list(dict.fromkeys(config.server_tools)), scope)
+            if scope is not None and offline.shared_memory(config):
+                # N-09: a memory space or a knowledge proposal would hand the step's content to other (cloud) agents.
+                raise offline.shared_memory_error(offline.shared_memory(config), scope)
             interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node_id, config))
             ask = functools.partial(
                 execute_agent,

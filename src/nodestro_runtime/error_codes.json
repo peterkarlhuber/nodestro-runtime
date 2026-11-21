@@ -459,6 +459,7 @@
   "offline.cloud_model": ["model", "scope"],
   "offline.remote_endpoint": ["node_id", "scope"],
   "offline.server_tools": ["names", "scope"],
+  "offline.shared_memory": ["fields", "scope"],
   "offline.tool_unavailable": ["name", "reason"],
   "output.unknown_source": ["fields", "reason"],
   "preview.not_agent": [],

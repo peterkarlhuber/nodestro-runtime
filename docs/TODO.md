@@ -605,6 +605,10 @@ Items that need an independent or external review (an internal audit does not re
     offline check judges it by the sandbox of the call;
   - `local_service._loopback` (hardware detection, not a security check) still treats `127.`-prefixed names as this
     computer;
+  - an offline agent cannot use a persistent memory space at all (fail closed), not even one read by offline agents
+    only; a space flagged offline (readable by offline agents only) would allow it;
+  - a conversation whose earlier answer's run was deleted counts as offline content (fail closed), and the sticky
+    rule has no way to forget offline answers short of a new conversation;
   - the tool catalog (`ToolInfo`) does not carry the offline state yet; it is reported through the agent's
     validation.
 - **Next step:** Decide whether a workflow-wide offline flag is wanted.

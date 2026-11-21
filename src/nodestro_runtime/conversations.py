@@ -51,6 +51,7 @@ from .agent_templates import AgentTemplates
 from .engine import add_usage, as_text
 from .input_files import InputFile
 from .launcher import launch
+from .offline import OfflineScope, cloud_model_error
 from .preflight import agent_models
 from .problems import NodestroError, Problem, problem
 from .providers import check_model, provider_of
@@ -318,7 +319,8 @@ def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef, offline: 
     tenant (``/api/memory``), so an answer that wrote into it would hand the conversation to them. Run memory belongs
     to the answer's run, which only the conversation's owner sees, and goes with it.
 
-    ``offline`` (N-09): the conversation is offline, so the answer's agent is too (the agent's own flag stays on)."""
+    ``offline`` (N-09): the conversation is offline, so the answer's agent is too (the agent's own flag stays on), and
+    an offline answer proposes no knowledge (``offline.shared_memory``: other agents would read it)."""
     quality = config.quality
     if quality.enabled and not is_local(quality.judge_model):
         quality = quality.model_copy(update={"enabled": False})
@@ -334,6 +336,11 @@ def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef, offline: 
             "task_template": "{{input}}",
             "origin": ref,
             "offline": config.offline or offline,
+            "knowledge_proposals": (
+                config.knowledge_proposals.model_copy(update={"enabled": False})
+                if config.offline or offline
+                else config.knowledge_proposals
+            ),
         },
         deep=True,
     )
@@ -747,7 +754,14 @@ class Conversations:
             )
             # N-09: an offline conversation or an offline agent answers with local models only; the answer's agent is
             # offline then, and the engine checks every call of the run again.
+            history = self._history(conversation_id, user.seq)
             offline = conversation.offline or template_agent.offline
+            earlier = None if offline else self.offline_history(history)
+            if earlier is not None:
+                # The history repeats earlier offline answers: they stay on local models after the switch is off.
+                if not is_local(check_model(conversation.model)):
+                    raise cloud_model_error(check_model(conversation.model), earlier)
+                offline = True
             model = self._checked_model(conversation.model, offline=offline)
             agent = answer_agent(template_agent, model=model, ref=ref, offline=offline)
             workflow = answer_workflow(conversation, agent, budget)
@@ -755,7 +769,7 @@ class Conversations:
             run = await launch(
                 self.workspace,
                 workflow,
-                RunIn(input=answer_input(self._history(conversation_id, user.seq), content), file_ids=file_ids),
+                RunIn(input=answer_input(history, content), file_ids=file_ids),
                 trigger="conversation",
                 trigger_ref=conversation.id,
                 started_by=actor,
@@ -851,6 +865,23 @@ class Conversations:
                 stored = self.store.get(MESSAGES, key, ConversationMessage)
                 if stored is not None and stored.id == message.id:
                     self.store.delete(MESSAGES, key)
+
+    def offline_history(self, history: list[ConversationMessage]) -> OfflineScope | None:
+        """Whether an earlier answer of ``history`` is offline content (N-09, ``RunManager.content_offline_scope``),
+        and why: the next answer gets it as its history (:func:`answer_input`), so it stays on local models also after
+        the conversation's offline switch is off (sticky, as the assistant's run attachments). Fails closed: an
+        answer whose run cannot be read counts as offline."""
+        runs = self.workspace.runs
+        for item in history:
+            if item.role == "user" or not item.run_id or item.run_id == RESERVED:
+                continue
+            run = runs.get(item.run_id)
+            if run is None:
+                return "conversation"
+            scope = runs.content_offline_scope(run)
+            if scope is not None:
+                return scope
+        return None
 
     def _history(self, conversation_id: str, before: int) -> list[ConversationMessage]:
         found = self.store.list_prefix(MESSAGES, f"{conversation_id}:", ConversationMessage)
