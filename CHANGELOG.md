@@ -24,6 +24,18 @@
   - Tests: `tests/test_folders.py`, which also runs orkexa's folder grant conformance cases (N-63) through the real
     tools (attack catalog, link swaps, patterns, limits, revocation, expiry, access log), on Linux, macOS and
     Windows.
+- Conversations (N-05): long conversations keep working. The history of an answer is fitted into the model's context
+  window (its window minus the agent's output limit, system prompt and tools) with `orkexa.core.compaction`, at most
+  the newest 30 messages as before. Older messages are replaced by a summary turn that names its range: per
+  conversation `history` `trim` (default, a note) or `summarize` (a helper model, `summary_model` or the
+  conversation's model, in a run of the conversation; never a cloud helper for offline content: an offline
+  conversation or agent, or an offline history, N-09, `connect_model(offline=...)`). A failed summary falls back to trimming. The answer shows it (`ConversationMessage.summary`,
+  `HistorySummary`), and the export writes it. Untrusted data stays framed with its source and never reaches the
+  helper. No new error code. Review fixes: frames a model wrote that are not byte-exact (one line, CRLF, any quoting,
+  unclosed) stay framed (orkexa); a summary's cost counts from its run even when its answer cannot start (L1), and
+  the answer's pre-check runs before the summary; a summary run started after a mid-send delete is deleted too
+  (L2); the extra request and the wait inside send are documented (L3). See
+  [docs/conversations.md](docs/conversations.md#long-conversations-n-05).
 - Offline per agent and per conversation (N-09): `AgentConfig.offline` (default off, left out of stored agents while
   off) and the existing `Conversation.offline` apply the strict offline mode's rules to one agent or to every answer of
   one conversation, checked at every call. See [docs/offline.md](docs/offline.md).
