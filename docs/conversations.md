@@ -38,7 +38,15 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 Only the owner sees a conversation on a server (another owner's id is not found); on the desktop everyone of the
 workspace does, as for the Nodestro Assistant. A conversation stored without an owner (made on a desktop, then restored
 into a server) is seen by nobody on a server: it fails closed and stays orphaned until it is restored on a desktop
-(L-7). A stored document of another tenant is never read. Both collections are
+(L-7). A stored document of another tenant is never read.
+
+Who asks without an owner identity on a multi-user installation passes `NO_OWNER` (W3-S1): a principal without a
+role in the tenant, such as a service, a machine or anything else that is not a member. It sees no conversation, no
+message, no file and no answer run (nor a run below one), and it starts no conversation (`access.person_required`),
+so no conversation is ever shared by everyone without an owner identity. Before, such a principal was passed as `None`
+and saw every conversation of the tenant. Only the desktop's single person (and Nodestro Local Docker's) passes
+`None`; the API decides which owner a request has (nodestro-api `owner_of`, `docs/access.md` there). An administrator
+is a member like any other: the role grants no read of another member's conversation. Both collections are
 documents of the tenant's store: on PostgreSQL they are rows of `nodestro_documents` with `tenant_id`, so no schema
 migration is needed and the tenant SQL check covers every statement (the module has no SQL of its own;
 `tests/test_conversations_postgres.py`).
@@ -91,7 +99,8 @@ of their own (spec 7.1) will close this gap.
 An answer's run holds the conversation (its input), the answer (its output) and the files sent with it. So it belongs
 to the conversation (H-1):
 
-- `Conversations.run_visible(run_id, owner)`: only who sees the conversation sees its runs (also the runs below one).
+- `Conversations.run_visible(run_id, owner)`: only who sees the conversation sees its runs (also the runs below one;
+  `NO_OWNER` sees none).
   `summary_visible(run, owner)` does the same for a run at hand (a run list's summary): a top-level run that is not an
   answer needs no store read, an answer's run one (N-2).
   The API checks it on every route with a run id (runs, export, files, cancel, resume, approvals, tool approvals,

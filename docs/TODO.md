@@ -583,6 +583,8 @@ Items that need an independent or external review (an internal audit does not re
     own close it;
   - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
     deleted by hand.
+  - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
+    run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
 - **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`

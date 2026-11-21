@@ -28,6 +28,7 @@ from nodestro_runtime.conversations import (
     AGENT_NODE,
     COLLECTION,
     MESSAGES,
+    NO_OWNER,
     AgentChoice,
     ConversationChange,
     ConversationIn,
@@ -726,6 +727,71 @@ async def test_l7_a_conversation_without_owner_is_seen_by_nobody_on_a_server(mak
     assert workspace.conversations.summaries("usr_alice") == []
     with pytest.raises(ConversationNotFound):
         workspace.conversations.get(conversation_id, "usr_alice")
+
+
+async def test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation(make: Make) -> None:
+    """W3-S1: a principal without an owner identity on a server (``NO_OWNER``) sees no conversation, no answer run,
+    no run below one and no file, and starts none. Before, it was passed as ``None`` and saw everything."""
+    workspace = make({"AGENT": [text("Noted.")]})
+    template_id = template(workspace)
+    mine = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template_id), model=CLOUD), owner="usr_alice"
+    )
+    added = workspace.conversations.add_file(
+        mine.id, "usr_alice", b"secret notes", name="notes.txt", media_type="text/plain", uploaded_by="usr_alice"
+    )
+    sent = await workspace.conversations.send(mine.id, "usr_alice", MessageIn(content="Keep this", file_ids=[added.id]))
+    run_id = sent.assistant.run_id or ""
+    await workspace.wait(run_id, timeout=20)
+    run = workspace.runs.get(run_id)
+    assert run is not None
+    child = RunSummary(**run.model_dump(include=set(RunSummary.model_fields))).model_copy(
+        update={"id": "run_child", "trigger": "subworkflow", "trigger_ref": run_id, "parent_run_id": run_id}
+    )
+    workspace.store.put("runs", child.id, child)
+
+    assert workspace.conversations.summaries(NO_OWNER) == []
+    for call in (
+        lambda: workspace.conversations.get(mine.id, NO_OWNER),
+        lambda: workspace.conversations.detail(mine.id, NO_OWNER),
+        lambda: workspace.conversations.messages(mine.id, NO_OWNER),
+        lambda: workspace.conversations.file(mine.id, NO_OWNER, added.id),
+        lambda: workspace.conversations.usage(mine.id, NO_OWNER),
+        lambda: workspace.conversations.export_markdown(mine.id, NO_OWNER),
+        lambda: workspace.conversations.run_of(mine.id, NO_OWNER, sent.assistant.id),
+        lambda: workspace.conversations.update(mine.id, NO_OWNER, ConversationChange(title="x")),
+        lambda: workspace.conversations.remove_file(mine.id, NO_OWNER, added.id),
+        lambda: workspace.conversations.cancel(mine.id, NO_OWNER, sent.assistant.id),
+        lambda: workspace.conversations.add_file(
+            mine.id, NO_OWNER, b"x", name="x.txt", media_type="text/plain", uploaded_by="svc"
+        ),
+    ):
+        with pytest.raises(ConversationNotFound):
+            call()
+    with pytest.raises(ConversationNotFound):
+        await workspace.conversations.send(mine.id, NO_OWNER, MessageIn(content="hi"))
+    with pytest.raises(ConversationNotFound):
+        await workspace.conversations.delete(mine.id, NO_OWNER)
+    for run_ref in (run_id, child.id):
+        assert workspace.conversations.run_visible(run_ref, NO_OWNER) is False
+    assert workspace.conversations.summary_visible(run, NO_OWNER) is False
+    assert workspace.conversations.summary_visible(child, NO_OWNER) is False
+    # It starts none either, so no conversation is ever shared by everyone without an owner identity.
+    with pytest.raises(NodestroError) as refused:
+        workspace.conversations.create(
+            ConversationIn(agent=AgentChoice(template_id=template_id), model=CLOUD), owner=NO_OWNER
+        )
+    assert refused.value.code == "access.person_required"
+    # A stored conversation that names it as its owner (a crafted or restored document) is seen by no such request.
+    raw = workspace.store.get_raw(COLLECTION, mine.id)
+    workspace.store.put_raw(COLLECTION, mine.id, {**raw, "owner": NO_OWNER})
+    assert workspace.conversations.summaries(NO_OWNER) == []
+    assert workspace.conversations.run_visible(run_id, NO_OWNER) is False
+    # The desktop's only person (``None``) and the owner are not affected.
+    assert [item.id for item in workspace.conversations.summaries(None)] == [mine.id]
+    workspace.store.put_raw(COLLECTION, mine.id, raw)
+    assert workspace.conversations.run_visible(run_id, "usr_alice") is True
+    assert workspace.conversations.run_visible(child.id, "usr_alice") is True
 
 
 # ---- re-review fixes ---------------------------------------------------------------------------------------------

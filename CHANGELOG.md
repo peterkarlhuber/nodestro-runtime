@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
+  multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
+  answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such
+  a principal as `None` and it saw every conversation. `None` stays the desktop's single person.
 - Conversations with own agents (N-04, Welle 2): the module `nodestro_runtime.conversations` and
   `Workspace.conversations`. The API serves them only while `NODESTRO_CONVERSATIONS=1` (default off). See
   [docs/conversations.md](docs/conversations.md).
