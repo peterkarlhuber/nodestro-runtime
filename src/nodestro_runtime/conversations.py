@@ -309,14 +309,16 @@ def answer_input(history: list[ConversationMessage], content: str) -> str:
     return "\n\n".join(parts)
 
 
-def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
+def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef, offline: bool = False) -> AgentConfig:
     """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback and no
     quality check with a cloud judge (a cloud model is never chosen automatically; the judge model defaults to a
     cloud model), and the message as its task. A quality check with a local judge stays.
 
     Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every member of the workspace or
     tenant (``/api/memory``), so an answer that wrote into it would hand the conversation to them. Run memory belongs
-    to the answer's run, which only the conversation's owner sees, and goes with it."""
+    to the answer's run, which only the conversation's owner sees, and goes with it.
+
+    ``offline`` (N-09): the conversation is offline, so the answer's agent is too (the agent's own flag stays on)."""
     quality = config.quality
     if quality.enabled and not is_local(quality.judge_model):
         quality = quality.model_copy(update={"enabled": False})
@@ -331,6 +333,7 @@ def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentC
             "memory": memory,
             "task_template": "{{input}}",
             "origin": ref,
+            "offline": config.offline or offline,
         },
         deep=True,
     )
@@ -406,6 +409,14 @@ class Conversations:
     def get(self, conversation_id: str, owner: str | None) -> Conversation:
         """The conversation; :class:`ConversationNotFound` for an unknown id and for another owner's."""
         return self._stored(conversation_id, owner)
+
+    def is_offline(self, conversation_id: str) -> bool:
+        """Whether the conversation is offline now (N-09), read by the engine at every call of its answers' runs. An
+        unknown or another tenant's conversation counts as offline (fail closed): its runs are cancelled anyway."""
+        found = self.store.get(COLLECTION, conversation_id, Conversation)
+        if found is None or found.tenant_id != self.workspace.tenant_id:
+            return True
+        return found.offline
 
     def run_visible(self, run_id: str, owner: str | None) -> bool:
         """Whether ``owner`` may see run ``run_id`` through the run routes (H-1). An answer's run (trigger
@@ -526,6 +537,15 @@ class Conversations:
             "chosen automatically",
         )
 
+    def _template_offline(self, conversation: Conversation) -> bool:
+        """Whether the conversation's agent template version is offline (N-09); a template that no longer exists
+        counts as not offline here (an answer refuses it anyway)."""
+        try:
+            choice = AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
+            return self._agent(choice)[1].offline
+        except NodestroError:
+            return False
+
     @staticmethod
     def _checked_model(model: str, *, offline: bool) -> str:
         qualified = check_model(model)
@@ -550,7 +570,8 @@ class Conversations:
             title=request.title.strip(),
             auto_title=not request.title.strip(),
             agent=ref,
-            model=self._checked_model(model, offline=request.offline),
+            # An offline agent (N-09) answers with local models only, also in a conversation that is not offline.
+            model=self._checked_model(model, offline=request.offline or config.offline),
             offline=request.offline,
             budget_usd=request.budget_usd,
         )
@@ -562,7 +583,8 @@ class Conversations:
         made on the stored conversation under its lock, so it never writes back an older ``last_seq`` or file list
         (M-1)."""
         sent = change.model_fields_set
-        agent = self._agent(change.agent)[0] if "agent" in sent and change.agent is not None else None
+        chosen = self._agent(change.agent) if "agent" in sent and change.agent is not None else None
+        agent = chosen[0] if chosen is not None else None
         with self.store.transaction():
             self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
@@ -574,7 +596,8 @@ class Conversations:
             offline = change.offline if "offline" in sent and change.offline is not None else conversation.offline
             updates["offline"] = offline
             model = change.model if "model" in sent and change.model else conversation.model
-            updates["model"] = self._checked_model(model, offline=offline)
+            template_offline = chosen[1].offline if chosen is not None else self._template_offline(conversation)
+            updates["model"] = self._checked_model(model, offline=offline or template_offline)
             if "budget_usd" in sent:
                 updates["budget_usd"] = change.budget_usd
             self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=updates))
@@ -719,12 +742,16 @@ class Conversations:
         file_ids = list(dict.fromkeys(request.file_ids))
         conversation, user, answer, budget = self._reserve(conversation_id, owner, content, file_ids)
         try:
-            model = self._checked_model(conversation.model, offline=conversation.offline)
             ref, template_agent = self._agent(
                 AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
             )
-            workflow = answer_workflow(conversation, answer_agent(template_agent, model=model, ref=ref), budget)
-            check_answer_models(workflow, model=model, offline=conversation.offline)
+            # N-09: an offline conversation or an offline agent answers with local models only; the answer's agent is
+            # offline then, and the engine checks every call of the run again.
+            offline = conversation.offline or template_agent.offline
+            model = self._checked_model(conversation.model, offline=offline)
+            agent = answer_agent(template_agent, model=model, ref=ref, offline=offline)
+            workflow = answer_workflow(conversation, agent, budget)
+            check_answer_models(workflow, model=model, offline=offline)
             run = await launch(
                 self.workspace,
                 workflow,

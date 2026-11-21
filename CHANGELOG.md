@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Offline per agent and per conversation (N-09): `AgentConfig.offline` (default off, left out of stored agents while
+  off) and the existing `Conversation.offline` apply the strict offline mode's rules to one agent or to every answer of
+  one conversation, checked at every call. See [docs/offline.md](docs/offline.md).
+  - New module `nodestro_runtime.offline`: the per-tool state (`tool_state`: available offline, or why not:
+    `network`, `remote_mcp`, `external_reach`, `unknown`), the connection check and the agent's issues.
+  - Engine: every model connection of an offline step is local only (`offline.cloud_model`, `offline.remote_endpoint`),
+    also the quality judge and orchestrator decisions; every call of a library tool that is not available offline is
+    refused before the approval gate (`offline.tool_unavailable`, also with approvals off); an offline step with
+    server tools does not start (`offline.server_tools`). An offline conversation is read at every call and covers the
+    runs below its answers (sub-workflows, team runs).
+  - Validation: a cloud model or judge and server tools of an offline agent are errors; each tool that is not
+    available offline is a warning with its reason. The pre-check reports a local model server that is not local.
+  - Conversations: an offline agent template answers with local models only; the answer's agent of an offline
+    conversation is offline (`answer_agent(..., offline=...)`); `Conversations.is_offline`.
+  - Run chat about a run with an offline agent or conversation uses local models only; the agent test applies the
+    same rules.
+  - `preflight.is_local_endpoint` moved to `offline.is_local_endpoint` (still importable from `preflight`).
+  - New codes: `offline.cloud_model`, `offline.remote_endpoint`, `offline.server_tools`, `offline.tool_unavailable`.
+
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
   answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such

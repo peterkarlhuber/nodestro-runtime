@@ -579,6 +579,8 @@ class Workspace:
         #: Conversations with own agents (N-04): each answer is a run of this manager; the API serves them only while
         #: ``NODESTRO_CONVERSATIONS=1``.
         self.conversations = Conversations(self)
+        # N-09: the answers' runs read their conversation's offline flag at every call.
+        self.runs.conversation_offline = self.conversations.is_offline
         self.runs.after_run = self.files.write_outputs
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None

@@ -26,7 +26,7 @@ from orkexa import Denial, EphemeralMemory, MaxToolCallsError, MaxToolRoundsErro
 from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
-from . import tool_policy
+from . import offline, tool_policy
 from .agent_builder import AgentBuilder, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode, request_regions
 from .engine import access_error, execute_agent, is_person, node_problem, render_task, tool_rounds_problem, usage_of
@@ -208,6 +208,12 @@ class AgentTester:
             with lock:
                 calls[call.id] = record
                 result.tool_calls.append(record)
+            if config.offline and call.name in config.tools:
+                # N-09: an offline agent never calls a tool that is not available offline, as in a run.
+                state = offline.tool_state(self.builder.tools, call.name)
+                if not state.available:
+                    record.approval = ToolCallApproval(status="denied", code="offline.tool_unavailable")
+                    return Denial(model_text=f"Tool call denied: {state.text}", code="offline.tool_unavailable")
             denial = self._gate(gate, config, call, record, result.id)
             return None if denial is None else Denial(model_text=f"Tool call denied: {denial}")
 
@@ -239,7 +245,17 @@ class AgentTester:
                         raise access_error(found, resource, show_source=is_person(actor))
                 return self.connect(provider)
 
+        if config.offline:
+            # N-09: an offline agent gets local connections only, also in its test.
+            access_connect = connect
+
+            def connect(provider: str) -> Connection:
+                offline.check_provider(provider, "agent")
+                return offline.check_connection(access_connect(provider), "agent")
+
         try:
+            if config.offline and config.server_tools:
+                raise offline.server_tools_error(list(dict.fromkeys(config.server_tools)), "agent")
             built_config, run_memory, isolated = self._memory(config)
             result.memory_isolated = isolated
             outcome = execute_agent(
