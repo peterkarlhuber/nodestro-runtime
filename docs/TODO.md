@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 34 |
+| P3 Low | 35 |
 | P4 Optional | 14 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -593,6 +593,18 @@ Items that need an independent or external review (an internal audit does not re
   stdio limit stopped it. It did not reproduce. The test was not changed.
 - **Next step:** If it fails again, look at the order of the timeout and the output limit under a slow runner, and
   decide whether `mcp.timeout` is an acceptable stable code for a flooding server.
+
+### RT-091 · Flaky: builtin-sandbox probe `compat desktop-workspace` fails its cleanup
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** `sandbox_probes.py` (`_workspace_check`), `python_envs.py`
+  (`UvRunner`, the uv cache `<data>/python/cache`), CI job `builtin-sandbox`
+- **What:** The probe passes its checks, then deleting its temporary workspace fails with
+  `OSError: [Errno 39] Directory not empty: '/tmp/nodestro-workspace-…/data/python/cache'`: something still writes
+  into the workspace's uv cache while `TemporaryDirectory` removes it. Seen on master 65114cf (2026-11-14, CI run
+  43572392555) and on runtime #205 (82c1976, 2026-11-21, CI run 44840617186); both passed on a rerun. The writer is
+  not identified yet. No code was changed.
+- **Next step:** Find the process that writes the cache after the workspace is closed (a uv subprocess or a
+  background thread), and make `Workspace.close()` wait for it, or let the probe's cleanup tolerate it.
 
 ### RT-084 · Activity log: API endpoints, server retention and remaining sources (N-13)
 
