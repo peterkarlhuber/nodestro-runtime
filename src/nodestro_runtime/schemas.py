@@ -1198,6 +1198,10 @@ class Run(_Model):
     workflow: Workflow
     input: str = ""
     file_ids: list[str] = Field(default_factory=list)
+    #: Files the agents fed by the start get as an overview only, to read on demand with the files tool (never in
+    #: full): the earlier files of a conversation for its next answer (RT-089). Set only by the runtime, never by a
+    #: request.
+    reference_file_ids: list[str] = Field(default_factory=list)
     #: The values of the input form as entered (validated, typed).
     values: dict[str, Any] = Field(default_factory=dict)
     #: With a form: the free text entered next to it (``input`` combines both).

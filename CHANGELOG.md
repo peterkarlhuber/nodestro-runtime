@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Conversations (RT-089 follow-ups; still behind `NODESTRO_CONVERSATIONS` in the API, off by default):
+  - An answer's run that is still going when its conversation is deleted (after the delete's wait of 10 seconds) is
+    deleted once it stops (`Conversations.run_stopped`, a listener of the run manager; also on the reaper's
+    interrupt). Before, it stayed, hidden from everyone, until it was deleted by hand. The desktop's start deletes
+    the ones left when Nodestro stopped (`Conversations.sweep_orphan_runs`).
+  - The files sent with earlier messages of a conversation that are still in it are offered to the next answers
+    (newest first, at most `EARLIER_FILES` = 20): an overview read on demand with the files tool, never the whole
+    file again. New `Run.reference_file_ids` (set only by the runtime: `launch(..., reference_file_ids=...)`,
+    `RunManager.start`), `file_delivery.collect(..., on_demand=...)`. A file uploaded but never sent, a removed file
+    and another person's files are never offered; only the conversation's owner sees the run (H-1).
+  - A memory space of its own per conversation stays open (decision in `docs/TODO.md` RT-089): answers keep run
+    memory.
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
   answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such

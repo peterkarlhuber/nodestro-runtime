@@ -1148,8 +1148,12 @@ class RunManager:
         release_number: int | None = None,
         api_key_id: str | None = None,
         started_by: str | None = None,
+        reference_file_ids: list[str] | None = None,
     ) -> Run:
         """Start a new run; ``preset`` node states are taken over and never executed again.
+
+        ``reference_file_ids`` are files its first agents get as an overview only and read on demand
+        (:attr:`~nodestro_runtime.schemas.Run.reference_file_ids`); only the runtime passes them, never a request.
 
         ``started_by`` names the principal that started it (BUDGET-1: who may raise its budget besides
         administrators).
@@ -1170,6 +1174,7 @@ class RunManager:
                 release_number=release_number,
                 api_key_id=api_key_id,
                 started_by=started_by,
+                reference_file_ids=reference_file_ids,
             )
         )
         if elsewhere is not None:
@@ -1198,6 +1203,9 @@ class RunManager:
             values=prepared.values,
             text_input=request.input if prepared.values else None,
             file_ids=prepared.file_ids,
+            reference_file_ids=[
+                item for item in dict.fromkeys(reference_file_ids or []) if item not in prepared.file_ids
+            ],
             nodes={node.id: NodeRun(status="waiting") for node in workflow.nodes},
             trigger=trigger,
             trigger_ref=trigger_ref,
@@ -4716,10 +4724,15 @@ class RunManager:
 
         extra: list[ContentBlock] = []
         extra_tools: list[Tool] = []
-        if with_run_files and context.run.file_ids:
+        if with_run_files and (context.run.file_ids or context.run.reference_file_ids):
             run = context.run
             files = collect(
-                run.file_ids, start_fields(run.workflow), run.values, self.inputs, context.env.builder.knowledge
+                [*run.file_ids, *run.reference_file_ids],
+                start_fields(run.workflow),
+                run.values,
+                self.inputs,
+                context.env.builder.knowledge,
+                on_demand=frozenset(run.reference_file_ids) - set(run.file_ids),
             )
             capabilities = context.env.builder.capabilities(config.model)
             delivery = deliver(files, capabilities, self.inputs, context.env.builder.knowledge)

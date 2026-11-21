@@ -96,8 +96,11 @@ def collect(
     values: dict[str, object],
     inputs: InputFiles | None,
     knowledge: KnowledgeBase,
+    *,
+    on_demand: frozenset[str] = frozenset(),
 ) -> list[RunFile]:
-    """The run's files with what is known about them (unknown ids are left out)."""
+    """The run's files with what is known about them (unknown ids are left out). The uploads in ``on_demand`` are
+    given as an overview to read with the files tool, whatever their field says (a run's reference files)."""
     field_of: dict[str, InputField] = {}
     for item in fields:
         value = values.get(item.name)
@@ -123,7 +126,7 @@ def collect(
                     info=dict(stored.info),
                     notes=list(stored.notes),
                     outline=stored.outline,
-                    delivery=origin.delivery if origin is not None else "auto",
+                    delivery="on_demand" if file_id in on_demand else origin.delivery if origin is not None else "auto",
                     field=origin.name if origin is not None else None,
                     media_type=stored.media_type,
                 )

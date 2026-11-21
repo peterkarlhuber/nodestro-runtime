@@ -61,6 +61,7 @@ async def launch(
     resumed_from: str | None = None,
     preset: dict[str, NodeRun] | None = None,
     started_by: str | None = None,
+    reference_file_ids: list[str] | None = None,
 ) -> Run:
     # The pre-check may ask a local model server about its models (blocking requests, up to the client's timeout
     # each): never on the event loop, which serves every other request meanwhile (RT3-04).
@@ -84,6 +85,7 @@ async def launch(
         resumed_from=resumed_from,
         preset=preset,
         started_by=started_by,
+        reference_file_ids=reference_file_ids,
     )
 
 

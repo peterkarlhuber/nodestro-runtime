@@ -576,18 +576,29 @@ Items that need an independent or external review (an internal audit does not re
   [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
 - **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
   - the history goes to the model as text in the run's input; N-05 compacts long conversations;
-  - earlier files of a conversation are not offered to later answers (only the files sent with a message);
   - only agent templates answer, not agent nodes of a workflow;
   - the provenance field is a placeholder until N-08, the offline flag only refuses cloud models until N-09;
   - workflow- and agent-scoped grants and denies do not reach conversations (L-1, documented); agent ids of their
     own close it;
-  - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
-    deleted by hand.
-  - an answer has run memory only (W3-S1 review): a memory of one's own per conversation (a space only its owner
-    reaches) is open;
+  - a memory of one's own per conversation (a space only its owner reaches): **decided to stay open** (W3,
+    2026-11-21). Answers keep run memory (W3-S1 review). A space of one's own needs memory spaces with an owner,
+    which they do not have: every member lists, reads, searches and edits every space (`/api/memory`, the memory
+    browser, the assistant's attachments, knowledge adoption, backups and the access audit), so each of those paths
+    would need the owner check that conversations have, plus its own deletion with the conversation. That is a
+    change of the memory model, not of conversations, and a wrong path would hand the conversation to every member.
+    The history (N-05 compacts it) and the earlier files (below) carry what an answer needs meanwhile. Revisit with
+    owned memory spaces;
   - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
     run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
-- **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
+  - Done (W3, 2026-11-21): a run still going after its conversation was deleted is deleted once it stops
+    (`Conversations.run_stopped`, `sweep_orphan_runs`;
+    `test_rt089_a_run_still_going_after_its_conversation_was_deleted_is_deleted_once_it_stops`,
+    `test_rt089_the_start_deletes_the_runs_left_by_deleted_conversations`).
+  - Done (W3, 2026-11-21): earlier files of a conversation are offered to later answers as reference files (overview,
+    read on demand), of its owner only (`Run.reference_file_ids`,
+    `test_rt089_earlier_files_are_offered_to_later_answers_of_their_owner_only`).
+- **Next step:** The studio UI for conversations (nodestro-studio, branch `claude/w3-conv-ui`); N-05, N-08 and N-09
+  build on it.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 

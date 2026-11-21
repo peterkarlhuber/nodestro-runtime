@@ -62,8 +62,9 @@ Every answer is one run of the engine (`RunManager`), never a second agent loop:
 - The agent is the template's version with the conversation's model, its task template replaced by `{{input}}`, and
   without cloud fallbacks. Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every
   member (`/api/memory`), so an answer never writes the conversation into one; run memory belongs to the answer's
-  run, which only the conversation's owner sees, and goes with it. A memory of one's own per conversation is later
-  work (RT-089).
+  run, which only the conversation's owner sees, and goes with it. A memory of one's own per conversation is not
+  planned for now (RT-089, the decision is there): the conversation's history and its earlier files carry what an
+  answer needs to know.
 - The run's input is the earlier messages (the newest 30 user messages and finished answers) followed by the new
   message. N-05 compacts long conversations.
 - The run's usage is the answer's usage; the conversation's cost is the sum of its runs (failed and cancelled ones
@@ -114,8 +115,11 @@ to the conversation (H-1):
   cannot be reached (a parent is missing, or the parents form a loop): whose it is cannot be told, so it fails
   closed (review Low 1).
 - Deleting a conversation deletes its answers' runs with their result files, tool checkpoints, live chat and the
-  input files only they used, after cancelling a running one (it waits up to 10 seconds for it to stop; a run still
-  going then stays, hidden). The usage ledger keeps the cost.
+  input files only they used, after cancelling a running one (it waits up to 10 seconds for it to stop). A run still
+  going then is hidden from everyone and deleted as soon as it stops (`Conversations.run_stopped`, a listener of the
+  run manager, which the reaper's interrupt of a run whose worker died calls too); runs left when the desktop app
+  stopped are deleted at its next start (`sweep_orphan_runs`). Only a run whose conversation document is gone is
+  deleted. The usage ledger keeps the cost.
 - The run's workflow is named `Conversation`, never the conversation's title, because the run list and the usage
   report show the name to every member.
 - Aggregates still count the answers' runs (N-3, by design): the usage report (by workflow, keyed by the conversation
@@ -142,6 +146,14 @@ Files are input files of origin `conversation`. They stay until they are removed
 conversation is deleted (the input file clean-up keeps them). A message sends some of them; they go to the answer's run
 as run files, so the run's file delivery decides how the model gets them. An image goes as an image only to a model
 with image input; otherwise it is marked `unavailable` and the model only learns that it exists.
+
+Earlier files (RT-089): the files sent with earlier messages that are still in the conversation (newest first, at
+most `EARLIER_FILES`, 20) go to each later answer as reference files (`Run.reference_file_ids`): the model gets their
+overview and reads what it needs with the `input_files` tool, never the whole file again, so they cost little
+context. A file uploaded but never sent is not offered (the person has not sent it yet), a removed file is deleted,
+and only files of this conversation are offered, so of its owner: the conversation and the answer's run are seen by
+nobody else (H-1), and another member's conversation never names them (`conversation.not_found` for a file id of
+another conversation). `Run.reference_file_ids` is set only by the runtime (`launch`), never by a request.
 
 ## Export
 
