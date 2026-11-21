@@ -68,8 +68,8 @@ def grants(workspace: Workspace) -> FolderGrants:
 def docs(base: Path) -> Path:
     root = base / "docs"
     (root / "notes").mkdir(parents=True)
-    (root / "notes" / "plan.txt").write_text("The budget is 42 units\n", encoding="utf-8")
-    (root / "readme.md").write_text("Overview\n", encoding="utf-8")
+    (root / "notes" / "plan.txt").write_text("The budget is 42 units\n", encoding="utf-8", newline="\n")
+    (root / "readme.md").write_text("Overview\n", encoding="utf-8", newline="\n")
     return root
 
 
