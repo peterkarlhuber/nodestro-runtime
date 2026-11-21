@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 from .mcp_access import UNATTENDED_TRIGGERS
+from .offline import OfflineScope, check_connection, check_provider
 from .problems import NodestroError
 from .providers import provider_of
 from .reasoning import ReasoningTrace, trace_hook
@@ -988,8 +989,14 @@ def answer_question(
             # The answer's effort only where the model takes one (RT-004): GPT-4o, most compatible and vLLM servers
             # would refuse it.
             # N-06: the snapshot holds the run's content; a blocked cloud model never gets it.
+            # N-09: the snapshot of a run of an offline agent or conversation stays on local models.
+            scope = _offline_scope(manager, root, target_run)
+            if scope is not None:
+                check_provider(provider_of(model), scope)
             manager.check_cloud_access(provider_of(model), run_id=question.run_id, actor=question.author)
             connection = manager.connect(provider_of(model))
+            if scope is not None:
+                check_connection(connection, scope, docker=manager.builder.mode == "local-container")
             agent = AgentConfig(
                 name="Run chat",
                 model=model,
@@ -1039,6 +1046,13 @@ def answer_question(
                 )
             except Exception:  # the answer stays; the ledger misses it
                 logger.exception("Recording the usage of a live chat answer of run %s failed", question.run_id)
+
+
+def _offline_scope(manager: Any, root: Run, target: Run) -> OfflineScope | None:
+    """Why run chat about ``target`` (below ``root``) must stay offline (N-09), or ``None``: the snapshot holds the
+    results of the orchestrator's teams, so an offline agent anywhere in the run (or above it) counts."""
+    found: OfflineScope | None = manager.content_offline_scope(root) or manager.content_offline_scope(target)
+    return found
 
 
 def _usage(tracker: Any, usage_of: Any) -> Usage | None:

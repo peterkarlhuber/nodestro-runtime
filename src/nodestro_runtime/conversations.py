@@ -72,6 +72,7 @@ from .agent_templates import AgentTemplates
 from .engine import add_usage, as_text
 from .input_files import InputFile
 from .launcher import launch
+from .offline import OfflineScope, cloud_model_error
 from .preflight import agent_models
 from .problems import NodestroError, Problem, problem
 from .providers import check_model, provider_of
@@ -410,8 +411,11 @@ def history_budget(context_window: int | None, max_output: int | None, config: A
     return context_budget(context_window, output_reserve=reserve, reserved=reserved)
 
 
-def summary_workflow(conversation: Conversation, model: str, max_tokens: int, budget: float | None) -> Workflow:
-    """The run that summarizes earlier messages (N-05): the start step and a helper agent without tools."""
+def summary_workflow(
+    conversation: Conversation, model: str, max_tokens: int, budget: float | None, *, offline: bool = False
+) -> Workflow:
+    """The run that summarizes earlier messages (N-05): the start step and a helper agent without tools; ``offline``
+    (N-09): the helper agent is offline, so the engine allows it local models only at every call."""
     helper = AgentConfig(
         name="Summary",
         model=model,
@@ -419,6 +423,7 @@ def summary_workflow(conversation: Conversation, model: str, max_tokens: int, bu
         max_tokens=max(1024, max_tokens * 2),  # room for a reasoning model; the text is cut to ``max_tokens``
         max_tool_rounds=0,
         effort=None,
+        offline=offline,
     )
     return Workflow(
         id=conversation.id,
@@ -433,14 +438,17 @@ def summary_workflow(conversation: Conversation, model: str, max_tokens: int, bu
     )
 
 
-def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
+def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef, offline: bool = False) -> AgentConfig:
     """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback and no
     quality check with a cloud judge (a cloud model is never chosen automatically; the judge model defaults to a
     cloud model), and the message as its task. A quality check with a local judge stays.
 
     Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every member of the workspace or
     tenant (``/api/memory``), so an answer that wrote into it would hand the conversation to them. Run memory belongs
-    to the answer's run, which only the conversation's owner sees, and goes with it."""
+    to the answer's run, which only the conversation's owner sees, and goes with it.
+
+    ``offline`` (N-09): the conversation is offline, so the answer's agent is too (the agent's own flag stays on), and
+    an offline answer proposes no knowledge (``offline.shared_memory``: other agents would read it)."""
     quality = config.quality
     if quality.enabled and not is_local(quality.judge_model):
         quality = quality.model_copy(update={"enabled": False})
@@ -455,6 +463,12 @@ def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentC
             "memory": memory,
             "task_template": "{{input}}",
             "origin": ref,
+            "offline": config.offline or offline,
+            "knowledge_proposals": (
+                config.knowledge_proposals.model_copy(update={"enabled": False})
+                if config.offline or offline
+                else config.knowledge_proposals
+            ),
         },
         deep=True,
     )
@@ -530,6 +544,14 @@ class Conversations:
     def get(self, conversation_id: str, owner: str | None) -> Conversation:
         """The conversation; :class:`ConversationNotFound` for an unknown id and for another owner's."""
         return self._stored(conversation_id, owner)
+
+    def is_offline(self, conversation_id: str) -> bool:
+        """Whether the conversation is offline now (N-09), read by the engine at every call of its answers' runs. An
+        unknown or another tenant's conversation counts as offline (fail closed): its runs are cancelled anyway."""
+        found = self.store.get(COLLECTION, conversation_id, Conversation)
+        if found is None or found.tenant_id != self.workspace.tenant_id:
+            return True
+        return found.offline
 
     def run_visible(self, run_id: str, owner: str | None) -> bool:
         """Whether ``owner`` may see run ``run_id`` through the run routes (H-1). An answer's run (trigger
@@ -652,6 +674,15 @@ class Conversations:
             "chosen automatically",
         )
 
+    def _template_offline(self, conversation: Conversation) -> bool:
+        """Whether the conversation's agent template version is offline (N-09); a template that no longer exists
+        counts as not offline here (an answer refuses it anyway)."""
+        try:
+            choice = AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
+            return self._agent(choice)[1].offline
+        except NodestroError:
+            return False
+
     @staticmethod
     def _checked_model(model: str, *, offline: bool) -> str:
         qualified = check_model(model)
@@ -676,11 +707,12 @@ class Conversations:
             title=request.title.strip(),
             auto_title=not request.title.strip(),
             agent=ref,
-            model=self._checked_model(model, offline=request.offline),
+            # An offline agent (N-09) answers with local models only, also in a conversation that is not offline.
+            model=self._checked_model(model, offline=request.offline or config.offline),
             offline=request.offline,
             budget_usd=request.budget_usd,
             history=request.history,
-            summary_model=self._checked_model(request.summary_model, offline=request.offline)
+            summary_model=self._checked_model(request.summary_model, offline=request.offline or config.offline)
             if request.summary_model
             else None,
         )
@@ -692,7 +724,8 @@ class Conversations:
         made on the stored conversation under its lock, so it never writes back an older ``last_seq`` or file list
         (M-1)."""
         sent = change.model_fields_set
-        agent = self._agent(change.agent)[0] if "agent" in sent and change.agent is not None else None
+        chosen = self._agent(change.agent) if "agent" in sent and change.agent is not None else None
+        agent = chosen[0] if chosen is not None else None
         with self.store.transaction():
             self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
@@ -704,13 +737,16 @@ class Conversations:
             offline = change.offline if "offline" in sent and change.offline is not None else conversation.offline
             updates["offline"] = offline
             model = change.model if "model" in sent and change.model else conversation.model
-            updates["model"] = self._checked_model(model, offline=offline)
+            template_offline = chosen[1].offline if chosen is not None else self._template_offline(conversation)
+            updates["model"] = self._checked_model(model, offline=offline or template_offline)
             if "budget_usd" in sent:
                 updates["budget_usd"] = change.budget_usd
             if "history" in sent and change.history is not None:
                 updates["history"] = change.history
             helper = change.summary_model if "summary_model" in sent else conversation.summary_model
-            updates["summary_model"] = self._checked_model(helper, offline=offline) if helper else None
+            updates["summary_model"] = (
+                self._checked_model(helper, offline=offline or template_offline) if helper else None
+            )
             self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=updates))
         return self.detail(conversation_id, owner)
 
@@ -853,21 +889,36 @@ class Conversations:
         file_ids = list(dict.fromkeys(request.file_ids))
         conversation, user, answer, budget = self._reserve(conversation_id, owner, content, file_ids)
         try:
-            model = self._checked_model(conversation.model, offline=conversation.offline)
             ref, template_agent = self._agent(
                 AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
             )
-            agent = answer_agent(template_agent, model=model, ref=ref)
-            check_answer_models(answer_workflow(conversation, agent, budget), model=model, offline=conversation.offline)
-            # N-05: the history fitted into the model's context window, perhaps summarized in a run of its own.
+            # N-09: an offline conversation or an offline agent answers with local models only; the answer's agent is
+            # offline then, and the engine checks every call of the run again.
+            history = self._history(conversation_id, user.seq)
+            scope: OfflineScope | None = (
+                "conversation" if conversation.offline else "agent" if template_agent.offline else None
+            )
+            offline = scope is not None
+            earlier = None if offline else self.offline_history(history)
+            if earlier is not None:
+                # The history repeats earlier offline answers: they stay on local models after the switch is off.
+                if not is_local(check_model(conversation.model)):
+                    raise cloud_model_error(check_model(conversation.model), earlier)
+                offline = True
+                scope = earlier
+            model = self._checked_model(conversation.model, offline=offline)
+            agent = answer_agent(template_agent, model=model, ref=ref, offline=offline)
+            check_answer_models(answer_workflow(conversation, agent, budget), model=model, offline=offline)
+            # N-05: the history fitted into the model's context window, perhaps summarized in a run of its own. The
+            # helper obeys the same offline rules (the conversation, its agent and its offline history).
             text, summary = await self.history_input(
                 conversation,
-                self._history(conversation_id, user.seq),
+                history,
                 Turn(role="user", text=content, ref=user.seq),
                 agent=agent,
                 budget=budget,
                 actor=actor,
-                offline=conversation.offline or bool(getattr(template_agent, "offline", False)),
+                offline=scope,
             )
             if summary is not None and summary.usage is not None and budget is not None:
                 budget = max(0.0, budget - (summary.usage.estimated_cost_usd or 0.0))
@@ -912,16 +963,19 @@ class Conversations:
         agent: AgentConfig,
         budget: float | None,
         actor: str,
-        offline: bool,
+        offline: OfflineScope | None,
     ) -> tuple[str, HistorySummary | None]:
         """The answer's input (N-05): ``history`` and the ``new`` message fitted into the context window of the
         answer's model (:func:`history_budget`; an unknown window keeps the newest :data:`HISTORY_MESSAGES`), and
         what replaced the older messages (``None`` when everything fits).
 
         With ``history`` ``summarize`` a helper model summarizes them in a run of its own
-        (:meth:`_summarize`): the conversation's ``summary_model``, else its model. ``offline`` (the conversation or
-        its agent; N-09 adds an offline history) allows only a local helper; a cloud helper is refused before the
-        run (``conversation.offline_cloud_model``) and the history is trimmed instead, as for any failed summary."""
+        (:meth:`_summarize`): the conversation's ``summary_model``, else its model. Offline content (N-09: ``offline``,
+        the scope the answer runs under, else the conversation's flag or an offline answer in ``history``,
+        :meth:`offline_history`) allows only a local helper on this computer: a cloud helper is refused before
+        anything is sent (``offline.cloud_model``), and the history is trimmed instead, as for any failed summary."""
+        if offline is None:
+            offline = "conversation" if conversation.offline else self.offline_history(history)
         limits = self.workspace.builder.limits(agent.model)
         tokens = history_budget(limits.context_window, output_limits.model_ceiling(limits)[0], agent)
         summarizing = conversation.history == "summarize"
@@ -960,7 +1014,7 @@ class Conversations:
             run_id=found.get("run_id"),
             usage=found.get("usage"),
             sources=list(result.sources),
-            error=found.get("error") or ("conversation.summary_failed" if result.error else None),
+            error=found.get("error") or ("run.failed" if result.error else None),
         )
         return render_input(result.turns), summary
 
@@ -973,15 +1027,20 @@ class Conversations:
         model: str,
         budget: float | None,
         actor: str,
-        offline: bool,
+        offline: OfflineScope | None,
         into: dict[str, Any],
     ) -> str:
         """One summary of earlier messages by ``model``, as a run of the conversation (trigger ``conversation``): its
-        cost counts for the conversation, and the engine applies the conversation's grants and model rules. Records
-        the run, its usage and a refusal's code in ``into``; raises when there is no summary."""
+        cost counts for the conversation, and the engine applies the conversation's grants and model rules. With
+        offline content (``offline``, N-09) the helper must be a local model on this computer
+        (:meth:`~nodestro_runtime.workspace.Workspace.connect_model` refuses anything else with
+        ``offline.cloud_model`` before the run starts), and its agent is offline, so the engine checks every call
+        again. Records the run, its usage and a refusal's code in ``into``; raises when there is no summary."""
         try:
-            workflow = summary_workflow(conversation, check_model(model), max_tokens, budget)
-            check_answer_models(workflow, model=check_model(model), offline=offline)
+            helper = check_model(model)
+            await asyncio.to_thread(self.workspace.connect_model, helper, actor=actor, offline=offline)
+            workflow = summary_workflow(conversation, helper, max_tokens, budget, offline=offline is not None)
+            check_answer_models(workflow, model=helper, offline=offline is not None)
             run = await launch(
                 self.workspace,
                 workflow,
@@ -998,7 +1057,7 @@ class Conversations:
             done = await self.workspace.wait(run.id, timeout=SUMMARY_TIMEOUT_SECONDS)
         except TimeoutError:
             self.workspace.cancel(run.id)
-            into["error"] = "conversation.summary_timeout"
+            into["error"] = "run.cancelled"
             raise
         into["usage"] = done.usage
         state = done.nodes.get(SUMMARY_NODE)
@@ -1076,6 +1135,23 @@ class Conversations:
                 stored = self.store.get(MESSAGES, key, ConversationMessage)
                 if stored is not None and stored.id == message.id:
                     self.store.delete(MESSAGES, key)
+
+    def offline_history(self, history: list[ConversationMessage]) -> OfflineScope | None:
+        """Whether an earlier answer of ``history`` is offline content (N-09, ``RunManager.content_offline_scope``),
+        and why: the next answer gets it as its history (:func:`answer_input`), so it stays on local models also after
+        the conversation's offline switch is off (sticky, as the assistant's run attachments). Fails closed: an
+        answer whose run cannot be read counts as offline."""
+        runs = self.workspace.runs
+        for item in history:
+            if item.role == "user" or not item.run_id or item.run_id == RESERVED:
+                continue
+            run = runs.get(item.run_id)
+            if run is None:
+                return "conversation"
+            scope = runs.content_offline_scope(run)
+            if scope is not None:
+                return scope
+        return None
 
     def _history(self, conversation_id: str, before: int) -> list[ConversationMessage]:
         found = self.store.list_prefix(MESSAGES, f"{conversation_id}:", ConversationMessage)

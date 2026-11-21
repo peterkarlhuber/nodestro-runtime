@@ -323,3 +323,5 @@ request while the mode is on (checked each round). The managed server is not res
 it keeps the proxy variables it started with until Nodestro restarts. Local models have no external API billing: Orkexa prices them at zero
 with source `local`, and usage counts them in `Usage.local_requests`. Local operating costs (hardware, energy) are
 not recorded, so an interface shows "local, no API billing" instead of a total of 0.
+
+The same rules for one agent or one conversation, checked at every call: [offline.md](offline.md) (N-09).

@@ -96,6 +96,8 @@ SERVER_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
 
 #: Sandboxes without any network (ADR-0006): a container, or the built-in Linux sandbox (seccomp, no sockets).
 _NO_NETWORK: frozenset[Isolation] = frozenset({"container", "kernel"})
+#: The isolations without network (code in them cannot reach outside this computer).
+NO_NETWORK = _NO_NETWORK
 
 
 def parse_capability(value: Any, *, source: CapabilitySource | None = None) -> ToolCapability | None:

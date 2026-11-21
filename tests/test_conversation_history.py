@@ -277,39 +277,69 @@ def test_an_offline_conversation_refuses_a_cloud_summary_model(make: Make) -> No
     assert (changed.summary_model, changed.history, changed.offline) == (None, "summarize", True)
 
 
-async def test_an_offline_conversation_never_asks_a_cloud_helper(make: Make) -> None:
-    workspace = make({SUMMARIZER: [text("must not be asked")]})
+def stored(workspace: Workspace, *, offline: bool, summary_model: str | None) -> Conversation:
+    """A summarizing conversation stored as it is (e.g. restored from a backup), without the checks of create."""
     template_id = AgentTemplates(workspace.store).create(AgentConfig(system_prompt="AGENT")).id
     conversation = Conversation(
         tenant_id=workspace.tenant_id,
         agent=TemplateRef(template_id=template_id, version=1),
-        model=LOCAL,
-        offline=True,
+        model=LOCAL if offline else CLOUD,
+        offline=offline,
         history="summarize",
-        summary_model=CLOUD,  # stored before the conversation went offline (e.g. restored from a backup)
+        summary_model=summary_model,
     )
     workspace.store.put(COLLECTION, conversation.id, conversation)
-    history = [
+    return conversation
+
+
+def earlier(conversation: Conversation, *, run_id: str | None = None) -> list[ConversationMessage]:
+    return [
         ConversationMessage(
             conversation_id=conversation.id,
             seq=seq,
             role="user" if seq % 2 else "assistant",
             content=long_text(seq),
             status="complete" if seq % 2 else "succeeded",
+            run_id=None if seq % 2 else run_id,
         )
         for seq in range(1, 21)
     ]
-    agent = AgentConfig(system_prompt="AGENT", model=LOCAL)
+
+
+@pytest.mark.parametrize("scope", ["conversation", "agent"])
+async def test_an_offline_answer_never_asks_a_cloud_helper(make: Make, scope: str) -> None:
+    workspace = make({SUMMARIZER: [text("must not be asked")]})
+    conversation = stored(workspace, offline=scope == "conversation", summary_model=CLOUD)
     built, summary = await workspace.conversations.history_input(
+        conversation,
+        earlier(conversation),
+        Turn(role="user", text="new", ref=21),
+        agent=AgentConfig(system_prompt="AGENT", model=LOCAL),
+        budget=None,
+        actor="local",
+        offline=scope,  # type: ignore[arg-type]
+    )
+    assert summary is not None and summary.method == "trimmed"
+    assert summary.error == "offline.cloud_model" and summary.run_id is None
+    assert not calls(workspace, SUMMARIZER)
+    assert built.endswith("The user's new message:\nnew") and estimate_tokens(built) <= ROOM
+
+
+async def test_an_offline_history_never_reaches_a_cloud_helper(make: Make) -> None:
+    """N-09's sticky offline history: an earlier answer whose run is offline content (here one that cannot be read,
+    which fails closed) keeps the summary on local models although the conversation is no longer offline."""
+    workspace = make({SUMMARIZER: [text("must not be asked")]})
+    conversation = stored(workspace, offline=False, summary_model=None)  # the helper is the cloud answer model
+    history = earlier(conversation, run_id="run_gone")
+    assert workspace.conversations.offline_history(history) == "conversation"
+    _built, summary = await workspace.conversations.history_input(
         conversation,
         history,
         Turn(role="user", text="new", ref=21),
-        agent=agent,
+        agent=AgentConfig(system_prompt="AGENT", model=CLOUD),
         budget=None,
         actor="local",
-        offline=True,
+        offline=None,  # history_input finds the offline history itself
     )
-    assert summary is not None and summary.method == "trimmed"
-    assert summary.error == "conversation.offline_cloud_model" and summary.run_id is None
+    assert summary is not None and summary.method == "trimmed" and summary.error == "offline.cloud_model"
     assert not calls(workspace, SUMMARIZER)
-    assert built.endswith("The user's new message:\nnew") and estimate_tokens(built) <= ROOM

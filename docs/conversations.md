@@ -17,7 +17,7 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 | `title`, `auto_title` | The title; made from the first message until it is set |
 | `agent` | `TemplateRef`: the agent template and its version (`template_id`, `version`) |
 | `model` | The model of the next answer (`provider:model`) |
-| `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`) |
+| `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`). Every call of the answers, and of runs below them, follows the offline rules (N-09, [offline.md](offline.md)) |
 | `provenance` | Placeholder for N-08 (always `unchecked`) |
 | `budget_usd` | The budget over all answers (`None`: each answer has the default budget) |
 | `history` | How earlier messages that no longer fit the model's context window are shortened: `trim` (default) or `summarize` (N-05, see [Long conversations](#long-conversations-n-05)) |
@@ -138,6 +138,7 @@ A cloud model is never chosen automatically:
   an offline conversation uses local models only (`conversation.offline_cloud_model`), and the only cloud model an
   answer may use is the conversation's own, chosen by the person (`conversation.cloud_model_not_chosen`).
 - Switching the agent keeps the conversation's model.
+- An offline agent template answers with local models only, also in a conversation that is not offline (N-09).
 
 ## Long conversations (N-05)
 
@@ -161,14 +162,17 @@ Orkexa's `orkexa.core.compaction` (`Conversations.history_input`):
   and the engine applies the same grants. The answer waits for it (at most `SUMMARY_TIMEOUT_SECONDS`, 300 s). The
   next answer starts from the newest summary and the messages after it, so a summary is summarized again with them
   and its range keeps starting at message 1.
-- **Offline**: an offline conversation or an offline agent never uses a cloud helper. A cloud `summary_model` is
-  refused when the conversation is (or is switched) offline (`conversation.offline_cloud_model`), and before every
-  summary run the helper is checked like the answer's models (`check_answer_models` with the offline flag). A
-  refused helper sends nothing: the history is trimmed and the summary says why (`error`). The offline flag passed
-  to `history_input` is the conversation's or the agent's (`AgentConfig.offline` once N-09 is merged); N-09's sticky
-  offline history (an earlier offline answer in the history) is passed through the same parameter when N-09 lands.
-- **Failure**: when the summary run fails, times out (`conversation.summary_timeout`, the run is cancelled) or is
-  refused, the history is trimmed instead and the answer goes on; `error` holds the code.
+- **Offline** (N-09): offline content never reaches a cloud helper. The scope is the answer's: an offline
+  conversation, an offline agent, or a history with an earlier offline answer (`Conversations.offline_history`,
+  sticky after the switch is off). Before every summary run the helper is connected with
+  `Workspace.connect_model(helper, offline=<scope>)`, which refuses a cloud model (`offline.cloud_model`) or a local
+  model server that is not on this computer (`offline.remote_endpoint`) before anything is sent; the summary run's
+  agent is offline too, so the engine checks every call again. A cloud `summary_model` is also refused when it is
+  set, or when the conversation or its agent is (switched) offline (`conversation.offline_cloud_model`). A refused
+  helper sends nothing: the history is trimmed and the summary says why (`error`).
+- **Failure**: when the summary run fails, times out (the run is cancelled: `run.cancelled`) or is refused, the
+  history is trimmed instead and the answer goes on; `error` holds the code (the refusal's, the run's or
+  `run.failed`). No new code: the studio's existing texts apply.
 - **Visible**: the answer keeps what its model read in `summary` (`HistorySummary`: `method` `trimmed` or
   `summarized`, `first_seq` and `last_seq`, the `text`, the helper `model`, its `run_id` and `usage`, the `sources`
   of kept untrusted data, `error`). The API returns it with the answer, and the Markdown export writes it as
@@ -196,11 +200,10 @@ with image input; otherwise it is marked `unavailable` and the model only learns
 | `conversation.agent_not_found` | The agent template or version does not exist (`template_id`) |
 | `conversation.model_required` | No model given, and neither the agent's nor the default model is local |
 | `conversation.offline_cloud_model` | A cloud model for an offline conversation (`model`) |
+| `offline.*` | A call of an offline answer refused at run time (N-09, [offline.md](offline.md)) |
 | `conversation.empty_message` | Neither text nor files |
 | `conversation.answer_running` | Another answer of the conversation is still running |
 | `conversation.budget_exhausted` | The conversation's budget is used up (`budget_usd`) |
 | `conversation.cloud_model_not_chosen` | The answer would use a cloud model nobody chose for it (`model`) |
 | `conversation.too_many_files` | The conversation holds the most files (`limit`) |
 | `conversation.run_missing` | The answer's run no longer exists (shown on the answer) |
-| `conversation.summary_timeout` | The history summary took longer than `SUMMARY_TIMEOUT_SECONDS`; trimmed instead (`summary.error` of the answer) |
-| `conversation.summary_failed` | The history summary failed for another reason; trimmed instead (`summary.error`; a failed summary run gives its run's code) |

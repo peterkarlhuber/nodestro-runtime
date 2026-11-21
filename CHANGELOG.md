@@ -6,11 +6,46 @@
   window (its window minus the agent's output limit, system prompt and tools) with `orkexa.core.compaction`, at most
   the newest 30 messages as before. Older messages are replaced by a summary turn that names its range: per
   conversation `history` `trim` (default, a note) or `summarize` (a helper model, `summary_model` or the
-  conversation's model, in a run of the conversation; never a cloud helper when the conversation or agent is
-  offline). A failed summary falls back to trimming. The answer shows it (`ConversationMessage.summary`,
+  conversation's model, in a run of the conversation; never a cloud helper for offline content: an offline
+  conversation or agent, or an offline history, N-09, `connect_model(offline=...)`). A failed summary falls back to trimming. The answer shows it (`ConversationMessage.summary`,
   `HistorySummary`), and the export writes it. Untrusted data stays framed with its source and never reaches the
-  helper. New codes `conversation.summary_timeout` and `conversation.summary_failed` (on the summary only). See
+  helper. No new error code. See
   [docs/conversations.md](docs/conversations.md#long-conversations-n-05).
+- Offline per agent and per conversation (N-09): `AgentConfig.offline` (default off, left out of stored agents while
+  off) and the existing `Conversation.offline` apply the strict offline mode's rules to one agent or to every answer of
+  one conversation, checked at every call. See [docs/offline.md](docs/offline.md).
+  - New module `nodestro_runtime.offline`: the per-tool state (`tool_state`: available offline, or why not:
+    `network`, `remote_mcp`, `external_reach`, `unknown`), the connection check and the agent's issues.
+  - Engine: every model connection of an offline step is local only (`offline.cloud_model`, `offline.remote_endpoint`),
+    also the quality judge and orchestrator decisions; every call of a library tool that is not available offline is
+    refused before the approval gate (`offline.tool_unavailable`, also with approvals off); an offline step with
+    server tools does not start (`offline.server_tools`). An offline conversation is read at every call and covers the
+    runs below its answers (sub-workflows, team runs).
+  - Validation: a cloud model or judge and server tools of an offline agent are errors; each tool that is not
+    available offline is a warning with its reason. The pre-check reports a local model server that is not local.
+  - Conversations: an offline agent template answers with local models only; the answer's agent of an offline
+    conversation is offline (`answer_agent(..., offline=...)`); `Conversations.is_offline`.
+  - Run chat about a run with an offline agent or conversation uses local models only; the agent test applies the
+    same rules.
+  - `preflight.is_local_endpoint` moved to `offline.is_local_endpoint` (still importable from `preflight`).
+  - New codes: `offline.cloud_model`, `offline.remote_endpoint`, `offline.server_tools`, `offline.tool_unavailable`.
+  - Review fixes (security): `is_local_endpoint` parses the host as an IP address and accepts only `localhost` and
+    loopback addresses, so `127.0.0.1.nip.io` or `127.attacker.example` no longer count as this computer (also in the
+    strict offline mode's pre-check); `ollama` counts only in the `local-container` profile
+    (`is_local_endpoint(url, docker=...)`, `check_connection(..., docker=...)`). An MCP server over HTTP is not
+    available offline even on `localhost` (new reason `http_mcp`); the strict offline pre-check counts only `stdio`
+    servers as local, as its approval gate. An own tool's derived `internal` reach is judged at call time by the
+    sandbox the call really runs in (`tool_state(..., sandbox=..., at_call=True)`,
+    `ToolLibrary.call_isolation`). New `RunManager.content_offline_scope(run)` (the run, above and below it, and its
+    conversation; fails closed) and `Workspace.connect_model(..., offline=scope)` for content of a finished run that
+    goes to a model outside the run (run chat; the assistant's run attachment and a test series' judge in
+    nodestro-api).
+  - Re-review fixes: an offline agent gets run memory only. A persistent memory space or knowledge proposals are an
+    error in its validation and stop the step at run time and in the agent test (new code `offline.shared_memory`,
+    `fields`, `scope`); an offline conversation answer proposes no knowledge. A conversation whose earlier answers
+    are offline content stays on local models after its offline switch is off (`offline.cloud_model`,
+    `Conversations.offline_history`). `content_offline_scope` follows `resumed_from` and a node's `reused_from`.
+
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
   answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such
