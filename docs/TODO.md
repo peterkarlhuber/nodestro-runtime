@@ -598,6 +598,18 @@ Items that need an independent or external review (an internal audit does not re
   - Done (W3, 2026-11-21): earlier files of a conversation are offered to later answers as reference files (overview,
     read on demand), of its owner only (`Run.reference_file_ids`,
     `test_rt089_earlier_files_are_offered_to_later_answers_of_their_owner_only`).
+  - Done (W3-P4a review, 2026-11-21): M-1, an imported trace never runs and reaches no file: `refuse_imported`
+    (`run.imported`) in `RunManager._launch`, `decide`, `decide_tool_call` and `decide_budget`; `import_trace` drops
+    `file_ids` and `reference_file_ids` and stores a paused trace as stopped; `file_delivery.collect` leaves out a
+    conversation's file unless the run acts for whoever uploaded it
+    (`test_w3p4a_m1_an_imported_trace_is_stored_stopped_and_names_no_files`,
+    `test_w3p4a_m1_an_imported_run_never_runs_whatever_its_stored_state`,
+    `test_w3p4a_m1_a_run_never_gets_a_conversation_file_of_another_person`). L-1, an overview's outline is framed
+    as untrusted and capped (`OUTLINE_FILE_CHARS`, `OUTLINE_TOTAL_CHARS`). L-2, a deleted answer's run takes its
+    events with it (`RunManager.delete_events`, `PostgresEventLog.delete` also drops buffered events; a late event
+    of a deleted run is not stored). L-3, a deletion that outlasts the 10-second wait is swept on a server too: the
+    nodestro-api worker's leader runs `sweep_orphan_runs` for every active tenant
+    (`ServerWorker.sweep_conversation_runs`); the desktop sweeps at its start.
 - **Next step:** The studio UI for conversations (nodestro-studio, branch `claude/w3-conv-ui`); N-05, N-08 and N-09
   build on it.
 

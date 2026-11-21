@@ -14,6 +14,19 @@
     and another person's files are never offered; only the conversation's owner sees the run (H-1).
   - A memory space of its own per conversation stays open (decision in `docs/TODO.md` RT-089): answers keep run
     memory.
+- Security (W3-P4a review, M-1): an imported trace is shown, never executed. `RunManager` refuses to decide,
+  continue or execute a run with `imported_at` (new code `run.imported`, `engine.refuse_imported`), also one stored by
+  an earlier version as paused. `traces.import_trace` no longer keeps the trace's `file_ids` and `reference_file_ids`
+  and stores a trace exported at a decision (`paused`, steps awaiting approval or budget) as stopped, as it did for
+  queued and running ones. `file_delivery.collect(..., owner=...)` leaves out a file of a conversation (origin
+  `assistant` or `conversation`) unless the run acts for the person who uploaded it; the engine passes the actor of
+  the top-level run. Before, a member could import a paused trace naming another member's conversation file and
+  approve it, and the agent read the file.
+- Conversations (W3-P4a review, lows): an overview's outline is framed as untrusted data like the file's content
+  and capped per file (`OUTLINE_FILE_CHARS` = 4,000) and per agent (`OUTLINE_TOTAL_CHARS` = 20,000). A deleted
+  answer's run takes its events with it: `RunManager.delete_events` (the history here, `remote_delete_events` for the
+  server's event table, wired by `QueuedRuns.attach` and the worker), `PostgresEventLog.delete` also drops buffered
+  events, and an event the run emits after its deletion is not published or stored.
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
   answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such

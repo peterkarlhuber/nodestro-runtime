@@ -712,6 +712,9 @@ class Conversations:
             self.store.delete("runs", item.id)
             self.workspace.files.delete_run(item.id)
             self.workspace.runs.discard_tool_waits(item.id, because="run.deleted")
+            # Its events too, here and in the server's event table (W3-P4a L-2); a last event of an execution
+            # that ends after this is not stored.
+            self.workspace.runs.delete_events(item.id)
         self.workspace.runs.chat.delete_run(run.id)
         self.workspace.inputs.release([file_id for item in tree for file_id in item.file_ids])
 

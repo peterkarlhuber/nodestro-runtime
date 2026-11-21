@@ -114,12 +114,14 @@ to the conversation (H-1):
   `404 run.not_found`. A run whose conversation is gone is seen by nobody. So is a run below another one whose top
   cannot be reached (a parent is missing, or the parents form a loop): whose it is cannot be told, so it fails
   closed (review Low 1).
-- Deleting a conversation deletes its answers' runs with their result files, tool checkpoints, live chat and the
-  input files only they used, after cancelling a running one (it waits up to 10 seconds for it to stop). A run still
-  going then is hidden from everyone and deleted as soon as it stops (`Conversations.run_stopped`, a listener of the
-  run manager, which the reaper's interrupt of a run whose worker died calls too); runs left when the desktop app
-  stopped are deleted at its next start (`sweep_orphan_runs`). Only a run whose conversation document is gone is
-  deleted. The usage ledger keeps the cost.
+- Deleting a conversation deletes its answers' runs with their result files, tool checkpoints, live chat, events
+  (also the server's event table; an event the run emits afterwards is not stored) and the input files only they
+  used, after cancelling a running one (it waits up to 10 seconds for it to stop). A run still going then is hidden
+  from everyone and deleted as soon as it stops (`Conversations.run_stopped`, a listener of the run manager, which
+  the reaper's interrupt of a run whose worker died calls too); runs left when the desktop app stopped are deleted at
+  its next start, and on a server by the worker's leader every hour (`sweep_orphan_runs`, nodestro-api
+  `ServerWorker.sweep_conversation_runs`). Only a run whose conversation document is gone is deleted. The usage
+  ledger keeps the cost.
 - The run's workflow is named `Conversation`, never the conversation's title, because the run list and the usage
   report show the name to every member.
 - Aggregates still count the answers' runs (N-3, by design): the usage report (by workflow, keyed by the conversation
@@ -154,6 +156,11 @@ context. A file uploaded but never sent is not offered (the person has not sent 
 and only files of this conversation are offered, so of its owner: the conversation and the answer's run are seen by
 nobody else (H-1), and another member's conversation never names them (`conversation.not_found` for a file id of
 another conversation). `Run.reference_file_ids` is set only by the runtime (`launch`), never by a request.
+
+Whatever names a file of a conversation (the run's files, its reference files, a form), a run gets it only when it
+acts for the person who uploaded it (`file_delivery.collect(..., owner=...)`, W3-P4a M-1); a run of another person,
+or of nobody, does not see it. An imported trace keeps no file ids and never runs (`run.imported`). The outline of an
+overview is framed as untrusted data and capped (`OUTLINE_FILE_CHARS` per file, `OUTLINE_TOTAL_CHARS` per agent).
 
 ## Export
 

@@ -22,6 +22,7 @@ lets a continued run (:mod:`nodestro_runtime.resume`) take over results of an ea
 from __future__ import annotations
 
 import asyncio
+import collections
 from collections.abc import Callable, Iterable, Mapping
 import concurrent.futures
 from contextlib import suppress
@@ -181,6 +182,8 @@ _PLACEHOLDER = PLACEHOLDER  # the name before it was public
 #: Events of a live run kept for late subscribers; beyond it ``text`` and ``thinking`` deltas are
 #: no longer kept (they are still published, and the node state holds the whole text).
 _MAX_EVENT_HISTORY = 5000
+#: How many deleted runs a manager remembers so that a late event of one is not published (W3-P4a L-2).
+_MAX_DELETED_EVENT_RUNS = 4096
 #: The ``seq`` of the last event of each paused run (store collection), kept across restarts.
 _EVENT_SEQ = "run_event_seq"
 #: Events a subscriber may fall behind; a subscriber that stops reading is ended instead of
@@ -1080,6 +1083,11 @@ class RunManager:
         #: events in order (the server's event table). With it, :meth:`subscribe` and :meth:`is_live` follow such
         #: runs, and :meth:`wait` waits for them.
         self.remote_events: Callable[[str, int], list[RunEvent]] | None = None
+        #: Deletes the stored events of a run from the server's event table (``None``: there is none here).
+        self.remote_delete_events: Callable[[str], object] | None = None
+        #: Runs whose events were deleted with the run (:meth:`delete_events`): nothing more is published or stored
+        #: for them, also not the last event of an execution that ends after the deletion (W3-P4a L-2).
+        self._deleted_events: collections.OrderedDict[str, None] = collections.OrderedDict()
         #: How often a run of another process is looked at (seconds).
         self.remote_poll = 0.25
         #: Per-call tool approvals (S-2, D10); ``None``: off (the default), runs call tools as before S-2.
@@ -1381,6 +1389,7 @@ class RunManager:
         return found
 
     def _launch(self, run: Run, *, local: bool = False, fence: str | None = None) -> Run:
+        refuse_imported(run)  # every execution passes here: an imported trace never runs (W3-P4a M-1)
         if self.dispatch is not None and not local:
             # Queue execution: the run is stored and a worker executes it (ADR-0004). A paused run whose decision
             # was recorded is queued again, so everybody waiting for it sees that it goes on. Several processes can
@@ -1601,6 +1610,7 @@ class RunManager:
                 raise KeyError(run_id)
             run, fence = _split(stored)
         read_status = run.status
+        refuse_imported(run)  # refused before anything is recorded (W3-P4a M-1)
         node = next((item for item in run.workflow.nodes if item.id == node_id), None)
         if node is None or node.type != "approval":
             raise KeyError(node_id)
@@ -1623,6 +1633,7 @@ class RunManager:
                 limit=AGENT_NOTE_MAX_CHARS,
             )
         top = self.root_of(run)
+        refuse_imported(top)
         if self._contexts.get(top.id) is None:
             # The run continues on an event loop: refuse before anything is recorded.
             _require_loop()
@@ -1761,6 +1772,9 @@ class RunManager:
         now: an approval of a call asked with another one is refused and closes the request (re-review R-1). A run
         paused at the call (M6b) continues once none of its calls waits any more; a run waiting in a thread reads the
         decision itself."""
+        stored = self.get(run_id)
+        if stored is not None:
+            refuse_imported(self.root_of(stored))
         approvals = ToolApprovals(self.store)
         try:
             decided = approvals.decide(
@@ -2010,6 +2024,7 @@ class RunManager:
         if run is None:
             raise KeyError(run_id)
         root = self.root_of(run)
+        refuse_imported(root)
         requests = run_budget.BudgetRequests(self.store)
         found = requests.get(root.id, request_id)
         if found is None:
@@ -2369,6 +2384,8 @@ class RunManager:
                 loop.call_soon_threadsafe(self._publish, context.run.id, kind, node_id, data)
 
     def _publish(self, run_id: str, kind: str, node_id: str | None, data: dict[str, Any]) -> None:
+        if run_id in self._deleted_events:
+            return  # the run was deleted (with its events): what it still emits is neither shown nor stored
         if run_id not in self._seq:
             # A run paused by an earlier process continues its numbering, so a client reconnecting
             # with Last-Event-ID never mistakes the new events for ones it has already seen.
@@ -2607,6 +2624,20 @@ class RunManager:
         """One activity event of the run (:mod:`nodestro_runtime.activity`); its actor is whoever started the
         top-level run. Never fails the run."""
         activity.add(self.store, source, action, actor=_run_actor(context.root.run), run_id=context.run.id, **fields)
+
+    def delete_events(self, run_id: str) -> None:
+        """Delete the events of a run that is deleted: the history here, its numbering and the server's event table.
+        Events the run still emits afterwards (the last one of an execution that ends now) are not published or
+        stored (W3-P4a L-2)."""
+        self._deleted_events[run_id] = None
+        while len(self._deleted_events) > _MAX_DELETED_EVENT_RUNS:
+            self._deleted_events.popitem(last=False)
+        self._forget_events(run_id)
+        if self.remote_delete_events is not None:
+            try:
+                self.remote_delete_events(run_id)
+            except Exception:  # the leader's housekeeping removes them after the retention
+                logger.exception("Deleting the stored events of run %s failed", run_id)
 
     def _forget_events(self, run_id: str) -> None:
         """Drop the event history of a run that finished: streams only replay events of live runs."""
@@ -4733,6 +4764,7 @@ class RunManager:
                 self.inputs,
                 context.env.builder.knowledge,
                 on_demand=frozenset(run.reference_file_ids) - set(run.file_ids),
+                owner=_run_actor(self.root_of(run)),
             )
             capabilities = context.env.builder.capabilities(config.model)
             delivery = deliver(files, capabilities, self.inputs, context.env.builder.knowledge)
@@ -5418,6 +5450,14 @@ def conversation_of(run: Run) -> str:
     if run.trigger == "conversation" and run.trigger_ref:
         return run.trigger_ref
     return run.id
+
+
+def refuse_imported(run: Run) -> None:
+    """An imported trace is shown, never executed (W3-P4a M-1): no decision, continuation, retry or execution of it
+    is carried out. Its content came from a file anybody could have written (its files, its owner, its trigger), so
+    nothing in it may act for anyone."""
+    if run.imported_at is not None:
+        raise NodestroError("run.imported", "An imported trace is only shown; it never runs")
 
 
 def _key_actor(api_key_id: str | None) -> str:
