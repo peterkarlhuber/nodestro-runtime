@@ -557,6 +557,7 @@
   "run.agent.EvaluationFailedError": ["type"],
   "run.agent.FetchError": ["type"],
   "run.agent.FlowError": ["type"],
+  "run.agent.FsError": ["type"],
   "run.agent.HistoryConversionError": ["type"],
   "run.agent.IncompleteResponseError": ["type"],
   "run.agent.InvalidRequestError": ["type"],

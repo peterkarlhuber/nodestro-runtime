@@ -576,7 +576,13 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P3 Low · **Status:** In progress · **Refs:** development plan N-04,
   [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
 - **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
-  - the history goes to the model as text in the run's input; N-05 compacts long conversations;
+  - the history goes to the model as text in the run's input, fitted into the context window (N-05, trim by default
+    or summarized per conversation); the studio UI does not offer `history` and `summary_model` yet, the summary
+    waits inside the send request (up to 300 s; a later step could summarize after an answer instead) and costs one
+    extra helper request per answer whose history does not fit, and token counts are estimates (orkexa ORK-046);
+  - N-05 review L2: a summary run that starts after its conversation was deleted mid-send is cancelled and deleted by
+    `Conversations._summarize` itself (the deletion code in `delete` is unchanged). The answer deletion rework on
+    `claude/w3-conv-ui` (P4a) should take summary runs (node `summary`, trigger `conversation`) into account;
   - earlier files of a conversation are not offered to later answers (only the files sent with a message);
   - only agent templates answer, not agent nodes of a workflow;
   - the provenance field is a placeholder until N-08;
