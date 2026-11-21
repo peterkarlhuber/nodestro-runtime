@@ -576,7 +576,15 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P3 Low · **Status:** In progress · **Refs:** development plan N-04,
   [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
 - **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
-  - the history goes to the model as text in the run's input; N-05 compacts long conversations;
+  - the history goes to the model as text in the run's input, fitted into the context window (N-05, trim by default
+    or summarized per conversation); the studio UI does not offer `history` and `summary_model` yet, the summary
+    waits inside the send request (up to 300 s; a later step could summarize after an answer instead) and costs one
+    extra helper request per answer whose history does not fit, and token counts are estimates (orkexa ORK-046);
+  - N-05 review L2: a summary run that starts after its conversation was deleted mid-send is cancelled and deleted by
+    `Conversations._summarize` itself. The RT-089 deletion takes summary runs (node `summary`, trigger
+    `conversation`, `trigger_ref` the conversation) like answers' runs: the delete finds them by `trigger_ref`, and one
+    still going is deleted once it stops or by the sweep
+    (`test_w3p4a_a_summary_run_still_going_after_the_delete_is_deleted_once_it_stops`);
   - only agent templates answer, not agent nodes of a workflow;
   - the provenance field is a placeholder until N-08;
   - Done (N-09, 2026-11-21): the offline flag applies the offline rules at every call of the answers and the runs

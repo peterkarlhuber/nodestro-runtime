@@ -1295,3 +1295,51 @@ async def test_w3p4a_l2_a_deleted_answers_run_takes_its_events_with_it(
     before = len(stored)
     workspace.runs._publish(run_id, "run_finished", None, {"status": "cancelled"})
     assert len(stored) == before  # a late last event of the deleted run is not stored
+
+
+async def test_w3p4a_a_summary_run_still_going_after_the_delete_is_deleted_once_it_stops(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary run of a conversation (N-05: node ``summary``, trigger ``conversation``, ``trigger_ref`` the
+    conversation) goes with the conversation as an answer's run does: the delete cancels it and, when it is still going
+    after the wait, it is hidden and deleted once it stops (RT-089)."""
+    from orkexa.core.compaction import SUMMARY_INSTRUCTIONS
+
+    from nodestro_runtime import conversations
+    from nodestro_runtime.conversations import SUMMARY_NODE, summary_workflow
+    from nodestro_runtime.launcher import launch
+
+    monkeypatch.setattr(conversations, "DELETE_WAIT_SECONDS", 0.3)
+    asked = threading.Event()
+    gate = threading.Event()
+
+    def slow(_request: dict[str, Any]) -> Any:
+        asked.set()
+        gate.wait(20)  # a helper call that ignores the cancel until it returns
+        return text("Summary.")
+
+    workspace = make({SUMMARY_INSTRUCTIONS[:60]: [slow]})
+    conversation_id = start(workspace, template(workspace))
+    stored = workspace.store.get(COLLECTION, conversation_id, conversations.Conversation)
+    assert stored is not None
+    workflow = summary_workflow(stored, CLOUD, 256, None)
+    assert [node.id for node in workflow.nodes][-1] == SUMMARY_NODE
+    run = await launch(
+        workspace, workflow, RunIn(input="transcript"), trigger="conversation", trigger_ref=conversation_id
+    )
+    deadline = time.monotonic() + 10
+    while not asked.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert asked.is_set()
+
+    await workspace.conversations.delete(conversation_id, None)
+    still = workspace.runs.get(run.id)
+    assert still is not None and still.status in ("queued", "running")
+    assert workspace.conversations.run_visible(run.id, None) is False
+
+    gate.set()
+    deadline = time.monotonic() + 10
+    while workspace.store.get_raw("runs", run.id) is not None and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert workspace.store.get_raw("runs", run.id) is None
+    assert run.id not in workspace.runs._events
