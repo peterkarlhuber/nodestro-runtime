@@ -37,8 +37,18 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 
 Only the owner sees a conversation on a server (another owner's id is not found); on the desktop everyone of the
 workspace does, as for the Nodestro Assistant. A conversation stored without an owner (made on a desktop, then restored
-into a server) is seen by nobody on a server: it fails closed and stays orphaned until it is restored on a desktop
-(L-7). A stored document of another tenant is never read. Both collections are
+into a server) is seen by nobody on a server, administrators included: it fails closed and stays orphaned until it
+is restored on a desktop (L-7) or the server's operator assigns it an owner who is a member of the tenant
+(`nodestro-server assistant backfill-owners --tenant --user --conversation`, audited; nodestro-api
+`docs/conversations.md`, W3-S1). Reading it never assigns an owner. A stored document of another tenant is never read.
+
+Who asks without an owner identity on a multi-user installation passes `NO_OWNER` (W3-S1): a principal without a
+role in the tenant, such as a service, a machine or anything else that is not a member. It sees no conversation, no
+message, no file and no answer run (nor a run below one), and it starts no conversation (`access.person_required`),
+so no conversation is ever shared by everyone without an owner identity. Before, such a principal was passed as `None`
+and saw every conversation of the tenant. Only the desktop's single person (and Nodestro Local Docker's) passes
+`None`; the API decides which owner a request has (nodestro-api `owner_of`, `docs/access.md` there). An administrator
+is a member like any other: the role grants no read of another member's conversation. Both collections are
 documents of the tenant's store: on PostgreSQL they are rows of `nodestro_documents` with `tenant_id`, so no schema
 migration is needed and the tenant SQL check covers every statement (the module has no SQL of its own;
 `tests/test_conversations_postgres.py`).
@@ -50,7 +60,10 @@ Every answer is one run of the engine (`RunManager`), never a second agent loop:
 - The run's workflow is a start step and the agent (node `agent`), with the conversation's id as workflow id and no
   inbox notifications. The trigger is `conversation` and `trigger_ref` is the conversation id.
 - The agent is the template's version with the conversation's model, its task template replaced by `{{input}}`, and
-  without cloud fallbacks.
+  without cloud fallbacks. Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every
+  member (`/api/memory`), so an answer never writes the conversation into one; run memory belongs to the answer's
+  run, which only the conversation's owner sees, and goes with it. A memory of one's own per conversation is later
+  work (RT-089).
 - The run's input is the earlier messages (the newest 30 user messages and finished answers) followed by the new
   message. N-05 compacts long conversations.
 - The run's usage is the answer's usage; the conversation's cost is the sum of its runs (failed and cancelled ones
@@ -91,7 +104,8 @@ of their own (spec 7.1) will close this gap.
 An answer's run holds the conversation (its input), the answer (its output) and the files sent with it. So it belongs
 to the conversation (H-1):
 
-- `Conversations.run_visible(run_id, owner)`: only who sees the conversation sees its runs (also the runs below one).
+- `Conversations.run_visible(run_id, owner)`: only who sees the conversation sees its runs (also the runs below one;
+  `NO_OWNER` sees none).
   `summary_visible(run, owner)` does the same for a run at hand (a run list's summary): a top-level run that is not an
   answer needs no store read, an answer's run one (N-2).
   The API checks it on every route with a run id (runs, export, files, cancel, resume, approvals, tool approvals,

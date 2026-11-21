@@ -7,7 +7,9 @@ switched between answers. Its parts:
   :data:`COLLECTION` and :data:`MESSAGES`, message key ``<conversation id>:<seq>``), so every query is bound to the
   tenant like every other document (on PostgreSQL rows of ``nodestro_documents`` with ``tenant_id``; no migration).
   Each conversation also records its tenant and its owner: on a server only its owner sees it (``owner``), on the
-  desktop everyone of the workspace (``owner`` ``None``), as for the Nodestro Assistant.
+  desktop everyone of the workspace (``owner`` ``None``). Who asks without an owner identity on a multi-user
+  installation (a principal without a role in the tenant) passes :data:`NO_OWNER`: it sees no conversation and no
+  answer run, and starts none (fail closed, W3-S1).
 - **Answers**: every answer is one run of the engine (trigger ``conversation``, ``trigger_ref`` = the conversation
   id) with a start step and the agent: there is no second agent loop. The run executes the agent with its tools,
   knowledge, per-call tool approvals (S-2) and access grants (N-06; a grant for "this conversation" names the
@@ -98,6 +100,12 @@ RESERVATION_TIMEOUT = timedelta(minutes=10)
 RESERVED = ""
 #: How long deleting a conversation waits for its cancelled answer to stop before it deletes the answer's run.
 DELETE_WAIT_SECONDS = 10.0
+#: The owner of a request without an owner identity on a multi-user installation (W3-S1): a server principal without
+#: a role in the tenant (a service, a machine, anything that is not a member). It sees no conversation, no answer run
+#: and no file of a conversation, and it starts none (fail closed). ``None`` is only the desktop's single person, who
+#: sees every conversation of the workspace. The value is no valid user id (a space and angle brackets), and a
+#: conversation that names it as its owner is seen by nobody but the desktop's person either.
+NO_OWNER = "<no owner>"
 
 #: N-08 (outflow protection by content provenance) will record here what the conversation holds; until then every
 #: conversation is ``unchecked``.
@@ -270,7 +278,9 @@ class SentConversationMessage(BaseModel):
 def visible(conversation: Conversation, owner: str | None) -> bool:
     """Whether ``owner`` sees the conversation: everyone without an owner (the desktop), else only its owner. A
     conversation stored without an owner (made on a desktop and restored on a server) is seen by nobody on a server
-    (fail closed)."""
+    (fail closed). :data:`NO_OWNER` sees no conversation at all."""
+    if owner == NO_OWNER:
+        return False
     return owner is None or conversation.owner == owner
 
 
@@ -302,15 +312,23 @@ def answer_input(history: list[ConversationMessage], content: str) -> str:
 def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
     """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback and no
     quality check with a cloud judge (a cloud model is never chosen automatically; the judge model defaults to a
-    cloud model), and the message as its task. A quality check with a local judge stays."""
+    cloud model), and the message as its task. A quality check with a local judge stays.
+
+    Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every member of the workspace or
+    tenant (``/api/memory``), so an answer that wrote into it would hand the conversation to them. Run memory belongs
+    to the answer's run, which only the conversation's owner sees, and goes with it."""
     quality = config.quality
     if quality.enabled and not is_local(quality.judge_model):
         quality = quality.model_copy(update={"enabled": False})
+    memory = config.memory
+    if memory.mode == "persistent":
+        memory = memory.model_copy(update={"mode": "run", "space": None})
     return config.model_copy(
         update={
             "model": model,
             "fallbacks": [item for item in config.fallbacks if is_local(item)],
             "quality": quality,
+            "memory": memory,
             "task_template": "{{input}}",
             "origin": ref,
         },
@@ -520,6 +538,10 @@ class Conversations:
         return qualified
 
     def create(self, request: ConversationIn, *, owner: str | None) -> AgentConversationDetail:
+        """Start a conversation of ``owner``; :data:`NO_OWNER` is refused (``access.person_required``): a conversation
+        always belongs to a person (W3-S1)."""
+        if owner == NO_OWNER:
+            raise NodestroError("access.person_required", "Only a member of the tenant can start a conversation")
         ref, config = self._agent(request.agent)
         model = request.model if request.model else self._default_model(config)
         conversation = Conversation(
@@ -980,6 +1002,7 @@ __all__ = [
     "COLLECTION",
     "CONVERSATIONS_ENV",
     "MESSAGES",
+    "NO_OWNER",
     "AgentChoice",
     "AgentConversationDetail",
     "AgentConversationFile",
