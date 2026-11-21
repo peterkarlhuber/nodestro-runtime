@@ -283,6 +283,10 @@ class AgentConfig(_Model):
     origin: TemplateRef | None = None
     #: Skills of the skill library in fixed versions (NAL-B3). They add instructions, never tools or permissions.
     skills: list[SkillBinding] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
+    #: Offline (N-09): the strict offline mode's rules for this agent only, checked at every call (see
+    #: :mod:`nodestro_runtime.offline`): local models only, no server tools, no tool with external reach. Left out of
+    #: the stored record while off, so agents and workflows stay byte-identical.
+    offline: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 # ---- workflows ------------------------------------------------------------------

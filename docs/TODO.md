@@ -13,7 +13,7 @@
 | P1 High | 1 |
 | P2 Medium | 9 |
 | P3 Low | 35 |
-| P4 Optional | 14 |
+| P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
 every entry below is not a release blocker. RT-001 (P1) gates only switching tool approvals on, which stay off
@@ -579,7 +579,9 @@ Items that need an independent or external review (an internal audit does not re
   - the history goes to the model as text in the run's input; N-05 compacts long conversations;
   - earlier files of a conversation are not offered to later answers (only the files sent with a message);
   - only agent templates answer, not agent nodes of a workflow;
-  - the provenance field is a placeholder until N-08, the offline flag only refuses cloud models until N-09;
+  - the provenance field is a placeholder until N-08;
+  - Done (N-09, 2026-11-21): the offline flag applies the offline rules at every call of the answers and the runs
+    below them ([offline.md](offline.md));
   - workflow- and agent-scoped grants and denies do not reach conversations (L-1, documented); agent ids of their
     own close it;
   - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
@@ -588,7 +590,28 @@ Items that need an independent or external review (an internal audit does not re
     reaches) is open;
   - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
     run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
-- **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
+- **Next step:** The studio UI for conversations; N-05 and N-08 build on it.
+
+### RT-092 · Offline per agent and per conversation (N-09): follow-ups
+
+- **Priority:** P4 Optional · **Status:** Open · **Refs:** development plan N-09, [docs/offline.md](offline.md)
+- **What:** The offline rules hold at every call of an offline agent or conversation. Open:
+  - an agent's output still goes wherever its workflow sends it (a later agent that is not offline may pass it to a
+    cloud model); a workflow-wide flag could mark every step;
+  - a local `stdio` MCP server counts as local, as in the strict offline mode (it runs in the sandbox container
+    without network); an HTTP MCP server on `localhost` is refused (`http_mcp`) and there is no explicit
+    allow-switch for one that is known to stay offline;
+  - the S-2 gate's `tool_facts` still reads an own tool's capability from the library's default sandbox; only the
+    offline check judges it by the sandbox of the call;
+  - `local_service._loopback` (hardware detection, not a security check) still treats `127.`-prefixed names as this
+    computer;
+  - an offline agent cannot use a persistent memory space at all (fail closed), not even one read by offline agents
+    only; a space flagged offline (readable by offline agents only) would allow it;
+  - a conversation whose earlier answer's run was deleted counts as offline content (fail closed), and the sticky
+    rule has no way to forget offline answers short of a new conversation;
+  - the tool catalog (`ToolInfo`) does not carry the offline state yet; it is reported through the agent's
+    validation.
+- **Next step:** Decide whether a workflow-wide offline flag is wanted.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 
