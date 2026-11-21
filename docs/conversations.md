@@ -159,9 +159,17 @@ Orkexa's `orkexa.core.compaction` (`Conversations.history_input`):
   of its own (workflow `Conversation summary`, node `summary`, trigger `conversation`, the conversation id as
   `trigger_ref`), so it is the conversation's like its answers: only its owner sees it, deleting the conversation
   deletes it, the conversation's budget pays for it, its cost is in the conversation's usage and the usage ledger,
-  and the engine applies the same grants. The answer waits for it (at most `SUMMARY_TIMEOUT_SECONDS`, 300 s). The
-  next answer starts from the newest summary and the messages after it, so a summary is summarized again with them
-  and its range keeps starting at message 1.
+  and the engine applies the same grants. Its cost counts from its run, also when the answer it was made for
+  could not start (the reservation is released, the summary run stays). The answer's own pre-check runs before the
+  summary, so an answer refused by it pays for none. A conversation deleted while its history is summarized deletes
+  a summary run that started after the delete too, and the message is refused (`ConversationNotFound`).
+- **Cost and wait of `summarize`**: whenever the history does not fit, an answer costs one extra model request (the
+  helper's), on top of the answer's own requests, paid from the conversation's budget. The summary runs inside the
+  send request: `POST .../messages` returns only after it (at most `SUMMARY_TIMEOUT_SECONDS`, 300 s; then it is
+  cancelled and the history trimmed), so a client, proxy or load balancer in front of the API needs a timeout above
+  that, or the conversation stays on `trim`. The next answer starts from the newest summary and the messages after
+  it, so a summary is summarized again only when the history no longer fits, and its range keeps starting at
+  message 1.
 - **Offline** (N-09): offline content never reaches a cloud helper. The scope is the answer's: an offline
   conversation, an offline agent, or a history with an earlier offline answer (`Conversations.offline_history`,
   sticky after the switch is off). Before every summary run the helper is connected with

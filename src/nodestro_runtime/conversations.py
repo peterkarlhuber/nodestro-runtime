@@ -71,7 +71,7 @@ from . import output_limits
 from .agent_templates import AgentTemplates
 from .engine import add_usage, as_text
 from .input_files import InputFile
-from .launcher import launch
+from .launcher import blocking_problems, launch
 from .offline import OfflineScope, cloud_model_error
 from .preflight import agent_models
 from .problems import NodestroError, Problem, problem
@@ -605,7 +605,7 @@ class Conversations:
                     model=item.model,
                     offline=item.offline,
                     messages=len(messages),
-                    cost_usd=self._usage(messages).estimated_cost_usd,
+                    cost_usd=self._usage(item.id, messages).estimated_cost_usd,
                     created_at=item.created_at,
                     updated_at=item.updated_at,
                 )
@@ -629,22 +629,34 @@ class Conversations:
         messages = self.messages(conversation_id, owner)
         answering = next((item.id for item in messages if item.status not in FINAL), None)
         return AgentConversationDetail(
-            **conversation.model_dump(), messages=messages, usage=self._usage(messages), answering=answering
+            **conversation.model_dump(),
+            messages=messages,
+            usage=self._usage(conversation_id, messages),
+            answering=answering,
         )
 
     def usage(self, conversation_id: str, owner: str | None) -> Usage:
         """The sum of the usage of every answer's run (failed and cancelled ones included)."""
-        return self._usage(self.messages(conversation_id, owner))
+        return self._usage(conversation_id, self.messages(conversation_id, owner))
 
-    @staticmethod
-    def _usage(messages: list[ConversationMessage]) -> Usage:
+    def _usage(self, conversation_id: str, messages: list[ConversationMessage]) -> Usage:
+        """The answers' usage and that of every history summary run of the conversation (N-05), read from the
+        runs, so a summary whose answer never started still counts (its reservation was released)."""
         total = Usage()
         for item in messages:
             if item.usage is not None:
                 total = add_usage(total, item.usage)
-            if item.summary is not None and item.summary.usage is not None:
-                total = add_usage(total, item.summary.usage)
+        for run in self._summary_runs(conversation_id):
+            total = add_usage(total, run.usage)
         return total
+
+    def _summary_runs(self, conversation_id: str) -> list[Run]:
+        """The history summary runs of a conversation (N-05): its runs whose workflow has the summary step."""
+        return [
+            run
+            for run in self.store.find("runs", "trigger_ref", [conversation_id], Run)
+            if run.trigger == "conversation" and any(node.id == SUMMARY_NODE for node in run.workflow.nodes)
+        ]
 
     # ---- writing ------------------------------------------------------------------------------------------------
 
@@ -909,6 +921,9 @@ class Conversations:
             model = self._checked_model(conversation.model, offline=offline)
             agent = answer_agent(template_agent, model=model, ref=ref, offline=offline)
             check_answer_models(answer_workflow(conversation, agent, budget), model=model, offline=offline)
+            if conversation.history == "summarize":
+                # The answer's own pre-check before a summary is paid for (N-05 review L1); launch repeats it.
+                await asyncio.to_thread(blocking_problems, self.workspace, answer_workflow(conversation, agent, budget))
             # N-05: the history fitted into the model's context window, perhaps summarized in a run of its own. The
             # helper obeys the same offline rules (the conversation, its agent and its offline history).
             text, summary = await self.history_input(
@@ -920,6 +935,8 @@ class Conversations:
                 actor=actor,
                 offline=scope,
             )
+            if summary is not None and summary.run_id and self._gone(conversation_id):
+                raise ConversationNotFound(conversation_id)  # deleted while its history was summarized (L2)
             if summary is not None and summary.usage is not None and budget is not None:
                 budget = max(0.0, budget - (summary.usage.estimated_cost_usd or 0.0))
             workflow = answer_workflow(conversation, agent, budget)
@@ -1053,6 +1070,13 @@ class Conversations:
             into["error"] = exc.code
             raise
         into["run_id"] = run.id
+        if self._gone(conversation.id):
+            # Deleted between the reservation and this launch, so the delete did not see this run (N-05 review L2):
+            # it goes the same way.
+            self.workspace.cancel(run.id)
+            if await self._stopped(run.id):
+                self._delete_run(run.id)
+            raise ConversationNotFound(conversation.id)
         try:
             done = await self.workspace.wait(run.id, timeout=SUMMARY_TIMEOUT_SECONDS)
         except TimeoutError:
@@ -1066,6 +1090,9 @@ class Conversations:
             into["error"] = (state.error_code if state is not None else None) or done.error_code or "run.failed"
             raise RuntimeError(into["error"])
         return text
+
+    def _gone(self, conversation_id: str) -> bool:
+        return self.store.get(COLLECTION, conversation_id, Conversation) is None
 
     def _reserve(
         self, conversation_id: str, owner: str | None, content: str, file_ids: list[str]
@@ -1083,7 +1110,7 @@ class Conversations:
                 raise ConversationNotFound(missing[0])
             budget: float | None = None
             if conversation.budget_usd is not None:
-                total = self._usage(history)
+                total = self._usage(conversation_id, history)
                 spent = total.known_cost_usd if total.known_cost_usd is not None else total.estimated_cost_usd or 0.0
                 budget = conversation.budget_usd - spent
                 if budget <= 0:

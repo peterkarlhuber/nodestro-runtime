@@ -9,7 +9,10 @@
   conversation's model, in a run of the conversation; never a cloud helper for offline content: an offline
   conversation or agent, or an offline history, N-09, `connect_model(offline=...)`). A failed summary falls back to trimming. The answer shows it (`ConversationMessage.summary`,
   `HistorySummary`), and the export writes it. Untrusted data stays framed with its source and never reaches the
-  helper. No new error code. See
+  helper. No new error code. Review fixes: frames a model wrote that are not byte-exact (one line, CRLF, any quoting,
+  unclosed) stay framed (orkexa); a summary's cost counts from its run even when its answer cannot start (L1), and
+  the answer's pre-check runs before the summary; a summary run started after a mid-send delete is deleted too
+  (L2); the extra request and the wait inside send are documented (L3). See
   [docs/conversations.md](docs/conversations.md#long-conversations-n-05).
 - Offline per agent and per conversation (N-09): `AgentConfig.offline` (default off, left out of stored agents while
   off) and the existing `Conversation.offline` apply the strict offline mode's rules to one agent or to every answer of
