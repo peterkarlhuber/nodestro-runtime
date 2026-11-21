@@ -97,8 +97,9 @@ def test_discovery_skips_broken_entry_points() -> None:
     assert [item.name for item in found] == ["good"]
 
 
-# Locria Phase 0R (S1, S3) and owner decision E-0R-2 A: tools of installed integrations are locked; foreign code runs
-# only in the Docker sandbox, which extension tools cannot use yet (N-22), so no switch value unlocks them.
+# Security review 2026-11 (phase 0R, S1, S3) and owner decision E-0R-2 A: tools of installed integrations are
+# locked; foreign code runs only in the Docker sandbox, which extension tools cannot use yet (N-22), so no switch
+# value unlocks them.
 
 
 class _Ocr:
