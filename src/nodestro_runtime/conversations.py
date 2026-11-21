@@ -312,15 +312,23 @@ def answer_input(history: list[ConversationMessage], content: str) -> str:
 def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
     """The template's agent as it answers in a conversation: the conversation's model, no cloud fallback and no
     quality check with a cloud judge (a cloud model is never chosen automatically; the judge model defaults to a
-    cloud model), and the message as its task. A quality check with a local judge stays."""
+    cloud model), and the message as its task. A quality check with a local judge stays.
+
+    Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every member of the workspace or
+    tenant (``/api/memory``), so an answer that wrote into it would hand the conversation to them. Run memory belongs
+    to the answer's run, which only the conversation's owner sees, and goes with it."""
     quality = config.quality
     if quality.enabled and not is_local(quality.judge_model):
         quality = quality.model_copy(update={"enabled": False})
+    memory = config.memory
+    if memory.mode == "persistent":
+        memory = memory.model_copy(update={"mode": "run", "space": None})
     return config.model_copy(
         update={
             "model": model,
             "fallbacks": [item for item in config.fallbacks if is_local(item)],
             "quality": quality,
+            "memory": memory,
             "task_template": "{{input}}",
             "origin": ref,
         },

@@ -794,6 +794,28 @@ async def test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation(ma
     assert workspace.conversations.run_visible(child.id, "usr_alice") is True
 
 
+async def test_w3s1_an_answer_never_writes_into_a_shared_memory_space(make: Make) -> None:
+    """W3-S1 review (medium): a template with persistent memory answered with the shared space, which every member
+    reads (``/api/memory``). An answer keeps run memory instead: the space stays untouched."""
+    note = tool_use("memory", {"command": "create", "path": "/memories/n.md", "file_text": "salary zanzibar"})
+    workspace = make({"AGENT": [note, text("Noted.")]})
+    template_id = template(workspace, memory={"mode": "persistent", "space": "Team"})
+    conversation = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template_id), model=CLOUD), owner="usr_alice"
+    )
+    sent = await workspace.conversations.send(conversation.id, "usr_alice", MessageIn(content="Remember my salary"))
+    run_id = sent.assistant.run_id or ""
+    await workspace.wait(run_id, timeout=20)
+    run = workspace.runs.get(run_id)
+    assert run is not None and run.status == "succeeded", run
+    [agent] = [node for node in run.workflow.nodes if node.agent is not None]
+    assert agent.agent is not None and (agent.agent.memory.mode, agent.agent.memory.space) == ("run", None)
+    assert workspace.memory.open("Team").entries() == []
+    # The template itself is unchanged (a workflow run still uses the space).
+    stored = AgentTemplates(workspace.store).get(template_id)
+    assert stored.agent.memory.mode == "persistent"
+
+
 # ---- re-review fixes ---------------------------------------------------------------------------------------------
 
 

@@ -58,7 +58,10 @@ Every answer is one run of the engine (`RunManager`), never a second agent loop:
 - The run's workflow is a start step and the agent (node `agent`), with the conversation's id as workflow id and no
   inbox notifications. The trigger is `conversation` and `trigger_ref` is the conversation id.
 - The agent is the template's version with the conversation's model, its task template replaced by `{{input}}`, and
-  without cloud fallbacks.
+  without cloud fallbacks. Persistent memory becomes run memory (W3-S1 review): a memory space is shared by every
+  member (`/api/memory`), so an answer never writes the conversation into one; run memory belongs to the answer's
+  run, which only the conversation's owner sees, and goes with it. A memory of one's own per conversation is later
+  work (RT-089).
 - The run's input is the earlier messages (the newest 30 user messages and finished answers) followed by the new
   message. N-05 compacts long conversations.
 - The run's usage is the answer's usage; the conversation's cost is the sum of its runs (failed and cancelled ones

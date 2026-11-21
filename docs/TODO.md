@@ -583,6 +583,8 @@ Items that need an independent or external review (an internal audit does not re
     own close it;
   - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
     deleted by hand.
+  - an answer has run memory only (W3-S1 review): a memory of one's own per conversation (a space only its owner
+    reaches) is open;
   - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
     run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
 - **Next step:** The studio UI for conversations; N-05, N-08 and N-09 build on it.
