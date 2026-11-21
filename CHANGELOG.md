@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Conversations (N-05): long conversations keep working. The history of an answer is fitted into the model's context
+  window (its window minus the agent's output limit, system prompt and tools) with `orkexa.core.compaction`, at most
+  the newest 30 messages as before. Older messages are replaced by a summary turn that names its range: per
+  conversation `history` `trim` (default, a note) or `summarize` (a helper model, `summary_model` or the
+  conversation's model, in a run of the conversation; never a cloud helper when the conversation or agent is
+  offline). A failed summary falls back to trimming. The answer shows it (`ConversationMessage.summary`,
+  `HistorySummary`), and the export writes it. Untrusted data stays framed with its source and never reaches the
+  helper. New codes `conversation.summary_timeout` and `conversation.summary_failed` (on the summary only). See
+  [docs/conversations.md](docs/conversations.md#long-conversations-n-05).
 - Conversations (W3-S1, security): `conversations.NO_OWNER` is the owner of a request without an owner identity on a
   multi-user installation (a principal without a role in the tenant). It sees no conversation, message, file or
   answer run (nor a run below one) and starts no conversation (`access.person_required`); before, the API passed such

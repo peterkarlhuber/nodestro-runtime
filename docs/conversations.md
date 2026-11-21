@@ -20,6 +20,8 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 | `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`) |
 | `provenance` | Placeholder for N-08 (always `unchecked`) |
 | `budget_usd` | The budget over all answers (`None`: each answer has the default budget) |
+| `history` | How earlier messages that no longer fit the model's context window are shortened: `trim` (default) or `summarize` (N-05, see [Long conversations](#long-conversations-n-05)) |
+| `summary_model` | The helper model of `summarize` (`None`: the conversation's model); never a cloud model when offline |
 | `files` | The conversation's files: input files of origin `conversation` |
 
 `ConversationMessage` (collection `conversation_messages`, key = `<conversation id>:<seq>`):
@@ -34,6 +36,7 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 | `agent`, `model` | Answers: the agent version and model that answered |
 | `usage`, `cost_usd` | Answers: the usage and cost of the answer's run |
 | `run_id`, `approval_ids` | Answers: the run, and the tool approval requests it waits for |
+| `summary` | Answers: what replaced the earlier messages for this answer (`HistorySummary`, N-05); `None` when all fit |
 
 Only the owner sees a conversation on a server (another owner's id is not found); on the desktop everyone of the
 workspace does, as for the Nodestro Assistant. A conversation stored without an owner (made on a desktop, then restored
@@ -64,8 +67,8 @@ Every answer is one run of the engine (`RunManager`), never a second agent loop:
   member (`/api/memory`), so an answer never writes the conversation into one; run memory belongs to the answer's
   run, which only the conversation's owner sees, and goes with it. A memory of one's own per conversation is later
   work (RT-089).
-- The run's input is the earlier messages (the newest 30 user messages and finished answers) followed by the new
-  message. N-05 compacts long conversations.
+- The run's input is the earlier messages (user messages and finished answers) followed by the new message, fitted
+  into the model's context window ([Long conversations](#long-conversations-n-05)).
 - The run's usage is the answer's usage; the conversation's cost is the sum of its runs (failed and cancelled ones
   included). The runs are in the run list like every other run.
 - With a conversation budget, each run gets the rest of it as its budget; an exhausted budget refuses the message
@@ -136,6 +139,44 @@ A cloud model is never chosen automatically:
   answer may use is the conversation's own, chosen by the person (`conversation.cloud_model_not_chosen`).
 - Switching the agent keeps the conversation's model.
 
+## Long conversations (N-05)
+
+The earlier messages go to the answer's model as text in the run's input, fitted into its context window with
+Orkexa's `orkexa.core.compaction` (`Conversations.history_input`):
+
+- **Budget**: the model's context window (`AgentBuilder.limits`: documented, declared or reported by the local model
+  server) minus the agent's output limit (`max_tokens`, at most the model's maximum output, or half the window when
+  only the window is known), its system prompt and `TOOL_TOKENS` (400) per tool, less a 10 % margin for the token
+  estimate (three bytes of UTF-8 per token). With an unknown window only the message limit applies.
+- **What stays**: the new message always, then the newest messages that fit, at most `HISTORY_MESSAGES` (30). The
+  older ones are replaced by one summary turn at the start that names its range, e.g.
+  `[Summary of turns 1 to 12 (trimmed)]` (turns are the messages' `seq` numbers).
+- **`history: trim`** (the default): the summary turn says that the messages were left out. No model is asked, so
+  nothing changes for a conversation that fits.
+- **`history: summarize`**: a helper model summarizes the older messages, so the conversation keeps what they said.
+  The helper is `summary_model`, else the conversation's model; both were chosen by the person. The summary is a run
+  of its own (workflow `Conversation summary`, node `summary`, trigger `conversation`, the conversation id as
+  `trigger_ref`), so it is the conversation's like its answers: only its owner sees it, deleting the conversation
+  deletes it, the conversation's budget pays for it, its cost is in the conversation's usage and the usage ledger,
+  and the engine applies the same grants. The answer waits for it (at most `SUMMARY_TIMEOUT_SECONDS`, 300 s). The
+  next answer starts from the newest summary and the messages after it, so a summary is summarized again with them
+  and its range keeps starting at message 1.
+- **Offline**: an offline conversation or an offline agent never uses a cloud helper. A cloud `summary_model` is
+  refused when the conversation is (or is switched) offline (`conversation.offline_cloud_model`), and before every
+  summary run the helper is checked like the answer's models (`check_answer_models` with the offline flag). A
+  refused helper sends nothing: the history is trimmed and the summary says why (`error`). The offline flag passed
+  to `history_input` is the conversation's or the agent's (`AgentConfig.offline` once N-09 is merged); N-09's sticky
+  offline history (an earlier offline answer in the history) is passed through the same parameter when N-09 lands.
+- **Failure**: when the summary run fails, times out (`conversation.summary_timeout`, the run is cancelled) or is
+  refused, the history is trimmed instead and the answer goes on; `error` holds the code.
+- **Visible**: the answer keeps what its model read in `summary` (`HistorySummary`: `method` `trimmed` or
+  `summarized`, `first_seq` and `last_seq`, the `text`, the helper `model`, its `run_id` and `usage`, the `sources`
+  of kept untrusted data, `error`). The API returns it with the answer, and the Markdown export writes it as
+  `## History · messages 1 to 12 summarized by <model> (run <id>)` before the answer.
+- **Untrusted data**: text in `<untrusted_data>` frames (`frame_untrusted`) never reaches the helper; it reads
+  `[data N]` placeholders. The summary keeps an excerpt of each frame in a new frame with the original source, and the
+  helper's text cannot open or close a frame. Framed data never becomes an instruction.
+
 ## Files
 
 Files are input files of origin `conversation`. They stay until they are removed from the conversation or the
@@ -161,3 +202,5 @@ with image input; otherwise it is marked `unavailable` and the model only learns
 | `conversation.cloud_model_not_chosen` | The answer would use a cloud model nobody chose for it (`model`) |
 | `conversation.too_many_files` | The conversation holds the most files (`limit`) |
 | `conversation.run_missing` | The answer's run no longer exists (shown on the answer) |
+| `conversation.summary_timeout` | The history summary took longer than `SUMMARY_TIMEOUT_SECONDS`; trimmed instead (`summary.error` of the answer) |
+| `conversation.summary_failed` | The history summary failed for another reason; trimmed instead (`summary.error`; a failed summary run gives its run's code) |

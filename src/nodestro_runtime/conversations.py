@@ -16,8 +16,17 @@ switched between answers. Its parts:
   conversation id), and its usage is the run's usage, so it shows in the run list and the usage ledger. The answer
   message references its run (``run_id``) and, while a tool call waits for a person, the approval requests
   (``approval_ids``).
-- **History**: the run's input is the new message after the earlier messages of the conversation (the newest
-  :data:`HISTORY_MESSAGES`), as text. Compacting long conversations is N-05.
+- **History** (N-05): the run's input is the new message after the earlier messages of the conversation, as text,
+  fitted into the answer model's context window (:meth:`Conversations.history_input`, with
+  :mod:`orkexa.core.compaction`): its window minus the agent's output reserve, its system prompt and tools; at most
+  the newest :data:`HISTORY_MESSAGES`. The older messages are replaced by a summary turn that names its range. The
+  conversation's ``history`` decides how: ``trim`` (the default) leaves them out with a note, ``summarize`` has a
+  helper model (``summary_model``, else the conversation's model) summarize them in a run of its own (trigger
+  ``conversation``, so its cost is the conversation's and it obeys the same model rules: an offline conversation or
+  agent never uses a cloud helper). A failed summary falls back to trimming. The answer keeps what replaced the
+  earlier messages (:class:`HistorySummary`, ``summary``), so the history shows it; the next answer starts from the
+  newest summary. Untrusted data (``<untrusted_data>`` frames) never reaches the helper and stays framed with its
+  source in the summary.
 - **Streaming**: the answer's events are the run's events (:class:`~nodestro_runtime.schemas.RunEvent`); the API
   forwards them unchanged.
 - **Cancel**: cancelling an answer cancels its run; the engine closes the model connection (``CancelFlag``,
@@ -43,10 +52,22 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 import re
+import sys
 from typing import TYPE_CHECKING, Any, Literal
 
+from orkexa.core.compaction import (
+    SUMMARY_INSTRUCTIONS,
+    Compacted,
+    Turn,
+    acompact,
+    compact,
+    context_budget,
+    estimate_tokens,
+)
+from orkexa.core.compaction import Strategy as HistoryStrategy
 from pydantic import BaseModel, Field
 
+from . import output_limits
 from .agent_templates import AgentTemplates
 from .engine import add_usage, as_text
 from .input_files import InputFile
@@ -80,8 +101,16 @@ COLLECTION = "conversations"
 MESSAGES = "conversation_messages"
 #: The provider of local models: the only one a conversation picks without being told.
 LOCAL_PROVIDER = "ollama"
-#: Earlier messages that go to the model with a new one (the newest ones).
+#: Earlier messages that go to the model with a new one at most (the newest ones; older ones are trimmed or
+#: summarized, N-05).
 HISTORY_MESSAGES = 30
+#: Tokens kept free for each tool definition of the answer's agent when its history is fitted (an estimate).
+TOOL_TOKENS = 400
+#: The id of the helper's step in a summary run (N-05).
+SUMMARY_NODE = "summary"
+#: How long an answer waits for its history summary; then the summary run is cancelled and the history trimmed.
+#: Well below :data:`RESERVATION_TIMEOUT`, so the reserved answer does not expire meanwhile.
+SUMMARY_TIMEOUT_SECONDS = 300.0
 MAX_MESSAGE_CHARS = 20_000
 MAX_TITLE_CHARS = 120
 MAX_FILES_PER_MESSAGE = 10
@@ -137,6 +166,25 @@ class AgentConversationFile(BaseModel):
     added_at: datetime = Field(default_factory=now)
 
 
+class HistorySummary(BaseModel):
+    """What replaced the earlier messages of a conversation for one answer (N-05), shown in its history.
+
+    ``method`` ``trimmed``: the messages ``first_seq`` to ``last_seq`` were left out; ``summarized``: a helper model
+    (``model``, in run ``run_id`` with its ``usage``) summarized them. ``text`` is exactly what the answer's model
+    read; it keeps untrusted data in ``<untrusted_data>`` frames with their ``sources``. ``error``: why summarizing
+    failed (the history was trimmed instead)."""
+
+    method: Literal["trimmed", "summarized"]
+    first_seq: int | None = None
+    last_seq: int | None = None
+    text: str
+    model: str | None = None
+    run_id: str | None = None
+    usage: Usage | None = None
+    sources: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
 class Conversation(BaseModel):
     id: str = Field(default_factory=lambda: new_id("conv"))
     #: The tenant whose store holds it (``local`` on the desktop); a document of another tenant is never read.
@@ -156,6 +204,12 @@ class Conversation(BaseModel):
     provenance: ProvenanceStatus = "unchecked"
     #: The conversation's budget in USD over all its answers (``None``: each answer has the default budget).
     budget_usd: float | None = Field(default=None, ge=0)
+    #: How earlier messages that no longer fit the model's context window are shortened (N-05): ``trim`` leaves
+    #: them out, ``summarize`` has a helper model summarize them.
+    history: HistoryStrategy = "trim"
+    #: The helper model of ``summarize`` (``None``: the conversation's model); chosen by the person, so it may be a
+    #: cloud model, but never in an offline conversation or for an offline agent.
+    summary_model: str | None = None
     files: list[AgentConversationFile] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=now)
     updated_at: datetime = Field(default_factory=now)
@@ -206,7 +260,7 @@ class ConversationMessage(BaseModel):
     error: Problem | None = None
     agent: TemplateRef | None = None
     model: str | None = None
-    #: Answers: the usage and cost of the answer's run.
+    #: Answers: the usage and cost of the answer's run (a history summary's run is in ``summary``).
     usage: Usage | None = None
     cost_usd: float | None = None
     #: Answers: the run that wrote it (``""`` while it is reserved and its run starts), and the approval requests it
@@ -214,6 +268,8 @@ class ConversationMessage(BaseModel):
     run_id: str | None = None
     approval_ids: list[str] = Field(default_factory=list)
     reply_to: str | None = None
+    #: Answers: the earlier messages this answer's model read only as a summary, or that were left out (N-05).
+    summary: HistorySummary | None = None
     created_at: datetime = Field(default_factory=now)
     finished_at: datetime | None = None
 
@@ -252,6 +308,8 @@ class ConversationIn(BaseModel):
     title: str = Field(default="", max_length=MAX_TITLE_CHARS)
     offline: bool = False
     budget_usd: float | None = Field(default=None, ge=0)
+    history: HistoryStrategy = "trim"
+    summary_model: str | None = Field(default=None, max_length=200)
 
 
 class ConversationChange(BaseModel):
@@ -262,6 +320,9 @@ class ConversationChange(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     offline: bool | None = None
     budget_usd: float | None = Field(default=None, ge=0)
+    history: HistoryStrategy | None = None
+    #: ``""`` clears it (the conversation's model summarizes).
+    summary_model: str | None = Field(default=None, max_length=200)
 
 
 class MessageIn(BaseModel):
@@ -297,16 +358,79 @@ def is_local(model: str) -> bool:
     return provider_of(model) == LOCAL_PROVIDER
 
 
-def answer_input(history: list[ConversationMessage], content: str) -> str:
-    """The run's input of an answer: the earlier messages (the newest :data:`HISTORY_MESSAGES`) and the new one."""
-    earlier = [item for item in history if item.role == "user" or item.status == "succeeded"][-HISTORY_MESSAGES:]
+def history_turns(history: list[ConversationMessage], *, summarized: bool = False) -> list[Turn]:
+    """The earlier messages as turns (the user's messages and the answers that succeeded). ``summarized``: start from
+    the newest summary an answer read (N-05) and the messages after it."""
+    finished = [item for item in history if item.role == "user" or item.status == "succeeded"]
+    start: list[Turn] = []
+    if summarized:
+        latest = next(
+            (
+                item.summary
+                for item in reversed(history)
+                if item.summary is not None and item.summary.method == "summarized" and item.summary.last_seq
+            ),
+            None,
+        )
+        if latest is not None and latest.last_seq is not None:
+            start = [Turn(role="summary", text=latest.text, ref=latest.last_seq, first=latest.first_seq)]
+            finished = [item for item in finished if item.seq > latest.last_seq]
+    return start + [Turn(role=item.role, text=item.content, ref=item.seq) for item in finished]
+
+
+def render_input(turns: tuple[Turn, ...] | list[Turn]) -> str:
+    """The run's input of an answer: the earlier turns (a summary turn first, if any) and the new message (the last
+    turn)."""
+    *earlier, new = turns
     if not earlier:
-        return content
+        return new.text
     parts = ["The conversation so far (oldest first):"]
-    for item in earlier:
-        parts.append(f"{'User' if item.role == 'user' else 'Assistant'}: {item.content}")
-    parts.append(f"The user's new message:\n{content}")
+    for turn in earlier:
+        if turn.role == "summary":
+            parts.append(turn.text)  # it starts with its own label: "[Summary of turns 1 to 12 (summarized)]"
+        else:
+            parts.append(f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.text}")
+    parts.append(f"The user's new message:\n{new.text}")
     return "\n\n".join(parts)
+
+
+def answer_input(history: list[ConversationMessage], content: str) -> str:
+    """The run's input of an answer without a known context window: the earlier messages (the newest
+    :data:`HISTORY_MESSAGES`, older ones trimmed with a note) and the new one."""
+    turns = [*history_turns(history), Turn(role="user", text=content)]
+    return render_input(compact(turns, budget=sys.maxsize, max_turns=HISTORY_MESSAGES + 1).turns)
+
+
+def history_budget(context_window: int | None, max_output: int | None, config: AgentConfig) -> int | None:
+    """The tokens an answer's history may take (N-05): the model's context window minus the agent's output limit
+    (capped by the model's maximum output ``max_output``), its system prompt and its tools (an estimate each);
+    ``None`` for an unknown window."""
+    reserve = min(config.max_tokens, max_output) if max_output else config.max_tokens
+    reserved = estimate_tokens(config.system_prompt) + TOOL_TOKENS * (len(config.tools) + len(config.server_tools))
+    return context_budget(context_window, output_reserve=reserve, reserved=reserved)
+
+
+def summary_workflow(conversation: Conversation, model: str, max_tokens: int, budget: float | None) -> Workflow:
+    """The run that summarizes earlier messages (N-05): the start step and a helper agent without tools."""
+    helper = AgentConfig(
+        name="Summary",
+        model=model,
+        system_prompt=SUMMARY_INSTRUCTIONS,
+        max_tokens=max(1024, max_tokens * 2),  # room for a reasoning model; the text is cut to ``max_tokens``
+        max_tool_rounds=0,
+        effort=None,
+    )
+    return Workflow(
+        id=conversation.id,
+        name="Conversation summary",
+        nodes=[
+            Node(id=_START_NODE, type="start"),
+            Node(id=SUMMARY_NODE, type="agent", label=helper.name, agent=helper),
+        ],
+        edges=[Edge(id="e1", source=_START_NODE, target=SUMMARY_NODE)],
+        budget_usd=budget,
+        notifications=NotificationRules(events=[]),
+    )
 
 
 def answer_agent(config: AgentConfig, *, model: str, ref: TemplateRef) -> AgentConfig:
@@ -496,6 +620,8 @@ class Conversations:
         for item in messages:
             if item.usage is not None:
                 total = add_usage(total, item.usage)
+            if item.summary is not None and item.summary.usage is not None:
+                total = add_usage(total, item.summary.usage)
         return total
 
     # ---- writing ------------------------------------------------------------------------------------------------
@@ -553,6 +679,10 @@ class Conversations:
             model=self._checked_model(model, offline=request.offline),
             offline=request.offline,
             budget_usd=request.budget_usd,
+            history=request.history,
+            summary_model=self._checked_model(request.summary_model, offline=request.offline)
+            if request.summary_model
+            else None,
         )
         self.store.put(COLLECTION, conversation.id, conversation)
         return self.detail(conversation.id, owner)
@@ -577,6 +707,10 @@ class Conversations:
             updates["model"] = self._checked_model(model, offline=offline)
             if "budget_usd" in sent:
                 updates["budget_usd"] = change.budget_usd
+            if "history" in sent and change.history is not None:
+                updates["history"] = change.history
+            helper = change.summary_model if "summary_model" in sent else conversation.summary_model
+            updates["summary_model"] = self._checked_model(helper, offline=offline) if helper else None
             self.store.put(COLLECTION, conversation_id, conversation.model_copy(update=updates))
         return self.detail(conversation_id, owner)
 
@@ -723,12 +857,25 @@ class Conversations:
             ref, template_agent = self._agent(
                 AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
             )
-            workflow = answer_workflow(conversation, answer_agent(template_agent, model=model, ref=ref), budget)
-            check_answer_models(workflow, model=model, offline=conversation.offline)
+            agent = answer_agent(template_agent, model=model, ref=ref)
+            check_answer_models(answer_workflow(conversation, agent, budget), model=model, offline=conversation.offline)
+            # N-05: the history fitted into the model's context window, perhaps summarized in a run of its own.
+            text, summary = await self.history_input(
+                conversation,
+                self._history(conversation_id, user.seq),
+                Turn(role="user", text=content, ref=user.seq),
+                agent=agent,
+                budget=budget,
+                actor=actor,
+                offline=conversation.offline or bool(getattr(template_agent, "offline", False)),
+            )
+            if summary is not None and summary.usage is not None and budget is not None:
+                budget = max(0.0, budget - (summary.usage.estimated_cost_usd or 0.0))
+            workflow = answer_workflow(conversation, agent, budget)
             run = await launch(
                 self.workspace,
                 workflow,
-                RunIn(input=answer_input(self._history(conversation_id, user.seq), content), file_ids=file_ids),
+                RunIn(input=text, file_ids=file_ids),
                 trigger="conversation",
                 trigger_ref=conversation.id,
                 started_by=actor,
@@ -742,7 +889,7 @@ class Conversations:
             if current is None:  # deleted while the run started: the run goes too
                 self.workspace.cancel(run.id)
                 raise ConversationNotFound(conversation_id)
-            answer = answer.model_copy(update={"run_id": run.id, "agent": ref, "model": model})
+            answer = answer.model_copy(update={"run_id": run.id, "agent": ref, "model": model, "summary": summary})
             if not self.store.replace_if(
                 MESSAGES, _key(conversation_id, answer.seq), answer, field="run_id", expected=RESERVED
             ):
@@ -755,6 +902,111 @@ class Conversations:
                 changed["title"] = make_title(content) or (user.attachments[0].name if user.attachments else "")
             self.store.put(COLLECTION, conversation_id, current.model_copy(update=changed))
         return SentConversationMessage(user=user, assistant=self._sync(answer))
+
+    async def history_input(
+        self,
+        conversation: Conversation,
+        history: list[ConversationMessage],
+        new: Turn,
+        *,
+        agent: AgentConfig,
+        budget: float | None,
+        actor: str,
+        offline: bool,
+    ) -> tuple[str, HistorySummary | None]:
+        """The answer's input (N-05): ``history`` and the ``new`` message fitted into the context window of the
+        answer's model (:func:`history_budget`; an unknown window keeps the newest :data:`HISTORY_MESSAGES`), and
+        what replaced the older messages (``None`` when everything fits).
+
+        With ``history`` ``summarize`` a helper model summarizes them in a run of its own
+        (:meth:`_summarize`): the conversation's ``summary_model``, else its model. ``offline`` (the conversation or
+        its agent; N-09 adds an offline history) allows only a local helper; a cloud helper is refused before the
+        run (``conversation.offline_cloud_model``) and the history is trimmed instead, as for any failed summary."""
+        limits = self.workspace.builder.limits(agent.model)
+        tokens = history_budget(limits.context_window, output_limits.model_ceiling(limits)[0], agent)
+        summarizing = conversation.history == "summarize"
+        turns = [*history_turns(history, summarized=summarizing), new]
+        found: dict[str, Any] = {}
+
+        async def summarize(transcript: str, max_tokens: int) -> str:
+            helper = conversation.summary_model or agent.model
+            found["model"] = helper
+            return await self._summarize(
+                conversation,
+                transcript,
+                max_tokens,
+                model=helper,
+                budget=budget,
+                actor=actor,
+                offline=offline,
+                into=found,
+            )
+
+        result: Compacted = await acompact(
+            turns,
+            budget=tokens if tokens is not None else sys.maxsize,
+            strategy=conversation.history,
+            summarize=summarize if summarizing else None,
+            max_turns=HISTORY_MESSAGES + 1,
+        )
+        if result.summary is None or result.method == "none":
+            return render_input(result.turns), None
+        summary = HistorySummary(
+            method="summarized" if result.method == "summarized" else "trimmed",
+            first_seq=result.summary.first,
+            last_seq=result.summary.ref,
+            text=result.summary.text,
+            model=found.get("model") if result.method == "summarized" else None,
+            run_id=found.get("run_id"),
+            usage=found.get("usage"),
+            sources=list(result.sources),
+            error=found.get("error") or ("conversation.summary_failed" if result.error else None),
+        )
+        return render_input(result.turns), summary
+
+    async def _summarize(
+        self,
+        conversation: Conversation,
+        transcript: str,
+        max_tokens: int,
+        *,
+        model: str,
+        budget: float | None,
+        actor: str,
+        offline: bool,
+        into: dict[str, Any],
+    ) -> str:
+        """One summary of earlier messages by ``model``, as a run of the conversation (trigger ``conversation``): its
+        cost counts for the conversation, and the engine applies the conversation's grants and model rules. Records
+        the run, its usage and a refusal's code in ``into``; raises when there is no summary."""
+        try:
+            workflow = summary_workflow(conversation, check_model(model), max_tokens, budget)
+            check_answer_models(workflow, model=check_model(model), offline=offline)
+            run = await launch(
+                self.workspace,
+                workflow,
+                RunIn(input=transcript),
+                trigger="conversation",
+                trigger_ref=conversation.id,
+                started_by=actor,
+            )
+        except NodestroError as exc:
+            into["error"] = exc.code
+            raise
+        into["run_id"] = run.id
+        try:
+            done = await self.workspace.wait(run.id, timeout=SUMMARY_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self.workspace.cancel(run.id)
+            into["error"] = "conversation.summary_timeout"
+            raise
+        into["usage"] = done.usage
+        state = done.nodes.get(SUMMARY_NODE)
+        text = (as_text(state.output) if state.output is not None else state.text) if state is not None else ""
+        if done.status != "succeeded" or not text.strip():
+            into["error"] = (state.error_code if state is not None else None) or done.error_code or "run.failed"
+            raise RuntimeError(into["error"])
+        return text
 
     def _reserve(
         self, conversation_id: str, owner: str | None, content: str, file_ids: list[str]
@@ -962,6 +1214,8 @@ class Conversations:
             f"- Exported: {_stamp(datetime.now(UTC))}",
         ]
         for item in detail.messages:
+            if item.summary is not None:
+                lines += ["", f"## History · {_summary_label(item.summary)}", "", item.summary.text]
             who = "User" if item.role == "user" else f"Assistant ({item.model})"
             lines += ["", f"## {who} · {_stamp(item.created_at)}", "", item.content or "_(no text)_"]
             if item.attachments:
@@ -985,6 +1239,16 @@ class Conversations:
                     note += f" · {item.error.code}"
                 lines += ["", f"_{note}_"]
         return "\n".join(lines) + "\n"
+
+
+def _summary_label(summary: HistorySummary) -> str:
+    """Where a history summary comes from: its messages, its method and the helper model."""
+    span = f"messages {summary.first_seq} to {summary.last_seq}"
+    if summary.method == "trimmed":
+        note = f"{span} left out" + (f" ({summary.error})" if summary.error else "")
+    else:
+        note = f"{span} summarized by {summary.model}" + (f" (run {summary.run_id})" if summary.run_id else "")
+    return note
 
 
 def _stamp(value: datetime) -> str:
@@ -1013,6 +1277,7 @@ __all__ = [
     "ConversationMessage",
     "ConversationNotFound",
     "Conversations",
+    "HistorySummary",
     "MessageFile",
     "MessageIn",
     "MessageStatus",
@@ -1022,4 +1287,8 @@ __all__ = [
     "answer_input",
     "answer_workflow",
     "conversations_enabled",
+    "history_budget",
+    "history_turns",
+    "render_input",
+    "summary_workflow",
 ]

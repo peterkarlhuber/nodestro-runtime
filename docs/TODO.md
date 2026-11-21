@@ -576,7 +576,9 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P3 Low · **Status:** In progress · **Refs:** development plan N-04,
   [docs/conversations.md](conversations.md), nodestro-api `api_conversations.py`
 - **What:** The conversation object is merged behind `NODESTRO_CONVERSATIONS` (api). Open:
-  - the history goes to the model as text in the run's input; N-05 compacts long conversations;
+  - the history goes to the model as text in the run's input, fitted into the context window (N-05, trim by default
+    or summarized per conversation); the studio UI does not offer `history` and `summary_model` yet, the summary
+    waits inside the send request (up to 300 s), and token counts are estimates (orkexa ORK-046);
   - earlier files of a conversation are not offered to later answers (only the files sent with a message);
   - only agent templates answer, not agent nodes of a workflow;
   - the provenance field is a placeholder until N-08, the offline flag only refuses cloud models until N-09;
