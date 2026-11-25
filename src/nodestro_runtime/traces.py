@@ -21,6 +21,10 @@ from .storage import DocumentStore
 MAX_TRACE_BYTES = 50 * 1024 * 1024
 _FINGERPRINTS = "trace_imports"
 _UNFINISHED = "Incomplete trace: the run had not finished when it was exported."
+#: Statuses of a run that has not ended: an imported one is stored as cancelled.
+_UNFINISHED_STATUSES = frozenset({"queued", "running", "paused"})
+#: Statuses of a step that waits or runs: an imported one is stored as cancelled.
+_WAITING_NODE_STATUSES = frozenset({"waiting", "running", "awaiting_approval", "awaiting_budget"})
 
 
 class TraceImportError(NodestroError):
@@ -85,15 +89,24 @@ def import_trace(store: DocumentStore, data: bytes) -> tuple[Run, bool]:
         return duplicate, True
     run = trace.model_copy(
         deep=True,
-        update={"id": new_id("run"), "source_run_id": trace.source_run_id or trace.id, "imported_at": now()},
+        update={
+            "id": new_id("run"),
+            "source_run_id": trace.source_run_id or trace.id,
+            "imported_at": now(),
+            # The ids of files are not the trace's to name (W3-P4a M-1): a file id in a trace could point at
+            # anybody's upload of this installation. What the run was given stays visible in its steps.
+            "file_ids": [],
+            "reference_file_ids": [],
+        },
     )
-    if run.status in ("queued", "running"):
-        # A trace exported mid-run cannot continue here; show it as stopped.
+    if run.status in _UNFINISHED_STATUSES:
+        # A trace exported mid-run or at a decision cannot continue here; show it as stopped (an imported trace
+        # never runs, W3-P4a M-1).
         run.status = "cancelled"
         if run.error is None:
             run.error, run.error_code = _UNFINISHED, "trace.unfinished"
         for state in run.nodes.values():
-            if state.status in ("waiting", "running"):
+            if state.status in _WAITING_NODE_STATUSES:
                 state.status = "cancelled"
     store.put("runs", run.id, run)
     store.put_raw(_FINGERPRINTS, fingerprint(trace), run.id)

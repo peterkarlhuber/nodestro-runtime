@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Conversations (RT-089 follow-ups; still behind `NODESTRO_CONVERSATIONS` in the API, off by default):
+  - An answer's run that is still going when its conversation is deleted (after the delete's wait of 10 seconds) is
+    deleted once it stops (`Conversations.run_stopped`, a listener of the run manager; also on the reaper's
+    interrupt). Before, it stayed, hidden from everyone, until it was deleted by hand. The desktop's start deletes
+    the ones left when Nodestro stopped (`Conversations.sweep_orphan_runs`).
+  - The files sent with earlier messages of a conversation that are still in it are offered to the next answers
+    (newest first, at most `EARLIER_FILES` = 20): an overview read on demand with the files tool, never the whole
+    file again. New `Run.reference_file_ids` (set only by the runtime: `launch(..., reference_file_ids=...)`,
+    `RunManager.start`), `file_delivery.collect(..., on_demand=...)`. A file uploaded but never sent, a removed file
+    and another person's files are never offered; only the conversation's owner sees the run (H-1).
+  - A memory space of its own per conversation stays open (decision in `docs/TODO.md` RT-089): answers keep run
+    memory.
+- Security (W3-P4a review, M-1): an imported trace is shown, never executed. `RunManager` refuses to decide,
+  continue or execute a run with `imported_at` (new code `run.imported`, `engine.refuse_imported`), also one stored by
+  an earlier version as paused. `traces.import_trace` no longer keeps the trace's `file_ids` and `reference_file_ids`
+  and stores a trace exported at a decision (`paused`, steps awaiting approval or budget) as stopped, as it did for
+  queued and running ones. `file_delivery.collect(..., owner=...)` leaves out a file of a conversation (origin
+  `assistant` or `conversation`) unless the run acts for the person who uploaded it; the engine passes the actor of
+  the top-level run. Before, a member could import a paused trace naming another member's conversation file and
+  approve it, and the agent read the file.
+- Conversations (W3-P4a review, lows): an overview's outline is framed as untrusted data like the file's content
+  and capped per file (`OUTLINE_FILE_CHARS` = 4,000) and per agent (`OUTLINE_TOTAL_CHARS` = 20,000). A deleted
+  answer's run takes its events with it: `RunManager.delete_events` (the history here, `remote_delete_events` for the
+  server's event table, wired by `QueuedRuns.attach` and the worker), `PostgresEventLog.delete` also drops buffered
+  events, and an event the run emits after its deletion is not published or stored.
 - Conversations (N-05): long conversations keep working. The history of an answer is fitted into the model's context
   window (its window minus the agent's output limit, system prompt and tools) with `orkexa.core.compaction`, at most
   the newest 30 messages as before. Older messages are replaced by a summary turn that names its range: per

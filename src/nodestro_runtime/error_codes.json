@@ -614,6 +614,7 @@
   "run.deleted": [],
   "run.failed": [],
   "run.gone": [],
+  "run.imported": [],
   "run.incomplete": [],
   "run.interrupted": [],
   "run.local_model_missing": ["model", "provider"],
