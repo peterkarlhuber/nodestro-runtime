@@ -42,6 +42,7 @@ import re
 from typing import Any, Literal
 import unicodedata
 
+from orkexa.fs import fold as fold_name
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from .sandbox_policy import Isolation
@@ -418,7 +419,10 @@ def _within(inner: tuple[str, ...], outer: tuple[str, ...], *, fold: bool) -> bo
     if len(inner) < len(outer):
         return False
     if fold:
-        return all(a.casefold() == b.casefold() for a, b in zip(inner, outer, strict=False))
+        # As the path guard compares names (orkexa.fs.fold: case folding, dotless i as i, default-ignorable code
+        # points dropped): a deny holds for every spelling a case-insensitive file system may open as the same
+        # entry (N-10 re-review M2).
+        return all(fold_name(a) == fold_name(b) for a, b in zip(inner, outer, strict=False))
     return inner[: len(outer)] == outer
 
 

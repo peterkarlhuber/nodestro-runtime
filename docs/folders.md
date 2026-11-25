@@ -64,9 +64,9 @@ written by hand, every call evaluates the safety limits again.
 
 | Tool | What it does |
 | --- | --- |
-| `list_folder(folder="", path="")` | Without a folder, it lists the granted folders' names. With one, it lists the entries of that folder or a subfolder: `name`, `path`, `kind` (`file`, `dir`, `link`, `other`) and `size`. Links are shown but never followed. Files and subfolders that a deny blocks are left out. Without a folder, the call is logged too (`folder.listed` without a grant id) |
+| `list_folder(folder="", path="")` | Without a folder, it lists the granted folders' names. With one, it lists the entries of that folder or a subfolder: `name`, `path`, `kind` (`file`, `dir`, `link`, `other`) and `size`; `name` and `path` have bidirectional controls and zero-width characters escaped (`\uXXXX`), so an entry with such a name is shown but cannot be opened. Links are shown but never followed. Files and subfolders that a deny blocks are left out. Without a folder, the call is logged too (`folder.listed` without a grant id) |
 | `read_file(folder, path, offset=0)` | Reads the text of a text file or a PDF. It returns `source` (`<folder>/<path>`), `kind`, `size`, `pages` for a PDF, and the text from `offset`. At most `max_chars` characters come per call, and `next_offset` continues |
-| `search_files(folder, query, path="")` | Finds files whose name or text contains `query` (1 to 200 characters, case-insensitive). It returns the matches with `name` (escaped like a listing's name), `path`, `line` and a snippet, plus `files_searched`, `skipped` (subfolders that could not be listed, with their code; only when there are some) and `truncated`. A snippet is file content and comes between the same random data markers as `read_file`'s text. PDFs are found by name only |
+| `search_files(folder, query, path="")` | Finds files whose name or text contains `query` (1 to 200 characters, case-insensitive). It returns the matches with `name` and `path` (escaped like a listing's: bidirectional controls and zero-width characters as `\uXXXX`), `line` and a snippet, plus `files_searched`, `skipped` (subfolders that could not be listed, with their code; only when there are some) and `truncated`. A snippet is file content and comes between the same random data markers as `read_file`'s text. PDFs are found by name only |
 
 All three tools have `access=read`, `reach=internal` and `source=folder` (`tool_policy.BUILTIN_CAPABILITIES`), so
 they stay available in the strict offline mode and to offline agents (N-09). They use category `files`.
@@ -105,14 +105,19 @@ A file that is too large says so and asks the agent to request a smaller file or
    - the data folder as the protected folder.
 
    So a revocation, an expiry or a deny on a subfolder applies at the next call, and another folder's grant never
-   opens this one.
+   opens this one. A deny compares names as the path guard does (`orkexa.fs.fold`: case folding, dotless i as i,
+   zero-width and other default-ignorable characters dropped), so it holds for every spelling a case-insensitive
+   file system may open as the denied folder.
 3. It opens the folder through `orkexa.fs.SafeRoot` with the grant's patterns, limits and identity. That means:
    - no links and no junctions, also not as a parent folder;
    - no `..` and no absolute paths;
    - no files with several hard links (`fs.hard_link`; there is no opt-in);
    - no special files;
    - every folder is opened relative to its parent, so a swap during the call is refused (`fs.root_changed`,
-     `fs.link`) instead of followed.
+     `fs.link`) instead of followed;
+   - while a path is opened, the access model is evaluated again for the names the file system stored for each
+     component (`SafeRoot(on_open=...)`), not only for the spelling asked for: on NTFS or exFAT `pr\u0131vate`
+     (dotless i) opens `private`, and a deny on `private` refuses it (`access.denied`).
 4. A read checks the grant again after the file was read, so a grant revoked during a long PDF extraction returns
    nothing. A listing checks every entry, files too, so a deny on one exact file leaves it out. A search reads the
    grants and denies again for every folder it takes from its queue: it checks that folder (a deny added while it
@@ -123,7 +128,8 @@ A file that is too large says so and asks the agent to request a smaller file or
 5. It writes one event to the activity log (N-13). The event has source `file`, action `folder.listed`,
    `folder.read` or `folder.searched`, resource type `folder_grant` with the grant's id, the agent, the run, the
    outcome (`success`, `denied`, `failure`) and the refusal code. It never names a path or a file.
-   `FolderGrants.accesses(id)` returns this access log.
+   `FolderGrants.accesses(id)` returns this access log. A new grant is the event `folder.granted` (the person as
+   actor); its code is `default_excludes_off` when an administrator turned the default excludes off.
 
 ## Patterns
 
@@ -139,7 +145,8 @@ A file that is too large says so and asks the agent to request a smaller file or
 - An invalid pattern is refused when granting (`folder.invalid_pattern`).
 
 Every grant also excludes the common secret files (`folders.DEFAULT_EXCLUDES`, compared without case): `**/.env*`,
-`**/*.pem`, `**/*.key`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc` and `**/*.kdbx`. They
+`**/*.pem`, `**/*.key`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc`, `**/*.kdbx`,
+`**/*.p12`, `**/*.pfx`, `**/*.ppk` and `**/credentials*`. They
 cannot be listed, read or searched (`fs.excluded`; some are already refused by the guard's credential blocklist,
 `fs.blocked`). An administrator can turn this off for one grant with `default_excludes=false`; the guard's
 blocklist still holds then.

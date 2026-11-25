@@ -93,6 +93,14 @@ def temp_roots() -> set[str]:
     return found
 
 
+#: The activity event of a new folder grant; its ``code`` is :data:`DEFAULT_EXCLUDES_OFF` when an administrator
+#: turned the default excludes off.
+GRANTED = "folder.granted"
+DEFAULT_EXCLUDES_OFF = "default_excludes_off"
+#: The actions of the folder tools: a grant's access log (:meth:`FolderGrants.accesses`) lists only these.
+TOOL_ACTIONS = ("folder.listed", "folder.read", "folder.searched")
+
+
 def _refused(reason: NotGrantable) -> NodestroError:
     return NodestroError("folder.not_grantable", "This folder cannot be granted", reason=reason)
 
@@ -185,6 +193,16 @@ class FolderGrants:
                 created_at=access.created_at,
             )
             self.store.put(COLLECTION, folder.id, folder)
+        # The grant in the activity log (N-13); turning the default excludes off is named (N-10 re-review).
+        activity.add(
+            self.store,
+            "file",
+            GRANTED,
+            actor=by.id,
+            resource_type="folder_grant",
+            resource_id=folder.id,
+            code=None if default_excludes else DEFAULT_EXCLUDES_OFF,
+        )
         return self._view(folder, access)
 
     def revoke(self, folder_id: str, *, by: Person) -> FolderGrantView:
@@ -206,7 +224,9 @@ class FolderGrants:
     def accesses(self, folder_id: str, *, limit: int = 200) -> builtins.list[FolderAccessEntry]:
         """The access log of a grant, newest first: every call of the folder tools on it (activity log, N-13)."""
         folder = self._folder(folder_id)
-        events = activity.query(self.store, resource_type="folder_grant", resource_id=folder.id, limit=limit)
+        events = activity.query(
+            self.store, actions=TOOL_ACTIONS, resource_type="folder_grant", resource_id=folder.id, limit=limit
+        )
         return [
             FolderAccessEntry(
                 at=event.at,
@@ -250,4 +270,14 @@ class FolderGrants:
         )
 
 
-__all__ = ["TEMP_ROOTS", "FolderAccessEntry", "FolderGrantView", "FolderGrants", "NotGrantable", "temp_roots"]
+__all__ = [
+    "DEFAULT_EXCLUDES_OFF",
+    "GRANTED",
+    "TEMP_ROOTS",
+    "TOOL_ACTIONS",
+    "FolderAccessEntry",
+    "FolderGrantView",
+    "FolderGrants",
+    "NotGrantable",
+    "temp_roots",
+]

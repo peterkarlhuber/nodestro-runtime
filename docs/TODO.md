@@ -665,7 +665,16 @@ Items that need an independent or external review (an internal audit does not re
   - folder content (file text, search snippets) is not marked as shared content yet (review L3): a cloud model
     request with it does not need the per-provider grant of spec 7.2. N-08 (provenance, `shared_content`) covers it;
     it is a precondition for activation;
-  - review L11 (independent review of 87b38cb): no change needed; recorded here so it is not raised again.
+  - review L11 (no change needed): file content persists in the run's tool-call records and in the run event
+    `folder_file_read` (which names relative paths), as with every other tool's results;
+  - re-review (1193824), no change needed: a third-party writer can rename an entry between the access check and
+    the open (the guard pins identities and opens relative to the parent; the deny is evaluated again for the
+    stored names while opening, so only a rename into a not-denied name gets through, as with any reader);
+  - re-review: a search's deadline is checked between entries, so a read in progress (PDF budget, a large file)
+    can overrun it: worst case about 40 s plus one read;
+  - re-review: denies stored before folder denies were canonical (L5) are not migrated; the switch has never been
+    on, so there are none;
+  - re-review: shared content is not marked yet (L3 above; N-08).
 - **Next step:** Independent review; nodestro-api routes (`/api/folders`) and the studio texts are in the same
   change.
 
