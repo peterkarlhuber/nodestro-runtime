@@ -437,6 +437,9 @@ class PostgresEventLog:
         return [RunEvent.model_validate_json(row[0]) for row in rows]
 
     def delete(self, run_id: str) -> int:
+        """Delete the stored events of a run, also the ones still waiting in the buffer (a deleted run's)."""
+        with self._lock:
+            self._buffer = [event for event in self._buffer if event.run_id != run_id]
         return self.database._write(
             "DELETE FROM nodestro_run_events WHERE tenant_id = %s AND run_id = %s", (self.tenant_id, run_id)
         )
@@ -466,6 +469,7 @@ class QueuedRuns:
         self.runs.dispatch = self.dispatch
         self.runs.remote_cancel = self.cancel
         self.runs.remote_events = lambda run_id, after: log.events(run_id, after=after)
+        self.runs.remote_delete_events = log.delete
 
     def dispatch(self, run: Run) -> None:
         if self.queue.enqueue(self.tenant_id, RUN_JOB, run.id) is None:
@@ -711,6 +715,7 @@ class RunWorker:
         if log is None:
             log = self._logs[tenant_id] = PostgresEventLog(self.queue.database, tenant_id)
         runs.event_sink = log.append
+        runs.remote_delete_events = log.delete
         gate = getattr(runs, "tool_gate", None)
         if gate is not None:
             gate.slots = self.slots

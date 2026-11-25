@@ -588,6 +588,8 @@ class Workspace:
         #: Conversations with own agents (N-04): each answer is a run of this manager; the API serves them only while
         #: ``NODESTRO_CONVERSATIONS=1``.
         self.conversations = Conversations(self)
+        # An answer's run whose conversation was deleted while it ran is deleted once it stops (RT-089).
+        self.runs.listeners.append(self.conversations.run_stopped)
         # N-09: the answers' runs read their conversation's offline flag at every call.
         self.runs.conversation_offline = self.conversations.is_offline
         self.runs.after_run = self.files.write_outputs
@@ -599,6 +601,11 @@ class Workspace:
         if storage is None:
             # Runs that were executing when Nodestro stopped can never finish; they become continuable.
             self.runs.recover()
+            # Answers' runs of conversations deleted while they ran, left when Nodestro stopped (RT-089).
+            try:
+                self.conversations.sweep_orphan_runs()
+            except Exception:  # housekeeping; it never stops Nodestro from starting
+                logging.getLogger(__name__).exception("Deleting the runs of deleted conversations failed")
             # Runs paused at a tool call (M6b): overdue questions expire before anything continues; with the
             # switch off their questions are closed. Continuing them needs the event loop (the app's sweep).
             try:
