@@ -582,22 +582,47 @@ Items that need an independent or external review (an internal audit does not re
     waits inside the send request (up to 300 s; a later step could summarize after an answer instead) and costs one
     extra helper request per answer whose history does not fit, and token counts are estimates (orkexa ORK-046);
   - N-05 review L2: a summary run that starts after its conversation was deleted mid-send is cancelled and deleted by
-    `Conversations._summarize` itself (the deletion code in `delete` is unchanged). The answer deletion rework on
-    `claude/w3-conv-ui` (P4a) should take summary runs (node `summary`, trigger `conversation`) into account;
-  - earlier files of a conversation are not offered to later answers (only the files sent with a message);
+    `Conversations._summarize` itself. The RT-089 deletion takes summary runs (node `summary`, trigger
+    `conversation`, `trigger_ref` the conversation) like answers' runs: the delete finds them by `trigger_ref`, and one
+    still going is deleted once it stops or by the sweep
+    (`test_w3p4a_a_summary_run_still_going_after_the_delete_is_deleted_once_it_stops`);
   - only agent templates answer, not agent nodes of a workflow;
   - the provenance field is a placeholder until N-08;
   - Done (N-09, 2026-11-21): the offline flag applies the offline rules at every call of the answers and the runs
     below them ([offline.md](offline.md));
   - workflow- and agent-scoped grants and denies do not reach conversations (L-1, documented); agent ids of their
     own close it;
-  - a run still going 10 seconds after its conversation was deleted stays (hidden from everyone) until it is
-    deleted by hand.
-  - an answer has run memory only (W3-S1 review): a memory of one's own per conversation (a space only its owner
-    reaches) is open;
+  - a memory of one's own per conversation (a space only its owner reaches): **decided to stay open** (W3,
+    2026-11-21). Answers keep run memory (W3-S1 review). A space of one's own needs memory spaces with an owner,
+    which they do not have: every member lists, reads, searches and edits every space (`/api/memory`, the memory
+    browser, the assistant's attachments, knowledge adoption, backups and the access audit), so each of those paths
+    would need the owner check that conversations have, plus its own deletion with the conversation. That is a
+    change of the memory model, not of conversations, and a wrong path would hand the conversation to every member.
+    The history (N-05 compacts it) and the earlier files (below) carry what an answer needs meanwhile. Revisit with
+    owned memory spaces;
   - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
     run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
-- **Next step:** The studio UI for conversations; N-05 and N-08 build on it.
+  - Done (W3, 2026-11-21): a run still going after its conversation was deleted is deleted once it stops
+    (`Conversations.run_stopped`, `sweep_orphan_runs`;
+    `test_rt089_a_run_still_going_after_its_conversation_was_deleted_is_deleted_once_it_stops`,
+    `test_rt089_the_start_deletes_the_runs_left_by_deleted_conversations`).
+  - Done (W3, 2026-11-21): earlier files of a conversation are offered to later answers as reference files (overview,
+    read on demand), of its owner only (`Run.reference_file_ids`,
+    `test_rt089_earlier_files_are_offered_to_later_answers_of_their_owner_only`).
+  - Done (W3-P4a review, 2026-11-21): M-1, an imported trace never runs and reaches no file: `refuse_imported`
+    (`run.imported`) in `RunManager._launch`, `decide`, `decide_tool_call` and `decide_budget`; `import_trace` drops
+    `file_ids` and `reference_file_ids` and stores a paused trace as stopped; `file_delivery.collect` leaves out a
+    conversation's file unless the run acts for whoever uploaded it
+    (`test_w3p4a_m1_an_imported_trace_is_stored_stopped_and_names_no_files`,
+    `test_w3p4a_m1_an_imported_run_never_runs_whatever_its_stored_state`,
+    `test_w3p4a_m1_a_run_never_gets_a_conversation_file_of_another_person`). L-1, an overview's outline is framed
+    as untrusted and capped (`OUTLINE_FILE_CHARS`, `OUTLINE_TOTAL_CHARS`). L-2, a deleted answer's run takes its
+    events with it (`RunManager.delete_events`, `PostgresEventLog.delete` also drops buffered events; a late event
+    of a deleted run is not stored). L-3, a deletion that outlasts the 10-second wait is swept on a server too: the
+    nodestro-api worker's leader runs `sweep_orphan_runs` for every active tenant
+    (`ServerWorker.sweep_conversation_runs`); the desktop sweeps at its start.
+- **Next step:** The studio UI for conversations (nodestro-studio, branch `claude/w3-conv-ui`); N-05 and N-08 build
+  on it.
 
 ### RT-092 · Offline per agent and per conversation (N-09): follow-ups
 

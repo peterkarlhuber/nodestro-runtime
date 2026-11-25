@@ -37,7 +37,9 @@ switched between answers. Its parts:
   conversation refuses cloud models.
 - **Files**: files are input files of origin ``conversation`` and go to the answer's run as run files, so the run's
   file delivery decides how the model gets them: an image only as an image to a model with image input, otherwise
-  it is marked unavailable (:mod:`nodestro_runtime.file_delivery`).
+  it is marked unavailable (:mod:`nodestro_runtime.file_delivery`). The files sent with earlier messages that are
+  still in the conversation are offered to the answer as reference files: an overview, read on demand with the files
+  tool (RT-089).
 - **Export**: :meth:`Conversations.export_markdown`.
 
 The switch :data:`CONVERSATIONS_ENV` (default off) guards the API routes (nodestro-api); this module itself has no
@@ -50,6 +52,7 @@ import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 import json
+import logging
 import os
 import re
 import sys
@@ -96,6 +99,12 @@ from .schemas import (
 if TYPE_CHECKING:
     from .workspace import Workspace
 
+logger = logging.getLogger(__name__)
+#: The deletions waiting for an answer's run of a deleted conversation to stop (:meth:`Conversations.run_stopped`),
+#: held only so they are not garbage collected. No state of a conversation (L-4): the conversation is gone, deleting is
+#: idempotent, and a deletion lost with the process is done by the next sweep.
+_DELETING: set[asyncio.Task[None]] = set()
+
 #: The switch of the conversation API (N-04): ``1`` turns it on; off by default.
 CONVERSATIONS_ENV = "NODESTRO_CONVERSATIONS"
 COLLECTION = "conversations"
@@ -128,8 +137,11 @@ RESERVATION_TIMEOUT = timedelta(minutes=10)
 #: The ``run_id`` of a reserved answer whose run is starting. The send that reserved it and a reader that finds it
 #: expired both replace it only while it is still this value (a compare-and-set), so exactly one of them wins (N-4).
 RESERVED = ""
-#: How long deleting a conversation waits for its cancelled answer to stop before it deletes the answer's run.
+#: How long deleting a conversation waits for its cancelled answer to stop before it deletes the answer's run; a run
+#: still going then is deleted once it stops (:meth:`Conversations.run_stopped`, RT-089).
 DELETE_WAIT_SECONDS = 10.0
+#: The most earlier files of the conversation an answer is offered (the newest ones; RT-089).
+EARLIER_FILES = 20
 #: The owner of a request without an owner identity on a multi-user installation (W3-S1): a server principal without
 #: a role in the tenant (a service, a machine, anything that is not a member). It sees no conversation, no answer run
 #: and no file of a conversation, and it starts none (fail closed). ``None`` is only the desktop's single person, who
@@ -393,6 +405,22 @@ def render_input(turns: tuple[Turn, ...] | list[Turn]) -> str:
             parts.append(f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.text}")
     parts.append(f"The user's new message:\n{new.text}")
     return "\n\n".join(parts)
+
+
+def earlier_files(conversation: Conversation, history: list[ConversationMessage], sent: list[str]) -> list[str]:
+    """The files an answer is offered besides the ones sent with its message (RT-089): the files sent with earlier
+    messages of this conversation that are still in it (a removed file is deleted), newest first, at most
+    :data:`EARLIER_FILES`. Only files of the conversation itself: the caller has checked that ``owner`` sees it, and the
+    answer's run is seen by nobody else (H-1). A file uploaded but never sent is not offered."""
+    present = {item.id for item in conversation.files}
+    found: list[str] = []
+    for message in sorted(history, key=lambda item: item.seq, reverse=True):
+        if message.role != "user":
+            continue
+        for item in message.attachments:
+            if item.file_id in present and item.file_id not in sent and item.file_id not in found:
+                found.append(item.file_id)
+    return found[:EARLIER_FILES]
 
 
 def answer_input(history: list[ConversationMessage], content: str) -> str:
@@ -765,10 +793,10 @@ class Conversations:
     async def delete(self, conversation_id: str, owner: str | None) -> None:
         """Delete the conversation with its messages, files and the answers' runs (H-1: the runs hold the messages as
         input, the answers as output and the files). A running answer is cancelled first and deleted once it stopped
-        (at most :data:`DELETE_WAIT_SECONDS`; a run that is still going then stays, and :meth:`run_visible` hides it
-        from everyone). The usage ledger keeps the cost. The caller revokes the grants for "this conversation"
-        (``revoke_conversation`` of the tool approval rules, L-2): only a person's request writes
-        grants."""
+        (at most :data:`DELETE_WAIT_SECONDS`; a run that is still going then is hidden from everyone by
+        :meth:`run_visible` and deleted once it stops, :meth:`run_stopped`, RT-089). The usage ledger keeps the cost.
+        The caller revokes the grants for "this conversation" (``revoke_conversation`` of the tool approval rules,
+        L-2): only a person's request writes grants."""
         with self.store.transaction():
             self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
@@ -789,6 +817,52 @@ class Conversations:
         for file in conversation.files:
             if file.id in self.workspace.inputs:
                 self.workspace.inputs.delete(file.id, force=True)
+
+    # ---- the runs of deleted conversations (RT-089) ------------------------------------------------------------------
+
+    def _orphan(self, run: Run) -> bool:
+        """Whether ``run`` is a stopped answer's run whose conversation is gone (deleted while it ran)."""
+        if run.trigger != "conversation" or run.parent_run_id or run.status in ("queued", "running", "paused"):
+            return False
+        # Only a conversation that is gone: a stored one of another tenant hides the run (run_visible) but is not
+        # taken as deleted.
+        return self.store.get_raw(COLLECTION, run.trigger_ref or "") is None
+
+    def run_stopped(self, run: Run) -> None:
+        """A listener of the run manager (every stop of a run): an answer's run whose conversation was deleted while it
+        ran is deleted once it stopped, with everything stored for it (as the delete does). Called in the process that
+        executed it, and by the reaper's interrupt on a server; the desktop's start sweeps the rest
+        (:meth:`sweep_orphan_runs`)."""
+        if not self._orphan(run):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or not self.workspace.runs.is_live(run.id):
+            self._delete_run(run.id)
+            return
+        # The engine still finishes the run's execution (its last event): delete it right after.
+        task = loop.create_task(self._delete_when_stopped(run.id))
+        _DELETING.add(task)
+        task.add_done_callback(_DELETING.discard)
+
+    async def _delete_when_stopped(self, run_id: str) -> None:
+        try:
+            if await self._stopped(run_id):
+                self._delete_run(run_id)
+        except Exception:  # housekeeping: the next sweep tries again; the run stays hidden meanwhile
+            logger.exception("Deleting run %s of a deleted conversation failed", run_id)
+
+    def sweep_orphan_runs(self) -> list[str]:
+        """Delete every stopped answer's run whose conversation is gone (a run that was still going when its
+        conversation was deleted, and the process ended before it stopped). Returns the deleted run ids."""
+        deleted: list[str] = []
+        for run in self.store.find("runs", "trigger", ["conversation"], Run):
+            if self._orphan(run) and not self.workspace.runs.is_live(run.id):
+                self._delete_run(run.id)
+                deleted.append(run.id)
+        return deleted
 
     async def _stopped(self, run_id: str) -> bool:
         loop = asyncio.get_running_loop()
@@ -820,6 +894,9 @@ class Conversations:
             self.store.delete("runs", item.id)
             self.workspace.files.delete_run(item.id)
             self.workspace.runs.discard_tool_waits(item.id, because="run.deleted")
+            # Its events too, here and in the server's event table (W3-P4a L-2); a last event of an execution
+            # that ends after this is not stored.
+            self.workspace.runs.delete_events(item.id)
         self.workspace.runs.chat.delete_run(run.id)
         self.workspace.inputs.release([file_id for item in tree for file_id in item.file_ids])
 
@@ -899,7 +976,7 @@ class Conversations:
         if not content and not request.file_ids:
             raise NodestroError("conversation.empty_message", "The message is empty")
         file_ids = list(dict.fromkeys(request.file_ids))
-        conversation, user, answer, budget = self._reserve(conversation_id, owner, content, file_ids)
+        conversation, user, answer, budget, earlier_ids = self._reserve(conversation_id, owner, content, file_ids)
         try:
             ref, template_agent = self._agent(
                 AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
@@ -947,6 +1024,7 @@ class Conversations:
                 trigger="conversation",
                 trigger_ref=conversation.id,
                 started_by=actor,
+                reference_file_ids=earlier_ids,
             )
         except BaseException:
             self._release(conversation_id, user, answer)
@@ -1096,8 +1174,9 @@ class Conversations:
 
     def _reserve(
         self, conversation_id: str, owner: str | None, content: str, file_ids: list[str]
-    ) -> tuple[Conversation, ConversationMessage, ConversationMessage, float | None]:
-        """Check and store the user's message and a queued answer without a run, in one transaction."""
+    ) -> tuple[Conversation, ConversationMessage, ConversationMessage, float | None, list[str]]:
+        """Check and store the user's message and a queued answer without a run, in one transaction. Also returns the
+        earlier files the answer is offered (:func:`earlier_files`)."""
         with self.store.transaction():
             self.store.lock(COLLECTION, conversation_id)
             conversation = self._stored(conversation_id, owner)
@@ -1151,7 +1230,7 @@ class Conversations:
                     raise NodestroError("conversation.answer_running", "Wait until the current answer is finished")
             reserved = conversation.model_copy(update={"last_seq": answer.seq, "updated_at": now()})
             self.store.put(COLLECTION, conversation_id, reserved)
-        return reserved, user, answer, budget
+        return reserved, user, answer, budget, earlier_files(conversation, history, file_ids)
 
     def _release(self, conversation_id: str, user: ConversationMessage, answer: ConversationMessage) -> None:
         """Remove a reservation whose run did not start (the sequence numbers stay used)."""
@@ -1390,6 +1469,7 @@ __all__ = [
     "answer_input",
     "answer_workflow",
     "conversations_enabled",
+    "earlier_files",
     "history_budget",
     "history_turns",
     "render_input",

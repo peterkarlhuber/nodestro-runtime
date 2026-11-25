@@ -89,7 +89,7 @@ def test_the_answer_reservation_holds_across_processes(database: PostgresDatabas
             ConversationIn(agent=AgentChoice(template_id=template_id), model="anthropic:claude-sonnet-5-5"),
             owner="usr_alice",
         )
-        _conversation, user, answer, _budget = first.conversations._reserve(created.id, "usr_alice", "one", [])
+        _, user, answer, _, _ = first.conversations._reserve(created.id, "usr_alice", "one", [])
         with pytest.raises(NodestroError) as caught:
             second.conversations._reserve(created.id, "usr_alice", "two", [])
         assert caught.value.code == "conversation.answer_running"
@@ -100,3 +100,21 @@ def test_the_answer_reservation_holds_across_processes(database: PostgresDatabas
     finally:
         first.close()
         second.close()
+
+
+def test_w3p4a_l2_deleting_a_runs_events_also_drops_the_ones_still_buffered(database: PostgresDatabase) -> None:
+    """The events of a deleted run go from the event table, also those still waiting in a worker's buffer: a later
+    flush never writes them back (the run's last events can be buffered when its conversation is deleted)."""
+    from nodestro_runtime.jobs import PostgresEventLog
+    from nodestro_runtime.schemas import RunEvent
+
+    log = PostgresEventLog(database, "alpha")
+    kept = PostgresEventLog(database, "alpha")
+    log.append(RunEvent(seq=1, run_id="run_gone", type="run_started", data={}))  # written at once
+    log.append(RunEvent(seq=2, run_id="run_gone", type="text", node_id="agent", data={"text": "a"}))  # buffered
+    log.append(RunEvent(seq=1, run_id="run_kept", type="text", node_id="agent", data={"text": "b"}))  # buffered
+    assert [event.seq for event in log.events("run_gone")] == [1]
+    log.delete("run_gone")
+    log.flush()
+    assert log.events("run_gone") == []
+    assert [event.seq for event in kept.events("run_kept")] == [1]  # the other run's buffered event is written
