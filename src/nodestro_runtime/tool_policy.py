@@ -982,9 +982,9 @@ def site_access(
     shared_content: bool = False,
 ) -> AccessExplanation:
     """:func:`explain` for a workflow start or a cloud model request (actions :data:`SITE_ACTIONS`). ``agent``
-    overrides the context's agent (``None`` for a top-level start); ``shared_content`` says the conversation holds
-    content from a granted source (N-08 provenance; nothing sets it yet). It refuses exactly when ``allowed`` is
-    ``False``."""
+    overrides the context's agent (``None`` for a top-level start); ``shared_content`` says the conversation or run
+    holds content from a granted source (N-08 provenance; also ``access.shared_content``): a cloud model then needs
+    a grant. It refuses exactly when ``allowed`` is ``False``."""
     action = SITE_ACTIONS[resource.type]
     request = AccessRequest(
         resource=resource,
@@ -993,7 +993,7 @@ def site_access(
         agent=agent,
         mode="supervised" if attended else "unattended",
         conversation_id=access.conversation_id,
-        shared_content=shared_content,
+        shared_content=shared_content or access.shared_content,
         offline=access.offline,
     )
     return explain(request, grants=access.grants, denies=access.denies, at=at)
@@ -1013,6 +1013,9 @@ class AccessContext(BaseModel):
     protected_folders: tuple[str, ...] = ()
     #: Local (``stdio``) MCP servers: strict offline does not refuse their tools (they run on this computer).
     local_servers: frozenset[str] = frozenset()
+    #: N-08: the conversation or run holds content of a granted source (only while the provenance switch is on):
+    #: every call that reaches outside then needs a grant (:func:`provenance_refusal`).
+    shared_content: bool = False
 
 
 def agent_ref(workflow_id: str, node_id: str) -> str:
@@ -1041,6 +1044,7 @@ def tool_access(
         agent=access.agent,
         mode="supervised" if attended else "unattended",
         conversation_id=access.conversation_id,
+        shared_content=access.shared_content,
         offline=access.offline,
         tool=ToolFacts.of(capability, version=version, definition_hash=definition_hash),
     )
@@ -1237,13 +1241,101 @@ def decide(
         and (binding is None or binding.ask != "always")
     ):
         return GateDecision(action="allow", access_source=found.source)
+    held = provenance_refusal(tool, capability, context, found, at=at, related=related)
+    if held is not None and verdict.action != "deny":
+        return held
+    if (
+        verdict.action == "allow"
+        and found is not None
+        and found.source.startswith("grant:")
+        and context.access is not None
+        and context.access.shared_content
+        and capability.reach == "external"
+    ):
+        # N-08: the grant is what lets this call reach outside with granted content; the person sees which one.
+        return verdict.model_copy(update={"access_source": found.source})
     return verdict
+
+
+def egress_granted(
+    capability: ToolCapability,
+    context: CallContext,
+    found: AccessDecision | None,
+    *,
+    at: datetime,
+    related: Sequence[AccessResource] = (),
+) -> bool:
+    """N-08: whether a call may reach outside although its conversation or run holds content of a granted source.
+
+    ``True`` when nothing holds it: the provenance switch is off (``context.access`` is ``None`` or has no
+    ``shared_content``), the call stays inside (``reach`` ``internal``), or a grant covers it: one on the tool
+    itself (``found``, as :func:`tool_access` evaluated it with the shared content), or one on the service the call
+    uses (``related``: its MCP server or its connection). A grant on the service only satisfies this rule; it never
+    lifts a question of S-2 or the MCP rules (:func:`decide`)."""
+    access = context.access
+    if access is None or not access.shared_content or capability.reach != "external":
+        return True
+    if found is not None and found.allowed and found.source.startswith("grant:"):
+        return True
+    for resource in related:
+        service = related_access(resource, capability, access, attended=context.attended, at=at)
+        if service.allowed and service.source.startswith("grant:"):
+            return True
+    return False
+
+
+def refusal_of(
+    resource: AccessResource, found: AccessDecision, *, action: AccessAction = "execute", effect: EffectClass
+) -> AccessExplanation:
+    """The explanation of a refusal where no call site of :func:`explain` fits (N-08: a server tool of a request that
+    holds content of a granted source). ``found`` is what :func:`evaluate` said; a decision that allowed is refused
+    as a missing grant (it needed a grant and found none)."""
+    kind: DenialKind = found.kind if found.kind is not None else "missing_grant"
+    name = found.source.partition(":")[2] if found.source.startswith("limit:") else None
+    return AccessExplanation(
+        resource=resource,
+        action=action,
+        effect=effect,
+        allowed=False,
+        outcome="refused",
+        kind=kind,
+        code=_DENIAL_CODES[kind],
+        source=found.source if found.kind is not None else "none",
+        limit=name,
+        limit_text=SAFETY_LIMITS.get(name) if name else None,
+    )
+
+
+def provenance_refusal(
+    tool: str,
+    capability: ToolCapability,
+    context: CallContext,
+    found: AccessDecision | None,
+    *,
+    at: datetime,
+    related: Sequence[AccessResource] = (),
+) -> GateDecision | None:
+    """N-08: what happens to a call that reaches outside from a conversation or run with content of a granted source
+    and that no grant covers (:func:`egress_granted`); ``None`` when it may go on as S-2 decides.
+
+    - A person watches: the call is asked (the existing approval card shows its arguments, e.g. a web search's
+      query, before anything is sent). A confirmation lets this one call run, like a ``once`` grant.
+    - Nobody watches: it is refused with ``access.missing_grant`` (no question can be answered)."""
+    if egress_granted(capability, context, found, at=at, related=related):
+        return None
+    if context.attended:
+        return ASK
+    reason = _ACCESS_REASONS["missing_grant"].format(tool=tool)
+    return GateDecision(
+        action="deny", code="access.missing_grant", reason=reason, access_source=found.source if found else None
+    )
 
 
 #: What a refused call tells the agent: no path, no record id, no limit name (N-07; the person sees the source).
 _ACCESS_REASONS: dict[str, str] = {
     "denied": "The tool {tool} is blocked for this agent",
     "safety_limit": "The tool {tool} is not allowed here by a fixed safety rule",
+    "missing_grant": "The tool {tool} would send content from a granted source outside, and no permission covers it",
 }
 
 
@@ -1328,11 +1420,14 @@ __all__ = [
     "effect_class",
     "effect_for",
     "effect_of",
+    "egress_granted",
     "evaluate",
     "explain",
     "folder_parts",
     "matching_pre_grant",
     "parse_capability",
+    "provenance_refusal",
+    "refusal_of",
     "related_access",
     "safety_limit",
     "server_tool_capability",

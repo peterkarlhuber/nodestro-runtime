@@ -208,9 +208,11 @@ the related resources over the whole S-2 matrix, and runs with stored records be
   (`ToolGate(local_mcp=...)`, `AccessContext.local_servers`): it runs on this computer. Its denies still hold.
 - **Connections** are the ones the agent's tool settings name. A deny for some agents also holds when the gate
   cannot name the agent (fail closed).
-- **Cloud models.** The default rule of spec 7.2 allows a cloud model without shared content. Nothing marks shared
-  content yet (N-08 provenance), so today only a deny or a safety limit (strict offline: `limit:offline`) refuses.
-  The check runs when a turn connects, so a new deny applies at the next turn. An agent test and the live run chat
+- **Cloud models.** The default rule of spec 7.2 allows a cloud model without shared content. Without N-08 only a
+  deny or a safety limit (strict offline: `limit:offline`) refuses. With N-08's switch on, a conversation or run that
+  holds content of a granted source marks it as shared content, and a cloud model then needs a grant
+  ([content-provenance.md](content-provenance.md)). The check runs when a turn connects, so a new deny applies at the
+  next turn; with N-08 a turn that holds granted content is checked before each request too. An agent test and the live run chat
   have no agent: a deny for some agents holds there too.
 - `Workspace.connect_model(model, actor=..., attended=..., probe=...)`: `attended=False` for a caller nobody watches
   (a benchmark judge), so denies and limits for unattended use apply; `probe=True` for a check whether a model can
@@ -286,7 +288,7 @@ now. They are for people and the administration only; a model never gets an expl
 ## Not in this step
 
 - The api query and write routes, and the studio approval cards and overview.
-- Marking shared content (N-08), so a cloud model request with shared content needs a grant.
+- Marking shared content is N-08, behind its own switch: [content-provenance.md](content-provenance.md).
 - A grant on a workflow, MCP server or connection that lifts a question (spec 7.2 "Freigabe je Dienst/Ziel").
 - The `DenialNotice` type (N-07).
 

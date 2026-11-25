@@ -993,7 +993,13 @@ def answer_question(
             scope = _offline_scope(manager, root, target_run)
             if scope is not None:
                 check_provider(provider_of(model), scope)
-            manager.check_cloud_access(provider_of(model), run_id=question.run_id, actor=question.author)
+            # N-08: a snapshot of a run with content of a granted source needs a grant for a cloud model.
+            manager.check_cloud_access(
+                provider_of(model),
+                run_id=question.run_id,
+                actor=question.author,
+                shared_content=manager.content_granted(root) or manager.content_granted(target_run),
+            )
             connection = manager.connect(provider_of(model))
             if scope is not None:
                 check_connection(connection, scope, docker=manager.builder.mode == "local-container")

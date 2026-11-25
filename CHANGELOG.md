@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Egress protection by content provenance (N-08), off by default (`NODESTRO_CONTENT_PROVENANCE=1`, effective only with
+  `NODESTRO_ACCESS_GRANTS=1` and `NODESTRO_TOOL_APPROVALS=1`). See [docs/content-provenance.md](docs/content-provenance.md).
+  - Once content of a granted source (a folder, knowledge, persistent memory, an attached file) enters a run, the run
+    and the conversation it answers in are marked: `Run.granted_content` (left out of stored records while unset) and
+    `Conversation.provenance` = `granted_content` (new value; monotonic). The run event `content_provenance` shows it.
+    The source comes from the tools' declaration (orkexa `Tool(content_source=...)`, `ToolCall.content_source`): the
+    folder tools declare `folder`, the input files tool `attachment`, knowledge and memory tools theirs; run memory
+    declares none.
+  - From then on every tool call that reaches outside (web tools, every MCP tool, tools with external reach) needs an
+    N-06 grant on the tool or on the service it uses (its MCP server or connection): a person is asked with the
+    existing approval card (a web search shows its query), an unattended call is refused with
+    `access.missing_grant` (`tool_policy.provenance_refusal`, `egress_granted`). Denies and safety limits come first;
+    strict offline refuses every path. A grant on a service never lifts a question or the MCP rules.
+  - Every cloud model request then needs a grant on the cloud provider: at the connection (agent turns, orchestrator
+    decisions, judges, `Workspace.connect_model(..., shared_content=)`, `RunManager.check_cloud_access(...,
+    shared_content=)`, run chat, a conversation's summary) and before each request of a turn that holds granted
+    content (`RunManager._check_egress`), which also refuses server tools that reach outside without a tool grant.
+    Agent tests do the same for the one test.
+  - The mark reaches sub-workflows and team runs (they share the top-level run), the conversation's next answers and
+    a continued run; `RunManager.content_granted(run)` reads it for callers that send a finished run's content.
+  - New: `tool_approvals.PROVENANCE_ENV`, `provenance_enabled`, `ToolGate(provenance=)`, `ToolGate.call_context(...,
+    shared_content=)`, `ToolGate.site_refusal(..., shared_content=)`, `AccessContext.shared_content`,
+    `tool_policy.refusal_of`, `Conversations.is_granted` and `mark_granted`, `RunManager.holds_granted`,
+    `mark_granted` and `content_granted`. Needs orkexa with `Tool(content_source=...)` (paired lock).
+  - Tests: `tests/test_content_provenance.py` (U-7 with scripted models and a counting network and provider mock).
+  - `mcp/netguard.py` stays: it is not a forwarding copy (MCP's egress policy, `httpcore2` backend, error codes and the
+    response cap on top of `orkexa.net.guard`).
+
 - Granted folders (N-10), off by default (`NODESTRO_FOLDER_GRANTS=1`; activation after the independent review). A
   person grants a folder for reading; agents read it with the new tools `list_folder`, `read_file` and
   `search_files`. See [docs/folders.md](docs/folders.md).

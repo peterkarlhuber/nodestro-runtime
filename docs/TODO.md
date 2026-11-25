@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 9 |
-| P3 Low | 35 |
+| P3 Low | 36 |
 | P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -82,11 +82,12 @@ None known.
 - **Priority:** P3 Low · **Status:** Open · **Refs:** RT-086, [docs/access-grants.md](access-grants.md) "At the
   other call sites", `tests/test_access_grants_sites.py`
 - **What:** The checks at workflow starts, MCP servers, connections and cloud models only refuse. Open:
-  - shared content is never marked yet (N-08 provenance), so a cloud model request with content does not need a
-    grant per provider and agent (spec 7.2) until N-08 sets `shared_content`;
+  - Done with N-08 (behind its own switch, RT-094): content of a granted source marks the run and the conversation, and
+    a cloud model request with that content then needs a grant (`shared_content`);
   - a grant on a workflow, MCP server or connection does not lift a question (spec 7.2 "Freigabe je Dienst", "je
     Ziel"); MCP stays strict by design;
-  - a cloud model is checked when a turn connects, not before each request of a long turn;
+  - a cloud model is checked when a turn connects, not before each request of a long turn (with N-08 on, a turn that
+    holds granted content is checked before each request);
   - the api passes the signed-in user as `actor` to `connect_model` and `AgentTester.run` (until then their audit
     actor is `system` and the error has no source);
   - a top-level workflow start counts only records for all agents (a start is a person's or a trigger's).
@@ -587,7 +588,8 @@ Items that need an independent or external review (an internal audit does not re
     still going is deleted once it stops or by the sweep
     (`test_w3p4a_a_summary_run_still_going_after_the_delete_is_deleted_once_it_stops`);
   - only agent templates answer, not agent nodes of a workflow;
-  - the provenance field is a placeholder until N-08;
+  - Done (N-08, RT-094): `provenance` is `granted_content` once an answer held content of a granted source (while
+    the switch is on), and every later answer needs grants for what leaves the computer;
   - Done (N-09, 2026-11-21): the offline flag applies the offline rules at every call of the answers and the runs
     below them ([offline.md](offline.md));
   - workflow- and agent-scoped grants and denies do not reach conversations (L-1, documented); agent ids of their
@@ -665,6 +667,26 @@ Items that need an independent or external review (an internal audit does not re
   - search snippets are short excerpts of file content returned without the data markers of `read_file`.
 - **Next step:** Independent review; nodestro-api routes (`/api/folders`) and the studio texts are in the same
   change.
+
+### RT-094 · Egress protection by content provenance (N-08): activation and follow-ups
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** [docs/content-provenance.md](content-provenance.md),
+  `tests/test_content_provenance.py`, orkexa ORK-047 (`Tool(content_source=...)`), RT-086, RT-088, RT-093
+- **What:** Behind `NODESTRO_CONTENT_PROVENANCE` (default off, effective only with `NODESTRO_ACCESS_GRANTS`): once
+  content of a granted folder, knowledge, persistent memory or an attached file is in a conversation or run, every
+  outbound tool call (web tools, MCP, tools with external reach) and every cloud model request needs an N-06 grant; a
+  person is asked with the existing approval card (a web search shows its query), an unattended call is refused with
+  `access.missing_grant`. Open:
+  - the mark is per conversation and execution, not per piece of content, so one folder read makes every outbound
+    call of the conversation need a grant;
+  - tools without a declared content source (own tools, MCP tools) are not seen as granted sources;
+  - content that entered before the switch was on is `unchecked`;
+  - `explain` and `who_may` explain the records, not a run's mark;
+  - the api passes `shared_content` for the assistant's run attachment and a test series' judge (nodestro-api
+    branch `claude/w3-n08`); other api callers of `connect_model` send no run content;
+  - Nodestro has no transport that starts a workflow on another installation; a workflow elsewhere is reached through
+    a tool and counts as external there. Revisit if such a transport is added.
+- **Next step:** Independent review together with RT-093 (N-10); the owner decides about activation after gate G-2.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 

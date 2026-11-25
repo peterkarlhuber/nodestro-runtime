@@ -18,7 +18,7 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 | `agent` | `TemplateRef`: the agent template and its version (`template_id`, `version`) |
 | `model` | The model of the next answer (`provider:model`) |
 | `offline` | Only local models answer; a cloud model is refused (`conversation.offline_cloud_model`). Every call of the answers, and of runs below them, follows the offline rules (N-09, [offline.md](offline.md)) |
-| `provenance` | Placeholder for N-08 (always `unchecked`) |
+| `provenance` | N-08: `granted_content` once an answer held content of a granted source while the switch was on, else `unchecked`; never reset ([content-provenance.md](content-provenance.md)) |
 | `budget_usd` | The budget over all answers (`None`: each answer has the default budget) |
 | `history` | How earlier messages that no longer fit the model's context window are shortened: `trim` (default) or `summarize` (N-05, see [Long conversations](#long-conversations-n-05)) |
 | `summary_model` | The helper model of `summarize` (`None`: the conversation's model); never a cloud model when offline |

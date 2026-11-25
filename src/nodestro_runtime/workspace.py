@@ -138,6 +138,7 @@ from .tool_approvals import (
     approvals_enabled,
     checkpoints_enabled,
     max_paused,
+    provenance_enabled,
     record_audit,
 )
 from .tool_drafts import ToolDrafts
@@ -517,6 +518,8 @@ class Workspace:
                 offline=self.strict_offline,
                 protected_folders=(str(self.data_dir.resolve()),),
                 local_mcp=self._local_mcp_servers,
+                # N-08: egress protection by content provenance (a fourth switch, default off; needs the third).
+                provenance=provenance_enabled(),
             )
             # Changing MCP tools are usable only behind this gate (WP-5): every such call is asked (tool_policy.decide).
             self.mcp.write_gate = True
@@ -592,6 +595,8 @@ class Workspace:
         self.runs.listeners.append(self.conversations.run_stopped)
         # N-09: the answers' runs read their conversation's offline flag at every call.
         self.runs.conversation_offline = self.conversations.is_offline
+        self.runs.conversation_granted = self.conversations.is_granted
+        self.runs.mark_conversation_granted = self.conversations.mark_granted
         self.runs.after_run = self.files.write_outputs
         #: Runs of published releases (set by the HTTP API, which owns publishing; ``None``: none).
         self.published: PublishedRuns | None = None
@@ -1609,6 +1614,7 @@ class Workspace:
         attended: bool = True,
         probe: bool = False,
         offline: OfflineScope | None = None,
+        shared_content: bool = False,
     ) -> Connection:
         """The connection of a model's provider; a cloud model in the strict offline mode is refused first (also
         when its provider is not configured: a key would not help), then one the access model v2 blocks (N-06).
@@ -1619,14 +1625,20 @@ class Workspace:
         (``connection(provider)``) is not checked: it sends no content.
 
         ``offline`` (N-09): the content to send is offline content (:meth:`RunManager.content_offline_scope`), so only
-        a local model on this computer is connected; a cloud model is refused before its connection is resolved."""
+        a local model on this computer is connected; a cloud model is refused before its connection is resolved.
+
+        ``shared_content`` (N-08): the content to send holds content of a granted source
+        (:meth:`RunManager.content_granted`), so a cloud model needs a grant (only while the provenance switch is
+        on)."""
         provider = provider_of(model)
         if provider != "ollama" and self.strict_offline():
             raise _offline_cloud_model(model, provider)
         if offline is not None:
             check_provider(provider, offline)
         # N-06: a cloud model the access model v2 blocks is refused before anything is sent (only while it is on).
-        self.runs.check_cloud_access(provider, actor=actor, attended=attended, audit=not probe)
+        self.runs.check_cloud_access(
+            provider, actor=actor, attended=attended, audit=not probe, shared_content=shared_content
+        )
         connection = self.connection(provider)
         if offline is not None:
             check_connection(connection, offline, docker=self.builder.mode == "local-container")

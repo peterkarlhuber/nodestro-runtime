@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from .knowledge import KnowledgeBase
 
 TOOL_NAME = "input_files"
+#: What the input files tool declares about its content (``ToolCall.content_source``, N-08): an attached file.
+ATTACHMENT_CONTENT_SOURCE = "attachment"
 #: Characters one file may put into the context with ``auto``.
 INLINE_FILE_CHARS = 60_000
 #: Characters all files together may put into one agent's context.
@@ -491,7 +493,7 @@ def files_tool(
         except KeyError:
             raise ToolResultError("Error: the file is no longer available") from None
 
-    tool = Tool(input_files, name=TOOL_NAME)
+    tool = Tool(input_files, name=TOOL_NAME, content_source=ATTACHMENT_CONTENT_SOURCE)
     if subject != "this run" and tool.description:
         tool.description = tool.description.replace("this run", subject)
     return tool

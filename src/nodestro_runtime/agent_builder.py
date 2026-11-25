@@ -499,6 +499,8 @@ class AgentBuilder:
             memory = self.memory_spaces.open(config.memory.space)
         elif config.memory.mode == "run":
             memory = EphemeralMemory() if run_memory is None else run_memory()
+            # N-08: run memory holds only what this run wrote, so a memory call brings no granted content.
+            memory.content_source = None
 
         files, index = self.knowledge.views(config.knowledge)
         context_blocks: list[ContentBlock] = []

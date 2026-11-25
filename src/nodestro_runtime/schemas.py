@@ -1222,6 +1222,10 @@ class Run(_Model):
     nodes: dict[str, NodeRun] = Field(default_factory=dict)
     #: The run's source ledger (NAL-A2): every web source its tools saw; empty for runs without web tools.
     sources: list[SourceEntry] = Field(default_factory=list)
+    #: N-08 (egress protection by content provenance): content of a granted source (a folder, knowledge, persistent
+    #: memory, an attached file) entered this run or a run below it. Recorded only while the switch is on, never
+    #: cleared (monotonic). Left out of the stored record while unset, so runs stay byte-identical.
+    granted_content: bool = Field(default=False, exclude_if=lambda value: not value)
     #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
     #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
     flow_state: dict[str, Any] | None = None
