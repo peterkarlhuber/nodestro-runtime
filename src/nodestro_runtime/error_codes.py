@@ -41,6 +41,7 @@ _NOT_PARAMS = frozenset({"message", "level", "field"})
 NOT_CODES = frozenset(
     {
         "document.docx",
+        "folder.granted",
         "folder.listed",
         "folder.read",
         "folder.searched",

@@ -79,6 +79,16 @@
     - `list_folder` without a folder is logged (`folder.listed` without a grant id);
     - on Windows, a system folder named by the environment that cannot be compared (an 8.3 short name, a device
       path) now refuses every folder (`limit:unresolvable_path`) and logs a warning, instead of being skipped.
+  - Fixes from the re-review of N-10 (regression tests in `tests/test_folders.py`):
+    - M2: a deny could be passed by another spelling the path guard opens on a case-insensitive file system (on
+      NTFS `pr\u0131vate/pay.txt` opened the denied `private`). Denies now compare names with `orkexa.fs.fold`
+      (`tool_policy._within(fold=True)`; case folding, dotless i, default-ignorable characters), and the folder
+      tools evaluate the access model again for the names the file system stored while a path is opened
+      (`SafeRoot(on_open=...)`);
+    - a new grant is the activity event `folder.granted`, with code `default_excludes_off` when the default
+      excludes are off; `FolderGrants.accesses` lists only the tools' calls;
+    - `path` in listings and matches is escaped like `name`;
+    - `DEFAULT_EXCLUDES` also covers `*.p12`, `*.pfx`, `*.ppk` and `credentials*`.
 - Conversations (RT-089 follow-ups; still behind `NODESTRO_CONVERSATIONS` in the API, off by default):
   - An answer's run that is still going when its conversation is deleted (after the delete's wait of 10 seconds) is
     deleted once it stops (`Conversations.run_stopped`, a listener of the run manager; also on the reaper's

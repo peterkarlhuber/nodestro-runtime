@@ -57,7 +57,8 @@ COLLECTION = "folder_grants"
 MAX_FILE_BYTES = 50 * 1024 * 1024
 #: Common secret files every grant leaves out (``orkexa.fs`` patterns, compared without case) unless an
 #: administrator turns them off for one grant (``FolderGrant.default_excludes``): environment files, keys and
-#: certificates, SSH keys, package registry and netrc credentials, KeePass databases.
+#: certificates, SSH keys, package registry and netrc credentials, KeePass databases, PKCS#12 and PuTTY keys,
+#: credentials files.
 DEFAULT_EXCLUDES: tuple[str, ...] = (
     "**/.env*",
     "**/*.pem",
@@ -68,6 +69,10 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "**/.pypirc",
     "**/.netrc",
     "**/*.kdbx",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.ppk",
+    "**/credentials*",
 )
 
 Operation = Literal["list", "read", "search"]
@@ -262,7 +267,27 @@ class FolderReader:
             max_file_bytes=limits.max_file_bytes,
             max_entries=limits.max_entries,
             expect_identity=folder.identity,
+            on_open=self._opened(folder),
         )
+
+    def _opened(self, folder: FolderGrant) -> Callable[[tuple[str, ...]], None]:
+        """The path guard's ``on_open``: the access model for the names the file system stored for what is
+        opened, not the spelling asked for (N-10 re-review M2: on a case-insensitive file system, ``private``
+        spelled with a dotless i may open the denied ``private``). Uses the records of the moment the folder is
+        opened for this call."""
+        grants, denies = self.records()
+        own = next((grant for grant in grants if grant.id == folder.grant_id), None)
+
+        def check(names: tuple[str, ...]) -> None:
+            if not names:
+                return  # the granted folder itself: checked before every call
+            if own is None:
+                raise FolderError("access.missing_grant", _REFUSALS["missing_grant"])
+            found = self._decide(folder, os.path.join(folder.path, *names), own, denies)
+            if not found.allowed:
+                raise FolderError(found.code or "access.denied", _REFUSALS.get(found.kind or "", _REFUSED))
+
+        return check
 
     @contextmanager
     def _call(self, operation: Operation) -> Iterator[list[FolderGrant | None]]:
@@ -322,7 +347,7 @@ class FolderReader:
             self._check(folder, _join(root, parts))  # denied or revoked while the folder was listed
             allowed = self._allowed_below(folder)
             entries = [
-                {"name": entry.display, "path": entry.path, "kind": entry.kind, "size": entry.size}
+                {"name": entry.display, "path": _shown(entry.path), "kind": entry.kind, "size": entry.size}
                 for entry in found
                 if allowed(_join(root, entry.path))
             ]
@@ -384,6 +409,10 @@ class FolderReader:
                     continue  # denied after it was queued
                 try:
                     entries = root.list(current)
+                except FolderError:
+                    if current == start:
+                        raise
+                    continue  # denied under the name the file system stored for it
                 except FsError as exc:
                     if current == start or exc.code in _FATAL:
                         raise
@@ -410,15 +439,17 @@ class FolderReader:
                         searched += 1
                         try:
                             text = _text_of(root.read_bytes(entry.path), entry.path)
-                        except FsError:
-                            continue  # hard links, binary files, files that changed meanwhile: not searched
+                        except (FsError, FolderError):
+                            continue  # hard links, binary files, changed or denied meanwhile: not searched
                         hit = _first_line(text, needle)
                         if hit is not None:
                             matches.append(_match(entry.display, entry.path, hit[0], hit[1]))
             # Denied or revoked while the last files were read: nothing denied is returned.
             self._check(folder, _join(root, start))
             allowed = self._allowed_below(folder)
-            matches = [match for match in matches if allowed(_join(root, match["path"]))]
+            matches = [
+                {**match, "path": _shown(match["path"])} for match in matches if allowed(_join(root, match["path"]))
+            ]
             result: dict[str, Any] = {"matches": matches, "files_searched": searched, "truncated": truncated}
             if skipped:
                 result["skipped"] = skipped
@@ -444,6 +475,12 @@ _REFUSALS = {
 def _join(root: SafeRoot, parts: Sequence[str] | str) -> str:
     names = parts.split("/") if isinstance(parts, str) else list(parts)
     return os.path.join(root.path, *[name for name in names if name])
+
+
+def _shown(path: str) -> str:
+    """A relative path as the tools show it: every name escaped like ``Entry.display`` (bidirectional controls and
+    zero-width characters as ``\\uXXXX``). A file whose name holds such characters is shown but not opened."""
+    return "/".join(display_name(part) for part in path.split("/"))
 
 
 def _match(name: str, path: str, line: int | None, snippet: str | None) -> dict[str, Any]:
