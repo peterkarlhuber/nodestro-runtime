@@ -27,6 +27,12 @@
     `tool_policy.refusal_of`, `Conversations.is_granted` and `mark_granted`, `RunManager.holds_granted`,
     `mark_granted` and `content_granted`. Needs orkexa with `Tool(content_source=...)` (paired lock).
   - Tests: `tests/test_content_provenance.py` (U-7 with scripted models and a counting network and provider mock).
+  - Review fixes: a step's quality judge checks its own model before every request (it connected before the mark and
+    may use another provider than the agent), in runs and agent tests (`execute_agent(..., judge_hooks=)`); the agent
+    test's copy of a persistent memory space keeps the source `memory` (`agent_builder.SpaceCopy`); a local model
+    server whose address is not on this computer counts as a recipient outside it (`RunManager.leaves_computer`,
+    `offline.remote_model_server`); a sub-workflow stores its own first mark at once. Documented: files a person
+    uploads into an assistant chat are no granted source, and knowledge embeddings are not checked.
   - `mcp/netguard.py` stays: it is not a forwarding copy (MCP's egress policy, `httpcore2` backend, error codes and the
     response cap on top of `orkexa.net.guard`).
 

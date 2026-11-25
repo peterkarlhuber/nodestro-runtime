@@ -688,8 +688,12 @@ Items that need an independent or external review (an internal audit does not re
   - the api passes `shared_content` for the assistant's run attachment and a test series' judge (nodestro-api
     branch `claude/w3-n08`); other api callers of `connect_model` send no run content;
   - Nodestro has no transport that starts a workflow on another installation; a workflow elsewhere is reached through
-    a tool and counts as external there. Revisit if such a transport is added.
-- **Next step:** Independent review together with RT-093 (N-10); the owner decides about activation after gate G-2.
+    a tool and counts as external there. Revisit if such a transport is added;
+  - knowledge embeddings go to the workspace's local model server whatever its address, unchecked against the mark;
+  - done in the independent review (2026-11-25): the quality judge checks its own model before every request (High),
+    the agent test's memory copy keeps the source `memory` (Medium), a local model server elsewhere needs a grant
+    (L1), assistant chat uploads documented as no granted source (L2), a child run stores its first mark at once (L3).
+- **Next step:** Re-review of the fixes; the owner decides about activation after gate G-2.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 

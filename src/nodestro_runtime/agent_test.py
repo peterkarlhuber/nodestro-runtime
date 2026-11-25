@@ -16,7 +16,7 @@ run. It is still kept apart from runs:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from decimal import Decimal
 import threading
@@ -27,7 +27,7 @@ from orkexa.dynamic import BudgetTracker, Sandbox
 from pydantic import BaseModel, Field
 
 from . import offline, tool_policy
-from .agent_builder import AgentBuilder, run_own_tool
+from .agent_builder import AgentBuilder, SpaceCopy, run_own_tool
 from .cost_tracking import PricedTracker, PriceMode, request_regions
 from .engine import (
     access_error,
@@ -42,7 +42,7 @@ from .engine import (
 )
 from .pricing import PricingService
 from .problems import Problem
-from .providers import Connection, provider_of
+from .providers import Connection, check_model, provider_of
 from .reasoning import ReasoningTrace, trace_hook
 from .schemas import AgentConfig, EvaluationRecord, ToolCallApproval, ToolCallRecord, Usage, new_id, now
 from .tool_approvals import CallBinding, ToolGate, bind_call, record_refusal, tool_facts
@@ -145,7 +145,8 @@ class AgentTester:
         files = {entry.path: space.read(entry.path) for entry in space.entries()}
         isolated = config.model_copy(deep=True)
         isolated.memory.mode = "run"
-        return isolated, lambda: EphemeralMemory(files), True
+        # N-08: the copy holds the space's content, so reading it marks the test like the space would.
+        return isolated, lambda: SpaceCopy(files), True
 
     def _gate(
         self,
@@ -201,18 +202,29 @@ class AgentTester:
             "made. Run the workflow to approve the call."
         )
 
-    def _check_egress(self, gate: ToolGate, config: AgentConfig, actor: str) -> None:
-        """N-08: before a request of a test that holds content of a granted source, a cloud model needs a grant
-        (audited like a run's refusal), and a server tool that reaches outside is refused (a test never acts on a
-        grant for a tool)."""
-        provider = provider_of(config.model)
+    def _leaves_computer(self, provider: str, connection: Connection | None = None) -> bool:
+        """N-08: a cloud provider, or a local model server whose address is not on this computer (only while the
+        provenance switch is on; see :meth:`RunManager.leaves_computer`)."""
         if provider != "ollama":
+            return True
+        gate = self.tool_gate()
+        if gate is None or not gate.provenance:
+            return False
+        found = connection if connection is not None else self.connect(provider)
+        return offline.remote_model_server(found, docker=self.builder.mode == "local-container")
+
+    def _check_egress(self, gate: ToolGate, model: str, server_tools: Sequence[str], actor: str) -> None:
+        """N-08: before a request of a test that holds content of a granted source, a model outside this computer
+        (``model``: the agent's or its judge's) needs a grant (audited like a run's refusal), and a server tool that
+        reaches outside is refused (a test never acts on a grant for a tool)."""
+        provider = provider_of(model)
+        if self._leaves_computer(provider):
             resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
             found = gate.site_refusal(resource, attended=True, agent=None, shared_content=True)
             if found is not None:
                 record_refusal(gate.approvals.store, found, resource, actor=actor)
                 raise access_error(found, resource, show_source=is_person(actor))
-        for key in dict.fromkeys(config.server_tools):
+        for key in dict.fromkeys(server_tools):
             capability = tool_policy.server_tool_capability(key)
             if capability.reach != "external":
                 continue
@@ -245,7 +257,13 @@ class AgentTester:
             tracker.check()
             if granted and gate is not None:
                 # N-08: the request would carry granted content: a cloud model needs a grant, as in a run.
-                self._check_egress(gate, config, actor)
+                self._check_egress(gate, config.model, config.server_tools, actor)
+
+        def on_judge_request(_args: dict[str, Any]) -> None:
+            tracker.check()
+            if granted and gate is not None:
+                # N-08: the judge connected at the start and may use another provider: its own model is checked.
+                self._check_egress(gate, check_model(config.quality.judge_model), (), actor)
 
         def before_tool(call: ToolCall) -> Denial | None:
             record = ToolCallRecord(id=call.id, name=call.name, input=call.input)
@@ -285,14 +303,21 @@ class AgentTester:
             # N-06: a cloud model the access model v2 blocks never gets the test's prompt (no agent: a test agent has
             # no identity, so a deny for some agents holds here too). Audited like a run's refusal; only a person sees
             # the source in the result.
+            def refuse(provider: str) -> None:
+                resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
+                found = gate.site_refusal(resource, attended=True, agent=None)
+                if found is not None:
+                    record_refusal(gate.approvals.store, found, resource, actor=actor)
+                    raise access_error(found, resource, show_source=is_person(actor))
+
             def connect(provider: str) -> Connection:
                 if provider != "ollama":
-                    resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
-                    found = gate.site_refusal(resource, attended=True, agent=None)
-                    if found is not None:
-                        record_refusal(gate.approvals.store, found, resource, actor=actor)
-                        raise access_error(found, resource, show_source=is_person(actor))
-                return self.connect(provider)
+                    refuse(provider)
+                    return self.connect(provider)
+                connection = self.connect(provider)  # the local model server: its address decides (N-08)
+                if self._leaves_computer(provider, connection):
+                    refuse(provider)
+                return connection
 
         if config.offline:
             # N-09: an offline agent gets local connections only, also in its test.
@@ -324,6 +349,7 @@ class AgentTester:
                 # before_tool applies the per-call rules to every call while the gate exists.
                 gated=gate is not None,
                 on_built=lambda built: setattr(result, "reasoning_reduced", built.reasoning_reduced),
+                judge_hooks={"on_request": on_judge_request},
             )
             result.output = outcome.output
             result.evaluation = outcome.evaluation

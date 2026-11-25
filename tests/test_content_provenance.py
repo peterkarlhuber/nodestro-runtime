@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 import contextvars
+import dataclasses
 from datetime import timedelta
 import functools
 import json
@@ -38,8 +39,9 @@ from nodestro_runtime.folders import FOLDERS_ENV
 from nodestro_runtime.local_models import LOCAL_DEFAULT_MODEL
 from nodestro_runtime.mcp.models import SERVERS, TOOLS, McpServer, McpTool, ToolDefinition
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.schemas import AgentConfig, Run, RunIn, Workflow, now
-from nodestro_runtime.testing import ScriptedClient, text, tool_use
+from nodestro_runtime.providers import Connection
+from nodestro_runtime.schemas import AgentConfig, QualityConfig, QualityCriterion, Run, RunIn, Workflow, now
+from nodestro_runtime.testing import ScriptedClient, parsed, text, tool_use
 from nodestro_runtime.tool_approvals import (
     ACCESS_ENV,
     ENABLE_ENV,
@@ -733,6 +735,182 @@ def test_an_agent_test_holds_its_cloud_model_after_a_folder_read(make: Make, doc
     assert (result.status, result.error_code) == ("failed", "access.missing_grant")
     assert len(workspace.cloud.messages.calls) == 1  # type: ignore[attr-defined]
     assert network.outbound == 0
+
+
+# ---- secondary models: the quality judge, the agent test's memory copy, a remote model server (N-08 review) --------
+
+
+#: A quality judge's verdict that passes (the evaluator's system prompt names a "strict, fair reviewer").
+JUDGE = "strict, fair reviewer"
+PASSED = parsed(
+    lambda model: model(criteria=[{"name": "ok", "reasoning": "ok", "passed": True}], summary="ok", suggestions=[])
+)
+
+
+def _quality(judge: str) -> QualityConfig:
+    return QualityConfig(
+        enabled=True, criteria=[QualityCriterion(name="ok", description="It is ok")], judge_model=judge
+    )
+
+
+def _sent(workspace: Workspace) -> str:
+    return json.dumps(workspace.cloud.messages.calls, default=str)  # type: ignore[attr-defined]
+
+
+async def test_a_cloud_judge_of_a_local_agent_needs_a_grant_after_a_folder_read(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """The judge connects when the step starts, before the folder read marks it, and its model is not the agent's:
+    every request of the judge checks the judge's own provider (review High)."""
+    workspace = make(
+        {JUDGE: [PASSED] * 3},
+        {"READER": [OBEYING[0], f"The budget is {SECRET}."] * 2},
+    )
+    _grant_folder(workspace, docs)
+    reader = AgentConfig(
+        name="Reader", system_prompt="READER", model=LOCAL, tools=["read_file"], quality=_quality(CLOUD)
+    )
+    run = await _finished(workspace, _chain(("reader", reader)), trigger="schedule", trigger_ref="sch_1")
+    assert run.granted_content
+    assert run.nodes["reader"].error_code == "access.missing_grant"
+    assert workspace.cloud.messages.calls == [] and SECRET not in _sent(workspace)  # type: ignore[attr-defined]
+    refused = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert [(item.details["resource_type"], item.details["resource_id"]) for item in refused] == [
+        ("cloud_provider", "anthropic")
+    ]
+    # A grant for the judge's provider lets it judge.
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/reader")
+    granted = await _finished(workspace, _chain(("reader", reader)), trigger="schedule", trigger_ref="sch_1")
+    assert granted.nodes["reader"].status == "succeeded", granted.nodes["reader"].error
+    assert granted.nodes["reader"].evaluation is not None and SECRET in _sent(workspace)
+
+
+async def test_a_judge_on_another_cloud_provider_needs_its_own_grant(make: Make, docs: Path, network: Network) -> None:
+    """A grant for the agent's provider says nothing about the judge's (review High)."""
+    workspace = make(
+        {
+            "READER": [tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}), text(f"Budget {SECRET}")],
+            JUDGE: [PASSED] * 3,
+        }
+    )
+    _grant_folder(workspace, docs)
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/reader")
+    reader = AgentConfig(
+        name="Reader", system_prompt="READER", model=CLOUD, tools=["read_file"], quality=_quality(OTHER_CLOUD)
+    )
+    run = await _finished(workspace, _chain(("reader", reader)), trigger="schedule", trigger_ref="sch_1")
+    assert run.nodes["reader"].error_code == "access.missing_grant"
+    assert run.nodes["reader"].error_params["resource_id"] == "openai"
+    # The agent's two requests went to its granted provider; the judge sent nothing.
+    calls = workspace.cloud.messages.calls  # type: ignore[attr-defined]
+    assert len(calls) == 2 and all("READER" in json.dumps(call.get("system"), default=str) for call in calls)
+
+
+def test_an_agent_test_holds_its_cloud_judge_after_a_folder_read(make: Make, docs: Path, network: Network) -> None:
+    from nodestro_runtime.agent_test import AgentTestIn
+
+    workspace = make({JUDGE: [PASSED] * 3}, {"READER": [OBEYING[0], f"Budget {SECRET}"]})
+    _grant_folder(workspace, docs)
+    agent = AgentConfig(
+        name="Reader", system_prompt="READER", model=LOCAL, tools=["read_file"], quality=_quality(CLOUD)
+    )
+    result, _ = contextvars.copy_context().run(
+        workspace.tester.run, AgentTestIn(agent=agent, input="go"), actor="local"
+    )
+    assert (result.status, result.error_code) == ("failed", "access.missing_grant")
+    assert workspace.cloud.messages.calls == [] and network.outbound == 0  # type: ignore[attr-defined]
+
+
+def test_an_agent_test_marks_a_read_of_its_persistent_memory_copy(make: Make, network: Network) -> None:
+    """The agent test reads a copy of the persistent space, which keeps the memory's source (review Medium)."""
+    from nodestro_runtime.agent_builder import SpaceCopy
+    from nodestro_runtime.agent_test import AgentTestIn
+
+    workspace = make({"MEM": [tool_use("memory", {"command": "view", "path": "/memories/plan.md"}), text("never")]})
+    workspace.builder.memory_spaces.open("team").write("/memories/plan.md", f"Budget {SECRET}")
+    config = AgentConfig(
+        name="Mem",
+        system_prompt="MEM",
+        model=CLOUD,
+        memory={"mode": "persistent", "space": "team"},  # type: ignore[arg-type]
+    )
+    result, _ = contextvars.copy_context().run(
+        workspace.tester.run, AgentTestIn(agent=config, input="go"), actor="local"
+    )
+    assert result.memory_isolated
+    assert (result.status, result.error_code) == ("failed", "access.missing_grant")
+    assert len(workspace.cloud.messages.calls) == 1 and SECRET not in _sent(workspace)  # type: ignore[attr-defined]
+    # The copy keeps the source where plain run memory declares none.
+    built = workspace.builder.build(
+        AgentConfig(system_prompt="x", model=CLOUD, memory={"mode": "run"}),  # type: ignore[arg-type]
+        connection=workspace.runs.connect("anthropic"),
+        run_memory=lambda: SpaceCopy({}),
+    )
+    assert built.memory is not None and built.memory.content_source == "memory"
+
+
+async def test_a_local_model_server_elsewhere_counts_as_a_recipient(make: Make, docs: Path, network: Network) -> None:
+    """A local model server whose address is not on this computer is reached outside it: with granted content it needs
+    a grant like a cloud provider (review L1); on this computer it needs none."""
+    workspace = make({}, {"READER": [OBEYING[0], "never", OBEYING[0], "done"]})
+    _grant_folder(workspace, docs)
+    real = workspace.runs.connect
+    where = {"url": "https://gpu.example.com/v1"}
+
+    def server(provider: str) -> Connection:
+        found = real(provider)
+        if provider != "ollama":
+            return found
+        return dataclasses.replace(found, base_url=where["url"])
+
+    workspace.runs.connect = server  # type: ignore[method-assign]
+    reader = AgentConfig(name="Reader", system_prompt="READER", model=LOCAL, tools=["read_file"])
+    run = await _finished(workspace, _chain(("reader", reader)), trigger="schedule", trigger_ref="sch_1")
+    assert run.nodes["reader"].error_code == "access.missing_grant"
+    assert run.nodes["reader"].error_params["resource_id"] == "ollama"
+    assert len(workspace.local.calls) == 1  # type: ignore[attr-defined]  # the request with the file was never sent
+    where["url"] = "http://127.0.0.1:11434/v1"
+    local = await _finished(workspace, _chain(("reader", reader)), trigger="schedule", trigger_ref="sch_1")
+    assert local.nodes["reader"].status == "succeeded", local.nodes["reader"].error
+
+
+async def test_a_sub_workflow_stores_its_mark_at_once(make: Make, docs: Path, network: Network) -> None:
+    """A child run's first mark is stored when it happens, also when its top-level run was marked before (review L3)."""
+    workspace = make({}, {"READER": [OBEYING[0], "done"], "CHILD": [OBEYING[0], "read"]})
+    _grant_folder(workspace, docs)
+    child_flow = workspace.save_workflow(
+        _chain(
+            ("child", AgentConfig(name="Child", system_prompt="CHILD", model=LOCAL, tools=["read_file"])),
+            workflow_id="wf_child",
+        )
+    )
+    stored: dict[str, bool] = {}
+    original = workspace.runs.mark_granted
+
+    def mark(context: Any, node_id: str, source: str, *, tool: str | None = None) -> None:
+        original(context, node_id, source, tool=tool)
+        found = workspace.store.get("runs", context.run.id, Run)
+        stored[context.run.workflow_id] = bool(found is not None and found.granted_content)
+
+    workspace.runs.mark_granted = mark  # type: ignore[method-assign]
+    parent = Workflow.model_validate(
+        {
+            "id": "wf_n08",
+            "name": "Parent",
+            "nodes": [
+                {"id": "start", "type": "start"},
+                {"id": "reader", "type": "agent", "agent": _reader().model_dump(mode="json")},
+                {"id": "sub", "type": "subworkflow", "subworkflow": {"workflow_id": child_flow.id}},
+            ],
+            "edges": [
+                {"id": "e1", "source": "start", "target": "reader"},
+                {"id": "e2", "source": "reader", "target": "sub"},
+            ],
+        }
+    )
+    run = await _finished(workspace, parent, trigger="schedule", trigger_ref="sch_1")
+    assert run.status == "succeeded", run.error
+    assert stored == {"wf_n08": True, "wf_child": True}
 
 
 # ---- conversations and the content of finished runs ----------------------------------------------------------------

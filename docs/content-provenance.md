@@ -17,7 +17,13 @@ the computer without a person's permission. The granted sources are:
 | Persistent memory | a call of the memory tool of an agent with a memory space | `memory` |
 | An attached file | files of the run delivered into the step's context at its start (also the overview of a conversation's earlier files), or a call of the input files tool | `attachment` |
 
-Run memory (`memory.mode` `run`) is not a granted source: it holds only what the run itself wrote.
+Run memory (`memory.mode` `run`) is not a granted source: it holds only what the run itself wrote. The agent test's
+writable copy of a persistent memory space (`agent_builder.SpaceCopy`) is: it holds the space's content.
+
+Files a person uploads into an assistant chat (the API's assistant, not a conversation's run) are not a granted
+source: the person hands them to the model they chose for that chat themselves, so sending them is the person's own
+act, not an agent reading a source someone granted for agents. A run or knowledge attached to such a chat is checked
+(the API passes the run's mark, memory files and knowledge text as `shared_content`).
 
 Once such content is there, the run is **marked** (`Run.granted_content`), and so is the conversation it answers in
 (`Conversation.provenance` = `granted_content`). The mark is monotonic: it is never cleared. From then on:
@@ -31,8 +37,12 @@ Once such content is there, the run is **marked** (`Run.granted_content`), and s
   - nobody watches (a schedule, a batch, an API run): the call is refused with `access.missing_grant`. The agent reads
     a fixed text without the source.
 - **Every cloud model request** needs a grant on the cloud provider (`cloud_provider`, action `submit`). The default
-  of spec 7.2 ("a cloud model without shared content") no longer applies. The local model server (`ollama`) is no
-  cloud provider. Without a grant the step fails with `access.missing_grant` before the request is sent.
+  of spec 7.2 ("a cloud model without shared content") no longer applies. This holds for every model of a step: the
+  agent's, its fallbacks (always the agent's provider) and its quality judge, whose requests check the judge's own
+  provider. The local model server (`ollama`) is no cloud provider while its address is on this computer
+  (`offline.is_local_endpoint`, as in N-09's offline mode); a local model server elsewhere is a recipient outside
+  the computer and needs a grant on `cloud_provider` `ollama` (`RunManager.leaves_computer`). Without a grant the step
+  fails with `access.missing_grant` before the request is sent.
 - **Every server tool that reaches outside** (`web_search`, `web_fetch`) needs a grant on the tool (`tool:<key>`).
   Server tools run at the provider and never pass the tool hook, so a request that offers one is refused as a whole.
 
@@ -49,6 +59,7 @@ All checks are the runtime's; the studio only shows what happens.
 | Tool call | the tool gate, `tool_policy.decide` (`provenance_refusal`, `egress_granted`), at every call | missing grant: ask or `access.missing_grant` |
 | Cloud model, at the connection | `RunManager._access_connect` (every connection of an agent's turn, orchestrator decisions, judges), `Workspace.connect_model(..., shared_content=)`, `RunManager.check_cloud_access(..., shared_content=)` | `access.missing_grant` |
 | Cloud model, per request | the `on_request` hook of an agent's turn and an orchestrator's decision (`RunManager._check_egress`): granted content can enter a turn after it connected | `access.missing_grant` |
+| Quality judge, per request | the judge's own `on_request` (`execute_agent(..., judge_hooks=)`), in a run and in an agent test: the judge connects when the step starts, maybe before the mark, and may use another provider than the agent | `access.missing_grant` |
 | Server tools | the same `on_request` check | `access.missing_grant` |
 | Run chat about a run | `run_chat` passes `RunManager.content_granted` of the run and its top-level run | `access.missing_grant` |
 | A conversation's summary (N-05) | `Conversations._summarize` passes the conversation's mark to `connect_model` | `access.missing_grant` (the history is trimmed instead) |
@@ -64,7 +75,8 @@ The mark itself is the run event `content_provenance` (`source`, `tool`, `first`
 
 ## How the mark travels
 
-- **Within an execution**: a step marks its run and the top-level run. Sub-workflows and team runs share the
+- **Within an execution**: a step marks its run and the top-level run. Each run is stored at its own first mark, a
+  sub-workflow's too, so a reader of the run sees the mark before the run ends. Sub-workflows and team runs share the
   top-level run's execution, so a mark anywhere holds for every later call of the whole execution, above and below.
 - **A sub-workflow is a recipient like any other**: it runs on this computer, but what it sends outside or to a cloud
   model is checked with the mark it inherits. Nodestro has no transport of its own that starts a workflow on another
@@ -88,6 +100,9 @@ failed marks the run anyway (its error can name what it found).
 
 ## Known limits
 
+- Knowledge embeddings (vector retrieval) go to the workspace's local model server whatever its address, as before:
+  indexing does not run in a step, and a search query is not checked against the mark. Keep the embedding server on
+  this computer when knowledge is granted content.
 - A tool without a declaration is not seen. MCP tools never declare a source: their results are external data, not
   granted content.
 - Content that entered a conversation or run while the switch was off is not recorded: such a conversation is
