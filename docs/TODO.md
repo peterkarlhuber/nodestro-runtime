@@ -664,7 +664,10 @@ Items that need an independent or external review (an internal audit does not re
   - an own or integration tool already named `list_folder`, `read_file` or `search_files` is shadowed by the built-in
     tool once the switch is on (the names are reserved);
   - the tool library reads the switch when it is built; changing it needs a restart;
-  - search snippets are short excerpts of file content returned without the data markers of `read_file`.
+  - folder content (file text, search snippets) is not marked as shared content yet (review L3): a cloud model
+    request with it does not need the per-provider grant of spec 7.2. N-08 (provenance, `shared_content`) covers it;
+    it is a precondition for activation;
+  - review L11 (independent review of 87b38cb): no change needed; recorded here so it is not raised again.
 - **Next step:** Independent review; nodestro-api routes (`/api/folders`) and the studio texts are in the same
   change.
 

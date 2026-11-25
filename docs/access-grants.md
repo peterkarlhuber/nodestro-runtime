@@ -129,6 +129,10 @@ Folders are compared by whole path components, never by string prefix: `/home/a/
 
 The path is never trimmed: one with leading or trailing white space is refused.
 
+A folder deny is stored canonical (`os.path.realpath`: links resolved, `..`, repeated and trailing separators gone),
+like a folder grant (N-10), so a deny named through a link still holds for the canonical paths the folder tools ask
+for.
+
 Windows paths (`C:\...`, UNC, `\\?\`) get more normalization:
 - both separators are accepted, and `\\?\C:\x` is `C:\x`;
 - two leading separators of either kind always mean a Windows path, so `//host/share` is UNC (fail closed on POSIX

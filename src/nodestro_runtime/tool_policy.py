@@ -35,6 +35,7 @@ from __future__ import annotations
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 import itertools
+import logging
 import os
 import posixpath
 import re
@@ -284,17 +285,35 @@ def system_folders() -> tuple[str, ...]:
     return (*SYSTEM_FOLDERS, *(path for path in found if path))
 
 
-def _system_parts() -> list[tuple[str, ...]]:
-    """The components of every system folder that names a folder on this system. On Windows a POSIX folder
-    (``/bin``) names none (it would be relative to the current drive), so it is left out instead of making every
-    folder unresolvable; on POSIX the Windows folders still compare (fail closed for UNC-like spellings)."""
+def _system_parts() -> list[tuple[str, ...]] | None:
+    """The components of every system folder that names a folder on this system, or ``None`` when a system folder
+    the environment names cannot be compared (an 8.3 short name such as ``C:\\PROGRA~1``, a device path, a path
+    without a drive): then no folder can be told apart from it, so every folder is refused (fail closed) and a
+    warning is logged once per value. On Windows a POSIX folder (``/bin``) names none (it would be relative to the
+    current drive), so it is left out (logged at debug level) instead of making every folder unresolvable; on POSIX
+    the Windows folders still compare (fail closed for UNC-like spellings)."""
     found: list[tuple[str, ...]] = []
-    for path in system_folders():
+    for path in SYSTEM_FOLDERS:
         try:
             found.append(folder_parts(path))
         except ValueError:
+            _log.debug("System folder %s names no folder on this system; left out", path)
+    for name in _SYSTEM_FOLDER_ENV:
+        value = os.environ.get(name, "")
+        if not value:
             continue
+        try:
+            found.append(folder_parts(value))
+        except ValueError:
+            if (name, value) not in _WARNED:
+                _WARNED.add((name, value))
+                _log.warning("The system folder in %s cannot be compared (%r); every folder is refused", name, value)
+            return None
     return found
+
+
+_log = logging.getLogger(__name__)
+_WARNED: set[tuple[str, str]] = set()
 
 
 _EFFECTS: dict[tuple[str, str], EffectClass] = {
@@ -577,7 +596,10 @@ def safety_limit(request: AccessRequest) -> str | None:
             protected = [folder_parts(path) for path in request.protected_folders]
         except ValueError:
             return "unresolvable_path"
-        protected += _system_parts()
+        system = _system_parts()
+        if system is None:
+            return "unresolvable_path"
+        protected += system
         forms = {parts, _drive_form(parts)}
         if any(_within(form, folder, fold=True) for form in forms for folder in protected):
             return "protected_folder"

@@ -27,13 +27,15 @@ A `FolderGrant` (collection `folder_grants`) is an access grant of the access mo
 | `identity` | `(device, inode)` or `(volume, file index)` when it was granted. If another folder replaces it, reads are refused (`fs.root_changed`) |
 | `access` | Always `read` |
 | `include`, `exclude` | Patterns, see below |
+| `default_excludes` | `true` (default): the common secret files are left out, see "Patterns". Only an administrator turns it off for one grant |
 | `limits` | `FolderLimits`, see below |
 | `index` | The person asked for a search index. It is stored only; indexing granted folders is a later step |
 | `grant_id` | The access grant that holds duration (`until_revoked`, or `until` with `expires_at`), scope (`all`, `agents`, `conversation`), mode (`supervised`, `unattended`, `both`) and revocation |
 
 There is no second approval logic. Expiry, revocation, scope, mode and the audit (`access_granted`,
 `access_grant_revoked`) all belong to the access grant. A folder grant is never deleted; it ends with its access
-grant. The access grant and the folder grant are stored in one transaction.
+grant. The access grant and the folder grant are stored in one transaction, and the name is checked inside it, so
+two grants of the same name sent at once cannot both be stored.
 
 `FolderGrants(store, data_dir).grant(name=..., path=..., by=Person(...))` is the only writer. Only a `Person`
 writes, and no module of the runtime imports the writer (`tests/test_access_grants_gate.py`). The api calls it for
@@ -51,6 +53,7 @@ A folder is refused with `folder.not_grantable`. The param `reason` says why:
 | `link` | The path itself is a link the guard refuses |
 | `not_found`, `not_a_directory` | There is no such folder |
 | `invalid_path` | Not an absolute path, or not a path at all |
+| `temp_root` | A shared temporary folder itself: `/tmp`, `/var/tmp`, `/private/tmp`, `/private/var/tmp`, `/private/var/folders` and the temporary folder of the process (`tempfile.gettempdir()`). Every program writes there. A folder inside one can be granted |
 | `safety_limit` | A global safety limit of the access model applies (`limit:protected_folder`, `limit:unresolvable_path`, the system folders of `tool_policy.SYSTEM_FOLDERS`), checked for both the given and the canonical spelling |
 
 A folder above the data folder can be granted, but the data folder stays closed inside it (`fs.blocked`, by name and
@@ -61,9 +64,9 @@ written by hand, every call evaluates the safety limits again.
 
 | Tool | What it does |
 | --- | --- |
-| `list_folder(folder="", path="")` | Without a folder, it lists the granted folders' names. With one, it lists the entries of that folder or a subfolder: `name`, `path`, `kind` (`file`, `dir`, `link`, `other`) and `size`. Links are shown but never followed. Subfolders that a deny blocks are left out |
+| `list_folder(folder="", path="")` | Without a folder, it lists the granted folders' names. With one, it lists the entries of that folder or a subfolder: `name`, `path`, `kind` (`file`, `dir`, `link`, `other`) and `size`. Links are shown but never followed. Files and subfolders that a deny blocks are left out. Without a folder, the call is logged too (`folder.listed` without a grant id) |
 | `read_file(folder, path, offset=0)` | Reads the text of a text file or a PDF. It returns `source` (`<folder>/<path>`), `kind`, `size`, `pages` for a PDF, and the text from `offset`. At most `max_chars` characters come per call, and `next_offset` continues |
-| `search_files(folder, query, path="")` | Finds files whose name or text contains `query` (1 to 200 characters, case-insensitive). It returns the matches with `path`, `line` and a snippet, plus `files_searched` and `truncated`. PDFs are found by name only |
+| `search_files(folder, query, path="")` | Finds files whose name or text contains `query` (1 to 200 characters, case-insensitive). It returns the matches with `name` (escaped like a listing's name), `path`, `line` and a snippet, plus `files_searched`, `skipped` (subfolders that could not be listed, with their code; only when there are some) and `truncated`. A snippet is file content and comes between the same random data markers as `read_file`'s text. PDFs are found by name only |
 
 All three tools have `access=read`, `reach=internal` and `source=folder` (`tool_policy.BUILTIN_CAPABILITIES`), so
 they stay available in the strict offline mode and to offline agents (N-09). They use category `files`.
@@ -111,7 +114,12 @@ A file that is too large says so and asks the agent to request a smaller file or
    - every folder is opened relative to its parent, so a swap during the call is refused (`fs.root_changed`,
      `fs.link`) instead of followed.
 4. A read checks the grant again after the file was read, so a grant revoked during a long PDF extraction returns
-   nothing. A search checks it again before each folder.
+   nothing. A listing checks every entry, files too, so a deny on one exact file leaves it out. A search reads the
+   grants and denies again for every folder it takes from its queue: it checks that folder (a deny added while it
+   was queued holds), then every file and subfolder in it before it reads or queues them. Before it returns, it
+   checks the grant and every match once more. A subfolder that cannot be listed (`fs.too_large`, replaced or
+   removed meanwhile) is skipped and named in `skipped`; a changed granted folder (`fs.root_changed`) still ends the
+   search.
 5. It writes one event to the activity log (N-13). The event has source `file`, action `folder.listed`,
    `folder.read` or `folder.searched`, resource type `folder_grant` with the grant's id, the agent, the run, the
    outcome (`success`, `denied`, `failure`) and the refusal code. It never names a path or a file.
@@ -130,6 +138,12 @@ A file that is too large says so and asks the agent to request a smaller file or
 - With `include` set, only matching files are read; folders stay visible so their files can be reached.
 - An invalid pattern is refused when granting (`folder.invalid_pattern`).
 
+Every grant also excludes the common secret files (`folders.DEFAULT_EXCLUDES`, compared without case): `**/.env*`,
+`**/*.pem`, `**/*.key`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc` and `**/*.kdbx`. They
+cannot be listed, read or searched (`fs.excluded`; some are already refused by the guard's credential blocklist,
+`fs.blocked`). An administrator can turn this off for one grant with `default_excludes=false`; the guard's
+blocklist still holds then.
+
 ## Limits
 
 `FolderLimits` is set per grant within fixed bounds:
@@ -146,8 +160,9 @@ A file that is too large says so and asks the agent to request a smaller file or
 | `pdf_memory_mb` | 256 | 64 to 1,024 |
 
 A PDF is extracted in an isolated process with these budgets (`orkexa.fs.TextBudget`). A PDF bomb ends with
-`fs.too_complex` within its time budget. A search stops after 30 seconds (`SEARCH_SECONDS`) and returns what it found
-as `truncated`. Binary files are not read (`fs.unsupported_type`).
+`fs.too_complex` within its time budget. A search stops after 30 seconds (`SEARCH_SECONDS`), checked before every
+folder and every entry, also in a tree without files. It queues at most 10,000 folders (`MAX_PENDING`); deeper ones
+are then left out. Either way it returns what it found as `truncated`. Binary files are not read (`fs.unsupported_type`).
 
 ## Tests
 
@@ -157,7 +172,8 @@ as `truncated`. Binary files are not read (`fs.unsupported_type`).
   `tests/folder_support.py` adapts the tools to `FolderAccess`. They cover the attack catalog of
   `orkexa.testing.pathguard` (links out, link swaps during the call, `..`, absolute paths, junctions, hard links,
   Unicode normalization, case, invalid UTF-8), system folders and the data folder, include and exclude patterns, the
-  size limit, revocation, expiry, a replaced folder, Unicode names and the access log.
+  size limit, revocation, expiry, a replaced folder, Unicode names, a person's denies on a file and a subfolder
+  in any spelling, the grant's scope and mode, and the access log.
 - CI runs `tests/test_folders.py` on Linux, macOS and Windows (`.github/workflows/platforms.yml`).
 
 ## Not in this step
