@@ -25,8 +25,8 @@
     `folder.invalid_query`, `folder.name_taken`, `folder.not_found`, `folder.not_grantable`, `folder.unavailable`,
     `folder.unknown`, and the `fs.*` codes of the guard the tools return (`fs.root_changed` now in the catalog too).
   - Tests: `tests/test_folders.py`, which also runs orkexa's folder grant conformance cases (N-63) through the real
-    tools (attack catalog, link swaps, patterns, limits, revocation, expiry, access log), on Linux, macOS and
-    Windows.
+    tools (attack catalog, link swaps, patterns, limits, revocation, expiry, denies in any spelling, scope and
+    mode, access log), on Linux, macOS and Windows.
   - Fixes from the independent review of N-10 (each with a regression test in `tests/test_folders.py`):
     - a deny on an exact file now holds in `list_folder` and `search_files` too (before, only `read_file` refused it;
       a search returned its text as a snippet). A search reads the grants and denies again for every folder it takes

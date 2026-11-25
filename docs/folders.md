@@ -172,7 +172,8 @@ are then left out. Either way it returns what it found as `truncated`. Binary fi
   `tests/folder_support.py` adapts the tools to `FolderAccess`. They cover the attack catalog of
   `orkexa.testing.pathguard` (links out, link swaps during the call, `..`, absolute paths, junctions, hard links,
   Unicode normalization, case, invalid UTF-8), system folders and the data folder, include and exclude patterns, the
-  size limit, revocation, expiry, a replaced folder, Unicode names and the access log.
+  size limit, revocation, expiry, a replaced folder, Unicode names, a person's denies on a file and a subfolder
+  in any spelling, the grant's scope and mode, and the access log.
 - CI runs `tests/test_folders.py` on Linux, macOS and Windows (`.github/workflows/platforms.yml`).
 
 ## Not in this step

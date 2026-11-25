@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 from orkexa import Tool
 from orkexa.errors import ToolInputError
@@ -21,6 +21,7 @@ from nodestro_runtime.folder_tools import FolderToolError, list_folder, read_fil
 from nodestro_runtime.folders import FOLDERS_ENV, FolderCaller, FolderLimits, FolderReader
 from nodestro_runtime.schemas import now
 from nodestro_runtime.tool_approvals import AccessRules, Person
+from nodestro_runtime.tool_policy import AccessResource
 from nodestro_runtime.tool_spec import BUILTIN_SPECS, CallCounter, RunServices, bind_tool
 from nodestro_runtime.workspace import Workspace
 
@@ -63,15 +64,32 @@ class ToolFolders:
     """:class:`orkexa.testing.conformance.FolderAccess` through the folder tools of one workspace: grants are written
     by :class:`FolderGrants` as a person, reads go through the bound tools, the access log is the activity log."""
 
-    def __init__(self, request: Request) -> None:
-        self.workspace = Workspace(request.workdir / DATA_FOLDER, integrations=[])
-        self.grants = FolderGrants(self.workspace.store, str(self.workspace.data_dir.resolve()))
-        folders = reader(self.workspace)
+    def __init__(
+        self, request: Request | None, *, of: ToolFolders | None = None, caller: FolderCaller | None = None
+    ) -> None:
+        if of is None:
+            assert request is not None
+            self.workspace = Workspace(request.workdir / DATA_FOLDER, integrations=[])
+            self.grants = FolderGrants(self.workspace.store, str(self.workspace.data_dir.resolve()))
+            self.names: dict[str, str] = {}
+            self.owner = True
+        else:  # another caller of the same workspace (as_caller)
+            self.workspace, self.grants, self.names, self.owner = of.workspace, of.grants, of.names, False
+        folders = reader(self.workspace, caller)
         self.tools = {tool.name: bound(tool, folders) for tool in (list_folder, read_file, search_files)}
-        self.names: dict[str, str] = {}
 
     def close(self) -> None:
-        self.workspace.close()
+        if self.owner:
+            self.workspace.close()
+
+    def as_caller(self, agent: str, *, unattended: bool = False) -> ToolFolders:
+        mode: Literal["supervised", "unattended"] = "unattended" if unattended else "supervised"
+        return ToolFolders(None, of=self, caller=FolderCaller(agent=agent, mode=mode, actor="local"))
+
+    def deny(self, path: str) -> None:
+        AccessRules(self.workspace.store).deny(
+            resource=AccessResource(type="folder", id=path), actions=["read"], by=PERSON
+        )
 
     def grant(
         self,
@@ -81,6 +99,8 @@ class ToolFolders:
         exclude: Any = (),
         max_file_bytes: int | None = None,
         expires_at: datetime | None = None,
+        agents: Any = (),
+        unattended: bool = False,
     ) -> str:
         limits = FolderLimits() if max_file_bytes is None else FolderLimits(max_file_bytes=max_file_bytes)
         name = f"folder{len(self.names) + 1}"
@@ -92,6 +112,9 @@ class ToolFolders:
             exclude=tuple(exclude),
             limits=limits,
             expires_at=expires_at,
+            scope="agents" if agents else "all",
+            agents=tuple(agents),
+            mode="unattended" if unattended else "supervised",
         )
         self.names[view.folder.id] = name
         return view.folder.id
