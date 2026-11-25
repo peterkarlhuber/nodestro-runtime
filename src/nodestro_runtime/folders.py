@@ -33,7 +33,7 @@ import os
 import time
 from typing import Any, Literal
 
-from orkexa.fs import PDF_SUFFIXES, FsError, SafeRoot, TextBudget
+from orkexa.fs import PDF_SUFFIXES, FsError, SafeRoot, TextBudget, display_name
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from . import activity
@@ -55,6 +55,20 @@ FOLDERS_ENV = "NODESTRO_FOLDER_GRANTS"
 COLLECTION = "folder_grants"
 #: The largest file a grant may allow (``orkexa.fs.DEFAULT_MAX_FILE_BYTES``).
 MAX_FILE_BYTES = 50 * 1024 * 1024
+#: Common secret files every grant leaves out (``orkexa.fs`` patterns, compared without case) unless an
+#: administrator turns them off for one grant (``FolderGrant.default_excludes``): environment files, keys and
+#: certificates, SSH keys, package registry and netrc credentials, KeePass databases.
+DEFAULT_EXCLUDES: tuple[str, ...] = (
+    "**/.env*",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/id_ed25519*",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/.netrc",
+    "**/*.kdbx",
+)
 
 Operation = Literal["list", "read", "search"]
 _ACTIONS: dict[str, str] = {"list": "folder.listed", "read": "folder.read", "search": "folder.searched"}
@@ -105,6 +119,8 @@ class FolderGrant(BaseModel):
     include: tuple[str, ...] = Field(default=(), max_length=100)
     exclude: tuple[str, ...] = Field(default=(), max_length=100)
     limits: FolderLimits = FolderLimits()
+    #: Leave out :data:`DEFAULT_EXCLUDES` (the common secret files); only an administrator turns this off.
+    default_excludes: bool = True
     #: The person asked for a search index of the folder. Stored only: indexing granted folders is a later step.
     index: bool = False
     #: The access grant (N-06) that holds duration, expiry, scope, mode and revocation.
@@ -185,15 +201,17 @@ class FolderReader:
     # ---- what the caller may use ----------------------------------------------------------------------------
 
     def folders(self) -> list[FolderGrant]:
-        """The folders this caller may read now, by name (the paths stay with the person)."""
-        grants, denies = self.records()
-        active = {grant.id: grant for grant in grants}
-        found: dict[str, FolderGrant] = {}
-        for folder in self.store.list(COLLECTION, FolderGrant):
-            own = active.get(folder.grant_id)
-            if own is not None and self._decide(folder, folder.path, own, denies).allowed:
-                found.setdefault(folder.name.casefold(), folder)
-        return sorted(found.values(), key=lambda item: item.name.casefold())
+        """The folders this caller may read now, by name (the paths stay with the person). Logged as
+        ``folder.listed`` without a grant id."""
+        with self._call("list"):
+            grants, denies = self.records()
+            active = {grant.id: grant for grant in grants}
+            found: dict[str, FolderGrant] = {}
+            for folder in self.store.list(COLLECTION, FolderGrant):
+                own = active.get(folder.grant_id)
+                if own is not None and self._decide(folder, folder.path, own, denies).allowed:
+                    found.setdefault(folder.name.casefold(), folder)
+            return sorted(found.values(), key=lambda item: item.name.casefold())
 
     def _decide(self, folder: FolderGrant, target: str, own: Grant, denies: Sequence[Deny]) -> AccessDecision:
         try:
@@ -239,7 +257,7 @@ class FolderReader:
         return SafeRoot(
             folder.path,
             include=folder.include,
-            exclude=folder.exclude,
+            exclude=(*DEFAULT_EXCLUDES, *folder.exclude) if folder.default_excludes else folder.exclude,
             protected=[self.protected],
             max_file_bytes=limits.max_file_bytes,
             max_entries=limits.max_entries,
@@ -284,7 +302,8 @@ class FolderReader:
         return folder, self._root(folder)
 
     def _allowed_below(self, folder: FolderGrant) -> Callable[[str], bool]:
-        """Whether a folder below the grant may be read now (a deny on it is left out of listings and searches)."""
+        """Whether a file or folder below the grant may be read, with the records active now (a deny on it is left
+        out of listings and searches). Call it again for fresh records: a search does so for every folder."""
         grants, denies = self.records()
         own = next((grant for grant in grants if grant.id == folder.grant_id), None)
         return lambda target: own is not None and self._decide(folder, target, own, denies).allowed
@@ -293,16 +312,19 @@ class FolderReader:
 
     def list(self, name: str, path: str = "") -> tuple[FolderGrant, list[dict[str, Any]]]:
         """The entries of a folder below the grant (``""``: the granted folder), each with ``name``, ``path``,
-        ``kind`` (``file``, ``dir``, ``link``, ``other``) and ``size``. Subfolders a deny blocks are left out."""
+        ``kind`` (``file``, ``dir``, ``link``, ``other``) and ``size``. Files and subfolders a deny blocks are left
+        out (a deny on the exact file too)."""
         with self._call("list") as slot:
             folder, root = self._open(slot, name)
             parts = root.check(path, kind="dir")
             self._check(folder, _join(root, parts))
+            found = root.list(path)
+            self._check(folder, _join(root, parts))  # denied or revoked while the folder was listed
             allowed = self._allowed_below(folder)
             entries = [
                 {"name": entry.display, "path": entry.path, "kind": entry.kind, "size": entry.size}
-                for entry in root.list(path)
-                if entry.kind != "dir" or allowed(_join(root, entry.path))
+                for entry in found
+                if allowed(_join(root, entry.path))
             ]
             return folder, entries
 
@@ -320,8 +342,15 @@ class FolderReader:
 
     def search(self, name: str, query: str, path: str = "") -> tuple[FolderGrant, dict[str, Any]]:
         """Files below ``path`` whose name or text contains ``query`` (case-insensitive): ``matches`` with
-        ``path``, ``line`` and ``snippet`` (``None`` for a match by name), ``files_searched`` and ``truncated``.
-        PDFs are found by name only. A search stops at the grant's limits and after :data:`SEARCH_SECONDS`."""
+        ``name`` (escaped for display, as in listings), ``path``, ``line`` and ``snippet`` (``None`` for a match by
+        name), ``files_searched``, ``skipped`` (subfolders that could not be read, with their code) and
+        ``truncated``. PDFs are found by name only.
+
+        Every folder is checked against the access model with the records active when it is taken from the queue,
+        and every file and subfolder in it before it is read or queued, so a deny on an exact file or one added
+        during the search holds; the matches are checked once more before they are returned. A search stops at the
+        grant's limits, at :data:`MAX_PENDING` queued folders and after :data:`SEARCH_SECONDS` (checked before every
+        folder and every entry) and then returns what it found as ``truncated``."""
         needle = query.strip().casefold()
         with self._call("search") as slot:
             folder, root = self._open(slot, name)
@@ -330,23 +359,53 @@ class FolderReader:
             limits = folder.limits
             start = "/".join(root.check(path, kind="dir"))
             self._check(folder, _join(root, start))
+            deadline = time.monotonic() + SEARCH_SECONDS
             matches: list[dict[str, Any]] = []
+            skipped: list[dict[str, str]] = []
             searched = 0
             pending = [start]
-            deadline = time.monotonic() + SEARCH_SECONDS
             truncated = False
+
+            def stop() -> bool:
+                return (
+                    len(matches) >= limits.max_results
+                    or searched >= limits.max_search_files
+                    or time.monotonic() >= deadline
+                )
+
             while pending and not truncated:
+                if stop():
+                    truncated = True
+                    break
+                current = pending.pop(0)
                 self._check(folder, folder.path)  # a revocation stops a long search at the next folder
-                allowed = self._allowed_below(folder)
-                for entry in root.list(pending.pop(0)):
+                allowed = self._allowed_below(folder)  # fresh records for every folder
+                if current != start and not allowed(_join(root, current)):
+                    continue  # denied after it was queued
+                try:
+                    entries = root.list(current)
+                except FsError as exc:
+                    if current == start or exc.code in _FATAL:
+                        raise
+                    if len(skipped) < MAX_SKIPPED:
+                        skipped.append({"path": display_name(current), "code": exc.code})
+                    continue  # one unreadable subfolder does not end the search
+                for entry in entries:
+                    if stop():
+                        truncated = True
+                        break
+                    if entry.kind not in ("dir", "file"):
+                        continue  # links are never followed, special files never read
+                    if not allowed(_join(root, entry.path)):
+                        continue  # a deny on this exact file or subfolder
                     if entry.kind == "dir":
-                        if allowed(_join(root, entry.path)):
+                        if len(pending) >= MAX_PENDING:
+                            truncated = True  # the rest of the folder is still searched, deeper folders are not
+                        else:
                             pending.append(entry.path)
                         continue
-                    if entry.kind != "file":
-                        continue  # links are never followed, special files never read
                     if needle in entry.name.casefold():
-                        matches.append({"path": entry.path, "line": None, "snippet": None})
+                        matches.append(_match(entry.display, entry.path, None, None))
                     elif entry.size <= limits.max_file_bytes and not _is_pdf(entry.path):
                         searched += 1
                         try:
@@ -355,19 +414,25 @@ class FolderReader:
                             continue  # hard links, binary files, files that changed meanwhile: not searched
                         hit = _first_line(text, needle)
                         if hit is not None:
-                            matches.append({"path": entry.path, "line": hit[0], "snippet": hit[1]})
-                    if (
-                        len(matches) >= limits.max_results
-                        or searched >= limits.max_search_files
-                        or time.monotonic() > deadline
-                    ):
-                        truncated = True
-                        break
-            return folder, {"matches": matches, "files_searched": searched, "truncated": truncated}
+                            matches.append(_match(entry.display, entry.path, hit[0], hit[1]))
+            # Denied or revoked while the last files were read: nothing denied is returned.
+            self._check(folder, _join(root, start))
+            allowed = self._allowed_below(folder)
+            matches = [match for match in matches if allowed(_join(root, match["path"]))]
+            result: dict[str, Any] = {"matches": matches, "files_searched": searched, "truncated": truncated}
+            if skipped:
+                result["skipped"] = skipped
+            return folder, result
 
 
 #: The longest one search may take (seconds); it then returns what it found as ``truncated``.
 SEARCH_SECONDS = 30.0
+#: The most folders one search keeps queued; deeper folders are then left out and the search is ``truncated``.
+MAX_PENDING = 10_000
+#: The most unreadable subfolders one search names in ``skipped``.
+MAX_SKIPPED = 20
+#: Codes that end a search instead of skipping one subfolder: the granted folder itself changed.
+_FATAL = frozenset({"fs.root_changed", "fs.protected_root"})
 _REFUSED = "Reading this folder is not allowed"
 _REFUSALS = {
     "missing_grant": "The folder is not granted to this agent here (or the grant has ended)",
@@ -379,6 +444,10 @@ _REFUSALS = {
 def _join(root: SafeRoot, parts: Sequence[str] | str) -> str:
     names = parts.split("/") if isinstance(parts, str) else list(parts)
     return os.path.join(root.path, *[name for name in names if name])
+
+
+def _match(name: str, path: str, line: int | None, snippet: str | None) -> dict[str, Any]:
+    return {"name": name, "path": path, "line": line, "snippet": snippet}
 
 
 def _is_pdf(path: str) -> bool:
@@ -411,8 +480,10 @@ def _first_line(text: str, needle: str) -> tuple[int, str] | None:
 
 __all__ = [
     "COLLECTION",
+    "DEFAULT_EXCLUDES",
     "FOLDERS_ENV",
     "MAX_FILE_BYTES",
+    "MAX_PENDING",
     "SEARCH_SECONDS",
     "FileText",
     "FolderCaller",

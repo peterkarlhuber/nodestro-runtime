@@ -19,6 +19,7 @@ import builtins
 from collections.abc import Callable, Sequence
 from datetime import datetime
 import os
+import tempfile
 from typing import Literal
 
 from orkexa.fs import FsError, SafeRoot
@@ -34,7 +35,14 @@ from .tool_policy import AccessMode, AccessRequest, AccessResource, AccessScope,
 
 #: Why a folder cannot be granted (``folder.not_grantable``, param ``reason``).
 NotGrantable = Literal[
-    "protected_root", "network_path", "invalid_path", "not_found", "not_a_directory", "link", "safety_limit"
+    "protected_root",
+    "network_path",
+    "invalid_path",
+    "not_found",
+    "not_a_directory",
+    "link",
+    "safety_limit",
+    "temp_root",
 ]
 _FS_REASONS: dict[str, NotGrantable] = {
     "fs.protected_root": "protected_root",
@@ -72,6 +80,19 @@ class FolderAccessEntry(BaseModel):
     conversation_id: str | None = None
 
 
+#: The shared temporary folders themselves: every program writes there, so they are never granted. A folder
+#: inside one may be granted (reason ``temp_root``).
+TEMP_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders")
+
+
+def temp_roots() -> set[str]:
+    """The canonical spellings (``os.path.normcase``) of the temporary folders that cannot be granted: the
+    :data:`TEMP_ROOTS` that exist here and this process's temporary folder."""
+    found = {os.path.normcase(os.path.realpath(path)) for path in TEMP_ROOTS if os.name != "nt"}
+    found.add(os.path.normcase(os.path.realpath(tempfile.gettempdir())))
+    return found
+
+
 def _refused(reason: NotGrantable) -> NodestroError:
     return NodestroError("folder.not_grantable", "This folder cannot be granted", reason=reason)
 
@@ -95,13 +116,16 @@ class FolderGrants:
         exclude: Sequence[str] = (),
         limits: FolderLimits | None = None,
         index: bool = False,
+        default_excludes: bool = True,
         scope: AccessScope = "all",
         agents: Sequence[str] = (),
         mode: AccessMode = "supervised",
         expires_at: datetime | None = None,
     ) -> FolderGrantView:
         """Grant ``path`` (absolute) for reading under ``name``. ``expires_at`` makes it an ``until`` grant,
-        otherwise it holds until revoked."""
+        otherwise it holds until revoked. ``default_excludes=False`` lets the agents read the common secret files
+        (:data:`~nodestro_runtime.folders.DEFAULT_EXCLUDES`), which every grant leaves out unless an administrator
+        turns this off explicitly."""
         if not folders_enabled():
             raise NodestroError("folder.disabled", "Folder grants are not switched on for this application")
         if not isinstance(by, Person):
@@ -109,8 +133,6 @@ class FolderGrants:
         shown = name.strip()
         if not shown or len(shown) > 80 or not shown.isprintable() or "/" in shown or "\\" in shown:
             raise NodestroError("folder.invalid_name", "A folder name has 1 to 80 printable characters, no slash")
-        if any(view.status == "active" and view.folder.name.casefold() == shown.casefold() for view in self.list()):
-            raise NodestroError("folder.name_taken", "An active folder grant already has this name")
         if not os.path.isabs(path):
             raise _refused("invalid_path")
         try:
@@ -119,6 +141,8 @@ class FolderGrants:
             raise _refused(_FS_REASONS.get(exc.code, "invalid_path")) from None
         except ValueError:
             raise NodestroError("folder.invalid_pattern", "An include or exclude pattern is not valid") from None
+        if os.path.normcase(root.path) in temp_roots():
+            raise _refused("temp_root")
         for spelling in dict.fromkeys([path, root.path]):
             try:
                 request = AccessRequest(
@@ -132,6 +156,10 @@ class FolderGrants:
             if safety_limit(request) is not None:
                 raise _refused("safety_limit")
         with self.store.transaction():  # the access grant and the folder grant are stored together or not at all
+            # Checked inside the transaction (it holds the write lock), so two grants of one name cannot both pass.
+            self.store.lock(COLLECTION, "name")
+            if any(view.status == "active" and view.folder.name.casefold() == shown.casefold() for view in self.list()):
+                raise NodestroError("folder.name_taken", "An active folder grant already has this name")
             access = self.rules.grant(
                 resource=AccessResource(type="folder", id=root.path),
                 actions=["read"],
@@ -151,6 +179,7 @@ class FolderGrants:
                 exclude=tuple(exclude),
                 limits=limits or FolderLimits(),
                 index=index,
+                default_excludes=default_excludes,
                 grant_id=access.id,
                 created_by=by.id,
                 created_at=access.created_at,
@@ -221,4 +250,4 @@ class FolderGrants:
         )
 
 
-__all__ = ["FolderAccessEntry", "FolderGrantView", "FolderGrants", "NotGrantable"]
+__all__ = ["TEMP_ROOTS", "FolderAccessEntry", "FolderGrantView", "FolderGrants", "NotGrantable", "temp_roots"]

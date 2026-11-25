@@ -282,6 +282,7 @@
   "fs.not_a_directory": [],
   "fs.not_found": [],
   "fs.protected_root": [],
+  "fs.root_changed": [],
   "fs.too_complex": [],
   "fs.too_large": [],
   "fs.unsupported_type": ["path"],

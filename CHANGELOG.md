@@ -23,10 +23,28 @@
     the Windows system folders, the data folder and an unresolvable request still hold.
   - New codes: `folder.disabled`, `folder.failed`, `folder.invalid_name`, `folder.invalid_pattern`,
     `folder.invalid_query`, `folder.name_taken`, `folder.not_found`, `folder.not_grantable`, `folder.unavailable`,
-    `folder.unknown`, and the `fs.*` codes of the guard the tools return.
+    `folder.unknown`, and the `fs.*` codes of the guard the tools return (`fs.root_changed` now in the catalog too).
   - Tests: `tests/test_folders.py`, which also runs orkexa's folder grant conformance cases (N-63) through the real
     tools (attack catalog, link swaps, patterns, limits, revocation, expiry, access log), on Linux, macOS and
     Windows.
+  - Fixes from the independent review of N-10 (each with a regression test in `tests/test_folders.py`):
+    - a deny on an exact file now holds in `list_folder` and `search_files` too (before, only `read_file` refused it;
+      a search returned its text as a snippet). A search reads the grants and denies again for every folder it takes
+      from its queue, checks that folder and every entry in it, and checks the grant and its matches once more before
+      it returns;
+    - the 30-second search limit is checked before every folder and every entry (a tree of folders without files
+      was walked to its end), and the queue holds at most `MAX_PENDING` (10,000) folders; both end as `truncated`;
+    - search snippets come between the data markers of `read_file`, and a match has the escaped `name` of a listing;
+    - a subfolder that cannot be listed is skipped and named in the new `skipped` list instead of ending the search;
+    - a folder deny is stored canonical (`os.path.realpath`), like a folder grant;
+    - the shared temporary folders themselves cannot be granted (new reason `temp_root`); folders inside them can;
+    - every grant leaves out common secret files (`folders.DEFAULT_EXCLUDES`: `.env*`, `*.pem`, `*.key`, `id_rsa*`,
+      `id_ed25519*`, `.npmrc`, `.pypirc`, `.netrc`, `*.kdbx`); new `FolderGrant.default_excludes` (default `true`) and
+      `FolderGrants.grant(default_excludes=...)` for an administrator to turn it off;
+    - the name of a new grant is checked inside the transaction that stores it;
+    - `list_folder` without a folder is logged (`folder.listed` without a grant id);
+    - on Windows, a system folder named by the environment that cannot be compared (an 8.3 short name, a device
+      path) now refuses every folder (`limit:unresolvable_path`) and logs a warning, instead of being skipped.
 - Conversations (RT-089 follow-ups; still behind `NODESTRO_CONVERSATIONS` in the API, off by default):
   - An answer's run that is still going when its conversation is deleted (after the delete's wait of 10 seconds) is
     deleted once it stops (`Conversations.run_stopped`, a listener of the run manager; also on the reaper's
