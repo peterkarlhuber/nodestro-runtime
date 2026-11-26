@@ -850,6 +850,12 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Tests and quality assurance
 
+Fixed 2026-11-26 (no entry left): the lease-loss tests (`test_job_delivery.py`, `test_run_fencing.py`) expired a live
+worker's lease while its heartbeat kept running; a renewal already on its way landed between the expiry and the
+reaper, which then found nothing (master 6b65b2e, pg-b 3.11, 2026-11-21). `tests/lease_support.py` now holds the
+worker's renewals while a test expires and reaps, as a real stall does; with a 40 ms late heartbeat and a 100 ms late
+reaper (probe) master failed 5 of 8 runs, the fix 0 of 8.
+
 ### RT-078 · Dependency confusion: the poisoned-index job and the studio origin commit (TABRION DC-NR-1)
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** TABRION DC-NR-1, `scripts/check_tabrion_source.py` (checksummed
