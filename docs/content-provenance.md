@@ -45,6 +45,21 @@ Once such content is there, the run is **marked** (`Run.granted_content`), and s
   fails with `access.missing_grant` before the request is sent.
 - **Every server tool that reaches outside** (`web_search`, `web_fetch`) needs a grant on the tool (`tool:<key>`).
   Server tools run at the provider and never pass the tool hook, so a request that offers one is refused as a whole.
+- **Every embedding of granted content** follows the rule of the local model server: the knowledge's embedding model
+  runs on that server (`ollama`), so an embedding server on this computer needs nothing, and one elsewhere needs a
+  grant on `cloud_provider` `ollama` before anything is sent:
+  - a step's knowledge search in mode `vector` or `hybrid` embeds its query; once the execution holds granted
+    content, the call is refused before the query is sent (the agent reads a fixed text: the knowledge search would
+    send the query to an embedding model outside this computer). It is refused, never quietly answered with
+    full-text search: the agent asked for another ranking, and a full-text answer under the same tool call would
+    hide the refusal. A full-text search (`fts`) embeds nothing and is never held;
+  - knowledge is itself a granted source, so its text goes to such a server only with a grant for all agents:
+    rebuilding the semantic index is refused with `access.missing_grant`; a file added to knowledge (an upload,
+    OCR, an adoption from a run, a project import) is indexed **without vectors** instead, explicitly: the refusal is
+    audited, full-text search finds the file, and the index status says `incomplete` until a rebuild with a grant;
+  - the similarity hint of an adoption (taking content over into knowledge) searches with the item's own words: it
+    is treated as granted content, and when its embedding is refused it uses full-text search (it is only a hint).
+  A person's own search in the knowledge view is not granted content and is not held.
 
 A grant never lifts a deny or a safety limit, and both come first: strict offline refuses every one of these paths
 (`access.safety_limit`), with or without a grant. A grant on a service only satisfies this rule: it never lifts a
@@ -61,6 +76,8 @@ All checks are the runtime's; the studio only shows what happens.
 | Cloud model, per request | the `on_request` hook of an agent's turn and an orchestrator's decision (`RunManager._check_egress`): granted content can enter a turn after it connected | `access.missing_grant` |
 | Quality judge, per request | the judge's own `on_request` (`execute_agent(..., judge_hooks=)`), in a run and in an agent test: the judge connects when the step starts, maybe before the mark, and may use another provider than the agent | `access.missing_grant` |
 | Server tools | the same `on_request` check | `access.missing_grant` |
+| Knowledge search of a step (vector, hybrid) | before the query is embedded: `ScopedIndex.before_embed`, set from `RunServices.embedding_check` (`RunManager._check_embedding`) | the call fails with a fixed text; audited as `access_refused` |
+| Knowledge indexing and rebuild, an adoption's hint | `KnowledgeBase.embedding_check` (the workspace: `RunManager.check_cloud_access("ollama", shared_content=True)`) before a rebuild, before new text is embedded, and before a search with `granted=True` | rebuild: `access.missing_grant`; new text: indexed without vectors; hint: full-text search |
 | Run chat about a run | `run_chat` passes `RunManager.content_granted` of the run and its top-level run | `access.missing_grant` |
 | A conversation's summary (N-05) | `Conversations._summarize` passes the conversation's mark to `connect_model` | `access.missing_grant` (the history is trimmed instead) |
 
@@ -69,7 +86,9 @@ Every refusal is recorded for the person:
 - a refused tool call: `ToolCallApproval` (status `denied`, code `access.missing_grant`), the run event `tool_denied`
   and the activity event `tool.called` with outcome `denied`;
 - a refused model request or server tool: the audit event `access_refused` (activity `tool_approval.access_refused`,
-  outcome `denied`) and the run event `access_refused`, as N-06 does.
+  outcome `denied`) and the run event `access_refused`, as N-06 does;
+- a refused embedding: the audit event `access_refused` (resource `cloud_provider` `ollama`); in a run also the run
+  event `access_refused` and the failed call of the knowledge search.
 
 The mark itself is the run event `content_provenance` (`source`, `tool`, `first`).
 
@@ -100,9 +119,11 @@ failed marks the run anyway (its error can name what it found).
 
 ## Known limits
 
-- Knowledge embeddings (vector retrieval) go to the workspace's local model server whatever its address, as before:
-  indexing does not run in a step, and a search query is not checked against the mark. Keep the embedding server on
-  this computer when knowledge is granted content.
+- The address of the embedding server is read at each check from the local model server's connection; the
+  knowledge keeps the embedding model it connected while its name stays the same, so after the server's address
+  changed, a rebuild or restart makes the model use the new one.
+- Agent tests never run a knowledge search with granted content: the tool gate refuses the knowledge search there
+  (it counts as an unknown tool, and a test never asks), so no query reaches the embedding server.
 - A tool without a declaration is not seen. MCP tools never declare a source: their results are external data, not
   granted content.
 - Content that entered a conversation or run while the switch was off is not recorded: such a conversation is

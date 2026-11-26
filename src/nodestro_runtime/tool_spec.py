@@ -371,6 +371,9 @@ class RunServices:
     #: The granted folders this step may read (N-10, :class:`~nodestro_runtime.folders.FolderReader`); ``None``:
     #: none here (the switch is off, outside a run, or not in this mode).
     folders: FolderReader | None = None
+    #: N-08: raises before the agent's knowledge search embeds its query (vector or hybrid), when the query may not
+    #: reach the embedding model (:attr:`~nodestro_runtime.knowledge.ScopedIndex.before_embed`); ``None``: no check.
+    embedding_check: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)

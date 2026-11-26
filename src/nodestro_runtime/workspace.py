@@ -60,7 +60,7 @@ from .conversations import Conversations
 from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
-from .engine import RunManager
+from .engine import EMBEDDING_PROVIDER, RunManager
 from .extensions import Extensions, Integration, discover
 from .folder_tools import FOLDER_TOOLS
 from .folders import folders_enabled
@@ -492,6 +492,9 @@ class Workspace:
             assistant_model=lambda: self.settings().assistant_model,
         )
         self.runs.budget_policy = self._budget_policy
+        # N-08: knowledge text (and a search query of granted content) reaches an embedding server outside this
+        # computer only with a grant on its provider; nothing is checked while the provenance switch is off.
+        self.knowledge.embedding_check = lambda: self.runs.check_cloud_access(EMBEDDING_PROVIDER, shared_content=True)
         # The internal inbox (NAL-A3): everywhere but on a server whose Axentra inbox is on (that stays the only one).
         self.inbox: LocalInbox | None = None
         if local_inbox_enabled(server=storage is not None):

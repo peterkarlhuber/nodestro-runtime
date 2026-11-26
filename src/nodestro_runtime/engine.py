@@ -64,6 +64,7 @@ from orkexa import (
     Tool,
     ToolCall,
     ToolCallSuspended,
+    ToolResultError,
     TurnSuspended,
     UsageRecord,
     UsageSummary,
@@ -1432,6 +1433,18 @@ class RunManager:
                 source=explained.source,
             )
             raise access_error(explained, resource, show_source=is_person(_run_actor(root)))
+
+    def _check_embedding(self, context: _RunContext, node_id: str) -> None:
+        """Before the agent's knowledge search embeds its query (vector or hybrid) in an execution that holds content
+        of a granted source (N-08): an embedding server outside this computer (:meth:`leaves_computer`) needs a grant
+        on its provider (``cloud_provider`` ``ollama``), as a model request does. A refusal is audited and shown
+        (:meth:`_check_site_access`), and the search fails before the query is sent: the agent reads a fixed text.
+        Nothing happens while the switch is off, without such content, or for a server on this computer."""
+        if not self.holds_granted(context) or not self.leaves_computer(EMBEDDING_PROVIDER):
+            return
+        resource = tool_policy.AccessResource(type="cloud_provider", id=EMBEDDING_PROVIDER)
+        if self._check_site_access(context, node_id, resource) is not None:
+            raise ToolResultError(EMBEDDING_REFUSED)
 
     def content_granted(self, run: Run) -> bool:
         """Whether ``run`` holds content of a granted source (N-08), for everything that sends a finished run's
@@ -4760,6 +4773,7 @@ class RunManager:
             notify=notify,
             save_file=save_file,
             run_file=run_file,
+            embedding_check=lambda: self._check_embedding(context, node_id),
         )
 
     def _folder_reader(self, context: _RunContext, node_id: str, agent_name: str | None) -> FolderReader | None:
@@ -5786,6 +5800,14 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
     target.error = found.message
     target.error_code = found.code
     target.error_params = found.params
+
+
+#: N-08: the provider of the knowledge embeddings (the workspace connects them to its local model server only).
+EMBEDDING_PROVIDER = "ollama"
+#: N-08: what the agent reads for a knowledge search whose query may not reach the embedding model (no source).
+EMBEDDING_REFUSED = (
+    "The knowledge search would send the query to an embedding model outside this computer, and no permission covers it"
+)
 
 
 #: N-08: the content sources Orkexa's own tools declare, as the run names them (a store or index of the agent's

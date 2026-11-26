@@ -21,6 +21,10 @@ setting chooses the mode and the embedding model; an agent may choose another mo
 Vectors exist only after a person built the semantic index (:meth:`KnowledgeBase.start_reindex`); they belong to one
 embedding model, and another model needs a reindex. An agent view (:class:`ScopedIndex`) limits a search to the
 agent's files *before* ranking, in every mode.
+
+Egress protection (N-08, only while its switch is on): every embedding of granted content asks a check first
+(:attr:`KnowledgeBase.embedding_check`, :attr:`ScopedIndex.before_embed`), so knowledge text and a marked run's search
+query reach an embedding model outside this computer only with a grant (``docs/content-provenance.md``).
 """
 
 from __future__ import annotations
@@ -199,11 +203,20 @@ class ScopedIndex(Index):
     The files limit the candidates *before* ranking (the index filters by source), so other files never take the
     places of the assigned ones, in full-text, vector and hybrid search alike."""
 
-    def __init__(self, base: Index, file_ids: Iterable[str], mode: RetrievalMode | None = None) -> None:
+    def __init__(
+        self,
+        base: Index,
+        file_ids: Iterable[str],
+        mode: RetrievalMode | None = None,
+        *,
+        before_embed: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(max_chars=base.max_chars, overlap=base.overlap)
         self.base = base
         self.file_ids = frozenset(file_ids)
         self.mode = mode
+        #: N-08: called before a search that embeds its query (every mode but ``fts``); it raises to refuse it.
+        self.before_embed = before_embed
 
     def add_chunks(self, chunks: Iterable[Chunk]) -> list[int]:
         raise PermissionError("This view is read-only")
@@ -223,7 +236,10 @@ class ScopedIndex(Index):
         sources: Iterable[str] | None = None,
     ) -> list[Hit]:
         allowed = self.file_ids if sources is None else self.file_ids & set(sources)
-        return self.base.retrieve(query, k, mode=mode or self.mode, sources=sorted(allowed))
+        chosen = mode or self.mode
+        if chosen != "fts" and self.before_embed is not None:
+            self.before_embed()  # ``None`` (the index's default) may embed too
+        return self.base.retrieve(query, k, mode=chosen, sources=sorted(allowed))
 
 
 class ChunkAccess(Protocol):
@@ -278,6 +294,9 @@ class KnowledgeBase:
         self.retrieval: Callable[[], tuple[RetrievalMode, str | None]] = lambda: ("fts", None)
         #: The embedding model of a name (the workspace connects it to the local model server).
         self.embedding_model: Callable[[str], EmbeddingModel] | None = None
+        #: N-08: raises (``access.*``) when granted content may not go to the embedding model: the workspace refuses
+        #: a model outside this computer without a grant while the provenance switch is on. ``None``: no check.
+        self.embedding_check: Callable[[], None] | None = None
         self._job: ReindexJob | None = None
         self._job_cancel: threading.Event | None = None
         #: On a server's API process: where reindex jobs are queued for a worker (:class:`ReindexQueue`, RT-046);
@@ -460,12 +479,39 @@ class KnowledgeBase:
                 return
         setattr(self.index, "embeddings", self._model(str(target.get("model"))))  # noqa: B010
 
+    def _check_embedding(self) -> None:
+        """N-08: raise ``access.*`` when granted content may not be sent to the embedding model now."""
+        if self.embedding_check is not None:
+            self.embedding_check()
+
+    def _without_vectors(self, work: Callable[[], object]) -> None:
+        model = getattr(self.index, "embeddings", None)
+        setattr(self.index, "embeddings", None)  # noqa: B010
+        try:
+            work()
+        finally:
+            setattr(self.index, "embeddings", model)  # noqa: B010
+
+    def _index_checked(self, work: Callable[[], object]) -> None:
+        """Index text; when the embedding check refuses (N-08), index it without vectors: the text stays searchable
+        in full text, the refusal is audited and the status shows ``incomplete`` until a permitted reindex."""
+        if getattr(self.index, "embeddings", None) is not None:
+            try:
+                self._check_embedding()
+            except NodestroError as exc:
+                if not exc.code.startswith("access."):
+                    raise
+                logger.warning("New knowledge is indexed without vectors: %s", exc.code)
+                self._without_vectors(work)
+                return
+        work()
+
     def _index_with_fallback(self, work: Callable[[], object]) -> None:
         """Index new text; when the embedding model cannot be reached, index it without vectors (a later reindex
         adds them, the status shows ``incomplete``) instead of refusing the upload."""
         self._sync_embeddings()
         try:
-            work()
+            self._index_checked(work)
         except (OllamaError, RetrievalError) as exc:
             # ``reindex_required``: the embedding model changed on the server (a pull or rebuild gave it another
             # digest), so its vectors would not match the index's; the status says ``reindex_required`` (RT3-08).
@@ -474,12 +520,7 @@ class KnowledgeBase:
             ):
                 raise
             logger.warning("New knowledge is indexed without vectors: %s", exc)
-            model = getattr(self.index, "embeddings", None)
-            setattr(self.index, "embeddings", None)  # noqa: B010
-            try:
-                work()
-            finally:
-                setattr(self.index, "embeddings", model)  # noqa: B010
+            self._without_vectors(work)
 
     def index_status(self) -> KnowledgeIndexStatus:
         mode, model = self.retrieval()
@@ -530,6 +571,7 @@ class KnowledgeBase:
         model = self._model(name)
         if model is None:
             raise NodestroError("knowledge.embedding_model_missing", "No embedding model is available")
+        self._check_embedding()  # N-08: a reindex sends every chunk of the knowledge to the model
         return name, model
 
     def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
@@ -682,7 +724,7 @@ class KnowledgeBase:
             self.store._save(entry, data)
             self.index.delete(entry.id)
             if text.strip():
-                self.index.add(text, source=entry.id, title=entry.name, file_id=entry.id)
+                self._index_checked(lambda: self.index.add(text, source=entry.id, title=entry.name, file_id=entry.id))
 
     def _mark(self, file_id: str, **values: str) -> None:
         entry = self.store.info(file_id)
@@ -754,10 +796,20 @@ class KnowledgeBase:
             )
 
     def search(
-        self, query: str, file_ids: Iterable[str] | None = None, k: int = 8, *, mode: RetrievalMode | None = None
+        self,
+        query: str,
+        file_ids: Iterable[str] | None = None,
+        k: int = 8,
+        *,
+        mode: RetrievalMode | None = None,
+        granted: bool = False,
     ) -> list[Hit]:
-        """Search the knowledge base (``mode``: default the workspace's), limited to ``file_ids`` before ranking."""
+        """Search the knowledge base (``mode``: default the workspace's), limited to ``file_ids`` before ranking.
+        ``granted``: the query holds granted content (N-08), so a search that embeds it asks the embedding check
+        first (``access.*`` when refused)."""
         chosen = mode or self.retrieval()[0]
+        if granted and chosen != "fts":
+            self._check_embedding()
         self._prepare_search(chosen)
         try:
             return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
@@ -769,8 +821,11 @@ class KnowledgeBase:
 
     # ---- per-agent views -----------------------------------------------------------
 
-    def views(self, config: KnowledgeConfig) -> tuple[ScopedFileStore | None, ScopedIndex | None]:
-        """The store and index an agent gets for ``config`` (``None`` where it gets none)."""
+    def views(
+        self, config: KnowledgeConfig, *, before_embed: Callable[[], None] | None = None
+    ) -> tuple[ScopedFileStore | None, ScopedIndex | None]:
+        """The store and index an agent gets for ``config`` (``None`` where it gets none). ``before_embed``: the run's
+        check before a search embeds its query (N-08, :attr:`ScopedIndex.before_embed`)."""
         file_ids = [file_id for file_id in config.file_ids if file_id in self.store]
         if not file_ids or config.mode == "context":
             return None, None
@@ -778,4 +833,4 @@ class KnowledgeBase:
             return ScopedFileStore(self.store, file_ids), None
         mode = self.effective_mode(config)
         self._prepare_search(mode)
-        return None, ScopedIndex(self.index, file_ids, mode)
+        return None, ScopedIndex(self.index, file_ids, mode, before_embed=before_embed)

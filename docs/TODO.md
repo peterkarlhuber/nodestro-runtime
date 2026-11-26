@@ -698,7 +698,10 @@ Items that need an independent or external review (an internal audit does not re
     branch `claude/w3-n08`); other api callers of `connect_model` send no run content;
   - Nodestro has no transport that starts a workflow on another installation; a workflow elsewhere is reached through
     a tool and counts as external there. Revisit if such a transport is added;
-  - knowledge embeddings go to the workspace's local model server whatever its address, unchecked against the mark;
+  - done (W3-S, knowledge embeddings): an embedding server outside this computer needs a grant on `cloud_provider`
+    `ollama`; a marked step's vector or hybrid knowledge search is refused before its query is embedded, knowledge
+    text is indexed without vectors and a rebuild is refused without that grant, an adoption's hint uses full-text
+    search (`tests/test_content_provenance.py`, section "knowledge embeddings");
   - done in the independent review (2026-11-25): the quality judge checks its own model before every request (High),
     the agent test's memory copy keeps the source `memory` (Medium), a local model server elsewhere needs a grant
     (L1), assistant chat uploads documented as no granted source (L2), a child run stores its first mark at once (L3).
