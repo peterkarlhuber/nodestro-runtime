@@ -4,7 +4,8 @@ Covered: the first index (text and PDF files through the path guard, other types
 a change (size, times and content hash), a touch without a change, a deletion, a deny on a subfolder, a revocation
 (the chunks and their vectors are dropped at once, a search returns nothing, also one already running and a sync
 already running), an expiry, the reconciliation at the start (changes made while Nodestro was closed, grants that ended
-meanwhile), the switch turned off, and that the knowledge search never returns a folder's chunks. Provenance (N-08)
+meanwhile), the switch turned off, that the knowledge search never returns a folder's chunks, and the budgets of a file
+and a folder (review L-1, L-2). Provenance (N-08)
 and the embedding rules (RT-094) of folder indexes are in ``test_content_provenance.py``.
 """
 
@@ -22,6 +23,7 @@ from folder_support import PERSON, bound, grant_base, reader
 import pytest
 from test_folders import _pdf
 
+from nodestro_runtime import folder_index
 from nodestro_runtime.folder_grants import FolderGrants
 from nodestro_runtime.folder_index import FILES, STATES, FolderIndex, FolderIndexFile, FolderIndexState, source_of
 from nodestro_runtime.folder_tools import FolderToolError, search_files
@@ -315,6 +317,57 @@ def test_an_expired_grant_loses_its_index_at_the_next_sweep(workspace: Workspace
     index.clock = lambda: now() + timedelta(hours=2)
     assert index.drop_ended() == [folder.id]
     assert _folder_chunks(workspace) == []
+
+
+def test_a_files_and_a_folders_chunks_are_budgeted(
+    workspace: Workspace, docs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-12 review L-1, L-2: at most ``MAX_FILE_CHUNKS`` chunks of one file and the folder's chunk budget are indexed;
+    the rest is left out and the state says ``truncated``."""
+    monkeypatch.setattr(folder_index, "MAX_FILE_CHUNKS", 2)
+    paragraph = "The harbour ledger lists every crate. " * 60
+    (docs / "ledger.txt").write_text("\n\n".join([paragraph] * 12), encoding="utf-8")
+    folder = _grant(workspace, docs)
+    index = _index(workspace)
+    state = index.sync(folder.id)
+    assert state is not None and state.state == "ready" and state.truncated
+    [ledger] = [item for item in index.files(folder.id) if item.path == "ledger.txt"]
+    assert ledger.chunks == 2 and ledger.truncated
+    index.max_folder_chunks = 3
+    _changed(docs / "readme.md", "Overview of the lighthouse archive, revised\n")
+    state = index.sync(folder.id)
+    assert state is not None and state.truncated and state.chunks <= 3
+    assert sum(item.chunks for item in index.files(folder.id)) == state.chunks <= 3
+
+
+def test_a_folders_byte_budget_leaves_the_other_files_out(workspace: Workspace, docs: Path) -> None:
+    folder = _grant(workspace, docs)
+    index = _index(workspace)
+    index.max_folder_bytes = 1
+    state = index.sync(folder.id)
+    assert state is not None and state.state == "ready" and state.truncated and state.chunks == 0
+    assert _folder_chunks(workspace) == []
+
+
+def test_a_long_sync_drops_another_folders_expired_index(workspace: Workspace, docs: Path, base: Path) -> None:
+    """N-12 review L-2: a sync sweeps for ended grants between files, not only between syncs."""
+    other = base / "other"
+    other.mkdir()
+    (other / "memo.txt").write_text("The lantern schedule\n", encoding="utf-8")
+    expiring = FolderGrants(workspace.store, str(workspace.data_dir.resolve())).grant(
+        name="Other", path=str(other), by=PERSON, index=True, expires_at=now() + timedelta(hours=1)
+    )
+    folder = _grant(workspace, docs)
+    index = _index(workspace)
+    index.sync(expiring.folder.id)
+    assert any(source.startswith(f"{FOLDER_SOURCE}{expiring.folder.id}/") for source in _folder_chunks(workspace))
+    real = index.clock
+    index.clock = lambda: real() + timedelta(hours=2)
+    index.sweep_seconds = 0
+    state = index.sync(folder.id)
+    assert state is not None and state.state == "ready"
+    assert not any(source.startswith(f"{FOLDER_SOURCE}{expiring.folder.id}/") for source in _folder_chunks(workspace))
+    assert index.state(expiring.folder.id) is None
 
 
 def test_the_index_is_reconciled_at_the_start(base: Path, docs: Path) -> None:

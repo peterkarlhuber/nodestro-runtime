@@ -1369,6 +1369,27 @@ class RunManager:
             return False
         return not offline.is_local_endpoint(address, docker=self.builder.mode == "local-container")
 
+    def folder_embedding_allowed(self, address: str | None) -> bool:
+        """Whether granted folder text (N-12) may be embedded by the model at ``address`` (the address it really sends
+        to), fail closed whatever the switches (N-12 review H-1): a server on this computer, or one elsewhere only while
+        the provenance switch (with the access model) is on and a grant on ``cloud_provider`` ``ollama`` allows
+        shared content. No address (an injected model) counts as this computer, as in :meth:`embedding_leaves`.
+        A refusal by the access model is audited as :meth:`check_cloud_access` audits it."""
+        if not address or offline.is_local_endpoint(address, docker=self.builder.mode == "local-container"):
+            return True
+        gate = self.tool_gate
+        if gate is None or not gate.provenance:
+            return False
+        try:
+            # The grant a person gives for the knowledge embeddings (RT-094): an unattended grant always names agents,
+            # and the folder index embeds for no agent.
+            self.check_cloud_access(EMBEDDING_PROVIDER, shared_content=True, endpoint=address)
+        except NodestroError as exc:
+            if not exc.code.startswith("access."):
+                raise
+            return False
+        return True
+
     def holds_granted(self, context: _RunContext) -> bool:
         """Whether this execution holds content of a granted source (N-08): its top-level run is marked, or the
         conversation it answers in is (read now). ``False`` while the switch is off."""

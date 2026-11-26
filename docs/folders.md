@@ -186,7 +186,10 @@ access log names the grant, and the run is marked as holding granted content (N-
 - **First index and changes.** `FolderIndex.sync` walks the folder through `orkexa.fs.SafeRoot` with the grant's
   patterns, limits, identity and the default excludes, and reads text files (`.txt`, `.md`, `.markdown`, `.csv`,
   `.json`, `.yaml`, `.yml`, `.html`, `.xml`) and PDFs (in the isolated extraction with the grant's page, time and memory
-  budgets); other types are left out. At most `max_search_files` files and 10,000 queued folders (else `truncated`).
+  budgets); other types are left out. At most `max_search_files` files and 10,000 queued folders, at most 400 chunks
+  of one file (`MAX_FILE_CHUNKS`, which also bounds how long the index's write lock is held), and at most 50,000
+  chunks and 512 MiB of files of one folder (`MAX_FOLDER_CHUNKS`, `MAX_FOLDER_BYTES`); what is over a budget is left
+  out and the state says `truncated`.
   A file whose size, modification time or change time differs from the manifest (collection `folder_index_files`) is
   read again; its chunks are replaced only when its SHA-256 changed. Files that are gone, excluded, denied, too large
   or no longer readable lose their chunks. The times are read with `os.stat` without following links, only as a hint
@@ -195,19 +198,27 @@ access log names the grant, and the run is marked as holding granted content (N-
   knowledge base's write lock. A revocation (`DELETE /api/folders/{id}` or `DELETE /api/access/grants/{id}`) drops
   the folder's chunks with their vectors and its manifest at once (`Workspace.folder_access_changed`,
   `FolderIndex.drop_ended`); a sync running at that moment stores nothing more. An expiry is found by the indexer's
-  sweep (every 30 seconds). Until a chunk is gone, the folder tools refuse the folder anyway, and every hit of an index
-  search is checked again against the access model (the caller's scope and denies) and the path guard after the search,
-  so a search over a revoked folder, also one already running, returns nothing. A deny on a subfolder holds at the next
+  sweep (every 30 seconds), also between the files of a long sync of another folder. Until a chunk is gone, the
+  folder tools refuse the folder anyway, and every hit of an index search is checked again against the access model
+  (the caller's scope and denies) and the path guard after the search, so a search over a revoked folder, also one
+  already running, returns nothing. A deny on a subfolder holds at the next
   search and leaves the index at the next sync. Denies that name agents keep a path out of the index for everyone (the
   index serves the grant as a whole; who may search it is checked per call).
 - **Reconciliation.** `FolderIndexer` (a background thread on the desktop and in Nodestro Local Docker) runs
   `FolderIndex.reconcile` at the start and every 5 minutes: ended grants and chunks without a grant are dropped,
   every active grant with `index` is synced. A new grant is indexed at once (the API wakes the indexer).
-- **Egress (N-08, RT-094).** Folder text is granted content. It is embedded through the knowledge base's embedding
-  check, so an embedding server outside this computer gets it only with a grant on `cloud_provider` `ollama`; without
-  one the text is indexed without vectors (full text finds it) and the refusal is audited. An index search in vector or
-  hybrid mode asks the run's check before it embeds its query (`RunServices.embedding_check`), like a knowledge search;
-  without a semantic index it searches in full text.
+- **Egress (N-08, RT-094; review H-1).** Folder text is granted content, and its rule fails closed whatever the
+  other switches: it is embedded only when `KnowledgeBase.folder_embedding_allowed` (the workspace:
+  `RunManager.folder_embedding_allowed`) allows the address the embedding model really sends to. A server on this
+  computer (`localhost`, loopback; in Local Docker also `ollama`) always may; a server elsewhere only while the
+  provenance switch (`NODESTRO_CONTENT_PROVENANCE`, with the access model) is on and a person's grant on
+  `cloud_provider` `ollama` for all agents allows shared content (a refusal is audited). Otherwise, also with
+  approvals, the access model or provenance off, the text is indexed without vectors (full text finds it), an index
+  search does not embed its query (it runs in full text), and a rebuild of the semantic index for such a model removes
+  every folder index before it starts and stores no folder chunk while it runs (the indexer rebuilds them without
+  vectors at its next run). When the query may be embedded, an index search in vector or hybrid mode also asks the
+  run's check first (`RunServices.embedding_check`), like a knowledge search; without a semantic index it searches in
+  full text.
 - **Switch.** The index exists only while `NODESTRO_FOLDER_GRANTS=1` and never in the server profile. With the switch
   off, the workspace removes every folder index at its start.
 
@@ -224,8 +235,11 @@ access log names the grant, and the run is marked as holding granted content (N-
 - CI runs `tests/test_folders.py` on Linux, macOS and Windows (`.github/workflows/platforms.yml`).
 - `tests/test_folder_index.py` (N-12): first index, change by time and hash, a touch without a change, deletion, a
   deny, revocation (also during a search and during a sync), expiry, the reconciliation at the start, the switch
-  turned off, and that knowledge searches never return a folder's chunks. `tests/test_content_provenance.py`: an index
-  search marks the run; folder text and a marked run's query reach an embedding server elsewhere only with a grant.
+  turned off, that knowledge searches never return a folder's chunks, the file and folder budgets, and the sweep
+  during a long sync. `tests/test_content_provenance.py`: an index search marks the run; folder text and a marked
+  run's query reach an embedding server elsewhere only with a grant, in every combination of the approvals, access
+  and provenance switches (review H-1), a server on this computer embeds it in every combination, and a rebuild for a
+  server elsewhere drops the folder indexes first.
 
 ## Not in this step
 

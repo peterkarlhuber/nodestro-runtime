@@ -506,6 +506,9 @@ class Workspace:
             EMBEDDING_PROVIDER, shared_content=True, endpoint=address or ""
         )
         self.knowledge.embedding_address = self._embedding_address
+        # N-12 review H-1: granted folder text is embedded only on this computer, or elsewhere with provenance on and a
+        # grant; never merely because a switch is off.
+        self.knowledge.folder_embedding_allowed = self.runs.folder_embedding_allowed
         # The internal inbox (NAL-A3): everywhere but on a server whose Axentra inbox is on (that stays the only one).
         self.inbox: LocalInbox | None = None
         if local_inbox_enabled(server=storage is not None):
@@ -528,6 +531,8 @@ class Workspace:
                 )
                 self.folder_indexer = FolderIndexer(self.folder_index)
                 self.runs.folder_index = self.folder_index
+                # A reindex whose model may not embed folder text drops every folder index first (rebuilt after it).
+                self.knowledge.folder_reset = self.folder_index.purge
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
             self.runs.tool_gate = ToolGate(

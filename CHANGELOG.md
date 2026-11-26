@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Security (N-12 review H-1, L-1, L-2): a granted folder's text went to an embedding server outside this computer
+  without a grant while the provenance switch (or approvals, or the access model) was off: only the folder switch was
+  needed. Now it fails closed whatever the switches: folder text is embedded, and a folder index search embeds its
+  query, only for a server on this computer, or for one elsewhere while provenance is on and a grant allows it
+  (new `RunManager.folder_embedding_allowed`, `KnowledgeBase.folder_embedding_allowed`); else the chunks are stored
+  without vectors and the search runs in full text. A rebuild of the semantic index for such a model removes every
+  folder index first (`KnowledgeBase.folder_reset`) and stores no folder chunk while it runs
+  (`knowledge.FolderIndexBusy`). Budgets: at most 400 chunks per file (`folder_index.MAX_FILE_CHUNKS`), 50,000
+  chunks and 512 MiB per folder (`MAX_FOLDER_CHUNKS`, `MAX_FOLDER_BYTES`; `truncated` in the state,
+  `FolderIndexFile.truncated`), and a long sync sweeps for ended grants between files. Regression tests across every switch combination.
 - Granted folders as a knowledge source (N-12; behind `NODESTRO_FOLDER_GRANTS`, off; never in the server profile): a
   folder grant with `index` keeps a search index of the folder (new module `folder_index`: `FolderIndex`,
   `FolderIndexer`, `FolderIndexFile`, `FolderIndexState`, `source_of`; collections `folder_index_files` and

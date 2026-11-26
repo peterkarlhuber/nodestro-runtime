@@ -25,10 +25,17 @@ The rights stay on the :class:`~nodestro_runtime.folders.FolderGrant`:
 - :meth:`FolderIndex.reconcile` runs at the start and then periodically (:class:`FolderIndexer`): it syncs every
   active grant with ``index`` and drops the index of every grant that ended, and every folder chunk without a grant.
 
-Egress (N-08, RT-094): folder text is granted content. Indexing it uses the knowledge base's embedding check
-(:meth:`KnowledgeBase.embedding_check`), so an embedding server outside this computer gets it only with a grant on
-``cloud_provider`` ``ollama``; without one the text is indexed without vectors (full-text search finds it). A search
-that embeds its query asks the run's check first (``RunServices.embedding_check``).
+Egress (N-08, RT-094, N-12 review H-1): folder text is granted content, fail closed whatever the switches. It is
+embedded only when :attr:`KnowledgeBase.folder_embedding_allowed` allows the embedding model's address: a server on
+this computer, or one elsewhere only while the provenance switch is on and a grant on ``cloud_provider`` ``ollama``
+allows it. Otherwise the text is indexed without vectors (full-text search finds it), a folder search does not embed
+its query, and a reindex for such a model removes every folder index first and stores no folder chunk until it ended
+(the indexer rebuilds them, without vectors). A search that embeds its query asks the run's check as well
+(``RunServices.embedding_check``).
+
+Budgets (N-12 review L-1, L-2): at most :data:`MAX_FILE_CHUNKS` chunks of one file and :data:`MAX_FOLDER_CHUNKS`
+chunks or :data:`MAX_FOLDER_BYTES` bytes of files of one folder are indexed; the rest is left out and the state says
+``truncated``. A long sync sweeps for ended grants of other folders every :data:`SWEEP_SECONDS`.
 
 Off unless ``NODESTRO_FOLDER_GRANTS=1``, and never in the server profile, like the folder tools. While the switch is
 off, the workspace removes every folder index at its start (:meth:`FolderIndex.purge`). See ``docs/folders.md``.
@@ -45,6 +52,7 @@ import logging
 import os
 import posixpath
 import threading
+import time
 from typing import Literal
 
 from orkexa import Chunk
@@ -53,7 +61,7 @@ from orkexa.retrieval import split_text
 from pydantic import AwareDatetime, BaseModel
 
 from .folders import COLLECTION, FolderError, FolderGrant, _is_pdf, _text_of, safe_root
-from .knowledge import FOLDER_SOURCE, KnowledgeBase
+from .knowledge import FOLDER_SOURCE, FolderIndexBusy, KnowledgeBase
 from .schemas import now
 from .storage import DocumentStore
 from .tool_policy import AccessDecision, AccessRequest, AccessResource, Deny, Grant, evaluate
@@ -72,6 +80,12 @@ MAX_PENDING = 10_000
 SYNC_SECONDS = 300.0
 #: Seconds between two sweeps for grants that ended (an expiry; a revocation drops at once).
 SWEEP_SECONDS = 30.0
+#: The most chunks one file adds to the index (the rest of it is left out; bounds the time the write lock is held).
+MAX_FILE_CHUNKS = 400
+#: The most chunks of one folder's files the index holds.
+MAX_FOLDER_CHUNKS = 50_000
+#: The most bytes of one folder's files the index reads (their sizes summed).
+MAX_FOLDER_BYTES = 512 * 1024 * 1024
 #: Codes that end a sync instead of skipping one subfolder: the granted folder itself changed or is gone.
 _FATAL = frozenset({"fs.root_changed", "fs.protected_root", "fs.not_found", "fs.not_a_directory", "fs.link"})
 
@@ -100,6 +114,8 @@ class FolderIndexFile(BaseModel):
     sha256: str
     chunks: int
     indexed_at: AwareDatetime
+    #: The file had more than :data:`MAX_FILE_CHUNKS` (or the folder's chunk budget left) chunks; the rest is left out.
+    truncated: bool = False
 
 
 class FolderIndexState(BaseModel):
@@ -112,7 +128,8 @@ class FolderIndexState(BaseModel):
     chunks: int = 0
     #: Files that could not be read (too large, binary, a PDF over its budget, hard links, changed meanwhile).
     skipped: int = 0
-    #: The sync stopped at the grant's file limit or the folder queue's limit.
+    #: The sync stopped at the grant's file limit, the folder queue's limit or the folder's chunk or byte budget, or a
+    #: file was cut at :data:`MAX_FILE_CHUNKS`.
     truncated: bool = False
     code: str | None = None
     synced_at: AwareDatetime | None = None
@@ -141,12 +158,19 @@ class FolderIndex:
         records: Callable[[], tuple[Sequence[Grant], Sequence[Deny]]],
         protected: str,
         clock: Callable[[], datetime] = now,
+        max_folder_chunks: int = MAX_FOLDER_CHUNKS,
+        max_folder_bytes: int = MAX_FOLDER_BYTES,
+        sweep_seconds: float = SWEEP_SECONDS,
     ) -> None:
         self.store = store
         self.knowledge = knowledge
         self.records = records
         self.protected = protected
         self.clock = clock
+        self.max_folder_chunks = max_folder_chunks
+        self.max_folder_bytes = max_folder_bytes
+        self.sweep_seconds = sweep_seconds
+        self._swept = time.monotonic()
         self._guard = threading.Lock()
         self._locks: dict[str, threading.Lock] = {}
 
@@ -228,6 +252,14 @@ class FolderIndex:
                 dropped.append(folder_id)
         return dropped
 
+    def _sweep(self) -> None:
+        """Drop the indexes of grants that ended, at most every ``sweep_seconds``: a long sync of one folder does not
+        keep another folder's expired grant in the index (N-12 review L-2)."""
+        if time.monotonic() - self._swept < self.sweep_seconds:
+            return
+        self._swept = time.monotonic()
+        self.drop_ended()
+
     def purge(self) -> list[str]:
         """Drop every folder index (the switch is off: nothing of a granted folder stays in the index)."""
         indexed = {state.folder_id for state in self.store.list(STATES, FolderIndexState)}
@@ -281,14 +313,31 @@ class FolderIndex:
         known = {item.path: item for item in self.files(folder.id)}
         skipped = 0
         root = self._root(folder)
+        kept: set[str] = set()
+        spent_bytes = spent_chunks = 0
         for path, size in found.items():
+            self._sweep()
+            room = self.max_folder_chunks - spent_chunks
+            spent_bytes += size
+            if room <= 0 or spent_bytes > self.max_folder_bytes:
+                truncated = True  # the folder's budget is spent: the other files are left out
+                break
             try:
-                if not self._index_file(folder, root, path, size, known.get(path)):
-                    skipped += 1
+                stored, cut = self._index_file(folder, root, path, size, known.get(path), room)
             except _Ended:
                 self.drop(folder.id)
                 return None
-        for path in known.keys() - found.keys():  # gone, excluded, denied or above a limit now
+            except FolderIndexBusy:
+                # A reindex runs that may not embed folder text: the next sync continues.
+                logger.info("A folder index waits for the semantic index to be built")
+                return self.state(folder.id)
+            if stored is None:
+                skipped += 1
+                continue
+            kept.add(path)
+            spent_chunks += stored
+            truncated = truncated or cut
+        for path in known.keys() - kept:  # gone, excluded, denied, unreadable or above a limit now
             self._remove_file(folder, path)
         files = self.files(folder.id)
         state = FolderIndexState(
@@ -332,6 +381,7 @@ class FolderIndex:
         truncated = False
         while pending:
             current = pending.pop(0)
+            self._sweep()
             held = self._grant(folder)
             if held is None:
                 raise _Ended
@@ -374,22 +424,31 @@ class FolderIndex:
         return found, truncated
 
     def _index_file(
-        self, folder: FolderGrant, root: SafeRoot, path: str, size: int, known: FolderIndexFile | None
-    ) -> bool:
-        """Index one file when it changed; ``False`` when it could not be read (its old chunks are removed)."""
+        self,
+        folder: FolderGrant,
+        root: SafeRoot,
+        path: str,
+        size: int,
+        known: FolderIndexFile | None,
+        room: int = MAX_FOLDER_CHUNKS,
+    ) -> tuple[int | None, bool]:
+        """Index one file when it changed, with at most ``room`` (and :data:`MAX_FILE_CHUNKS`) chunks. Returns the
+        chunks it has and whether some were left out; ``None`` chunks when it could not be read (its old chunks are
+        then removed)."""
         try:
             # A hint only, never used to read: the content is read through the path guard and its hash decides.
             info = os.stat(os.path.join(root.path, *path.split("/")), follow_symlinks=False)
         except OSError:
             self._remove_file(folder, path)
-            return False
+            return None, False
         if (
             known is not None
             and known.size == size == info.st_size
             and known.mtime_ns == info.st_mtime_ns
             and known.ctime_ns == info.st_ctime_ns
+            and known.chunks <= room
         ):
-            return True  # unchanged
+            return known.chunks, known.truncated  # unchanged
         try:
             data = root.read_bytes(path)
             digest = hashlib.sha256(data).hexdigest()
@@ -403,23 +462,27 @@ class FolderIndex:
                 chunks=known.chunks if known is not None else 0,
                 indexed_at=self.clock(),
             )
-            if known is not None and known.sha256 == digest:
+            if known is not None and known.sha256 == digest and known.chunks <= room:
+                entry = entry.model_copy(update={"truncated": known.truncated})
                 with self.knowledge.writing():
                     if not self._active(folder):
                         raise _Ended
                     self.store.put(FILES, _key(folder.id, path), entry)  # touched, not changed
-                return True
+                return known.chunks, known.truncated
             chunks = self._chunks(folder, root, path, data)
         except (FsError, FolderError):
             self._remove_file(folder, path)  # binary, too large, a PDF over its budget, changed or denied meanwhile
-            return False
+            return None, False
+        limit = min(MAX_FILE_CHUNKS, room)
+        cut = len(chunks) > limit
+        chunks = chunks[:limit]
         with self.knowledge.writing():
             # Checked inside the write lock a revocation's drop takes: once the grant ended, nothing more is stored.
             if not self._active(folder):
                 raise _Ended
             stored = self.knowledge.replace_chunks(source_of(folder.id, path), chunks)
-            self.store.put(FILES, _key(folder.id, path), entry.model_copy(update={"chunks": stored}))
-        return True
+            self.store.put(FILES, _key(folder.id, path), entry.model_copy(update={"chunks": stored, "truncated": cut}))
+        return stored, cut
 
     def _chunks(self, folder: FolderGrant, root: SafeRoot, path: str, data: bytes) -> list[Chunk]:
         source = source_of(folder.id, path)
@@ -539,8 +602,6 @@ class FolderIndexer:
         self._wake.set()
 
     def _loop(self) -> None:
-        import time
-
         next_sync = 0.0
         while not self._stop.is_set():
             try:
@@ -567,6 +628,9 @@ class FolderIndexer:
 __all__ = [
     "FILES",
     "INDEXED_SUFFIXES",
+    "MAX_FILE_CHUNKS",
+    "MAX_FOLDER_BYTES",
+    "MAX_FOLDER_CHUNKS",
     "STATES",
     "SWEEP_SECONDS",
     "SYNC_SECONDS",

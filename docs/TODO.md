@@ -677,10 +677,12 @@ Items that need an independent or external review (an internal audit does not re
     (`folder_index.py`, `docs/folders.md` "The search index"); `search_files` searches it. Open: DOCX and XLSX files
     are not indexed (the knowledge upload converts them); the index state (`folder_index_state`) is not shown on the
     folders page or in the API yet; an expiry is dropped at the indexer's sweep (30 s), a revocation at once; the
-    index is part of the knowledge database, so a backup taken while a folder was indexed holds its chunks (they are
-    dropped at the next start when the grant ended, or when the switch is off); change detection uses size,
+    index is part of the knowledge database: the API leaves folder chunks and the index collections out of backups
+    and the data export (review M-1); change detection uses size,
     modification and change time (a file rewritten within one timestamp tick with the same size is found at the
-    next change);
+    next change); a rebuild of the semantic index for a model that may not embed folder text drops every folder index
+    first, and it is rebuilt (without vectors) at the indexer's next run, up to 5 minutes later; the folder budgets
+    (400 chunks per file, 50,000 chunks and 512 MiB per folder) are constants, not grant settings;
   - the run event `folder_file_read` names a run's sources live; a stored list of sources per answer is not built
     yet (the tool results name them);
   - an own or integration tool already named `list_folder`, `read_file` or `search_files` is shadowed by the built-in

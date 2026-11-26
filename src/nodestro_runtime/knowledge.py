@@ -26,6 +26,11 @@ Granted folders (N-12, :mod:`nodestro_runtime.folder_index`): the index may also
 folder (source ``folder:<folder grant id>/<path>``, :data:`FOLDER_SOURCE`). They are no knowledge files: the file store
 never holds them, and every knowledge search (an agent's view, :meth:`KnowledgeBase.search`) is limited to the
 knowledge files, so folder text is found only through the folder tools, which check the folder grant at every call.
+Folder text is embedded (and a folder search's query is) only when :attr:`KnowledgeBase.folder_embedding_allowed`
+says so, whatever the switches: an embedding server on this computer, or one elsewhere while the provenance switch is
+on and a grant allows it. Otherwise the chunks are stored without vectors, the search runs in full text, and a reindex
+for a model that may not embed them removes them first (:attr:`KnowledgeBase.folder_reset`) and stores none until it
+ended (N-12 review H-1).
 
 Egress protection (N-08, only while its switch is on): every embedding of granted content asks a check first
 (:attr:`KnowledgeBase.embedding_check`, :attr:`ScopedIndex.before_embed`), so knowledge text and a marked run's search
@@ -204,6 +209,10 @@ class ScopedFileStore(FileStore):
         raise PermissionError("This view is read-only")
 
 
+class FolderIndexBusy(Exception):
+    """A granted folder's chunks cannot be stored now (a reindex runs that may not embed them): try again later."""
+
+
 def _address(url: str | None) -> str | None:
     """A model server's address without its OpenAI-compatible suffix (``/v1``), to compare the one an embedding model
     was built for with the one the settings name now."""
@@ -335,6 +344,15 @@ class KnowledgeBase:
         #: Whether the index may hold chunks of granted folders (N-12: the desktop and Nodestro Local Docker, never a
         #: server): a search without files is then limited to the knowledge files.
         self.folder_sources = False
+        #: N-12 (fail closed, whatever the switches): whether granted folder text may be embedded by the model at the
+        #: given address (the one it really sends to). The workspace allows this computer, and a server elsewhere only
+        #: while the provenance switch is on and a grant allows it. Default: only a model without an address.
+        self.folder_embedding_allowed: Callable[[str | None], bool] = lambda address: not address
+        #: Removes every folder chunk (the folder index rebuilds them later): called when a reindex starts for a model
+        #: that may not embed folder text, since a reindex embeds every chunk of the index.
+        self.folder_reset: Callable[[], object] = self._remove_folder_chunks
+        #: Whether the running reindex's model may embed folder text (while it runs, no folder chunk is stored else).
+        self._reindex_folders = True
 
     def ocr_available(self) -> bool:
         return self.runner() is not None
@@ -529,10 +547,18 @@ class KnowledgeBase:
         finally:
             setattr(self.index, "embeddings", model)  # noqa: B010
 
-    def _index_checked(self, work: Callable[[], object]) -> None:
+    def _index_checked(self, work: Callable[[], object], allowed: Callable[[str | None], bool] | None = None) -> None:
         """Index text; when the embedding check refuses (N-08), index it without vectors: the text stays searchable
-        in full text, the refusal is audited and the status shows ``incomplete`` until a permitted reindex."""
+        in full text, the refusal is audited and the status shows ``incomplete`` until a permitted reindex.
+        ``allowed``: the check to use instead (granted folder text, :attr:`folder_embedding_allowed`)."""
         if getattr(self.index, "embeddings", None) is not None:
+            if allowed is not None:
+                if allowed(self._embeddings_address):
+                    work()
+                else:
+                    logger.info("Granted folder text is indexed without vectors (its embedding server is elsewhere)")
+                    self._without_vectors(work)
+                return
             try:
                 self._check_embedding(self._embeddings_address)
             except NodestroError as exc:
@@ -543,12 +569,15 @@ class KnowledgeBase:
                 return
         work()
 
-    def _index_with_fallback(self, work: Callable[[], object]) -> None:
+    def _index_with_fallback(
+        self, work: Callable[[], object], allowed: Callable[[str | None], bool] | None = None
+    ) -> None:
         """Index new text; when the embedding model cannot be reached, index it without vectors (a later reindex
-        adds them, the status shows ``incomplete``) instead of refusing the upload."""
+        adds them, the status shows ``incomplete``) instead of refusing the upload. ``allowed``: as for
+        :meth:`_index_checked`."""
         self._sync_embeddings()
         try:
-            self._index_checked(work)
+            self._index_checked(work, allowed)
         except (OllamaError, RetrievalError) as exc:
             # ``reindex_required``: the embedding model changed on the server (a pull or rebuild gave it another
             # digest), so its vectors would not match the index's; the status says ``reindex_required`` (RT3-08).
@@ -613,6 +642,17 @@ class KnowledgeBase:
         self._check_embedding(_model_address(model, wanted))
         return name, model
 
+    def _folders_embeddable(self, model: EmbeddingModel) -> bool:
+        """Whether a reindex with ``model`` may embed granted folder text (N-12 review H-1); without folder chunks it
+        does not matter."""
+        if not any(source.startswith(FOLDER_SOURCE) for source in self._chunk_counts()):
+            return True
+        return self.folder_embedding_allowed(_model_address(model, _address(self.embedding_address())))
+
+    def _remove_folder_chunks(self) -> None:
+        with self._lock:
+            self.remove_sources([source for source in self._chunk_counts() if source.startswith(FOLDER_SOURCE)])
+
     def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
         """Build (or complete, or switch) the semantic index with an embedding model, in the background.
 
@@ -626,12 +666,16 @@ class KnowledgeBase:
         if self.reindex_queue is not None:
             self.reindex_queue.start(name)
             return self.index_status()
+        folders = self._folders_embeddable(model)
         with self._lock:
             if self._job is not None and self._job.state == "running":
                 raise NodestroError("knowledge.reindex_running", "The semantic index is already being built")
             job = ReindexJob(model=name)
             cancel = threading.Event()
             self._job, self._job_cancel = job, cancel
+            self._reindex_folders = folders
+            if not folders:
+                self.folder_reset()
         threading.Thread(
             target=self._build, args=(job, model, cancel, None), name="nodestro-reindex", daemon=True
         ).start()
@@ -653,6 +697,9 @@ class KnowledgeBase:
             job.state, job.error_code, job.error = "failed", exc.code, str(exc)
             job.finished_at = datetime.now(UTC)
             return job
+        if not self._folders_embeddable(model):
+            with self._lock:
+                self.folder_reset()
         self._build(job, model, cancel, progress)
         return job
 
@@ -881,8 +928,9 @@ class KnowledgeBase:
 
     def replace_chunks(self, source: str, chunks: list[Chunk]) -> int:
         """Replace the chunks of one granted folder's file with ``chunks`` (embedded when the semantic index is on
-        and the embedding check allows it, else without vectors, as new knowledge is); returns how many are stored.
-        Refuses the id of a knowledge file."""
+        and :attr:`folder_embedding_allowed` allows the model's address, else without vectors); returns how many are
+        stored. Refuses the id of a knowledge file. :class:`FolderIndexBusy` while a reindex runs whose model may not
+        embed folder text (it would embed every chunk the index holds)."""
         if not source.startswith(FOLDER_SOURCE):
             raise ValueError("Only a granted folder's source can be replaced here")
 
@@ -892,7 +940,9 @@ class KnowledgeBase:
                 self.index.add_chunks(chunks)
 
         with self._lock:
-            self._index_with_fallback(work)
+            if not self._reindex_folders and self.reindexing():
+                raise FolderIndexBusy("A reindex runs whose embedding model may not embed folder text")
+            self._index_with_fallback(work, self.folder_embedding_allowed)
         return len(chunks)
 
     def search_sources(
@@ -904,7 +954,8 @@ class KnowledgeBase:
         before_embed: Callable[[str | None], None] | None = None,
     ) -> list[Hit]:
         """Search the chunks of a granted folder's ``sources`` in the workspace's retrieval mode, in full text while
-        the semantic index cannot serve it. ``before_embed`` is the run's check before the query is embedded (N-08):
+        the semantic index cannot serve it, and while :attr:`folder_embedding_allowed` refuses the model's address
+        (the query is then never embedded). ``before_embed`` is the run's check before the query is embedded (N-08):
         it raises to refuse."""
         if not sources:
             return []
@@ -916,7 +967,9 @@ class KnowledgeBase:
                 chosen = "fts"
         if chosen != "fts":
             self._sync_embeddings()
-            if before_embed is not None:
+            if not self.folder_embedding_allowed(self._embeddings_address):
+                chosen = "fts"  # the query is never sent to an embedding server folder text may not go to
+            elif before_embed is not None:
                 before_embed(self._embeddings_address)
         try:
             return self.index.retrieve(query, k, mode=chosen, sources=sources)
