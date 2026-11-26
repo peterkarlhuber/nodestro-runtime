@@ -509,7 +509,9 @@ class AgentBuilder:
                 # N-08: run memory holds only what this run wrote, so a memory call brings no granted content.
                 memory.content_source = None
 
-        files, index = self.knowledge.views(config.knowledge)
+        files, index = self.knowledge.views(
+            config.knowledge, before_embed=services.embedding_check if services is not None else None
+        )
         context_blocks: list[ContentBlock] = []
         if config.knowledge.mode == "context":
             for file_id in config.knowledge.file_ids:

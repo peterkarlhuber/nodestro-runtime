@@ -32,7 +32,20 @@
     test's copy of a persistent memory space keeps the source `memory` (`agent_builder.SpaceCopy`); a local model
     server whose address is not on this computer counts as a recipient outside it (`RunManager.leaves_computer`,
     `offline.remote_model_server`); a sub-workflow stores its own first mark at once. Documented: files a person
-    uploads into an assistant chat are no granted source, and knowledge embeddings are not checked.
+    uploads into an assistant chat are no granted source.
+  - Knowledge embeddings (RT-094): an embedding server whose address is not on this computer is a recipient outside
+    it and needs a grant on `cloud_provider` `ollama` (`RunManager.leaves_computer`, the rule of the chat models).
+    The vector or hybrid knowledge search of a step that holds granted content refuses the call before its query is
+    embedded (`RunManager._check_embedding`, `ScopedIndex(before_embed=)`, `RunServices.embedding_check`); the agent
+    reads a fixed text, the refusal is audited (`access_refused`). Knowledge text is a granted source too
+    (`KnowledgeBase.embedding_check`): a rebuild of the semantic index is refused with `access.missing_grant`, a new,
+    recognised, adopted or imported file is indexed without vectors (full-text search finds it, the status says
+    `incomplete`); a search whose query holds granted content (`KnowledgeBase.search(..., granted=True)`, the
+    adoption's similarity hint) is refused, and the hint then uses full-text search. Switch off: unchanged.
+    Review fix (M-1): the check judges the address the embedding model really sends to
+    (`RunManager.embedding_leaves`, `check_cloud_access(endpoint=)`, `embedding_check(address)`), and the knowledge
+    builds the model again when the server's address changed (`KnowledgeBase.embedding_address`); before, a model
+    built for a remote server kept sending granted content there after the address was changed to this computer.
   - `mcp/netguard.py` stays: it is not a forwarding copy (MCP's egress policy, `httpcore2` backend, error codes and the
     response cap on top of `orkexa.net.guard`).
 

@@ -993,3 +993,355 @@ async def test_nothing_is_marked_while_the_switch_is_off(
         assert len(cloud.messages.calls) == 1  # as before N-08: the default of spec 7.2 allows the cloud model
     finally:
         workspace.close()
+
+
+# ---- knowledge embeddings (RT-094) ----------------------------------------------------------------------------------
+
+
+class CountedEmbeddings:
+    """A deterministic embedding model that records every text it is asked to embed (documents and queries)."""
+
+    def __init__(self) -> None:
+        self.documents: list[str] = []
+        self.queries: list[str] = []
+
+    @staticmethod
+    def _vector(text: str) -> list[float]:
+        return [1.0 if SECRET in text else 0.1, 1.0 if "refund" in text else 0.1, 0.5]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.documents.extend(texts)
+        return [self._vector(item) for item in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        self.queries.append(text)
+        return self._vector(text)
+
+    def refresh_identity(self) -> None:
+        return None
+
+    def identity(self) -> Any:
+        from orkexa.embeddings import EmbeddingIdentity
+
+        return EmbeddingIdentity(provider="test", model="counted:1", dimensions=3, digest="d1")
+
+
+def _semantic(workspace: Workspace, mode: str = "vector") -> CountedEmbeddings:
+    """Knowledge with a built semantic index of ``mode``; the model records what it embeds."""
+    import time
+
+    model = CountedEmbeddings()
+    knowledge = workspace.knowledge
+    knowledge.embedding_model = lambda _name: model  # type: ignore[assignment,return-value]
+    knowledge.retrieval = lambda: (mode, "counted:1")  # type: ignore[assignment,return-value]
+    knowledge.add(b"Customers get a refund within thirty days of the purchase, always.", name="returns.md")
+    knowledge.start_reindex()
+    for _ in range(200):
+        if knowledge.index_status().state == "ready":
+            break
+        time.sleep(0.02)
+    assert knowledge.index_status().state == "ready"
+    model.documents.clear()
+    return model
+
+
+def _model_server(workspace: Workspace, url: str) -> dict[str, str]:
+    """Let the local model server (and with it the embedding server) answer at ``url``; change ``where["url"]``."""
+    real = workspace.runs.connect
+    where = {"url": url}
+
+    def server(provider: str) -> Connection:
+        found = real(provider)
+        return dataclasses.replace(found, base_url=where["url"]) if provider == "ollama" else found
+
+    workspace.runs.connect = server  # type: ignore[method-assign]
+    return where
+
+
+def _searcher(workspace: Workspace, retrieval: str = "vector", model: str = LOCAL) -> AgentConfig:
+    from nodestro_runtime.schemas import KnowledgeConfig
+
+    [returns] = workspace.knowledge.files()
+    return AgentConfig(
+        name="Searcher",
+        system_prompt="SEARCHER",
+        model=model,
+        tools=["read_file"],
+        knowledge=KnowledgeConfig(file_ids=[returns.id], mode="search", retrieval=retrieval),  # type: ignore[arg-type]
+    )
+
+
+def _search_granted(workspace: Workspace) -> None:
+    """The agent may call the knowledge search unattended (it counts as an unknown tool, S-2 / N-06)."""
+    from nodestro_runtime.tool_policy import UNKNOWN
+
+    _unattended(
+        workspace,
+        AccessResource(type="tool", id="search"),
+        ["execute"],
+        "wf_n08/searcher",
+        tool=ToolFacts.of(UNKNOWN, version=None),
+    )
+
+
+@pytest.mark.parametrize("retrieval", ["vector", "hybrid"])
+async def test_a_marked_runs_knowledge_search_sends_no_query_to_an_embedding_server_elsewhere(
+    make: Make, docs: Path, network: Network, retrieval: str
+) -> None:
+    """RT-094: after a folder read, the agent's vector or hybrid knowledge search would embed a query that holds the
+    folder's content: an embedding server outside this computer needs a grant on ``cloud_provider`` ``ollama``, even
+    when the agent's own (cloud) model is granted. Without one the query is never embedded, the agent reads a fixed
+    text and the refusal is audited."""
+    from nodestro_runtime.engine import EMBEDDING_REFUSED
+
+    query = {"query": f"refund {SECRET}"}
+    turn = [tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}), tool_use("search", query), text("done")]
+    workspace = make({"SEARCHER": turn * 3})
+    _grant_folder(workspace, docs)
+    model = _semantic(workspace, retrieval)
+    where = _model_server(workspace, "https://gpu.example.com/v1")
+    _search_granted(workspace)
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/searcher")
+    flow = _chain(("searcher", _searcher(workspace, retrieval, CLOUD)))
+    seen: list[Any] = []
+    workspace.runs.event_sink = seen.append
+    run = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    search = _calls(run, "searcher")["search"]
+    assert run.nodes["searcher"].status == "succeeded", run.nodes["searcher"].error
+    assert search.is_error and search.output == EMBEDDING_REFUSED
+    assert model.queries == []  # nothing was sent to the embedding server
+    refused = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert refused and refused[0].details["resource_id"] == "ollama" and refused[0].outcome == "access.missing_grant"
+    events = [event for event in seen if event.type == "access_refused"]
+    assert [event.data["resource_id"] for event in events] == ["ollama"]
+    # A grant on the embedding server's provider lets the query go.
+    _unattended(workspace, AccessResource(type="cloud_provider", id="ollama"), ["submit"], "wf_n08/searcher")
+    granted = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    assert not _calls(granted, "searcher")["search"].is_error
+    assert model.queries == [query["query"]]
+    # A server on this computer needs none (the address decides first).
+    where["url"] = "http://127.0.0.1:11434/v1"
+    model.queries.clear()
+    local = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    assert not _calls(local, "searcher")["search"].is_error and model.queries == [query["query"]]
+
+
+async def test_an_unmarked_runs_knowledge_search_and_full_text_search_embed_as_before(
+    make: Make, network: Network
+) -> None:
+    """Only granted content is held: the first search of an unmarked run and a full-text search are not checked."""
+    workspace = make({"SEARCHER": [tool_use("search", {"query": "refund"}), text("done")] * 2})
+    model = _semantic(workspace)
+    _model_server(workspace, "https://gpu.example.com/v1")
+    _search_granted(workspace)
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/searcher")
+    flow = _chain(("searcher", _searcher(workspace, model=CLOUD)))
+    run = await _finished(workspace, flow, trigger="schedule", trigger_ref="s")
+    assert not _calls(run, "searcher")["search"].is_error and model.queries == ["refund"]
+    model.queries.clear()
+    fts = await _finished(
+        workspace, _chain(("searcher", _searcher(workspace, "fts", CLOUD))), trigger="schedule", trigger_ref="s"
+    )
+    assert not _calls(fts, "searcher")["search"].is_error and model.queries == []
+
+
+def test_knowledge_is_embedded_by_a_server_elsewhere_only_with_a_grant(make: Make, network: Network) -> None:
+    """RT-094: knowledge is a granted source. An embedding server outside this computer gets its text only with a
+    grant on ``cloud_provider`` ``ollama``: a rebuild is refused, a new file is indexed without vectors (full-text
+    search finds it, the status says ``incomplete``), both audited. On this computer nothing changes."""
+    workspace = make()
+    model = _semantic(workspace)
+    where = _model_server(workspace, "https://gpu.example.com/v1")
+    with pytest.raises(NodestroError) as refused:
+        workspace.knowledge.start_reindex()
+    assert refused.value.code == "access.missing_grant"
+    added = workspace.knowledge.add(f"Plan: {SECRET}".encode(), name="plan.md")
+    assert model.documents == []
+    assert workspace.knowledge.index_status().state == "incomplete"
+    assert [hit.source for hit in workspace.knowledge.search(SECRET, mode="fts")] == [added.id]
+    refusals = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert len(refusals) == 2 and {item.details["resource_id"] for item in refusals} == {"ollama"}
+    # A person's own query is not granted content; an adoption's (the item's content) is.
+    workspace.knowledge.search("refund", mode="vector")
+    with pytest.raises(NodestroError):
+        workspace.knowledge.search("refund", mode="vector", granted=True)
+    assert model.queries == ["refund"]
+    # With a grant for all agents the rebuild embeds every chunk.
+    grant = AccessRules(workspace.store).grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    workspace.knowledge.start_reindex()
+    import time
+
+    for _ in range(200):
+        if workspace.knowledge.index_status().state == "ready":
+            break
+        time.sleep(0.02)
+    assert any(SECRET in item for item in model.documents)
+    # On this computer no grant is asked for.
+    AccessRules(workspace.store).revoke_grant(grant.id, by=PERSON)
+    where["url"] = "http://127.0.0.1:11434/v1"
+    model.documents.clear()
+    workspace.knowledge.add(b"More refund rules.", name="more.md")
+    assert model.documents == ["More refund rules."]
+
+
+def test_an_adoption_hint_searches_full_text_when_its_query_may_not_be_embedded(make: Make, network: Network) -> None:
+    """RT-094: the similarity hint of taking content over into knowledge searches with the item's own words: with an
+    embedding server elsewhere and no grant it uses full-text search (on this computer), never the embeddings."""
+    from nodestro_runtime import adoption
+
+    workspace = make()
+    model = _semantic(workspace)
+    _model_server(workspace, "https://gpu.example.com/v1")
+    stored = workspace.inputs.add(
+        b"Customers get a refund within thirty days of the purchase, always!", name="copy.txt"
+    )
+    checked = adoption.check(
+        workspace, adoption.AdoptRequest(items=[adoption.AdoptSource(kind="input", input_id=stored.id)], collection="c")
+    )
+    assert model.queries == []
+    assert [item.name for item in checked[0].similar] == ["returns.md"]
+
+
+async def test_the_embedding_checks_change_nothing_while_the_switch_is_off(
+    make: Make, docs: Path, network: Network, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switch off: an embedding server elsewhere gets queries and knowledge exactly as before RT-094."""
+    monkeypatch.delenv(PROVENANCE_ENV)
+    chat = LocalChat({"SEARCHER": [OBEYING[0], ("search", {"query": f"refund {SECRET}"}), "done"]})
+    workspace = Workspace(docs.parent / "off", client_factory=lambda provider: chat, integrations=[])
+    try:
+        assert workspace.runs.tool_gate is not None and not workspace.runs.tool_gate.provenance
+        _grant_folder(workspace, docs)
+        model = _semantic(workspace)
+        _model_server(workspace, "https://gpu.example.com/v1")
+        _search_granted(workspace)
+        workspace.knowledge.start_reindex()  # not refused
+        run = await _finished(
+            workspace, _chain(("searcher", _searcher(workspace))), trigger="schedule", trigger_ref="sch_1"
+        )
+        assert not _calls(run, "searcher")["search"].is_error
+        assert model.queries == [f"refund {SECRET}"]
+        assert not [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    finally:
+        workspace.close()
+
+
+def test_an_agent_test_never_runs_a_knowledge_search_with_granted_content(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """Pins the agent test's path: after a folder read its knowledge search is refused by the tool gate (a test never
+    asks and never acts on a grant), so no query reaches the embedding server (RT-094)."""
+    from nodestro_runtime.agent_test import AgentTestIn
+
+    workspace = make({}, {"SEARCHER": [OBEYING[0], ("search", {"query": f"refund {SECRET}"}), "done"]})
+    _grant_folder(workspace, docs)
+    model = _semantic(workspace)
+    _model_server(workspace, "https://gpu.example.com/v1")
+    _search_granted(workspace)
+    result, _ = contextvars.copy_context().run(
+        workspace.tester.run, AgentTestIn(agent=_searcher(workspace), input="go"), actor="local"
+    )
+    [search] = [call for call in result.tool_calls if call.name == "search"]
+    assert search.approval is not None and search.approval.status == "denied"
+    assert model.queries == []
+
+
+class _AddressedEmbeddings:
+    """Like Orkexa's ``OllamaEmbeddings``: bound to the server address it was built for (``client.base_url``)."""
+
+    def __init__(self, url: str, sent: list[tuple[str, str]]) -> None:
+        self.client = type("Client", (), {"base_url": url})()
+        self.sent = sent
+
+    @staticmethod
+    def _vector(value: str) -> list[float]:
+        return [1.0 if SECRET in value else 0.1, 1.0 if "refund" in value else 0.1, 0.5]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.sent.extend((self.client.base_url, item) for item in texts)
+        return [self._vector(item) for item in texts]
+
+    def embed_query(self, value: str) -> list[float]:
+        self.sent.append((self.client.base_url, value))
+        return self._vector(value)
+
+    def refresh_identity(self) -> None:
+        return None
+
+    def identity(self) -> Any:
+        from orkexa.embeddings import EmbeddingIdentity
+
+        return EmbeddingIdentity(provider="test", model="counted:1", dimensions=3, digest="d1")
+
+
+async def test_an_embedding_model_built_for_another_address_is_built_again_before_it_embeds(
+    make: Make, docs: Path, network: None
+) -> None:
+    """RT-094 review M-1: the knowledge kept the embedding model it had built for a remote server while the model name
+    stayed the same; after the address was changed to this computer, the N-08 check read the new (local) address and
+    let new knowledge, an adoption hint's query and a marked run's search through, and the old model sent them to the
+    remote server without a grant. Now the model is built again for the address the settings name, and the check
+    judges the address the model really sends to. Both directions: remote -> local sends everything to this computer;
+    local -> remote is refused without a grant."""
+    from nodestro_runtime.schemas import KnowledgeConfig
+
+    remote, local = "https://gpu.example.com/v1", "http://127.0.0.1:11434/v1"
+    sent: list[tuple[str, str]] = []
+    turn = [
+        tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}),
+        tool_use("search", {"query": f"refund {SECRET}"}),
+    ]
+    workspace = make({"SEARCHER": [*turn, text("done")] * 3})
+    _grant_folder(workspace, docs)
+    where = _model_server(workspace, remote)
+    knowledge = workspace.knowledge
+    knowledge.embedding_model = lambda _name: _AddressedEmbeddings(where["url"], sent)  # type: ignore[assignment]
+    knowledge.retrieval = lambda: ("vector", "counted:1")  # type: ignore[method-assign]
+    rules = AccessRules(workspace.store)
+    grant = rules.grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    knowledge.add(b"Customers get a refund within thirty days of the purchase, always.", name="returns.md")
+    knowledge.start_reindex()
+    for _ in range(200):
+        if knowledge.index_status().state == "ready":
+            break
+        await asyncio.sleep(0.02)
+    assert knowledge.index_status().state == "ready"
+    rules.revoke_grant(grant.id, by=PERSON)
+
+    # Remote -> this computer: new knowledge, an adoption hint and a marked run's search all go to this computer.
+    where["url"] = local
+    sent.clear()
+    knowledge.add(f"Board minutes {SECRET}".encode(), name="minutes.md")
+    knowledge.search(f"refund {SECRET}", mode="vector", granted=True)
+    _search_granted(workspace)
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/searcher")
+    agent = AgentConfig(
+        name="Searcher",
+        system_prompt="SEARCHER",
+        model=CLOUD,
+        tools=["read_file"],
+        knowledge=KnowledgeConfig(file_ids=[item.id for item in knowledge.files()], mode="search", retrieval="vector"),
+    )
+    run = await _finished(workspace, _chain(("searcher", agent)), trigger="schedule", trigger_ref="s")
+    assert not _calls(run, "searcher")["search"].is_error
+    assert [item for item in sent if SECRET in item[1]], sent  # the probe embedded something
+    assert all(address == local for address, _value in sent), sent
+
+    # This computer -> remote: the model is built for the remote address and the check refuses it without a grant.
+    where["url"] = remote
+    sent.clear()
+    with pytest.raises(NodestroError) as refused:
+        knowledge.search(f"refund {SECRET}", mode="vector", granted=True)
+    assert refused.value.code.startswith("access.")
+    knowledge.add(f"More minutes {SECRET}".encode(), name="more.md")  # indexed without vectors
+    assert not [item for item in sent if item[0] == remote and SECRET in item[1]], sent

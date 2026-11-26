@@ -60,7 +60,7 @@ from .conversations import Conversations
 from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
-from .engine import RunManager
+from .engine import EMBEDDING_PROVIDER, RunManager
 from .extensions import Extensions, Integration, discover
 from .folder_tools import FOLDER_TOOLS
 from .folders import folders_enabled
@@ -492,6 +492,14 @@ class Workspace:
             assistant_model=lambda: self.settings().assistant_model,
         )
         self.runs.budget_policy = self._budget_policy
+        # N-08: knowledge text (and a search query of granted content) reaches an embedding server outside this
+        # computer only with a grant on its provider; nothing is checked while the provenance switch is off.
+        # The check judges the address the embedding model really sends to; a model built for an earlier address is
+        # built again first (RT-094 review M-1).
+        self.knowledge.embedding_check = lambda address: self.runs.check_cloud_access(
+            EMBEDDING_PROVIDER, shared_content=True, endpoint=address or ""
+        )
+        self.knowledge.embedding_address = self._embedding_address
         # The internal inbox (NAL-A3): everywhere but on a server whose Axentra inbox is on (that stays the only one).
         self.inbox: LocalInbox | None = None
         if local_inbox_enabled(server=storage is not None):
@@ -1089,10 +1097,14 @@ class Workspace:
         values = self.store.get_raw("settings", "app") or {}
         return _retrieval_mode(values.get("knowledge_retrieval")), values.get("embedding_model") or None
 
+    def _embedding_address(self) -> str | None:
+        """The address of the server the knowledge embeddings use now (the one agents use, as the N-08 check reads
+        it: :meth:`RunManager.connect`); ``None``: none."""
+        return (self.runs.connect("ollama").base_url or "").removesuffix("/v1").rstrip("/") or None
+
     def _embedding_model(self, name: str) -> OllamaEmbeddings:
         """An Ollama embedding model on the server agents use (the managed one, the container, or the operator's)."""
-        connection = self.connection("ollama")
-        base = (connection.base_url or "").removesuffix("/v1").rstrip("/")
+        base = self._embedding_address()
         if not base:
             raise NodestroError("local.not_running", "No local model server is running")
         return OllamaEmbeddings(_embedding_name(name), base_url=base, allow_remote=True)

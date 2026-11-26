@@ -355,7 +355,14 @@ def _similar(ctx: Workspace, item: _Item, preview: str) -> list[KnowledgeRef]:
     seen: set[str] = set()
     query = " ".join(list(dict.fromkeys(re.findall(r"\w{4,}", preview)))[:12])
     try:
-        hits = ctx.knowledge.search(query, None, 8)
+        try:
+            # N-08: the query is the item's content, so a search that embeds it asks the embedding check first.
+            hits = ctx.knowledge.search(query, None, 8, granted=True)
+        except NodestroError as error:
+            if not error.code.startswith("access."):
+                raise
+            # Refused (audited): the hint uses full-text search, which stays on this computer.
+            hits = ctx.knowledge.search(query, None, 8, mode="fts")
     except Exception:  # the full-text index rejects some queries; similarity is only a hint
         return []
     for hit in hits:
