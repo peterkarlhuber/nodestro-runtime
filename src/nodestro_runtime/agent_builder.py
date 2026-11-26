@@ -97,6 +97,12 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _MODEL_NAME = re.compile(r"[^A-Za-z0-9_]")
 
 
+class SpaceCopy(EphemeralMemory):
+    """A writable copy of a persistent memory space, used as run memory where nothing may change the space (the
+    agent test). Its content came from the space, so it keeps the memory's content source (N-08) where plain run
+    memory, which holds only what its run wrote, declares none."""
+
+
 class ConfigIssue(BaseModel):
     """A problem with an agent configuration; ``code``/``params`` are shown in the UI language."""
 
@@ -499,6 +505,9 @@ class AgentBuilder:
             memory = self.memory_spaces.open(config.memory.space)
         elif config.memory.mode == "run":
             memory = EphemeralMemory() if run_memory is None else run_memory()
+            if not isinstance(memory, SpaceCopy):
+                # N-08: run memory holds only what this run wrote, so a memory call brings no granted content.
+                memory.content_source = None
 
         files, index = self.knowledge.views(config.knowledge)
         context_blocks: list[ContentBlock] = []

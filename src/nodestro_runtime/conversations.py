@@ -149,9 +149,10 @@ EARLIER_FILES = 20
 #: conversation that names it as its owner is seen by nobody but the desktop's person either.
 NO_OWNER = "<no owner>"
 
-#: N-08 (outflow protection by content provenance) will record here what the conversation holds; until then every
-#: conversation is ``unchecked``.
-ProvenanceStatus = Literal["unchecked"]
+#: N-08 (egress protection by content provenance): ``granted_content`` once content of a granted source (a folder,
+#: knowledge, persistent memory, an attached file) entered one of its answers while the switch was on; never reset.
+#: ``unchecked``: nothing was recorded (also everything before the switch was on).
+ProvenanceStatus = Literal["unchecked", "granted_content"]
 MessageStatus = Literal["complete", "queued", "running", "paused", "succeeded", "failed", "cancelled"]
 #: An answer in one of these states is final: its run ended.
 FINAL: frozenset[str] = frozenset({"complete", "succeeded", "failed", "cancelled"})
@@ -213,7 +214,8 @@ class Conversation(BaseModel):
     model: str
     #: Only local models answer (a cloud model is refused).
     offline: bool = False
-    #: The provenance of the conversation's content (N-08): a placeholder.
+    #: The provenance of the conversation's content (N-08, monotonic): with ``granted_content`` every call of its
+    #: answers that reaches outside and every cloud model request needs a grant (while the switch is on).
     provenance: ProvenanceStatus = "unchecked"
     #: The conversation's budget in USD over all its answers (``None``: each answer has the default budget).
     budget_usd: float | None = Field(default=None, ge=0)
@@ -580,6 +582,25 @@ class Conversations:
         if found is None or found.tenant_id != self.workspace.tenant_id:
             return True
         return found.offline
+
+    def is_granted(self, conversation_id: str) -> bool:
+        """Whether the conversation holds content of a granted source (N-08), read by the engine at every check of its
+        answers' runs. An unknown or another tenant's conversation counts as holding it (fail closed)."""
+        found = self.store.get(COLLECTION, conversation_id, Conversation)
+        if found is None or found.tenant_id != self.workspace.tenant_id:
+            return True
+        return found.provenance == "granted_content"
+
+    def mark_granted(self, conversation_id: str) -> None:
+        """Record that content of a granted source entered an answer of the conversation (N-08; by the engine).
+        Monotonic: once ``granted_content``, it stays so. One store transaction under the conversation's lock, so a
+        concurrent change of the conversation is not lost; a deleted conversation is not written again."""
+        with self.store.transaction():
+            self.store.lock(COLLECTION, conversation_id)
+            current = self.store.get(COLLECTION, conversation_id, Conversation)
+            if current is None or current.provenance == "granted_content":
+                return
+            self.store.put(COLLECTION, conversation_id, current.model_copy(update={"provenance": "granted_content"}))
 
     def run_visible(self, run_id: str, owner: str | None) -> bool:
         """Whether ``owner`` may see run ``run_id`` through the run routes (H-1). An answer's run (trigger
@@ -1133,7 +1154,13 @@ class Conversations:
         again. Records the run, its usage and a refusal's code in ``into``; raises when there is no summary."""
         try:
             helper = check_model(model)
-            await asyncio.to_thread(self.workspace.connect_model, helper, actor=actor, offline=offline)
+            await asyncio.to_thread(
+                self.workspace.connect_model,
+                helper,
+                actor=actor,
+                offline=offline,
+                shared_content=self.is_granted(conversation.id),
+            )
             workflow = summary_workflow(conversation, helper, max_tokens, budget, offline=offline is not None)
             check_answer_models(workflow, model=helper, offline=offline is not None)
             run = await launch(

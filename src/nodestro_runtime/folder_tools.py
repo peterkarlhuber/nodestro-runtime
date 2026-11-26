@@ -21,7 +21,18 @@ from orkexa.fs import FsError
 from .folders import FolderError, FolderReader
 from .tool_spec import current_tool_context
 
-__all__ = ["FOLDER_TOOLS", "FOLDER_TOOL_NAMES", "FolderToolError", "list_folder", "read_file", "search_files"]
+#: What the folder tools declare about their content (``ToolCall.content_source``, N-08): content of a granted folder.
+FOLDER_CONTENT_SOURCE = "folder"
+
+__all__ = [
+    "FOLDER_CONTENT_SOURCE",
+    "FOLDER_TOOLS",
+    "FOLDER_TOOL_NAMES",
+    "FolderToolError",
+    "list_folder",
+    "read_file",
+    "search_files",
+]
 
 
 class FolderToolError(ToolResultError):
@@ -62,7 +73,7 @@ def _wrap(text: str, source: str) -> str:
     )
 
 
-@Tool
+@Tool(content_source=FOLDER_CONTENT_SOURCE)
 def list_folder(folder: str = "", path: str = "") -> dict[str, Any]:
     """List the folders a person granted to you, or the files and subfolders in one of them (read-only).
 
@@ -86,7 +97,7 @@ def list_folder(folder: str = "", path: str = "") -> dict[str, Any]:
     return {"folder": found.name, "path": path, "entries": entries}
 
 
-@Tool
+@Tool(content_source=FOLDER_CONTENT_SOURCE)
 def read_file(folder: str, path: str, offset: int = 0) -> dict[str, Any]:
     """Read the text of one file in a granted folder (text files and PDFs; read-only).
 
@@ -125,7 +136,7 @@ def read_file(folder: str, path: str, offset: int = 0) -> dict[str, Any]:
     return result
 
 
-@Tool
+@Tool(content_source=FOLDER_CONTENT_SOURCE)
 def search_files(folder: str, query: str, path: str = "") -> dict[str, Any]:
     """Find files in a granted folder whose name or text contains a word or phrase (any case; read-only).
 

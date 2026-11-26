@@ -111,6 +111,13 @@ def is_local_endpoint(url: str, *, docker: bool = False) -> bool:
     return address.is_loopback
 
 
+def remote_model_server(connection: Connection, *, docker: bool = False) -> bool:
+    """Whether ``connection`` (a local model server's) has an address that is not on this computer
+    (:func:`is_local_endpoint`). A connection without an address (an injected client) counts as local, as in
+    :func:`check_connection`. N-08 treats such a server as a recipient outside the computer."""
+    return bool(connection.base_url) and not is_local_endpoint(str(connection.base_url), docker=docker)
+
+
 def mcp_available_offline(server: Any) -> OfflineReason | None:
     """``None`` when an MCP server can be used offline, otherwise why not. Only a local ``stdio`` server counts: it
     runs in a sandbox container without network. An HTTP server is refused even on this computer, because the

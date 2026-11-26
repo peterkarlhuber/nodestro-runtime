@@ -1046,6 +1046,10 @@ class RunManager:
         self.connect = connect
         #: Whether a conversation (N-04) is offline now (N-09), by its id; read at every call of its answers' runs.
         self.conversation_offline: Callable[[str], bool] = lambda _conversation_id: False
+        #: N-08: whether a conversation holds content of a granted source, by its id (read at every check of its
+        #: answers' runs), and how a run marks it (monotonic). Wired to the conversations by the workspace.
+        self.conversation_granted: Callable[[str], bool] = lambda _conversation_id: False
+        self.mark_conversation_granted: Callable[[str], None] = lambda _conversation_id: None
         self.default_budget = default_budget
         self.assistant_model = assistant_model
         #: The workspace's price catalog and price mode (PRICING-1); without a catalog Orkexa's built-in prices apply.
@@ -1234,6 +1238,10 @@ class RunManager:
         )
         if preset:
             run.nodes.update({node_id: state for node_id, state in preset.items() if node_id in run.nodes})
+        if resumed_from and self.provenance_on():
+            # N-08: a continued run holds the earlier run's results, so it starts with that run's mark (fails closed).
+            earlier = self.get(resumed_from)
+            run.granted_content = earlier is None or self.content_granted(earlier)
         return self._launch(run)
 
     # ---- access model v2 beyond tool calls (N-06; only while its switch is on) ---------------------------------------
@@ -1259,18 +1267,22 @@ class RunManager:
         run_id: str | None = None,
         attended: bool = True,
         audit: bool = True,
+        shared_content: bool = False,
     ) -> None:
         """Refuse a model request outside an agent's turn (the live run chat, the assistants and every other caller of
         :meth:`~nodestro_runtime.workspace.Workspace.connect_model`; no agent) to a cloud model the access model v2
         blocks (N-06). ``attended``: a person waits for the answer (a benchmark judge does not). ``audit``: record the
         refusal with its source (``False`` for a probe that only asks whether a model can be used). Only a person
         (``actor``) sees the source in the error. Nothing happens while the switch is off or for the local model
-        server."""
+        server. ``shared_content`` (N-08): the content to send holds content of a granted source
+        (:meth:`content_granted`), so the cloud model needs a grant (only while the provenance switch is on)."""
         gate = self.tool_gate
-        if gate is None or gate.access is None or provider == "ollama":
+        if gate is None or gate.access is None or not self.leaves_computer(provider):
             return
         resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
-        found = gate.site_refusal(resource, attended=attended, agent=None, conversation_id=run_id)
+        found = gate.site_refusal(
+            resource, attended=attended, agent=None, conversation_id=run_id, shared_content=shared_content
+        )
         if found is not None:
             if audit:
                 record_refusal(self.store, found, resource, actor=actor, run_id=run_id)
@@ -1303,6 +1315,7 @@ class RunManager:
             attended=root.trigger not in UNATTENDED_TRIGGERS,
             agent=agent,
             conversation_id=conversation_of(root),
+            shared_content=self.holds_granted(context),
         )
         if found is None:
             return None
@@ -1317,6 +1330,130 @@ class RunManager:
             source=found.source,
         )
         return found
+
+    # ---- N-08: egress protection by content provenance (only while its switch is on) ------------------------------
+
+    def provenance_on(self) -> bool:
+        """Whether the egress protection by content provenance applies (N-08: its switch and the access model)."""
+        gate = self.tool_gate
+        return gate is not None and gate.provenance
+
+    def leaves_computer(self, provider: str, connection: Connection | None = None) -> bool:
+        """Whether a model of ``provider`` is reached outside this computer, so content sent to it needs a grant on
+        the provider (resource ``cloud_provider``): every cloud provider, and (N-08, only while its switch is on) a
+        local model server whose address is not on this computer (:func:`~nodestro_runtime.offline.is_local_endpoint`,
+        the same rule as N-09's offline mode). ``connection``: the provider's connection when the caller has it."""
+        if provider != "ollama":
+            return True
+        if not self.provenance_on():
+            return False
+        found = connection if connection is not None else self.connect(provider)
+        return offline.remote_model_server(found, docker=self.builder.mode == "local-container")
+
+    def holds_granted(self, context: _RunContext) -> bool:
+        """Whether this execution holds content of a granted source (N-08): its top-level run is marked, or the
+        conversation it answers in is (read now). ``False`` while the switch is off."""
+        if not self.provenance_on():
+            return False
+        root = context.root.run
+        if root.granted_content:
+            return True
+        return bool(root.trigger == "conversation" and root.trigger_ref and self.conversation_granted(root.trigger_ref))
+
+    def mark_granted(self, context: _RunContext, node_id: str, source: str, *, tool: str | None = None) -> None:
+        """Record that content of a granted source (``source``: ``folder``, ``knowledge``, ``memory``,
+        ``attachment`` ...) entered the step ``node_id`` (N-08). Monotonic: the run, its top-level run and the
+        conversation it answers in stay marked. From here on every call of the execution that reaches outside and
+        every cloud model request needs a grant. Shown as the run event ``content_provenance``. Nothing happens while
+        the switch is off."""
+        if not self.provenance_on():
+            return
+        root = context.root
+        with context.lock:
+            first = not root.run.granted_content
+            own_first = not context.run.granted_content
+            context.run.granted_content = True
+            root.run.granted_content = True
+        self._emit(context, "content_provenance", node_id, source=source, tool=tool, first=first)
+        run = root.run
+        if run.trigger == "conversation" and run.trigger_ref:
+            self.mark_conversation_granted(run.trigger_ref)
+        # Stored at once, each run at its own first mark (a sub-workflow's too, also when its top-level run was
+        # marked before): a paused run continued elsewhere (a worker, a restart) and a reader of the finished child
+        # (``content_granted``) see the mark without waiting for the run's end.
+        if own_first:
+            self._save(context)
+        if first and root is not context:
+            self._save(root)
+
+    def _check_egress(self, context: _RunContext, node_id: str, model: str, server_tools: Sequence[str] = ()) -> None:
+        """Before each model request of a turn that holds content of a granted source (N-08): a cloud ``model`` needs
+        a grant (:meth:`_check_site_access`, the same check as at the connection), and so does every server tool that
+        reaches outside (it runs at the provider and never passes the tool hook): a grant on the tool (resource
+        ``tool:<key>``). A refusal is audited and shown, and the step fails before the request is sent. Nothing
+        happens while the switch is off or the turn holds no such content."""
+        if not self.holds_granted(context):
+            return
+        root = context.root.run
+        if self.leaves_computer(provider_of(model)):
+            resource = tool_policy.AccessResource(type="cloud_provider", id=provider_of(model))
+            found = self._check_site_access(context, node_id, resource)
+            if found is not None:
+                raise access_error(found, resource, show_source=is_person(_run_actor(root)))
+        gate = self.tool_gate
+        assert gate is not None
+        for key in dict.fromkeys(server_tools):
+            capability = tool_policy.server_tool_capability(key)
+            agent = tool_policy.agent_ref(context.run.workflow_id, node_id)
+            situation = gate.call_context(
+                run_id=context.run.id,
+                node_id=node_id,
+                trigger=root.trigger,
+                trigger_ref=root.trigger_ref,
+                agent=agent,
+                conversation_id=conversation_of(root),
+                shared_content=True,
+            )
+            assert situation.access is not None
+            at = now()
+            found_tool = tool_policy.tool_access(key, capability, situation.access, attended=situation.attended, at=at)
+            if tool_policy.egress_granted(capability, situation, found_tool, at=at):
+                continue
+            resource = tool_policy.AccessResource(type="tool", id=key)
+            explained = tool_policy.refusal_of(resource, found_tool, effect=tool_policy.effect_of(capability))
+            record_refusal(self.store, explained, resource, actor=_run_actor(root), run_id=context.run.id, agent=agent)
+            self._emit(
+                context,
+                "access_refused",
+                node_id,
+                resource_type=resource.type,
+                resource_id=resource.id,
+                code=explained.code,
+                source=explained.source,
+            )
+            raise access_error(explained, resource, show_source=is_person(_run_actor(root)))
+
+    def content_granted(self, run: Run) -> bool:
+        """Whether ``run`` holds content of a granted source (N-08), for everything that sends a finished run's
+        content to a model outside the run (run chat, the assistant's run attachment, a test series' judge): it,
+        its top-level run or the conversation that run answers in is marked. A mark on a run below it reaches the
+        top-level run, and a continued run starts with its earlier run's mark. Fails closed: a parent that cannot be
+        read counts as marked. ``False`` while the switch is off."""
+        if not self.provenance_on():
+            return False
+        top = run
+        seen: set[str] = set()
+        while True:
+            if top.granted_content:
+                return True
+            if not top.parent_run_id or top.id in seen:
+                break
+            seen.add(top.id)
+            parent = self.get(top.parent_run_id)
+            if parent is None:
+                return True
+            top = parent
+        return bool(top.trigger == "conversation" and top.trigger_ref and self.conversation_granted(top.trigger_ref))
 
     def offline_scope(self, context: _RunContext, config: AgentConfig | None = None) -> offline.OfflineScope | None:
         """Whether a call of this step must stay offline (N-09), and why: the conversation the top-level run answers
@@ -1430,13 +1567,21 @@ class RunManager:
         if gate is None or gate.access is None:
             return self.connect
 
+        def refuse(provider: str) -> None:
+            resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
+            found = self._check_site_access(context, node_id, resource)
+            if found is not None:
+                raise access_error(found, resource, show_source=is_person(_run_actor(context.root.run)))
+
         def connect(provider: str) -> Connection:
             if provider != "ollama":
-                resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
-                found = self._check_site_access(context, node_id, resource)
-                if found is not None:
-                    raise access_error(found, resource, show_source=is_person(_run_actor(context.root.run)))
-            return self.connect(provider)
+                refuse(provider)
+                return self.connect(provider)
+            # The local model server: its address decides (N-08), so it is resolved first.
+            connection = self.connect(provider)
+            if self.leaves_computer(provider, connection):
+                refuse(provider)
+            return connection
 
         return connect
 
@@ -3488,6 +3633,7 @@ class RunManager:
             trigger_ref=root.trigger_ref,
             agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
             conversation_id=conversation_of(root),
+            shared_content=self.holds_granted(context),
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -3634,6 +3780,7 @@ class RunManager:
                     trigger_ref=root.trigger_ref,
                     agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
                     conversation_id=conversation_of(root),
+                    shared_content=self.holds_granted(context),
                 ),
                 at=now(),
                 version=_version,
@@ -3805,6 +3952,7 @@ class RunManager:
             trigger_ref=root.trigger_ref,
             agent=tool_policy.agent_ref(context.run.workflow_id, node_id),
             conversation_id=conversation_of(root),
+            shared_content=self.holds_granted(context),
         )
         verdict = tool_policy.decide(
             tool=call.name,
@@ -4466,6 +4614,8 @@ class RunManager:
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
             context.tracker.check()
+            # N-08: a team's result may have brought granted content since the decision connected.
+            self._check_egress(context, node.id, config.model)
 
         interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node.id))
         try:
@@ -4831,6 +4981,16 @@ class RunManager:
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
             context.tracker.check()
+            # N-08: granted content may have entered this turn after it connected (a folder read): every request
+            # that would carry it to a cloud model, or to a server tool that reaches outside, needs a grant.
+            self._check_egress(context, node_id, config.model, config.server_tools)
+
+        def on_judge_request(_args: dict[str, Any]) -> None:
+            self._check_owned(context)
+            context.tracker.check()
+            # N-08: the quality judge connected when the step started, maybe before the step held granted content,
+            # and its model may run at another provider than the agent's: each of its requests checks its own model.
+            self._check_egress(context, node_id, check_model(config.quality.judge_model))
 
         def before_tool(call: ToolCall) -> Denial | None:
             context.check()
@@ -4887,6 +5047,10 @@ class RunManager:
             # One activity event per call: its tool and result, never its arguments or output.
             refused = call.id in denied
             refused_code = denied.pop(call.id, None)
+            source = granted_source(call.content_source)
+            if source is not None and not refused:
+                # N-08: the tool returned content of a granted source (a folder, knowledge, memory, a file).
+                self.mark_granted(context, node_id, source, tool=call.name)
             self._activity(
                 context,
                 "tool_call",
@@ -4964,6 +5128,9 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
+            # N-08: what the step gets before its first request (attached files, knowledge in the context).
+            for source in start_sources(config, extra):
+                self.mark_granted(context, node_id, source)
             scope = self.offline_scope(context, config)
             if scope is not None and config.server_tools:
                 # N-09: server tools run at the provider and never pass the tool hook, so the step does not start.
@@ -4997,6 +5164,7 @@ class RunManager:
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
                 services=self._run_services(context, node_id, config.name),
+                judge_hooks={"on_request": on_judge_request},
             )
             outcome = ask(prompt)
             if checked_fields(config.output):
@@ -5172,6 +5340,7 @@ def execute_agent(
     on_built: Callable[[BuiltAgent], None] | None = None,
     services: RunServices | None = None,
     skills: SkillSet | None = None,
+    judge_hooks: Mapping[str, Callable[..., Any]] | None = None,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -5186,6 +5355,9 @@ def execute_agent(
     Agent and judge each use the connection of their own provider. ``gated`` must be true only when the
     ``before_tool`` hook applies the shared per-call approval rules to every call (MCP tools that change data need it).
     ``on_built`` sees the built agent before it is asked (e.g. to record a reduced reasoning, RT-050).
+    ``judge_hooks``: the quality judge's own hooks; its ``on_request`` runs before every request of the judge, which
+    may go to another provider than the agent's (N-08 checks the judge's model there). Without it the judge shares
+    the agent's ``on_request``.
     """
     built = builder.build(
         config,
@@ -5233,8 +5405,9 @@ def execute_agent(
         pin = getattr(tracker, "pin_conditions", None)
         if pin is not None:
             pin(evaluator.agent.name, evaluator.agent.options)
-        if "on_request" in hooks:
-            evaluator.agent.on_request = hooks["on_request"]
+        judge_request = (judge_hooks or {}).get("on_request", hooks.get("on_request"))
+        if judge_request is not None:
+            evaluator.agent.on_request = judge_request
         if on_evaluation_start is not None:
             on_evaluation_start()
         if suspendable:
@@ -5613,6 +5786,32 @@ def _fail(target: NodeRun | Run, found: Problem) -> None:
     target.error = found.message
     target.error_code = found.code
     target.error_params = found.params
+
+
+#: N-08: the content sources Orkexa's own tools declare, as the run names them (a store or index of the agent's
+#: knowledge). Every other declared source keeps its name (``folder``, ``attachment``, ``memory``).
+_SOURCE_NAMES = {"files": "knowledge", "index": "knowledge"}
+
+
+def granted_source(declared: str | None) -> str | None:
+    """The granted source a tool call's declared content source (``ToolCall.content_source``) stands for (N-08), or
+    ``None`` when the tool declares none. Every declared source is a granted source: Nodestro's tools declare one only
+    for content of a folder, the knowledge, a persistent memory or an attached file."""
+    if declared is None:
+        return None
+    return _SOURCE_NAMES.get(declared, declared)
+
+
+def start_sources(config: AgentConfig, extra: Sequence[ContentBlock]) -> list[str]:
+    """The granted content a step gets before its first request (N-08): files of the run delivered into its context
+    (``attachment``: the attached files and the overview of a conversation's earlier files) and knowledge given in
+    full (``knowledge``, mode ``context``)."""
+    found: list[str] = []
+    if extra:
+        found.append("attachment")
+    if config.knowledge.mode == "context" and config.knowledge.file_ids:
+        found.append("knowledge")
+    return found
 
 
 def conversation_of(run: Run) -> str:

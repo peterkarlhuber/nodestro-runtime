@@ -434,7 +434,7 @@ class SpecTool(Tool):
         counter: CallCounter | None = None,
         services: RunServices | None = None,
     ) -> None:
-        super().__init__(name=inner.name, strict=inner.strict)
+        super().__init__(name=inner.name, strict=inner.strict, content_source=inner.content_source)
         self.inner = inner
         self.spec = spec
         self.params: Mapping[str, Any] = dict(params or {})

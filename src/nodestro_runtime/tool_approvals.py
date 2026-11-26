@@ -671,6 +671,11 @@ ENABLE_ENV = "NODESTRO_TOOL_APPROVALS"
 #: take part in every tool call's decision. Only effective together with :data:`ENABLE_ENV`; activating it needs the
 #: owner's gate G-2. While off, the gate decides exactly as before.
 ACCESS_ENV = "NODESTRO_ACCESS_GRANTS"
+#: Switches the egress protection by content provenance on (``1``; N-08, default off): once a conversation or run
+#: holds content of a granted source (a folder, knowledge, persistent memory, an attached file), every call that
+#: reaches outside and every cloud model request needs a grant. Only effective together with :data:`ACCESS_ENV`
+#: (its grants are the ones it asks for); activation is the owner's decision, like the access model's.
+PROVENANCE_ENV = "NODESTRO_CONTENT_PROVENANCE"
 #: Pauses runs at a call that waits for a decision instead of waiting in a thread (``1``; M6b, default off). Only
 #: effective together with :data:`ENABLE_ENV`; activation is a separate decision like the approvals themselves.
 CHECKPOINTS_ENV = "NODESTRO_TOOL_APPROVAL_CHECKPOINTS"
@@ -688,6 +693,11 @@ def approvals_enabled() -> bool:
 def access_grants_enabled() -> bool:
     """Whether the access model v2 takes part in the gate (both switches on)."""
     return approvals_enabled() and os.environ.get(ACCESS_ENV, "").strip() == "1"
+
+
+def provenance_enabled() -> bool:
+    """Whether the egress protection by content provenance applies (N-08; the access model v2 on as well)."""
+    return access_grants_enabled() and os.environ.get(PROVENANCE_ENV, "").strip() == "1"
 
 
 def checkpoints_enabled() -> bool:
@@ -758,6 +768,7 @@ class ToolGate:
         offline: Callable[[], bool] = lambda: False,
         protected_folders: Sequence[str] = (),
         local_mcp: Callable[[], Iterable[str]] = lambda: (),
+        provenance: bool = False,
     ) -> None:
         self.approvals = approvals
         #: Pause the run at a call that waits (M6b) instead of waiting in the agent's thread.
@@ -777,6 +788,9 @@ class ToolGate:
         self.protected_folders = tuple(protected_folders)
         #: The ids of local (``stdio``) MCP servers: strict offline does not refuse their tools.
         self.local_mcp = local_mcp
+        #: N-08: content of a granted source in a conversation or run makes outbound calls need a grant (only with
+        #: the access model v2 on, ``access`` set).
+        self.provenance = provenance and access is not None
 
     def call_context(
         self,
@@ -787,10 +801,13 @@ class ToolGate:
         trigger_ref: str | None,
         agent: str | None = None,
         conversation_id: str | None = None,
+        shared_content: bool = False,
     ) -> CallContext:
         """The situation of a call in a run started by ``trigger`` (the root run's): the one place that says
         whether a person can answer and which pre-grants count. The engine's gate and the warning before an
-        unattended start (:mod:`nodestro_runtime.tool_preflight`) both use it, so they cannot disagree."""
+        unattended start (:mod:`nodestro_runtime.tool_preflight`) both use it, so they cannot disagree.
+        ``shared_content``: the run holds content of a granted source (N-08; counts only while :attr:`provenance`
+        is on)."""
         scope: tuple[PreGrantScope, str] | None = None
         if trigger in ("schedule", "batch", "benchmark") and trigger_ref:
             scope = (cast(PreGrantScope, trigger), trigger_ref)
@@ -802,7 +819,7 @@ class ToolGate:
             scope=scope,
             pre_grants=tuple(self.pre_grants(*scope)) if scope is not None else (),
             mcp_unattended=self.mcp_unattended(),
-            access=self._access(agent, conversation_id),
+            access=self._access(agent, conversation_id, shared_content),
         )
 
     def related(self, tools: Any, name: str, settings: Mapping[str, Any] | None = None) -> tuple[AccessResource, ...]:
@@ -831,19 +848,24 @@ class ToolGate:
         attended: bool,
         agent: str | None,
         conversation_id: str | None = None,
+        shared_content: bool = False,
     ) -> AccessExplanation | None:
         """The refusal of a workflow start or a cloud model request (N-06), or ``None`` (also while the switch is
         off). Read at every check, so a revocation or a new deny applies at the next start or request.
 
         It refuses exactly when :func:`~.tool_policy.explain` says ``allowed`` is ``False`` (a deny, a safety limit,
-        or for a cloud model with shared content a missing grant); the refusal is that explanation."""
-        access = self._access(agent, conversation_id)
+        or for a cloud model with shared content a missing grant); the refusal is that explanation.
+        ``shared_content``: the content to send holds content of a granted source (N-08; only while
+        :attr:`provenance` is on)."""
+        access = self._access(agent, conversation_id, shared_content)
         if access is None:
             return None
         found = site_access(resource, access, attended=attended, at=now(), agent=agent)
         return None if found.allowed else found
 
-    def _access(self, agent: str | None, conversation_id: str | None) -> AccessContext | None:
+    def _access(
+        self, agent: str | None, conversation_id: str | None, shared_content: bool = False
+    ) -> AccessContext | None:
         """Read at every call, so a revoked grant or a new deny applies at the next call."""
         if self.access is None:
             return None
@@ -856,6 +878,7 @@ class ToolGate:
             offline=self.offline(),
             protected_folders=self.protected_folders,
             local_servers=frozenset(self.local_mcp()),
+            shared_content=shared_content and self.provenance,
         )
 
 
@@ -1249,6 +1272,7 @@ __all__ = [
     "MAX_PAUSED_ENV",
     "MAX_WAIT",
     "PRE_GRANTS",
+    "PROVENANCE_ENV",
     "REFUSALS",
     "RUN_OWN_TOOLS",
     "SWITCH_OFF",
@@ -1270,6 +1294,7 @@ __all__ = [
     "audit_target",
     "checkpoints_enabled",
     "max_paused",
+    "provenance_enabled",
     "record_audit",
     "record_refusal",
     "request_key",
