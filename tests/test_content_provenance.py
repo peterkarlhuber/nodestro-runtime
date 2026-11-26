@@ -1249,3 +1249,99 @@ def test_an_agent_test_never_runs_a_knowledge_search_with_granted_content(
     [search] = [call for call in result.tool_calls if call.name == "search"]
     assert search.approval is not None and search.approval.status == "denied"
     assert model.queries == []
+
+
+class _AddressedEmbeddings:
+    """Like Orkexa's ``OllamaEmbeddings``: bound to the server address it was built for (``client.base_url``)."""
+
+    def __init__(self, url: str, sent: list[tuple[str, str]]) -> None:
+        self.client = type("Client", (), {"base_url": url})()
+        self.sent = sent
+
+    @staticmethod
+    def _vector(value: str) -> list[float]:
+        return [1.0 if SECRET in value else 0.1, 1.0 if "refund" in value else 0.1, 0.5]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.sent.extend((self.client.base_url, item) for item in texts)
+        return [self._vector(item) for item in texts]
+
+    def embed_query(self, value: str) -> list[float]:
+        self.sent.append((self.client.base_url, value))
+        return self._vector(value)
+
+    def refresh_identity(self) -> None:
+        return None
+
+    def identity(self) -> Any:
+        from orkexa.embeddings import EmbeddingIdentity
+
+        return EmbeddingIdentity(provider="test", model="counted:1", dimensions=3, digest="d1")
+
+
+async def test_an_embedding_model_built_for_another_address_is_built_again_before_it_embeds(
+    make: Make, docs: Path, network: None
+) -> None:
+    """RT-094 review M-1: the knowledge kept the embedding model it had built for a remote server while the model name
+    stayed the same; after the address was changed to this computer, the N-08 check read the new (local) address and
+    let new knowledge, an adoption hint's query and a marked run's search through, and the old model sent them to the
+    remote server without a grant. Now the model is built again for the address the settings name, and the check
+    judges the address the model really sends to. Both directions: remote -> local sends everything to this computer;
+    local -> remote is refused without a grant."""
+    from nodestro_runtime.schemas import KnowledgeConfig
+
+    remote, local = "https://gpu.example.com/v1", "http://127.0.0.1:11434/v1"
+    sent: list[tuple[str, str]] = []
+    turn = [
+        tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}),
+        tool_use("search", {"query": f"refund {SECRET}"}),
+    ]
+    workspace = make({"SEARCHER": [*turn, text("done")] * 3})
+    _grant_folder(workspace, docs)
+    where = _model_server(workspace, remote)
+    knowledge = workspace.knowledge
+    knowledge.embedding_model = lambda _name: _AddressedEmbeddings(where["url"], sent)  # type: ignore[assignment]
+    knowledge.retrieval = lambda: ("vector", "counted:1")  # type: ignore[method-assign]
+    rules = AccessRules(workspace.store)
+    grant = rules.grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    knowledge.add(b"Customers get a refund within thirty days of the purchase, always.", name="returns.md")
+    knowledge.start_reindex()
+    for _ in range(200):
+        if knowledge.index_status().state == "ready":
+            break
+        await asyncio.sleep(0.02)
+    assert knowledge.index_status().state == "ready"
+    rules.revoke_grant(grant.id, by=PERSON)
+
+    # Remote -> this computer: new knowledge, an adoption hint and a marked run's search all go to this computer.
+    where["url"] = local
+    sent.clear()
+    knowledge.add(f"Board minutes {SECRET}".encode(), name="minutes.md")
+    knowledge.search(f"refund {SECRET}", mode="vector", granted=True)
+    _search_granted(workspace)
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/searcher")
+    agent = AgentConfig(
+        name="Searcher",
+        system_prompt="SEARCHER",
+        model=CLOUD,
+        tools=["read_file"],
+        knowledge=KnowledgeConfig(file_ids=[item.id for item in knowledge.files()], mode="search", retrieval="vector"),
+    )
+    run = await _finished(workspace, _chain(("searcher", agent)), trigger="schedule", trigger_ref="s")
+    assert not _calls(run, "searcher")["search"].is_error
+    assert [item for item in sent if SECRET in item[1]], sent  # the probe embedded something
+    assert all(address == local for address, _value in sent), sent
+
+    # This computer -> remote: the model is built for the remote address and the check refuses it without a grant.
+    where["url"] = remote
+    sent.clear()
+    with pytest.raises(NodestroError) as refused:
+        knowledge.search(f"refund {SECRET}", mode="vector", granted=True)
+    assert refused.value.code.startswith("access.")
+    knowledge.add(f"More minutes {SECRET}".encode(), name="more.md")  # indexed without vectors
+    assert not [item for item in sent if item[0] == remote and SECRET in item[1]], sent

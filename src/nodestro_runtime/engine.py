@@ -1269,6 +1269,7 @@ class RunManager:
         attended: bool = True,
         audit: bool = True,
         shared_content: bool = False,
+        endpoint: str | None = None,
     ) -> None:
         """Refuse a model request outside an agent's turn (the live run chat, the assistants and every other caller of
         :meth:`~nodestro_runtime.workspace.Workspace.connect_model`; no agent) to a cloud model the access model v2
@@ -1276,9 +1277,13 @@ class RunManager:
         refusal with its source (``False`` for a probe that only asks whether a model can be used). Only a person
         (``actor``) sees the source in the error. Nothing happens while the switch is off or for the local model
         server. ``shared_content`` (N-08): the content to send holds content of a granted source
-        (:meth:`content_granted`), so the cloud model needs a grant (only while the provenance switch is on)."""
+        (:meth:`content_granted`), so the cloud model needs a grant (only while the provenance switch is on).
+        ``endpoint``: the address the request really goes to, judged instead of the provider's connection (the
+        knowledge embeddings, RT-094: their model may have been built for an earlier address)."""
         gate = self.tool_gate
-        if gate is None or gate.access is None or not self.leaves_computer(provider):
+        if gate is None or gate.access is None:
+            return
+        if not (self.embedding_leaves(endpoint) if endpoint is not None else self.leaves_computer(provider)):
             return
         resource = tool_policy.AccessResource(type="cloud_provider", id=provider)
         found = gate.site_refusal(
@@ -1350,6 +1355,15 @@ class RunManager:
             return False
         found = connection if connection is not None else self.connect(provider)
         return offline.remote_model_server(found, docker=self.builder.mode == "local-container")
+
+    def embedding_leaves(self, address: str | None) -> bool:
+        """Whether the knowledge embeddings sent to ``address`` (the address their model really uses, not the one the
+        settings name now: RT-094 review M-1) leave this computer (N-08, only while its switch is on). No address (an
+        injected model) counts as local, as in :func:`~nodestro_runtime.offline.remote_model_server`. A host name is
+        judged by its name: ``localhost`` counts as this computer, whatever the hosts file says (documented)."""
+        if not self.provenance_on() or not address:
+            return False
+        return not offline.is_local_endpoint(address, docker=self.builder.mode == "local-container")
 
     def holds_granted(self, context: _RunContext) -> bool:
         """Whether this execution holds content of a granted source (N-08): its top-level run is marked, or the
@@ -1434,13 +1448,14 @@ class RunManager:
             )
             raise access_error(explained, resource, show_source=is_person(_run_actor(root)))
 
-    def _check_embedding(self, context: _RunContext, node_id: str) -> None:
+    def _check_embedding(self, context: _RunContext, node_id: str, address: str | None) -> None:
         """Before the agent's knowledge search embeds its query (vector or hybrid) in an execution that holds content
         of a granted source (N-08): an embedding server outside this computer (:meth:`leaves_computer`) needs a grant
         on its provider (``cloud_provider`` ``ollama``), as a model request does. A refusal is audited and shown
         (:meth:`_check_site_access`), and the search fails before the query is sent: the agent reads a fixed text.
-        Nothing happens while the switch is off, without such content, or for a server on this computer."""
-        if not self.holds_granted(context) or not self.leaves_computer(EMBEDDING_PROVIDER):
+        Nothing happens while the switch is off, without such content, or for a server on this computer. ``address``:
+        where the embedding model really sends the query (:meth:`embedding_leaves`)."""
+        if not self.holds_granted(context) or not self.embedding_leaves(address):
             return
         resource = tool_policy.AccessResource(type="cloud_provider", id=EMBEDDING_PROVIDER)
         if self._check_site_access(context, node_id, resource) is not None:
@@ -4773,7 +4788,7 @@ class RunManager:
             notify=notify,
             save_file=save_file,
             run_file=run_file,
-            embedding_check=lambda: self._check_embedding(context, node_id),
+            embedding_check=lambda address: self._check_embedding(context, node_id, address),
         )
 
     def _folder_reader(self, context: _RunContext, node_id: str, agent_name: str | None) -> FolderReader | None:

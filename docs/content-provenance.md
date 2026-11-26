@@ -119,9 +119,13 @@ failed marks the run anyway (its error can name what it found).
 
 ## Known limits
 
-- The address of the embedding server is read at each check from the local model server's connection; the
-  knowledge keeps the embedding model it connected while its name stays the same, so after the server's address
-  changed, a rebuild or restart makes the model use the new one.
+- The check judges the address the embedding model really sends to (an Ollama model's `client.base_url`), not the
+  one the settings name. Before it embeds anything, the knowledge builds its model again when the local model
+  server's address changed (`KnowledgeBase.embedding_address`; review M-1: before, a model built for a remote server
+  kept sending there after the address was changed to this computer, while the check read the new local address).
+- A server is judged by its address as written (`offline.is_local_endpoint`): `localhost`, a loopback address and
+  the host's own names count as this computer. A hosts file (`/etc/hosts`) that points `localhost` elsewhere is
+  trusted, as for the chat models (N-09); whoever can change it controls the computer already.
 - Agent tests never run a knowledge search with granted content: the tool gate refuses the knowledge search there
   (it counts as an unknown tool, and a test never asks), so no query reaches the embedding server.
 - A tool without a declaration is not seen. MCP tools never declare a source: their results are external data, not

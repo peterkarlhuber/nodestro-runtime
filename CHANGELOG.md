@@ -42,6 +42,10 @@
     recognised, adopted or imported file is indexed without vectors (full-text search finds it, the status says
     `incomplete`); a search whose query holds granted content (`KnowledgeBase.search(..., granted=True)`, the
     adoption's similarity hint) is refused, and the hint then uses full-text search. Switch off: unchanged.
+    Review fix (M-1): the check judges the address the embedding model really sends to
+    (`RunManager.embedding_leaves`, `check_cloud_access(endpoint=)`, `embedding_check(address)`), and the knowledge
+    builds the model again when the server's address changed (`KnowledgeBase.embedding_address`); before, a model
+    built for a remote server kept sending granted content there after the address was changed to this computer.
   - `mcp/netguard.py` stays: it is not a forwarding copy (MCP's egress policy, `httpcore2` backend, error codes and the
     response cap on top of `orkexa.net.guard`).
 

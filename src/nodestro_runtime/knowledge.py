@@ -197,6 +197,20 @@ class ScopedFileStore(FileStore):
         raise PermissionError("This view is read-only")
 
 
+def _address(url: str | None) -> str | None:
+    """A model server's address without its OpenAI-compatible suffix (``/v1``), to compare the one an embedding model
+    was built for with the one the settings name now."""
+    return (url or "").strip().removesuffix("/").removesuffix("/v1").rstrip("/") or None
+
+
+def _model_address(model: object, fallback: str | None) -> str | None:
+    """The address ``model`` really sends to: an Ollama model's client (``base_url``); else the address it was built
+    for (``fallback``)."""
+    client = getattr(model, "client", None)
+    found = getattr(client, "base_url", None)
+    return _address(found) if isinstance(found, str) else fallback
+
+
 class ScopedIndex(Index):
     """A read-only view of an index that searches only the chunks of ``file_ids``, ranked by ``mode``.
 
@@ -294,9 +308,15 @@ class KnowledgeBase:
         self.retrieval: Callable[[], tuple[RetrievalMode, str | None]] = lambda: ("fts", None)
         #: The embedding model of a name (the workspace connects it to the local model server).
         self.embedding_model: Callable[[str], EmbeddingModel] | None = None
-        #: N-08: raises (``access.*``) when granted content may not go to the embedding model: the workspace refuses
-        #: a model outside this computer without a grant while the provenance switch is on. ``None``: no check.
-        self.embedding_check: Callable[[], None] | None = None
+        #: N-08: raises (``access.*``) when granted content may not go to the embedding model at the given address
+        #: (the one the model really sends to): the workspace refuses an address outside this computer without a grant
+        #: while the provenance switch is on. ``None``: no check.
+        self.embedding_check: Callable[[str | None], None] | None = None
+        #: The address of the local model server a newly built embedding model uses now (the workspace's connection);
+        #: a model built for another address is built again before it embeds anything (RT-094 review M-1).
+        self.embedding_address: Callable[[], str | None] = lambda: None
+        #: The address the index's embedding model sends to (``None``: no model, or one without an address).
+        self._embeddings_address: str | None = None
         self._job: ReindexJob | None = None
         self._job_cancel: threading.Event | None = None
         #: On a server's API process: where reindex jobs are queued for a worker (:class:`ReindexQueue`, RT-046);
@@ -470,19 +490,26 @@ class KnowledgeBase:
         if target is None:
             setattr(self.index, "embeddings", None)  # noqa: B010 (an attribute of the vector-capable indexes only)
             return
-        if current is not None:
+        wanted = _address(self.embedding_address())
+        if current is not None and self._embeddings_address == wanted:
+            # Kept only while it still talks to the server the settings name (RT-094 review M-1: before, a model
+            # built for a remote server kept sending there after the address was changed to this computer, while
+            # the N-08 check read the new address and let granted content through).
             try:
                 identity = current.identity()
             except (OllamaError, NodestroError):
                 identity = None
             if identity is not None and identity.model == target.get("model"):
                 return
-        setattr(self.index, "embeddings", self._model(str(target.get("model"))))  # noqa: B010
+        model = self._model(str(target.get("model")))
+        self._embeddings_address = _model_address(model, wanted)
+        setattr(self.index, "embeddings", model)  # noqa: B010
 
-    def _check_embedding(self) -> None:
-        """N-08: raise ``access.*`` when granted content may not be sent to the embedding model now."""
+    def _check_embedding(self, address: str | None) -> None:
+        """N-08: raise ``access.*`` when granted content may not be sent to the embedding model at ``address`` (the
+        address the model that will embed it really uses)."""
         if self.embedding_check is not None:
-            self.embedding_check()
+            self.embedding_check(address)
 
     def _without_vectors(self, work: Callable[[], object]) -> None:
         model = getattr(self.index, "embeddings", None)
@@ -497,7 +524,7 @@ class KnowledgeBase:
         in full text, the refusal is audited and the status shows ``incomplete`` until a permitted reindex."""
         if getattr(self.index, "embeddings", None) is not None:
             try:
-                self._check_embedding()
+                self._check_embedding(self._embeddings_address)
             except NodestroError as exc:
                 if not exc.code.startswith("access."):
                     raise
@@ -568,10 +595,12 @@ class KnowledgeBase:
             raise NodestroError("knowledge.embedding_model_missing", "Choose an embedding model first")
         if self._vectors() is None:
             raise NodestroError("knowledge.vectors_unavailable", "This knowledge base cannot hold vectors")
+        wanted = _address(self.embedding_address())
         model = self._model(name)
         if model is None:
             raise NodestroError("knowledge.embedding_model_missing", "No embedding model is available")
-        self._check_embedding()  # N-08: a reindex sends every chunk of the knowledge to the model
+        # N-08: a reindex sends every chunk of the knowledge to the model, at the address it was built for.
+        self._check_embedding(_model_address(model, wanted))
         return name, model
 
     def start_reindex(self, model_name: str | None = None) -> KnowledgeIndexStatus:
@@ -808,9 +837,9 @@ class KnowledgeBase:
         ``granted``: the query holds granted content (N-08), so a search that embeds it asks the embedding check
         first (``access.*`` when refused)."""
         chosen = mode or self.retrieval()[0]
-        if granted and chosen != "fts":
-            self._check_embedding()
         self._prepare_search(chosen)
+        if granted and chosen != "fts":
+            self._check_embedding(self._embeddings_address)
         try:
             return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
         except RetrievalError as exc:
@@ -822,10 +851,11 @@ class KnowledgeBase:
     # ---- per-agent views -----------------------------------------------------------
 
     def views(
-        self, config: KnowledgeConfig, *, before_embed: Callable[[], None] | None = None
+        self, config: KnowledgeConfig, *, before_embed: Callable[[str | None], None] | None = None
     ) -> tuple[ScopedFileStore | None, ScopedIndex | None]:
         """The store and index an agent gets for ``config`` (``None`` where it gets none). ``before_embed``: the run's
-        check before a search embeds its query (N-08, :attr:`ScopedIndex.before_embed`)."""
+        check before a search embeds its query (N-08, :attr:`ScopedIndex.before_embed`), given the address the
+        embedding model sends to; the model is built again first when the server's address changed."""
         file_ids = [file_id for file_id in config.file_ids if file_id in self.store]
         if not file_ids or config.mode == "context":
             return None, None
@@ -833,4 +863,10 @@ class KnowledgeBase:
             return ScopedFileStore(self.store, file_ids), None
         mode = self.effective_mode(config)
         self._prepare_search(mode)
-        return None, ScopedIndex(self.index, file_ids, mode, before_embed=before_embed)
+
+        def prepared() -> None:
+            self._sync_embeddings()
+            if before_embed is not None:
+                before_embed(self._embeddings_address)
+
+        return None, ScopedIndex(self.index, file_ids, mode, before_embed=prepared)

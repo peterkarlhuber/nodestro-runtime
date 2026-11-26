@@ -372,8 +372,9 @@ class RunServices:
     #: none here (the switch is off, outside a run, or not in this mode).
     folders: FolderReader | None = None
     #: N-08: raises before the agent's knowledge search embeds its query (vector or hybrid), when the query may not
-    #: reach the embedding model (:attr:`~nodestro_runtime.knowledge.ScopedIndex.before_embed`); ``None``: no check.
-    embedding_check: Callable[[], None] | None = None
+    #: reach the embedding model at the given address (the one it really sends to,
+    #: :meth:`~nodestro_runtime.knowledge.KnowledgeBase.views`); ``None``: no check.
+    embedding_check: Callable[[str | None], None] | None = None
 
 
 @dataclass(frozen=True)
