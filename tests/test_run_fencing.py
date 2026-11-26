@@ -12,6 +12,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
+from lease_support import StalledRenewal
 import postgres_support
 import pytest
 
@@ -253,13 +254,16 @@ async def test_a_worker_that_loses_its_lease_stops_its_run_without_storing_it(
     worker = processes(worker_db, {"WRITE": [blocking(release, called)]})
     queue = JobQueue(api_db)
     started = await api_start(api, queue, "alpha", simple_flow())
-    runner = RunWorker(JobQueue(worker_db), worker, name="w1", heartbeat=0.05, flush=0.02)
+    worker_queue = JobQueue(worker_db)
+    stall = StalledRenewal(worker_queue)
+    runner = RunWorker(worker_queue, worker, name="w1", heartbeat=0.05, flush=0.02)
     try:
         executing = asyncio.ensure_future(runner.run_once())
         await asyncio.to_thread(called.wait, 10)
-        # The lease expires (as if heartbeats had stalled) and another worker's reaper takes the run.
-        api_db._write("UPDATE nodestro_jobs SET lease_until = clock_timestamp() - interval '1 second'", ())
-        assert [job.ref for job in reap(queue, api)] == [started.id]
+        # The heartbeats stall, the lease expires and another worker's reaper takes the run.
+        with stall:
+            api_db._write("UPDATE nodestro_jobs SET lease_until = clock_timestamp() - interval '1 second'", ())
+            assert [job.ref for job in reap(queue, api)] == [started.id]
         # The worker notices at its next heartbeat and stops executing the run.
         await asyncio.sleep(0.3)
         seen = worker("alpha").store.get("runs", started.id, Run)

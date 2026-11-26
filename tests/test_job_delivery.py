@@ -30,6 +30,7 @@ import threading
 import time
 from typing import Any
 
+from lease_support import StalledRenewal
 from orkexa import Tool
 import postgres_support
 import pytest
@@ -239,7 +240,8 @@ async def until(api: Process, queue: JobQueue, run_id: str, statuses: tuple[str,
 
 
 def expire_leases(database: PostgresDatabase) -> None:
-    """What a stalled heartbeat looks like to the reaper (a blocked loop, a database stall, a paused VM)."""
+    """What a stalled heartbeat looks like to the reaper (a blocked loop, a database stall, a paused VM). With a live
+    worker, call it inside :class:`~lease_support.StalledRenewal` so that no renewal in flight undoes it."""
     database._write("UPDATE nodestro_jobs SET lease_until = clock_timestamp() - interval '1 second'", ())
 
 
@@ -352,12 +354,15 @@ async def test_an_external_write_before_a_lost_lease_is_never_repeated_without_a
     worker = processes(worker_db, {"BILL": counting.answer("BILL", invoicing())})
     queue = JobQueue(api_db)
     started = await api_start(api, queue, chain("Bill", agent("bill", "BILL", [TOOL])))
-    runner = RunWorker(JobQueue(worker_db), worker, name="old", heartbeat=0.05, flush=0.02)
+    worker_queue = JobQueue(worker_db)
+    stall = StalledRenewal(worker_queue)
+    runner = RunWorker(worker_queue, worker, name="old", heartbeat=0.05, flush=0.02)
     try:
         executing = asyncio.ensure_future(runner.run_once())
         assert await asyncio.to_thread(world.entered.wait, 10)
-        expire_leases(api_db)
-        assert [job.ref for job in reap(queue, api)] == [started.id]
+        with stall:
+            expire_leases(api_db)
+            assert [job.ref for job in reap(queue, api)] == [started.id]
         await asyncio.sleep(0.3)  # the old worker notices at its next heartbeat
     finally:
         world.hold.set()
@@ -497,12 +502,15 @@ async def test_a_sub_workflow_of_a_worker_that_lost_its_lease_stores_and_calls_n
         )
     )
     started = await workspace.run(outer, RunIn(input="x"))
-    runner = RunWorker(JobQueue(worker_db), worker, name="w1", heartbeat=0.05, flush=0.02)
+    worker_queue = JobQueue(worker_db)
+    stall = StalledRenewal(worker_queue)
+    runner = RunWorker(worker_queue, worker, name="w1", heartbeat=0.05, flush=0.02)
     try:
         executing = asyncio.ensure_future(runner.run_once())
         assert await asyncio.to_thread(writing.wait, 10)
-        expire_leases(api_db)
-        assert [job.ref for job in reap(queue, api)] == [started.id]
+        with stall:
+            expire_leases(api_db)
+            assert [job.ref for job in reap(queue, api)] == [started.id]
         await asyncio.sleep(0.3)
     finally:
         release.set()  # the innermost agent answers after the lease was lost
