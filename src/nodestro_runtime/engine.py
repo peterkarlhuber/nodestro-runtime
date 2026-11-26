@@ -1387,6 +1387,27 @@ class RunManager:
         if first and root is not context:
             self._save(root)
 
+    def mark_memory_owner(self, context: _RunContext) -> None:
+        """Make the run and its top-level run private to the person whose persistent memory space a step uses
+        (RT-089c review H-2): where spaces have owners, only that person sees them on any run route
+        (:meth:`~nodestro_runtime.conversations.AgentConversations.run_visible`), so the memory tool's output in the
+        run's steps, events and trace never reaches another member. A run that acts for no person is marked
+        :data:`~nodestro_runtime.memory_spaces.NOBODY` (seen by nobody; its step fails anyway). Stored at once, before
+        the step reads the space; nothing happens on the desktop (no owners)."""
+        if getattr(context.env.builder.memory_spaces, "owners", None) is None:
+            return
+        root = context.root
+        owner = _memory_owner(root.run)
+        with context.lock:
+            changed = [item for item in (context, root) if item.run.memory_owner != owner]
+            for item in changed:
+                item.run.memory_owner = owner
+        for item in dict.fromkeys(changed):
+            self._save(item)
+        if changed:
+            # Tells an open event stream to check again whether its reader still sees the run (it ends otherwise).
+            self._emit(context, "memory_private", None)
+
     def _check_egress(self, context: _RunContext, node_id: str, model: str, server_tools: Sequence[str] = ()) -> None:
         """Before each model request of a turn that holds content of a granted source (N-08): a cloud ``model`` needs
         a grant (:meth:`_check_site_access`, the same check as at the connection), and so does every server tool that
@@ -5129,6 +5150,9 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
+            # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read.
+            if config.memory.mode == "persistent":
+                self.mark_memory_owner(context)
             # N-08: what the step gets before its first request (attached files, knowledge in the context).
             for source in start_sources(config, extra):
                 self.mark_granted(context, node_id, source)

@@ -1226,6 +1226,10 @@ class Run(_Model):
     #: memory, an attached file) entered this run or a run below it. Recorded only while the switch is on, never
     #: cleared (monotonic). Left out of the stored record while unset, so runs stay byte-identical.
     granted_content: bool = Field(default=False, exclude_if=lambda value: not value)
+    #: RT-089c: the person whose persistent memory space a step of this run (or of a run below it) used, where spaces
+    #: have owners (a server). Only that person sees the run on any run route; ``None`` (left out): no such step, or the
+    #: desktop. Set before the step starts and never cleared.
+    memory_owner: str | None = Field(default=None, exclude_if=lambda value: value is None)
     #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
     #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
     flow_state: dict[str, Any] | None = None
@@ -1298,6 +1302,10 @@ class RunSummary(_Model):
     release_number: int | None = None
     #: The run budget (BUDGET-1): a set ``pending_request_id`` means the paused run waits for a budget decision.
     budget: RunBudget | None = None
+    #: RT-089c: the person whose persistent memory space a step of this run (or of a run below it) used, where spaces
+    #: have owners (a server). Only that person sees the run on any run route; ``None`` (left out): no such step, or the
+    #: desktop. Set before the step starts and never cleared.
+    memory_owner: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RunEvent(_Model):

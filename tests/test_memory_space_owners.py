@@ -182,3 +182,57 @@ async def test_the_desktop_keeps_every_space(make: Make) -> None:
     assert SECRET in _sent(workspace)
     assert workspace.memory.owner("team") is None
     assert [item.name for item in workspace.memory.visible(BOB)] == ["team"]
+
+
+# ---- review H-2: a run that used a person's memory space is that person's alone -----------------------------------
+
+
+async def test_a_run_with_persistent_memory_is_seen_only_by_its_owner(make: Make) -> None:
+    """Review H-2 (RT-089c): the memory tool's output is part of the run (steps, events, trace). Before, every member
+    saw Alice's run and read her space through it; now the run is marked as hers before the step reads the space, and
+    every run route (``run_visible``, ``summary_visible``) shows it to her alone: not to an administrator, not to a
+    principal without an owner identity. The desktop's single person (``None``) still sees it."""
+    from nodestro_runtime.conversations import NO_OWNER
+    from nodestro_runtime.schemas import RunSummary
+
+    workspace = make({"MEM": [NOTE, text("saved"), VIEW, text("read")]})
+    events: list[Any] = []
+    workspace.runs.event_sink = events.append
+    first = await _run(workspace, ALICE)
+    assert first.status == "succeeded"
+    run = await _run(workspace, ALICE)
+    assert run.memory_owner == ALICE and SECRET in run.model_dump_json()
+    conversations = workspace.conversations
+    for viewer, seen in ((ALICE, True), (None, True), (BOB, False), (NO_OWNER, False)):
+        assert conversations.run_visible(run.id, viewer) is seen, viewer
+        summary = workspace.store.get("runs", run.id, RunSummary)
+        assert summary is not None and conversations.summary_visible(summary, viewer) is seen, viewer
+    # The mark is stored before the space is read, and the stream is told (``memory_private``) before any event of
+    # the step's memory tool, so an open stream of another member ends before it shows anything of the space.
+    mine = [event for event in events if event.run_id == run.id]
+    kinds = [event.type for event in mine]
+    marked = kinds.index("memory_private")
+    leaked = next(i for i, event in enumerate(mine) if SECRET in event.model_dump_json())
+    assert marked < leaked, kinds
+    # A run below it (a sub-workflow's) is seen by nobody else either: the walk checks every run up to the top.
+    child = run.model_copy(update={"id": "run_child", "parent_run_id": run.id, "memory_owner": None})
+    workspace.store.put("runs", child.id, child)
+    assert conversations.run_visible(child.id, BOB) is False
+    assert conversations.run_visible(child.id, ALICE) is True
+
+
+async def test_a_run_without_persistent_memory_stays_visible_and_unmarked(make: Make) -> None:
+    from nodestro_runtime.schemas import MemoryConfig as Memory
+
+    workspace = make({"MEM": [text("plain")]})
+    agent = _agent().model_copy(update={"memory": Memory()})
+    run = await workspace.wait(workspace.runs.start(_flow(agent), RunIn(input="go"), started_by=ALICE).id, timeout=30)
+    assert run.status == "succeeded" and run.memory_owner is None
+    assert "memory_owner" not in workspace.store.get_raw("runs", run.id)  # stored records stay as they were
+    assert workspace.conversations.run_visible(run.id, BOB) is True
+
+
+async def test_the_desktop_marks_no_run(make: Make) -> None:
+    workspace = make({"MEM": [NOTE, text("saved")]}, owners=False)
+    run = await _run(workspace, "local")
+    assert run.status == "succeeded" and run.memory_owner is None

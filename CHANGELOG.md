@@ -16,6 +16,17 @@
   - A space that has files but no owner (all spaces of a server before this change, and spaces restored from a
     desktop) fails closed: nobody's run uses it and nothing claims it by itself until the operator assigns an owner.
   - The desktop and Local Docker (no owners) are unchanged.
+  - Review fixes (H-2, 2026-11-26): a run whose step used a person's persistent memory space is that person's alone.
+    `Run.memory_owner` and `RunSummary.memory_owner` (left out while unset) are set and stored before the step reads
+    the space (`Engine.mark_memory_owner`), with the run event `memory_private`; `Conversations.run_visible` and
+    `summary_visible` (every run route of the API) show such a run, and any run below it, only to that person: not to
+    an administrator, not to a principal without an owner identity (`conversations.memory_visible`). A run that acts
+    for no person is marked as nobody's (its step fails anyway). Before, the memory tool's output in another
+    member's run showed the space to every member.
+  - Residual risks (documented, TODO RT-089): workflows are shared, so an editor can name another member's space in a
+    workflow and prompt it to overwrite or empty the space when its owner runs it (what is read stays in the owner's
+    private run); a name is taken by its first writer (squatting); a removed member's spaces stay theirs and unused
+    (no transfer: a separate owner decision).
 
 - Egress protection by content provenance (N-08), off by default (`NODESTRO_CONTENT_PROVENANCE=1`, effective only with
   `NODESTRO_ACCESS_GRANTS=1` and `NODESTRO_TOOL_APPROVALS=1`). See [docs/content-provenance.md](docs/content-provenance.md).
