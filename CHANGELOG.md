@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Security (RT-089c): memory spaces have an owner on a server. Before, every member listed, read and changed every
+  space, and every member's run of a workflow read what another member's run had written there.
+  - `MemorySpaces(..., owners=store)` (a server tenant's workspace passes its store): the owner of each space is
+    recorded in `memory_space_owners` (`SpaceOwner`: `created` by its first writer, or `assigned` by the operator).
+    New: `MemorySpaces.owner`, `may_use`, `visible`, `ownerless`, `open_for` (claims a new, empty space for a user
+    id) and `assign` (only where no owner is; never replaces one); `memory_spaces.NOBODY`, `space_not_found` and the
+    code `memory.space_not_found`.
+  - A step with persistent memory uses the space of the person who started the top-level run
+    (`execute_agent(..., memory_owner=)`, `AgentBuilder.build(..., memory_owner=)`, default nobody); an agent test
+    the tester's; the context preview counts the files for its owner only (`build_preview(..., owner=)`). Any other
+    caller, and every run that acts for no person, gets `memory.space_not_found` before the agent starts.
+  - A space that has files but no owner (all spaces of a server before this change, and spaces restored from a
+    desktop) fails closed: nobody's run uses it and nothing claims it by itself until the operator assigns an owner.
+  - The desktop and Local Docker (no owners) are unchanged.
+
 - Egress protection by content provenance (N-08), off by default (`NODESTRO_CONTENT_PROVENANCE=1`, effective only with
   `NODESTRO_ACCESS_GRANTS=1` and `NODESTRO_TOOL_APPROVALS=1`). See [docs/content-provenance.md](docs/content-provenance.md).
   - Once content of a granted source (a folder, knowledge, persistent memory, an attached file) enters a run, the run

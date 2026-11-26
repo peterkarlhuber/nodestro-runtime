@@ -472,6 +472,7 @@
   "mcp.vault_unavailable": [],
   "mcp.write_not_supported": ["name"],
   "memory.space_name": ["name"],
+  "memory.space_not_found": ["name"],
   "model.choice_invalid": ["configured", "model"],
   "model.local_unavailable": [],
   "notify.empty_title": [],

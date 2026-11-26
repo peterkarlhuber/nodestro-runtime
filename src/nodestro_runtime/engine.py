@@ -102,6 +102,7 @@ from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, f
 from .input_files import InputFiles
 from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
+from .memory_spaces import NOBODY
 from .notifications import RunNotifier
 from .orchestrator import (
     child_outcome,
@@ -5165,6 +5166,9 @@ class RunManager:
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
                 services=self._run_services(context, node_id, config.name),
                 judge_hooks={"on_request": on_judge_request},
+                # RT-089c: a persistent memory space is the person's who started the run (its owner); a run that
+                # acts for no person (a schedule, an API key) uses none where spaces have owners.
+                memory_owner=_memory_owner(context.root.run),
             )
             outcome = ask(prompt)
             if checked_fields(config.output):
@@ -5341,6 +5345,7 @@ def execute_agent(
     services: RunServices | None = None,
     skills: SkillSet | None = None,
     judge_hooks: Mapping[str, Callable[..., Any]] | None = None,
+    memory_owner: str | None = NOBODY,
 ) -> AgentOutcome:
     """Build the agent and ask it once, or let a judge check and refine the answer.
 
@@ -5357,7 +5362,7 @@ def execute_agent(
     ``on_built`` sees the built agent before it is asked (e.g. to record a reduced reasoning, RT-050).
     ``judge_hooks``: the quality judge's own hooks; its ``on_request`` runs before every request of the judge, which
     may go to another provider than the agent's (N-08 checks the judge's model there). Without it the judge shares
-    the agent's ``on_request``.
+    the agent's ``on_request``. ``memory_owner``: whom the agent acts for (RT-089c, :meth:`AgentBuilder.build`).
     """
     built = builder.build(
         config,
@@ -5374,6 +5379,7 @@ def execute_agent(
         gated=gated,
         services=services,
         skills=skills,
+        memory_owner=memory_owner,
     )
     judging = config.quality.enabled and bool(config.quality.criteria)
     judge = check_model(config.quality.judge_model) if judging else None
@@ -5876,6 +5882,12 @@ def is_person(actor: str | None) -> bool:
     except NodestroError:
         return False
     return True
+
+
+def _memory_owner(run: Run) -> str:
+    """Whose persistent memory spaces the top-level ``run`` uses (RT-089c): the person who started it; a run that acts
+    for no person (a schedule, an API key, a machine) uses none where spaces have owners."""
+    return run.started_by if run.started_by and is_person(run.started_by) else NOBODY
 
 
 def _run_actor(run: Run) -> str:

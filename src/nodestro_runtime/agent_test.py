@@ -40,6 +40,7 @@ from .engine import (
     tool_rounds_problem,
     usage_of,
 )
+from .memory_spaces import NOBODY
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection, check_model, provider_of
@@ -137,11 +138,15 @@ class AgentTester:
         self.pricing: PricingService | None = None
         self.price_mode: Callable[[], PriceMode] = lambda: "standard"
 
-    def _memory(self, config: AgentConfig) -> tuple[AgentConfig, Callable[[], MemoryBackend], bool]:
-        """Persistent memory becomes a writable copy, so a test never changes the space."""
+    def _memory(
+        self, config: AgentConfig, actor: str = "system"
+    ) -> tuple[AgentConfig, Callable[[], MemoryBackend], bool]:
+        """Persistent memory becomes a writable copy, so a test never changes the space. The space must be the one of
+        the person who runs the test where spaces have owners (RT-089c); a test of nobody gets none there."""
         if config.memory.mode != "persistent" or not config.memory.space:
             return config, EphemeralMemory, False
-        space = self.builder.memory_spaces.open(config.memory.space)
+        owner = actor if is_person(actor) else NOBODY
+        space = self.builder.memory_spaces.open_for(config.memory.space, owner)
         files = {entry.path: space.read(entry.path) for entry in space.entries()}
         isolated = config.model_copy(deep=True)
         isolated.memory.mode = "run"
@@ -334,7 +339,7 @@ class AgentTester:
                 raise offline.server_tools_error(list(dict.fromkeys(config.server_tools)), "agent")
             if config.offline and offline.shared_memory(config):
                 raise offline.shared_memory_error(offline.shared_memory(config), "agent")
-            built_config, run_memory, isolated = self._memory(config)
+            built_config, run_memory, isolated = self._memory(config, actor)
             result.memory_isolated = isolated
             outcome = execute_agent(
                 self.builder,

@@ -405,7 +405,8 @@ class Workspace:
             self.tenant_id = storage.tenant_id
             self._secrets = storage.secrets
             self.knowledge = KnowledgeBase(storage.knowledge, ocr=ocr_runner, engine=self.extensions.ocr)
-            self.memory = MemorySpaces(storage.memory)
+            # RT-089c: on a server every memory space has one owner (the tenant's store records them).
+            self.memory = MemorySpaces(storage.memory, owners=storage.store)
         self.knowledge.activity = self.store  # uploads and deletions go to the activity log
         # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
         self._environ: Mapping[str, str] | None = None if storage is None else {}

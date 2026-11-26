@@ -18,6 +18,7 @@ from .engine import _PLACEHOLDER, approval_note, as_text, node_label, render_tas
 from .file_delivery import collect, plan
 from .forms import check_values, prompt_values
 from .graph import data_sources, note_sources
+from .memory_spaces import NOBODY
 from .problems import NodestroError
 from .run_views import workflow_runs
 from .sanitize import redact_secrets
@@ -132,7 +133,10 @@ def build_preview(
     given_input: str | None,
     run: Run | None,
     given_values: dict[str, Any] | None = None,
+    owner: str | None = NOBODY,
 ) -> ContextPreview:
+    """The context the agent ``node_id`` would get. ``owner``: who asks (RT-089c): the files of a persistent memory
+    space are counted only for its owner where spaces have owners (``None``: the desktop's single person)."""
     nodes = {node.id: node for node in workflow.nodes}
     node = nodes.get(node_id)
     if node is None:
@@ -285,7 +289,8 @@ def build_preview(
     memory_files = 0
     if config.memory.mode == "persistent" and config.memory.space:
         try:
-            memory_files = len(nodestro.memory.open(config.memory.space).entries())
+            if nodestro.memory.may_use(config.memory.space, owner):
+                memory_files = len(nodestro.memory.open(config.memory.space).entries())
         except NodestroError:
             memory_files = 0
     return ContextPreview(

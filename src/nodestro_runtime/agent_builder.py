@@ -45,7 +45,7 @@ from .catalog import SERVER_TOOLS
 from .connections import ResolvedConnection
 from .knowledge import KnowledgeBase
 from .mcp_access import check_unattended_mcp
-from .memory_spaces import MemorySpaces
+from .memory_spaces import NOBODY, MemorySpaces
 from .model_profile import (
     ModelProfile,
     OptionSupport,
@@ -446,6 +446,7 @@ class AgentBuilder:
         gated: bool = False,
         services: RunServices | None = None,
         skills: SkillSet | None = None,
+        memory_owner: str | None = NOBODY,
     ) -> BuiltAgent:
         """Build the agent; raises ``ValueError``/``TypeError``/``KeyError`` for invalid settings.
 
@@ -458,6 +459,9 @@ class AgentBuilder:
         hook asks the shared per-call approval gate before every call; MCP tools that change data need it.
         ``services`` lends the built-in tools the run's source ledger and cost booking (NAL-A2). ``skills`` are the
         agent's skills with the run's record of their use (NAL-B3); without them they are resolved here, unrecorded.
+        ``memory_owner``: whom the agent acts for, who must own its persistent memory space where spaces have owners
+        (RT-089c, :meth:`~nodestro_runtime.memory_spaces.MemorySpaces.open_for`); by default nobody, so a caller that
+        names nobody gets no space there.
         """
         model = check_model(config.model)
         provider = provider_of(model)
@@ -502,7 +506,7 @@ class AgentBuilder:
         if config.memory.mode == "persistent":
             if not config.memory.space:
                 raise NodestroError("config.memory_space_missing", "Persistent memory needs a memory space")
-            memory = self.memory_spaces.open(config.memory.space)
+            memory = self.memory_spaces.open_for(config.memory.space, memory_owner)
         elif config.memory.mode == "run":
             memory = EphemeralMemory() if run_memory is None else run_memory()
             if not isinstance(memory, SpaceCopy):
@@ -681,7 +685,8 @@ class AgentBuilder:
         try:
             # Checked as for a run that asks before every call (gated): validation never runs a tool. Paths that
             # do not ask (agent test without a gate, tool test panel) refuse such tools when they build them.
-            self.build(config, connection=_validation_connection(self, config), gated=True)
+            # The space of a persistent memory is opened, never read (``memory_owner`` None): the agent never runs.
+            self.build(config, connection=_validation_connection(self, config), gated=True, memory_owner=None)
         except NodestroError as exc:
             field = (
                 "tools"
