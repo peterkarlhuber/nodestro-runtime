@@ -16,6 +16,12 @@ message. Everything stays inside Nodestro: there is no e-mail, webhook or push c
 - **Tool** ``notify_user(title, message, level)``: an internal message to the run's starter (or the members);
   ``write`` + ``internal``, no network, at most :data:`MAX_MESSAGES_PER_RUN` per run.
 
+Private runs (RT-089d): a run that used a person's persistent memory space (``Run.memory_owner``, RT-089c) is that
+person's alone, also in the inbox: its messages (events and ``notify_user``) go to the memory's owner only, whatever
+the workflow's rules name, and a run marked for nobody (it acts for no person) notifies nobody. The HTTP API also
+filters every listed message by the run's visibility, so a message written before the run became private is not shown
+to anyone else afterwards.
+
 Content: event messages carry ids, the workflow's name and a problem code, never arguments, model output, error texts
 or secrets. A ``notify_user`` message is model output: interfaces show it as plain text (never HTML) and say that it
 came from an agent.
@@ -51,6 +57,8 @@ logger = logging.getLogger(__name__)
 
 Level = Literal["info", "success", "warning", "error"]
 LEVELS: tuple[Level, ...] = ("info", "success", "warning", "error")
+#: A run's ``memory_owner`` when it acts for no person (``memory_spaces.NOBODY``; not imported: no cycle).
+NOBODY_RECIPIENT = "<no owner>"
 #: A message's kind: one of :data:`EVENTS`, or ``message`` (from ``notify_user``).
 Kind = Literal["run_finished", "run_failed", "approval_pending", "budget_pending", "quality_failed", "message"]
 
@@ -258,6 +266,16 @@ _LEVELS: dict[str, Level] = {
 }
 
 
+def private_recipient(run: Run) -> str | None:
+    """Who alone may get messages of ``run`` (RT-089d): ``None`` for a run without a person's memory, else the memory's
+    owner; :data:`NOBODY_RECIPIENT` for a run that acts for no person (nobody is told)."""
+    if run.memory_owner is None:
+        return None
+    if run.memory_owner == NOBODY_RECIPIENT:
+        return NOBODY_RECIPIENT
+    return run.memory_owner
+
+
 class RunNotifier:
     """Writes the messages of runs into a :class:`LocalInbox` (an engine run listener, and the ``notify_user`` sink)."""
 
@@ -267,6 +285,9 @@ class RunNotifier:
     def __call__(self, run: Run) -> None:
         """Called when ``run`` ended or paused: notify its events that its workflow's rules name."""
         rules = run.workflow.notifications
+        private = private_recipient(run)
+        if private == NOBODY_RECIPIENT:
+            return
         for event, record, params in run_events(run):
             if event not in rules.events:
                 continue
@@ -284,7 +305,7 @@ class RunNotifier:
                     run_id=run.id,
                     workflow_id=run.workflow_id,
                     workflow_name=_clean(run.workflow_name, MAX_TITLE),
-                    user_id=run.started_by if rules.recipients == "starter" and run.started_by else None,
+                    user_id=private or (run.started_by if rules.recipients == "starter" and run.started_by else None),
                 )
             )
 
@@ -298,6 +319,9 @@ class RunNotifier:
         text = _clean(text, MAX_TEXT)
         if not title:
             raise ValueError("notify.empty_title")
+        private = private_recipient(run)
+        if private == NOBODY_RECIPIENT:
+            raise ValueError("notify.private")
         for number in range(1, MAX_MESSAGES_PER_RUN + 1):
             key = notification_key("message", f"{run.id}:{number}")
             item = Notification(
@@ -311,7 +335,7 @@ class RunNotifier:
                 run_id=run.id,
                 workflow_id=run.workflow_id,
                 workflow_name=_clean(run.workflow_name, MAX_TITLE),
-                user_id=run.started_by or None,
+                user_id=private or run.started_by or None,
             )
             if self.inbox.add(item):
                 return item.id
@@ -349,6 +373,10 @@ def notify_user(title: str, message: str, level: Literal["info", "success", "war
             raise ToolResultError(
                 f"Error: this run has left {MAX_MESSAGES_PER_RUN} messages already (notify.limit); answer without "
                 "another one"
+            ) from None
+        if code == "notify.private":
+            raise ToolResultError(
+                "Error: this run acts for no person, so it leaves no messages (notify.private)"
             ) from None
         raise ToolResultError("Error: the message needs a title (notify.empty_title)") from None
     return f"Message {message_id} left in the inbox."

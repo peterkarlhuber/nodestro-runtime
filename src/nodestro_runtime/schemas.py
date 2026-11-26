@@ -1230,6 +1230,10 @@ class Run(_Model):
     #: have owners (a server). Only that person sees the run on any run route; ``None`` (left out): no such step, or the
     #: desktop. Set before the step starts and never cleared.
     memory_owner: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    #: RT-089d: the persistent memory spaces the run's steps (or the steps of runs below it) opened, kept on the
+    #: top-level run. Every run that executes afterwards in the same tree needs the owner's consent for these spaces
+    #: (:mod:`nodestro_runtime.memory_consents`). Left out while empty; never shortened.
+    memory_spaces: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
     #: The ``orkexa.flow`` state of the run (invocations, loop counters, stop); ``None`` for runs of earlier
     #: versions, whose state is derived from ``nodes`` (:mod:`nodestro_runtime.flow_driver`).
     flow_state: dict[str, Any] | None = None

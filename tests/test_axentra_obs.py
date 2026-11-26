@@ -675,6 +675,7 @@ def test_failed_runs_and_pending_approvals_go_to_the_inbox_once(notifying: tuple
         "duplicate": 0,
         "no_recipient": 0,
         "failed": 0,
+        "private": 0,
         "events": {"approval_pending": 1, "budget_pending": 1, "run_failed": 1},
     }
     # A retried or resumed worker sweeps the same records again: nothing new.
@@ -698,6 +699,49 @@ def test_failed_runs_and_pending_approvals_go_to_the_inbox_once(notifying: tuple
     assert notify.dispatcher().run_once(10).claimed == 0
     rows = _owner(database)._query("SELECT DISTINCT channel, status, provider FROM axentra_notify_messages")
     assert rows == [("inbox", "sent", "inbox")]
+
+
+def test_private_runs_notify_only_their_memory_owner(notifying: tuple[Any, Any, dict[str, str]]) -> None:
+    """RT-089d: a run that used a person's memory space (``memory_owner``) is theirs alone, also in the inbox. Before,
+    every member with the run permission was told its workflow's name and status, and its approvals' tools. Now only
+    the owner is told (an approval: by its run's top-level run); a run private to nobody tells nobody."""
+    from axentra.core.context import Actor, ActorKind, Principal
+
+    database, notifications, users = notifying
+    _run(database, "alpha", "run_mine", "failed", _usage(1, 0.1), memory_owner="u_operator")
+    _run(database, "alpha", "run_top", "paused", _usage(1, 0.1), memory_owner="u_operator")
+    _run(database, "alpha", "run_kid", "paused", _usage(1, 0.1), parent_run_id="run_top")
+    database.store("alpha").put_raw(
+        "tool_approvals",
+        "run_kid:tap_9",
+        {"id": "tap_9", "run_id": "run_kid", "tool": "send_mail", "status": "pending"},
+    )
+    database.store("alpha").put_raw(
+        "tool_approvals",
+        "run_gone:tap_8",
+        {"id": "tap_8", "run_id": "run_gone", "tool": "send_mail", "status": "pending"},
+    )
+    _run(
+        database,
+        "alpha",
+        "run_none",
+        "paused",
+        _usage(1, 0.1),
+        budget={"pending_request_id": "bud_9"},
+        memory_owner="<no owner>",
+    )
+    report = notifications.sweep()
+    assert (report.sent, report.private, report.failed) == (2, 2, 0), report.as_dict()
+    notify = notifications.link.services.platform.notify
+    product = notifications.link.services.product_id
+    tenant = notifications.link.tenant("alpha")
+
+    def inbox(user: str, role: str) -> list[str]:
+        who = Principal(actor=Actor(ActorKind.USER, users[user], role))
+        return sorted(item.subject or "" for item in notify.list_inbox(who, product, tenant).items)
+
+    assert inbox("u_operator", "operator") == ["A run of Check failed", "send_mail waits for your approval"]
+    assert inbox("u_owner", "owner") == []  # not the tenant's owner either
 
 
 def test_a_template_switched_to_email_stops_the_notifications(notifying: tuple[Any, Any, dict[str, str]]) -> None:

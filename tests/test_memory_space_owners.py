@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from nodestro_runtime.agent_test import AgentTestIn
+from nodestro_runtime.memory_consents import agent_digest, workflow_digest
 from nodestro_runtime.memory_spaces import NOBODY, OWNERS, MemorySpaces, SpaceOwner
 from nodestro_runtime.preview import build_preview
 from nodestro_runtime.problems import NodestroError
@@ -77,6 +78,13 @@ async def _run(workspace: Workspace, started_by: str | None, **start: Any) -> Ru
     return await workspace.wait(run.id, timeout=30)
 
 
+def allow(workspace: Workspace, owner: str = ALICE, space: str = "team", flow: Workflow | None = None) -> None:
+    """The owner's explicit consent (RT-089d) for the workflow (default :func:`_flow`) to use their space."""
+    flow = flow or _flow(_agent(space=space))
+    digest = workflow_digest(workspace.runs.pin_subworkflows(flow))
+    workspace.memory.grant(space, owner, "workflow", digest, workflow_id=flow.id)
+
+
 def _sent(workspace: Workspace) -> str:
     return str(workspace.client.messages.calls)  # type: ignore[attr-defined]
 
@@ -86,6 +94,7 @@ async def test_poc_another_member_cannot_read_a_space(make: Make) -> None:
     memory for the note. Before, Bob's agent read it (every member used every space); now his step fails before the
     agent starts, and the note never reaches his model."""
     workspace = make({"MEM": [NOTE, text("saved"), VIEW, text("read")]})
+    allow(workspace)  # RT-089d: Alice allowed this workflow (it creates her space "team")
     first = await _run(workspace, ALICE)
     assert first.status == "succeeded", first.nodes["a"].error
     assert workspace.memory.owner("team") == ALICE
@@ -127,6 +136,7 @@ def test_an_agent_test_reads_only_its_testers_space(make: Make) -> None:
     refused = test_as(BOB)
     assert (refused.status, refused.error_code) == ("failed", "memory.space_not_found")
     assert workspace.client.messages.calls == []  # type: ignore[attr-defined]
+    workspace.memory.grant("team", ALICE, "agent", agent_digest(_agent()))  # RT-089d: Alice allowed this agent
     allowed = test_as(ALICE)
     assert allowed.status == "succeeded", allowed.error
     assert SECRET in _sent(workspace)
@@ -146,6 +156,7 @@ async def test_a_space_without_an_owner_fails_closed_until_the_operator_assigns_
     assert not workspace.memory.assign("team", BOB)  # an owner is never replaced
     stored = workspace.store.get(OWNERS, "team", SpaceOwner)
     assert stored is not None and (stored.owner, stored.how) == (ALICE, "assigned")
+    allow(workspace)  # RT-089d: the new owner allows the workflow
     run = await _run(workspace, ALICE)
     assert run.status == "succeeded", run.nodes["a"].error
     assert SECRET in _sent(workspace)
@@ -198,6 +209,7 @@ async def test_a_run_with_persistent_memory_is_seen_only_by_its_owner(make: Make
     workspace = make({"MEM": [NOTE, text("saved"), VIEW, text("read")]})
     events: list[Any] = []
     workspace.runs.event_sink = events.append
+    allow(workspace)  # RT-089d
     first = await _run(workspace, ALICE)
     assert first.status == "succeeded"
     run = await _run(workspace, ALICE)

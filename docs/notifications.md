@@ -17,6 +17,10 @@ Only top-level runs notify; runs of sub-workflows, imported runs and runs of a p
 callers are outside the workspace, so they cannot fill the members' inbox). A failed run with both `run_failed`
 and `run_finished` gives one message. `quality_failed` means a step's quality check did not pass in the end.
 
+A run that used a person's private memory space (`Run.memory_owner`, a server) notifies that person only, whatever
+`recipients` says, and a run private to nobody notifies nobody (RT-089d, [memory-consents.md](memory-consents.md));
+the API also hides, in the list and the unread count, every message of a run the reader may not see.
+
 ## Inbox
 
 `notifications.LocalInbox` keeps the messages as documents of the workspace's store (collection `notifications`),

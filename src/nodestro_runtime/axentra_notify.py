@@ -14,6 +14,10 @@ the roles with the ``run`` permission) and that have an Axentra user (linked by 
 skipped and counted. The content holds ids, the workflow's name, the tool's name and a problem code: never call
 arguments, model output, error messages or secrets.
 
+**Private runs (RT-089d).** A run that used a person's persistent memory space (``memory_owner``, RT-089c; for an
+approval, the run's top-level run) is that person's alone: its messages go to that member only (when their role may
+act), never to the other members; a run marked for nobody notifies nobody.
+
 **Idempotent per event.** Each message has the key ``nodestro:notify:<event>:<record id>:<Axentra user>``. A worker
 that retries, resumes or crashes after enqueueing replays the key and Axentra returns the stored message; a replay
 with other content (a renamed workflow) is refused by Axentra and counted as ``duplicate``, never sent again. The
@@ -41,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 #: Roles told about failed runs and pending approvals: those with the ``run`` permission (nodestro_api.identity).
 NOTIFY_ROLES = ("owner", "admin", "editor", "operator")
+#: A private run's owner when it acts for no person (``memory_spaces.NOBODY``): nobody is told (RT-089d).
+PRIVATE_TO_NOBODY = "<no owner>"
 #: How far back the first sweep after a start looks.
 LOOKBACK = timedelta(hours=1)
 #: The inbox templates Nodestro creates in product ``nodestro`` (key, category, variables, subject, text).
@@ -101,6 +107,8 @@ class NotifyReport:
     duplicate: int = 0
     no_recipient: int = 0
     failed: int = 0
+    #: Events of runs private to nobody (RT-089d): nobody is told.
+    private: int = 0
     events: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -110,6 +118,7 @@ class NotifyReport:
             "duplicate": self.duplicate,
             "no_recipient": self.no_recipient,
             "failed": self.failed,
+            "private": self.private,
             "events": dict(sorted(self.events.items())),
         }
 
@@ -168,15 +177,44 @@ class AxentraNotifications:
 
     # -- recipients ----------------------------------------------------------------------------------------------
 
-    def recipients(self, tenant_id: str) -> list[str]:
-        """The Axentra users of the tenant's members that may act (:data:`NOTIFY_ROLES`), sorted."""
-        rows = self.link.database._query(
+    def recipients(self, tenant_id: str, only: str | None = None) -> list[str]:
+        """The Axentra users of the tenant's members that may act (:data:`NOTIFY_ROLES`), sorted; ``only``: of that
+        member alone (a private run's owner, RT-089d)."""
+        query = (
             "SELECT l.axentra_id FROM nodestro_memberships m JOIN nodestro_axentra_ids l"
             " ON l.kind = 'user' AND l.nodestro_id = m.user_id WHERE m.tenant_id = %s AND m.role = ANY(%s)"
-            " ORDER BY l.axentra_id",
-            (tenant_id, list(NOTIFY_ROLES)),
         )
+        params: tuple[Any, ...] = (tenant_id, list(NOTIFY_ROLES))
+        if only is not None:
+            query += " AND m.user_id = %s"
+            params += (only,)
+        rows = self.link.database._query(query + " ORDER BY l.axentra_id", params)
         return [str(row[0]) for row in rows]
+
+    def private_owner(self, tenant_id: str, run_id: str) -> str | None:
+        """The memory owner of the top-level run above ``run_id`` (RT-089d; ``None``: not private). A run whose top
+        cannot be read (missing, a loop, too deep) counts as private to nobody (fail closed); a record that names no
+        run is not private."""
+        if not run_id:
+            return None
+        seen: set[str] = set()
+        current = run_id
+        while current and current not in seen and len(seen) < 64:
+            seen.add(current)
+            rows = self.link.database._query(
+                "SELECT data ->> 'parent_run_id', data ->> 'memory_owner' FROM nodestro_documents"
+                " WHERE tenant_id = %s AND collection = 'runs' AND id = %s",
+                (tenant_id, current),
+            )
+            if not rows:
+                return PRIVATE_TO_NOBODY
+            parent, owner = rows[0]
+            if owner:
+                return str(owner)
+            if not parent:
+                return None
+            current = str(parent)
+        return PRIVATE_TO_NOBODY
 
     def _tenant(self, tenant_id: str) -> str | None:
         found = self.link.tenant(tenant_id)
@@ -192,16 +230,28 @@ class AxentraNotifications:
     # -- sending -------------------------------------------------------------------------------------------------
 
     def notify(
-        self, tenant_id: str, event: str, record_id: str, variables: dict[str, Any], report: NotifyReport
+        self,
+        tenant_id: str,
+        event: str,
+        record_id: str,
+        variables: dict[str, Any],
+        report: NotifyReport,
+        *,
+        private: str | None = None,
     ) -> None:
-        """Enqueue the inbox message of one event for every recipient (idempotent per recipient)."""
+        """Enqueue the inbox message of one event for every recipient (idempotent per recipient); ``private``: the
+        memory owner of a private run, who alone is told (:data:`PRIVATE_TO_NOBODY`: nobody, RT-089d)."""
         from axentra.core.errors import Conflict
 
+        if private == PRIVATE_TO_NOBODY:
+            report.private += 1
+            count_operation("notification", "private", kind=event)
+            return
         if not self._ready:
             self.ensure_templates()
         report.events[event] = report.events.get(event, 0) + 1
         ax_tenant = self._tenant(tenant_id)
-        users = self.recipients(tenant_id) if ax_tenant is not None else []
+        users = self.recipients(tenant_id, private) if ax_tenant is not None else []
         if not users:
             report.no_recipient += 1
             count_operation("notification", "no_recipient", kind=event)
@@ -244,15 +294,16 @@ class AxentraNotifications:
         for (tenant_id,) in database._query("SELECT id FROM nodestro_tenants ORDER BY id"):
             tenant_id = str(tenant_id)
             failed = database._query(
-                "SELECT id, coalesce(data ->> 'workflow_name', ''), coalesce(data ->> 'error_code', 'run.failed')"
+                "SELECT id, coalesce(data ->> 'workflow_name', ''), coalesce(data ->> 'error_code', 'run.failed'),"
+                " data ->> 'memory_owner'"
                 " FROM nodestro_documents WHERE tenant_id = %s AND collection = 'runs' AND data ->> 'status' = 'failed'"
                 " AND data ->> 'parent_run_id' IS NULL AND data ->> 'imported_at' IS NULL AND updated_at >= %s"
                 " ORDER BY updated_at, id",
                 (tenant_id, since),
             )
-            for run_id, workflow, code in failed:
+            for run_id, workflow, code, owner in failed:
                 variables = {"workflow": str(workflow)[:120], "run_id": str(run_id), "error_code": str(code)[:80]}
-                self.notify(tenant_id, "run_failed", str(run_id), variables, report)
+                self.notify(tenant_id, "run_failed", str(run_id), variables, report, private=_private(owner))
             pending = database._query(
                 "SELECT data ->> 'id', coalesce(data ->> 'tool', ''), coalesce(data ->> 'run_id', '')"
                 " FROM nodestro_documents WHERE tenant_id = %s AND collection = 'tool_approvals'"
@@ -261,17 +312,19 @@ class AxentraNotifications:
             )
             for request_id, tool, run_id in pending:
                 variables = {"tool": str(tool)[:120], "run_id": str(run_id)}
-                self.notify(tenant_id, "approval_pending", str(request_id), variables, report)
+                owner = self.private_owner(tenant_id, str(run_id))
+                self.notify(tenant_id, "approval_pending", str(request_id), variables, report, private=_private(owner))
             budget = database._query(
-                "SELECT data -> 'budget' ->> 'pending_request_id', id, coalesce(data ->> 'workflow_name', '')"
+                "SELECT data -> 'budget' ->> 'pending_request_id', id, coalesce(data ->> 'workflow_name', ''),"
+                " data ->> 'memory_owner'"
                 " FROM nodestro_documents WHERE tenant_id = %s AND collection = 'runs' AND data ->> 'status' = 'paused'"
                 " AND data -> 'budget' ->> 'pending_request_id' IS NOT NULL AND updated_at >= %s"
                 " ORDER BY updated_at, id",
                 (tenant_id, since),
             )
-            for request_id, run_id, workflow in budget:
+            for request_id, run_id, workflow, owner in budget:
                 variables = {"workflow": str(workflow)[:120], "run_id": str(run_id)}
-                self.notify(tenant_id, "budget_pending", str(request_id), variables, report)
+                self.notify(tenant_id, "budget_pending", str(request_id), variables, report, private=_private(owner))
         if report.failed == 0:
             # The next pass starts a little before this one did: a record committed while this pass read is not
             # missed (the overlap is replayed, not sent again).
@@ -282,6 +335,14 @@ class AxentraNotifications:
         """Axentra's notification retention (content after ``notify.content_retention_days``); the worker's cleanup."""
         result: dict[str, int] = self._notify.purge_retention()
         return result
+
+
+def _private(owner: Any) -> str | None:
+    """A run's ``memory_owner`` as :meth:`AxentraNotifications.notify` takes it: a person, nobody, or not private."""
+    if not owner:
+        return None
+    owner = str(owner)
+    return PRIVATE_TO_NOBODY if owner == PRIVATE_TO_NOBODY or any(char in owner for char in " <>") else owner
 
 
 __all__ = [

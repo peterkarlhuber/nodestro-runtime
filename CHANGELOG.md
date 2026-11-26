@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Security (RT-089d): a workflow uses a person's private memory space only after that person's explicit consent.
+  Before, an editor could build a shared workflow that names Alice's space, and Alice's run of it read her memory
+  into that workflow and its tools ([docs/memory-consents.md](docs/memory-consents.md)).
+  - New: `memory_consents` (`workflow_digest`, `agent_digest`, `consent_targets`, `MAX_TARGETS`), `MemoryConsent`,
+    `MemorySpaces.needs_consent`, `consented`, `grant`, `consents`, `revoke`, `consent_required` and the codes
+    `memory.consent_required` and `memory.consent_too_large`; `Run.memory_spaces` (left out while empty).
+  - A step that opens the owner's space needs a consent for its run's workflow and every run above it; a run that
+    executes later in a tree that used a space (sub-workflow, team, continued paused or failed run) needs one for
+    its workflow; an agent test for its configuration. Otherwise `memory.consent_required` before anything is read.
+    Nothing grants a consent by itself; a changed workflow has another digest. The desktop needs none.
+  - A continued run takes over `memory_owner` and `memory_spaces` of the run it continues (before, it was visible to
+    every member although it held the private run's results).
+  - Private runs in every channel: the local inbox writes a private run's messages for its owner only (a run private
+    to nobody notifies nobody, `notify.private`); the Axentra inbox sweep tells only the owner (approvals by their
+    top-level run; `NotifyReport.private`); `memory_private` is sent to every run above the step, so a parent's open
+    stream ends for another reader too.
 - Security (RT-089c): memory spaces have an owner on a server. Before, every member listed, read and changed every
   space, and every member's run of a workflow read what another member's run had written there.
   - `MemorySpaces(..., owners=store)` (a server tenant's workspace passes its store): the owner of each space is
