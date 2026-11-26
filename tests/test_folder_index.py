@@ -448,3 +448,59 @@ def _wait(condition: Callable[[], bool], timeout: float = 20.0) -> None:
             return
         time.sleep(0.05)
     assert condition()
+
+
+def test_the_copy_before_a_migration_holds_no_folder_index(workspace: Workspace, docs: Path, tmp_path: Path) -> None:
+    """N-12 review L-b: the copy made before a schema migration outlives a revocation, so it holds nothing of a
+    folder's index; knowledge stays in it."""
+    import sqlite3
+
+    from nodestro_runtime.workspace import backup_migrated_database
+
+    workspace.knowledge.add(b"Customers get a refund within thirty days.", name="returns.md")
+    folder = _grant(workspace, docs)
+    _index(workspace).sync(folder.id)
+    assert _folder_chunks(workspace)
+    copy = backup_migrated_database(workspace.sqlite_store, tmp_path / "backups", 1, 2)
+    assert b"harbour project" not in copy.read_bytes()
+    with sqlite3.connect(copy) as connection:
+        sources = [row[0] for row in connection.execute("SELECT source FROM index_chunks")]
+        assert sources and not any(source.startswith(FOLDER_SOURCE) for source in sources)
+        collections = {row[0] for row in connection.execute("SELECT DISTINCT collection FROM nodestro_documents")}
+        assert not collections & {FILES, STATES}
+        assert connection.execute("SELECT count(*) FROM index_fts WHERE index_fts MATCH 'harbour'").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM index_fts WHERE index_fts MATCH 'refund'").fetchone()[0] == 1
+    assert _folder_chunks(workspace)  # the live index is untouched
+
+
+def test_a_legacy_vector_table_that_cannot_be_cleaned_loses_its_storage(tmp_path: Path) -> None:
+    """N-12 review L-a: fail closed. When the legacy ``vec0`` table cannot be cleaned (its module is not loaded), its
+    storage tables are dropped instead of keeping vectors of a folder's text."""
+    import sqlite3
+
+    from nodestro_runtime.storage import strip_index_sources
+
+    database = sqlite3.connect(tmp_path / "copy.db")
+    database.executescript(
+        "CREATE TABLE index_chunks (id INTEGER PRIMARY KEY, namespace TEXT, source TEXT, title TEXT, file_id TEXT,"
+        " metadata TEXT, text TEXT);"
+        "INSERT INTO index_chunks VALUES (1, 'nodestro', 'folder:fg_1/plan.txt', 'plan', NULL, '{}', 'secret');"
+        "INSERT INTO index_chunks VALUES (2, 'nodestro', 'file_1', 'returns', 'file_1', '{}', 'refund');"
+        "CREATE TABLE index_vec (rowid INTEGER);"  # stands for the virtual table
+        "CREATE TABLE index_vec_chunks (rowid INTEGER, vectors BLOB);"
+        "CREATE TABLE index_vec_vector_chunks00 (rowid INTEGER, vectors BLOB);"
+    )
+
+    class Unloaded:
+        """The connection as it is without sqlite-vec: the virtual table cannot be written."""
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            if sql.startswith("DELETE FROM index_vec "):
+                raise sqlite3.OperationalError("no such module: vec0")
+            return database.execute(sql, *args)
+
+    assert strip_index_sources(Unloaded(), FOLDER_SOURCE, (FILES, STATES))  # type: ignore[arg-type]
+    tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert not {"index_vec_chunks", "index_vec_vector_chunks00"} & tables
+    assert [row[0] for row in database.execute("SELECT source FROM index_chunks")] == ["file_1"]
+    database.close()

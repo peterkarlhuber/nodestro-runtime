@@ -46,7 +46,7 @@ from datetime import UTC, datetime
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from orkexa import Chunk, FileStore, Hit, Index, SQLiteFileStore, SQLiteIndex, StoredFile
 from orkexa.embeddings import EmbeddingIdentity, EmbeddingModel
@@ -209,6 +209,26 @@ class ScopedFileStore(FileStore):
         raise PermissionError("This view is read-only")
 
 
+class _WithoutFolderText:
+    """The embedding model of a reindex that may not embed granted folder text (N-12 review H-1b): it refuses a batch
+    while the index holds any folder chunk, so no route that adds one during the reindex can send it to the model.
+    Everything else is the model's own."""
+
+    def __init__(self, model: EmbeddingModel, has_folder_chunks: Callable[[], bool]) -> None:
+        self.model = model
+        self._has_folder_chunks = has_folder_chunks
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self._has_folder_chunks():
+            raise RetrievalError(
+                "vector_unavailable", "Granted folder text may not go to this embedding model; build the index again"
+            )
+        return list(self.model.embed_documents(texts))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.model, name)
+
+
 class FolderIndexBusy(Exception):
     """A granted folder's chunks cannot be stored now (a reindex runs that may not embed them): try again later."""
 
@@ -351,7 +371,7 @@ class KnowledgeBase:
         #: Removes every folder chunk (the folder index rebuilds them later): called when a reindex starts for a model
         #: that may not embed folder text, since a reindex embeds every chunk of the index.
         self.folder_reset: Callable[[], object] = self._remove_folder_chunks
-        #: Whether the running reindex's model may embed folder text (while it runs, no folder chunk is stored else).
+        #: Whether the running reindex's model may embed folder text: while it is False, no folder chunk is stored.
         self._reindex_folders = True
 
     def ocr_available(self) -> bool:
@@ -643,11 +663,13 @@ class KnowledgeBase:
         return name, model
 
     def _folders_embeddable(self, model: EmbeddingModel) -> bool:
-        """Whether a reindex with ``model`` may embed granted folder text (N-12 review H-1); without folder chunks it
-        does not matter."""
-        if not any(source.startswith(FOLDER_SOURCE) for source in self._chunk_counts()):
-            return True
+        """Whether a reindex with ``model`` may embed granted folder text (N-12 review H-1), judged by the address the
+        model sends to alone: also when the index holds no folder chunk yet, since a folder may be indexed while the
+        reindex runs (review H-1b)."""
         return self.folder_embedding_allowed(_model_address(model, _address(self.embedding_address())))
+
+    def _has_folder_chunks(self) -> bool:
+        return any(source.startswith(FOLDER_SOURCE) for source in self._chunk_counts())
 
     def _remove_folder_chunks(self) -> None:
         with self._lock:
@@ -697,8 +719,10 @@ class KnowledgeBase:
             job.state, job.error_code, job.error = "failed", exc.code, str(exc)
             job.finished_at = datetime.now(UTC)
             return job
-        if not self._folders_embeddable(model):
-            with self._lock:
+        folders = self._folders_embeddable(model)
+        with self._lock:
+            self._reindex_folders = folders
+            if not folders:
                 self.folder_reset()
         self._build(job, model, cancel, progress)
         return job
@@ -710,8 +734,12 @@ class KnowledgeBase:
         cancel: threading.Event,
         progress: Callable[[int, int], None] | None,
     ) -> None:
-        """The reindex itself; its outcome is written to ``job``."""
+        """The reindex itself; its outcome is written to ``job``. While its model may not embed folder text, no
+        folder chunk is stored (:meth:`replace_chunks`), and the model refuses any batch while a folder chunk exists
+        (a last guard, :class:`_WithoutFolderText`)."""
         reindex = self.index.reindex  # type: ignore[attr-defined]
+        if not self._reindex_folders:
+            model = cast(EmbeddingModel, _WithoutFolderText(model, self._has_folder_chunks))
 
         def report(done: int, total: int) -> None:
             job.completed, job.total = done, total
@@ -739,6 +767,10 @@ class KnowledgeBase:
             job.state = "failed"
             job.error_code, job.error = "knowledge.reindex_failed", str(exc)
         finally:
+            with self._lock:
+                self._reindex_folders = True
+                if isinstance(getattr(self.index, "embeddings", None), _WithoutFolderText):
+                    self.index.embeddings = self.index.embeddings.model  # type: ignore[attr-defined]
             job.finished_at = datetime.now(UTC)
 
     def _current_job(self) -> ReindexJob | None:
@@ -940,7 +972,7 @@ class KnowledgeBase:
                 self.index.add_chunks(chunks)
 
         with self._lock:
-            if not self._reindex_folders and self.reindexing():
+            if not self._reindex_folders:
                 raise FolderIndexBusy("A reindex runs whose embedding model may not embed folder text")
             self._index_with_fallback(work, self.folder_embedding_allowed)
         return len(chunks)

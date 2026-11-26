@@ -62,11 +62,13 @@ from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import EMBEDDING_PROVIDER, RunManager
 from .extensions import Extensions, Integration, discover
+from .folder_index import FILES as FOLDER_INDEX_FILES
+from .folder_index import STATES as FOLDER_INDEX_STATES
 from .folder_index import FolderIndex, FolderIndexer
 from .folder_tools import FOLDER_TOOLS
 from .folders import folders_enabled
 from .input_files import FileCatalog, InputFiles
-from .knowledge import KnowledgeBase, KnowledgeTables
+from .knowledge import FOLDER_SOURCE, KnowledgeBase, KnowledgeTables
 from .launcher import launch
 from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL, SelectionPreferences
 from .local_service import LocalModelService
@@ -127,7 +129,7 @@ from .schemas import (
 )
 from .server_settings import TenantSecrets, is_encrypted
 from .skills import Skills
-from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
+from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store, strip_copy
 from .tool_adoption import audit_revocation
 from .tool_approvals import (
     AccessRules,
@@ -233,13 +235,16 @@ def _lock(descriptor: int) -> None:
 def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, target: int) -> Path:
     """Copy the whole database to ``directory`` before migrating it from ``current`` to ``target``; the copy's path.
 
-    The copy is written under a temporary name and renamed when complete, so a backup that exists is whole."""
+    The copy is written under a temporary name and renamed when complete, so a backup that exists is whole. It holds no
+    granted folder's index (N-12 review L-b): the copy outlives a revocation, and the index is built again from the
+    folder while its grant holds (:func:`~nodestro_runtime.storage.strip_copy`)."""
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     target_path = directory / f"pre-migration-{current}-to-{target}-{stamp}.db"
     partial = target_path.with_suffix(".db.partial")
     try:
         store.snapshot(partial)
+        strip_copy(partial, FOLDER_SOURCE, (FOLDER_INDEX_FILES, FOLDER_INDEX_STATES))
         partial.replace(target_path)
     except BaseException:
         partial.unlink(missing_ok=True)

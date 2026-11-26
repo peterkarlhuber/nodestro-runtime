@@ -614,6 +614,56 @@ def restore_desktop_database_modes(results: Iterable[ModeRepair]) -> list[ModeRe
     return restored
 
 
+def strip_index_sources(connection: sqlite3.Connection, prefix: str, collections: tuple[str, ...]) -> bool:
+    """Remove from a copy of a SQLite database every search index chunk whose source starts with ``prefix``, with its
+    vectors and full-text entries, and every document of ``collections``. For a granted folder's index (N-12 review
+    M-1, L-a, L-b): copies that outlive the folder's grant (a backup, the data export, the copy before a migration)
+    hold none of it; the index is built again from the folder while the grant holds. Returns whether anything was
+    removed (the caller then commits and runs ``VACUUM`` with ``secure_delete`` on, so nothing stays in a free page).
+
+    The legacy vector table (``index_vec``, ``vec0``: ``embedder=`` callables, which Nodestro never uses) is cleaned
+    when its module is loaded; else its storage tables are dropped (fail closed: its vectors are derived data)."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    removed = False
+    if "nodestro_documents" in tables and collections:
+        marks = ", ".join("?" for _ in collections)
+        found = connection.execute(f"DELETE FROM nodestro_documents WHERE collection IN ({marks})", collections)
+        removed = found.rowcount > 0
+    if "index_chunks" not in tables:
+        return removed
+    # substr, not LIKE: a source is data, and LIKE would treat ``_`` and ``%`` in it as patterns.
+    matching = "substr(source, 1, ?) = ?"
+    values = (len(prefix), prefix)
+    if connection.execute(f"SELECT count(*) FROM index_chunks WHERE {matching}", values).fetchone()[0] == 0:
+        return removed
+    chunk_ids = f"SELECT id FROM index_chunks WHERE {matching}"
+    if "index_vectors" in tables:
+        connection.execute(f"DELETE FROM index_vectors WHERE chunk_id IN ({chunk_ids})", values)
+    if "index_vec" in tables:
+        try:
+            connection.execute(f"DELETE FROM index_vec WHERE rowid IN ({chunk_ids})", values)
+        except sqlite3.OperationalError:
+            for name in sorted(table for table in tables if table.startswith("index_vec_")):
+                connection.execute(f'DROP TABLE "{name}"')
+    connection.execute(f"DELETE FROM index_chunks WHERE {matching}", values)
+    if "index_fts" in tables:
+        # The full-text index reads its text from index_chunks: rebuilt, it holds no term of the removed text.
+        connection.execute("INSERT INTO index_fts (index_fts) VALUES ('rebuild')")
+    return True
+
+
+def strip_copy(database: Path, prefix: str, collections: tuple[str, ...]) -> None:
+    """:func:`strip_index_sources` on the SQLite database file ``database`` (a copy nothing else has open)."""
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA secure_delete = ON")
+        if strip_index_sources(connection, prefix, collections):
+            connection.commit()
+            connection.execute("VACUUM")
+    finally:
+        connection.close()
+
+
 def _like(prefix: str) -> str:
     """A LIKE pattern (escape character ``\\``) for ids starting with ``prefix``."""
     return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -1109,4 +1159,6 @@ __all__ = [
     "SQLiteStore",
     "Store",
     "stopped_documents",
+    "strip_copy",
+    "strip_index_sources",
 ]

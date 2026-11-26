@@ -1558,7 +1558,90 @@ def test_a_reindex_for_a_server_elsewhere_drops_the_folder_index_and_stores_none
     assert waiting is not None and waiting.state == "indexing"
     assert not any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
     del knowledge.reindexing
+    knowledge._reindex_folders = True  # as at the end of a reindex
     state = index.sync(folder_id)
     assert state is not None and state.state == "ready" and state.chunks
     assert any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    assert not any(SECRET in item for item in model.documents)
+
+
+class _ReindexHook(CountedEmbeddings):
+    """A model of another build (a reindex switches to it) that runs ``hook`` before its first batch."""
+
+    def __init__(self, hook: Callable[[], object]) -> None:
+        super().__init__()
+        self.hook = hook
+        self.fired = False
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not self.fired:
+            self.fired = True
+            self.hook()
+        return super().embed_documents(texts)
+
+    def identity(self) -> Any:
+        from orkexa.embeddings import EmbeddingIdentity
+
+        return EmbeddingIdentity(provider="test", model="counted:1", dimensions=3, digest="second-build")
+
+
+@pytest.mark.parametrize("on", _SWITCH_COMBINATIONS, ids=lambda on: "+".join(on) or "folders-only")
+def test_a_folder_indexed_first_while_a_reindex_runs_reaches_no_embedding_server_elsewhere(
+    base: Path, docs: Path, network: Network, monkeypatch: pytest.MonkeyPatch, on: tuple[str, ...]
+) -> None:
+    """N-12 review H-1b (regression): a reindex started before a folder had any chunk did not hold the folder index
+    back, so a first sync while it ran stored chunks without vectors and the reindex embedded them at a server
+    elsewhere. The reindex model's address alone decides: the sync waits, and runs after the reindex."""
+    workspace = _switched_workspace(base, monkeypatch, on)
+    try:
+        _semantic(workspace, "hybrid")
+        _model_server(workspace, "https://gpu.example.com/v1")
+        view = FolderGrants(workspace.store, str(workspace.data_dir.resolve())).grant(
+            name="Docs", path=str(docs), by=PERSON, mode="unattended", index=True
+        )
+        index = workspace.folder_index
+        assert index is not None
+        during: list[Any] = []
+        model = _ReindexHook(lambda: during.append(index.sync(view.folder.id)))
+        workspace.knowledge.embedding_model = lambda _name: model  # type: ignore[assignment,return-value]
+        try:
+            workspace.knowledge.start_reindex()
+        except NodestroError as exc:
+            assert exc.code.startswith("access.")  # refused for the knowledge as well (provenance on)
+            return
+        _wait_for_reindex(workspace)
+        assert model.fired and not any(SECRET in item for item in model.documents)
+        assert during and (during[0] is None or during[0].state == "indexing")  # it waited
+        state = index.sync(view.folder.id)
+        assert state is not None and state.state == "ready" and state.chunks
+        assert not any(SECRET in item for item in model.documents)
+    finally:
+        workspace.close()
+
+
+def test_a_reindex_that_may_not_embed_folder_text_stops_at_a_folder_chunk_from_any_route(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 review H-1b: the last guard. A folder chunk that reaches the index during such a reindex by any route
+    (here written to the index directly) ends the reindex before the batch is embedded."""
+    from orkexa import Chunk
+
+    workspace = make()
+    _semantic(workspace, "hybrid")
+    _model_server(workspace, "https://gpu.example.com/v1")
+    AccessRules(workspace.store).grant(  # the knowledge files may go there
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    knowledge = workspace.knowledge
+    knowledge.folder_embedding_allowed = lambda address: False  # the folder's text may not
+    written = Chunk(text=DOCUMENT, source="folder:fg_direct/plan.txt", title="plan.txt", metadata={})
+    model = _ReindexHook(lambda: knowledge.index.add_chunks([written]))
+    knowledge.embedding_model = lambda _name: model  # type: ignore[assignment,return-value]
+    knowledge.start_reindex()
+    _wait_for_reindex(workspace)
+    job = knowledge._current_job()
+    assert job is not None and job.state == "failed" and job.error_code == "knowledge.vector_unavailable"
     assert not any(SECRET in item for item in model.documents)

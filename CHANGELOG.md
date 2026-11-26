@@ -11,7 +11,13 @@
   folder index first (`KnowledgeBase.folder_reset`) and stores no folder chunk while it runs
   (`knowledge.FolderIndexBusy`). Budgets: at most 400 chunks per file (`folder_index.MAX_FILE_CHUNKS`), 50,000
   chunks and 512 MiB per folder (`MAX_FOLDER_CHUNKS`, `MAX_FOLDER_BYTES`; `truncated` in the state,
-  `FolderIndexFile.truncated`), and a long sync sweeps for ended grants between files. Regression tests across every switch combination.
+  `FolderIndexFile.truncated`), and a long sync sweeps for ended grants between files. Regression tests across
+  every switch combination.
+- Security (N-12 review round 2, H-1b, L-b): a rebuild of the semantic index started while no folder was indexed yet
+  did not hold the folder index back, and a first index during it was embedded at a server elsewhere. The rebuild is
+  now judged by its model's address alone, in the thread and in a server worker (`execute_reindex`), and its model
+  refuses every batch while the index holds a folder chunk. The copy before a schema migration holds no folder index
+  (new `storage.strip_index_sources`, `storage.strip_copy`, also used by the API's backups).
 - Granted folders as a knowledge source (N-12; behind `NODESTRO_FOLDER_GRANTS`, off; never in the server profile): a
   folder grant with `index` keeps a search index of the folder (new module `folder_index`: `FolderIndex`,
   `FolderIndexer`, `FolderIndexFile`, `FolderIndexState`, `source_of`; collections `folder_index_files` and

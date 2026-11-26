@@ -216,9 +216,15 @@ access log names the grant, and the run is marked as holding granted content (N-
   approvals, the access model or provenance off, the text is indexed without vectors (full text finds it), an index
   search does not embed its query (it runs in full text), and a rebuild of the semantic index for such a model removes
   every folder index before it starts and stores no folder chunk while it runs (the indexer rebuilds them without
-  vectors at its next run). When the query may be embedded, an index search in vector or hybrid mode also asks the
-  run's check first (`RunServices.embedding_check`), like a knowledge search; without a semantic index it searches in
-  full text.
+  vectors at its next run). The rebuild is judged by its model's address alone, also when no folder is indexed yet
+  (review H-1b: a first index during the rebuild was embedded), and as a last guard its model refuses every batch
+  while the index holds a folder chunk (the rebuild then fails, nothing is sent). When the query may be embedded, an
+  index search in vector or hybrid mode also asks the run's check first (`RunServices.embedding_check`), like a
+  knowledge search; without a semantic index it searches in full text.
+- **Copies.** The copy of the database made before a schema migration (`<data dir>/backups/pre-migration-*.db`)
+  holds no folder index (`storage.strip_copy`, review L-b); backups, the safety backup before a restore and the data
+  export leave it out in the API (its `docs/backup.md`). The index is built again from the folder while the grant
+  holds.
 - **Switch.** The index exists only while `NODESTRO_FOLDER_GRANTS=1` and never in the server profile. With the switch
   off, the workspace removes every folder index at its start.
 
@@ -239,7 +245,9 @@ access log names the grant, and the run is marked as holding granted content (N-
   during a long sync. `tests/test_content_provenance.py`: an index search marks the run; folder text and a marked
   run's query reach an embedding server elsewhere only with a grant, in every combination of the approvals, access
   and provenance switches (review H-1), a server on this computer embeds it in every combination, and a rebuild for a
-  server elsewhere drops the folder indexes first.
+  server elsewhere drops the folder indexes first, a folder indexed for the first time while such a rebuild runs is
+  not embedded in any combination (review H-1b), and the rebuild's model stops at a folder chunk from any route.
+  `tests/test_folder_index.py` also covers the copy before a migration and the legacy vector table.
 
 ## Not in this step
 
