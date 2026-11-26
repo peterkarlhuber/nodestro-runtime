@@ -91,8 +91,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10 # CI-FAST AP1: no run data yet (nightly-only); a short job
     permissions:
+      contents: read # the lock-lag step reads the component repositories (compare API)
       issues: write
     steps:
+      # Lock lag (criteria.md K4): the nightly installs the studio master's lock, so while a paired studio bump is not
+      # merged it tests this master against older components. This step only labels the night: it lists each of
+      # LOCK_COMPONENTS (this package and the internal ones it needs) whose locked commit is behind that component's
+      # master, in the job summary and in the issue comment. A red night stays red.
+      - name: Lock lag (the studio lock against the component masters)
+        continue-on-error: true # a broken label must not keep the issue step from running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCK_COMPONENTS: nodestro-runtime orkexa
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, urllib.request
+
+          def get(url, api=True):
+              headers = {"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json"}
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers if api else {}), timeout=20) as r:
+                  return json.load(r) if api else r.read().decode()
+
+          pin = re.compile(r"^(\S+) @ git\+https://github\.com/peterkarlhuber/([A-Za-z0-9_.-]+?)(?:\.git)?@([0-9a-f]{40})$")
+          try:
+              lock = get("https://raw.githubusercontent.com/peterkarlhuber/nodestro-studio/master/platform/internal-server.txt", api=False)
+              behind = []
+              for line in lock.splitlines():
+                  m = pin.match(line.strip())
+                  if not m or m[1] not in os.environ["LOCK_COMPONENTS"].split():
+                      continue
+                  compare = get(f"https://api.github.com/repos/peterkarlhuber/{m[2]}/compare/{m[3]}...master")
+                  if int(compare.get("ahead_by", 0)) > 0:
+                      behind.append(f"- `{m[1]}`: the lock pins `{m[3][:8]}`, master is {compare['ahead_by']} commit(s) ahead")
+              if behind:
+                  note = ["**Lock lag:** the studio master's lock pins components behind their master, so a red job that"
+                          " installs the lock may be lock lag, not a regression (criteria.md K4; the night still counts red):", ""]
+                  note += behind
+              else:
+                  note = [f"**Lock lag:** none; the studio master's lock pins the master of {os.environ['LOCK_COMPONENTS']}."]
+          except Exception as exc:  # an API error must not hide the nightly result
+              note = [f"**Lock lag unknown:** {type(exc).__name__}: {str(exc)[:200]}"]
+          text = "\n".join(note) + "\n"
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "lock-lag.md"), "w", encoding="utf-8") as f:
+              f.write(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("### Lock lag\n\n" + text)
+          print(text)
+          PY
       - name: Open, update or close the nightly issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -105,7 +150,9 @@ jobs:
           failed=$(python3 -c 'import json,os; n=json.loads(os.environ["NEEDS"]); print(" ".join(k for k,v in n.items() if v["result"] not in ("success","skipped")))')
           number=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq "map(select(.title==\"$title\"))[0].number // empty")
           if [ -n "$failed" ]; then
-            body="Nightly run $RUN_URL failed: $failed (commit $GITHUB_SHA)."
+            body="Nightly run $RUN_URL failed: $failed (commit $GITHUB_SHA).
+
+          $(cat "$RUNNER_TEMP/lock-lag.md" 2>/dev/null || echo "Lock lag unknown: the lock-lag step wrote nothing.")"
             if [ -n "$number" ]; then gh issue comment "$number" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
             exit 1
           elif [ -n "$number" ]; then
