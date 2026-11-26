@@ -22,6 +22,11 @@ Vectors exist only after a person built the semantic index (:meth:`KnowledgeBase
 embedding model, and another model needs a reindex. An agent view (:class:`ScopedIndex`) limits a search to the
 agent's files *before* ranking, in every mode.
 
+Granted folders (N-12, :mod:`nodestro_runtime.folder_index`): the index may also hold the chunks of files of a granted
+folder (source ``folder:<folder grant id>/<path>``, :data:`FOLDER_SOURCE`). They are no knowledge files: the file store
+never holds them, and every knowledge search (an agent's view, :meth:`KnowledgeBase.search`) is limited to the
+knowledge files, so folder text is found only through the folder tools, which check the folder grant at every call.
+
 Egress protection (N-08, only while its switch is on): every embedding of granted content asks a check first
 (:attr:`KnowledgeBase.embedding_check`, :attr:`ScopedIndex.before_embed`), so knowledge text and a marked run's search
 query reach an embedding model outside this computer only with a grant (``docs/content-provenance.md``).
@@ -30,7 +35,7 @@ query reach an embedding model outside this computer only with a grant (``docs/c
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
@@ -53,6 +58,8 @@ from .storage import DocumentStore
 
 logger = logging.getLogger(__name__)
 _INDEXED_SUFFIXES = (".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".html", ".xml")
+#: The start of the index source of a granted folder's file (N-12): never a knowledge file's id.
+FOLDER_SOURCE = "folder:"
 
 
 @dataclass(frozen=True)
@@ -325,6 +332,9 @@ class KnowledgeBase:
         #: The workspace's store, where uploads and deletions are logged (:mod:`nodestro_runtime.activity`);
         #: ``None``: not logged (a knowledge base outside a workspace).
         self.activity: DocumentStore | None = None
+        #: Whether the index may hold chunks of granted folders (N-12: the desktop and Nodestro Local Docker, never a
+        #: server): a search without files is then limited to the knowledge files.
+        self.folder_sources = False
 
     def ocr_available(self) -> bool:
         return self.runner() is not None
@@ -840,12 +850,79 @@ class KnowledgeBase:
         self._prepare_search(chosen)
         if granted and chosen != "fts":
             self._check_embedding(self._embeddings_address)
+        # Only knowledge files: the chunks of a granted folder are found through the folder tools alone (N-12).
+        if file_ids is not None:
+            sources: list[str] | None = [item for item in file_ids if not item.startswith(FOLDER_SOURCE)]
+        else:
+            sources = [entry.id for entry in self.store.list()] if self.folder_sources else None
         try:
-            return self.index.retrieve(query, k, mode=chosen, sources=None if file_ids is None else list(file_ids))
+            return self.index.retrieve(query, k, mode=chosen, sources=sources)
         except RetrievalError as exc:
             if exc.code != "reindex_required":
                 raise
             # The vectors belong to another model or build (e.g. a new digest after a pull): a reindex is needed.
+            raise NodestroError("knowledge.reindex_required", str(exc)) from None
+
+    # ---- granted folders (N-12, nodestro_runtime.folder_index) --------------------------------------------------
+
+    def writing(self) -> AbstractContextManager[Any]:
+        """The write lock of the index: a folder index checks its grant and stores a file's chunks under it, so a
+        revocation that drops the folder's chunks under the same lock leaves nothing behind."""
+        return self._lock
+
+    def chunk_sources(self) -> list[str]:
+        """Every source the index holds chunks of."""
+        return list(self._chunk_counts())
+
+    def remove_sources(self, sources: Iterable[str]) -> int:
+        """Remove every chunk (and its vectors) of ``sources``; returns how many were removed."""
+        with self._lock:
+            return sum(self.index.delete(source) for source in sources)
+
+    def replace_chunks(self, source: str, chunks: list[Chunk]) -> int:
+        """Replace the chunks of one granted folder's file with ``chunks`` (embedded when the semantic index is on
+        and the embedding check allows it, else without vectors, as new knowledge is); returns how many are stored.
+        Refuses the id of a knowledge file."""
+        if not source.startswith(FOLDER_SOURCE):
+            raise ValueError("Only a granted folder's source can be replaced here")
+
+        def work() -> None:
+            self.index.delete(source)
+            if chunks:
+                self.index.add_chunks(chunks)
+
+        with self._lock:
+            self._index_with_fallback(work)
+        return len(chunks)
+
+    def search_sources(
+        self,
+        query: str,
+        sources: list[str],
+        k: int,
+        *,
+        before_embed: Callable[[str | None], None] | None = None,
+    ) -> list[Hit]:
+        """Search the chunks of a granted folder's ``sources`` in the workspace's retrieval mode, in full text while
+        the semantic index cannot serve it. ``before_embed`` is the run's check before the query is embedded (N-08):
+        it raises to refuse."""
+        if not sources:
+            return []
+        chosen = self.retrieval()[0]
+        if chosen != "fts":
+            try:
+                self.check_mode(chosen)
+            except NodestroError:
+                chosen = "fts"
+        if chosen != "fts":
+            self._sync_embeddings()
+            if before_embed is not None:
+                before_embed(self._embeddings_address)
+        try:
+            return self.index.retrieve(query, k, mode=chosen, sources=sources)
+        except RetrievalError as exc:
+            if exc.code != "reindex_required":
+                raise
             raise NodestroError("knowledge.reindex_required", str(exc)) from None
 
     # ---- per-agent views -----------------------------------------------------------

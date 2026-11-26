@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Granted folders as a knowledge source (N-12; behind `NODESTRO_FOLDER_GRANTS`, off; never in the server profile): a
+  folder grant with `index` keeps a search index of the folder (new module `folder_index`: `FolderIndex`,
+  `FolderIndexer`, `FolderIndexFile`, `FolderIndexState`, `source_of`; collections `folder_index_files` and
+  `folder_index_state`). The knowledge base's index holds one source per file (`folder:<grant id>/<path>`,
+  `knowledge.FOLDER_SOURCE`), never its file store. First index, change by size, times and SHA-256, deletion and
+  denies through `orkexa.fs.SafeRoot` with the grant's patterns, limits and PDF budgets; text and PDF files only.
+  Rights stay on the grant: a revocation drops the folder's chunks and vectors at once
+  (`Workspace.folder_access_changed`, called by the API), a sync checks the grant inside the index's write lock
+  before every file, an expiry is dropped at the indexer's sweep, and every index hit is checked again for the caller
+  after the search. The workspace reconciles the indexes at its start and every 5 minutes, and removes them all while
+  the switch is off. `search_files` searches a folder's ready index (ranked passages, PDF text, `index: true`,
+  `page`); the run is marked (N-08) as before, and a vector or hybrid index search asks the run's embedding check
+  first (RT-094). `KnowledgeBase.search` without files and with files now covers only knowledge files
+  (`KnowledgeBase.folder_sources`); new `KnowledgeBase.writing`, `chunk_sources`, `remove_sources`,
+  `replace_chunks`, `search_sources`; `folders.safe_root`; `FolderReader(index=, embedding_check=)`;
+  `RunManager.folder_index`. Tests: `tests/test_folder_index.py`, `tests/test_content_provenance.py`; see
+  `docs/folders.md`, "The search index".
+
 - Security (RT-089c): memory spaces have an owner on a server. Before, every member listed, read and changed every
   space, and every member's run of a workflow read what another member's run had written there.
   - `MemorySpaces(..., owners=store)` (a server tenant's workspace passes its store): the owner of each space is

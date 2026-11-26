@@ -673,7 +673,14 @@ Items that need an independent or external review (an internal audit does not re
     granted although `orkexa.fs` allows them (fails closed; decide whether `/private/var/folders` should be
     grantable);
   - files with several hard links are always refused; there is no opt-in;
-  - `FolderGrant.index` is stored only; indexing a granted folder is a later step;
+  - N-12 (in review): a grant with `index` keeps a search index of the folder in the knowledge base's index
+    (`folder_index.py`, `docs/folders.md` "The search index"); `search_files` searches it. Open: DOCX and XLSX files
+    are not indexed (the knowledge upload converts them); the index state (`folder_index_state`) is not shown on the
+    folders page or in the API yet; an expiry is dropped at the indexer's sweep (30 s), a revocation at once; the
+    index is part of the knowledge database, so a backup taken while a folder was indexed holds its chunks (they are
+    dropped at the next start when the grant ended, or when the switch is off); change detection uses size,
+    modification and change time (a file rewritten within one timestamp tick with the same size is found at the
+    next change);
   - the run event `folder_file_read` names a run's sources live; a stored list of sources per answer is not built
     yet (the tool results name them);
   - an own or integration tool already named `list_folder`, `read_file` or `search_files` is shadowed by the built-in

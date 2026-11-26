@@ -12,7 +12,7 @@ the computer without a person's permission. The granted sources are:
 
 | Source | When it enters the context | Recorded as |
 |---|---|---|
-| A granted folder (N-10) | a call of `list_folder`, `read_file` or `search_files` | `folder` |
+| A granted folder (N-10) | a call of `list_folder`, `read_file` or `search_files` (also a search of the folder's index, N-12) | `folder` |
 | Knowledge | knowledge given in full (mode `context`) at the start of a step, or a call of the knowledge store's tool (`files`) or search tool (`search`) | `knowledge` |
 | Persistent memory | a call of the memory tool of an agent with a memory space | `memory` |
 | An attached file | files of the run delivered into the step's context at its start (also the overview of a conversation's earlier files), or a call of the input files tool | `attachment` |
@@ -58,7 +58,10 @@ Once such content is there, the run is **marked** (`Run.granted_content`), and s
     OCR, an adoption from a run, a project import) is indexed **without vectors** instead, explicitly: the refusal is
     audited, full-text search finds the file, and the index status says `incomplete` until a rebuild with a grant;
   - the similarity hint of an adoption (taking content over into knowledge) searches with the item's own words: it
-    is treated as granted content, and when its embedding is refused it uses full-text search (it is only a hint).
+    is treated as granted content, and when its embedding is refused it uses full-text search (it is only a hint);
+  - a granted folder's search index (N-12, `docs/folders.md`) follows the knowledge rules: its text is indexed
+    without vectors when the embedding check refuses, and a `search_files` call on an indexed folder asks the run's
+    check before it embeds its query (the same fixed text when refused).
   A person's own search in the knowledge view is not granted content and is not held.
 
 A grant never lifts a deny or a safety limit, and both come first: strict offline refuses every one of these paths
@@ -77,7 +80,8 @@ All checks are the runtime's; the studio only shows what happens.
 | Quality judge, per request | the judge's own `on_request` (`execute_agent(..., judge_hooks=)`), in a run and in an agent test: the judge connects when the step starts, maybe before the mark, and may use another provider than the agent | `access.missing_grant` |
 | Server tools | the same `on_request` check | `access.missing_grant` |
 | Knowledge search of a step (vector, hybrid) | before the query is embedded: `ScopedIndex.before_embed`, set from `RunServices.embedding_check` (`RunManager._check_embedding`) | the call fails with a fixed text; audited as `access_refused` |
-| Knowledge indexing and rebuild, an adoption's hint | `KnowledgeBase.embedding_check` (the workspace: `RunManager.check_cloud_access("ollama", shared_content=True)`) before a rebuild, before new text is embedded, and before a search with `granted=True` | rebuild: `access.missing_grant`; new text: indexed without vectors; hint: full-text search |
+| Search of a folder's index (N-12, vector, hybrid) | before the query is embedded: `FolderReader.embedding_check` (`RunManager._check_embedding`) | the call fails with the same fixed text; audited as `access_refused` |
+| Knowledge and folder indexing, rebuild, an adoption's hint | `KnowledgeBase.embedding_check` (the workspace: `RunManager.check_cloud_access("ollama", shared_content=True)`) before a rebuild, before new text is embedded, and before a search with `granted=True` | rebuild: `access.missing_grant`; new text: indexed without vectors; hint: full-text search |
 | Run chat about a run | `run_chat` passes `RunManager.content_granted` of the run and its top-level run | `access.missing_grant` |
 | A conversation's summary (N-05) | `Conversations._summarize` passes the conversation's mark to `connect_model` | `access.missing_grant` (the history is trimmed instead) |
 

@@ -1345,3 +1345,93 @@ async def test_an_embedding_model_built_for_another_address_is_built_again_befor
     assert refused.value.code.startswith("access.")
     knowledge.add(f"More minutes {SECRET}".encode(), name="more.md")  # indexed without vectors
     assert not [item for item in sent if item[0] == remote and SECRET in item[1]], sent
+
+
+# ---- folder indexes (N-12) ------------------------------------------------------------------------------------------
+
+
+def _grant_indexed(workspace: Workspace, docs: Path) -> str:
+    """The folder granted with a search index, indexed now (the background indexer would do it soon)."""
+    view = FolderGrants(workspace.store, str(workspace.data_dir.resolve())).grant(
+        name="Docs", path=str(docs), by=PERSON, mode="unattended", index=True
+    )
+    assert workspace.folder_index is not None
+    state = workspace.folder_index.sync(view.folder.id)
+    assert state is not None and state.state == "ready"
+    return view.folder.id
+
+
+async def test_a_search_of_a_folder_index_marks_the_run(make: Make, docs: Path, network: Network) -> None:
+    """N-12: a folder's index is the folder's content: a run whose agent searches it holds granted content."""
+    workspace = make({}, {"INDEXED": [("search_files", {"folder": "Docs", "query": "budget"}), "done"]})
+    _grant_indexed(workspace, docs)
+    seen: list[Any] = []
+    workspace.runs.event_sink = seen.append
+    agent = AgentConfig(name="Indexed", system_prompt="INDEXED", model=LOCAL, tools=["search_files"])
+    run = await _finished(workspace, _chain(("indexed", agent)), trigger="schedule", trigger_ref="sch_1")
+    search = _calls(run, "indexed")["search_files"]
+    assert (
+        not search.is_error and json.loads(search.output or "{}")["index"] is True and SECRET in (search.output or "")
+    )
+    assert run.granted_content
+    marks = [event.data for event in seen if event.type == "content_provenance"]
+    assert [(mark["source"], mark["tool"]) for mark in marks] == [("folder", "search_files")]
+
+
+def test_a_folder_is_embedded_by_a_server_elsewhere_only_with_a_grant(make: Make, docs: Path, network: Network) -> None:
+    """N-12 with RT-094: a folder's text reaches an embedding server outside this computer only with a grant on
+    ``cloud_provider`` ``ollama``; without one it is indexed without vectors (full-text search finds it) and the
+    refusal is audited."""
+    from nodestro_runtime.folder_index import source_of
+
+    workspace = make()
+    model = _semantic(workspace, "hybrid")
+    _model_server(workspace, "https://gpu.example.com/v1")
+    folder_id = _grant_indexed(workspace, docs)
+    assert not any(SECRET in item for item in model.documents)
+    refusals = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert refusals and {item.details["resource_id"] for item in refusals} == {"ollama"}
+    assert workspace.knowledge.index_status().state == "incomplete"
+    source = source_of(folder_id, "plan.txt")
+    assert [hit.source for hit in workspace.knowledge.index.retrieve(SECRET, 5, mode="fts", sources=[source])] == [
+        source
+    ]
+    # With a grant the changed file is embedded.
+    AccessRules(workspace.store).grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    (docs / "plan.txt").write_text(f"{DOCUMENT}\nRevised.", encoding="utf-8")
+    assert workspace.folder_index is not None
+    workspace.folder_index.sync(folder_id)
+    assert any(SECRET in item for item in model.documents)
+
+
+async def test_a_marked_runs_folder_index_search_sends_no_query_to_an_embedding_server_elsewhere(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 with RT-094: after a folder read, a hybrid search of the folder's index would embed a query that may hold
+    the folder's content: an embedding server elsewhere needs a grant on ``cloud_provider`` ``ollama``."""
+    from nodestro_runtime.engine import EMBEDDING_REFUSED
+
+    query = {"folder": "Docs", "query": "budget"}
+    turn = [tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}), tool_use("search_files", query), text("ok")]
+    workspace = make({"INDEXED": turn * 2})
+    model = _semantic(workspace, "hybrid")
+    _grant_indexed(workspace, docs)  # embedded on this computer
+    _model_server(workspace, "https://gpu.example.com/v1")
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/indexed")
+    agent = AgentConfig(name="Indexed", system_prompt="INDEXED", model=CLOUD, tools=["read_file", "search_files"])
+    flow = _chain(("indexed", agent))
+    model.queries.clear()
+    run = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    search = _calls(run, "indexed")["search_files"]
+    assert run.nodes["indexed"].status == "succeeded", run.nodes["indexed"].error
+    assert search.is_error and search.output == EMBEDDING_REFUSED
+    assert model.queries == []
+    _unattended(workspace, AccessResource(type="cloud_provider", id="ollama"), ["submit"], "wf_n08/indexed")
+    granted = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    assert not _calls(granted, "indexed")["search_files"].is_error
+    assert model.queries == ["budget"]
