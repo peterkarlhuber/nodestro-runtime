@@ -20,7 +20,6 @@ from typing import Any
 import pytest
 
 from nodestro_runtime.agent_test import AgentTestIn
-from nodestro_runtime.memory_consents import agent_digest, workflow_digest
 from nodestro_runtime.memory_spaces import NOBODY, OWNERS, MemorySpaces, SpaceOwner
 from nodestro_runtime.preview import build_preview
 from nodestro_runtime.problems import NodestroError
@@ -81,7 +80,7 @@ async def _run(workspace: Workspace, started_by: str | None, **start: Any) -> Ru
 def allow(workspace: Workspace, owner: str = ALICE, space: str = "team", flow: Workflow | None = None) -> None:
     """The owner's explicit consent (RT-089d) for the workflow (default :func:`_flow`) to use their space."""
     flow = flow or _flow(_agent(space=space))
-    digest = workflow_digest(workspace.runs.pin_subworkflows(flow))
+    digest = workspace.runs.consent_digest(workspace.runs.pin_subworkflows(flow))
     workspace.memory.grant(space, owner, "workflow", digest, workflow_id=flow.id)
 
 
@@ -136,7 +135,8 @@ def test_an_agent_test_reads_only_its_testers_space(make: Make) -> None:
     refused = test_as(BOB)
     assert (refused.status, refused.error_code) == ("failed", "memory.space_not_found")
     assert workspace.client.messages.calls == []  # type: ignore[attr-defined]
-    workspace.memory.grant("team", ALICE, "agent", agent_digest(_agent()))  # RT-089d: Alice allowed this agent
+    # RT-089d: Alice allowed this agent
+    workspace.memory.grant("team", ALICE, "agent", workspace.runs.agent_consent_digest(_agent()))
     allowed = test_as(ALICE)
     assert allowed.status == "succeeded", allowed.error
     assert SECRET in _sent(workspace)

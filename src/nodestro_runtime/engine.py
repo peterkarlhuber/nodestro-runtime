@@ -103,7 +103,7 @@ from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, f
 from .input_files import InputFiles
 from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .memory_consents import workflow_digest
+from .memory_consents import agent_digest, with_children, workflow_digest
 from .memory_spaces import NOBODY, consent_required
 from .notifications import RunNotifier
 from .orchestrator import (
@@ -1062,6 +1062,11 @@ class RunManager:
         self.resolve_workflow: Callable[[str, int | None], tuple[Workflow, int | None]] = _no_workflow
         #: What identifies a tool's current code (for fingerprints of continued runs).
         self.tool_marker: Callable[[str], str] = lambda name: name
+        #: What an agent uses outside its configuration, for the digest a memory consent covers (RT-089d,
+        #: :mod:`.memory_consents`); the workspace adds connections and MCP servers.
+        self.consent_means: Callable[[AgentConfig], Any] = lambda config: [
+            self.tool_marker(name) for name in sorted(set(config.tools))
+        ]
         #: The files a run can reference by id: name, or :class:`~nodestro_runtime.forms.FileRef` with format and size
         #: (checks the file fields of input forms).
         self.file_names: Callable[[], Mapping[str, str] | Mapping[str, FileRef]] | None = None
@@ -1420,13 +1425,18 @@ class RunManager:
 
         RT-089d: the top-level run also records ``space`` (``Run.memory_spaces``), so every run that executes later in
         its tree needs the owner's consent for it (:meth:`check_memory_flow`); and every run above the step's run
-        (not only the top-level one) is told, so an open event stream of any of them ends for another reader."""
+        (not only the top-level one) is marked and told, so an open event stream of any of them ends for another
+        reader."""
         if getattr(context.env.builder.memory_spaces, "owners", None) is None:
             return
         root = context.root
         owner = _memory_owner(root.run)
+        # Every run from the step's run up to the top-level run (review F4: also the ones in between, whose steps get
+        # the step's output), as this process runs them.
+        chain = [context, *(found for run_id in self._ancestor_ids(context) if (found := self._contexts.get(run_id)))]
+        chain.append(root)
         with context.lock:
-            changed = [item for item in (context, root) if item.run.memory_owner != owner]
+            changed = [item for item in dict.fromkeys(chain) if item.run.memory_owner != owner]
             for item in changed:
                 item.run.memory_owner = owner
             if space and owner != NOBODY and space not in root.run.memory_spaces:
@@ -1486,7 +1496,10 @@ class RunManager:
         if not spaces.needs_consent(space, owner):
             return False
         for run in [context.run, *self._ancestor_runs(context)]:
-            if not spaces.consented(space, owner, "workflow", run.workflow_id, workflow_digest(run.workflow)):
+            if not spaces.consented(space, owner, "workflow", run.workflow_id, self.consent_digest(run.workflow)):
+                # Review F3: the refused run is its owner's alone first, so its error (space, workflow) reaches no
+                # other member; the space is recorded, so a continuation needs the consent too.
+                self.mark_memory_owner(context, space)
                 raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
         return True
 
@@ -1502,9 +1515,11 @@ class RunManager:
         if getattr(spaces, "owners", None) is None or owner is None or owner == NOBODY:
             return
         run = context.run
+        # Review F3: a run of a private tree is private before anything else (also when it is refused here).
+        self.mark_memory_owner(context)
         if not top.memory_spaces:
             raise consent_required("", workflow_id=run.workflow_id, workflow_name=run.workflow_name)
-        digest = workflow_digest(run.workflow)
+        digest = self.consent_digest(run.workflow)
         for space in top.memory_spaces:
             if not spaces.consented(space, owner, "workflow", run.workflow_id, digest):
                 raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
@@ -1742,6 +1757,31 @@ class RunManager:
             tool_sandbox=self.tool_sandbox,
             tool_marker=self.tool_marker,
         )
+
+    def consent_digest(self, workflow: Workflow) -> str:
+        """The digest a memory consent covers for ``workflow`` as a run executes it (pinned; RT-089d): its content,
+        its agents' means (:attr:`consent_means`) and, for a sub-workflow or team that has no saved version (it would
+        run its current content), that content's digest too, recursively."""
+        return self._consent_digest(workflow, frozenset())
+
+    def _consent_digest(self, workflow: Workflow, seen: frozenset[str]) -> str:
+        own = workflow_digest(workflow, self.consent_means)
+        seen = seen | {workflow.id}
+        refs = [ref for node in workflow.nodes for ref in graph.workflow_refs(node)]
+        unsaved = {ref.workflow_id for ref in refs if ref.version is None}
+        children: dict[str, str] = {}
+        for child_id in sorted(unsaved - seen):
+            try:
+                child, _number = self.resolve_workflow(child_id, None)
+            except (KeyError, NodestroError):
+                children[child_id] = "missing"
+                continue
+            children[child_id] = self._consent_digest(self.pin_subworkflows(child), seen)
+        return with_children(own, children)
+
+    def agent_consent_digest(self, config: AgentConfig) -> str:
+        """The digest a memory consent covers for an agent test of ``config`` (RT-089d)."""
+        return agent_digest(config, self.consent_means)
 
     def pin_subworkflows(self, workflow: Workflow) -> Workflow:
         """A copy whose sub-workflow nodes name the exact version they will run."""

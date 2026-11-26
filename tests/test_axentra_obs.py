@@ -711,6 +711,16 @@ def test_private_runs_notify_only_their_memory_owner(notifying: tuple[Any, Any, 
     _run(database, "alpha", "run_mine", "failed", _usage(1, 0.1), memory_owner="u_operator")
     _run(database, "alpha", "run_top", "paused", _usage(1, 0.1), memory_owner="u_operator")
     _run(database, "alpha", "run_kid", "paused", _usage(1, 0.1), parent_run_id="run_top")
+    # Review F4: a paused sub-workflow run without its own mark is private by its top-level run (budget decisions).
+    _run(
+        database,
+        "alpha",
+        "run_kid_budget",
+        "paused",
+        _usage(1, 0.1),
+        parent_run_id="run_top",
+        budget={"pending_request_id": "bud_7"},
+    )
     database.store("alpha").put_raw(
         "tool_approvals",
         "run_kid:tap_9",
@@ -731,7 +741,7 @@ def test_private_runs_notify_only_their_memory_owner(notifying: tuple[Any, Any, 
         memory_owner="<no owner>",
     )
     report = notifications.sweep()
-    assert (report.sent, report.private, report.failed) == (2, 2, 0), report.as_dict()
+    assert (report.sent, report.private, report.failed) == (3, 2, 0), report.as_dict()
     notify = notifications.link.services.platform.notify
     product = notifications.link.services.product_id
     tenant = notifications.link.tenant("alpha")
@@ -740,7 +750,11 @@ def test_private_runs_notify_only_their_memory_owner(notifying: tuple[Any, Any, 
         who = Principal(actor=Actor(ActorKind.USER, users[user], role))
         return sorted(item.subject or "" for item in notify.list_inbox(who, product, tenant).items)
 
-    assert inbox("u_operator", "operator") == ["A run of Check failed", "send_mail waits for your approval"]
+    assert inbox("u_operator", "operator") == [
+        "A run of Check failed",
+        "A run of Check waits for a budget decision",
+        "send_mail waits for your approval",
+    ]
     assert inbox("u_owner", "owner") == []  # not the tenant's owner either
 
 

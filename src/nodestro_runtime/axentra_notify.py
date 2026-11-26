@@ -315,15 +315,16 @@ class AxentraNotifications:
                 owner = self.private_owner(tenant_id, str(run_id))
                 self.notify(tenant_id, "approval_pending", str(request_id), variables, report, private=_private(owner))
             budget = database._query(
-                "SELECT data -> 'budget' ->> 'pending_request_id', id, coalesce(data ->> 'workflow_name', ''),"
-                " data ->> 'memory_owner'"
+                "SELECT data -> 'budget' ->> 'pending_request_id', id, coalesce(data ->> 'workflow_name', '')"
                 " FROM nodestro_documents WHERE tenant_id = %s AND collection = 'runs' AND data ->> 'status' = 'paused'"
                 " AND data -> 'budget' ->> 'pending_request_id' IS NOT NULL AND updated_at >= %s"
                 " ORDER BY updated_at, id",
                 (tenant_id, since),
             )
-            for request_id, run_id, workflow, owner in budget:
+            for request_id, run_id, workflow in budget:
                 variables = {"workflow": str(workflow)[:120], "run_id": str(run_id)}
+                # Review F4: a paused sub-workflow run is private when its top-level run is (like approvals).
+                owner = self.private_owner(tenant_id, str(run_id))
                 self.notify(tenant_id, "budget_pending", str(request_id), variables, report, private=_private(owner))
         if report.failed == 0:
             # The next pass starts a little before this one did: a record committed while this pass read is not

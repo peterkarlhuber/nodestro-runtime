@@ -138,6 +138,9 @@ class AgentTester:
         #: The workspace's price catalog and price mode (PRICING-1).
         self.pricing: PricingService | None = None
         self.price_mode: Callable[[], PriceMode] = lambda: "standard"
+        #: What an agent uses outside its configuration, for the digest of a memory consent (RT-089d); the workspace
+        #: hands in the engine's (:attr:`~nodestro_runtime.engine.RunManager.consent_means`).
+        self.consent_means: Callable[[AgentConfig], Any] = lambda config: sorted(set(config.tools))
 
     def _memory(
         self, config: AgentConfig, actor: str = "system"
@@ -152,7 +155,7 @@ class AgentTester:
         owner = actor if is_person(actor) else NOBODY
         spaces = self.builder.memory_spaces
         if spaces.needs_consent(config.memory.space, owner) and not spaces.consented(
-            config.memory.space, owner, "agent", None, agent_digest(config)
+            config.memory.space, owner, "agent", None, agent_digest(config, self.consent_means)
         ):
             raise consent_required(config.memory.space, subject="agent")
         space = spaces.open_for(config.memory.space, owner)

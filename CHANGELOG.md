@@ -18,6 +18,17 @@
     to nobody notifies nobody, `notify.private`); the Axentra inbox sweep tells only the owner (approvals by their
     top-level run; `NotifyReport.private`); `memory_private` is sent to every run above the step, so a parent's open
     stream ends for another reader too.
+  - Review fixes: the digest also covers what the agents use outside the workflow (`RunManager.consent_means`,
+    `consent_digest`, `agent_consent_digest`): each custom tool's version and code, each bound connection's settings,
+    addresses and sealed secret, each MCP tool's server configuration and definition, and the content of a
+    sub-workflow without a saved version. Before, a new version of a custom tool or a changed webhook address kept
+    the consent valid. `workflow_digest` and `agent_digest` take the means, `consent_targets` the digest function;
+    new `combined_digest`. A refused run is marked private first, so its error reaches no other member; runs between
+    the step's run and the top-level run are marked too; the Axentra budget sweep takes a sub-workflow run's privacy
+    from its top-level run.
+  - Release note: on upgrade, server workflows (and agent tests) that use a persistent memory space fail closed with
+    `memory.consent_required` until the space's owner grants a consent. Consents are granted through the HTTP API
+    only (`/api/memory-consents`); the studio shows the error but has no page for granting yet.
 - Security (RT-089c): memory spaces have an owner on a server. Before, every member listed, read and changed every
   space, and every member's run of a workflow read what another member's run had written there.
   - `MemorySpaces(..., owners=store)` (a server tenant's workspace passes its store): the owner of each space is

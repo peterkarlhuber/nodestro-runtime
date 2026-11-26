@@ -19,12 +19,15 @@ from typing import Any
 import pytest
 
 from nodestro_runtime.agent_test import AgentTestIn
-from nodestro_runtime.memory_consents import MAX_TARGETS, agent_digest, consent_targets, workflow_digest
+from nodestro_runtime.connections import ConnectionIn, ConnectionPatch
+from nodestro_runtime.mcp.models import SERVERS, TOOLS, McpServer, McpTool, ToolDefinition
+from nodestro_runtime.memory_consents import MAX_TARGETS, combined_digest, consent_targets, workflow_digest
 from nodestro_runtime.memory_spaces import CONSENTS, NOBODY
 from nodestro_runtime.notifications import LocalInbox, RunNotifier
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.schemas import AgentConfig, MemoryConfig, NotificationRules, Run, RunIn, Workflow
+from nodestro_runtime.schemas import AgentConfig, MemoryConfig, NotificationRules, Run, RunIn, ToolSettings, Workflow
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
+from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
 from nodestro_runtime.workspace import Workspace
 
 ALICE, BOB = "usr_alice", "usr_bob"
@@ -90,12 +93,26 @@ def _seed(workspace: Workspace) -> None:
 
 def _allow(workspace: Workspace, workflow_id: str, owner: str = ALICE, space: str = "team") -> list[str]:
     """What the HTTP API does when the owner allows a workflow: every workflow it runs, in its current content."""
-    targets = consent_targets(workspace.resolve_workflow, workspace.runs.pin_subworkflows, workflow_id)
+    targets = _targets(workspace, workflow_id)
     for target in targets:
         workspace.memory.grant(
             space, owner, "workflow", target.digest, workflow_id=target.workflow_id, workflow_version=target.version
         )
     return [target.workflow_id for target in targets]
+
+
+def _targets(workspace: Workspace, workflow_id: str) -> Any:
+    runs = workspace.runs
+    return consent_targets(workspace.resolve_workflow, runs.pin_subworkflows, runs.consent_digest, workflow_id)
+
+
+def _digest(workspace: Workspace, flow: Workflow) -> str:
+    """The digest of ``flow`` as a run executes it (pinned; with its agents' means)."""
+    return workspace.runs.consent_digest(workspace.runs.pin_subworkflows(flow))
+
+
+def _consented(workspace: Workspace, flow: Workflow) -> bool:
+    return workspace.memory.consented("team", ALICE, "workflow", flow.id, _digest(workspace, flow))
 
 
 async def _start(workspace: Workspace, flow: Workflow, by: str | None = ALICE, **start: Any) -> Run:
@@ -117,7 +134,10 @@ async def test_poc_a_shared_workflow_uses_alices_memory_only_after_her_consent(m
     assert (refused.nodes["a"].status, refused.nodes["a"].error_code) == ("failed", "memory.consent_required")
     assert refused.nodes["a"].error_params == {"space": "team", "workflow_id": "wf_shared", "workflow": "Shared"}
     assert _calls(workspace) == 0  # nothing reached a model
-    assert refused.memory_owner is None and refused.memory_spaces == []  # nothing was read
+    # Review F3: the refused run is Alice's alone, so its error (her space, the workflow) reaches no other member.
+    assert (refused.memory_owner, refused.memory_spaces) == (ALICE, ["team"])
+    assert workspace.conversations.run_visible(refused.id, BOB) is False
+    assert workspace.conversations.run_visible(refused.id, ALICE) is True
     assert _allow(workspace, flow.id) == ["wf_shared"]
     allowed = await _start(workspace, flow)
     assert allowed.status == "succeeded", allowed.nodes["a"].error
@@ -125,7 +145,8 @@ async def test_poc_a_shared_workflow_uses_alices_memory_only_after_her_consent(m
     assert (allowed.memory_owner, allowed.memory_spaces) == (ALICE, ["team"])
     # The stored run has the same digest as the consent: a paused run continued elsewhere is checked the same way.
     stored = workspace.store.get("runs", allowed.id, Run)
-    assert stored is not None and workflow_digest(stored.workflow) == workflow_digest(allowed.workflow)
+    assert stored is not None
+    assert workspace.runs.consent_digest(stored.workflow) == workspace.runs.consent_digest(allowed.workflow)
     calls = _calls(workspace)
     changed = workspace.save_workflow(_flow("wf_shared", _agent_node("a", _agent("CHANGED"))))
     again = await _start(workspace, changed)
@@ -137,7 +158,7 @@ async def test_bob_cannot_consent_for_alices_space_and_his_run_stays_not_found(m
     workspace = make({"MEM": [VIEW, text("read")]})
     _seed(workspace)
     flow = workspace.save_workflow(_flow("wf_shared", _agent_node("a", _agent())))
-    digest = workflow_digest(workspace.runs.pin_subworkflows(flow))
+    digest = _digest(workspace, flow)
     with pytest.raises(NodestroError) as caught:
         workspace.memory.grant("team", BOB, "workflow", digest, workflow_id=flow.id)
     assert caught.value.code == "memory.space_not_found"
@@ -220,7 +241,7 @@ async def test_a_workflow_started_after_the_memory_step_needs_the_consent(make: 
     assert _calls(workspace) == calls
     # Even when only the main workflow's own consent is renewed, the courier's new content is refused.
     pinned = workspace.runs.pin_subworkflows(workspace.resolve_workflow(flow.id, None)[0])
-    workspace.memory.grant("team", ALICE, "workflow", workflow_digest(pinned), workflow_id=flow.id)
+    workspace.memory.grant("team", ALICE, "workflow", workspace.runs.consent_digest(pinned), workflow_id=flow.id)
     third = await _start(workspace, flow)
     assert third.nodes["a"].status == "succeeded"
     courier_run = workspace.store.get("runs", third.nodes["after"].child_run_id or "", Run)
@@ -297,6 +318,128 @@ async def test_the_parent_stream_is_told_when_a_sub_workflow_reads_memory(make: 
     middle_id = run.nodes["sub"].child_run_id
     told = {event.run_id for event in events if event.type == "memory_private"}
     assert {run.id, middle_id} <= told and len(told) == 3
+    # Review F4: the run in between is marked too (its steps got the memory step's output), not only told.
+    middle_run = workspace.store.get("runs", middle_id or "", Run)
+    assert middle_run is not None and middle_run.memory_owner == ALICE
+    assert workspace.conversations.run_visible(middle_id or "", BOB) is False
+
+
+# ---- what the agents use outside the workflow (review F1) -----------------------------------------------------------
+
+CUSTOM = "celsius_to_fahrenheit"
+
+
+def _save_tool(workspace: Workspace, code: str = CUSTOM_TOOL_TEMPLATE) -> None:
+    result, info = workspace.tools.save_custom(
+        code, CUSTOM_TESTS_TEMPLATE, CUSTOM, trust=workspace.tools.editor_trust(CUSTOM, code)
+    )
+    assert result.ok and info is not None, result
+
+
+async def test_a_new_version_of_a_custom_tool_makes_the_consent_stale(make: Make) -> None:
+    """Review F1: an agent names its custom tools, a run takes their latest version, and every member who may run
+    workflows may save a new one. Before, Alice's consent still held after Bob's new version (one that posts what it
+    gets elsewhere). Now the digest covers each tool's version and code: her run fails before the agent starts."""
+    workspace = make({"MEM": [VIEW, text("read")]})
+    _seed(workspace)
+    _save_tool(workspace)
+    agent = _agent().model_copy(update={"tools": [CUSTOM]})
+    flow = workspace.save_workflow(_flow("wf_tool", _agent_node("a", agent)))
+    _allow(workspace, flow.id)
+    tested = workspace.runs.agent_consent_digest(agent)
+    assert _consented(workspace, flow)
+    _save_tool(workspace, CUSTOM_TOOL_TEMPLATE + "\n# version 2: posts its input elsewhere\n")
+    assert not _consented(workspace, flow)
+    assert workspace.runs.agent_consent_digest(agent) != tested  # an agent test's consent too
+    refused = await _start(workspace, flow)
+    assert refused.nodes["a"].error_code == "memory.consent_required" and _calls(workspace) == 0
+
+
+async def test_a_changed_connection_makes_the_consent_stale(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F1: a tool sends to the connection its settings name (``tool_settings.connection_id``); a member who
+    may edit connections could point it elsewhere. The digest covers the connection's settings, reachable addresses
+    and (sealed) secret, so a changed address or a new secret makes the consent stale."""
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    workspace = make({"MEM": [VIEW, text("read")]})
+    _seed(workspace)
+    hook = workspace.connections.create(
+        ConnectionIn(type="webhook", name="Hook", settings={"url": "https://hooks.example.com/in"})
+    )
+    bound = {"search_web": ToolSettings(connection_id=hook.id)}
+    agent = _agent().model_copy(update={"tools": ["search_web"], "tool_settings": bound})
+    flow = workspace.save_workflow(_flow("wf_hook", _agent_node("a", agent)))
+    _allow(workspace, flow.id)
+    assert _consented(workspace, flow)
+    workspace.connections.update(hook.id, ConnectionPatch(settings={"url": "https://elsewhere.example.com/in"}))
+    assert not _consented(workspace, flow)
+    refused = await _start(workspace, flow)
+    assert refused.nodes["a"].error_code == "memory.consent_required" and _calls(workspace) == 0
+    _allow(workspace, flow.id)
+    assert _consented(workspace, flow)
+    workspace.connections.set_secret(hook.id, "another token")
+    assert not _consented(workspace, flow)
+    workspace.connections.delete(hook.id, force=True)
+    assert not _consented(workspace, flow)
+
+
+def test_a_changed_mcp_server_or_tool_makes_the_consent_stale(make: Make) -> None:
+    """Review F1: an MCP tool calls the server its configuration names; the digest covers the server's address,
+    transport and sign-in kind and the tool's definition, not its check times."""
+    workspace = make({})
+    server = McpServer(slug="docs", name="Docs", url="https://mcp.example/mcp")
+    definition = ToolDefinition(name="lookup", description="Look up")
+    tool = McpTool(
+        server_id=server.id,
+        name="lookup",
+        tool_name="mcp__docs__lookup",
+        definition=definition,
+        hash=definition.digest(),
+        status="approved",
+        access="read",
+    )
+    workspace.store.put(SERVERS, server.id, server)
+    workspace.store.put(TOOLS, tool.key, tool)
+    flow = _flow("wf_mcp", _agent_node("a", _agent().model_copy(update={"tools": [tool.tool_name]})))
+    before = workspace.runs.consent_digest(flow)
+    workspace.store.put(SERVERS, server.id, server.model_copy(update={"last_error_code": "mcp.unreachable"}))
+    assert workspace.runs.consent_digest(flow) == before  # its status is not what a call does
+    workspace.store.put(SERVERS, server.id, server.model_copy(update={"url": "https://elsewhere.example/mcp"}))
+    assert workspace.runs.consent_digest(flow) != before
+    workspace.store.put(SERVERS, server.id, server)
+    assert workspace.runs.consent_digest(flow) == before
+    workspace.store.put(TOOLS, tool.key, tool.model_copy(update={"hash": "0" * 64}))
+    assert workspace.runs.consent_digest(flow) != before
+
+
+async def test_a_sub_workflow_without_saved_versions_is_covered_by_its_content(make: Make) -> None:
+    """Review F2: a sub-workflow that was never saved as a version runs its current content, which the parent's own
+    content (``version`` unset) does not pin. The parent's digest covers that content too: a change of it makes the
+    consent stale before the memory step runs."""
+    workspace = make({"MEM": [VIEW, text("read")]})
+    _seed(workspace)
+    draft = _flow("wf_draft", _agent_node("c", _agent("SEND", space=None)), name="Draft")
+    workspace.store.put("workflows", draft.id, draft)  # no saved version
+    parent = workspace.save_workflow(_flow("wf_parent", _agent_node("a", _agent()), _sub("after", draft.id)))
+    pinned = workspace.runs.pin_subworkflows(parent)
+    assert [node.subworkflow.version for node in pinned.nodes if node.subworkflow is not None] == [None]
+    assert _allow(workspace, parent.id) == ["wf_parent", "wf_draft"]
+    assert _consented(workspace, parent)
+    leak = _flow("wf_draft", _agent_node("c", _agent("LEAK", space=None)), name="Draft")
+    workspace.store.put("workflows", draft.id, leak)
+    assert not _consented(workspace, parent)
+    refused = await _start(workspace, parent)
+    assert refused.nodes["a"].error_code == "memory.consent_required" and _calls(workspace) == 0
+
+
+def test_the_combined_digest_covers_every_target(make: Make) -> None:
+    """Review F2: what the owner confirms when granting is one digest over every workflow of the consent."""
+    workspace = make({})
+    child = workspace.save_workflow(_flow("wf_child", _agent_node("a", _agent("X", None)), name="Child"))
+    parent = workspace.save_workflow(_flow("wf_parent", _sub("sub", child.id), name="Parent"))
+    before = combined_digest(_targets(workspace, parent.id))
+    assert combined_digest(_targets(workspace, parent.id)) == before
+    workspace.save_workflow(_flow("wf_child", _agent_node("a", _agent("Y", None)), name="Child"))
+    assert combined_digest(_targets(workspace, parent.id)) != before
 
 
 # ---- agent tests ----------------------------------------------------------------------------------------------------
@@ -315,7 +458,7 @@ def test_an_agent_test_needs_the_consent_for_exactly_its_configuration(make: Mak
     refused = test_as(ALICE, _agent())
     assert (refused.status, refused.error_code) == ("failed", "memory.consent_required")
     assert _calls(workspace) == 0
-    workspace.memory.grant("team", ALICE, "agent", agent_digest(_agent()))
+    workspace.memory.grant("team", ALICE, "agent", workspace.runs.agent_consent_digest(_agent()))
     assert test_as(BOB, _agent()).error_code == "memory.space_not_found"  # still nothing for Bob
     changed = test_as(ALICE, _agent("OTHER"))
     assert changed.error_code == "memory.consent_required" and _calls(workspace) == 0
@@ -332,12 +475,15 @@ async def test_the_desktop_needs_no_consent(make: Make) -> None:
 
 
 def test_the_digest_covers_content_not_time_stamps(make: Make) -> None:
+    digest = make({}).runs.consent_digest
     flow = _flow("wf_d", _agent_node("a", _agent()))
     same = flow.model_copy(update={"updated_at": flow.updated_at.replace(year=2000)})
-    assert workflow_digest(flow) == workflow_digest(same)
-    assert workflow_digest(flow) != workflow_digest(_flow("wf_d", _agent_node("a", _agent("X"))))
-    assert workflow_digest(flow) != workflow_digest(_flow("wf_other", _agent_node("a", _agent())))
-    assert agent_digest(_agent()) != agent_digest(_agent(space="other"))
+    assert digest(flow) == digest(same)
+    assert digest(flow) != digest(_flow("wf_d", _agent_node("a", _agent("X"))))
+    assert digest(flow) != digest(_flow("wf_other", _agent_node("a", _agent())))
+    assert make({}).runs.agent_consent_digest(_agent()) != make({}).runs.agent_consent_digest(_agent(space="other"))
+    # The means are part of it: the same workflow with other means is other content.
+    assert workflow_digest(flow, lambda _config: []) != workflow_digest(flow, lambda _config: ["other"])
 
 
 def test_a_consent_covers_at_most_max_targets_workflows(make: Make) -> None:
@@ -346,7 +492,7 @@ def test_a_consent_covers_at_most_max_targets_workflows(make: Make) -> None:
     for number in range(1, MAX_TARGETS + 1):
         previous = workspace.save_workflow(_flow(f"wf_{number}", _sub("sub", previous.id)))
     with pytest.raises(NodestroError) as caught:
-        consent_targets(workspace.resolve_workflow, workspace.runs.pin_subworkflows, previous.id)
+        _targets(workspace, previous.id)
     assert caught.value.code == "memory.consent_too_large"
 
 

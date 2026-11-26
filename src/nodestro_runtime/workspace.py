@@ -71,10 +71,11 @@ from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBE
 from .local_service import LocalModelService
 from .mcp.hub import McpHub, McpLimits
 from .mcp.models import SERVERS as MCP_SERVERS
+from .mcp.models import McpServer, McpTool
 from .mcp.netguard import EgressPolicy
 from .mcp.service import McpService
 from .mcp.vault import VAULT_KEY_ENV, TokenVault, vault_box_from_env
-from .mcp_access import unattended_mcp_enabled
+from .mcp_access import is_mcp_tool, unattended_mcp_enabled
 from .memory_spaces import MemorySpaces, MemoryTables
 from .notifications import NOTIFY_TOOLS, LocalInbox, RunNotifier, local_inbox_enabled
 from .offline import OfflineScope, check_connection, check_provider
@@ -112,6 +113,7 @@ from .schemas import (
     DEFAULT_AGENT_MODEL,
     DEFAULT_ASSISTANT_MODEL,
     LANGUAGES,
+    AgentConfig,
     BuiltinSandboxStatus,
     Run,
     RunIn,
@@ -163,6 +165,28 @@ LOCK_FILE = "nodestro.lock"
 #: The installation's own bookkeeping (never the user's settings): which default models it started with.
 INSTALLATION = "installation"
 MODEL_DEFAULTS = "model_defaults"
+
+
+def _sealed_digest(sealed: str | None, storage: str) -> str:
+    """What changes when a connection's secret is set again, without the secret (RT-089d)."""
+    return f"{storage}:{hashlib.sha256((sealed or '').encode()).hexdigest()[:16]}"
+
+
+def _mcp_marker(server: McpServer, tool: McpTool) -> dict[str, Any]:
+    """An MCP tool's server configuration and definition for a memory consent's digest (RT-089d): what decides where
+    a call goes and what it does. Not its status, check times or tokens (they change while it is used)."""
+    return {
+        "server": server.id,
+        "url": server.url,
+        "transport": server.transport,
+        "stdio": server.stdio.model_dump(mode="json") if server.stdio is not None else None,
+        "auth": server.auth,
+        "issuer": server.oauth.get("issuer"),
+        "allow_loopback": server.allow_loopback,
+        "tool": tool.name,
+        "hash": tool.hash,
+        "access": tool.access,
+    }
 
 
 def _retry_cap(value: Any) -> int:
@@ -589,6 +613,9 @@ class Workspace:
         self.tester.tool_sandbox = self.python.workflow_sandbox
         self.runs.resolve_workflow = self.resolve_workflow
         self.runs.tool_marker = self.tool_marker
+        # RT-089d: a memory consent covers the custom tools, connections and MCP servers an agent uses.
+        self.runs.consent_means = self.consent_means
+        self.tester.consent_means = self.consent_means
         # Files uploaded as run inputs: own storage, never knowledge by themselves (see input_files.py).
         inputs = data_dir / "inputs"
         blobs = storage.input_blobs(inputs) if storage is not None and storage.input_blobs is not None else None
@@ -1479,6 +1506,37 @@ class Workspace:
             return f"{name}:missing"
         digest = hashlib.sha256((info.code or "").encode()).hexdigest()[:12]
         return f"{name}:v{info.version}:{digest}"
+
+    def consent_means(self, config: AgentConfig) -> dict[str, Any]:
+        """What ``config`` uses outside its own configuration, for the digest of a memory consent (RT-089d,
+        :mod:`.memory_consents`), by tool: the tool's version and code (:meth:`tool_marker`), the bound connection's
+        type, provider, settings, reachable addresses and secret (sealed, so a new secret changes it; never the secret
+        itself), and for an MCP tool its server's address, transport, command and sign-in kind and the tool's
+        definition. A change of any of them makes a consent stale, so content allowed for one destination never
+        reaches another."""
+        found: dict[str, Any] = {}
+        for name in sorted(set(config.tools)):
+            entry: dict[str, Any] = {"tool": self.tool_marker(name)}
+            bound = config.tool_settings.get(name)
+            if bound is not None and bound.connection_id:
+                connection = self.connections.find(bound.connection_id)
+                entry["connection"] = (
+                    None
+                    if connection is None
+                    else {
+                        "id": connection.id,
+                        "type": connection.type,
+                        "provider": connection.provider,
+                        "settings": connection.settings,
+                        "egress": sorted(connection.egress),
+                        "secret": _sealed_digest(connection.secret_sealed, connection.secret_storage),
+                    }
+                )
+            if is_mcp_tool(name):
+                server_tool = self.mcp.find(name)
+                entry["mcp"] = None if server_tool is None else _mcp_marker(*server_tool)
+            found[name] = entry
+        return found
 
     # ---- running ----------------------------------------------------------------------
 
