@@ -11,12 +11,20 @@ files before owners were recorded has none and fails closed: no member's run or 
 server's operator gives it an owner (:meth:`MemorySpaces.assign`, audited by the caller); nothing assigns one by
 itself and nothing is deleted. The desktop's single person (``owner`` ``None``, or a workspace without
 :attr:`MemorySpaces.owners`) sees every space as before.
+
+Consents (RT-089d): owning a space is not enough for a workflow to use it. A workflow may be shared and changed by
+other members, so a run (or an agent test) opens a person's space only after that person allowed exactly this content
+to use it: a :class:`MemoryConsent` names the space, its owner, the workflow (or the tested agent configuration) and
+the SHA-256 digest of its content (:mod:`nodestro_runtime.memory_consents`). Any change of the content changes the
+digest, so the consent no longer applies to it; nothing grants a consent by itself, and the owner revokes one at any
+time. Without a consent the step fails with ``memory.consent_required`` (fail closed). The desktop needs none.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
 from datetime import UTC, datetime
+import hashlib
 from pathlib import Path
 import re
 import threading
@@ -62,6 +70,63 @@ class SpaceOwner(BaseModel):
     #: ``created``: its first writer; ``assigned``: the operator gave a space without an owner its owner.
     how: Literal["created", "assigned"]
     at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+#: The collection of the owners' consents (RT-089d): :func:`consent_key` -> :class:`MemoryConsent`.
+CONSENTS = "memory_space_consents"
+#: What a consent allows to use a space: a saved workflow in one content, or one agent configuration in an agent test.
+ConsentSubject = Literal["workflow", "agent"]
+
+
+class MemoryConsent(BaseModel):
+    """The owner of a memory space allows one content to use it (RT-089d): the workflow ``workflow_id`` (or, for an
+    agent test, an agent configuration) whose content has the digest ``digest``. It applies to nothing else: a changed
+    workflow has another digest and needs a new consent."""
+
+    id: str
+    space: str
+    owner: str
+    subject: ConsentSubject
+    #: The workflow (``subject`` ``workflow``); ``None`` for an agent configuration.
+    workflow_id: str | None = None
+    #: The saved version the consent was given for and the workflow's name then (shown to the owner; not checked).
+    workflow_version: int | None = None
+    workflow_name: str = ""
+    #: The SHA-256 digest of the content (:func:`nodestro_runtime.memory_consents.workflow_digest`, ``agent_digest``).
+    digest: str
+    at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+def consent_key(space: str, subject: ConsentSubject, workflow_id: str | None, digest: str) -> str:
+    """A consent's key: one per space, subject, workflow and digest (the same consent given twice is one)."""
+    return f"{space}|{subject}|{workflow_id or ''}|{digest}"
+
+
+def consent_id(key: str) -> str:
+    return "mcn_" + hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
+def consent_required(
+    name: str, *, workflow_id: str | None = None, workflow_name: str = "", subject: ConsentSubject = "workflow"
+) -> NodestroError:
+    """The answer for the owner's own space that this content may not use (RT-089d): only the owner gets it (any
+    other caller gets :func:`space_not_found`), so it reveals nothing they do not know."""
+    if subject == "agent":
+        return NodestroError(
+            "memory.consent_required",
+            f"The memory space {name} may be used by this agent configuration only after you allowed it",
+            space=name,
+            workflow_id="",
+            workflow="",
+        )
+    return NodestroError(
+        "memory.consent_required",
+        f"The memory space {name} may be used by the workflow {workflow_name or workflow_id} only after its owner "
+        "allowed this version of it",
+        space=name,
+        workflow_id=workflow_id or "",
+        workflow=workflow_name or workflow_id or "",
+    )
 
 
 def space_not_found(name: str) -> NodestroError:
@@ -224,6 +289,89 @@ class MemorySpaces:
         if found is None or found.owner != owner:
             raise space_not_found(name)
         return self.open(name)
+
+    # ---- consents (RT-089d) --------------------------------------------------------------------------------------
+
+    def needs_consent(self, name: str, owner: str | None) -> bool:
+        """Whether a use of the space ``name`` for ``owner`` must first find the owner's consent: only where there are
+        owners, and only for a space that is ``owner``'s or that ``owner`` would create (no owner, no files). Any other
+        use is refused as a space that does not exist (:meth:`open_for`) and reveals nothing."""
+        if self.owners is None or owner is None or not _is_user(owner):
+            return False
+        name = check_space_name(name)
+        recorded = self.owner(name)
+        if recorded is not None:
+            return recorded == owner
+        return not self.open(name).entries()
+
+    def consented(
+        self, name: str, owner: str | None, subject: ConsentSubject, workflow_id: str | None, digest: str
+    ) -> bool:
+        """Whether ``owner`` allowed the content with ``digest`` (of the workflow ``workflow_id``, or an agent
+        configuration) to use their space ``name``. Always true without owners (the desktop)."""
+        if self.owners is None or owner is None:
+            return True
+        name = check_space_name(name)
+        if not _is_user(owner) or self.owner(name) != owner:
+            return False
+        found = self.owners.get(CONSENTS, consent_key(name, subject, workflow_id, digest), MemoryConsent)
+        return found is not None and found.owner == owner
+
+    def grant(
+        self,
+        name: str,
+        owner: str,
+        subject: ConsentSubject,
+        digest: str,
+        *,
+        workflow_id: str | None = None,
+        workflow_version: int | None = None,
+        workflow_name: str = "",
+    ) -> MemoryConsent:
+        """The owner's explicit consent (the caller audits it): ``owner`` must own the space ``name`` or create it now
+        (as its first writer, :meth:`open_for`); anything else answers ``memory.space_not_found``."""
+        if self.owners is None or not _is_user(owner):
+            raise ValueError("A consent is given by a user who owns a space of a workspace with owners")
+        if subject == "workflow" and not workflow_id:
+            raise ValueError("A workflow's consent names the workflow")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("A consent names a SHA-256 digest")
+        name = check_space_name(name)
+        self.open_for(name, owner)  # claims a new space, refuses another person's
+        key = consent_key(name, subject, workflow_id if subject == "workflow" else None, digest)
+        consent = MemoryConsent(
+            id=consent_id(key),
+            space=name,
+            owner=owner,
+            subject=subject,
+            workflow_id=workflow_id if subject == "workflow" else None,
+            workflow_version=workflow_version,
+            workflow_name=workflow_name[:200],
+            digest=digest,
+        )
+        self.owners.put(CONSENTS, key, consent)
+        return consent
+
+    def consents(self, owner: str | None) -> list[MemoryConsent]:
+        """The consents ``owner`` gave, oldest first (only for spaces they still own); none without owners."""
+        if self.owners is None or owner is None:
+            return []
+        mine = {item.space for item in self.owners.list(OWNERS, SpaceOwner) if item.owner == owner}
+        found = [
+            item for item in self.owners.list(CONSENTS, MemoryConsent) if item.owner == owner and item.space in mine
+        ]
+        return sorted(found, key=lambda item: (item.at, item.id))
+
+    def revoke(self, consent: str, owner: str) -> MemoryConsent | None:
+        """Withdraw ``owner``'s consent with the id ``consent`` (another person's or an unknown id: ``None``). A run
+        that already reads the space keeps its step; every later step and child run is refused."""
+        if self.owners is None:
+            return None
+        for key, item in self.owners.items(CONSENTS, MemoryConsent):
+            if item.id == consent and item.owner == owner:
+                self.owners.delete(CONSENTS, key)
+                return item
+        return None
 
     def assign(self, name: str, owner: str) -> bool:
         """Give the space ``name`` the owner ``owner`` where it has none (the operator's assignment; the caller checks

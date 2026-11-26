@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Security (RT-089d): a workflow uses a person's private memory space only after that person's explicit consent.
+  Before, an editor could build a shared workflow that names Alice's space, and Alice's run of it read her memory
+  into that workflow and its tools ([docs/memory-consents.md](docs/memory-consents.md)).
+  - New: `memory_consents` (`workflow_digest`, `agent_digest`, `consent_targets`, `MAX_TARGETS`), `MemoryConsent`,
+    `MemorySpaces.needs_consent`, `consented`, `grant`, `consents`, `revoke`, `consent_required` and the codes
+    `memory.consent_required` and `memory.consent_too_large`; `Run.memory_spaces` (left out while empty).
+  - A step that opens the owner's space needs a consent for its run's workflow and every run above it; a run that
+    executes later in a tree that used a space (sub-workflow, team, continued paused or failed run) needs one for
+    its workflow; an agent test for its configuration. Otherwise `memory.consent_required` before anything is read.
+    Nothing grants a consent by itself; a changed workflow has another digest. The desktop needs none.
+  - A continued run takes over `memory_owner` and `memory_spaces` of the run it continues (before, it was visible to
+    every member although it held the private run's results).
+  - Private runs in every channel: the local inbox writes a private run's messages for its owner only (a run private
+    to nobody notifies nobody, `notify.private`); the Axentra inbox sweep tells only the owner (approvals by their
+    top-level run; `NotifyReport.private`); `memory_private` is sent to every run above the step, so a parent's open
+    stream ends for another reader too.
+  - Review fixes: the digest also covers what the agents use outside the workflow (`RunManager.consent_means`,
+    `consent_digest`, `agent_consent_digest`): each custom tool's version and code, each bound connection's settings,
+    addresses and sealed secret, each MCP tool's server configuration and definition, and the content of a
+    sub-workflow without a saved version. Before, a new version of a custom tool or a changed webhook address kept
+    the consent valid. `workflow_digest` and `agent_digest` take the means, `consent_targets` the digest function;
+    new `combined_digest`. A refused run is marked private first, so its error reaches no other member; runs between
+    the step's run and the top-level run are marked too; the Axentra budget sweep takes a sub-workflow run's privacy
+    from its top-level run.
+  - Release note: on upgrade, server workflows (and agent tests) that use a persistent memory space fail closed with
+    `memory.consent_required` until the space's owner grants a consent. Consents are granted through the HTTP API
+    only (`/api/memory-consents`); the studio shows the error but has no page for granting yet.
 - Security (N-12 review H-1, L-1, L-2): a granted folder's text went to an embedding server outside this computer
   without a grant while the provenance switch (or approvals, or the access model) was off: only the folder switch was
   needed. Now it fails closed whatever the switches: folder text is embedded, and a folder index search embeds its

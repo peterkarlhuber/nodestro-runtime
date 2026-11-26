@@ -104,7 +104,8 @@ from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, f
 from .input_files import InputFiles
 from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .memory_spaces import NOBODY
+from .memory_consents import agent_digest, with_children, workflow_digest
+from .memory_spaces import NOBODY, consent_required
 from .notifications import RunNotifier
 from .orchestrator import (
     child_outcome,
@@ -1062,6 +1063,11 @@ class RunManager:
         self.resolve_workflow: Callable[[str, int | None], tuple[Workflow, int | None]] = _no_workflow
         #: What identifies a tool's current code (for fingerprints of continued runs).
         self.tool_marker: Callable[[str], str] = lambda name: name
+        #: What an agent uses outside its configuration, for the digest a memory consent covers (RT-089d,
+        #: :mod:`.memory_consents`); the workspace adds connections and MCP servers.
+        self.consent_means: Callable[[AgentConfig], Any] = lambda config: [
+            self.tool_marker(name) for name in sorted(set(config.tools))
+        ]
         #: The files a run can reference by id: name, or :class:`~nodestro_runtime.forms.FileRef` with format and size
         #: (checks the file fields of input forms).
         self.file_names: Callable[[], Mapping[str, str] | Mapping[str, FileRef]] | None = None
@@ -1247,6 +1253,13 @@ class RunManager:
             # N-08: a continued run holds the earlier run's results, so it starts with that run's mark (fails closed).
             earlier = self.get(resumed_from)
             run.granted_content = earlier is None or self.content_granted(earlier)
+        if resumed_from:
+            # RT-089c/RT-089d: a continued run takes over the earlier run's results, so it stays private to the owner
+            # of the memory those results came from and runs only with the owner's consent (``check_memory_flow``).
+            earlier = self.get(resumed_from)
+            if earlier is not None and earlier.memory_owner is not None:
+                run.memory_owner = earlier.memory_owner
+                run.memory_spaces = list(earlier.memory_spaces)
         return self._launch(run)
 
     # ---- access model v2 beyond tool calls (N-06; only while its switch is on) ---------------------------------------
@@ -1426,26 +1439,114 @@ class RunManager:
         if first and root is not context:
             self._save(root)
 
-    def mark_memory_owner(self, context: _RunContext) -> None:
+    def mark_memory_owner(self, context: _RunContext, space: str | None = None) -> None:
         """Make the run and its top-level run private to the person whose persistent memory space a step uses
         (RT-089c review H-2): where spaces have owners, only that person sees them on any run route
         (:meth:`~nodestro_runtime.conversations.AgentConversations.run_visible`), so the memory tool's output in the
         run's steps, events and trace never reaches another member. A run that acts for no person is marked
         :data:`~nodestro_runtime.memory_spaces.NOBODY` (seen by nobody; its step fails anyway). Stored at once, before
-        the step reads the space; nothing happens on the desktop (no owners)."""
+        the step reads the space; nothing happens on the desktop (no owners).
+
+        RT-089d: the top-level run also records ``space`` (``Run.memory_spaces``), so every run that executes later in
+        its tree needs the owner's consent for it (:meth:`check_memory_flow`); and every run above the step's run
+        (not only the top-level one) is marked and told, so an open event stream of any of them ends for another
+        reader."""
         if getattr(context.env.builder.memory_spaces, "owners", None) is None:
             return
         root = context.root
         owner = _memory_owner(root.run)
+        # Every run from the step's run up to the top-level run (review F4: also the ones in between, whose steps get
+        # the step's output), as this process runs them.
+        chain = [context, *(found for run_id in self._ancestor_ids(context) if (found := self._contexts.get(run_id)))]
+        chain.append(root)
         with context.lock:
-            changed = [item for item in (context, root) if item.run.memory_owner != owner]
+            changed = [item for item in dict.fromkeys(chain) if item.run.memory_owner != owner]
             for item in changed:
                 item.run.memory_owner = owner
+            if space and owner != NOBODY and space not in root.run.memory_spaces:
+                root.run.memory_spaces.append(space)
+                if root not in changed:
+                    changed.append(root)
         for item in dict.fromkeys(changed):
             self._save(item)
         if changed:
-            # Tells an open event stream to check again whether its reader still sees the run (it ends otherwise).
+            # Tells an open event stream to check again whether its reader still sees the run (it ends otherwise):
+            # the step's run, and every run above it up to the top-level run.
             self._emit(context, "memory_private", None)
+            for run_id in self._ancestor_ids(context):
+                self._emit_to(context, run_id, "memory_private")
+
+    def _ancestor_ids(self, context: _RunContext) -> list[str]:
+        """The runs above ``context``'s run, nearest first, up to its top-level run (bounded; RT-089d)."""
+        found: list[str] = []
+        parent = context.run.parent_run_id
+        while parent and parent not in found and len(found) < 64:
+            found.append(parent)
+            if parent == context.root.run.id:
+                break
+            above = self._contexts.get(parent)
+            stored = above.run if above is not None else self.store.get("runs", parent, Run)
+            parent = stored.parent_run_id if stored is not None else None
+        return found
+
+    def _ancestor_runs(self, context: _RunContext) -> list[Run]:
+        """The runs above ``context``'s run as this process holds them (else as stored), nearest first. A run that
+        cannot be read is left out by :meth:`check_memory_consent`'s caller as missing (it refuses then)."""
+        found: list[Run] = []
+        for run_id in self._ancestor_ids(context):
+            above = self._contexts.get(run_id)
+            if above is not None:
+                found.append(above.run)
+            elif run_id == context.root.run.id:
+                found.append(context.root.run)
+            else:
+                stored = self.store.get("runs", run_id, Run)
+                if stored is None:
+                    raise consent_required("", workflow_id=run_id)
+                found.append(stored)
+        return found
+
+    def check_memory_consent(self, context: _RunContext, space: str | None) -> bool:
+        """Before a step opens the persistent memory space ``space`` (RT-089d): its owner must have allowed the
+        content of the step's run's workflow and of every run above it (:mod:`.memory_consents`); otherwise the step
+        fails with ``memory.consent_required`` before anything is read. Only for a space the run's person owns (or
+        would create): every other use is refused as before (``memory.space_not_found``) and reveals nothing. Nothing
+        happens on the desktop (no owners). True when the space is the person's and the consent holds (the caller
+        records the space then)."""
+        spaces = context.env.builder.memory_spaces
+        if getattr(spaces, "owners", None) is None or not space:
+            return False
+        owner = _memory_owner(context.root.run)
+        if not spaces.needs_consent(space, owner):
+            return False
+        for run in [context.run, *self._ancestor_runs(context)]:
+            if not spaces.consented(space, owner, "workflow", run.workflow_id, self.consent_digest(run.workflow)):
+                # Review F3: the refused run is its owner's alone first, so its error (space, workflow) reaches no
+                # other member; the space is recorded, so a continuation needs the consent too.
+                self.mark_memory_owner(context, space)
+                raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
+        return True
+
+    def check_memory_flow(self, context: _RunContext) -> None:
+        """Before a run executes in a tree that already used a person's memory space (RT-089d): a sub-workflow's or a
+        team's run, a paused run that continues, a continued failed run. Its workflow needs the owner's consent for
+        every space the tree used (``Run.memory_spaces``), so the memory never reaches workflow content its owner
+        did not allow, also after the owner revoked a consent. A tree marked for a person without recorded spaces
+        (a run from before RT-089d) fails closed."""
+        spaces = context.env.builder.memory_spaces
+        top = context.root.run
+        owner = top.memory_owner
+        if getattr(spaces, "owners", None) is None or owner is None or owner == NOBODY:
+            return
+        run = context.run
+        # Review F3: a run of a private tree is private before anything else (also when it is refused here).
+        self.mark_memory_owner(context)
+        if not top.memory_spaces:
+            raise consent_required("", workflow_id=run.workflow_id, workflow_name=run.workflow_name)
+        digest = self.consent_digest(run.workflow)
+        for space in top.memory_spaces:
+            if not spaces.consented(space, owner, "workflow", run.workflow_id, digest):
+                raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
 
     def _check_egress(self, context: _RunContext, node_id: str, model: str, server_tools: Sequence[str] = ()) -> None:
         """Before each model request of a turn that holds content of a granted source (N-08): a cloud ``model`` needs
@@ -1680,6 +1781,31 @@ class RunManager:
             tool_sandbox=self.tool_sandbox,
             tool_marker=self.tool_marker,
         )
+
+    def consent_digest(self, workflow: Workflow) -> str:
+        """The digest a memory consent covers for ``workflow`` as a run executes it (pinned; RT-089d): its content,
+        its agents' means (:attr:`consent_means`) and, for a sub-workflow or team that has no saved version (it would
+        run its current content), that content's digest too, recursively."""
+        return self._consent_digest(workflow, frozenset())
+
+    def _consent_digest(self, workflow: Workflow, seen: frozenset[str]) -> str:
+        own = workflow_digest(workflow, self.consent_means)
+        seen = seen | {workflow.id}
+        refs = [ref for node in workflow.nodes for ref in graph.workflow_refs(node)]
+        unsaved = {ref.workflow_id for ref in refs if ref.version is None}
+        children: dict[str, str] = {}
+        for child_id in sorted(unsaved - seen):
+            try:
+                child, _number = self.resolve_workflow(child_id, None)
+            except (KeyError, NodestroError):
+                children[child_id] = "missing"
+                continue
+            children[child_id] = self._consent_digest(self.pin_subworkflows(child), seen)
+        return with_children(own, children)
+
+    def agent_consent_digest(self, config: AgentConfig) -> str:
+        """The digest a memory consent covers for an agent test of ``config`` (RT-089d)."""
+        return agent_digest(config, self.consent_means)
 
     def pin_subworkflows(self, workflow: Workflow) -> Workflow:
         """A copy whose sub-workflow nodes name the exact version they will run."""
@@ -2702,17 +2828,29 @@ class RunManager:
             state = context.run.nodes.get(node_id)
             if state is not None and state.iteration:
                 data.setdefault("iteration", list(state.iteration))
+        self._emit_to(context, context.run.id, kind, node_id, data)
+
+    def _emit_to(
+        self,
+        context: _RunContext,
+        run_id: str,
+        kind: str,
+        node_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """:meth:`_emit` for the run ``run_id`` of ``context``'s tree (a run above it, RT-089d)."""
+        data = {} if data is None else data
         loop = context.root.loop or self._loop
         if loop is None or context.root.fenced_out:
             # No loop yet: called outside a run (e.g. cancelling a stored run); nobody listens. Or the run is no
             # longer this process's (C-06): its stream belongs to whoever has it now.
             return
         if _in_loop(loop):
-            self._publish(context.run.id, kind, node_id, data)
+            self._publish(run_id, kind, node_id, data)
         else:
             # A closed loop (the application stopped) has no listeners left.
             with suppress(RuntimeError):
-                loop.call_soon_threadsafe(self._publish, context.run.id, kind, node_id, data)
+                loop.call_soon_threadsafe(self._publish, run_id, kind, node_id, data)
 
     def _publish(self, run_id: str, kind: str, node_id: str | None, data: dict[str, Any]) -> None:
         if run_id in self._deleted_events:
@@ -2809,6 +2947,8 @@ class RunManager:
                 context, "workflow", "workflow.started", resource_type="workflow", resource_id=run.workflow_id
             )
         try:
+            # RT-089d: a run in a tree that used a person's memory space runs only with the owner's consent.
+            self.check_memory_flow(context)
             while True:
                 await self._run_graph(context)
                 if context.resume_requested and not context.cancelled.is_set():
@@ -5214,9 +5354,11 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         try:
-            # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read.
+            # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read;
+            # RT-089d: only with its owner's consent for this workflow content (and every run above this one).
             if config.memory.mode == "persistent":
-                self.mark_memory_owner(context)
+                consented = self.check_memory_consent(context, config.memory.space)
+                self.mark_memory_owner(context, config.memory.space if consented else None)
             # N-08: what the step gets before its first request (attached files, knowledge in the context).
             for source in start_sources(config, extra):
                 self.mark_granted(context, node_id, source)

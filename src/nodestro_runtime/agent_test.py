@@ -40,7 +40,8 @@ from .engine import (
     tool_rounds_problem,
     usage_of,
 )
-from .memory_spaces import NOBODY
+from .memory_consents import agent_digest
+from .memory_spaces import NOBODY, consent_required
 from .pricing import PricingService
 from .problems import Problem
 from .providers import Connection, check_model, provider_of
@@ -137,16 +138,27 @@ class AgentTester:
         #: The workspace's price catalog and price mode (PRICING-1).
         self.pricing: PricingService | None = None
         self.price_mode: Callable[[], PriceMode] = lambda: "standard"
+        #: What an agent uses outside its configuration, for the digest of a memory consent (RT-089d); the workspace
+        #: hands in the engine's (:attr:`~nodestro_runtime.engine.RunManager.consent_means`).
+        self.consent_means: Callable[[AgentConfig], Any] = lambda config: sorted(set(config.tools))
 
     def _memory(
         self, config: AgentConfig, actor: str = "system"
     ) -> tuple[AgentConfig, Callable[[], MemoryBackend], bool]:
         """Persistent memory becomes a writable copy, so a test never changes the space. The space must be the one of
-        the person who runs the test where spaces have owners (RT-089c); a test of nobody gets none there."""
+        the person who runs the test where spaces have owners (RT-089c); a test of nobody gets none there. RT-089d: and
+        its owner must have allowed exactly this configuration (its digest) to use it: a test of a shared workflow's
+        agent runs that agent's tools with the owner's memory, so without the consent it fails with
+        ``memory.consent_required`` before anything is read."""
         if config.memory.mode != "persistent" or not config.memory.space:
             return config, EphemeralMemory, False
         owner = actor if is_person(actor) else NOBODY
-        space = self.builder.memory_spaces.open_for(config.memory.space, owner)
+        spaces = self.builder.memory_spaces
+        if spaces.needs_consent(config.memory.space, owner) and not spaces.consented(
+            config.memory.space, owner, "agent", None, agent_digest(config, self.consent_means)
+        ):
+            raise consent_required(config.memory.space, subject="agent")
+        space = spaces.open_for(config.memory.space, owner)
         files = {entry.path: space.read(entry.path) for entry in space.entries()}
         isolated = config.model_copy(deep=True)
         isolated.memory.mode = "run"

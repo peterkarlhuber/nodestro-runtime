@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 9 |
+| P2 Medium | 10 |
 | P3 Low | 36 |
 | P4 Optional | 15 |
 
@@ -40,6 +40,29 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+### RT-089d · Private memory spaces: the owner's consent, private runs in every channel, open name questions
+
+- **Priority:** P2 Medium · **Status:** In review · **Refs:** RT-089c, [docs/memory-consents.md](memory-consents.md),
+  `memory_consents`, `MemorySpaces.grant`/`consented`/`revoke`, `tests/test_memory_consents.py`, nodestro-api
+  `/api/memory-consents`
+- **Done:** a workflow (and an agent test) uses a person's space only with that person's explicit consent for exactly
+  its content (digest, pinned sub-workflows, and the custom tools, connections and MCP servers its agents use);
+  runs above the step and runs after it in the same tree need it too; a revoked consent stops paused and continued
+  runs; a continued run and a refused run stay private. Private runs notify their owner only (local inbox, server
+  inbox; budget questions by their top-level run) and every run above the step is marked and gets `memory_private`.
+- **Open:**
+  - name squatting: a space name is its first writer's (writing a file or giving a consent claims it). Proposed:
+    per-person namespaces in the interface, or an operator reservation; never an automatic reassignment;
+  - spaces (and consents) of removed members stay theirs and locked. Proposed: an operator command that lists them
+    and transfers or deletes one explicitly and audited, like `memory backfill-owners`;
+  - a run above the step that this process does not hold (only possible across processes) is not marked itself;
+    its visibility follows the top-level run's mark;
+  - a running step that already passed its check finishes after a revocation (the next check refuses);
+  - Axentra inbox messages are filtered when they are sent, not when they are read (one sent before a run became
+    private stays in the recipient's inbox);
+  - the studio has no page yet to review, grant and revoke consents (the API and the error texts exist).
+- **Next step:** review of the fixes (F1-F5); studio consent page; owner decision on squatting and removed members.
 
 ### RT-086 · Access model v2 (N-06): api query, studio cards and the remaining call sites
 
