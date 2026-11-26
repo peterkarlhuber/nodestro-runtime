@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 import time
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from orkexa.fs import PDF_SUFFIXES, FsError, SafeRoot, TextBudget, display_name
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -47,6 +47,9 @@ from .tool_policy import (
     Grant,
     evaluate,
 )
+
+if TYPE_CHECKING:
+    from .folder_index import FolderIndex
 
 #: The switch of folder grants and the folder tools. Off unless set to ``1``; activating it is an owner decision
 #: after the independent review of N-10.
@@ -126,7 +129,8 @@ class FolderGrant(BaseModel):
     limits: FolderLimits = FolderLimits()
     #: Leave out :data:`DEFAULT_EXCLUDES` (the common secret files); only an administrator turns this off.
     default_excludes: bool = True
-    #: The person asked for a search index of the folder. Stored only: indexing granted folders is a later step.
+    #: Keep a search index of the folder (N-12, :mod:`nodestro_runtime.folder_index`): ``search_files`` then
+    #: searches the index (ranked passages, PDF text too) instead of reading every file.
     index: bool = False
     #: The access grant (N-06) that holds duration, expiry, scope, mode and revocation.
     grant_id: str
@@ -179,12 +183,32 @@ class FileText:
     pages: int | None = None
 
 
+def safe_root(
+    folder: FolderGrant, protected: str, *, on_open: Callable[[tuple[str, ...]], None] | None = None
+) -> SafeRoot:
+    """The path guard of a folder grant: its folder with its patterns (and the default excludes), its limits, its
+    identity as granted, Nodestro's data folder ``protected``."""
+    limits = folder.limits
+    return SafeRoot(
+        folder.path,
+        include=folder.include,
+        exclude=(*DEFAULT_EXCLUDES, *folder.exclude) if folder.default_excludes else folder.exclude,
+        protected=[protected],
+        max_file_bytes=limits.max_file_bytes,
+        max_entries=limits.max_entries,
+        expect_identity=folder.identity,
+        on_open=on_open,
+    )
+
+
 class FolderReader:
     """The folder tools' access for one caller: lists, reads and searches granted folders (module documentation).
 
     ``records`` returns the access grants and denies active now (read and handed in by the
     workspace: this module never writes records). ``protected`` is Nodestro's data folder. ``on_read`` is told the
-    folder name, grant id and relative path of every file read, so the run can name its sources."""
+    folder name, grant id and relative path of every file read, so the run can name its sources. ``index`` holds the
+    search indexes of granted folders (N-12); ``embedding_check`` is the run's check before a search embeds its
+    query (N-08)."""
 
     def __init__(
         self,
@@ -195,6 +219,8 @@ class FolderReader:
         caller: FolderCaller,
         clock: Callable[[], datetime],
         on_read: Callable[[FolderGrant, FileText], None] | None = None,
+        index: FolderIndex | None = None,
+        embedding_check: Callable[[str | None], None] | None = None,
     ) -> None:
         self.store = store
         self.records = records
@@ -202,6 +228,8 @@ class FolderReader:
         self.caller = caller
         self.clock = clock
         self.on_read = on_read
+        self.index = index
+        self.embedding_check = embedding_check
 
     # ---- what the caller may use ----------------------------------------------------------------------------
 
@@ -258,17 +286,7 @@ class FolderReader:
         return named[0]
 
     def _root(self, folder: FolderGrant) -> SafeRoot:
-        limits = folder.limits
-        return SafeRoot(
-            folder.path,
-            include=folder.include,
-            exclude=(*DEFAULT_EXCLUDES, *folder.exclude) if folder.default_excludes else folder.exclude,
-            protected=[self.protected],
-            max_file_bytes=limits.max_file_bytes,
-            max_entries=limits.max_entries,
-            expect_identity=folder.identity,
-            on_open=self._opened(folder),
-        )
+        return safe_root(folder, self.protected, on_open=self._opened(folder))
 
     def _opened(self, folder: FolderGrant) -> Callable[[tuple[str, ...]], None]:
         """The path guard's ``on_open``: the access model for the names the file system stored for what is
@@ -375,7 +393,12 @@ class FolderReader:
         and every file and subfolder in it before it is read or queued, so a deny on an exact file or one added
         during the search holds; the matches are checked once more before they are returned. A search stops at the
         grant's limits, at :data:`MAX_PENDING` queued folders and after :data:`SEARCH_SECONDS` (checked before every
-        folder and every entry) and then returns what it found as ``truncated``."""
+        folder and every entry) and then returns what it found as ``truncated``.
+
+        A folder with a ready search index (N-12, ``FolderGrant.index``) is searched in its index instead: the best
+        passages of its text and PDF files, ranked like the knowledge search, each match with ``page`` for a PDF and
+        ``line`` ``None``; the result says ``index``. The matches are checked against the access model and the path
+        guard after the search, so a deny or a revocation meanwhile leaves nothing."""
         needle = query.strip().casefold()
         with self._call("search") as slot:
             folder, root = self._open(slot, name)
@@ -384,6 +407,9 @@ class FolderReader:
             limits = folder.limits
             start = "/".join(root.check(path, kind="dir"))
             self._check(folder, _join(root, start))
+            indexed = self._search_index(folder, root, query.strip(), start)
+            if indexed is not None:
+                return folder, indexed
             deadline = time.monotonic() + SEARCH_SECONDS
             matches: list[dict[str, Any]] = []
             skipped: list[dict[str, str]] = []
@@ -454,6 +480,34 @@ class FolderReader:
             if skipped:
                 result["skipped"] = skipped
             return folder, result
+
+    def _search_index(self, folder: FolderGrant, root: SafeRoot, query: str, start: str) -> dict[str, Any] | None:
+        """The index search of :meth:`search`; ``None`` when the folder has no ready index."""
+        if self.index is None:
+            return None
+        hits = self.index.search(
+            folder, query, below=start, k=folder.limits.max_results, before_embed=self.embedding_check
+        )
+        if hits is None:
+            return None
+        # Revoked or denied while the index was searched: nothing of it is returned.
+        self._check(folder, _join(root, start))
+        allowed = self._allowed_below(folder)
+        matches: list[dict[str, Any]] = []
+        for hit in hits:
+            try:
+                parts = root.check(hit.path, kind="file")  # the grant's patterns and the name rules hold too
+            except (FsError, FolderError):
+                continue
+            if not allowed(_join(root, parts)):
+                continue
+            name = hit.path.rsplit("/", 1)[-1]
+            match = _match(display_name(name), _shown(hit.path), None, hit.text)
+            if hit.page is not None:
+                match["page"] = hit.page
+            matches.append(match)
+        files = len({match["path"] for match in matches})
+        return {"matches": matches, "files_searched": files, "truncated": False, "index": True}
 
 
 #: The longest one search may take (seconds); it then returns what it found as ``truncated``.
@@ -529,4 +583,5 @@ __all__ = [
     "FolderLimits",
     "FolderReader",
     "folders_enabled",
+    "safe_root",
 ]

@@ -14,6 +14,7 @@ Modules:
 - `nodestro_runtime.folders`: the records and the reader.
 - `nodestro_runtime.folder_grants`: the writer, used by the api only.
 - `nodestro_runtime.folder_tools`: the tools.
+- `nodestro_runtime.folder_index`: the search index of a folder grant with `index` (N-12, see "The search index").
 
 ## The grant
 
@@ -171,6 +172,62 @@ A PDF is extracted in an isolated process with these budgets (`orkexa.fs.TextBud
 folder and every entry, also in a tree without files. It queues at most 10,000 folders (`MAX_PENDING`); deeper ones
 are then left out. Either way it returns what it found as `truncated`. Binary files are not read (`fs.unsupported_type`).
 
+## The search index (N-12)
+
+A grant with `index` set keeps a search index of the folder (`nodestro_runtime.folder_index`). It lives in the
+knowledge base's search index (`KnowledgeBase`), one index source per file (`folder:<folder grant id>/<path>`), and
+never in its file store: a folder's files are no knowledge files, no knowledge list shows them, and no knowledge
+search returns them (an agent's knowledge view holds only the files assigned to it, a search without files only the
+knowledge files). Agents search it with `search_files`: a folder with a ready index is searched there instead of file
+by file (the best passages of its text files and PDFs, ranked like the knowledge search, `index: true`, `page` for a
+PDF). So every search is a call of the folder tools: the access model decides for the caller at that moment, the
+access log names the grant, and the run is marked as holding granted content (N-08, source `folder`).
+
+- **First index and changes.** `FolderIndex.sync` walks the folder through `orkexa.fs.SafeRoot` with the grant's
+  patterns, limits, identity and the default excludes, and reads text files (`.txt`, `.md`, `.markdown`, `.csv`,
+  `.json`, `.yaml`, `.yml`, `.html`, `.xml`) and PDFs (in the isolated extraction with the grant's page, time and memory
+  budgets); other types are left out. At most `max_search_files` files and 10,000 queued folders, at most 400 chunks
+  of one file (`MAX_FILE_CHUNKS`, which also bounds how long the index's write lock is held), and at most 50,000
+  chunks and 512 MiB of files of one folder (`MAX_FOLDER_CHUNKS`, `MAX_FOLDER_BYTES`); what is over a budget is left
+  out and the state says `truncated`.
+  A file whose size, modification time or change time differs from the manifest (collection `folder_index_files`) is
+  read again; its chunks are replaced only when its SHA-256 changed. Files that are gone, excluded, denied, too large
+  or no longer readable lose their chunks. The times are read with `os.stat` without following links, only as a hint
+  of a change; the content is read through the path guard.
+- **Rights stay on the grant.** Before each file's chunks are stored, the access grant is checked again inside the
+  knowledge base's write lock. A revocation (`DELETE /api/folders/{id}` or `DELETE /api/access/grants/{id}`) drops
+  the folder's chunks with their vectors and its manifest at once (`Workspace.folder_access_changed`,
+  `FolderIndex.drop_ended`); a sync running at that moment stores nothing more. An expiry is found by the indexer's
+  sweep (every 30 seconds), also between the files of a long sync of another folder. Until a chunk is gone, the
+  folder tools refuse the folder anyway, and every hit of an index search is checked again against the access model
+  (the caller's scope and denies) and the path guard after the search, so a search over a revoked folder, also one
+  already running, returns nothing. A deny on a subfolder holds at the next
+  search and leaves the index at the next sync. Denies that name agents keep a path out of the index for everyone (the
+  index serves the grant as a whole; who may search it is checked per call).
+- **Reconciliation.** `FolderIndexer` (a background thread on the desktop and in Nodestro Local Docker) runs
+  `FolderIndex.reconcile` at the start and every 5 minutes: ended grants and chunks without a grant are dropped,
+  every active grant with `index` is synced. A new grant is indexed at once (the API wakes the indexer).
+- **Egress (N-08, RT-094; review H-1).** Folder text is granted content, and its rule fails closed whatever the
+  other switches: it is embedded only when `KnowledgeBase.folder_embedding_allowed` (the workspace:
+  `RunManager.folder_embedding_allowed`) allows the address the embedding model really sends to. A server on this
+  computer (`localhost`, loopback; in Local Docker also `ollama`) always may; a server elsewhere only while the
+  provenance switch (`NODESTRO_CONTENT_PROVENANCE`, with the access model) is on and a person's grant on
+  `cloud_provider` `ollama` for all agents allows shared content (a refusal is audited). Otherwise, also with
+  approvals, the access model or provenance off, the text is indexed without vectors (full text finds it), an index
+  search does not embed its query (it runs in full text), and a rebuild of the semantic index for such a model removes
+  every folder index before it starts and stores no folder chunk while it runs (the indexer rebuilds them without
+  vectors at its next run). The rebuild is judged by its model's address alone, also when no folder is indexed yet
+  (review H-1b: a first index during the rebuild was embedded), and as a last guard its model refuses every batch
+  while the index holds a folder chunk (the rebuild then fails, nothing is sent). When the query may be embedded, an
+  index search in vector or hybrid mode also asks the run's check first (`RunServices.embedding_check`), like a
+  knowledge search; without a semantic index it searches in full text.
+- **Copies.** The copy of the database made before a schema migration (`<data dir>/backups/pre-migration-*.db`)
+  holds no folder index (`storage.strip_copy`, review L-b); backups, the safety backup before a restore and the data
+  export leave it out in the API (its `docs/backup.md`). The index is built again from the folder while the grant
+  holds.
+- **Switch.** The index exists only while `NODESTRO_FOLDER_GRANTS=1` and never in the server profile. With the switch
+  off, the workspace removes every folder index at its start.
+
 ## Tests
 
 - `tests/test_folders.py`: the grant rules, the tools, the refusals, the switch, the capability, the PDF budget and
@@ -182,10 +239,20 @@ are then left out. Either way it returns what it found as `truncated`. Binary fi
   size limit, revocation, expiry, a replaced folder, Unicode names, a person's denies on a file and a subfolder
   in any spelling, the grant's scope and mode, and the access log.
 - CI runs `tests/test_folders.py` on Linux, macOS and Windows (`.github/workflows/platforms.yml`).
+- `tests/test_folder_index.py` (N-12): first index, change by time and hash, a touch without a change, deletion, a
+  deny, revocation (also during a search and during a sync), expiry, the reconciliation at the start, the switch
+  turned off, that knowledge searches never return a folder's chunks, the file and folder budgets, and the sweep
+  during a long sync. `tests/test_content_provenance.py`: an index search marks the run; folder text and a marked
+  run's query reach an embedding server elsewhere only with a grant, in every combination of the approvals, access
+  and provenance switches (review H-1), a server on this computer embeds it in every combination, and a rebuild for a
+  server elsewhere drops the folder indexes first, a folder indexed for the first time while such a rebuild runs is
+  not embedded in any combination (review H-1b), and the rebuild's model stops at a folder chunk from any route.
+  `tests/test_folder_index.py` also covers the copy before a migration and the legacy vector table.
 
 ## Not in this step
 
-- Indexing a granted folder (`index` is stored only).
+- Indexing DOCX and XLSX files of a granted folder (the knowledge upload converts them; the index reads text and PDF
+  files only), and showing a folder index's state (`folder_index_state`) on the folders page.
 - An opt-in for files with several hard links.
 - Writing to a granted folder.
 - On macOS, the access model's system folders include `/private/var`, so a folder below the temporary folder

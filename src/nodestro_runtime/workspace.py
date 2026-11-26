@@ -62,10 +62,13 @@ from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import EMBEDDING_PROVIDER, RunManager
 from .extensions import Extensions, Integration, discover
+from .folder_index import FILES as FOLDER_INDEX_FILES
+from .folder_index import STATES as FOLDER_INDEX_STATES
+from .folder_index import FolderIndex, FolderIndexer
 from .folder_tools import FOLDER_TOOLS
 from .folders import folders_enabled
 from .input_files import FileCatalog, InputFiles
-from .knowledge import KnowledgeBase, KnowledgeTables
+from .knowledge import FOLDER_SOURCE, KnowledgeBase, KnowledgeTables
 from .launcher import launch
 from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL, SelectionPreferences
 from .local_service import LocalModelService
@@ -128,7 +131,7 @@ from .schemas import (
 )
 from .server_settings import TenantSecrets, is_encrypted
 from .skills import Skills
-from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store
+from .storage import BeforeMigration, DocumentStore, SQLiteStore, Store, strip_copy
 from .tool_adoption import audit_revocation
 from .tool_approvals import (
     AccessRules,
@@ -256,13 +259,16 @@ def _lock(descriptor: int) -> None:
 def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, target: int) -> Path:
     """Copy the whole database to ``directory`` before migrating it from ``current`` to ``target``; the copy's path.
 
-    The copy is written under a temporary name and renamed when complete, so a backup that exists is whole."""
+    The copy is written under a temporary name and renamed when complete, so a backup that exists is whole. It holds no
+    granted folder's index (N-12 review L-b): the copy outlives a revocation, and the index is built again from the
+    folder while its grant holds (:func:`~nodestro_runtime.storage.strip_copy`)."""
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     target_path = directory / f"pre-migration-{current}-to-{target}-{stamp}.db"
     partial = target_path.with_suffix(".db.partial")
     try:
         store.snapshot(partial)
+        strip_copy(partial, FOLDER_SOURCE, (FOLDER_INDEX_FILES, FOLDER_INDEX_STATES))
         partial.replace(target_path)
     except BaseException:
         partial.unlink(missing_ok=True)
@@ -432,6 +438,10 @@ class Workspace:
             # RT-089c: on a server every memory space has one owner (the tenant's store records them).
             self.memory = MemorySpaces(storage.memory, owners=storage.store)
         self.knowledge.activity = self.store  # uploads and deletions go to the activity log
+        # N-12: only an installation on this computer can index granted folders; its knowledge search stays limited
+        # to the knowledge files.
+        self._folders_here = storage is None and self.profile.kind != "server"
+        self.knowledge.folder_sources = self._folders_here
         # A server's own environment variables belong to no tenant: its tenants use only their stored keys.
         self._environ: Mapping[str, str] | None = None if storage is None else {}
         self._endpoints: tuple[str, ...] | None = None if storage is None else storage.endpoints
@@ -525,6 +535,9 @@ class Workspace:
             EMBEDDING_PROVIDER, shared_content=True, endpoint=address or ""
         )
         self.knowledge.embedding_address = self._embedding_address
+        # N-12 review H-1: granted folder text is embedded only on this computer, or elsewhere with provenance on and a
+        # grant; never merely because a switch is off.
+        self.knowledge.folder_embedding_allowed = self.runs.folder_embedding_allowed
         # The internal inbox (NAL-A3): everywhere but on a server whose Axentra inbox is on (that stays the only one).
         self.inbox: LocalInbox | None = None
         if local_inbox_enabled(server=storage is not None):
@@ -533,10 +546,22 @@ class Workspace:
             self.runs.listeners.append(self.runs.notifier)
         #: The access grants and denies active now (N-06), read at every use by the tool gate and the folder tools.
         access_records = AccessRules(self.store).current
+        #: The search indexes of granted folders (N-12) and the thread that keeps them current; ``None`` while the
+        #: folder switch is off or on a server.
+        self.folder_index: FolderIndex | None = None
+        self.folder_indexer: FolderIndexer | None = None
         if folders_enabled():
             # N-10: the folder tools read granted folders (their own switch, default off).
             self.runs.folder_records = access_records
             self.runs.protected_folder = str(self.data_dir.resolve())
+            if self._folders_here:
+                self.folder_index = FolderIndex(
+                    self.store, self.knowledge, records=access_records, protected=str(self.data_dir.resolve())
+                )
+                self.folder_indexer = FolderIndexer(self.folder_index)
+                self.runs.folder_index = self.folder_index
+                # A reindex whose model may not embed folder text drops every folder index first (rebuilt after it).
+                self.knowledge.folder_reset = self.folder_index.purge
         if approvals_enabled():
             # Per-call tool approvals (S-2): off unless switched on explicitly (after the security acceptance).
             self.runs.tool_gate = ToolGate(
@@ -658,6 +683,17 @@ class Workspace:
                 self.python.recover()
             except Exception:  # housekeeping; it never stops Nodestro from starting
                 logging.getLogger(__name__).exception("Recovering interrupted Python installations failed")
+            # N-12: the folder indexes are reconciled in the background (ended grants dropped, changes indexed);
+            # with the switch off nothing of a granted folder stays in the index.
+            try:
+                if self.folder_indexer is not None:
+                    self.folder_indexer.start()
+                elif self._folders_here:
+                    FolderIndex(
+                        self.store, self.knowledge, records=lambda: ((), ()), protected=str(self.data_dir.resolve())
+                    ).purge()
+            except Exception:  # housekeeping; it never stops Nodestro from starting
+                logging.getLogger(__name__).exception("Reconciling the folder indexes failed")
         # Uploads nobody used (e.g. a run dialog that was closed) are removed after a day.
         try:
             self.inputs.cleanup()
@@ -744,6 +780,8 @@ class Workspace:
             )
             for run_id in live:
                 self.runs.cancel(run_id)
+        if self.folder_indexer is not None:
+            self.folder_indexer.stop()
         self.mcp.hub.close()
         self.local_models.close()
         self.knowledge.close()
@@ -751,6 +789,16 @@ class Workspace:
         self.store.close()
         if self._directory_lock is not None:
             self._directory_lock.release()
+
+    def folder_access_changed(self, folder_id: str | None = None) -> None:
+        """A person granted or revoked a folder, or changed an access grant or deny (N-12): the index of every folder
+        grant that ended is dropped now, and the indexes are brought up to date soon (``folder_id``: only that one).
+        Nothing happens while folder grants are off."""
+        if self.folder_index is None:
+            return
+        self.folder_index.drop_ended()
+        if self.folder_indexer is not None:
+            self.folder_indexer.wake(folder_id)
 
     async def aclose(self) -> None:
         """Cancel the runs of this process, wait until they stored their final state, then :meth:`close`."""

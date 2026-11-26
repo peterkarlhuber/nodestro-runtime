@@ -97,6 +97,7 @@ from .conditions import APPROVED, MISSING, REJECTED, decide, lookup, rule_proble
 from .cost_tracking import PricedTracker, PriceMode, request_regions, stale_requests
 from .file_delivery import TOOL_NAME as FILES_TOOL_NAME
 from .file_delivery import collect, deliver
+from .folder_index import FolderIndex
 from .folders import FileText, FolderCaller, FolderGrant, FolderReader
 from .forms import FileRef, field_problems, name_of, prepare, prompt_values
 from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, feeding_nodes, ports
@@ -1085,6 +1086,8 @@ class RunManager:
         #: folder grants are switched off. ``protected_folder`` is Nodestro's data folder.
         self.folder_records: Callable[[], tuple[Sequence[tool_policy.Grant], Sequence[tool_policy.Deny]]] | None = None
         self.protected_folder: str | None = None
+        #: The search indexes of granted folders (N-12); ``None``: folders are searched file by file.
+        self.folder_index: FolderIndex | None = None
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
@@ -1378,6 +1381,27 @@ class RunManager:
         if not self.provenance_on() or not address:
             return False
         return not offline.is_local_endpoint(address, docker=self.builder.mode == "local-container")
+
+    def folder_embedding_allowed(self, address: str | None) -> bool:
+        """Whether granted folder text (N-12) may be embedded by the model at ``address`` (the address it really sends
+        to), fail closed whatever the switches (N-12 review H-1): a server on this computer, or one elsewhere only while
+        the provenance switch (with the access model) is on and a grant on ``cloud_provider`` ``ollama`` allows
+        shared content. No address (an injected model) counts as this computer, as in :meth:`embedding_leaves`.
+        A refusal by the access model is audited as :meth:`check_cloud_access` audits it."""
+        if not address or offline.is_local_endpoint(address, docker=self.builder.mode == "local-container"):
+            return True
+        gate = self.tool_gate
+        if gate is None or not gate.provenance:
+            return False
+        try:
+            # The grant a person gives for the knowledge embeddings (RT-094): an unattended grant always names agents,
+            # and the folder index embeds for no agent.
+            self.check_cloud_access(EMBEDDING_PROVIDER, shared_content=True, endpoint=address)
+        except NodestroError as exc:
+            if not exc.code.startswith("access."):
+                raise
+            return False
+        return True
 
     def holds_granted(self, context: _RunContext) -> bool:
         """Whether this execution holds content of a granted source (N-08): its top-level run is marked, or the
@@ -4984,7 +5008,18 @@ class RunManager:
             run_id=context.run.id,
             node_id=node_id,
         )
-        return FolderReader(self.store, records=records, protected=protected, caller=caller, clock=now, on_read=read)
+        return FolderReader(
+            self.store,
+            records=records,
+            protected=protected,
+            caller=caller,
+            clock=now,
+            on_read=read,
+            index=self.folder_index,
+            # N-08: a search of a folder's index that embeds its query asks the run's check first, as a knowledge
+            # search does (an embedding server elsewhere needs a grant once the run holds granted content).
+            embedding_check=lambda address: self._check_embedding(context, node_id, address),
+        )
 
     def _draft_files(self, top: Run, node_id: str) -> tuple[Any, Any]:
         """``save_file`` and ``run_file`` of the draft tools (NAL-A4): drafts belong to the top-level run (the run a

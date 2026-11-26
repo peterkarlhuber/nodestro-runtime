@@ -20,6 +20,7 @@ import contextvars
 import dataclasses
 from datetime import timedelta
 import functools
+import itertools
 import json
 from pathlib import Path
 import socket
@@ -35,7 +36,7 @@ from nodestro_runtime.agent_templates import AgentTemplates
 from nodestro_runtime.connections import ConnectionIn, connection_type
 from nodestro_runtime.conversations import AgentChoice, ConversationIn, MessageIn
 from nodestro_runtime.folder_grants import FolderGrants
-from nodestro_runtime.folders import FOLDERS_ENV
+from nodestro_runtime.folders import COLLECTION, FOLDERS_ENV, FolderGrant
 from nodestro_runtime.local_models import LOCAL_DEFAULT_MODEL
 from nodestro_runtime.mcp.models import SERVERS, TOOLS, McpServer, McpTool, ToolDefinition
 from nodestro_runtime.problems import NodestroError
@@ -1345,3 +1346,302 @@ async def test_an_embedding_model_built_for_another_address_is_built_again_befor
     assert refused.value.code.startswith("access.")
     knowledge.add(f"More minutes {SECRET}".encode(), name="more.md")  # indexed without vectors
     assert not [item for item in sent if item[0] == remote and SECRET in item[1]], sent
+
+
+# ---- folder indexes (N-12) ------------------------------------------------------------------------------------------
+
+
+def _grant_indexed(workspace: Workspace, docs: Path) -> str:
+    """The folder granted with a search index, indexed now (the background indexer would do it soon)."""
+    view = FolderGrants(workspace.store, str(workspace.data_dir.resolve())).grant(
+        name="Docs", path=str(docs), by=PERSON, mode="unattended", index=True
+    )
+    assert workspace.folder_index is not None
+    state = workspace.folder_index.sync(view.folder.id)
+    assert state is not None and state.state == "ready"
+    return view.folder.id
+
+
+async def test_a_search_of_a_folder_index_marks_the_run(make: Make, docs: Path, network: Network) -> None:
+    """N-12: a folder's index is the folder's content: a run whose agent searches it holds granted content."""
+    workspace = make({}, {"INDEXED": [("search_files", {"folder": "Docs", "query": "budget"}), "done"]})
+    _grant_indexed(workspace, docs)
+    seen: list[Any] = []
+    workspace.runs.event_sink = seen.append
+    agent = AgentConfig(name="Indexed", system_prompt="INDEXED", model=LOCAL, tools=["search_files"])
+    run = await _finished(workspace, _chain(("indexed", agent)), trigger="schedule", trigger_ref="sch_1")
+    search = _calls(run, "indexed")["search_files"]
+    assert (
+        not search.is_error and json.loads(search.output or "{}")["index"] is True and SECRET in (search.output or "")
+    )
+    assert run.granted_content
+    marks = [event.data for event in seen if event.type == "content_provenance"]
+    assert [(mark["source"], mark["tool"]) for mark in marks] == [("folder", "search_files")]
+
+
+def test_a_folder_is_embedded_by_a_server_elsewhere_only_with_a_grant(make: Make, docs: Path, network: Network) -> None:
+    """N-12 with RT-094: a folder's text reaches an embedding server outside this computer only with a grant on
+    ``cloud_provider`` ``ollama``; without one it is indexed without vectors (full-text search finds it) and the
+    refusal is audited."""
+    from nodestro_runtime.folder_index import source_of
+
+    workspace = make()
+    model = _semantic(workspace, "hybrid")
+    _model_server(workspace, "https://gpu.example.com/v1")
+    folder_id = _grant_indexed(workspace, docs)
+    assert not any(SECRET in item for item in model.documents)
+    refusals = [item for item in audit_events(workspace.store) if item.kind == "access_refused"]
+    assert refusals and {item.details["resource_id"] for item in refusals} == {"ollama"}
+    assert workspace.knowledge.index_status().state == "incomplete"
+    source = source_of(folder_id, "plan.txt")
+    assert [hit.source for hit in workspace.knowledge.index.retrieve(SECRET, 5, mode="fts", sources=[source])] == [
+        source
+    ]
+    # With a grant the changed file is embedded.
+    AccessRules(workspace.store).grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    (docs / "plan.txt").write_text(f"{DOCUMENT}\nRevised.", encoding="utf-8")
+    assert workspace.folder_index is not None
+    workspace.folder_index.sync(folder_id)
+    assert any(SECRET in item for item in model.documents)
+
+
+async def test_a_marked_runs_folder_index_search_sends_no_query_to_an_embedding_server_elsewhere(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 with RT-094: after a folder read, a hybrid search of the folder's index would embed a query that may hold
+    the folder's content: an embedding server elsewhere needs a grant on ``cloud_provider`` ``ollama``. Without the
+    grant the folder text may go there with (review H-1), the search runs in full text; with it, the run needs its own
+    grant as well."""
+    from nodestro_runtime.engine import EMBEDDING_REFUSED
+
+    query = {"folder": "Docs", "query": "budget"}
+    turn = [tool_use("read_file", {"folder": "Docs", "path": "plan.txt"}), tool_use("search_files", query), text("ok")]
+    workspace = make({"INDEXED": turn * 3})
+    model = _semantic(workspace, "hybrid")
+    _grant_indexed(workspace, docs)  # embedded on this computer
+    _model_server(workspace, "https://gpu.example.com/v1")
+    _unattended(workspace, AccessResource(type="cloud_provider", id="anthropic"), ["submit"], "wf_n08/indexed")
+    agent = AgentConfig(name="Indexed", system_prompt="INDEXED", model=CLOUD, tools=["read_file", "search_files"])
+    flow = _chain(("indexed", agent))
+    model.queries.clear()
+    run = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    search = _calls(run, "indexed")["search_files"]
+    assert run.nodes["indexed"].status == "succeeded", run.nodes["indexed"].error
+    assert not search.is_error and json.loads(search.output or "{}")["index"] is True  # in full text
+    assert model.queries == []
+    AccessRules(workspace.store).grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    refused = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    search = _calls(refused, "indexed")["search_files"]
+    assert search.is_error and search.output == EMBEDDING_REFUSED
+    assert model.queries == []
+    _unattended(workspace, AccessResource(type="cloud_provider", id="ollama"), ["submit"], "wf_n08/indexed")
+    granted = await _finished(workspace, flow, trigger="schedule", trigger_ref="sch_1")
+    assert not _calls(granted, "indexed")["search_files"].is_error
+    assert model.queries == ["budget"]
+
+
+#: Every combination of the switches beside the folder switch (N-12 review H-1).
+_SWITCH_COMBINATIONS = [
+    combination
+    for size in range(4)
+    for combination in itertools.combinations((ENABLE_ENV, ACCESS_ENV, PROVENANCE_ENV), size)
+]
+
+
+def _switched_workspace(base: Path, monkeypatch: pytest.MonkeyPatch, on: tuple[str, ...]) -> Workspace:
+    for name in (ENABLE_ENV, ACCESS_ENV, PROVENANCE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    for name in (FOLDERS_ENV, *on):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    return Workspace(base / "data", client_factory=lambda _provider: ScriptedClient({}), integrations=[])
+
+
+def _wait_for_reindex(workspace: Workspace) -> None:
+    import time
+
+    for _ in range(250):
+        if not workspace.knowledge.reindexing():
+            return
+        time.sleep(0.02)
+    raise AssertionError("the reindex did not end")
+
+
+@pytest.mark.parametrize("on", _SWITCH_COMBINATIONS, ids=lambda on: "+".join(on) or "folders-only")
+def test_folder_text_reaches_no_embedding_server_elsewhere_without_a_grant_whatever_the_switches(
+    base: Path, docs: Path, network: Network, monkeypatch: pytest.MonkeyPatch, on: tuple[str, ...]
+) -> None:
+    """N-12 review H-1 (regression): with only the folder switch on, or with approvals, access model or provenance off,
+    nothing judged the embedding server, and a granted folder's text went to a server elsewhere. Now it is indexed
+    without vectors in every combination: the first index, a folder search's query and a reindex send nothing."""
+    workspace = _switched_workspace(base, monkeypatch, on)
+    try:
+        model = _semantic(workspace, "hybrid")
+        _model_server(workspace, "https://gpu.example.com/v1")
+        folder_id = _grant_indexed(workspace, docs)
+        assert not any(SECRET in item for item in model.documents)
+        index = workspace.folder_index
+        assert index is not None
+        folder = workspace.store.get(COLLECTION, folder_id, FolderGrant)
+        assert folder is not None
+        model.queries.clear()
+        hits = index.search(folder, SECRET)
+        assert hits and model.queries == []  # found in full text, the query was not embedded
+        try:  # a reindex would embed every chunk the index holds
+            workspace.knowledge.start_reindex()
+        except NodestroError as exc:
+            assert exc.code.startswith("access.")  # refused for the knowledge as well (provenance on)
+        _wait_for_reindex(workspace)
+        index.sync(folder_id)  # rebuilt after it, without vectors
+        assert index.search(folder, SECRET)
+        assert not any(SECRET in item for item in model.documents)
+    finally:
+        workspace.close()
+
+
+@pytest.mark.parametrize("on", _SWITCH_COMBINATIONS, ids=lambda on: "+".join(on) or "folders-only")
+def test_folder_text_is_embedded_by_a_server_on_this_computer_whatever_the_switches(
+    base: Path, docs: Path, network: Network, monkeypatch: pytest.MonkeyPatch, on: tuple[str, ...]
+) -> None:
+    """N-12 review H-1: a model server on this computer embeds a granted folder's text (no grant needed)."""
+    workspace = _switched_workspace(base, monkeypatch, on)
+    try:
+        model = _semantic(workspace, "hybrid")
+        _model_server(workspace, "http://127.0.0.1:11434/v1")
+        _grant_indexed(workspace, docs)
+        assert any(SECRET in item for item in model.documents)
+    finally:
+        workspace.close()
+
+
+def test_a_reindex_for_a_server_elsewhere_drops_the_folder_index_and_stores_none_while_it_runs(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 review H-1: a reindex embeds every chunk the index holds, so one for a model that may not embed folder text
+    removes the folder's chunks first; a sync while it runs stores none and the next one rebuilds them."""
+    from nodestro_runtime.knowledge import FOLDER_SOURCE
+
+    workspace = make()
+    model = _semantic(workspace, "hybrid")
+    folder_id = _grant_indexed(workspace, docs)  # embedded on this computer
+    where = _model_server(workspace, "http://127.0.0.1:11434/v1")
+    knowledge = workspace.knowledge
+    assert any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    where["url"] = "https://gpu.example.com/v1"
+    AccessRules(workspace.store).grant(  # the knowledge files may go there, the folder's text may not
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    knowledge.folder_embedding_allowed = lambda address: not address or "gpu.example.com" not in address
+    model.documents.clear()
+    knowledge.start_reindex()
+    assert not any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    index = workspace.folder_index
+    assert index is not None and index.state(folder_id) is None
+    _wait_for_reindex(workspace)
+    # While such a reindex runs, a sync stores nothing (the reindex would embed it) and keeps the state.
+    knowledge.reindexing = lambda: True  # type: ignore[method-assign]
+    knowledge._reindex_folders = False
+    waiting = index.sync(folder_id)
+    assert waiting is not None and waiting.state == "indexing"
+    assert not any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    del knowledge.reindexing
+    knowledge._reindex_folders = True  # as at the end of a reindex
+    state = index.sync(folder_id)
+    assert state is not None and state.state == "ready" and state.chunks
+    assert any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    assert not any(SECRET in item for item in model.documents)
+
+
+class _ReindexHook(CountedEmbeddings):
+    """A model of another build (a reindex switches to it) that runs ``hook`` before its first batch."""
+
+    def __init__(self, hook: Callable[[], object]) -> None:
+        super().__init__()
+        self.hook = hook
+        self.fired = False
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not self.fired:
+            self.fired = True
+            self.hook()
+        return super().embed_documents(texts)
+
+    def identity(self) -> Any:
+        from orkexa.embeddings import EmbeddingIdentity
+
+        return EmbeddingIdentity(provider="test", model="counted:1", dimensions=3, digest="second-build")
+
+
+@pytest.mark.parametrize("on", _SWITCH_COMBINATIONS, ids=lambda on: "+".join(on) or "folders-only")
+def test_a_folder_indexed_first_while_a_reindex_runs_reaches_no_embedding_server_elsewhere(
+    base: Path, docs: Path, network: Network, monkeypatch: pytest.MonkeyPatch, on: tuple[str, ...]
+) -> None:
+    """N-12 review H-1b (regression): a reindex started before a folder had any chunk did not hold the folder index
+    back, so a first sync while it ran stored chunks without vectors and the reindex embedded them at a server
+    elsewhere. The reindex model's address alone decides: the sync waits, and runs after the reindex."""
+    workspace = _switched_workspace(base, monkeypatch, on)
+    try:
+        _semantic(workspace, "hybrid")
+        _model_server(workspace, "https://gpu.example.com/v1")
+        view = FolderGrants(workspace.store, str(workspace.data_dir.resolve())).grant(
+            name="Docs", path=str(docs), by=PERSON, mode="unattended", index=True
+        )
+        index = workspace.folder_index
+        assert index is not None
+        during: list[Any] = []
+        model = _ReindexHook(lambda: during.append(index.sync(view.folder.id)))
+        workspace.knowledge.embedding_model = lambda _name: model  # type: ignore[assignment,return-value]
+        try:
+            workspace.knowledge.start_reindex()
+        except NodestroError as exc:
+            assert exc.code.startswith("access.")  # refused for the knowledge as well (provenance on)
+            return
+        _wait_for_reindex(workspace)
+        assert model.fired and not any(SECRET in item for item in model.documents)
+        assert during and (during[0] is None or during[0].state == "indexing")  # it waited
+        state = index.sync(view.folder.id)
+        assert state is not None and state.state == "ready" and state.chunks
+        assert not any(SECRET in item for item in model.documents)
+    finally:
+        workspace.close()
+
+
+def test_a_reindex_that_may_not_embed_folder_text_stops_at_a_folder_chunk_from_any_route(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 review H-1b: the last guard. A folder chunk that reaches the index during such a reindex by any route
+    (here written to the index directly) ends the reindex before the batch is embedded."""
+    from orkexa import Chunk
+
+    workspace = make()
+    _semantic(workspace, "hybrid")
+    _model_server(workspace, "https://gpu.example.com/v1")
+    AccessRules(workspace.store).grant(  # the knowledge files may go there
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    knowledge = workspace.knowledge
+    knowledge.folder_embedding_allowed = lambda address: False  # the folder's text may not
+    written = Chunk(text=DOCUMENT, source="folder:fg_direct/plan.txt", title="plan.txt", metadata={})
+    model = _ReindexHook(lambda: knowledge.index.add_chunks([written]))
+    knowledge.embedding_model = lambda _name: model  # type: ignore[assignment,return-value]
+    knowledge.start_reindex()
+    _wait_for_reindex(workspace)
+    job = knowledge._current_job()
+    assert job is not None and job.state == "failed" and job.error_code == "knowledge.vector_unavailable"
+    assert not any(SECRET in item for item in model.documents)
