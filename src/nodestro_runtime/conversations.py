@@ -360,6 +360,14 @@ def visible(conversation: Conversation, owner: str | None) -> bool:
     return owner is None or conversation.owner == owner
 
 
+def memory_visible(run: RunSummary | Run, owner: str | None) -> bool:
+    """Whether ``owner`` may see a run as far as persistent memory goes (RT-089c review H-2): a run that used a person's
+    memory space (``memory_owner``, set only where spaces have owners) is seen by that person alone, administrators
+    and principals without an owner identity included; every other run, and every run for the desktop's single person
+    (``None``), is left to the other rules."""
+    return run.memory_owner is None or owner is None or (owner != NO_OWNER and run.memory_owner == owner)
+
+
 def make_title(text: str) -> str:
     """A title from the first message, without an AI request."""
     line = next((item.strip() for item in text.splitlines() if item.strip()), "")
@@ -613,7 +621,7 @@ class Conversations:
         run = self.store.get("runs", run_id, RunSummary)
         seen: set[str] = set()
         while run is not None and run.parent_run_id:
-            if run.id in seen:
+            if run.id in seen or not memory_visible(run, owner):
                 return False
             seen.add(run.id)
             run = self.store.get("runs", run.parent_run_id, RunSummary)
@@ -629,7 +637,10 @@ class Conversations:
         return self._top_visible(run, owner)
 
     def _top_visible(self, run: RunSummary | Run, owner: str | None) -> bool:
-        """Whether ``owner`` sees a top-level run: every run but an answer, and an answer only with its conversation."""
+        """Whether ``owner`` sees a top-level run: every run but an answer and a run with another person's memory
+        (RT-089c), and an answer only with its conversation."""
+        if not memory_visible(run, owner):
+            return False
         if run.trigger != "conversation":
             return True
         found = self.store.get(COLLECTION, run.trigger_ref or "", Conversation)

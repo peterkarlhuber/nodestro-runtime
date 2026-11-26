@@ -601,7 +601,22 @@ Items that need an independent or external review (an internal audit does not re
     would need the owner check that conversations have, plus its own deletion with the conversation. That is a
     change of the memory model, not of conversations, and a wrong path would hand the conversation to every member.
     The history (N-05 compacts it) and the earlier files (below) carry what an answer needs meanwhile. Revisit with
-    owned memory spaces;
+    owned memory spaces (they exist since RT-089c below; answers still get run memory);
+  - Done (RT-089c, W3-S): memory spaces have an owner on a server (`memory_spaces.OWNERS`, `MemorySpaces.open_for`,
+    `may_use`, `visible`, `ownerless`, `assign`). Its first writer owns a space (a member writing its first file, or
+    the person who started the run whose step first opens it); only the owner's runs, agent tests and context
+    previews use it, everyone else gets `memory.space_not_found` like for a space that does not exist. A run that
+    acts for no person (a schedule without a starter, an API key, a published app) uses no space on a server. A space
+    with files from before owners has none and fails closed until the operator assigns one (nodestro-api
+    `nodestro-server memory backfill-owners`); nothing is assigned by itself, nothing deleted. The desktop is
+    unchanged (`tests/test_memory_space_owners.py`). Open: scheduled and published runs with persistent memory on a
+    server need an owner identity of their own (they fail closed now). Review fix H-2: a run whose step used a
+    person's space is visible to that person alone on every run route (`Run.memory_owner`,
+    `conversations.memory_visible`; `test_a_run_with_persistent_memory_is_seen_only_by_its_owner`). Residual risks
+    (review M/L, no code): workflows are shared, so an editor can name Alice's space in a workflow and prompt the
+    agent to overwrite or empty it; when Alice runs it, it acts on her space (a dump stays in her private run, an
+    overwrite does not). A space name is taken by its first writer (squatting). The spaces of a removed member stay
+    theirs and unused; a transfer path would be a separate owner decision;
   - Done (W3-S1, 2026-11-21): a principal without an owner identity on a server sees no conversation and no answer
     run and starts none (`NO_OWNER`, `test_w3s1_who_has_no_owner_identity_sees_and_starts_no_conversation`).
   - Done (W3, 2026-11-21): a run still going after its conversation was deleted is deleted once it stops
