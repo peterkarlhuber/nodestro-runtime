@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Security (N-12 review H-1, L-1, L-2): a granted folder's text went to an embedding server outside this computer
+  without a grant while the provenance switch (or approvals, or the access model) was off: only the folder switch was
+  needed. Now it fails closed whatever the switches: folder text is embedded, and a folder index search embeds its
+  query, only for a server on this computer, or for one elsewhere while provenance is on and a grant allows it
+  (new `RunManager.folder_embedding_allowed`, `KnowledgeBase.folder_embedding_allowed`); else the chunks are stored
+  without vectors and the search runs in full text. A rebuild of the semantic index for such a model removes every
+  folder index first (`KnowledgeBase.folder_reset`) and stores no folder chunk while it runs
+  (`knowledge.FolderIndexBusy`). Budgets: at most 400 chunks per file (`folder_index.MAX_FILE_CHUNKS`), 50,000
+  chunks and 512 MiB per folder (`MAX_FOLDER_CHUNKS`, `MAX_FOLDER_BYTES`; `truncated` in the state,
+  `FolderIndexFile.truncated`), and a long sync sweeps for ended grants between files. Regression tests across
+  every switch combination.
+- Security (N-12 review round 2, H-1b, L-b): a rebuild of the semantic index started while no folder was indexed yet
+  did not hold the folder index back, and a first index during it was embedded at a server elsewhere. The rebuild is
+  now judged by its model's address alone, in the thread and in a server worker (`execute_reindex`), and its model
+  refuses every batch while the index holds a folder chunk. The copy before a schema migration holds no folder index
+  (new `storage.strip_index_sources`, `storage.strip_copy`, also used by the API's backups).
+- Granted folders as a knowledge source (N-12; behind `NODESTRO_FOLDER_GRANTS`, off; never in the server profile): a
+  folder grant with `index` keeps a search index of the folder (new module `folder_index`: `FolderIndex`,
+  `FolderIndexer`, `FolderIndexFile`, `FolderIndexState`, `source_of`; collections `folder_index_files` and
+  `folder_index_state`). The knowledge base's index holds one source per file (`folder:<grant id>/<path>`,
+  `knowledge.FOLDER_SOURCE`), never its file store. First index, change by size, times and SHA-256, deletion and
+  denies through `orkexa.fs.SafeRoot` with the grant's patterns, limits and PDF budgets; text and PDF files only.
+  Rights stay on the grant: a revocation drops the folder's chunks and vectors at once
+  (`Workspace.folder_access_changed`, called by the API), a sync checks the grant inside the index's write lock
+  before every file, an expiry is dropped at the indexer's sweep, and every index hit is checked again for the caller
+  after the search. The workspace reconciles the indexes at its start and every 5 minutes, and removes them all while
+  the switch is off. `search_files` searches a folder's ready index (ranked passages, PDF text, `index: true`,
+  `page`); the run is marked (N-08) as before, and a vector or hybrid index search asks the run's embedding check
+  first (RT-094). `KnowledgeBase.search` without files and with files now covers only knowledge files
+  (`KnowledgeBase.folder_sources`); new `KnowledgeBase.writing`, `chunk_sources`, `remove_sources`,
+  `replace_chunks`, `search_sources`; `folders.safe_root`; `FolderReader(index=, embedding_check=)`;
+  `RunManager.folder_index`. Tests: `tests/test_folder_index.py`, `tests/test_content_provenance.py`; see
+  `docs/folders.md`, "The search index".
+
 - Security (RT-089c): memory spaces have an owner on a server. Before, every member listed, read and changed every
   space, and every member's run of a workflow read what another member's run had written there.
   - `MemorySpaces(..., owners=store)` (a server tenant's workspace passes its store): the owner of each space is
