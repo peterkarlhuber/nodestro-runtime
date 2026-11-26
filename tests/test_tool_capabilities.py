@@ -5,8 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from orkexa.dynamic import SubprocessSandbox
+import pytest
 
 from nodestro_runtime.catalog import SERVER_TOOLS, ServerToolInfo
+from nodestro_runtime.folder_tools import FOLDER_TOOL_NAMES
+from nodestro_runtime.folders import FOLDERS_ENV
 from nodestro_runtime.mcp.models import McpTool, ToolDefinition
 from nodestro_runtime.testing import ContainerDouble
 from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE, ToolInfo, ToolLibrary
@@ -19,12 +22,20 @@ def host() -> SubprocessSandbox:
     return SubprocessSandbox(timeout=15.0, acknowledge_unsafe=True)
 
 
-def test_built_in_tools_carry_nodestros_statement(tmp_path: Path) -> None:
+def test_built_in_tools_carry_nodestros_statement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(FOLDERS_ENV, "1")  # the folder tools (N-10) are registered only with folder grants on
     library = ToolLibrary(tmp_path / "tools", sandbox=host())
     infos = {info.name: info for info in library.all() if info.kind == "builtin"}
     assert set(BUILTIN_CAPABILITIES) <= set(infos)
     for name, expected in BUILTIN_CAPABILITIES.items():
         assert infos[name].capability == expected
+
+
+def test_without_folder_grants_the_library_has_no_folder_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(FOLDERS_ENV, raising=False)
+    library = ToolLibrary(tmp_path / "tools", sandbox=host())
+    names = {info.name for info in library.all() if info.kind == "builtin"}
+    assert set(BUILTIN_CAPABILITIES) - names == set(FOLDER_TOOL_NAMES)
 
 
 def test_an_own_tool_on_the_host_counts_as_unknown(tmp_path: Path) -> None:

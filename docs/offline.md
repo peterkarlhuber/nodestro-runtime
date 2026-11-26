@@ -37,6 +37,9 @@ host name `ollama` (the Ollama container on Nodestro Local Docker's internal net
 | Own or generated tool | its capability's `reach` is `internal` (stated, or derived from a sandbox without network); an unstated capability counts as external. At call time a derived `internal` is judged again by the sandbox the call really runs in (the workflow's Python environment can be a host subprocess with network) | `external_reach` |
 | A tool that cannot be found | never (fails closed) | `unknown` |
 
+The folder tools `list_folder`, `read_file` and `search_files` (N-10, [folders.md](folders.md)) read only granted
+folders on this computer (`reach=internal`, `source=folder`) and stay available offline.
+
 The run's own tools (input files, run memory, knowledge search, skills) are not library tools of the agent and stay
 available: what they write stays in the run. Memory and knowledge proposals are the exception above: a persistent
 memory space and a knowledge proposal outlive the run and other agents read them, so an offline agent uses neither

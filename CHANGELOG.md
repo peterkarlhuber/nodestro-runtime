@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- Granted folders (N-10), off by default (`NODESTRO_FOLDER_GRANTS=1`; activation after the independent review). A
+  person grants a folder for reading; agents read it with the new tools `list_folder`, `read_file` and
+  `search_files`. See [docs/folders.md](docs/folders.md).
+  - New modules: `nodestro_runtime.folders` (`FolderGrant`, `FolderLimits`, `FolderReader`), `folder_grants` (the
+    writer, `FolderGrants`, for a `Person` only and imported by no runtime module) and `folder_tools`.
+  - A folder grant is an access grant of the access model v2 (resource `folder`, action `read`) plus name,
+    patterns, limits and the folder's identity: duration, expiry, scope, mode, revocation and the audit are N-06's.
+    Every tool call evaluates the access model (the folder grant's own access grant and every deny) and reads
+    through `orkexa.fs.SafeRoot`. System folders, the home folder, credential folders and the data folder are never
+    grantable (`folder.not_grantable` with `reason`), and the data folder stays closed inside a granted folder.
+  - The tools are `access=read`, `reach=internal`, `source=folder` (new `CapabilitySource` value `folder`), so they
+    stay available offline (N-09). They run on the desktop and in Nodestro Local Docker only. File text is marked as
+    data and comes with its source (`<folder>/<path>`); every file read is the run event `folder_file_read`.
+  - Every call is one activity event (N-13): source `file`, actions `folder.listed`, `folder.read`,
+    `folder.searched`, resource `folder_grant`. `FolderGrants.accesses` returns a grant's access log.
+  - Desktop-to-server imports skip `folder_grants`.
+  - Fix (N-06, found on the Windows runners): on Windows the POSIX system folders (`/bin` ...) made every folder
+    `limit:unresolvable_path`, so no folder access could ever be allowed there. They are now left out on Windows;
+    the Windows system folders, the data folder and an unresolvable request still hold.
+  - New codes: `folder.disabled`, `folder.failed`, `folder.invalid_name`, `folder.invalid_pattern`,
+    `folder.invalid_query`, `folder.name_taken`, `folder.not_found`, `folder.not_grantable`, `folder.unavailable`,
+    `folder.unknown`, and the `fs.*` codes of the guard the tools return (`fs.root_changed` now in the catalog too).
+  - Tests: `tests/test_folders.py`, which also runs orkexa's folder grant conformance cases (N-63) through the real
+    tools (attack catalog, link swaps, patterns, limits, revocation, expiry, denies in any spelling, scope and
+    mode, access log), on Linux, macOS and Windows.
+  - Fixes from the independent review of N-10 (each with a regression test in `tests/test_folders.py`):
+    - a deny on an exact file now holds in `list_folder` and `search_files` too (before, only `read_file` refused it;
+      a search returned its text as a snippet). A search reads the grants and denies again for every folder it takes
+      from its queue, checks that folder and every entry in it, and checks the grant and its matches once more before
+      it returns;
+    - the 30-second search limit is checked before every folder and every entry (a tree of folders without files
+      was walked to its end), and the queue holds at most `MAX_PENDING` (10,000) folders; both end as `truncated`;
+    - search snippets come between the data markers of `read_file`, and a match has the escaped `name` of a listing;
+    - a subfolder that cannot be listed is skipped and named in the new `skipped` list instead of ending the search;
+    - a folder deny is stored canonical (`os.path.realpath`), like a folder grant;
+    - the shared temporary folders themselves cannot be granted (new reason `temp_root`); folders inside them can;
+    - every grant leaves out common secret files (`folders.DEFAULT_EXCLUDES`: `.env*`, `*.pem`, `*.key`, `id_rsa*`,
+      `id_ed25519*`, `.npmrc`, `.pypirc`, `.netrc`, `*.kdbx`); new `FolderGrant.default_excludes` (default `true`) and
+      `FolderGrants.grant(default_excludes=...)` for an administrator to turn it off;
+    - the name of a new grant is checked inside the transaction that stores it;
+    - `list_folder` without a folder is logged (`folder.listed` without a grant id);
+    - on Windows, a system folder named by the environment that cannot be compared (an 8.3 short name, a device
+      path) now refuses every folder (`limit:unresolvable_path`) and logs a warning, instead of being skipped.
+  - Fixes from the re-review of N-10 (regression tests in `tests/test_folders.py`):
+    - M2: a deny could be passed by another spelling the path guard opens on a case-insensitive file system (on
+      NTFS `pr\u0131vate/pay.txt` opened the denied `private`). Denies now compare names with `orkexa.fs.fold`
+      (`tool_policy._within(fold=True)`; case folding, dotless i, default-ignorable characters), and the folder
+      tools evaluate the access model again for the names the file system stored while a path is opened
+      (`SafeRoot(on_open=...)`);
+    - a new grant is the activity event `folder.granted`, with code `default_excludes_off` when the default
+      excludes are off; `FolderGrants.accesses` lists only the tools' calls;
+    - `path` in listings and matches is escaped like `name`;
+    - `DEFAULT_EXCLUDES` also covers `*.p12`, `*.pfx`, `*.ppk` and `credentials*`.
 - Conversations (RT-089 follow-ups; still behind `NODESTRO_CONVERSATIONS` in the API, off by default):
   - An answer's run that is still going when its conversation is deleted (after the delete's wait of 10 seconds) is
     deleted once it stops (`Conversations.run_stopped`, a listener of the run manager; also on the reaper's

@@ -71,6 +71,8 @@ from .bedrock import redact_identity
 from .builtin_sandbox import LinuxSandbox
 from .builtin_tools import BUILTIN_TOOLS
 from .draft_tools import DRAFT_TOOLS
+from .folder_tools import FOLDER_TOOL_NAMES, FOLDER_TOOLS
+from .folders import folders_enabled
 from .mcp_access import is_mcp_tool
 from .notifications import NOTIFY_TOOLS
 from .output_limits import OPERATIONS
@@ -101,6 +103,7 @@ RESERVED_NAMES: frozenset[str] = (
     | {MEMORY_TOOL_NAME}
     | PLANNED_BUILTIN_NAMES
     | {tool.name for tool in (*NOTIFY_TOOLS, *DRAFT_TOOLS) if tool.name}
+    | FOLDER_TOOL_NAMES
 )
 
 # Tools are technical artefacts: whatever language the requirement is written in, the code, the
@@ -563,7 +566,9 @@ class ToolLibrary:
         self.provenance: ToolProvenance = provenance or MemoryProvenance()
         self._lock = threading.RLock()
         self.builtin: dict[str, Tool] = {}
-        for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *extra_tools):
+        # The folder tools (N-10) exist only while their switch is on (read once, when the library is built).
+        folder_tools = FOLDER_TOOLS if folders_enabled() else ()
+        for tool in (*BUILTIN_TOOLS, *WEB_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *folder_tools, *extra_tools):
             assert tool.name is not None
             self.builtin[tool.name] = tool
         #: The specs of built-in tools (NAL-A1): Nodestro's own and those integrations handed in (contract 2).

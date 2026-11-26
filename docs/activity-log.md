@@ -21,7 +21,7 @@ them.
 | `action` | `<area>.<verb>`, see below |
 | `actor` | who: a principal id (`local` on a desktop, a user id on a server), `api:<key id>`, or `system` |
 | `agent` | the agent's configured name, for tool calls and agent steps |
-| `resource_type` | `tool`, `run`, `workflow`, `node`, `input_file`, `knowledge_file`, `mcp_server`, `mcp_tool`, `service_connection`, `tool_pre_grant` |
+| `resource_type` | `tool`, `run`, `workflow`, `node`, `input_file`, `knowledge_file`, `mcp_server`, `mcp_tool`, `service_connection`, `tool_pre_grant`, `folder_grant` |
 | `resource_id` | the resource's Nodestro id or name (never a file path or file name) |
 | `outcome` | `success`, `failure` or `denied` (Axentra's audit outcomes) |
 | `code` | a problem code, a run or step status, a decision (`approved`, `rejected`) or a file format; never free text |
@@ -40,6 +40,7 @@ Identifiers and names must be printable single-line text of at most 200 characte
 | `agent` | `agent.finished` | `engine`, when an agent step ends | execution of an agent step (a step that pauses for a person is logged when it ends) |
 | `workflow` | `workflow.started`, `workflow.finished` | `engine` | run (also a sub-workflow's run); `finished` when the run ends, not when it pauses |
 | `file` | `file.uploaded`, `file.deleted` | `input_files.InputFiles.add` / `delete`, `knowledge.KnowledgeBase.add` / `delete` | upload or deletion; the cleanup deletes as `system` |
+| `file` | `folder.listed`, `folder.read`, `folder.searched` | `folders.FolderReader` (N-10, [folders.md](folders.md)) | call of `list_folder`, `read_file` or `search_files`, also a refused one (`denied`, with its code); resource `folder_grant` with the grant's id, never a path or a file name |
 | `tool_approval` | `tool_approval.<kind>` | `tool_approvals.record_audit` | approval audit event |
 | `mcp` | `mcp.<kind>` | `mcp.service.McpService.event` | MCP event |
 | `connection` | `connection.<kind>` | `connections.ConnectionService.event` | connection event |

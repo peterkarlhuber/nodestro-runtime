@@ -778,3 +778,31 @@ def test_a_record_stored_before_status_existed_can_be_revoked(rules: AccessRules
     assert rules.store.get_raw(collection, stored.id)["status"] == "revoked"
     kinds = [event.kind for _, event in rules.store.items(AUDIT, ToolApprovalEvent)]
     assert kinds.count("access_deny_revoked" if collection == "access_denies" else "access_grant_revoked") == 1
+
+
+def test_on_windows_the_posix_system_folders_do_not_make_every_folder_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows a POSIX folder such as ``/bin`` names no folder (it is relative to the current drive). It must not
+    make every folder ``unresolvable_path`` (N-10 found this: no folder could be granted on Windows); the Windows
+    system folders, the data folder and an unresolvable request still hold."""
+    from nodestro_runtime import tool_policy
+
+    monkeypatch.setattr(tool_policy.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", "C:\\Windows")
+
+    def limit(path: str, protected: tuple[str, ...] = ("C:\\Users\\ada\\AppData\\Local\\Nodestro",)) -> str | None:
+        found = AccessRequest(
+            resource=AccessResource(type="folder", id=path),
+            action="read",
+            effect="read_internal",
+            protected_folders=protected,
+        )
+        return tool_policy.safety_limit(found)
+
+    assert limit("C:\\Users\\ada\\Documents\\Offers") is None
+    assert limit("\\\\?\\C:\\Users\\ada\\Documents\\Offers") is None
+    assert limit("C:\\Windows\\System32") == "protected_folder"
+    assert limit("c:/program files/app") == "protected_folder"
+    assert limit("C:\\Users\\ada\\AppData\\Local\\Nodestro\\db") == "protected_folder"
+    assert limit("C:\\Users\\ada\\Documents", protected=("/data/nodestro",)) == "unresolvable_path"

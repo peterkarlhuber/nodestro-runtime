@@ -1083,6 +1083,10 @@ class AccessRules:
     ) -> Deny:
         at = self._check_writer(by)
         _check_resource(resource)
+        if resource.type == "folder":
+            # Stored canonical, like a folder grant (links resolved, ``..``, ``//`` and a trailing separator gone), so
+            # it compares with the canonical paths the folder tools ask for whatever spelling the person used.
+            resource = AccessResource(type="folder", id=_canonical_folder(resource.id))
         if resource.type == "tool" and resource.id in RUN_OWN_TOOLS:
             # The run's own tools never pass the per-call gate, so such a deny would look effective and not be.
             raise NodestroError(
@@ -1201,6 +1205,14 @@ def _check_resource(resource: AccessResource) -> None:
         folder_parts(resource.id)
     except ValueError:
         raise NodestroError("access.folder_path", "A folder is named by its absolute path") from None
+
+
+def _canonical_folder(path: str) -> str:
+    try:
+        found = os.path.realpath(path)
+    except (OSError, ValueError):
+        return path
+    return found if os.path.isabs(found) else path
 
 
 def _check_expiry(duration: str, expires_at: datetime | None, at: datetime) -> None:

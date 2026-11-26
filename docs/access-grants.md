@@ -129,6 +129,10 @@ Folders are compared by whole path components, never by string prefix: `/home/a/
 
 The path is never trimmed: one with leading or trailing white space is refused.
 
+A folder deny is stored canonical (`os.path.realpath`: links resolved, `..`, repeated and trailing separators gone),
+like a folder grant (N-10), so a deny named through a link still holds for the canonical paths the folder tools ask
+for.
+
 Windows paths (`C:\...`, UNC, `\\?\`) get more normalization:
 - both separators are accepted, and `\\?\C:\x` is `C:\x`;
 - two leading separators of either kind always mean a Windows path, so `//host/share` is UNC (fail closed on POSIX
@@ -144,8 +148,9 @@ Denies and safety limits compare case-folded on top. Grants compare the normaliz
 closed on case-insensitive file systems.
 
 This is a comparison of names, not a guard on the file system. Callers resolve links before they ask
-(`os.path.realpath`). Hard links, junctions, rename races and network drives are open points of the W0-6 spike for
-the file-system guard (N-10).
+(`os.path.realpath`). The folder tools (N-10, [folders.md](folders.md)) evaluate a folder grant at every call and read
+through the file-system guard `orkexa.fs.SafeRoot`, which handles links, junctions, hard links, swaps during a call
+and network drives.
 
 ## In the tool gate
 
@@ -285,7 +290,6 @@ now. They are for people and the administration only; a model never gets an expl
 ## Not in this step
 
 - The api query and write routes, and the studio approval cards and overview.
-- Folder checks at their call sites: they need the file-system guard (N-10).
 - Marking shared content (N-08), so a cloud model request with shared content needs a grant.
 - A grant on a workflow, MCP server or connection that lifts a question (spec 7.2 "Freigabe je Dienst/Ziel").
 - The `DenialNotice` type (N-07).

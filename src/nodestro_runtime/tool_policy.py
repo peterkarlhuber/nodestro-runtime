@@ -11,7 +11,8 @@ A :class:`ToolCapability` says
 - ``reach``: ``internal`` (stays inside Nodestro) or ``external`` (talks to systems outside it);
 - ``source``: who made the statement: ``nodestro`` (fixed for built-in and provider tools), ``author`` (the person
   who saved the tool), ``admin`` (an administrator's classification, e.g. of an MCP tool), ``derived`` (computed
-  from where the tool runs) or ``default`` (nobody said anything).
+  from where the tool runs), ``folder`` (fixed by Nodestro for the tools that read a granted folder, N-10: what they
+  return is content of a granted source) or ``default`` (nobody said anything).
 
 A missing or unknown statement means ``write`` + ``external`` (:data:`UNKNOWN`): only Nodestro or a person can make
 a tool look harmless, never its own code, its description or a model. The statement is security information, not
@@ -34,19 +35,21 @@ from __future__ import annotations
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 import itertools
+import logging
 import os
 import posixpath
 import re
 from typing import Any, Literal
 import unicodedata
 
+from orkexa.fs import fold as fold_name
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from .sandbox_policy import Isolation
 
 Access = Literal["read", "write", "destructive"]
 Reach = Literal["internal", "external"]
-CapabilitySource = Literal["nodestro", "author", "admin", "derived", "default"]
+CapabilitySource = Literal["nodestro", "author", "admin", "derived", "folder", "default"]
 
 
 class ToolCapability(BaseModel):
@@ -67,6 +70,8 @@ class ToolCapability(BaseModel):
 UNKNOWN = ToolCapability(access="write", reach="external", source="default")
 
 _READ_INTERNAL = ToolCapability(access="read", reach="internal", source="nodestro")
+#: The folder tools (N-10): read-only, on this computer, and their source is a granted folder.
+_FOLDER_READ = ToolCapability(access="read", reach="internal", source="folder")
 
 #: The built-in tools of Nodestro itself (``builtin_tools.BUILTIN_TOOLS``). Tools that extensions add are not in
 #: here: without their own statement they count as :data:`UNKNOWN`.
@@ -84,6 +89,10 @@ BUILTIN_CAPABILITIES: dict[str, ToolCapability] = {
     # NAL-A4: drafts are files of the run; nothing leaves Nodestro (sending is NAL-A5).
     "draft_email": ToolCapability(access="write", reach="internal", source="nodestro"),
     "draft_webhook": ToolCapability(access="write", reach="internal", source="nodestro"),
+    # N-10: they read granted folders on this computer, never write, never leave it; their output is folder content.
+    "list_folder": _FOLDER_READ,
+    "read_file": _FOLDER_READ,
+    "search_files": _FOLDER_READ,
 }
 
 #: The provider's server tools (``catalog.SERVER_TOOLS``). They run at the provider and never pass Nodestro's tool
@@ -277,6 +286,37 @@ def system_folders() -> tuple[str, ...]:
     return (*SYSTEM_FOLDERS, *(path for path in found if path))
 
 
+def _system_parts() -> list[tuple[str, ...]] | None:
+    """The components of every system folder that names a folder on this system, or ``None`` when a system folder
+    the environment names cannot be compared (an 8.3 short name such as ``C:\\PROGRA~1``, a device path, a path
+    without a drive): then no folder can be told apart from it, so every folder is refused (fail closed) and a
+    warning is logged once per value. On Windows a POSIX folder (``/bin``) names none (it would be relative to the
+    current drive), so it is left out (logged at debug level) instead of making every folder unresolvable; on POSIX
+    the Windows folders still compare (fail closed for UNC-like spellings)."""
+    found: list[tuple[str, ...]] = []
+    for path in SYSTEM_FOLDERS:
+        try:
+            found.append(folder_parts(path))
+        except ValueError:
+            _log.debug("System folder %s names no folder on this system; left out", path)
+    for name in _SYSTEM_FOLDER_ENV:
+        value = os.environ.get(name, "")
+        if not value:
+            continue
+        try:
+            found.append(folder_parts(value))
+        except ValueError:
+            if (name, value) not in _WARNED:
+                _WARNED.add((name, value))
+                _log.warning("The system folder in %s cannot be compared (%r); every folder is refused", name, value)
+            return None
+    return found
+
+
+_log = logging.getLogger(__name__)
+_WARNED: set[tuple[str, str]] = set()
+
+
 _EFFECTS: dict[tuple[str, str], EffectClass] = {
     ("read", "internal"): "read_internal",
     ("write", "internal"): "write_internal",
@@ -379,7 +419,10 @@ def _within(inner: tuple[str, ...], outer: tuple[str, ...], *, fold: bool) -> bo
     if len(inner) < len(outer):
         return False
     if fold:
-        return all(a.casefold() == b.casefold() for a, b in zip(inner, outer, strict=False))
+        # As the path guard compares names (orkexa.fs.fold: case folding, dotless i as i, default-ignorable code
+        # points dropped): a deny holds for every spelling a case-insensitive file system may open as the same
+        # entry (N-10 re-review M2).
+        return all(fold_name(a) == fold_name(b) for a, b in zip(inner, outer, strict=False))
     return inner[: len(outer)] == outer
 
 
@@ -554,9 +597,13 @@ def safety_limit(request: AccessRequest) -> str | None:
     if request.resource.type == "folder":
         try:
             parts = folder_parts(request.resource.id)
-            protected = [folder_parts(path) for path in (*system_folders(), *request.protected_folders)]
+            protected = [folder_parts(path) for path in request.protected_folders]
         except ValueError:
             return "unresolvable_path"
+        system = _system_parts()
+        if system is None:
+            return "unresolvable_path"
+        protected += system
         forms = {parts, _drive_form(parts)}
         if any(_within(form, folder, fold=True) for form in forms for folder in protected):
             return "protected_folder"

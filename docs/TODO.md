@@ -68,11 +68,12 @@ None known.
     write routes that build `Person` only from a signed-in user, never from an API key. Map the `access.*` codes.
   - nodestro-studio: scope and duration on `ToolApprovalCard.tsx` (N-16 candidate), the overview, texts of the
     `access.*` codes.
-  - Runtime: call `evaluate` where folders are used (N-10 file-system guard). The other call sites are done; their
-    open points are RT-088.
+  - Done (N-10, 2026-11-21): the folder tools call `evaluate` at every call and read through `orkexa.fs.SafeRoot`
+    (RT-093). The other call sites are done; their open points are RT-088.
   - Runtime: name agents by a stable agent id once agents have one (today `<workflow id>/<node id>`).
-  - Runtime: Windows folder checks remain by name. Hard links, junctions, network drives and the computer's own
-    name in UNC paths (only `localhost`, `127.0.0.1` and `::1` map to the drive) need the N-10 guard.
+  - Runtime: Windows folder checks of the access model remain by name. The folder tools add the N-10 guard (hard
+    links, junctions, network drives refused); the computer's own name in UNC paths (only `localhost`, `127.0.0.1`
+    and `::1` map to the drive) is still compared by name.
   - Runtime: the `DenialNotice` type (N-07).
   - Owner: activation after gate G-2, and the internal security check (the independent review goes with RT-001).
 
@@ -643,6 +644,39 @@ Items that need an independent or external review (an internal audit does not re
   - the tool catalog (`ToolInfo`) does not carry the offline state yet; it is reported through the agent's
     validation.
 - **Next step:** Decide whether a workflow-wide offline flag is wanted.
+
+### RT-093 · Granted folders (N-10): activation and follow-ups
+
+- **Priority:** P2 Medium · **Status:** In progress · **Refs:** development plan N-10, N-63,
+  [docs/folders.md](folders.md), `tests/test_folders.py`, `tests/folder_support.py`
+- **What:** Folder grants and the read-only tools `list_folder`, `read_file` and `search_files` are in, behind
+  `NODESTRO_FOLDER_GRANTS` (off). Open:
+  - the independent review of N-10 (security-relevant), then the owner's activation decision;
+  - on macOS, `tool_policy.SYSTEM_FOLDERS` contains `/private/var`, so folders below the temporary folder cannot be
+    granted although `orkexa.fs` allows them (fails closed; decide whether `/private/var/folders` should be
+    grantable);
+  - files with several hard links are always refused; there is no opt-in;
+  - `FolderGrant.index` is stored only; indexing a granted folder is a later step;
+  - the run event `folder_file_read` names a run's sources live; a stored list of sources per answer is not built
+    yet (the tool results name them);
+  - an own or integration tool already named `list_folder`, `read_file` or `search_files` is shadowed by the built-in
+    tool once the switch is on (the names are reserved);
+  - the tool library reads the switch when it is built; changing it needs a restart;
+  - folder content (file text, search snippets) is not marked as shared content yet (review L3): a cloud model
+    request with it does not need the per-provider grant of spec 7.2. N-08 (provenance, `shared_content`) covers it;
+    it is a precondition for activation;
+  - review L11 (no change needed): file content persists in the run's tool-call records and in the run event
+    `folder_file_read` (which names relative paths), as with every other tool's results;
+  - re-review (1193824), no change needed: a third-party writer can rename an entry between the access check and
+    the open (the guard pins identities and opens relative to the parent; the deny is evaluated again for the
+    stored names while opening, so only a rename into a not-denied name gets through, as with any reader);
+  - re-review: a search's deadline is checked between entries, so a read in progress (PDF budget, a large file)
+    can overrun it: worst case about 40 s plus one read;
+  - re-review: denies stored before folder denies were canonical (L5) are not migrated; the switch has never been
+    on, so there are none;
+  - re-review: shared content is not marked yet (L3 above; N-08).
+- **Next step:** Independent review; nodestro-api routes (`/api/folders`) and the studio texts are in the same
+  change.
 
 ### RT-090 · Flaky: `test_mcp_stdio::test_a_server_flooding_stdout_fails_with_a_stable_code`
 
