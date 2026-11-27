@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
-from contextvars import ContextVar, copy_context
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, field
 from decimal import Decimal
 import os
@@ -378,10 +378,69 @@ class RunServices:
     #: reach the embedding model at the given address (the one it really sends to,
     #: :meth:`~nodestro_runtime.knowledge.KnowledgeBase.views`); ``None``: no check.
     embedding_check: Callable[[str | None], None] | None = None
-    #: RT-089d (Welle 5): asked with the tool's name before each call resolves its connection, in a step that opened a
-    #: person's memory space under their consent; raises :class:`ToolResultError` when the connection (or anything
-    #: else the consent covers) changed since the step's check. ``None``: no check.
-    connection_check: Callable[[str], None] | None = None
+    #: RT-089d (Welle 5): the consent guard of a step in a run tree that uses a person's memory space
+    #: (:class:`ConsentGuard`): asked before and after each call resolves its connection. ``None``: no check.
+    connection_check: ConsentGuard | None = None
+
+
+class ConsentGuard:
+    """What a memory consent covered for one step (RT-089d, Welle 5): ``checked`` is the step's means
+    (:attr:`~nodestro_runtime.engine.RunManager.consent_means`) taken before its consent was checked, ``current``
+    reads them again. Every connection a tool reads, every MCP call and every model request of the step asks first;
+    anything changed since (a connection, a tool, an MCP server, a model server's address) refuses it, fail closed
+    (``memory.consent_required``: the next run needs a new consent)."""
+
+    def __init__(self, checked: Any, current: Callable[[], Any]) -> None:
+        self.checked = checked
+        self.current = current
+
+    def holds(self) -> bool:
+        try:
+            return bool(self.current() == self.checked)
+        except Exception:  # cannot tell: refuse
+            return False
+
+    def check(self, name: str) -> None:
+        """Before a tool call reads its connection (or an MCP tool sends): :class:`ToolResultError` when changed."""
+        if not self.holds():
+            raise ToolResultError(
+                f"Error: what {name} uses changed since the memory consent was checked; the call was not made "
+                "(memory.consent_required)"
+            )
+
+    def check_resolved(self, name: str, connection: ResolvedConnection | None) -> None:
+        """After the connection was read: it must be the one the consent covered (no edit between the check and the
+        read), and nothing else changed meanwhile."""
+        if connection is not None:
+            entry = self.checked.get(name) if isinstance(self.checked, dict) else None
+            covered = entry.get("connection") if isinstance(entry, dict) else None
+            seen = (connection.id, connection.type, connection.provider, dict(connection.settings))
+            if isinstance(covered, dict) and (
+                (covered.get("id"), covered.get("type"), covered.get("provider"), covered.get("settings")) != seen
+                or covered.get("egress") != sorted(connection.egress)
+            ):
+                raise ToolResultError(
+                    f"Error: the connection of {name} changed since the memory consent was checked; the call was not "
+                    "made (memory.consent_required)"
+                )
+        self.check(name)
+
+
+_CONSENT_GUARD: ContextVar[ConsentGuard | None] = ContextVar("nodestro_consent_guard", default=None)
+
+
+def bind_consent_guard(guard: ConsentGuard | None) -> Token[ConsentGuard | None]:
+    """Bind the consent guard of the step whose tools the current thread (and what it starts) runs."""
+    return _CONSENT_GUARD.set(guard)
+
+
+def reset_consent_guard(token: Token[ConsentGuard | None]) -> None:
+    _CONSENT_GUARD.reset(token)
+
+
+def consent_guard() -> ConsentGuard | None:
+    """The bound consent guard (tools without :class:`RunServices`, such as MCP tools, ask it)."""
+    return _CONSENT_GUARD.get()
 
 
 @dataclass(frozen=True)
@@ -560,13 +619,17 @@ def bind_tool(
             raise ToolResultError(
                 f"Error: {tool.name} has no {spec.connection_type} connection (check.connection_missing)"
             )
-        if services is not None and services.connection_check is not None:
-            services.connection_check(tool.name or "")  # before the connection is read (a refusal raises)
+        guard = services.connection_check if services is not None else None
+        if guard is not None:
+            guard.check(tool.name or "")  # before the connection is read (a refusal raises)
         try:
-            return resolve(connection_id, spec.connection_type)
+            found = resolve(connection_id, spec.connection_type)
         except Exception as exc:  # the code only: a service message could carry an address or a secret
             code = getattr(exc, "code", "connection.unavailable")
             raise ToolResultError(f"Error: the connection of {tool.name} cannot be used ({code})") from None
+        if guard is not None:
+            guard.check_resolved(tool.name or "", found)  # and the one read is the one the consent covered
+        return found
 
     return SpecTool(
         tool,
@@ -594,16 +657,20 @@ __all__ = [
     "STOP_GRACE_SECONDS",
     "WEB_TOOLS_SERVER_ENV",
     "CallCounter",
+    "ConsentGuard",
     "RunServices",
     "SettingsProblem",
     "SpecTool",
     "ToolContext",
     "ToolSettings",
     "ToolSpec",
+    "bind_consent_guard",
     "bind_tool",
     "builtin_spec",
+    "consent_guard",
     "current_tool_context",
     "host_tool_spec",
     "offered",
+    "reset_consent_guard",
     "settings_problems",
 ]

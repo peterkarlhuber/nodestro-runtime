@@ -5,16 +5,19 @@
 - Security (Welle 5, small follow-ups; every switch stays off by default):
   - RT-089d: a memory consent's digest also covers the address of each model server with a configurable address
     (`compatible`, `ollama`, `vllm`, also the quality judge's) and the lock of the workflow's approved Python
-    environment (`Workspace.consent_environment`, `memory_consents.with_environment`); a connection edited while a step
-    under a consent runs is refused at its next call (`RunServices.connection_check`). Digests of workflows without
-    either are unchanged.
+    environment (`Workspace.consent_environment`, `memory_consents.with_environment`) and of a local MCP server's
+    `mcp:` environment. Every step of a run tree that uses a person's space checks what the consent covered before
+    each connection it reads (and the connection read), each MCP call and each model request
+    (`tool_spec.ConsentGuard`); a change refuses them with `memory.consent_required`. Digests of workflows without
+    those means are unchanged.
   - N-12: a failed removal of the folder indexes before a rebuild no longer leaves the rebuild marked as running and
     the folder index held back; copies hold no broken legacy vector table (`storage.strip_index_sources`); a copy
     whose folder chunks cannot be removed loses its whole search index instead of failing the migration
-    (`storage.drop_search_index`); older copies before a migration are stripped at the start
-    (`workspace.strip_migration_copies`).
+    (`storage.drop_search_index`); older copies before a migration are stripped at the start, deleted when they cannot
+    be stripped, and leftovers of an interrupted copy are removed (`workspace.strip_migration_copies`).
   - Tool approvals: a call the MCP service refuses right before the send gets `tool.approval_stale` on its record and
-    its request is audited `stale` (also when the run waited in a thread; `CallBinding.refused`).
+    its request is audited `stale` (also when the run waited in a thread; `CallBinding.refused`). An allowed read
+    tool has no request, so its refusal sets the code but writes no `stale` audit event.
 
 - Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
   ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of

@@ -178,7 +178,7 @@ from .tool_approvals import (
     record_refusal,
     tool_facts,
 )
-from .tool_spec import CallCounter, RunServices
+from .tool_spec import CallCounter, ConsentGuard, RunServices, bind_consent_guard, reset_consent_guard
 from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
@@ -1531,26 +1531,22 @@ class RunManager:
                 raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
         return True
 
-    def _consent_guard(self, config: AgentConfig) -> Callable[[str], None]:
-        """The check before each connection a step reads after it opened a person's memory space under their consent
-        (RT-089d, Welle 5): the consent covered the connections' settings as they were at the step's check
-        (:attr:`consent_means`); a connection edited while the step runs (another address, another secret) would
-        otherwise get the memory under the old consent. Such a call is refused (fail closed); the next run needs a
-        new consent."""
-        checked = self.consent_means(config)
-
-        def check(name: str) -> None:
-            try:
-                same = self.consent_means(config) == checked
-            except Exception:  # cannot tell: refuse
-                same = False
-            if not same:
-                raise ToolResultError(
-                    f"Error: the connection of {name} changed since the memory consent was checked; the call was not "
-                    "made (memory.consent_required)"
-                )
-
-        return check
+    def _consent_guard(
+        self, context: _RunContext, config: AgentConfig, checked: Any, consented: bool
+    ) -> ConsentGuard | None:
+        """The guard of a step under a memory consent (RT-089d, Welle 5;
+        :class:`~nodestro_runtime.tool_spec.ConsentGuard`): for the step that opened a person's space (``consented``)
+        and for every later step of a run tree that used one (the same condition as :meth:`check_memory_flow`, which
+        is asked again here: the consent must still hold for the means as they are now). ``checked`` are the step's
+        means taken before its consent was checked, so a change after the check is never covered. ``None`` where
+        nothing is private."""
+        top = context.root.run
+        private_tree = top.memory_owner not in (None, NOBODY) and bool(top.memory_spaces)
+        if checked is None or not (consented or private_tree):
+            return None
+        if not consented:
+            self.check_memory_flow(context)
+        return ConsentGuard(checked, lambda: self.consent_means(config))
 
     def check_memory_flow(self, context: _RunContext) -> None:
         """Before a run executes in a tree that already used a person's memory space (RT-089d): a sub-workflow's or a
@@ -5212,6 +5208,8 @@ class RunManager:
             state.text += delta
             self._emit(context, "text", node_id, delta=delta)
 
+        #: The step's memory consent guard once it is known (set before the first request; RT-089d, Welle 5).
+        guard_box: list[ConsentGuard | None] = []
         trace = ReasoningTrace(text=state.thinking, phases=state.thinking_phases)
 
         def on_thinking(delta: str, kind: ReasoningKind) -> None:
@@ -5245,9 +5243,17 @@ class RunManager:
             # N-08: granted content may have entered this turn after it connected (a folder read): every request
             # that would carry it to a cloud model, or to a server tool that reaches outside, needs a grant.
             self._check_egress(context, node_id, config.model, config.server_tools)
+            # RT-089d (Welle 5): a step under a memory consent sends nothing once what it covered changed (another
+            # model server address, connection, tool or MCP server): the step fails closed.
+            guard = guard_box[-1] if guard_box else None
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
 
         def on_judge_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
+            guard = guard_box[-1] if guard_box else None
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
             context.tracker.check()
             # N-08: the quality judge connected when the step started, maybe before the step held granted content,
             # and its model may run at another provider than the agent's: each of its requests checks its own model.
@@ -5403,16 +5409,24 @@ class RunManager:
         interruptible: _Interruptible | None = None
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
+        guard_token = None
         try:
             # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read;
             # RT-089d: only with its owner's consent for this workflow content (and every run above this one).
+            # Welle 5: the means a consent covers, taken before it is checked (review 3: nothing changed after the
+            # check is ever covered); only where spaces have owners.
+            owners = getattr(context.env.builder.memory_spaces, "owners", None) is not None
+            checked = self.consent_means(config) if owners else None
             consented = False
             if config.memory.mode == "persistent":
                 consented = self.check_memory_consent(context, config.memory.space)
                 self.mark_memory_owner(context, config.memory.space if consented else None)
+            guard = self._consent_guard(context, config, checked, consented)
+            guard_box.append(guard)
+            guard_token = bind_consent_guard(guard)  # MCP tools ask it (reset with the cancel check below)
             services = self._run_services(context, node_id, config.name)
-            if consented:
-                services = replace(services, connection_check=self._consent_guard(config))
+            if guard is not None:
+                services = replace(services, connection_check=guard)
             # N-08: what the step gets before its first request (attached files, knowledge in the context).
             for source in start_sources(config, extra):
                 self.mark_granted(context, node_id, source)
@@ -5508,6 +5522,8 @@ class RunManager:
             if interruptible is not None:
                 interruptible.close()
             sandbox_cancel.reset(cancel_token)
+            if guard_token is not None:
+                reset_consent_guard(guard_token)
             if budget_checkpoint is not None and not suspended:
                 tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)
             if checkpointing and not suspended:

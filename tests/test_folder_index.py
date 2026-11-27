@@ -577,6 +577,39 @@ def test_copies_made_before_the_fix_lose_their_folder_index_at_the_start(base: P
     assert b"harbour project" in other.read_bytes()  # not a copy before a migration: not touched
 
 
+def test_an_unstrippable_copy_and_leftovers_of_an_interrupted_copy_are_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 5, 6 (Welle 5): a copy before a migration that cannot be stripped at all kept a folder's text, and the
+    leftovers of an interrupted copy (``*.db.partial`` and the snapshot's temporary files) stayed forever. Now both
+    are deleted; a directory that cannot be listed does not stop the start."""
+    from nodestro_runtime import workspace as workspace_module
+    from nodestro_runtime.workspace import strip_migration_copies
+
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    broken = backups / "pre-migration-1-to-2-20260101T000000000000Z.db"
+    broken.write_bytes(b"harbour project, not a database")
+    kept = backups / "pre-migration-2-to-3-20260102T000000000000Z.db"
+    _legacy_copy(kept)
+    partial = backups / "pre-migration-3-to-4-20260103T000000000000Z.db.partial"
+    partial.write_bytes(b"harbour project")
+    temporary = backups / "pre-migration-3-to-4-20260103T000000000000Z.db.partial.0123456789abcdef.tmp"
+    temporary.write_bytes(b"harbour project")
+    other = backups / "notes.db.partial"
+    other.write_bytes(b"not ours")
+    changed = strip_migration_copies(backups)
+    assert set(changed) == {broken, kept}
+    assert not broken.exists() and not partial.exists() and not temporary.exists()
+    assert kept.exists() and b"harbour secret" not in kept.read_bytes() and other.exists()
+
+    def unreadable(self: Path, pattern: str) -> Any:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(workspace_module.Path, "glob", unreadable)
+    assert strip_migration_copies(backups) == []  # logged, never raised
+
+
 def test_a_legacy_vector_table_that_cannot_be_cleaned_loses_its_storage(tmp_path: Path) -> None:
     """N-12 review L-a: fail closed. When the legacy ``vec0`` table cannot be cleaned (its module is not loaded), its
     storage tables are dropped instead of keeping vectors of a folder's text."""

@@ -10,12 +10,14 @@ exactly this content (:class:`~nodestro_runtime.memory_spaces.MemoryConsent`):
   version it will run (:meth:`~nodestro_runtime.engine.RunManager.pin_subworkflows`), and of what its agents use
   outside the workflow (``means``, :meth:`~nodestro_runtime.engine.RunManager.consent_means`): the version and code of
   each custom tool, the settings of each bound connection, the configuration of each MCP server and the definition of
-  each MCP tool, the address of each model server with a configurable address and the lock of the approved Python
-  environment the workflow's tools run in (the library versions they import). A change of any of these (a new version
-  of a custom tool, a connection that now sends elsewhere, another model server, other library versions, an edited
-  agent, edge or sub-workflow version) changes the digest; a consent never applies to changed content. A step also
-  checks its bound connections again at each call (a connection edited while the step runs is refused,
-  ``memory.consent_stale``).
+  each MCP tool (with a local server's approved packages), the address of each model server with a configurable
+  address and the lock of the approved Python environment the workflow's tools run in (the library versions they
+  import). A change of any of these (a new version of a custom tool, a connection that now sends elsewhere, another
+  model server, other library versions, an edited agent, edge or sub-workflow version) changes the digest; a consent
+  never applies to changed content. Every step of a run tree that uses a person's space also checks these again
+  before each connection it reads, each MCP call and each model request
+  (:class:`~nodestro_runtime.tool_spec.ConsentGuard`): a change while the step runs refuses them with
+  ``memory.consent_required`` (fail closed).
 - **Every run that can see the memory.** A step that opens a space needs a consent for its own run's workflow and
   for every run above it (their steps get the step's output). Once a run used a space (``Run.memory_spaces`` of the
   top-level run), every run that executes afterwards in the same tree (a sub-workflow, a team, a continued paused

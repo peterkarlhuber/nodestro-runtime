@@ -30,6 +30,7 @@ from ..release import McpToolRef
 from ..schemas import now
 from ..storage import DocumentStore
 from ..tool_approvals import ToolApprovals, bound_call, reclassified
+from ..tool_spec import consent_guard
 from . import oauth as oauth_flow
 from .hub import CallResult, Credential, Discovery, McpHub
 from .models import (
@@ -683,9 +684,15 @@ class McpService:
         connection). A change that lands after the request was sent applies from the next call on."""
         server, tool = self._usable_as_bound(tool_name, gated=gated)
         binding = bound_call(tool_name)
+        guard = consent_guard()
+        consent_changed: list[bool] = []
         credential = self.credential(server)
 
         def confirm() -> bool:
+            if guard is not None and not guard.holds():
+                # RT-089d (Welle 5): what a memory consent covered changed since the step's check (the server too).
+                consent_changed.append(True)
+                return False
             try:
                 self._usable_as_bound(tool_name, gated=gated, expected_hash=tool.approved_hash)
             except NodestroError:
@@ -704,6 +711,12 @@ class McpService:
             )
         finally:
             self._keep_refreshed(server, credential)
+        if result.refused and consent_changed:
+            raise NodestroError(
+                "memory.consent_required",
+                f"What {tool_name} uses changed since the memory consent was checked; it was not made",
+                space="",
+            )
         if result.refused:
             if binding is not None and not binding.refused:
                 binding.refused.append("tool.approval_stale")

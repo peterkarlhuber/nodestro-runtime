@@ -45,11 +45,17 @@ its tools. Now:
   a paused run that continues (so a revoked consent stops it), and a continued failed run (it takes over the earlier
   run's results, stays private to the same owner and inherits `memory_owner` and `memory_spaces`). A run marked for a
   person without recorded spaces (from before RT-089d) fails closed.
-- **During a step.** The consent is checked when the step opens the space; its tools read their connection at each
-  call. So that a connection edited while the step runs (another address, a new secret) never gets the memory under
-  the old consent, each call of such a step that reads a connection checks the step's means again
-  (`RunServices.connection_check`, `RunManager._consent_guard`) and is refused when anything changed (the tool result
-  names `memory.consent_required`; nothing is sent). The next run needs a new consent (Welle 5).
+- **During a step.** The consent is checked when a step opens the space (and when a run of the tree starts); its
+  tools read their connection at each call. So that nothing changed while a step runs (another address, a new
+  secret, another tool or MCP server, another model server) gets the memory under the old consent, every step of a
+  run tree that uses a person's space takes its means before its check (`RunManager._consent_guard`, which asks
+  `check_memory_flow` again for later steps) and compares them before each connection it reads and with the
+  connection read, before each MCP call (and again right before the send) and before each model request
+  (`tool_spec.ConsentGuard`). A change refuses the call (the tool result names `memory.consent_required`; nothing is
+  sent) and fails the step at its next model request with `memory.consent_required`. The next run needs a new
+  consent (Welle 5).
+- **Local MCP servers.** A local (stdio) MCP server's entry also covers the lock of its approved `mcp:`
+  environment.
 - **Agent tests** need a consent for the digest of the tested configuration with its means
   (`RunManager.agent_consent_digest`, `memory_consents.agent_digest`).
 - **Denial.** Without a matching consent the step (or the run) fails with `memory.consent_required` (`space`,

@@ -280,17 +280,38 @@ def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, 
 def strip_migration_copies(directory: Path) -> list[Path]:
     """Remove every granted folder's index from the copies made before schema migrations in ``directory`` (Welle 5):
     copies written by a release before N-12 review L-b still hold folder text, which outlives the grant. Runs at each
-    start of a workspace on its own database; a copy without folder index is opened and left as it is. Returns the
-    copies changed."""
+    start of a workspace on its own database (no migration copy is being written then); a copy without folder index
+    is opened and left as it is. Fail closed: a copy that cannot be stripped at all is deleted (its folder text must
+    not outlive the grant), and so are leftovers of an interrupted copy (``*.db.partial`` and the temporary files of
+    the snapshot next to it). Returns the copies changed or deleted. Never raises."""
     changed: list[Path] = []
-    for path in sorted(directory.glob("pre-migration-*.db")) if directory.is_dir() else ():
-        if path.is_symlink() or not path.is_file():
-            continue
+    try:
+        if not directory.is_dir():
+            return changed
+        copies = sorted(directory.glob("pre-migration-*.db"))
+        leftovers = sorted(directory.glob("pre-migration-*.db.partial*"))
+    except OSError:
+        logger.exception("The copies made before migrations could not be listed")
+        return changed
+    for path in leftovers:
         try:
+            if not path.is_dir():
+                path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("A leftover of an interrupted copy before a migration could not be removed")
+    for path in copies:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
             if strip_copy(path, FOLDER_SOURCE, (FOLDER_INDEX_FILES, FOLDER_INDEX_STATES)):
                 changed.append(path)
-        except Exception:  # one damaged copy never stops the others or the start
-            logger.exception("A granted folder's index could not be removed from a copy before a migration")
+        except Exception:  # never stops the others or the start
+            logger.exception("A copy before a migration could not be stripped of folder indexes; it is deleted")
+            try:
+                path.unlink(missing_ok=True)
+                changed.append(path)
+            except OSError:
+                logger.exception("A copy before a migration that may hold folder text could not be deleted")
     if changed:
         logger.info("Removed granted folders' indexes from %d copies made before migrations", len(changed))
     return changed
@@ -1628,6 +1649,11 @@ class Workspace:
             if is_mcp_tool(name):
                 server_tool = self.mcp.find(name)
                 entry["mcp"] = None if server_tool is None else _mcp_marker(*server_tool)
+                if server_tool is not None and server_tool[0].transport == "stdio":
+                    # Welle 5: a local server's approved packages (the lock of its ``mcp:`` environment) too.
+                    lock = self._lock_digest(scope_of("mcp", server_tool[0].id))
+                    if lock is not None:
+                        entry["mcp"]["environment"] = lock
             found[name] = entry
         # Welle 5 (RT-089d): the address of every model server the agent sends to, for providers with a configurable
         # one (an OpenAI-compatible server, Ollama, vLLM): content allowed for one server never reaches another. Keyed
@@ -1648,7 +1674,11 @@ class Workspace:
         """The approved Python environment a workflow's custom tools run in, for the digest of a memory consent
         (RT-089d, Welle 5): the SHA-256 of its lock (the exact versions of the libraries the tools import), ``None``
         when the workflow has none. Approving other library versions makes a consent stale."""
-        env = self.python.get(scope_of("workflow", workflow_id))
+        return self._lock_digest(scope_of("workflow", workflow_id))
+
+    def _lock_digest(self, scope: str) -> str | None:
+        """The SHA-256 of the approved lock of a Python environment (``None``: none)."""
+        env = self.python.get(scope)
         if env is None or not env.lock:
             return None
         return hashlib.sha256(f"{env.python_version}\n{env.lock}".encode()).hexdigest()

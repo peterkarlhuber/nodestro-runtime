@@ -17,6 +17,7 @@ from typing import Any
 from orkexa import Tool, ToolExecutionError, ToolInputError, ToolResultError
 
 from ..problems import NodestroError
+from ..tool_spec import consent_guard
 from .models import McpServer, McpTool
 from .service import McpService
 
@@ -112,6 +113,9 @@ class McpAgentTool(Tool):
 
     def execute(self, payload: dict[str, Any]) -> Any:
         self._validate(payload)
+        guard = consent_guard()
+        if guard is not None:
+            guard.check(self.name or "")  # RT-089d (Welle 5): the MCP server the consent covered, unchanged since
         try:
             server, _tool, result = self.service.call(
                 self.tool_name, payload, cancelled=self.cancelled, gated=self.gated

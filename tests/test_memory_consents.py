@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 import contextvars
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -489,11 +490,155 @@ async def test_a_connection_edited_while_the_step_runs_is_not_used(make: Make, m
     flow = workspace.save_workflow(_flow("wf_edit", _agent_node("a", agent)))
     _allow(workspace, flow.id)
     done = await _start(workspace, flow)
-    assert done.status == "succeeded", done.error
     calls = {call.id: call for call in done.nodes["a"].tool_calls}
     assert not calls["t1"].is_error, calls["t1"].output
     assert calls["t2"].is_error and "memory.consent_required" in (calls["t2"].output or "")
+    # Review 2: nor does the step send its next model request; it fails closed.
+    assert done.nodes["a"].error_code == "memory.consent_required" and done.status == "failed"
     assert not _consented(workspace, flow)  # and the next run needs a new consent
+
+
+def _search_hook(workspace: Workspace) -> Any:
+    hook = workspace.connections.create(ConnectionIn(type="search", name="Search", provider="test"))
+    workspace.connections.set_secret(hook.id, "a token")
+    return hook
+
+
+async def test_a_later_step_of_a_private_tree_does_not_use_an_edited_connection(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 1 (Welle 5): the guard covered only the step that opened the space. A later step of the same tree gets
+    that step's output (the memory) and was admitted by the tree's consent check at the run's start; a connection
+    edited after that check reached it. Now every step of a tree that used a person's space is guarded."""
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    workspace = make({})
+    hook = _search_hook(workspace)
+
+    def edited_then_search(_request: Any) -> Any:
+        workspace.connections.set_secret(hook.id, "another token")
+        return tool_use("search_web", {"query": "salary"}, call_id="t9")
+
+    workspace.client.messages.script.update(  # type: ignore[attr-defined]
+        {"MEM": [VIEW, text("read")], "SEND": [edited_then_search, text("done")]}
+    )
+    _seed(workspace)
+    bound = {"search_web": ToolSettings(connection_id=hook.id)}
+    sender = _agent("SEND", space=None, name="Send").model_copy(
+        update={"tools": ["search_web"], "tool_settings": bound}
+    )
+    flow = workspace.save_workflow(_flow("wf_later", _agent_node("a", _agent()), _agent_node("b", sender)))
+    _allow(workspace, flow.id)
+    done = await _start(workspace, flow)
+    assert done.nodes["a"].status == "succeeded", done.nodes["a"].error
+    [call] = done.nodes["b"].tool_calls
+    assert call.is_error and "memory.consent_required" in (call.output or "")
+    assert done.nodes["b"].error_code == "memory.consent_required"
+
+
+async def test_an_mcp_call_and_a_model_request_wait_for_an_unchanged_consent(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 2 (Welle 5): the guard asked only built-in tools with a connection. An MCP tool (it sends to its server)
+    and the step's model requests now ask it too: after a change of anything the consent covered (here: a bound
+    connection's secret; another model server address is covered the same way), the MCP call is not sent and the step
+    sends no further request."""
+    from mcp_support import serve
+
+    from nodestro_runtime.mcp.models import McpServerIn
+
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    handle = serve()
+    try:
+        workspace = make({})
+        hook = _search_hook(workspace)
+        added = workspace.mcp.add(McpServerIn(name="Catalog", url=handle.url, allow_loopback=True), actor="admin")
+        workspace.mcp.discover(added.id)
+        tool = workspace.mcp.tool(added.id, "search")
+        workspace.mcp.decide(added.id, "search", approve=True, access="read", expected_hash=tool.hash, actor="admin")
+
+        def edited_then_call(_request: Any) -> Any:
+            workspace.connections.set_secret(hook.id, "another token")
+            return tool_use("mcp__catalog__search", {"query": "salary"}, call_id="m1")
+
+        workspace.client.messages.script["MEM"] = [VIEW, edited_then_call, text("done")]  # type: ignore[attr-defined]
+        _seed(workspace)
+        bound = {"search_web": ToolSettings(connection_id=hook.id)}
+        agent = _agent().model_copy(update={"tools": ["search_web", "mcp__catalog__search"], "tool_settings": bound})
+        flow = workspace.save_workflow(_flow("wf_mcp_guard", _agent_node("a", agent)))
+        _allow(workspace, flow.id)
+        done = await _start(workspace, flow)
+        calls = {item.id: item for item in done.nodes["a"].tool_calls}
+        assert "m1" in calls, (done.nodes["a"].error_code, done.nodes["a"].error)
+        assert calls["m1"].is_error and "memory.consent_required" in (calls["m1"].output or "")
+        assert [r for r in handle.requests if r["headers"].get("mcp-method") == "tools/call"] == []
+        assert done.nodes["a"].error_code == "memory.consent_required"
+        assert _calls(workspace) == 2  # no model request after the change
+    finally:
+        handle.stop()
+
+
+async def test_a_connection_edited_between_the_check_and_the_read_is_refused(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 3 (Welle 5): the guard compared the means before the connection was read. Now the connection read is
+    compared with the one the consent covered too: an edit between the check and the read is refused."""
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    workspace = make({})
+    hook = _search_hook(workspace)
+    original = workspace.builder.resolve_connection
+    assert original is not None
+
+    def edited_while_read(connection_id: str, **kwargs: Any) -> Any:
+        found = original(connection_id, **kwargs)  # as if edited right after the guard's check
+        return dataclasses.replace(found, settings={**found.settings, "region": "zz"})
+
+    monkeypatch.setattr(workspace.builder, "resolve_connection", edited_while_read)
+    workspace.client.messages.script["MEM"] = [  # type: ignore[attr-defined]
+        VIEW,
+        tool_use("search_web", {"query": "salary"}, call_id="r1"),
+        text("done"),
+    ]
+    _seed(workspace)
+    bound = {"search_web": ToolSettings(connection_id=hook.id)}
+    agent = _agent().model_copy(update={"tools": ["search_web"], "tool_settings": bound})
+    flow = workspace.save_workflow(_flow("wf_read", _agent_node("a", agent)))
+    _allow(workspace, flow.id)
+    done = await _start(workspace, flow)
+    call = next(item for item in done.nodes["a"].tool_calls if item.id == "r1")
+    assert call.is_error and "memory.consent_required" in (call.output or "")
+
+
+def test_a_local_mcp_servers_approved_packages_are_covered(make: Make) -> None:
+    """Review 4 (Welle 5): a local (stdio) MCP server runs the packages of its approved ``mcp:`` environment; the
+    digest covers that environment's lock."""
+    from nodestro_runtime.mcp.models import StdioCommand
+
+    workspace = make({})
+    server = McpServer(
+        slug="local",
+        name="Local",
+        url="stdio:local_mcp",
+        transport="stdio",
+        stdio=StdioCommand(requirements=["local-mcp==1.0"], module="local_mcp"),
+    )
+    definition = ToolDefinition(name="lookup", description="Look up")
+    tool = McpTool(
+        server_id=server.id,
+        name="lookup",
+        tool_name="mcp__local__lookup",
+        definition=definition,
+        hash=definition.digest(),
+        status="approved",
+        access="read",
+    )
+    workspace.store.put(SERVERS, server.id, server)
+    workspace.store.put(TOOLS, tool.key, tool)
+    flow = _flow("wf_stdio", _agent_node("a", _agent().model_copy(update={"tools": [tool.tool_name]})))
+    environment = PythonEnvironment(scope=scope_of("mcp", server.id), kind="mcp", ref=server.id, lock="a==1\n")
+    workspace.python._put(environment)
+    before = workspace.runs.consent_digest(flow)
+    workspace.python._put(environment.model_copy(update={"lock": "a==2\n"}))
+    assert workspace.runs.consent_digest(flow) != before
 
 
 async def test_a_sub_workflow_without_saved_versions_is_covered_by_its_content(make: Make) -> None:

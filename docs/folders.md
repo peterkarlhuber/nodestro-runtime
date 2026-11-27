@@ -227,7 +227,8 @@ access log names the grant, and the run is marked as holding granted content (N-
   holds. Fail closed without blocking (Welle 5): a legacy `vec0` vector table that cannot be cleaned leaves the copy
   with its storage tables and its schema entry (no broken table stays); when a folder's chunks cannot be removed one
   by one, the copy loses its whole search index instead (`storage.drop_search_index`; the knowledge files stay) and
-  the migration goes on; copies an older release made before a migration lose their folder index at the next start
+  the migration goes on; copies an older release made before a migration lose their folder index at the next start,
+  a copy that cannot be stripped is deleted, and leftovers of an interrupted copy are removed
   (`workspace.strip_migration_copies`).
 - **A failed removal before a rebuild.** When removing the folder indexes before a rebuild of the semantic index fails,
   the rebuild does not start (`knowledge.reindex_failed`; it would embed what is left) and nothing stays marked: the
