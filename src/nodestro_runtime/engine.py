@@ -4233,15 +4233,14 @@ class RunManager:
         request: ToolApprovalRequest,
         is_error: bool,
         *,
-        refused: bool = False,
+        refused: str | None = None,
     ) -> None:
         """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
         after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
         (``tool.changed``), not ``executed``; so is a call the MCP service refused right before the send
-        (``refused``). The request stays ``executed``, so the call never runs later."""
-        stale = _stale_outcome(context.env.builder.tools, call, request) if is_error else None
-        if stale is None and refused:
-            stale = "refused_at_send"
+        (``refused``: its reason, e.g. ``memory.consent_required``). The request stays ``executed``, so the call never
+        runs later."""
+        stale = _refusal_outcome(context.env.builder.tools, call, request, refused) if is_error else None
         if stale is not None:
             gate.approvals.audit("stale", request, outcome=stale)
         else:
@@ -4854,11 +4853,21 @@ class RunManager:
         config = node.orchestrator
         assert config is not None
 
+        # RT-089d (Welle 5, review L3): in a run tree that uses a person's memory space the decision's model server
+        # is part of the consent (its address, :func:`memory_consents.workflow_digest`); its requests stop once it
+        # changed.
+        guard: ConsentGuard | None = None
+        if getattr(context.env.builder.memory_spaces, "owners", None) is not None:
+            means = AgentConfig(name=node_label(node), model=config.model)
+            guard = self._consent_guard(context, means, self.consent_means(means), False)
+
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
             context.tracker.check()
             # N-08: a team's result may have brought granted content since the decision connected.
             self._check_egress(context, node.id, config.model)
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
 
         interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node.id))
         try:
@@ -5310,18 +5319,24 @@ class RunManager:
             binding = bindings.pop(call.id, None)
             # The MCP service refused the call at its last check right before the send (the tool was reclassified or
             # approved differently after the gate let it run): it did not run, like a refusal at the gate.
-            refused_at_send = is_error and binding is not None and bool(binding.refused)
+            # Also a call refused because what a memory consent covered changed (``memory.consent_required``).
+            reason = binding.refused[0] if is_error and binding is not None and binding.refused else None
             record = calls.get(call.id)
             if request is not None and gate is not None:
-                self._audit_released(context, gate, call, request, is_error, refused=refused_at_send)
-            elif refused_at_send and gate is not None and record is not None and record.approval is not None:
+                self._audit_released(context, gate, call, request, is_error, refused=reason)
+            elif reason is not None and gate is not None and record is not None and record.approval is not None:
                 asked = record.approval.request_id
                 found = gate.approvals.get(context.run.id, asked) if asked else None
                 if found is not None:
-                    stale = _stale_outcome(context.env.builder.tools, call, found) or "refused_at_send"
-                    gate.approvals.audit("stale", found, outcome=stale)
-            if refused_at_send and record is not None and record.approval is not None and record.approval.code is None:
-                record.approval = record.approval.model_copy(update={"code": "tool.approval_stale"})
+                    outcome = _refusal_outcome(context.env.builder.tools, call, found, reason)
+                    gate.approvals.audit("stale", found, outcome=outcome)
+            if (
+                reason is not None
+                and record is not None
+                and record.approval is not None
+                and record.approval.code is None
+            ):
+                record.approval = record.approval.model_copy(update={"code": reason})
             if record is not None:
                 record.output = content[:20_000]
                 record.is_error = is_error
@@ -5416,7 +5431,10 @@ class RunManager:
             # Welle 5: the means a consent covers, taken before it is checked (review 3: nothing changed after the
             # check is ever covered); only where spaces have owners.
             owners = getattr(context.env.builder.memory_spaces, "owners", None) is not None
-            checked = self.consent_means(config) if owners else None
+            top = context.root.run
+            private_tree = top.memory_owner not in (None, NOBODY) and bool(top.memory_spaces)
+            needed = owners and (config.memory.mode == "persistent" or private_tree)  # review L1: only then
+            checked = self.consent_means(config) if needed else None
             consented = False
             if config.memory.mode == "persistent":
                 consented = self.check_memory_consent(context, config.memory.space)
@@ -5905,6 +5923,15 @@ def _stale_outcome(tools: Any, call: ToolCall, request: ToolApprovalRequest) -> 
     if reclassified(request.capability, tool_facts(tools, call.name)[0]):
         return "tool.reclassified"
     return None
+
+
+def _refusal_outcome(tools: Any, call: ToolCall, request: ToolApprovalRequest, refused: str | None) -> str | None:
+    """The ``stale`` audit outcome of an approved call that failed: a memory consent that no longer holds
+    (``memory.consent_required``), else :func:`_stale_outcome`, else ``refused_at_send`` when the MCP service refused it
+    right before the send; ``None`` when it ran."""
+    if refused is not None and refused != "tool.approval_stale":
+        return refused
+    return _stale_outcome(tools, call, request) or ("refused_at_send" if refused else None)
 
 
 def _current_hash(tools: Any, call: ToolCall) -> str:

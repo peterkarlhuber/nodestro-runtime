@@ -65,6 +65,13 @@ def workflow_digest(workflow: Workflow, means: Means) -> str:
     fields = set(WorkflowIn.model_fields) | {"id"}
     data = workflow.model_dump(mode="json", include=fields - _NOT_CONTENT)
     used = {node.id: means(node.agent) for node in workflow.nodes if node.agent is not None}
+    for node in workflow.nodes:
+        # Welle 5 (review L3): an orchestrator's own model server (its address), only where it adds something, so
+        # other digests stay the same.
+        if node.orchestrator is not None and node.id not in used:
+            found = means(AgentConfig(name=node.id, model=node.orchestrator.model))
+            if found:
+                used[node.id] = found
     return _digest({"workflow": data, "means": used})
 
 

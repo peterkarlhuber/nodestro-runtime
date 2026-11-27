@@ -8,8 +8,10 @@
     environment (`Workspace.consent_environment`, `memory_consents.with_environment`) and of a local MCP server's
     `mcp:` environment. Every step of a run tree that uses a person's space checks what the consent covered before
     each connection it reads (and the connection read), each MCP call and each model request
-    (`tool_spec.ConsentGuard`); a change refuses them with `memory.consent_required`. Digests of workflows without
-    those means are unchanged.
+    (`tool_spec.ConsentGuard`); a change refuses them with `memory.consent_required`. An orchestrator's model
+    server is covered too and its decision requests are guarded the same way; an approved call refused this way is
+    audited `stale` with `memory.consent_required` (not `executed`). The means are read only for a step with a
+    persistent space or a step of a private tree. Digests of workflows without those means are unchanged.
   - N-12: a failed removal of the folder indexes before a rebuild no longer leaves the rebuild marked as running and
     the folder index held back; copies hold no broken legacy vector table (`storage.strip_index_sources`); a copy
     whose folder chunks cannot be removed loses its whole search index instead of failing the migration

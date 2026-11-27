@@ -53,7 +53,9 @@ its tools. Now:
   connection read, before each MCP call (and again right before the send) and before each model request
   (`tool_spec.ConsentGuard`). A change refuses the call (the tool result names `memory.consent_required`; nothing is
   sent) and fails the step at its next model request with `memory.consent_required`. The next run needs a new
-  consent (Welle 5).
+  consent (Welle 5). An approved call refused this way is audited `stale` with outcome `memory.consent_required`.
+  An orchestrator's model server is part of the digest, and its decision requests in such a tree are guarded the
+  same way. A step that has no persistent space and is not in a private tree reads no means.
 - **Local MCP servers.** A local (stdio) MCP server's entry also covers the lock of its approved `mcp:`
   environment.
 - **Agent tests** need a consent for the digest of the tested configuration with its means

@@ -712,6 +712,8 @@ class McpService:
         finally:
             self._keep_refreshed(server, credential)
         if result.refused and consent_changed:
+            if binding is not None and not binding.refused:
+                binding.refused.append("memory.consent_required")
             raise NodestroError(
                 "memory.consent_required",
                 f"What {tool_name} uses changed since the memory consent was checked; it was not made",
