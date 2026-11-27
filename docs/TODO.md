@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 12 |
-| P3 Low | 36 |
+| P3 Low | 37 |
 | P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -40,6 +40,21 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+### RT-097 · Memory entries (N-24): follow-ups
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** [docs/memory-entries.md](memory-entries.md),
+  `MemorySpaces`, `BrowsableMemory.entries`, migration `0011_memory_origin.sql`, Orkexa `MemoryBackend.list_entries`
+- **Done:** entries with time, origin (`tool`, `user`, `import`, `assistant`) and `scope` (`user`) on SQLite and PostgreSQL;
+  manual remembering only by a person's explicit write; owner rules of RT-089c unchanged.
+- **Open:**
+  - the origin names the kind of writer, not which agent, run or workflow wrote (one shared connection per space;
+    Orkexa's `execute(origin=)` would take a finer value);
+  - the scopes `project` and `agent` are reserved names only: no space of a project or an agent exists yet;
+  - no creation time per entry (only the last write);
+  - no paging: `BrowsableMemory.entries` returns every file of a space at once (N-24 review L3);
+  - on SQLite, listing entries takes Orkexa's write lock (`BEGIN IMMEDIATE`) like `view` (N-24 review L4).
+- **Next step:** owner decision whether the origin should name the run or agent.
 
 ### RT-089d · Private memory spaces: the owner's consent, private runs in every channel, open name questions
 
@@ -151,8 +166,11 @@ None known.
   (the `RECORD`s of every site directory and `sys.path` folder), N3 (file identity, not names), N4 (every link hop)
   and N5 (zip distributions refused cleanly). Third review fixed NEW-1 (one file in two `RECORD`s, or a foreign
   `RECORD` naming the runtime's or the integration's files) and NEW-2 (`sitecustomize`/`usercustomize`); the
-  in-process limit is documented. Open decision: keep untrusted extension packages out of the host environment
-  altogether (a data-only package store mounted into the sandbox). L2 (the process's primary group counts as its own)
+  in-process limit is documented. Fourth review: NEW-4 (a foreign module imported before the checks rewrites
+  them) is not fixed in process by design; the boundary is stated plainly: the host environment holds only the
+  shipped lock, and the data-only extension store is the planned fix and a prerequisite of every G-6 class unlock
+  (owner decision on its timing pending). NEW-5 fixed in nodestro-integrations (no OCR program from a Python
+  package's folders). L2 (the process's primary group counts as its own)
   stays documented.
   Open for G-6: Docker Desktop on macOS and Windows (not tested), Podman with the profile (not tested), network and folder grant paths and package dependency images
   (designed, not implemented), an end-to-end check of the import path inside the images, showing the package states in

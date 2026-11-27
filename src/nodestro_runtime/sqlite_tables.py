@@ -17,11 +17,12 @@ from orkexa import SQLiteIndex, SQLiteMemory
 
 from .storage import open_sqlite
 
-#: The table ``SQLiteMemory`` creates on first use (created here too, so totals work on a new database).
+#: The table ``SQLiteMemory`` creates on first use (created here too, so totals work on a new database); N-24: with
+#: the ``origin`` of each file (``SQLiteMemory`` adds the column to an older table when it opens it).
 _MEMORY_TABLE = (
     "CREATE TABLE IF NOT EXISTS memory_files ("
     " namespace TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL,"
-    " updated_at TEXT NOT NULL, PRIMARY KEY (namespace, path))"
+    " updated_at TEXT NOT NULL, origin TEXT, PRIMARY KEY (namespace, path))"
 )
 
 

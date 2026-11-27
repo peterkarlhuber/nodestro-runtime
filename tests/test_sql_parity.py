@@ -31,6 +31,21 @@ TABLES = frozenset(tenant_tables(PACKAGE / "migrations" / "postgres"))
 #: The modules whose source the check reads after B6 (relative to the package's parent, as the check names them): the
 #: generic package of B4 is gone (its SQL is Orkexa's catalog).
 AFTER_MODULES = ("nodestro_runtime/postgres_tables.py",)
+#: N-24: statements of the baseline a later change replaced, by the catalog entry that replaced them: the entry is
+#: checked in their place (found, and with no finding the baseline did not have). A memory write records its origin.
+REPLACED = {
+    "memory_write": "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content) VALUES (%s, %s, %s, %s)"
+    " ON CONFLICT (tenant_id, namespace, path) DO UPDATE SET content = excluded.content,"
+    " updated_at = clock_timestamp()",
+}
+#: Catalog entries without a statement in the baseline: the unpartitioned pgvector probe, and (N-24) the entries of a
+#: memory with their time and origin.
+ADDED = ("vectors_pgvector", "memory_entries")
+
+
+def _replacements() -> dict[str, str]:
+    """Normalized baseline text -> normalized text of the catalog entry that replaced it."""
+    return {normalized(old): normalized(render(name, "nodestro_").as_string(None)) for name, old in REPLACED.items()}
 
 
 def normalized(text: str) -> str:
@@ -71,10 +86,13 @@ def test_every_statement_of_the_baseline_is_still_checked() -> None:
     assert len(entries) == 46
     assert baseline["tenant_tables"] == sorted(TABLES)
     now = after()
+    replaced = _replacements()
+    assert set(replaced) <= {re.sub(r"\$\d+", "$?", entry["canonical"]) for entry in entries}
     missing = []
     for entry in entries:
         assert entry["canonical"] is not None, entry  # the baseline had no dynamic or unparsed statement
         key = re.sub(r"\$\d+", "$?", entry["canonical"])
+        key = replaced.get(key, key)
         if key not in now:
             missing.append(entry["text"])
             continue
@@ -84,20 +102,25 @@ def test_every_statement_of_the_baseline_is_still_checked() -> None:
 
 
 def test_the_baseline_splits_into_catalog_and_nodestro_source() -> None:
-    """Of the 46 statements, 42 are the catalog's partitioned entries and 4 stay in Nodestro's source (chunk counts,
-    attaching a file, a source's text, the memory totals); the catalog adds only the unpartitioned pgvector probe."""
+    """Of the 46 statements, 42 are the catalog's partitioned entries (one of them replaced, :data:`REPLACED`) and 4
+    stay in Nodestro's source (chunk counts, attaching a file, a source's text, the memory totals); the catalog adds
+    only the entries of :data:`ADDED`."""
     # Rendering uses psycopg.sql (the postgres extra); the desktop profile runs this suite without it.
     pytest.importorskip("psycopg")
     baseline = {
         re.sub(r"\$\d+", "$?", entry["canonical"])
         for entry in json.loads(BASELINE.read_text(encoding="utf-8"))["statements"]
     }
+    replaced = _replacements()
+    assert set(replaced) <= baseline
+    baseline = {replaced.get(key, key) for key in baseline}
     catalog = {normalized(render(name, "nodestro_").as_string(None)): name for name in CATALOG}
-    assert set(catalog) - baseline == {normalized(render("vectors_pgvector", "nodestro_").as_string(None))}
+    added = {normalized(render(name, "nodestro_").as_string(None)) for name in ADDED}
+    assert set(catalog) - baseline == added
     source = PACKAGE / "postgres_tables.py"
     kept = {normalized(s.text) for s in statements_of(source.read_text(encoding="utf-8"), "postgres_tables.py", TABLES)}
     assert len(kept) == 4
-    assert baseline == (set(catalog) - {normalized("SELECT to_regtype('vector') IS NOT NULL")}) | kept
+    assert baseline == (set(catalog) - added) | kept
 
 
 @pytest.mark.parametrize(

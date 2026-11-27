@@ -27,6 +27,12 @@ POSIX = os.name == "posix"
 INTENDED: list[tuple[tuple[str, ...], Any, Any, str]] = [
     (("pragmas", "foreign_keys"), 0, 1, "SQLITE_PROFILE: foreign keys enforced (doc 06 MIG-NOD-6 field 4)"),
     (("pragmas", "trusted_schema"), 1, 0, "Tabrion's default: no SQL functions with side effects in the schema"),
+    (
+        ("memory_totals", "columns"),
+        ["namespace", "path", "content", "updated_at"],
+        ["namespace", "path", "content", "updated_at", "origin"],
+        "N-24: a new memory table has the origin of each file (memory entries)",
+    ),
 ]
 if POSIX:
     for mask in ("022", "002"):

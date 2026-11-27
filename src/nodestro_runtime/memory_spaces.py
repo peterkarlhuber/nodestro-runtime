@@ -18,6 +18,15 @@ to use it: a :class:`MemoryConsent` names the space, its owner, the workflow (or
 the SHA-256 digest of its content (:mod:`nodestro_runtime.memory_consents`). Any change of the content changes the
 digest, so the consent no longer applies to it; nothing grants a consent by itself, and the owner revokes one at any
 time. Without a consent the step fails with ``memory.consent_required`` (fail closed). The desktop needs none.
+
+Entries (N-24): every file of a space is an entry the owner sees, edits and deletes (:meth:`BrowsableMemory.entries`,
+:meth:`~BrowsableMemory.write`, :meth:`~BrowsableMemory.remove`), with the time and origin of its last write from the
+Orkexa backend (:meth:`orkexa.memory.MemoryBackend.list_entries`): ``tool`` when an agent's memory tool wrote it,
+:data:`ORIGIN_USER` when a person wrote it by an explicit action (the HTTP API), :data:`ORIGIN_ASSISTANT` when a
+person saved the memory assistant's proposal, :data:`ORIGIN_IMPORT` for an imported seed, ``None`` when unknown (written
+before origins were kept). Only an explicit action of a person writes with :data:`ORIGIN_USER`; no model tool does. Each
+entry and space names its ``scope``: today every space is one person's (``user``); ``project`` and ``agent`` are
+reserved for spaces of a project or of one agent.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ import threading
 from typing import Literal, Protocol
 
 from orkexa import SQLiteMemory
-from orkexa.memory import MEMORY_ROOT, MemoryBackend
+from orkexa.memory import MEMORY_ROOT, ORIGIN_TOOL, MemoryBackend
 from pydantic import BaseModel, Field
 
 from .problems import NodestroError
@@ -44,15 +53,35 @@ _SPACE = SPACE_PATTERN  # the name before it was public
 _PREFIX = "nodestro:"
 
 
+#: Whose a memory space is (N-24): every space today is one person's (``user``); ``project`` and ``agent`` are reserved.
+MemoryScope = Literal["user", "project", "agent"]
+#: The origin of a file a person wrote by an explicit action (the HTTP API), never by a model tool (N-24).
+ORIGIN_USER = "user"
+#: The origin of a file that came with an imported project (the memory seed of a standalone workflow).
+ORIGIN_IMPORT = "import"
+#: The origin of a file a person saved from the memory assistant's proposal: model output, not the person's own text.
+ORIGIN_ASSISTANT = "assistant"
+#: Every origin Nodestro writes (``None``, unknown, aside).
+ORIGINS = frozenset({ORIGIN_TOOL, ORIGIN_USER, ORIGIN_IMPORT, ORIGIN_ASSISTANT})
+
+
 class MemoryFile(BaseModel):
+    """One entry of a memory space (N-24: with the time and origin of its last write)."""
+
     path: str
     size: int
+    #: When it was last written; ``None`` when the storage keeps no time.
+    updated_at: datetime | None = None
+    #: Who wrote it last: one of :data:`ORIGINS` (``tool``, ``user``, ``import``, ``assistant``) or ``None`` (unknown).
+    origin: str | None = None
+    scope: MemoryScope = "user"
 
 
 class MemorySpaceInfo(BaseModel):
     name: str
     files: int
     size: int
+    scope: MemoryScope = "user"
 
 
 #: The collection of the spaces' owners (RT-089c): space name -> :class:`SpaceOwner`.
@@ -138,9 +167,11 @@ class BrowsableMemory(MemoryBackend):
     """A memory with read access for the memory browser (any Orkexa storage)."""
 
     def entries(self) -> list[MemoryFile]:
-        with self._lock:
-            files = self._files("")
-        return [MemoryFile(path=f"{MEMORY_ROOT}/{key}", size=size) for key, size in sorted(files.items())]
+        """Every file of the space, sorted by path, with the time and origin of its last write (N-24)."""
+        return [
+            MemoryFile(path=entry.path, size=entry.size, updated_at=entry.updated_at, origin=entry.origin)
+            for entry in self.list_entries(MEMORY_ROOT)
+        ]
 
     def read(self, path: str) -> str:
         key = path.removeprefix(MEMORY_ROOT).strip("/")
@@ -150,9 +181,10 @@ class BrowsableMemory(MemoryBackend):
             raise KeyError(path)
         return text
 
-    def write(self, path: str, text: str) -> None:
-        """Create or overwrite a file (the ``create`` command validates the path)."""
-        self.create(path, text)
+    def write(self, path: str, text: str, *, origin: str | None = ORIGIN_USER) -> None:
+        """Create or overwrite a file (the ``create`` command validates the path); a person's explicit write by
+        default (:data:`ORIGIN_USER`)."""
+        self.create(path, text, origin=origin)
 
     def remove(self, path: str) -> None:
         self.delete(path)

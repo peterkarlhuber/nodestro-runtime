@@ -68,13 +68,25 @@ def old_tables() -> ModuleType:
     return sys.modules.get(name) or _load(name, LEGACY / "postgres_tables_pre_b3.py")
 
 
+#: The schema version of the legacy fixtures (migrations 0001-0010).
+FIXTURE_VERSION = 10
+
+
 @contextmanager
 def restored(dump: str) -> Iterator[tuple[str, Any]]:
-    """The connection string of a new database with ``dump`` restored, and its :class:`PostgresDatabase`. An event
-    trigger logs every DDL command into ``mup_ddl_log`` from here on."""
-    from nodestro_runtime.storage_postgres import PostgresDatabase
+    """The connection string of a new database with ``dump`` restored, and its :class:`PostgresDatabase`. The
+    operator's migration brings it to this release's schema first (migrations newer than the fixture's 0010; N-24:
+    ``0011_memory_origin``, a nullable column), as an upgrade does before the new release serves; an event trigger
+    then logs every DDL command into ``mup_ddl_log``, so the cases see what the started release does."""
+    from nodestro_runtime.storage_postgres import POSTGRES_SCHEMA_VERSION, PostgresDatabase
 
     with postgres_support.restored_database(dump) as conninfo:
+        migration = PostgresDatabase(conninfo)
+        try:
+            assert migration.migrate(before_migration=lambda current, target: None) == FIXTURE_VERSION
+            assert migration.schema_version == POSTGRES_SCHEMA_VERSION
+        finally:
+            migration.close()
         _execute(
             conninfo,
             "CREATE TABLE public.mup_ddl_log (tag text NOT NULL)",
@@ -188,8 +200,11 @@ def upgrade(database: Any, ranking: str) -> dict[str, str]:
     assert snapshot(database, "tenant-b") == before_b
     after_b = index(database, "tenant-b", ranking=ranking).vector_status()
     assert after_b.active is not None and after_b.active["model"] == "fx-embed-a" and after_b.building is not None
-    # An operator's migrate finds nothing to apply (MP-B3 adds no migration); the checksums stay green.
-    assert database.migrate(before_migration=lambda current, target: None) == 10
+    # An operator's migrate finds nothing more to apply (the migrations newer than the fixture ran in ``restored``);
+    # the checksums stay green.
+    from nodestro_runtime.storage_postgres import POSTGRES_SCHEMA_VERSION
+
+    assert database.migrate(before_migration=lambda current, target: None) == POSTGRES_SCHEMA_VERSION
     database.require_current_schema()
     # Its only DDL is the runner's own CREATE TABLE IF NOT EXISTS of nodestro_schema_migrations (a no-op here).
     assert ddl(database) == ["CREATE TABLE"]

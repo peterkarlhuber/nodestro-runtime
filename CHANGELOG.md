@@ -8,6 +8,12 @@
   grant refused). New Docker tests: a cancelled run and a crashed host leave no container. Fix: extension containers are named
   `nodestro-sandbox-ext-*`, which Nodestro Local Docker's sandbox gateway accepts (`nodestro-ext-*` was refused there).
 
+- Docs (N-22 fourth review, NEW-4): `docs/extension-isolation.md` states the boundary of the host import plainly:
+  the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
+  installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before
+  them, for example a new module that a standard module imports when it exists). The data-only extension store is
+  the planned fix and must exist before any G-6 class unlock. No code change.
+
 - Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
   own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)
   and only on a closed import path (`trusted_integrations.environment_problems`: no user site-packages, nothing in the
@@ -32,6 +38,14 @@
   wheel replacing any module); so does a `sitecustomize` or `usercustomize` that is loaded or importable
   (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
   process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
+
+- New (N-24): memory entries with their time and origin ([docs/memory-entries.md](docs/memory-entries.md)).
+  `MemoryFile` gains `updated_at`, `origin` (`tool`, `user`, `import`, `assistant` for a saved proposal of the memory
+  assistant, or `null` when unknown; `ORIGINS` lists them) and `scope` (`user`;
+  `project` and `agent` reserved), `MemorySpaceInfo` gains `scope`; `BrowsableMemory.write` records a person's
+  explicit write as `user`. Migration `0011_memory_origin.sql` adds the nullable column `origin` to
+  `nodestro_memory_files` (Orkexa's PostgreSQL schema version 2); older files list no origin. The desktop import to
+  PostgreSQL carries the origin.
 
 - New (N-20, off by default: `NODESTRO_WORKFLOW_TOOLS`): agents call saved workflows in a fixed version as tools
   (`AgentConfig.workflow_tools`, `workflow_tools`; [docs/workflow-tools.md](docs/workflow-tools.md)). A call is a
