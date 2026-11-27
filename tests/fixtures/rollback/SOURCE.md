@@ -28,7 +28,10 @@ now reports `bypass_rls: true` (Tabrion contract I-20: a superuser can become th
 `BYPASSRLS`) and names it in the refusal message; `catalog.json` (every grant and ACL entry) and the other files were
 byte-identical. A revert of MIG-NOD-5 restores the old `roles.json` with it.
 A pull request that changes another snapshot on purpose (for example a new migration) rewrites the file with the tool
-and says why. A rollback (revert pull request) is verified by the same files: after the revert, `check` reports
+and says why. N-24 (migration `0011_memory_origin.sql`) rewrote `schema.json` and `errors.json` with the tool: `schema.json`
+gained the migration row and the nullable `memory_files.origin` column, and `errors.json` the supported schema
+version 11 in `schema_mismatch`; the other three files were byte-identical. A revert of N-24 restores both.
+A rollback (revert pull request) is verified by the same files: after the revert, `check` reports
 "snapshots identical" again.
 
 MIG-NOD-7 (extension status) is **not** covered by these files: `schema.json` leaves extension objects out, and no
