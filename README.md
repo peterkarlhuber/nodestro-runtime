@@ -252,8 +252,10 @@ install an extension package into the backend's Python environment** (owner deci
 shipped lock, and the products have no pip. Every other integration found there through the entry point group
 `nodestro.integrations` is refused as "installed in the host environment" (`invalid`), whatever
 `NODESTRO_EXTENSION_TOOLS` says: it is never imported (not even its import-time code runs in the host process), never
-offered and never sent to the sandbox; only its metadata is read to report it. Foreign extensions will come only from
-the separate, data-only extension store (`<data>/extensions`, a G-6 prerequisite, not built yet) and will run only in
+offered and never sent to the sandbox; only its metadata is read to report it. Foreign extensions come only from
+the separate, data-only extension store (`<data>/extensions/<sha256>/`, `Workspace.extension_store`: a checked
+pure-Python wheel taken in atomically by an administrator, kept read-only and never on `sys.path`; RT-098, its
+independent review is open) and run only in
 a new container of Orkexa's sandbox shape (no network, no host files, no environment, limits; the time limit removes
 the container), only while `NODESTRO_EXTENSION_TOOLS=1` (a development switch, off by default) and the Docker sandbox
 passed its checks; otherwise they are "locked, not sufficiently secured" (`Extensions.packages_status()`: `off`,

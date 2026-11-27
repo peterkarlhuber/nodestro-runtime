@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Security (RT-098, Welle 7; nothing enabled, the switch stays off, no class released): the data-only extension
+  store `<data>/extensions/<sha256>/` (`extension_store.ExtensionStore`, `Workspace.extension_store`, desktop and
+  Nodestro Local Docker only). Intake checks the expected SHA-256, the origin, size and zip safety (links, devices,
+  traversal, duplicates), every `RECORD` hash, the manifest and the dependencies, refuses `.pth`, `.data`, scripts and
+  native code, and is atomic; every call of a store tool checks that its package is still installed and not revoked,
+  and runs the verified bytes. Intake, update, removal and revocation are activity events (new source `extension`).
+  `extension_classes.PREREQUISITES`: a class that needs a missing G-6 item (17, 18, 21) cannot be released.
+  New codes `extension_store.refused` (param `reason`), `extension_store.not_found`, `extension_store.unreadable`.
+  `ExtensionPackage.key` includes the store hash.
+
 - Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
   containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
   by the sandbox gateway exactly; tool classes and grants are modelled (`extension_classes`, nothing released, every

@@ -18,24 +18,56 @@ any class of them may be enabled by default.
 5. The store is strictly separate from the host Python environment; its packages run only in the Docker sandbox.
 6. Until the store is built and has passed its security review, foreign extension tools stay locked by default.
 
-What this change does about it: a foreign package that `find_packages()` finds in the host environment (any entry
+What the runtime does about it: a foreign package that `find_packages()` finds in the host environment (any entry
 point other than the pinned trusted one) is refused as `invalid` with the detail "installed in the host environment"
 (`extensions.HOST_INSTALLED`), whatever `NODESTRO_EXTENSION_TOOLS` says. Only its metadata (entry point name,
 `module:attribute`, distribution name and version) is read to report it; it is never offered, imported or read, and
 nothing of it is sent to the sandbox (`test_extension_isolation.py::test_a_foreign_package_in_the_host_environment_is_refused`).
-The sandbox code and its tests stay: the store will feed it (the tests use a stand-in for the store,
-`store_packages`).
+Foreign packages come only from the data-only extension store (RT-098, below), which feeds the sandbox.
+
+## The data-only extension store (RT-098)
+
+`src/nodestro_runtime/extension_store.py`, `tests/test_extension_store.py`. Only on this computer (desktop, Nodestro
+Local Docker: `Workspace.extension_store`); a server and a workspace with explicit integrations have none.
+
+```text
+<data>/extensions/            0700, never on sys.path (the data directory is refused there, environment_problems)
+  index.json                  installed packages and revoked hashes; a package counts only while it is listed here
+  <sha256>/                   one wheel, unpacked, files 0444 and folders 0555; the name is the wheel's SHA-256
+  .staging/<random>/          an intake in progress (never valid)
+  .trash/<random>/            a removal in progress (never valid)
+```
+
+| Owner requirement (Welle 7) | How the store meets it | Check (`tests/test_extension_store.py`) |
+|---|---|---|
+| 1. never installed into the host environment, never imported in the host | the store writes files only below `<data>/extensions`; nothing there is on `sys.path`, `find_spec` does not find the module, `discover`/`find_packages` do not list it; the files only travel to the container on stdin | `::test_a_checked_wheel_is_kept_read_only_by_its_hash_and_never_imported`, `nothing_imported` in every test; Docker: `test_extension_isolation.py::Real` takes its package from a real store |
+| 2. install, update, removal only through the controlled interfaces | `ExtensionStore.install` (with `replaces=` for an update), `remove`, `revoke`; the HTTP API's admin routes call them (nodestro-api API-081). A folder the index does not list (copied in by hand, or left by a crash) is never used and is removed when the store opens | `::test_an_interrupted_intake_never_leaves_a_valid_package` |
+| 3. size, origin, hash, manifest, dependencies, file paths; unsafe archives, links, traversal, tampering refused | the administrator states the expected SHA-256 and the origin; the wheel is at most 8 MiB, at most 1,000 members, 1 MiB per file and 8 MiB unpacked (each member's real size is read, not trusted); no absolute, `..`, backslash, drive or duplicate path (also by case), no symbolic link, device, FIFO or other special member, no encrypted member, only stored or deflated members; exactly one `<name>-<version>.dist-info` whose `RECORD` lists exactly the members, each with its SHA-256 and size; `Root-Is-Purelib: true` and `py3-none-any` only; `METADATA` matching the folder; no `.data` part, no `.pth`, no `sitecustomize`/`usercustomize`, no native code; only `nodestro.integrations` entry points that name a module of the wheel (no `console_scripts`); no dependency except those the sandbox provides (`PROVIDED`; optional extras are ignored). After intake every read checks the folder against `RECORD` (whose own hash the index keeps): a changed, added or removed file, a symbolic link or a hard link makes the package `invalid` | `::test_an_unsafe_or_inconsistent_wheel_is_refused_before_anything_is_written` (27 cases), `::test_the_expected_hash_and_the_origin_are_required`, `::test_optional_and_provided_dependencies_are_accepted`, `::test_a_package_changed_after_intake_is_never_handed_to_the_sandbox` (6 cases) |
+| 4. atomic intake | written to `.staging/<random>/`, each file `fsync`ed and made read-only, the folder renamed to `<sha256>/`, then the index replaced in one `os.replace` (the commit point). A crash before the commit leaves only folders that are never valid and are removed at the next open | `::test_an_interrupted_intake_never_leaves_a_valid_package` (crash while writing, crash before the commit) |
+| 5. never on `sys.path` or the trusted integrations' search path | as 1; the existing checks keep refusing the data directory on the import path and every foreign package in the host environment (`HOST_INSTALLED`) | `::test_a_host_installed_package_stays_refused_next_to_the_store`, `test_trusted_integrations.py::test_the_data_directory_on_the_path_is_a_problem` |
+| 6. execution only in the Docker sandbox; locked without it | store packages go through the same `Extensions.load_packages` and `ExtensionSandbox` as before: off without the switch, `not_secured` without a proven daemon and seccomp probe | `::test_the_workspace_offers_store_packages_only_through_the_sandbox`; Docker: G-6 items 5 to 13 and 16 run against a store package |
+| 7. N-06 and N-13 mechanisms | a store tool is an extension tool like before: capability at least `UNKNOWN` (`floor_capability`), the tool gate of the access model and the approvals apply unchanged; intake (also a refused one), update, removal and revocation are activity events (source `extension`, resource `extension_package` = the SHA-256, the actor) | `::test_intake_removal_and_revocation_are_in_the_activity_log` |
+| 8. removal, revocation, update never make an invalid package runnable again | before every container of a call the package is checked against the index (still listed with the same `RECORD` hash, not revoked); the sandbox gets the bytes verified when the package was listed, never a fresh read; a revoked hash is never installed again; an update installs the new hash and removes the old one in the same commit | `::test_a_removed_revoked_or_replaced_package_never_runs_again` (3 cases), `::test_a_revoked_hash_is_never_installed_again`, `::test_one_distribution_at_a_time_and_updates_only_of_the_same` |
+| 9. product neutral | no product name; desktop and Nodestro Local Docker use the same store | — |
+
+Limits: a change takes effect for the listing when the workspace opens; a removal or revocation takes effect for calls
+at once (the check). A call that passed its check before a revocation was committed finishes (as any running action
+does). One version per distribution is installed at a time. Whoever can write the data directory can also write the
+index; the store protects against foreign packages and their files, not against a compromised data directory.
 
 **Acceptance criteria of the extension store** (all needed before any class is unlocked):
 
 - data only: each package unpacked read-only into `<data>/extensions/<sha256>/` (the wheel's SHA-256), never on
-  `sys.path` (the data directory is already refused there, `environment_problems`);
+  `sys.path` (the data directory is already refused there, `environment_problems`): built;
 - wheel checks before unpacking: zip safety (no absolute or `..` paths, no links, no device files), every file's
-  `RECORD` hash, limits on file count, file size and total size; no `.pth` file, script or `.data` part is ever run;
-- upload and removal by an administrator only, both audited;
-- execution only in the Docker sandbox, with the existing bounds (rules 2 to 7 below);
-- discovery from the store only (`find_packages` no longer reads the host environment's entry points);
-- an independent security review of the store before any class is unlocked.
+  `RECORD` hash, limits on file count, file size and total size; no `.pth` file, script or `.data` part is ever run:
+  built (`.pth`, `.data` and scripts are refused, not only never run);
+- upload and removal by an administrator only, both audited: the runtime audits; the admin-only routes are
+  nodestro-api API-081;
+- execution only in the Docker sandbox, with the existing bounds (rules 2 to 7 below): built;
+- discovery from the store only (`find_packages` no longer offers anything from the host environment; it only
+  reports and refuses it): built;
+- an independent security review of the store before any class is unlocked: open (G-6).
 
 **Residual risk.** The checks run inside the process they check, so they cannot catch a foreign package that is already
 in the host environment (its code can run before them and change them, review NEW-4). The boundary is therefore
@@ -86,8 +118,8 @@ products ship without pip. Installing anything else into it is outside the trust
    grant for extension tools yet. It sees no host path, no vault, no connection secret and no provider key: the only
    input is the call's JSON arguments.
 7. **Off by default.** `NODESTRO_EXTENSION_TOOLS=1` is a development switch. A package found in the host environment
-   is refused with or without it (`invalid`, "installed in the host environment"). For packages from the store (not
-   built yet): without the switch (the default in every profile) they are listed as locked with the reason `off` and
+   is refused with or without it (`invalid`, "installed in the host environment"). For packages from the store
+   (RT-098): without the switch (the default in every profile) they are listed as locked with the reason `off` and
    no container is started. With it, the
    runtime lists the packages' tools in the sandbox when the workspace opens and offers them on the desktop and in
    Nodestro Local Docker (never in the server profile: there no listing container starts). Turning it on is not a release: no tool class is enabled
@@ -155,9 +187,9 @@ Installing any foreign package there (an extension package included) is outside 
 below cannot detect it reliably: a foreign package's code can run before them and change them (review NEW-4, for
 example a new module such as `winreg.py` that a standard module imports when it exists). The fix decided by the
 owner is the data-only extension store (foreign packages kept as files outside every import path and only ever handed
-to the sandbox, never installed into the host environment); it must exist before any tool class is unlocked under G-6.
-Discovering extension packages from the host environment (`extensions.find_packages`) now only reports and refuses
-them (architecture decision above); the data-only store replaces it.
+to the sandbox, never installed into the host environment); it is built (RT-098, [above](#the-data-only-extension-store-rt-098))
+and must pass its independent review before any tool class is unlocked under G-6. Discovering extension packages from
+the host environment (`extensions.find_packages`) only reports and refuses them (architecture decision above).
 
 Owner decision on R1: the residual risk is accepted provisionally for internal development only if the Python
 installation can be changed exclusively by trusted people and processes; user-writable search paths, working
@@ -232,10 +264,11 @@ open.
 
 Mandatory prerequisite for every class (owner decision 2026-11-27): the data-only extension store, built to the
 acceptance criteria in [Architecture decision](#architecture-decision-owner-2026-11-27-binding) and passed by its
-independent security review, so that no foreign package is installed into the host environment. Until then foreign
-extension tools stay locked by default and no class is unlocked. Residual risk carried into G-6: in-process checks
-cannot catch a foreign package already in the host environment; the boundary is the environment (only the shipped
-lock, no pip in the products).
+independent security review, so that no foreign package is installed into the host environment. State (Welle 7): the
+store is built in the runtime (items 25 to 29); its admin routes, client methods and user interface follow in
+nodestro-api, nodestro-sdk and nodestro-studio; its independent review is open, so foreign extension tools stay locked
+by default and no class is unlocked. Residual risk carried into G-6: in-process checks cannot catch a foreign package
+already in the host environment; the boundary is the environment (only the shipped lock, no pip in the products).
 
 | # | Check | Expected | Covered by |
 |---|---|---|---|
@@ -256,14 +289,29 @@ lock, no pip in the products).
 | 14 | product profiles without the switch | no extension tool callable | `::test_no_extension_tool_in_a_product_profile_without_the_switch` |
 | 15 | image tag moved after the check | only the checked image id runs | Orkexa / `StreamedSandbox` (calls run the image id) |
 | 16 | run cancelled during a call; host process killed during a call | container removed; a left-over container removed by the reaper (all of the installation's at start, expired ones by deadline) | Docker: `::test_a_cancelled_run_removes_the_container`, `::test_a_container_left_by_a_crashed_host_is_reaped` |
-| 17 | network grant for a class with `reach=external` | only the granted host, through the egress guard | default no access proven (item 9); every grant refused: `::test_no_tool_class_is_released_and_no_grant_exists`; grant path designed, not implemented |
-| 18 | folder grant for a class that reads files | only through `orkexa.fs` and a grant | default no access proven (items 10, 11); every grant refused (as 17); grant path designed, not implemented |
-| 19 | Docker Desktop (macOS, Windows) | items 5 to 12 pass there | NOT tested: no CI runner offers Docker Desktop (licensing, nested virtualization); Orkexa's experimental colima macOS job covers only Orkexa's own sandbox; needs a manual run on real machines before G-6 |
+| 17 | network grant for a class with `reach=external` | only the granted host, through the egress guard | NOT implemented. Default no access proven (item 9); every grant refused: `::test_no_tool_class_is_released_and_no_grant_exists`. Classes that depend on it and stay locked while it is missing: `read`/`external` and `write`/`external` (network clients: tools that call web services or APIs), `extension_classes.PREREQUISITES`; a release of them is refused (`test_extension_store.py::test_classes_whose_prerequisite_is_missing_cannot_be_released`) |
+| 18 | folder grant for a class that reads or writes files | only through `orkexa.fs` and a grant | NOT implemented. Default no access proven (items 10, 11); every grant refused (as 17). Classes that depend on it and stay locked while it is missing: `write`/`internal` (file writers: converters and generators that save into a granted folder) and `write`/`external`; a file reader (`read`/`internal` with a folder grant) needs it too, because `require_supported` refuses every folder grant until it exists. Only `read`/`internal` without any grant (isolated computation on the call's arguments) does not depend on it |
+| 19 | Docker Desktop (macOS, Windows) | items 5 to 12 pass there | NOT tested, evidence missing: no CI runner offers Docker Desktop (licensing, nested virtualization), and no real machine was available in Welle 7. Orkexa's experimental colima macOS job covers only Orkexa's own sandbox and is no Docker Desktop acceptance. Needs a manual run of the `docker` job's tests on real machines before a G-6 release that includes these platforms |
 | 20 | own seccomp profile, user namespace remapping | profile shipped, applied and proven by a probe; remapping reported, not required | `::test_without_the_seccomp_profile_applied_the_tools_stay_locked`, `::test_every_extension_container_runs_under_the_seccomp_profile`, `::test_the_extension_seccomp_profile_is_stricter_than_the_default`, Docker: `::test_the_extension_seccomp_profile_is_applied_by_the_real_engine`, gateway: `test_sandbox_gateway.py::test_only_the_extension_seccomp_profile_is_accepted_as_a_seccomp_option`; Orkexa `test_docker_host.py::test_user_namespace_remapping_is_reported` |
-| 21 | dependencies of a package | built as a hashed image like tool environments, never in the host | partly: the runtime image is hashed and offline at run time; packages with dependencies are refused (`invalid`); the dependency image is designed, not implemented |
+| 21 | dependencies of a package | built as a hashed image like tool environments, never in the host | NOT implemented. The runtime image is hashed and offline at run time; the store refuses every package with a dependency the sandbox does not provide (`PROVIDED`: `nodestro-runtime`, `orkexa`, `pydantic`, `typing-extensions`), `test_extension_store.py::test_an_unsafe_or_inconsistent_wheel_is_refused_before_anything_is_written[a dependency]`. Depends on it, in every class: any package with third-party libraries (parsers, SDK clients, data libraries); it cannot even be installed until the dependency image exists |
 | 22 | per-class enabling and the trust exception (WZ-8) | designed, reviewed | designed and locked (`extension_classes.py`, `RELEASES` empty): `::test_a_class_counts_with_its_capability_only_once_released`; review open; WZ-8 not implemented on purpose |
 | 23 | a forged, self-consistent copy of the trusted integration ahead on the path (R1), an open import path | refused (only the copy next to the runtime; closed import path) | `test_trusted_integrations.py::test_a_forged_self_consistent_copy_ahead_on_the_path_is_refused` and the path checks above; replacing the copy next to the runtime is the accepted residual |
 | 24 | trust checks on Windows and macOS paths (short names, case, `/private`) | same verdicts | Platforms workflow: `test_trusted_integrations.py` |
+| 25 | intake into the data-only store: size, hash, origin, zip safety, links, devices, traversal, `RECORD`, manifest, dependencies, `.pth`/`.data`/scripts/native code | refused before anything is written; audited | `test_extension_store.py::test_an_unsafe_or_inconsistent_wheel_is_refused_before_anything_is_written`, `::test_the_expected_hash_and_the_origin_are_required`, `::test_intake_removal_and_revocation_are_in_the_activity_log` |
+| 26 | an intake interrupted at any point | no partial package is ever valid; left-overs removed at the next open | `test_extension_store.py::test_an_interrupted_intake_never_leaves_a_valid_package` |
+| 27 | a stored package changed after intake (file, `RECORD`, added or removed file, symbolic or hard link) | `invalid`, nothing sent to a container | `test_extension_store.py::test_a_package_changed_after_intake_is_never_handed_to_the_sandbox` |
+| 28 | removal, revocation, update while tools are listed | no later call starts a container; a revoked hash never comes back | `test_extension_store.py::test_a_removed_revoked_or_replaced_package_never_runs_again`, `::test_a_revoked_hash_is_never_installed_again` |
+| 29 | host modules and the store from inside the container | the host's modules (workspace, vault, store) cannot be imported; no host folder, data directory or store on the container's import path | Docker: `::test_host_modules_are_not_reachable`, `::test_host_files_and_secrets_are_not_visible` (also the runtime's package folder and the store) |
+| 30 | Podman (rootful and rootless) with the extension seccomp profile | items 5 to 12 and 20 pass there | NOT tested, evidence missing: no Podman engine in CI and none was available in Welle 7; Podman is not offered by the products today. Required before a G-6 release that names Podman |
+| 31 | the store's independent security review | passed | open (prepared, not run: needs the owner's separate consent) |
 
 The checks with "Docker:" run in the CI job `docker` of this repository (`NODESTRO_REQUIRE_DOCKER=1`: a daemon that
 does not pass Orkexa's preflight fails them instead of skipping them).
+
+State of the catalog (Welle 7). Proven on Linux CI Docker: 0 to 16, 20, 22 (designed and locked), 23 to 29. Not
+implemented, and every class that depends on them stays locked: 17 (network clients), 18 (file readers and writers),
+21 (packages with their own dependencies). Evidence missing on real platforms: 19 (Docker Desktop on macOS and
+Windows), 30 (Podman); no simulated or substitute run counts as their acceptance. Open reviews: the internal review of
+the store and the independent G-6 review (31). The only class without a missing item is `read`/`internal` without
+any grant; it too stays locked (`RELEASES` empty) until 19 or 30 is proven for the platforms its release names, and
+both reviews passed.
