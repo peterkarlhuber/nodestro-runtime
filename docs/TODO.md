@@ -12,7 +12,7 @@
 | P0 Critical | 0 |
 | P1 High | 1 |
 | P2 Medium | 12 |
-| P3 Low | 36 |
+| P3 Low | 37 |
 | P4 Optional | 15 |
 
 **Release blockers:** None. No entry blocks the frozen desktop candidate v0.2.0-preview.1 or the next preview;
@@ -40,6 +40,19 @@ Statuses: `Open`, `In progress` (PR linked), `Blocked` (names the blocker), `Nee
 None known.
 
 ## Security
+
+### RT-097 · Memory entries (N-24): follow-ups
+
+- **Priority:** P3 Low · **Status:** Open · **Refs:** [docs/memory-entries.md](memory-entries.md),
+  `MemorySpaces`, `BrowsableMemory.entries`, migration `0011_memory_origin.sql`, Orkexa `MemoryBackend.list_entries`
+- **Done:** entries with time, origin (`tool`, `user`, `import`) and `scope` (`user`) on SQLite and PostgreSQL;
+  manual remembering only by a person's explicit write; owner rules of RT-089c unchanged.
+- **Open:**
+  - the origin names the kind of writer, not which agent, run or workflow wrote (one shared connection per space;
+    Orkexa's `execute(origin=)` would take a finer value);
+  - the scopes `project` and `agent` are reserved names only: no space of a project or an agent exists yet;
+  - no creation time per entry (only the last write).
+- **Next step:** owner decision whether the origin should name the run or agent.
 
 ### RT-089d · Private memory spaces: the owner's consent, private runs in every channel, open name questions
 

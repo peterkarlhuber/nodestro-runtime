@@ -273,10 +273,10 @@ def test_the_adapter_runs_each_mode_as_the_database_did(database: Any) -> None:
     assert source.lock is database._lock
     executor = Executor(source, layout=LAYOUT, tenant_id=TENANT)
     key = {"tenant_id": TENANT, "namespace": "n"}
-    assert executor.execute("memory_write", {**key, "path": "a", "content": "x"}).rowcount == 1
+    assert executor.execute("memory_write", {**key, "path": "a", "content": "x", "origin": None}).rowcount == 1
     with executor.transaction():
         assert database.in_transaction
-        executor.execute("memory_write", {**key, "path": "b", "content": "y"})
+        executor.execute("memory_write", {**key, "path": "b", "content": "y", "origin": None})
         assert executor.execute("memory_files", {**key, "start": ""}).rows == [("a", 1), ("b", 1)]
     with pytest.raises(RuntimeError), executor.transaction():
         executor.execute("memory_clear", key)

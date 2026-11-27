@@ -212,6 +212,40 @@ def test_tenants_have_separate_memory(backends: Backends) -> None:
     assert alpha.open("Team").read("/memories/secret.md") == "alpha only"
 
 
+def test_memory_entries_keep_their_time_and_origin(backends: Backends) -> None:
+    """N-24: every entry of a space shows when and by whom it was last written: ``user`` for a person's explicit write
+    (``write``), ``tool`` for an agent's memory tool; a rename keeps the origin, a delete removes the entry."""
+    space = backends.memory("alpha").open("Team")
+    space.write("/memories/prefs.md", "Answers in German")
+    space.execute({"command": "create", "path": "/memories/learned.md", "file_text": "likes tea"})
+    entries = {entry.path: entry for entry in space.entries()}
+    assert {path: entry.origin for path, entry in entries.items()} == {
+        "/memories/learned.md": "tool",
+        "/memories/prefs.md": "user",
+    }
+    assert all(entry.updated_at is not None and entry.updated_at.tzinfo is not None for entry in entries.values())
+    assert {entry.scope for entry in entries.values()} == {"user"}
+    space.write("/memories/learned.md", "likes green tea")  # the person corrects the agent's entry
+    space.execute({"command": "rename", "old_path": "/memories/learned.md", "new_path": "/memories/tea.md"})
+    assert {entry.path: entry.origin for entry in space.entries()} == {
+        "/memories/prefs.md": "user",
+        "/memories/tea.md": "user",
+    }
+    space.remove("/memories/tea.md")
+    assert [entry.path for entry in space.entries()] == ["/memories/prefs.md"]
+    assert [info.scope for info in backends.memory("alpha").all()] == ["user"]
+
+
+def test_tenants_have_separate_memory_entries(backends: Backends) -> None:
+    if backends.kind == "sqlite":
+        pytest.skip("the desktop has one tenant")
+    alpha, beta = backends.memory("alpha"), backends.memory("beta")
+    alpha.open("Team").write("/memories/secret.md", "alpha only")
+    beta.open("Team").write("/memories/own.md", "beta")
+    assert [(entry.path, entry.origin) for entry in beta.open("Team").entries()] == [("/memories/own.md", "user")]
+    assert [entry.path for entry in alpha.open("Team").entries()] == ["/memories/secret.md"]
+
+
 def test_postgres_memory_refuses_nul_characters(backends: Backends) -> None:
     if backends.kind == "sqlite":
         pytest.skip("SQLite stores any character")
