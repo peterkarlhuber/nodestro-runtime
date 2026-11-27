@@ -65,11 +65,23 @@ def entries(*infos: Path) -> Callable[[], list[metadata.EntryPoint]]:
     return lambda: [entry for info in infos for entry in metadata.PathDistribution(info).entry_points]
 
 
+def _ours(name: str) -> bool:
+    return name == TOP or name.startswith(TOP + ".") or name == "evilmod"
+
+
 @pytest.fixture
 def clean_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Undo what a verified import leaves behind: its finder and its modules."""
-    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+    """Each test starts as a fresh process would and leaves the process as it found it: an installed
+    ``nodestro_integrations`` that earlier tests imported (a real discovery in the same worker) is set aside with its
+    verified finder and restored afterwards, and what the test imported is removed."""
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [finder for finder in sys.meta_path if not isinstance(finder, trusted_integrations._VerifiedFinder)],
+    )
     monkeypatch.setattr(trusted_integrations, "_FINDERS", {})
+    for name in [name for name in sys.modules if _ours(name)]:
+        monkeypatch.delitem(sys.modules, name)
     yield
-    for name in [name for name in sys.modules if name == TOP or name.startswith(TOP + ".") or name == "evilmod"]:
+    for name in [name for name in sys.modules if _ours(name)]:
         del sys.modules[name]
