@@ -27,9 +27,11 @@ stored exactly as before (the field is left out while empty).
 `workflow_tools.aggregate` computes what the workflow may do as a whole: the highest `access` (`read` < `write` <
 `destructive`) and `reach` (`internal` < `external`) of everything it contains, at every depth:
 
-- the models of its agents (fallbacks and a quality judge included): a model that is not served by the local model
-  server (Ollama) counts as `read` + `external`, also a configurable endpoint, so an offline step never reaches a
-  cloud model through a workflow;
+- the models of its agents (fallbacks and a quality judge included) and of its orchestrators: a model that is not
+  served by the local model server (Ollama) on this computer counts as `read` + `external`, also a configurable
+  endpoint and an Ollama server whose saved or external address is not loopback (`Workspace.local_model_server_here`;
+  the managed and the container's server are local), so an offline step never reaches a cloud model through a
+  workflow;
 - the tools of its agents (library capability, `tool_policy`), MCP tools (the administrator's classification) and
   the provider's server tools;
 - result files and persistent memory spaces (`write` + `internal`);

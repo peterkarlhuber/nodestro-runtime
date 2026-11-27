@@ -518,6 +518,45 @@ def test_m2_a_model_that_is_not_local_reaches_outside() -> None:
     assert aggregate(fallback, 1, resolve=lambda *_: (fallback, 1), facts=facts).reach == "external"
 
 
+def test_m2_an_orchestrator_model_that_is_not_local_reaches_outside() -> None:
+    from nodestro_runtime.schemas import OrchestratorConfig, OrchestratorMember
+
+    team = chain("wf_team", "Team", [Node(id="start", type="start"), agent_node("a", "A", model=LOCAL_DEFAULT_MODEL)])
+
+    def lead(model: str | None) -> Workflow:
+        config = OrchestratorConfig(members=[OrchestratorMember(workflow_id="wf_team", version=1)])
+        if model is not None:
+            config = config.model_copy(update={"model": model})
+        return chain(
+            "w", "W", [Node(id="start", type="start"), Node(id="lead", type="orchestrator", orchestrator=config)]
+        )
+
+    facts = {"calculator": READ}.get
+    # The default orchestrator model is a cloud model: a local-only team does not keep the workflow internal.
+    assert aggregate(lead(None), 1, resolve=lambda *_: (team, 1), facts=facts).reach == "external"
+    assert aggregate(lead(LOCAL_DEFAULT_MODEL), 1, resolve=lambda *_: (team, 1), facts=facts).reach == "internal"
+
+
+def test_m2_an_ollama_server_elsewhere_reaches_outside(make: Make) -> None:
+    from nodestro_runtime.schemas import SettingsIn
+
+    local = chain(
+        "w",
+        "W",
+        [Node(id="start", type="start"), agent_node("a", "A", tools=["calculator"], model=LOCAL_DEFAULT_MODEL)],
+    )
+    facts = {"calculator": READ}.get
+    resolve = lambda *_: (local, 1)  # noqa: E731
+    assert aggregate(local, 1, resolve=resolve, facts=facts, local_server=lambda: True).reach == "internal"
+    assert aggregate(local, 1, resolve=resolve, facts=facts, local_server=lambda: False).reach == "external"
+    workspace = make({})
+    assert workspace.runs.workflow_effect(local, 1).reach == "internal"
+    workspace.update_settings(SettingsIn(providers={"ollama": {"base_url": "http://127.0.0.1:11434/v1"}}))
+    assert workspace.runs.workflow_effect(local, 1).reach == "internal"
+    workspace.update_settings(SettingsIn(providers={"ollama": {"base_url": "http://gpu-box.example:11434/v1"}}))
+    assert workspace.runs.workflow_effect(local, 1).reach == "external"
+
+
 def paused_tree(workspace: Workspace, *, top_status: str = "running", waiting: str = "awaiting_approval") -> Any:
     from nodestro_runtime.schemas import NodeRun, Run
 

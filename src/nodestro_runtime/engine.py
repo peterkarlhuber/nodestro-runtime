@@ -1108,6 +1108,9 @@ class RunManager:
         self.protected_folder: str | None = None
         #: The search indexes of granted folders (N-12); ``None``: folders are searched file by file.
         self.folder_index: FolderIndex | None = None
+        #: Whether the local model server (Ollama) agents reach is on this computer, for the effect of workflow tools
+        #: (N-20, review M2); ``None``: it is. The workspace hands in its check (a remote Ollama host reaches outside).
+        self.local_model_server: Callable[[], bool] | None = None
         #: The environment of a run that does not use the manager's own (``None``): published APIs.
         self.environments: Callable[[Run], RunEnvironment | None] = lambda _run: None
         #: Queue execution (the server, ADR-0004): runs are handed to ``dispatch`` instead of executing in this
@@ -3922,7 +3925,11 @@ class RunManager:
             return self.pin_subworkflows(found), resolved
 
         return workflow_tools.aggregate(
-            self.pin_subworkflows(workflow), version, resolve=pinned, facts=self._workflow_tool_facts(tools)
+            self.pin_subworkflows(workflow),
+            version,
+            resolve=pinned,
+            facts=self._workflow_tool_facts(tools),
+            local_server=self.local_model_server,
         )
 
     def describe_workflow_tool(

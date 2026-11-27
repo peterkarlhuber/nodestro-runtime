@@ -115,11 +115,33 @@ def effective(stored: WorkflowEffect | None, current: WorkflowEffect) -> Workflo
     )
 
 
-def aggregate(workflow: Workflow, version: int | None, *, resolve: Resolve, facts: Facts) -> WorkflowEffect:
+def aggregate(
+    workflow: Workflow,
+    version: int | None,
+    *,
+    resolve: Resolve,
+    facts: Facts,
+    local_server: Callable[[], bool] | None = None,
+) -> WorkflowEffect:
     """The effect of ``workflow`` (in ``version``) with everything it contains (see the module documentation).
 
     ``resolve`` reads a contained workflow in its pinned version (a release resolves from its bundle); ``facts`` is
-    the capability of a library tool. Nothing runs."""
+    the capability of a library tool; ``local_server`` tells whether the local model server (Ollama) is on this
+    computer (``None``: it is). Nothing runs."""
+    on_this_computer: list[bool] = []
+
+    def local(model: str) -> bool:
+        if not _local(model):
+            return False
+        if local_server is None:
+            return True
+        if not on_this_computer:  # asked once per aggregation
+            try:
+                on_this_computer.append(bool(local_server()))
+            except Exception:
+                on_this_computer.append(False)  # not known: it may be elsewhere
+        return on_this_computer[0]
+
     result = ToolCapability(access="read", reach="internal", source="derived")
     memory = False
     approvals = 0
@@ -145,6 +167,9 @@ def aggregate(workflow: Workflow, version: int | None, *, resolve: Resolve, fact
             if node.type == "output" and node.output is not None and node.output.files:
                 result = _higher(result, _RESULT_FILES)
             if node.type == "orchestrator" and node.orchestrator is not None:
+                # Review M2: the orchestrator's own model reads the task and the teams' results like an agent's.
+                if not local(node.orchestrator.model):
+                    result = _higher(result, _CLOUD_MODEL)
                 select = node.orchestrator.select
                 if select is not None and not select.done:
                     unknown.append("team selection")  # teams chosen when the run starts: not known now
@@ -162,12 +187,13 @@ def aggregate(workflow: Workflow, version: int | None, *, resolve: Resolve, fact
                         unknown.append(name)
                     result = _higher(result, server or UNKNOWN)
                 # Review M2: a model request carries the step's content to its provider; only a local model server
-                # (Ollama) stays on this computer, every other provider (also a configurable endpoint) counts as
-                # reaching outside, so an offline step never reaches a cloud model through a workflow.
+                # (Ollama) on this computer keeps it here, every other provider (also a configurable endpoint) and an
+                # Ollama server elsewhere count as reaching outside, so an offline step never reaches a cloud model
+                # through a workflow.
                 models = [agent.model, *agent.fallbacks]
                 if agent.quality.enabled:
                     models.append(agent.quality.judge_model)
-                if not all(_local(model) for model in models):
+                if not all(local(model) for model in models):
                     result = _higher(result, _CLOUD_MODEL)
                 if agent.memory.mode == "persistent":
                     memory = True

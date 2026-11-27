@@ -12,7 +12,8 @@
   consents and pre-checks follow them; `Runs.decide` records a decision inside a workflow tool's run without a
   paused top-level run. New codes `workflow_tool.*`. Review fixes: steps with workflow tools run on a thread pool of
   their own per nesting depth (no deadlock of the agent pool); no pre-grant applies to a changing workflow tool, and
-  its name never takes another tool's; a model that is not local counts as reaching outside; a budget decision of
+  its name never takes another tool's; a model that is not local counts as reaching outside (an orchestrator's own
+  model included, and Ollama on a host that is not loopback, `Runs.local_model_server`); a budget decision of
   another process continues a waiting call; a decision needs a waiting call (`workflow_tool.not_waiting`) and an
   interrupted run cancels its waiting workflow runs; parallel calls keep their own records; nested result files are
   attachments.

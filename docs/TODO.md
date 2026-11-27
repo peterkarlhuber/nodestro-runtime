@@ -614,7 +614,7 @@ Items that need an independent or external review (an internal audit does not re
   `GET /api/workflows/{workflow_id}/versions/{number}/tool`
 - **Done (review of the independent review):** steps with workflow tools run on a pool of their own per depth (H1);
   no pre-grant applies to a changing workflow tool and its name never takes another tool's (M1); a model that is not
-  local reaches outside (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a
+  local reaches outside, an orchestrator's model and a remote Ollama host included (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a
   waiting call and an interrupted run cancels its waiting workflow runs (L1); records found by call id (L4); nested
   result files are attachments (L5).
 - **Done:** an agent calls a saved workflow in a fixed version (`AgentConfig.workflow_tools`) as a child run of its
@@ -627,8 +627,10 @@ Items that need an independent or external review (an internal audit does not re
 - **Open:**
   - switching it on needs the independent review of tool approvals (RT-001): every changing workflow tool depends on
     the per-call gate;
-  - a waiting call holds a thread of the workflow tool pool of its depth for up to 24 hours (never one of the
-    ordinary agent pool); with `NODESTRO_RUN_THREADS` such calls waiting at one depth, later ones wait for a thread;
+  - H1 leftover (a stall, not a deadlock): a waiting call holds a thread of the workflow tool pool of its depth for
+    up to 24 hours (never one of the ordinary agent pool); with `NODESTRO_RUN_THREADS` (default 32) calls waiting on
+    approvals at one depth, every later step with workflow tools of that depth waits for a thread until one of them
+    is decided, cancelled or times out;
   - sub-workflows without a version inside the called workflow are pinned when their step starts, not once per call
     (review L2): the effect is computed again at the next call;
   - a deny for the calling agent (N-06) does not follow into the workflow's own agents (review L3; documented);
