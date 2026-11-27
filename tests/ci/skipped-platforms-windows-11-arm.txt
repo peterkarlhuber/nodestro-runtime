@@ -2,3 +2,9 @@
 # One line per test: <classname>::<name>  # <reason>. A change needs its reason in the PR.
 tests.test_platform_start::test_import_without_linux_kernel_functions[darwin]  # simulates the other systems on Linux only
 tests.test_platform_start::test_import_without_linux_kernel_functions[win32]  # simulates the other systems on Linux only
+tests.test_trusted_integrations::test_a_closed_import_path_has_no_problems  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_the_user_site_packages_on_the_path_is_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_the_data_directory_on_the_path_is_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_folders_writable_by_every_user_are_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_folders_of_another_user_or_a_foreign_group_are_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_a_writable_entry_of_a_sealed_installation_is_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)

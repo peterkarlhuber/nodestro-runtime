@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from importlib import metadata
 import logging
 import os
+from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 from orkexa import Tool
@@ -180,8 +181,8 @@ def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list
     return found
 
 
-def _load(entry: metadata.EntryPoint) -> Integration:
-    value = trusted_integrations.load(entry)
+def _load(entry: metadata.EntryPoint, data_dir: str | Path | None) -> Integration:
+    value = trusted_integrations.load(entry, data_dir=data_dir)
     if callable(value) and not isinstance(value, Integration):
         value = value()
     if not isinstance(value, Integration):
@@ -203,10 +204,10 @@ def _listed(entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None) ->
     ]
 
 
-def _rejected(entry: metadata.EntryPoint) -> str:
+def _rejected(entry: metadata.EntryPoint, data_dir: str | Path | None) -> str:
     """Why ``entry``, which claims a trusted distribution name, may not be imported (empty: it passed every check)."""
     try:
-        trusted_integrations.verify(entry)
+        trusted_integrations.verify(entry, data_dir=data_dir)
     except trusted_integrations.UntrustedError as exc:
         return f"claims to be {TRUSTED_DISTRIBUTIONS_TEXT} but {exc}"
     return ""
@@ -214,10 +215,13 @@ def _rejected(entry: metadata.EntryPoint) -> str:
 
 def discover(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ) -> list[Integration]:
     """The integrations of Nodestro's own distribution installed in this environment, sorted by name. Only entry
-    points that pass :func:`nodestro_runtime.trusted_integrations.verify` are imported, from their verified files;
-    every other entry point is left to :func:`find_packages` and never imported.
+    points that pass :func:`nodestro_runtime.trusted_integrations.verify` are imported, from their verified files
+    (installed next to the runtime, on a closed import path; ``data_dir``: the workspace's data directory, which no
+    entry of the import path may lie in); every other entry point is left to :func:`find_packages` and never imported.
 
     A broken integration is logged and left out: an optional extension never stops the
     runtime from starting.
@@ -225,14 +229,14 @@ def discover(
     found: list[Integration] = []
     seen: set[tuple[str, str]] = set()
     for entry in _listed(entry_points):
-        if not trusted_integrations.claims_trusted(entry) or _rejected(entry):
+        if not trusted_integrations.claims_trusted(entry) or _rejected(entry, data_dir):
             continue
         key = (trusted_integrations.normalized(entry.dist.metadata["Name"]) if entry.dist else "", entry.name)
         if key in seen:
             continue
         seen.add(key)
         try:
-            found.append(_load(entry))
+            found.append(_load(entry, data_dir))
         except Exception:
             logger.exception("Integration %r could not be loaded", entry.name)
     return sorted(found, key=lambda item: item.name)
@@ -240,6 +244,8 @@ def discover(
 
 def find_packages(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ) -> list[ExtensionPackage]:
     """The installed integrations of every other distribution, as data: nothing of them is imported (N-22). An entry
     point that claims Nodestro's own distribution name and fails its checks is listed too, as ``rejected``."""
@@ -247,7 +253,7 @@ def find_packages(
     for entry in _listed(entry_points):
         if not trusted_integrations.claims_trusted(entry):
             found.append(package_of(entry))
-        elif reason := _rejected(entry):
+        elif reason := _rejected(entry, data_dir):
             logger.warning("The installed integration %r is never loaded: %s", entry.name, reason)
             found.append(package_of(entry, rejected=reason))
     return sorted(found, key=lambda item: item.key)

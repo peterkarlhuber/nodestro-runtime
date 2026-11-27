@@ -424,10 +424,10 @@ class Workspace:
         # Foreign installed integrations are never imported here (N-22): their tools run only in the Docker sandbox
         # (loaded below, once the Python environments exist), and only while the extension tools switch is on.
         self.extensions = Extensions(
-            discover() if integrations is None else integrations,
+            discover(data_dir=self.data_dir) if integrations is None else integrations,
             strict=integrations is not None,
             installed=integrations is None,
-            packages=find_packages() if integrations is None else (),
+            packages=find_packages(data_dir=self.data_dir) if integrations is None else (),
             reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *FOLDER_TOOLS) if tool.name},
         )
         self.store: DocumentStore

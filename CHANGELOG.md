@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
+  own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)
+  and only on a closed import path (`trusted_integrations.environment_problems`: no user site-packages, nothing in the
+  data directory, nothing writable by other users or foreign groups, nothing writable in a sealed installation).
+  On Windows the host import is locked (ACLs are not checked), so OCR is unavailable there. `discover` and
+  `find_packages` take `data_dir`. Trust boundary per product in `docs/extension-isolation.md`.
+
 - New (N-14): versioned exchange formats `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with
   one import check for all of them (`exchange`; [docs/exchange-formats.md](docs/exchange-formats.md)): size, format
   and version (`exchange.version_newer`), strict content, ZIP safety, preview and all-or-nothing apply. Exports never

@@ -316,8 +316,10 @@ def _workspace(
     else:
         monkeypatch.setenv(EXTENSION_TOOLS_ENV, switch)
     info = next(site.glob("*.dist-info"))
-    monkeypatch.setattr("nodestro_runtime.workspace.find_packages", lambda: find_packages(entry_points_of(info)))
-    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda: discover(entry_points_of(info)))
+    monkeypatch.setattr(
+        "nodestro_runtime.workspace.find_packages", lambda **_options: find_packages(entry_points_of(info))
+    )
+    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: discover(entry_points_of(info)))
     monkeypatch.setattr(Workspace, "_extension_sandbox", lambda _self, timeout: containers(timeout))
     return Workspace(profile=RuntimeProfile(kind=kind, data_dir=tmp_path / "data"))  # type: ignore[arg-type]
 
@@ -460,8 +462,10 @@ def test_a_server_never_starts_extension_containers(
     site, marker = package
     monkeypatch.setenv(EXTENSION_TOOLS_ENV, "1")
     info = next(site.glob("*.dist-info"))
-    monkeypatch.setattr("nodestro_runtime.workspace.find_packages", lambda: find_packages(entry_points_of(info)))
-    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda: discover(entry_points_of(info)))
+    monkeypatch.setattr(
+        "nodestro_runtime.workspace.find_packages", lambda **_options: find_packages(entry_points_of(info))
+    )
+    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: discover(entry_points_of(info)))
     containers = Containers()
     monkeypatch.setattr(Workspace, "_extension_sandbox", lambda _self, timeout: containers(timeout))
     with Workspace(tmp_path / "tenant", storage=tenant_storage(tmp_path / "db", "alpha")) as workspace:

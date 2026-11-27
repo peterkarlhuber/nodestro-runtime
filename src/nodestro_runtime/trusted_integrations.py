@@ -9,6 +9,14 @@ A distribution's name is its own statement, so it never decides trust by itself.
 3. every Python file of the pinned top-level package is listed in that distribution's ``RECORD`` with a SHA-256 hash,
    lies at its own path (no symbolic link on the way), and has exactly that hash now; the pinned module and the
    package's ``__init__.py`` are among them;
+4. it is installed in the same directory as the running ``nodestro_runtime`` package (:func:`installation_home`): a
+   copy anywhere else on ``sys.path`` (``PYTHONPATH``, the user's site-packages, the working directory, a ``.pth``
+   entry), however self-consistent, is refused (residual risk R1). Replacing the copy next to the runtime needs the
+   same write access as replacing the runtime itself;
+5. the import path is closed (:func:`environment_problems`, owner decision on R1): the user's site-packages is not on
+   it, no entry lies in the data directory, no entry or parent directory is writable by another user or a foreign
+   group, and when this process cannot write its own installation, it cannot write any entry of the import path
+   either. Where these permissions cannot be read (Windows ACLs) the host import is refused;
 
 and the import itself runs from exactly those verified bytes (:class:`_VerifiedFinder`, first on ``sys.meta_path``):
 no cached bytecode, no other copy of the package on ``sys.path``, no file the ``RECORD`` does not list. Anything that
@@ -29,6 +37,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import site
 import stat
 import sys
 import threading
@@ -75,9 +84,106 @@ def _read(path: Path) -> bytes:
         return handle.read(_MAX_FILE_BYTES + 1)
 
 
-def verify(entry: metadata.EntryPoint) -> tuple[str, Path, dict[str, bytes]]:
+def installation_home() -> Path | None:
+    """The directory the running ``nodestro_runtime`` package was imported from (its ``site-packages``); the only
+    place a trusted distribution is accepted from. ``None`` when it cannot be told."""
+    import nodestro_runtime
+
+    location = getattr(nodestro_runtime, "__file__", None)
+    return Path(os.path.realpath(location)).parent.parent if location else None
+
+
+def _same(first: Path, second: Path) -> bool:
+    return os.path.normcase(str(first)) == os.path.normcase(str(second))
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return _same(path, folder) or os.path.normcase(str(path)).startswith(os.path.normcase(str(folder)) + os.sep)
+
+
+#: Whether the permissions of the import path can be read as POSIX modes and owners (not on Windows: ACLs).
+_POSIX_MODES = os.name == "posix"
+
+
+def _ids() -> tuple[int, int]:
+    """The effective user and group id of this process."""
+    return os.geteuid(), os.getegid()
+
+
+def _writable(path: Path) -> bool:
+    return os.access(path, os.W_OK)
+
+
+def _existing(path: Path) -> Path:
+    """``path`` or its nearest existing parent (whoever can write that one can create ``path``)."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def _unsafe(folder: Path, *, own: bool) -> str:
+    """Why another user could change ``folder`` (empty: nobody but root and this user). ``own``: ``folder`` is the
+    entry itself, not a parent (a parent writable by everyone with the sticky bit, like ``/tmp``, is fine)."""
+    euid, egid = _ids()
+    info = os.stat(folder)
+    if info.st_uid not in (0, euid):
+        return f"{folder} belongs to another user"
+    if info.st_mode & stat.S_IWOTH and (own or not info.st_mode & stat.S_ISVTX):
+        return f"{folder} is writable by every user"
+    if info.st_mode & stat.S_IWGRP and info.st_uid != 0 and info.st_gid not in (0, egid):
+        return f"{folder} is writable by a group of other users"
+    return ""
+
+
+def environment_problems(
+    home: Path, *, data_dir: str | Path | None = None, path: Sequence[str] | None = None
+) -> list[str]:
+    """Why the import path ``path`` (default ``sys.path``) of a process whose runtime lives in ``home`` is not closed
+    against users and processes that may not change the installation (owner decision on R1; empty: closed).
+
+    - the user's site-packages is on it (every ``pip install --user`` and its ``.pth`` files reach the host);
+    - an entry, or ``home``, lies in ``data_dir`` (where the application builds environments and stores files);
+    - an entry (an empty or relative one is the working directory) or one of its parents belongs to another user than
+      root and this user, is writable by every user, or by a group other than root's or this user's own;
+    - this process cannot write ``home`` (a sealed installation, like the container images) but can write an entry;
+    - the permissions cannot be read on this system (Windows: ACLs), so nothing of the above is proven.
+    """
+    entries = list(sys.path if path is None else path)
+    cwd = Path(os.getcwd())
+    folders: list[Path] = []
+    for entry in [str(home), *entries]:
+        folder = Path(os.path.realpath(cwd / entry if entry else cwd))
+        if not any(_same(folder, seen) for seen in folders):
+            folders.append(folder)
+    problems: list[str] = []
+    if site.ENABLE_USER_SITE:
+        user_site = Path(os.path.realpath(site.getusersitepackages()))
+        if any(_same(folder, user_site) for folder in folders):
+            problems.append(f"the user's site-packages {user_site} is on the import path")
+    if data_dir is not None:
+        data = Path(os.path.realpath(data_dir))
+        problems += [f"{folder} lies in the data directory" for folder in folders if _inside(folder, data)]
+    if not _POSIX_MODES:
+        problems.append("the permissions of the import path cannot be checked on this system")
+        return problems
+    sealed = not _writable(_existing(home))
+    for folder in folders:
+        existing = _existing(folder)
+        if sealed and _writable(existing):
+            problems.append(f"{existing} is writable by this process, its installation {home} is not")
+            continue
+        for index, parent in enumerate([existing, *existing.parents]):
+            reason = _unsafe(parent, own=index == 0)
+            if reason:
+                problems.append(reason)
+                break
+    return list(dict.fromkeys(problems))
+
+
+def verify(entry: metadata.EntryPoint, *, data_dir: str | Path | None = None) -> tuple[str, Path, dict[str, bytes]]:
     """``(top-level package, its directory, {file path: verified source})`` for a trusted ``entry``; raises
-    :class:`UntrustedError` (see the module documentation). Nothing is imported."""
+    :class:`UntrustedError` (see the module documentation). Nothing is imported. ``data_dir``: the workspace's data
+    directory, which no entry of the import path may lie in."""
     dist = getattr(entry, "dist", None)
     if dist is None:
         raise UntrustedError("the entry point has no distribution")
@@ -91,6 +197,12 @@ def verify(entry: metadata.EntryPoint) -> tuple[str, Path, dict[str, bytes]]:
     base = Path(str(dist.locate_file(""))).resolve()
     if Path(folder).resolve().parent != base:
         raise UntrustedError("the metadata folder is not in the installation directory")
+    home = installation_home()
+    if home is None or not _same(base, home):
+        raise UntrustedError(f"it is not installed next to nodestro_runtime ({home}) but in {base}")
+    problems = environment_problems(home, data_dir=data_dir)
+    if problems:
+        raise UntrustedError("the import path is not closed: " + "; ".join(problems[:3]))
     module = entry.value.split(":")[0]
     top = module.split(".")[0]
     sources: dict[str, bytes] = {}
@@ -156,9 +268,9 @@ class _VerifiedFinder(importlib.abc.MetaPathFinder):
         raise ModuleNotFoundError(f"{fullname} is not a verified file of {self.top}", name=fullname)
 
 
-def load(entry: metadata.EntryPoint) -> Any:
+def load(entry: metadata.EntryPoint, *, data_dir: str | Path | None = None) -> Any:
     """Import a trusted ``entry`` from its verified files (:func:`verify`) and return its value."""
-    top, package, sources = verify(entry)
+    top, package, sources = verify(entry, data_dir=data_dir)
     with _FINDERS_LOCK:
         finder = _FINDERS.get(top)
         if finder is None or finder.package != package:
@@ -178,4 +290,13 @@ def load(entry: metadata.EntryPoint) -> Any:
     return value
 
 
-__all__ = ["TRUSTED_DISTRIBUTIONS", "TRUSTED_ENTRY_POINTS", "UntrustedError", "claims_trusted", "load", "verify"]
+__all__ = [
+    "TRUSTED_DISTRIBUTIONS",
+    "TRUSTED_ENTRY_POINTS",
+    "UntrustedError",
+    "claims_trusted",
+    "environment_problems",
+    "installation_home",
+    "load",
+    "verify",
+]
