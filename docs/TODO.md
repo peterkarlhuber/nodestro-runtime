@@ -147,9 +147,10 @@ None known.
   path is imported; per product in `docs/extension-isolation.md`. Independent review 2026-11-27 (BLOCK on #226)
   fixed: H1 (a foreign package in the runtime's directory whose `RECORD` lists trusted files, and `.pth` files with
   unknown code, refuse the import), M1 (a group-writable folder of root counts), L1 (the folder holding a symbolic
-  link is checked), L3 (the timeout test is self-contained). L2 (the process's primary group counts as its own) stays
-  documented. Open for G-6: Docker Desktop on macOS and Windows
-  (not tested), Podman with the profile (not tested), network and folder grant paths and package dependency images
+  link is checked), L3 (the timeout test is self-contained). Re-review fixed N1 (only allowlisted `.pth` files), N2
+  (the `RECORD`s of every site directory and `sys.path` folder), N3 (file identity, not names), N4 (every link hop)
+  and N5 (zip distributions refused cleanly). L2 (the process's primary group counts as its own) stays documented.
+  Open for G-6: Docker Desktop on macOS and Windows (not tested), Podman with the profile (not tested), network and folder grant paths and package dependency images
   (designed, not implemented), an end-to-end check of the import path inside the images, showing the package states in
   the API and the studio, the internal and the independent review. WZ-8 is not implemented on purpose. R2 unchanged.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
