@@ -28,7 +28,7 @@ Foreign packages come only from the data-only extension store (RT-098, below), w
 ## The data-only extension store (RT-098)
 
 `src/nodestro_runtime/extension_store.py`, `tests/test_extension_store.py`. Only on this computer (desktop, Nodestro
-Local Docker: `Workspace.extension_store`); a server and a workspace with explicit integrations have none.
+Local Docker: `Workspace.extension_store`); a server has none; with explicit integrations (`Workspace(integrations=[...])`) it can be changed but its packages are not listed.
 
 ```text
 <data>/extensions/            0700, never on sys.path (the data directory is refused there, environment_problems)

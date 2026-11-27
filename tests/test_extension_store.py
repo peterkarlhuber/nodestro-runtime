@@ -472,7 +472,7 @@ def test_the_workspace_offers_store_packages_only_through_the_sandbox(
     workspace = _workspace(tmp_path, monkeypatch, containers, switch=True)
     try:
         [status] = workspace.extensions.packages_status()
-        assert status["state"] == "sandboxed" and "echo_text" in status["tools"]
+        assert status["state"] == "sandboxed" and "echo_text" in status["tools"] and status["sha256"] == sha(wheel)
         assert {run["request"]["mode"] for run in containers.runs} == {"describe"}
     finally:
         workspace.close()
@@ -502,12 +502,16 @@ def test_a_host_installed_package_stays_refused_next_to_the_store(
     nothing_imported(marker, contained=True)
 
 
-def test_no_store_on_a_server_or_with_explicit_integrations(tmp_path: Path) -> None:
+def test_explicit_integrations_list_no_store_package(tmp_path: Path, marker: Path) -> None:
+    """The embedding application chose its integrations: the store can be changed, its packages are not listed."""
+    install(ExtensionStore(tmp_path / "data" / "extensions"), build_wheel(wheel_members(marker=marker)))
     workspace = Workspace(tmp_path / "data", integrations=[])
     try:
-        assert workspace.extension_store is None
+        assert workspace.extension_store is not None and len(workspace.extension_store.packages()) == 1
+        assert workspace.extensions.packages_status() == []
     finally:
         workspace.close()
+    nothing_imported(marker)
 
 
 def test_intake_removal_and_revocation_are_in_the_activity_log(

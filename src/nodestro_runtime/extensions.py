@@ -380,14 +380,16 @@ class Extensions:
         return found
 
     def packages_status(self) -> list[dict[str, object]]:
-        """Each foreign installed integration: name, distribution, version, ``state`` (``sandboxed`` or ``locked``),
-        ``reason`` and ``message`` (when locked), ``detail`` and its tools offered from the sandbox."""
+        """Each foreign installed integration: name, store hash (``None`` outside the store), distribution, version,
+        ``state`` (``sandboxed`` or ``locked``), ``reason`` and ``message`` (when locked), ``detail`` and its tools
+        offered from the sandbox."""
         result: list[dict[str, object]] = []
         for package in self.packages:
             reason, detail = self._package_state.get(package.key, ("off", ""))
             result.append(
                 {
                     "name": package.name,
+                    "sha256": package.sha256 or None,
                     "distribution": package.distribution,
                     "version": package.version,
                     "state": "locked" if reason else "sandboxed",

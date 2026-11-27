@@ -426,11 +426,10 @@ class Workspace:
         # (loaded below, once the Python environments exist), and only while the extension tools switch is on.
         # Foreign packages come only from the data-only extension store (RT-098), on this computer only: never from
         # the host environment (find_packages reports those as refused), never on a server.
-        #: The data-only extension store ``<data>/extensions`` (``None`` on a server and with explicit integrations).
+        #: The data-only extension store ``<data>/extensions`` (``None`` on a server). With explicit integrations it
+        #: can be changed, but its packages are not listed (the embedding application chose its integrations).
         self.extension_store: ExtensionStore | None = (
-            ExtensionStore(data_dir / STORE_DIR)
-            if integrations is None and storage is None and profile.kind in EXTENSION_MODES
-            else None
+            ExtensionStore(data_dir / STORE_DIR) if storage is None and profile.kind in EXTENSION_MODES else None
         )
         self.extensions = Extensions(
             discover(data_dir=self.data_dir) if integrations is None else integrations,
