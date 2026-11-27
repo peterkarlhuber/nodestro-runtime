@@ -27,6 +27,11 @@
   case on macOS, links); every link on the way to an entry is resolved hop by hop and its folder checked; a zip
   distribution that claims the trusted name is refused instead of raising. Environments with an editable install,
   uv or virtualenv venvs, coverage or pytest-cov refuse OCR (listed in `docs/extension-isolation.md`).
+  Third review (NEW-1, NEW-2): a file named by two distributions' `RECORD`s, or a `RECORD` other than the owner's that
+  names a file of the running runtime's package or the trusted integration, refuses the trusted import (a foreign
+  wheel replacing any module); so does a `sitecustomize` or `usercustomize` that is loaded or importable
+  (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
+  process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
 
 - New (N-20, off by default: `NODESTRO_WORKFLOW_TOOLS`): agents call saved workflows in a fixed version as tools
   (`AgentConfig.workflow_tools`, `workflow_tools`; [docs/workflow-tools.md](docs/workflow-tools.md)). A call is a

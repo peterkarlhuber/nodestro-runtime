@@ -149,7 +149,11 @@ None known.
   unknown code, refuse the import), M1 (a group-writable folder of root counts), L1 (the folder holding a symbolic
   link is checked), L3 (the timeout test is self-contained). Re-review fixed N1 (only allowlisted `.pth` files), N2
   (the `RECORD`s of every site directory and `sys.path` folder), N3 (file identity, not names), N4 (every link hop)
-  and N5 (zip distributions refused cleanly). L2 (the process's primary group counts as its own) stays documented.
+  and N5 (zip distributions refused cleanly). Third review fixed NEW-1 (one file in two `RECORD`s, or a foreign
+  `RECORD` naming the runtime's or the integration's files) and NEW-2 (`sitecustomize`/`usercustomize`); the
+  in-process limit is documented. Open decision: keep untrusted extension packages out of the host environment
+  altogether (a data-only package store mounted into the sandbox). L2 (the process's primary group counts as its own)
+  stays documented.
   Open for G-6: Docker Desktop on macOS and Windows (not tested), Podman with the profile (not tested), network and folder grant paths and package dependency images
   (designed, not implemented), an end-to-end check of the import path inside the images, showing the package states in
   the API and the studio, the internal and the independent review. WZ-8 is not implemented on purpose. R2 unchanged.
