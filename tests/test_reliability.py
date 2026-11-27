@@ -526,7 +526,7 @@ def test_installed_integrations_that_do_not_fit_are_left_out(tmp_path: Path, mon
         good,
         Integration(name="twice", tools=[_tool("echo_good")]),
     ]
-    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda: found)
+    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: found)
     with Workspace(tmp_path / "data") as workspace:
         assert workspace.extensions.integrations == [good]
         # Installed tools are locked (Phase 0R S1, E-0R-2 A): foreign code runs only in the Docker sandbox.

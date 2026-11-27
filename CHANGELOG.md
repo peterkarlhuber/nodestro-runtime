@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
+  containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
+  by the sandbox gateway exactly; tool classes and grants are modelled (`extension_classes`, nothing released, every
+  grant refused). New Docker tests: a cancelled run and a crashed host leave no container. Fix: extension containers are named
+  `nodestro-sandbox-ext-*`, which Nodestro Local Docker's sandbox gateway accepts (`nodestro-ext-*` was refused there).
+
+- Security (owner decision 2026-11-27, binding): a foreign extension package found in the host environment is
+  refused as `invalid`, "installed in the host environment" (`extensions.HOST_INSTALLED`), whatever
+  `NODESTRO_EXTENSION_TOOLS` says: only its metadata is read; it is never offered, imported, read or sent to the
+  sandbox. The sandbox stays for the data-only extension store (RT-098, a binding G-6 prerequisite; its acceptance
+  criteria and the residual risk are in `docs/extension-isolation.md`). README: never install extensions into the
+  backend's environment.
+
+- Docs (N-22 fourth review, NEW-4): `docs/extension-isolation.md` states the boundary of the host import plainly:
+  the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
+  installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before
+  them, for example a new module that a standard module imports when it exists). The data-only extension store is
+  the planned fix and must exist before any G-6 class unlock. No code change. The owner decision of 2026-11-27
+  (option A: harden now, the store later as its own work package) is recorded; the "unnoticed replacement" clause is
+  met by the boundary, not by the in-process checks, and `find_packages` discovery from the host environment is
+  development-only until the store replaces it.
+
+- Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
+  own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)
+  and only on a closed import path (`trusted_integrations.environment_problems`: no user site-packages, nothing in the
+  data directory, nothing writable by other users or foreign groups, nothing writable in a sealed installation).
+  On Windows the host import is locked (ACLs are not checked), so OCR is unavailable there. `discover` and
+  `find_packages` take `data_dir`. Trust boundary per product in `docs/extension-isolation.md`.
+  Independent review fixes: a foreign distribution in the runtime's directory whose `RECORD` lists files of the
+  trusted package or its metadata (also from a wheel's `.data/purelib`), a `.dist-info` there without `RECORD`, a
+  second metadata folder of the trusted name, a legacy `.egg-info`/`.egg`/`.egg-link`, or a `.pth` file with code
+  that is not a known one refuses the import (H1, `trusted_integrations.installation_problems`, tested with real
+  pip); a folder of root writable by a foreign group is refused (M1); the folder holding a symbolic link on the way
+  to an entry is checked (L1).
+  Re-review (N1 to N5): every `.pth` file of a site directory refuses the trusted import unless its exact bytes are
+  allowlisted (`KNOWN_PTH`: setuptools' `distutils-precedence.pth`), so line splits the interpreter honors (`\r`, a
+  byte order mark, form feed, U+0085, U+2028) cannot hide code and folder-only files count too; the `RECORD`s of
+  every site directory and `sys.path` folder are read and compared by file identity (split `lib`/`lib64`, another
+  case on macOS, links); every link on the way to an entry is resolved hop by hop and its folder checked; a zip
+  distribution that claims the trusted name is refused instead of raising. Environments with an editable install,
+  uv or virtualenv venvs, coverage or pytest-cov refuse OCR (listed in `docs/extension-isolation.md`).
+  Third review (NEW-1, NEW-2): a file named by two distributions' `RECORD`s, or a `RECORD` other than the owner's that
+  names a file of the running runtime's package or the trusted integration, refuses the trusted import (a foreign
+  wheel replacing any module); so does a `sitecustomize` or `usercustomize` that is loaded or importable
+  (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
+  process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
+
 - Tests: `test_a_worker_killed_during_a_model_call_never_has_the_call_repeated` waited for the call record's file to
   exist; `open()` creates it before the write, so a kill in between left it empty (`assert 0 == 1`, pg-a and pg-b,
   2026-11-27). It now waits until the call is recorded in the file.

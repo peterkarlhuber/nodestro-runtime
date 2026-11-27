@@ -6,6 +6,7 @@ import base64
 from collections.abc import Callable, Iterator
 import hashlib
 from importlib import metadata
+import os
 from pathlib import Path
 import sys
 
@@ -85,3 +86,16 @@ def clean_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     for name in [name for name in sys.modules if _ours(name)]:
         del sys.modules[name]
+
+
+def place_runtime(monkeypatch: pytest.MonkeyPatch, site: Path) -> Path:
+    """The running runtime counts as installed in ``site`` and its import path as closed, so a test's distribution in
+    ``site`` is judged by the other checks only (the location and the import path have tests of their own)."""
+    real = Path(os.path.realpath(site))
+    monkeypatch.setattr(trusted_integrations, "installation_home", lambda: real)
+    monkeypatch.setattr(trusted_integrations, "environment_problems", lambda *_args, **_options: [])
+    # The site directories and ``sys.path`` folders of this interpreter are the environment's, not the test's.
+    monkeypatch.setattr(trusted_integrations, "_scan_folders", lambda home: ([home], [home]))
+    # So is a ``sitecustomize`` of the interpreter running the tests (startup_hook_problems has tests of its own).
+    monkeypatch.setattr(trusted_integrations, "startup_hook_problems", lambda *_args, **_options: [])
+    return real

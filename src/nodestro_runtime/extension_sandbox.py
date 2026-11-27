@@ -2,12 +2,18 @@
 
 An installed integration that is not Nodestro's own is never imported into the host process
 (:func:`nodestro_runtime.extensions.find_packages`): it is an :class:`ExtensionPackage`, the entry point's
-``module:attribute`` and the Python files its distribution lists. Listing its tools (:meth:`ExtensionSandbox.describe`)
+``module:attribute`` and the Python files its distribution lists. Since the owner decision of 2026-11-27 a package
+found in the host environment is refused before it gets here (``HOST_INSTALLED``); this module stays for the
+separate extension store, which will feed it. Listing its tools (:meth:`ExtensionSandbox.describe`)
 and every call (:meth:`ExtensionSandbox.call`) run in a new container of Orkexa's one sandbox shape, started through a
 :class:`~nodestro_runtime.container_images.StreamedSandbox` only after the daemon passed the preflight and the
 in-container self-test. The files, Orkexa's runner modules, the contract module (:mod:`._extension_contract`) and one
 JSON request travel on stdin (:data:`BOOTSTRAP`); one JSON line comes back on stdout. There is no fallback: without a
 proven sandbox nothing runs (:class:`SandboxUnavailable`).
+
+Every extension container also runs under Nodestro's own seccomp profile (:mod:`.extension_seccomp`), stricter than
+the engine's default; a probe container of the same shape, without package code, proves once per daemon and image
+that the profile is applied, or nothing runs (``not_secured``).
 
 A call's time limit ends the container: the client is killed, the container killed and removed, and its absence
 checked (:meth:`ExtensionSandbox._ensure_gone`). What a package states about its tools can only raise their capability
@@ -35,7 +41,9 @@ from orkexa.dynamic import SandboxError, response_limit
 from orkexa.dynamic.docker import runner_files
 from orkexa.errors import ToolExecutionError
 
-from .tool_policy import UNKNOWN, ToolCapability
+from . import extension_seccomp
+from .extension_classes import NO_GRANTS, class_capability
+from .tool_policy import ToolCapability
 from .tool_spec import HOST_TOOL_TIMEOUT_SECONDS, SpecMode, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -58,7 +66,6 @@ DESCRIBE_TIMEOUT_SECONDS = 60.0
 _NAME = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _DOTTED = r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*"
 _ENTRY = re.compile(rf"^{_DOTTED}(:{_DOTTED})?$")
-_ACCESS = ("read", "write", "destructive")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 _SOURCE = Path(__file__).resolve().parent
 
@@ -122,15 +129,22 @@ class ExtensionPackage:
 
 
 def package_of(entry: metadata.EntryPoint, *, rejected: str = "") -> ExtensionPackage:
-    """``entry`` as an :class:`ExtensionPackage` (nothing of it is imported)."""
+    """``entry`` as an :class:`ExtensionPackage` (nothing of it is imported). A ``rejected`` package's files are never
+    read: only its metadata (name, entry point, distribution, version) is kept, to report it."""
     dist = entry.dist
+
+    def read_files() -> dict[str, str]:
+        if rejected:
+            raise PackageError(rejected)
+        return distribution_files(dist, entry.value)
+
     return ExtensionPackage(
         rejected=rejected,
         name=entry.name,
         entry=entry.value,
         distribution=dist.metadata["Name"] if dist is not None else "",
         version=dist.version if dist is not None else "",
-        read_files=lambda: distribution_files(dist, entry.value),
+        read_files=read_files,
     )
 
 
@@ -188,11 +202,10 @@ def _contract_files() -> dict[str, str]:
 
 def floor_capability(stated: Mapping[str, Any] | None) -> ToolCapability:
     """At least :data:`~nodestro_runtime.tool_policy.UNKNOWN` (write, external): a package's statement can raise the
-    access (``destructive``), never lower it; ``reach`` is always ``external``."""
-    access = (stated or {}).get("access")
-    if access in _ACCESS and _ACCESS.index(access) > _ACCESS.index(UNKNOWN.access):
-        return ToolCapability(access=access, reach="external", source="author")
-    return UNKNOWN
+    access (``destructive``), never lower it; ``reach`` is always ``external``. A tool class released after gate G-6
+    would count with its class instead (:func:`~.extension_classes.class_capability`); none is released, and the
+    containers get no grant."""
+    return class_capability(stated, NO_GRANTS)
 
 
 def extension_spec(name: str, stated: Mapping[str, Any] | None) -> ToolSpec:
@@ -225,6 +238,8 @@ class ExtensionSandbox:
         self._make = sandbox
         self._sandboxes: dict[float, Any] = {}
         self._files: dict[tuple[str, str, str], dict[str, str]] = {}
+        #: (docker, its environment, image id) for which the seccomp probe passed.
+        self._proven: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
 
     def _sandbox(self, timeout: float) -> Any:
@@ -234,11 +249,43 @@ class ExtensionSandbox:
             return self._sandboxes[timeout]
 
     def ready(self) -> None:
-        """Raise :class:`SandboxUnavailable` unless the daemon passed the preflight and the self-test."""
+        """Raise :class:`SandboxUnavailable` unless the daemon passed the preflight, the self-test and the seccomp
+        probe."""
+        sandbox = self._sandbox(DESCRIBE_TIMEOUT_SECONDS)
         try:
-            self._sandbox(DESCRIBE_TIMEOUT_SECONDS).ready_image()
+            image = sandbox.ready_image()
         except SandboxError as exc:
             raise SandboxUnavailable(str(exc)) from None
+        self._prove(sandbox, image)
+
+    @staticmethod
+    def _shaped(sandbox: Any, name: str, image: str) -> list[str]:
+        """Orkexa's sandbox shape for ``name`` plus the extension seccomp profile, up to the image."""
+        args = list(sandbox.shaped_run(name, image))
+        return [*args[:-1], "--security-opt", extension_seccomp.security_option(), args[-1]]
+
+    def _prove(self, sandbox: Any, image: str) -> None:
+        """Run :data:`~.extension_seccomp.PROBE_SCRIPT` in a container of the extension shape (no package code) once
+        per daemon and image; raise :class:`SandboxUnavailable` unless every probed call was refused."""
+        key = (str(sandbox.docker), json.dumps(sandbox.environ, sort_keys=True), image)
+        with self._lock:
+            if key in self._proven:
+                return
+        name = f"nodestro-sandbox-ext-probe-{uuid.uuid4().hex[:12]}"
+        try:
+            code, output = sandbox.run_container(
+                [*self._shaped(sandbox, name, image), *extension_seccomp.probe_command()], name, b"", max_stdout=4096
+            )
+        except SandboxError as exc:
+            self._ensure_gone(sandbox, name)
+            raise SandboxUnavailable(f"the seccomp probe failed: {exc}") from None
+        problems = extension_seccomp.check_probes(output.stdout.decode("utf-8", "replace"))
+        if code != 0 or problems:
+            stderr = output.stderr.decode("utf-8", "replace").strip()[-300:]
+            detail = "; ".join(item for item in (problems[0] if problems else "", stderr) if item)
+            raise SandboxUnavailable(f"the seccomp probe failed (exit code {code}): {detail}")
+        with self._lock:
+            self._proven.add(key)
 
     def _package_files(self, package: ExtensionPackage) -> dict[str, str]:
         with self._lock:
@@ -252,11 +299,12 @@ class ExtensionSandbox:
             image = sandbox.ready_image()
         except SandboxError as exc:
             raise SandboxUnavailable(str(exc)) from None
+        self._prove(sandbox, image)
         data = json.dumps(
             {"runner": _contract_files(), "files": self._package_files(package), "request": request}
         ).encode("utf-8")
-        name = f"nodestro-ext-{uuid.uuid4().hex[:12]}"
-        args = [*sandbox.shaped_run(name, image), "python", "-I", "-B", "-c", BOOTSTRAP]
+        name = f"nodestro-sandbox-ext-{uuid.uuid4().hex[:12]}"
+        args = [*self._shaped(sandbox, name, image), "python", "-I", "-B", "-c", BOOTSTRAP]
         try:
             code, output = sandbox.run_container(args, name, data, max_stdout=response_limit(MAX_RESULT_CHARS))
         except SandboxError:

@@ -24,10 +24,13 @@ Only Nodestro's own distribution (:data:`TRUSTED_DISTRIBUTIONS`) is imported int
 engine; its tools stay locked (``isolation_unavailable``): they would run in the host process, which sees the
 environment, the unlocked vault and the whole file system, and the time limit does not stop them. Every other entry
 point is never imported (N-22; security review 2026-11 (phase 0R), findings S1 to S3; owner decision E-0R-2 A):
-:func:`find_packages` reads it as data, and its tools run only in the Docker sandbox
-(:mod:`nodestro_runtime.extension_sandbox`), and only while :data:`EXTENSION_TOOLS_ENV` is ``1`` (off by default) and
-the daemon passed its checks. Otherwise they are locked with the reason ``off`` or ``not_secured`` ("locked, not
-sufficiently secured"); there is no host-process fallback. Integrations passed explicitly
+:func:`find_packages` reports it from its metadata only and refuses it as :data:`HOST_INSTALLED` (owner decision
+2026-11-27: foreign extension packages are never installed into, loaded through or run in the host environment).
+Their tools will run only from the separate extension store, in the Docker sandbox
+(:mod:`nodestro_runtime.extension_sandbox`), while :data:`EXTENSION_TOOLS_ENV` is ``1`` (off by default) and the
+daemon passed its checks; until that store exists the sandbox path for foreign packages is unused. A locked tool
+shows the reason ``off``, ``not_secured`` ("locked, not sufficiently secured") or ``invalid``; there is no
+host-process fallback. Integrations passed explicitly
 (``Workspace(integrations=[...])``) are the embedding application's own code and keep their tools. A capability that an
 installed integration states for its tools is never taken as given: it counts at least as :data:`~nodestro_runtime.
 tool_policy.UNKNOWN` (finding S3) and can only be raised, so a tool cannot pass the approval gate by calling itself
@@ -41,6 +44,7 @@ from dataclasses import dataclass, field
 from importlib import metadata
 import logging
 import os
+from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 from orkexa import Tool
@@ -80,6 +84,13 @@ TRUSTED_DISTRIBUTIONS: frozenset[str] = trusted_integrations.TRUSTED_DISTRIBUTIO
 TRUSTED_DISTRIBUTIONS_TEXT = ", ".join(sorted(TRUSTED_DISTRIBUTIONS))
 #: What a locked package or tool shows.
 LOCKED_MESSAGE = "locked, not sufficiently secured"
+#: Why a foreign extension package found in the host Python environment is never used (owner decision 2026-11-27):
+#: foreign extensions are never installed into, loaded through or run in the host; they will run only from the
+#: separate extension store, in the Docker sandbox.
+HOST_INSTALLED = (
+    "installed in the host environment: foreign extension packages are never loaded from the host's Python "
+    "environment; they run only from the extension store, which does not exist yet"
+)
 
 #: Why tools of installed integrations are locked: ``off`` (the switch is off), ``isolation_unavailable`` (a tool of
 #: the trusted distribution, which is imported into the host and has no isolated path), ``not_secured`` (the switch
@@ -180,8 +191,8 @@ def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list
     return found
 
 
-def _load(entry: metadata.EntryPoint) -> Integration:
-    value = trusted_integrations.load(entry)
+def _load(entry: metadata.EntryPoint, data_dir: str | Path | None) -> Integration:
+    value = trusted_integrations.load(entry, data_dir=data_dir)
     if callable(value) and not isinstance(value, Integration):
         value = value()
     if not isinstance(value, Integration):
@@ -203,10 +214,10 @@ def _listed(entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None) ->
     ]
 
 
-def _rejected(entry: metadata.EntryPoint) -> str:
+def _rejected(entry: metadata.EntryPoint, data_dir: str | Path | None) -> str:
     """Why ``entry``, which claims a trusted distribution name, may not be imported (empty: it passed every check)."""
     try:
-        trusted_integrations.verify(entry)
+        trusted_integrations.verify(entry, data_dir=data_dir)
     except trusted_integrations.UntrustedError as exc:
         return f"claims to be {TRUSTED_DISTRIBUTIONS_TEXT} but {exc}"
     return ""
@@ -214,10 +225,13 @@ def _rejected(entry: metadata.EntryPoint) -> str:
 
 def discover(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ) -> list[Integration]:
     """The integrations of Nodestro's own distribution installed in this environment, sorted by name. Only entry
-    points that pass :func:`nodestro_runtime.trusted_integrations.verify` are imported, from their verified files;
-    every other entry point is left to :func:`find_packages` and never imported.
+    points that pass :func:`nodestro_runtime.trusted_integrations.verify` are imported, from their verified files
+    (installed next to the runtime, on a closed import path; ``data_dir``: the workspace's data directory, which no
+    entry of the import path may lie in); every other entry point is left to :func:`find_packages` and never imported.
 
     A broken integration is logged and left out: an optional extension never stops the
     runtime from starting.
@@ -225,14 +239,14 @@ def discover(
     found: list[Integration] = []
     seen: set[tuple[str, str]] = set()
     for entry in _listed(entry_points):
-        if not trusted_integrations.claims_trusted(entry) or _rejected(entry):
+        if not trusted_integrations.claims_trusted(entry) or _rejected(entry, data_dir):
             continue
         key = (trusted_integrations.normalized(entry.dist.metadata["Name"]) if entry.dist else "", entry.name)
         if key in seen:
             continue
         seen.add(key)
         try:
-            found.append(_load(entry))
+            found.append(_load(entry, data_dir))
         except Exception:
             logger.exception("Integration %r could not be loaded", entry.name)
     return sorted(found, key=lambda item: item.name)
@@ -240,14 +254,19 @@ def discover(
 
 def find_packages(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ) -> list[ExtensionPackage]:
-    """The installed integrations of every other distribution, as data: nothing of them is imported (N-22). An entry
-    point that claims Nodestro's own distribution name and fails its checks is listed too, as ``rejected``."""
+    """The entry points of the host environment that are not the trusted integration, for reporting only (owner
+    decision 2026-11-27). Each is ``rejected``: a foreign package as :data:`HOST_INSTALLED`, one that claims
+    Nodestro's own distribution name and fails its checks with that reason. Only metadata is read; nothing is imported,
+    no file is read and nothing is sent to the sandbox, whatever :data:`EXTENSION_TOOLS_ENV` says."""
     found: list[ExtensionPackage] = []
     for entry in _listed(entry_points):
         if not trusted_integrations.claims_trusted(entry):
-            found.append(package_of(entry))
-        elif reason := _rejected(entry):
+            logger.warning("The extension package %r is never loaded: %s", entry.name, HOST_INSTALLED)
+            found.append(package_of(entry, rejected=HOST_INSTALLED))
+        elif reason := _rejected(entry, data_dir):
             logger.warning("The installed integration %r is never loaded: %s", entry.name, reason)
             found.append(package_of(entry, rejected=reason))
     return sorted(found, key=lambda item: item.key)

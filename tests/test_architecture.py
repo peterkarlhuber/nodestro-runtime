@@ -7,7 +7,7 @@ from pathlib import Path
 
 from orkexa import Tool
 import pytest
-from trusted_dist_support import clean_imports, entries, write_distribution  # noqa: F401 - a fixture
+from trusted_dist_support import clean_imports, entries, place_runtime, write_distribution  # noqa: F401 - a fixture
 
 from nodestro_runtime.extensions import (
     CONTRACT,
@@ -86,10 +86,11 @@ def test_integrations_must_match_the_contract() -> None:
 
 
 @pytest.mark.usefixtures("clean_imports")
-def test_discovery_skips_broken_entry_points(tmp_path: Path) -> None:
+def test_discovery_skips_broken_entry_points(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Only Nodestro's own distribution is imported, and only after its checks (N-22, F1): ``good`` is a verified copy,
     # ``broken`` claims the same distribution but names a module that does not exist.
     good = write_distribution(tmp_path / "good")
+    place_runtime(monkeypatch, tmp_path / "good")
     broken = write_distribution(tmp_path / "broken", entry="broken = does_not_exist:thing")
     found = discover(entries(good, broken))
     assert [item.name for item in found] == ["tesseract-ocr"]
@@ -111,7 +112,7 @@ class _Ocr:
 
 
 def _installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *found: Integration) -> Workspace:
-    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda: list(found))
+    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: list(found))
     return Workspace(tmp_path / "data")
 
 
