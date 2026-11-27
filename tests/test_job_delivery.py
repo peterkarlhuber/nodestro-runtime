@@ -277,7 +277,9 @@ async def test_a_worker_killed_during_a_model_call_never_has_the_call_repeated(
     child.start()
     try:
         deadline = time.monotonic() + 60
-        while not counter.exists():
+        # The call is recorded once "call" is in the file, not when the file exists: open() creates it before the
+        # write, and a kill in between left it empty (assert 0 == 1, pg-a and pg-b, 2026-11-27).
+        while "call" not in (counter.read_text() if counter.exists() else ""):
             assert time.monotonic() < deadline, "the worker never called the model"
             await asyncio.sleep(0.05)
     finally:

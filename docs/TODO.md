@@ -1023,6 +1023,12 @@ Items that need an independent or external review (an internal audit does not re
 
 ## Tests and quality assurance
 
+Fixed 2026-11-27 (no entry left): `test_job_delivery.py`'s killed-worker test killed the worker as soon as its call
+record file existed; the worker's `open()` creates it before writing `call`, so a kill in that gap left it empty
+(`assert 0 == 1`; pg-a 3.13 run 46049634485 and pg-b 3.14 run 46029410519 on PR heads, 2026-11-27). The test now waits
+until the call is recorded. Probe (a gap between open and write): master failed 1 of 5 runs at 20 ms and 5 of 5 at
+100 ms, the fix 0 of 15 at 20, 100 and 500 ms.
+
 Fixed 2026-11-26 (no entry left): the lease-loss tests (`test_job_delivery.py`, `test_run_fencing.py`) expired a live
 worker's lease while its heartbeat kept running; a renewal already on its way landed between the expiry and the
 reaper, which then found nothing (master 6b65b2e, pg-b 3.11, 2026-11-21). `tests/lease_support.py` now holds the

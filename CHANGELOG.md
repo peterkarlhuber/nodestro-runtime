@@ -43,6 +43,10 @@
   (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
   process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
 
+- Tests: `test_a_worker_killed_during_a_model_call_never_has_the_call_repeated` waited for the call record's file to
+  exist; `open()` creates it before the write, so a kill in between left it empty (`assert 0 == 1`, pg-a and pg-b,
+  2026-11-27). It now waits until the call is recorded in the file.
+
 - New (N-24): memory entries with their time and origin ([docs/memory-entries.md](docs/memory-entries.md)).
   `MemoryFile` gains `updated_at`, `origin` (`tool`, `user`, `import`, `assistant` for a saved proposal of the memory
   assistant, or `null` when unknown; `ORIGINS` lists them) and `scope` (`user`;
