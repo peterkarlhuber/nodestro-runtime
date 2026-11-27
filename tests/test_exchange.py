@@ -77,8 +77,12 @@ def test_json_files_are_checked_for_size_syntax_and_shape_first() -> None:
     big = raw({"format": "nodestro-mcp/1", "servers": [], "pad": "x" * exchange.MAX_JSON_BYTES})
     assert code(lambda: exchange.read_json(big, "nodestro-mcp")) == "exchange.too_large"
     assert code(lambda: exchange.read_json(b"{not json", "nodestro-mcp")) == "exchange.invalid_json"
-    deep = b"[" * 100_000 + b"]" * 100_000  # nesting deeper than the parser's recursion limit
-    assert code(lambda: exchange.read_json(deep, "nodestro-mcp")) == "exchange.invalid_json"
+    # Deep nesting: refused as JSON where the parser has a recursion limit, else by the content check (Python 3.14).
+    deep = b'{"format": "nodestro-mcp/1", "servers": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+    assert code(lambda: exchange.parse(exchange.Envelope, exchange.read_json(deep, "nodestro-mcp"))) in (
+        "exchange.invalid_json",
+        "exchange.content_invalid",
+    )
     assert code(lambda: exchange.read_json(b"[]", "nodestro-mcp")) == "exchange.format_invalid"
     with pytest.raises(NodestroError) as invalid:
         exchange.parse(
