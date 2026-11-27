@@ -14,6 +14,10 @@
   Re-check: the nesting count is linear (no backtracking pattern), and a ZIP comment is refused (it could hide a
   ZIP64 locator from the end record check).
 
+- Tests (N-22 follow-up): the trust tests set aside an installed `nodestro_integrations` that an earlier test of the
+  same worker imported (and its verified finder) and restore it afterwards. Before, the studio's components job (which
+  installs the real package) failed `test_discovery_skips_broken_entry_points` with "another nodestro_integrations is
+  already imported", and the fixture removed the real module for later tests. The trust check is unchanged.
 - Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
   ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of
   Nodestro's own distribution, verified against their `RECORD` hashes and loaded from the verified bytes
