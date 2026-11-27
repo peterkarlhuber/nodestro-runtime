@@ -61,7 +61,7 @@ from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import EMBEDDING_PROVIDER, RunManager
-from .extension_sandbox import ExtensionSandbox
+from .extension_sandbox import EXTENSION_MODES, ExtensionSandbox
 from .extensions import Extensions, Integration, discover, find_packages
 from .folder_index import FILES as FOLDER_INDEX_FILES
 from .folder_index import STATES as FOLDER_INDEX_STATES
@@ -637,12 +637,15 @@ class Workspace:
         self.docker_monitor.start_reaper(remove_all_first=storage is None)
         self.docker_monitor.status()
         self.tools.dependencies = EnvironmentGate(self.python)
-        self.tools.add_extension_tools(
-            self.extensions.load_packages(
-                ExtensionSandbox(self._extension_sandbox),
-                reserved={*self.tools.builtin, *self.tools.registry.names(), *RESERVED_NAMES},
+        # Extension tools are offered on this computer only (EXTENSION_MODES): a server's tenants never start their
+        # listing containers, switch or not.
+        if storage is None and self.profile.kind in EXTENSION_MODES:
+            self.tools.add_extension_tools(
+                self.extensions.load_packages(
+                    ExtensionSandbox(self._extension_sandbox),
+                    reserved={*self.tools.builtin, *self.tools.registry.names(), *RESERVED_NAMES},
+                )
             )
-        )
         self.tool_drafts.python = self.python
         self.runs.tool_sandbox = self.python.workflow_sandbox
         self.tester.tool_sandbox = self.python.workflow_sandbox

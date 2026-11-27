@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import ast
-from importlib import metadata
 from pathlib import Path
 
 from orkexa import Tool
 import pytest
+from trusted_dist_support import clean_imports, entries, write_distribution  # noqa: F401 - a fixture
 
 from nodestro_runtime.extensions import (
     CONTRACT,
@@ -85,28 +85,14 @@ def test_integrations_must_match_the_contract() -> None:
     assert duplicate.value.code == "extension.tool_duplicate"
 
 
-class _TrustedDist:
-    metadata = {"Name": "nodestro-integrations"}  # noqa: RUF012
-
-
-class _Trusted(metadata.EntryPoint):
-    """An entry point of Nodestro's own distribution (the only one discover() imports, N-22)."""
-
-    @property
-    def dist(self) -> object:  # type: ignore[override]
-        return _TrustedDist()
-
-
-def test_discovery_skips_broken_entry_points() -> None:
-    good = metadata.EntryPoint(name="good", value="tests_helpers:good", group="nodestro.integrations")
-
-    class Loaded(_Trusted):
-        def load(self) -> object:
-            return lambda: Integration(name="good")
-
-    broken = _Trusted(name="broken", value="does_not_exist:thing", group="nodestro.integrations")
-    found = discover(lambda: [Loaded(good.name, good.value, good.group), broken])
-    assert [item.name for item in found] == ["good"]
+@pytest.mark.usefixtures("clean_imports")
+def test_discovery_skips_broken_entry_points(tmp_path: Path) -> None:
+    # Only Nodestro's own distribution is imported, and only after its checks (N-22, F1): ``good`` is a verified copy,
+    # ``broken`` claims the same distribution but names a module that does not exist.
+    good = write_distribution(tmp_path / "good")
+    broken = write_distribution(tmp_path / "broken", entry="broken = does_not_exist:thing")
+    found = discover(entries(good, broken))
+    assert [item.name for item in found] == ["tesseract-ocr"]
 
 
 # Security review 2026-11 (phase 0R, S1, S3) and owner decision E-0R-2 A: tools of installed integrations are

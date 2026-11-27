@@ -9,12 +9,21 @@ any class of them may be enabled by default.
 
 ## Rules
 
-1. **No foreign code in the host process.** Only the entry points of Nodestro's own distribution
-   (`extensions.TRUSTED_DISTRIBUTIONS`: `nodestro-integrations`) are imported into the host, for their OCR engine.
+1. **No foreign code in the host process.** Only pinned entry points of Nodestro's own distribution
+   (`trusted_integrations.TRUSTED_ENTRY_POINTS`: `nodestro-integrations`, `tesseract-ocr =
+   nodestro_integrations.ocr:integration`) are imported into the host, for their OCR engine, and only after
+   `trusted_integrations.verify` passed: the exact `module:attribute`; a `<name>-<version>.dist-info` folder that
+   matches the metadata, in the installation directory of the files; every Python file of the pinned package listed in
+   that `RECORD` with a SHA-256 hash, reached without a symbolic link and matching the hash. The import then runs from
+   exactly those verified bytes (a finder first on `sys.meta_path`; no cached bytecode, no other copy on `sys.path`,
+   no unlisted file). A distribution that only calls itself `nodestro-integrations` (any spelling) and fails a check
+   is never imported and is reported as `invalid`. Every distribution is examined (no de-duplication by name, so an
+   earlier copy on the path cannot hide another). An editable install of `nodestro-integrations` is not trusted.
    Every other entry point is read as data only (`extensions.find_packages`): its name, its `module:attribute`, the
-   name and version of its distribution and the Python files the distribution's `RECORD` lists for that module. It is
-   never imported, so import-time code never runs in the host. Tools of the trusted distribution stay locked as before
-   (`isolation_unavailable`): they are imported into the host and have no isolated path.
+   name and version of its distribution and the Python files the distribution's `RECORD` lists for that module (no
+   symbolic link anywhere on the path). It is never imported, so import-time code never runs in the host. Tools of the
+   trusted distribution stay locked as before (`isolation_unavailable`): they are imported into the host and have no
+   isolated path.
 2. **One execution path: the Docker sandbox.** Listing a package's tools and every call run in a new container of
    Orkexa's one sandbox shape (`orkexa.dynamic.docker.run_args`: no network, read-only root, no capabilities, no new
    privileges, user `nobody`, private IPC, memory without swap, CPU, process, open-file and file-size limits, `noexec`
@@ -41,7 +50,7 @@ any class of them may be enabled by default.
 7. **Off by default.** `NODESTRO_EXTENSION_TOOLS=1` is a development switch: without it (the default in every
    profile) installed packages are listed as locked with the reason `off` and no container is started. With it, the
    runtime lists the packages' tools in the sandbox when the workspace opens and offers them on the desktop and in
-   Nodestro Local Docker (never in the server profile). Turning it on is not a release: no tool class is enabled
+   Nodestro Local Docker (never in the server profile: there no listing container starts). Turning it on is not a release: no tool class is enabled
    until G-6 (below) is passed, and nothing in this change enables one.
 
 `Extensions.packages_status()` (also in `Extensions.summary()`) reports each package with its state (`locked` or
@@ -58,10 +67,14 @@ locked package.
 - Each call starts a new container (about a second of overhead); state does not survive between calls.
 - The Docker sandbox shares the kernel with the host (or Docker Desktop's VM) and uses the daemon's default seccomp
   profile (see [docker-sandbox.md](docker-sandbox.md)).
-- The trusted distribution is recognised by its distribution name; anybody who can install a package into the
-  backend's environment can already run code there (for example through a `.pth` file). Installing a package is a
-  trust decision of whoever controls that environment; the rules above protect against the package's tools and
-  import-time code, not against a compromised environment.
+- Packages are told apart by distribution, entry point name and `module:attribute`; two that cannot be told apart
+  are both `invalid`. Listing runs one container per package, one after the other (up to 60 s each) while the
+  workspace opens with the switch on. Descriptions lose control and bidi characters but stay untrusted text that a
+  user interface must escape.
+- Residual risk: whoever can write into the backend's Python environment can already run code there at every start
+  (for example through a `.pth` file) or change a trusted file between its check and its import. Installing a package
+  is a trust decision of whoever controls that environment; the rules above protect against a package's tools, its
+  import-time code and a package that claims to be Nodestro's own, not against a compromised environment.
 
 ## G-6: evidence before a tool class is enabled
 
@@ -73,7 +86,7 @@ open.
 | # | Check | Expected | Covered by |
 |---|---|---|---|
 | 1 | switch missing or off | no tool offered, no container, no import of the package | `test_extension_isolation.py::test_switch_off_*` |
-| 2 | import-time code of a package | never runs in the host (switch off and on) | `::test_import_time_code_never_runs_in_the_host`, Docker: `::test_import_time_code_runs_only_in_the_container` |
+| 2 | import-time code of a package, also one that claims to be `nodestro-integrations` | never runs in the host (switch off and on) | `::test_import_time_code_never_runs_in_the_host`, `::test_a_distribution_that_claims_the_trusted_name_is_never_imported`, `::test_every_trust_check_refuses_the_import`, `::test_a_copy_earlier_on_the_path_neither_hides_nor_replaces_the_verified_one`, Docker: `::test_import_time_code_runs_only_in_the_container` |
 | 3 | no Docker, failed preflight or self-test | locked `not_secured`, no host fallback | `::test_without_a_proven_sandbox_the_tools_stay_locked`, `::test_a_missing_docker_cli_locks_the_tools_with_the_real_sandbox` |
 | 4 | self-declared capability `read`/`internal` | ignored, counts as unknown; approval applies | `::test_a_stated_capability_can_only_raise` |
 | 5 | endless loop | container removed after the limit (`docker ps -a` empty), host thread free | Docker: `::test_an_endless_loop_is_killed_and_the_container_removed` |

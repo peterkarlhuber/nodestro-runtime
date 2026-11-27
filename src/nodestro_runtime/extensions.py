@@ -41,11 +41,11 @@ from dataclasses import dataclass, field
 from importlib import metadata
 import logging
 import os
-import re
 from typing import Literal, Protocol, runtime_checkable
 
 from orkexa import Tool
 
+from . import trusted_integrations
 from .documents import OcrResult
 from .extension_sandbox import (
     ExtensionPackage,
@@ -74,8 +74,10 @@ SUPPORTED_CONTRACTS: frozenset[int] = frozenset({1, 2})
 #: On, the tools of foreign packages run in the Docker sandbox once the daemon passed its checks; no tool class is
 #: enabled by default before the security evidence G-6 (``docs/extension-isolation.md``).
 EXTENSION_TOOLS_ENV = "NODESTRO_EXTENSION_TOOLS"
-#: The distributions whose entry points are imported into the host process (Nodestro's own; for their OCR engines).
-TRUSTED_DISTRIBUTIONS: frozenset[str] = frozenset({"nodestro-integrations"})
+#: The distributions whose entry points may be imported into the host process (Nodestro's own; for their OCR
+#: engines), and only after the checks of :mod:`nodestro_runtime.trusted_integrations`.
+TRUSTED_DISTRIBUTIONS: frozenset[str] = trusted_integrations.TRUSTED_DISTRIBUTIONS
+TRUSTED_DISTRIBUTIONS_TEXT = ", ".join(sorted(TRUSTED_DISTRIBUTIONS))
 #: What a locked package or tool shows.
 LOCKED_MESSAGE = "locked, not sufficiently secured"
 
@@ -179,7 +181,7 @@ def _check(item: Integration, names: dict[str, str], reserved: set[str]) -> list
 
 
 def _load(entry: metadata.EntryPoint) -> Integration:
-    value = entry.load()
+    value = trusted_integrations.load(entry)
     if callable(value) and not isinstance(value, Integration):
         value = value()
     if not isinstance(value, Integration):
@@ -191,29 +193,44 @@ def _load(entry: metadata.EntryPoint) -> Integration:
     return value
 
 
-def _trusted(entry: metadata.EntryPoint) -> bool:
-    dist = getattr(entry, "dist", None)
-    name = dist.metadata["Name"] if dist is not None else None
-    return bool(name) and re.sub(r"[-_.]+", "-", str(name)).lower() in TRUSTED_DISTRIBUTIONS
-
-
 def _listed(entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None) -> list[metadata.EntryPoint]:
-    return list(entry_points() if entry_points is not None else metadata.entry_points(group=ENTRY_POINT_GROUP))
+    """Every entry point of the group, of every installed distribution (``metadata.entry_points()`` would keep only
+    the first distribution of each normalized name on ``sys.path``, so an earlier copy could hide another)."""
+    if entry_points is not None:
+        return list(entry_points())
+    return [
+        entry for dist in metadata.distributions() for entry in dist.entry_points if entry.group == ENTRY_POINT_GROUP
+    ]
+
+
+def _rejected(entry: metadata.EntryPoint) -> str:
+    """Why ``entry``, which claims a trusted distribution name, may not be imported (empty: it passed every check)."""
+    try:
+        trusted_integrations.verify(entry)
+    except trusted_integrations.UntrustedError as exc:
+        return f"claims to be {TRUSTED_DISTRIBUTIONS_TEXT} but {exc}"
+    return ""
 
 
 def discover(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
 ) -> list[Integration]:
-    """The integrations of the trusted distributions (:data:`TRUSTED_DISTRIBUTIONS`) installed in this environment,
-    sorted by name. Only these are imported; every other entry point is left to :func:`find_packages`.
+    """The integrations of Nodestro's own distribution installed in this environment, sorted by name. Only entry
+    points that pass :func:`nodestro_runtime.trusted_integrations.verify` are imported, from their verified files;
+    every other entry point is left to :func:`find_packages` and never imported.
 
     A broken integration is logged and left out: an optional extension never stops the
     runtime from starting.
     """
     found: list[Integration] = []
+    seen: set[tuple[str, str]] = set()
     for entry in _listed(entry_points):
-        if not _trusted(entry):
+        if not trusted_integrations.claims_trusted(entry) or _rejected(entry):
             continue
+        key = (trusted_integrations.normalized(entry.dist.metadata["Name"]) if entry.dist else "", entry.name)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             found.append(_load(entry))
         except Exception:
@@ -224,10 +241,16 @@ def discover(
 def find_packages(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
 ) -> list[ExtensionPackage]:
-    """The installed integrations of every other distribution, as data: nothing of them is imported (N-22)."""
-    return sorted(
-        (package_of(entry) for entry in _listed(entry_points) if not _trusted(entry)), key=lambda item: item.name
-    )
+    """The installed integrations of every other distribution, as data: nothing of them is imported (N-22). An entry
+    point that claims Nodestro's own distribution name and fails its checks is listed too, as ``rejected``."""
+    found: list[ExtensionPackage] = []
+    for entry in _listed(entry_points):
+        if not trusted_integrations.claims_trusted(entry):
+            found.append(package_of(entry))
+        elif reason := _rejected(entry):
+            logger.warning("The installed integration %r is never loaded: %s", entry.name, reason)
+            found.append(package_of(entry, rejected=reason))
+    return sorted(found, key=lambda item: item.key)
 
 
 class Extensions:
@@ -257,12 +280,18 @@ class Extensions:
         #: Tool name -> why it is locked (installed integrations only).
         self.locked: dict[str, LockReason] = {}
         self.packages: list[ExtensionPackage] = list(packages)
-        #: Package name -> (``None`` when its tools run in the sandbox, else why they are locked, a detail).
-        self._package_state: dict[str, tuple[LockReason | None, str]] = {
-            package.name: ("off", "") for package in self.packages
-        }
-        #: Package name -> the names of its tools offered from the sandbox.
-        self._package_tools: dict[str, list[str]] = {}
+        #: Package key -> (``None`` when its tools run in the sandbox, else why they are locked, a detail).
+        self._package_state: dict[tuple[str, str, str], tuple[LockReason | None, str]] = {}
+        keys = [package.key for package in self.packages]
+        for package in self.packages:
+            if package.rejected:
+                self._package_state[package.key] = ("invalid", package.rejected)
+            elif keys.count(package.key) > 1:  # two copies that cannot be told apart: neither is used
+                self._package_state[package.key] = ("invalid", "installed more than once")
+            else:
+                self._package_state[package.key] = ("off", "")
+        #: Package key -> the names of its tools offered from the sandbox.
+        self._package_tools: dict[tuple[str, str, str], list[str]] = {}
         taken = set(reserved)
         names: dict[str, str] = {}
         for item in integrations:
@@ -294,23 +323,22 @@ class Extensions:
         extension_sandbox.extension_spec`); none while the switch is off (no container starts) or while the sandbox
         has not passed its checks (``not_secured``: nothing runs anywhere else). A package that cannot be listed, or
         whose tool names clash with ``reserved`` or another package's, is locked (``invalid``)."""
-        if not self.packages:
+        usable = [package for package in self.packages if self._package_state[package.key][0] != "invalid"]
+        if not usable:
             return []
         if not extension_tools_enabled(environ):
-            for package in self.packages:
-                self._package_state[package.name] = ("off", "")
             return []
         try:
             sandbox.ready()
         except Exception as exc:  # SandboxUnavailable, or an image that cannot be built
             detail = str(exc)[:500]
             logger.warning("Tools of installed integrations stay locked (%s): %s", LOCKED_MESSAGE, detail)
-            for package in self.packages:
-                self._package_state[package.name] = ("not_secured", detail)
+            for package in usable:
+                self._package_state[package.key] = ("not_secured", detail)
             return []
         taken = set(reserved) | set(self.locked)
         found: list[tuple[ToolSpec, ExtensionTool]] = []
-        for package in self.packages:
+        for package in usable:
             try:
                 described = sandbox.describe(package)
                 names = [str(item["name"]) for item in described]
@@ -318,18 +346,18 @@ class Extensions:
                 if clash:
                     raise PackageError(f"tool names already taken: {', '.join(clash)}")
             except SandboxUnavailable as exc:
-                self._package_state[package.name] = ("not_secured", str(exc)[:500])
+                self._package_state[package.key] = ("not_secured", str(exc)[:500])
                 continue
             except Exception as exc:  # the package's files or answers
                 logger.warning("The installed integration %r is locked: %s", package.name, exc)
-                self._package_state[package.name] = ("invalid", str(exc)[:500])
+                self._package_state[package.key] = ("invalid", str(exc)[:500])
                 continue
             taken.update(names)
             for item in described:
                 spec = extension_spec(str(item["name"]), item["stated"])
                 found.append((spec, ExtensionTool(package, item, spec, sandbox)))
-            self._package_state[package.name] = (None, "")
-            self._package_tools[package.name] = names
+            self._package_state[package.key] = (None, "")
+            self._package_tools[package.key] = names
         return found
 
     def packages_status(self) -> list[dict[str, object]]:
@@ -337,7 +365,7 @@ class Extensions:
         ``reason`` and ``message`` (when locked), ``detail`` and its tools offered from the sandbox."""
         result: list[dict[str, object]] = []
         for package in self.packages:
-            reason, detail = self._package_state.get(package.name, ("off", ""))
+            reason, detail = self._package_state.get(package.key, ("off", ""))
             result.append(
                 {
                     "name": package.name,
@@ -347,7 +375,7 @@ class Extensions:
                     "reason": reason,
                     "message": LOCKED_MESSAGE if reason else None,
                     "detail": detail or None,
-                    "tools": list(self._package_tools.get(package.name, [])),
+                    "tools": list(self._package_tools.get(package.key, [])),
                 }
             )
         return result

@@ -657,7 +657,8 @@ class ToolLibrary:
         listed as ``untrusted``, with the spec's capability (at least unknown)."""
         with self._lock:
             for spec, tool in pairs:
-                assert tool.name is not None and tool.name not in self.builtin
+                if tool.name is None or tool.name in self.builtin:
+                    raise ValueError(f"The extension tool {tool.name!r} would replace a tool of the same name")
                 self.builtin[tool.name] = tool
                 self.specs[tool.name] = spec
             self.extension_tools = self.extension_tools | {tool.name for _spec, tool in pairs if tool.name}

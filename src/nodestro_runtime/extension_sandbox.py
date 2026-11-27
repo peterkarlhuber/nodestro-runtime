@@ -59,6 +59,7 @@ _NAME = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _DOTTED = r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*"
 _ENTRY = re.compile(rf"^{_DOTTED}(:{_DOTTED})?$")
 _ACCESS = ("read", "write", "destructive")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 _SOURCE = Path(__file__).resolve().parent
 
 #: ``python -I -B -c BOOTSTRAP`` in the container: reads one JSON envelope from stdin, writes Orkexa's runner modules
@@ -110,12 +111,21 @@ class ExtensionPackage:
     version: str
     #: Reads the package's files (``{"pkg/mod.py": source}``); called once, before the first container.
     read_files: Callable[[], dict[str, str]] = field(repr=False, compare=False)
+    #: Why the package is never used, not even in the sandbox (it claims to be Nodestro's own and failed the checks of
+    #: :mod:`nodestro_runtime.trusted_integrations`); empty otherwise.
+    rejected: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        """What tells two packages apart: distribution, entry point name, ``module:attribute``."""
+        return (self.distribution, self.name, self.entry)
 
 
-def package_of(entry: metadata.EntryPoint) -> ExtensionPackage:
+def package_of(entry: metadata.EntryPoint, *, rejected: str = "") -> ExtensionPackage:
     """``entry`` as an :class:`ExtensionPackage` (nothing of it is imported)."""
     dist = entry.dist
     return ExtensionPackage(
+        rejected=rejected,
         name=entry.name,
         entry=entry.value,
         distribution=dist.metadata["Name"] if dist is not None else "",
@@ -143,6 +153,8 @@ def distribution_files(dist: metadata.Distribution | None, entry: str) -> dict[s
         if any(part in ("", ".", "..") or part.startswith(".") for part in parts):
             raise PackageError(f"unexpected file name {item}")
         path = base.joinpath(*parts)
+        if os.path.realpath(path) != str(path):  # every component, not only the last (no linked package folder)
+            raise PackageError(f"{item} is reached through a symbolic link")
         try:
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
         except OSError as exc:
@@ -212,7 +224,7 @@ class ExtensionSandbox:
     def __init__(self, sandbox: SandboxFactory) -> None:
         self._make = sandbox
         self._sandboxes: dict[float, Any] = {}
-        self._files: dict[str, dict[str, str]] = {}
+        self._files: dict[tuple[str, str, str], dict[str, str]] = {}
         self._lock = threading.Lock()
 
     def _sandbox(self, timeout: float) -> Any:
@@ -230,9 +242,9 @@ class ExtensionSandbox:
 
     def _package_files(self, package: ExtensionPackage) -> dict[str, str]:
         with self._lock:
-            if package.name not in self._files:
-                self._files[package.name] = package.read_files()
-            return self._files[package.name]
+            if package.key not in self._files:
+                self._files[package.key] = package.read_files()
+            return self._files[package.key]
 
     def _run(self, package: ExtensionPackage, request: dict[str, Any], timeout: float) -> dict[str, Any]:
         sandbox = self._sandbox(timeout)
@@ -336,7 +348,8 @@ def _checked(item: Any) -> dict[str, Any]:
     stated = item.get("stated")
     return {
         "name": name,
-        "description": description,
+        # Control and bidi characters are dropped (not line breaks, tabs); the text stays untrusted, a UI escapes it.
+        "description": _CONTROL.sub("", description),
         "input_schema": schema,
         "stated": stated if isinstance(stated, dict) else {},
     }

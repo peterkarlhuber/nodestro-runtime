@@ -246,7 +246,8 @@ instructions only; they never grant tools or permissions, and their scripts are 
 versions they use. Details: [docs/skills.md](docs/skills.md).
 
 **Tools of installed integrations run only in the Docker sandbox (N-22).** Only Nodestro's own distribution
-(`nodestro-integrations`) is imported into the backend, for its OCR engine; every other integration installed through
+(`nodestro-integrations`) is imported into the backend, for its OCR engine, and only a wheel install whose files match
+the hashes in its `RECORD` (an editable install or a package that only uses that name is not imported); every other integration installed through
 the entry point group `nodestro.integrations` is never imported: not even its import-time code runs in the host
 process. Its tools are listed and called in a new container of Orkexa's sandbox shape (no network, no host files, no
 environment, limits; the time limit removes the container), and only while `NODESTRO_EXTENSION_TOOLS=1` (a development

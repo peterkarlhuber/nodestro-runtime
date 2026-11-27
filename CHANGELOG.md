@@ -3,8 +3,9 @@
 ## Unreleased
 
 - Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
-  ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only Nodestro's own
-  distribution (`TRUSTED_DISTRIBUTIONS`); every other entry point is read as data (`find_packages`,
+  ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of
+  Nodestro's own distribution, verified against their `RECORD` hashes and loaded from the verified bytes
+  (`trusted_integrations`; a name-claiming distribution is `invalid`, an editable install is not trusted); every other entry point is read as data (`find_packages`,
   `extension_sandbox.ExtensionPackage`), so its import-time code never runs in the host. With
   `NODESTRO_EXTENSION_TOOLS=1` (off by default) and a daemon that passed Orkexa's preflight and self-test, the tools are
   listed and called in a new container per call (`ExtensionSandbox`, `ExtensionTool`; desktop and Nodestro Local Docker
