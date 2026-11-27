@@ -6,6 +6,7 @@ case, ``/private`` on macOS).
 
 from __future__ import annotations
 
+from importlib import metadata
 import os
 from pathlib import Path
 import stat
@@ -359,9 +360,8 @@ def test_a_foreign_distribution_that_replaced_the_trusted_files_is_refused(
     _foreign_record(site, "acme_ext-1.0", [f"{TOP}/__init__.py", f"{TOP}/ocr.py", f"{info.name}/RECORD"])
     assert discover(trusted_entries(info)) == []
     [package] = find_packages(trusted_entries(info))
-    assert "its installation is not its own: acme_ext-1.0 also installed nodestro_integrations/__init__.py" in (
-        package.rejected
-    )
+    assert "its installation is not its own: acme_ext-1.0 in " in package.rejected
+    assert "also installed nodestro_integrations/__init__.py" in package.rejected
     assert not marker.exists() and TOP + ".ocr" not in sys.modules
 
 
@@ -415,7 +415,8 @@ def test_a_foreign_wheel_installed_by_pip_over_the_trusted_files_is_refused(
     entry = trusted_entries(installed)
     assert discover(entry) == []
     [package] = find_packages(entry)
-    assert "its installation is not its own: acme_ext-1.0 also installed nodestro_integrations" in package.rejected
+    assert "its installation is not its own: acme_ext-1.0 in " in package.rejected
+    assert "also installed nodestro_integrations" in package.rejected
     assert not marker.exists() and TOP + ".ocr" not in sys.modules
 
 
@@ -427,7 +428,6 @@ def test_the_genuine_installation_next_to_other_distributions_is_imported(
     place_runtime(monkeypatch, site)
     info = write_distribution(site)
     _foreign_record(site, "acme_ext-1.0", ["acme_ext/__init__.py", "../../bin/acme", "nodestro_integrations_extra.py"])
-    (site / "paths.pth").write_text("# a folder only\n/opt/somewhere\n", encoding="utf-8")
     (site / "distutils-precedence.pth").write_bytes(  # setuptools' exact bytes (no newline translation on Windows)
         b"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; "
         b"enabled and __import__('_distutils_hack').add_shim(); \n"
@@ -436,7 +436,9 @@ def test_the_genuine_installation_next_to_other_distributions_is_imported(
     assert found.name == "tesseract-ocr" and sys.modules[TOP + ".ocr"].GENUINE is True
 
 
-@pytest.mark.parametrize("change", ["no-record", "egg-info", "second-metadata", "metadata-replaced", "pth-code"])
+@pytest.mark.parametrize(
+    "change", ["no-record", "egg-info", "second-metadata", "metadata-replaced", "pth-code", "pth-folder"]
+)
 def test_every_installation_check_names_its_problem(tmp_path: Path, change: str) -> None:
     site = Path(os.path.realpath(tmp_path)) / "site"  # macOS: /private/var, Windows: long names
     info = write_distribution(site)
@@ -446,8 +448,9 @@ def test_every_installation_check_names_its_problem(tmp_path: Path, change: str)
         "second-metadata": (
             f"{site} holds another metadata folder of a trusted name, nodestro_integrations-0.1.0.dist-info"
         ),
-        "metadata-replaced": f"acme_ext-1.0 also installed {info.name}/entry_points.txt",
-        "pth-code": f"{site / 'acme.pth'} runs code at every interpreter start",
+        "metadata-replaced": f"acme_ext-1.0 in {site} also installed {info.name}/entry_points.txt",
+        "pth-code": f"{site / 'acme.pth'} is not a known .pth file (the interpreter reads it at every start)",
+        "pth-folder": f"{site / 'paths.pth'} is not a known .pth file (the interpreter reads it at every start)",
     }[change]
     if change == "no-record":
         (site / "acme_ext-1.0.dist-info").mkdir()
@@ -457,21 +460,111 @@ def test_every_installation_check_names_its_problem(tmp_path: Path, change: str)
         (site / "nodestro_integrations-0.1.0.dist-info").mkdir()
     elif change == "metadata-replaced":
         _foreign_record(site, "acme_ext-1.0", [f"{info.name}/entry_points.txt"])
-    else:
+    elif change == "pth-code":
         (site / "acme.pth").write_text("import acme_ext; acme_ext.start()\n", encoding="utf-8")
-    problems = trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[])
+    else:  # a folder only: also refused, the products need none (review N1)
+        (site / "paths.pth").write_text("# a folder only\n/opt/somewhere\n", encoding="utf-8")
+    problems = trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[], folders=[])
     assert problems == [expected]
-    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[]) == problems
+
+
+#: Lines that ``site.addpackage`` runs although they do not follow a ``\n`` (review N1): it decodes UTF-8 with or
+#: without a byte order mark and splits with ``str.splitlines``.
+HIDDEN_CODE = {
+    "carriage-return": b"# a folder\rimport sys; sys.stdout.write('ran')\r",
+    "byte-order-mark": b"\xef\xbb\xbfimport sys; sys.stdout.write('ran')\n",
+    "form-feed": b"# a folder\x0cimport sys; sys.stdout.write('ran')\n",
+    "next-line": "# a folder\x85import sys; sys.stdout.write('ran')\n".encode(),
+    "line-separator": "# a folder\u2028import sys; sys.stdout.write('ran')\n".encode(),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(HIDDEN_CODE))
+def test_a_pth_file_is_refused_however_its_code_is_hidden(tmp_path: Path, variant: str) -> None:
+    import subprocess
+
+    site = Path(os.path.realpath(tmp_path)) / "site"
+    info = write_distribution(site)
+    (site / "hidden.pth").write_bytes(HIDDEN_CODE[variant])
+    # The interpreter runs it: the case is real.
+    ran = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", f"import site; site.addsitedir({str(site)!r})"],
+        capture_output=True,
+        check=True,
+    )
+    assert ran.stdout == b"ran"
+    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[], folders=[]) == [
+        f"{site / 'hidden.pth'} is not a known .pth file (the interpreter reads it at every start)"
+    ]
 
 
 def test_pth_files_of_the_site_directories_are_checked_too(tmp_path: Path) -> None:
     site = tmp_path / "site"
     info = write_distribution(site)
     other = _folder(tmp_path / "base-site")
-    (other / "a1_tool.pth").write_text("import sys; exec('print(1)')\n", encoding="utf-8")
-    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[str(other)]) == [
-        f"{other / 'a1_tool.pth'} runs code at every interpreter start"
+    (other / "a1_tool.PTH").write_text("import sys; exec('print(1)')\n", encoding="utf-8")
+    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[other], folders=[]) == [
+        f"{other / 'a1_tool.PTH'} is not a known .pth file (the interpreter reads it at every start)"
     ]
+
+
+def test_records_of_every_folder_of_the_path_are_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review N2: purelib and platlib differ (``lib`` and ``lib64``); a distribution in the other one names the trusted
+    files with ``..``. It is found by the default scan, which reads ``sys.path``."""
+    root = Path(os.path.realpath(tmp_path))
+    home = root / "lib" / "python3" / "site-packages"
+    platlib = root / "lib64" / "python3" / "site-packages"
+    info = write_distribution(home)
+    _foreign_record(platlib, "acme_ext-1.0", ["../../../lib/python3/site-packages/nodestro_integrations/ocr.py"])
+    expected = [
+        f"acme_ext-1.0 in {platlib} also installed ../../../lib/python3/site-packages/nodestro_integrations/ocr.py"
+    ]
+    assert trusted_integrations.installation_problems(home, own=info.name, top=TOP, sites=[], folders=[platlib]) == (
+        expected
+    )
+    monkeypatch.setattr(trusted_integrations.site, "getsitepackages", lambda: [str(home)])
+    monkeypatch.setattr(trusted_integrations.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(sys, "path", [str(home), str(platlib)])
+    assert trusted_integrations.installation_problems(home, own=info.name, top=TOP) == expected
+
+
+def test_another_name_of_the_trusted_folder_counts(tmp_path: Path) -> None:
+    """Review N3: names are compared by file identity. A symbolic link always reaches the same folder; another case
+    does on a case-insensitive file system (macOS, Windows) and is a different, harmless folder elsewhere."""
+    site = Path(os.path.realpath(tmp_path)) / "site"
+    info = write_distribution(site)
+    (site / "alias").symlink_to(site / TOP, target_is_directory=True)
+    _foreign_record(site, "acme_ext-1.0", ["alias/ocr.py"])
+    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[], folders=[]) == [
+        f"acme_ext-1.0 in {site} also installed alias/ocr.py"
+    ]
+    (site / "alias").unlink()
+    (site / "acme_ext-1.0.dist-info" / "RECORD").write_text("Nodestro_Integrations/ocr.py,,\n", encoding="utf-8")
+    case_insensitive = (site / "NODESTRO_INTEGRATIONS").exists()
+    problems = trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[], folders=[])
+    assert problems == (
+        [f"acme_ext-1.0 in {site} also installed Nodestro_Integrations/ocr.py"] if case_insensitive else []
+    )
+
+
+def test_a_distribution_in_a_zip_archive_is_refused_cleanly(tmp_path: Path) -> None:
+    """Review N5: a zip distribution that claims the trusted name is refused, not an exception at workspace open."""
+    import zipfile
+
+    archive = tmp_path / "dist.zip"
+    info = "nodestro_integrations-0.2.0.dist-info"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr(f"{info}/METADATA", "Metadata-Version: 2.1\nName: nodestro-integrations\nVersion: 0.2.0\n")
+        handle.writestr(
+            f"{info}/entry_points.txt",
+            "[nodestro.integrations]\ntesseract-ocr = nodestro_integrations.ocr:integration\n",
+        )
+        handle.writestr(f"{info}/RECORD", "")
+    with zipfile.ZipFile(archive) as handle:
+        dist = metadata.PathDistribution(zipfile.Path(handle, at=f"{info}/"))  # type: ignore[arg-type]
+        assert discover(lambda: list(dist.entry_points)) == []
+        [package] = find_packages(lambda: list(dist.entry_points))
+    assert "it is not installed as files in a folder" in package.rejected
 
 
 # ---- review M1 and L1: a group of root's folder, and the folder that holds a symbolic link --------------------------
@@ -516,5 +609,27 @@ def test_the_folder_holding_a_symbolic_link_on_the_path_is_checked(tmp_path: Pat
             f"{shared} is writable by every user"
         ]
         assert trusted_integrations.environment_problems(home, path=[str(target)]) == []
+    finally:
+        shared.chmod(0o755)
+
+
+@posix_only
+def test_every_link_on_the_way_to_an_entry_is_checked(tmp_path: Path) -> None:
+    """Review N4: ``entry -> open/hop -> closed``: the second link lies in a folder every user can write, although
+    the entry's own folder and its target are closed."""
+    home = _folder(tmp_path / "site-packages")
+    closed = _folder(tmp_path / "closed" / "lib")
+    mine = _folder(tmp_path / "mine")
+    shared = _folder(tmp_path / "open", 0o777)
+    try:
+        (shared / "hop").symlink_to(closed, target_is_directory=True)
+        (mine / "entry").symlink_to(shared / "hop", target_is_directory=True)
+        assert trusted_integrations.environment_problems(home, path=[str(mine / "entry")]) == [
+            f"{shared} is writable by every user"
+        ]
+        (mine / "loop").symlink_to(mine / "loop")
+        assert trusted_integrations.environment_problems(home, path=[str(mine / "loop")]) == [
+            f"{mine / 'loop'} has too many symbolic links to be resolved"
+        ]
     finally:
         shared.chmod(0o755)

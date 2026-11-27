@@ -14,6 +14,13 @@
   that is not a known one refuses the import (H1, `trusted_integrations.installation_problems`, tested with real
   pip); a folder of root writable by a foreign group is refused (M1); the folder holding a symbolic link on the way
   to an entry is checked (L1).
+  Re-review (N1 to N5): every `.pth` file of a site directory refuses the trusted import unless its exact bytes are
+  allowlisted (`KNOWN_PTH`: setuptools' `distutils-precedence.pth`), so line splits the interpreter honors (`\r`, a
+  byte order mark, form feed, U+0085, U+2028) cannot hide code and folder-only files count too; the `RECORD`s of
+  every site directory and `sys.path` folder are read and compared by file identity (split `lib`/`lib64`, another
+  case on macOS, links); every link on the way to an entry is resolved hop by hop and its folder checked; a zip
+  distribution that claims the trusted name is refused instead of raising. Environments with an editable install,
+  uv or virtualenv venvs, coverage or pytest-cov refuse OCR (listed in `docs/extension-isolation.md`).
 
 - New (N-20, off by default: `NODESTRO_WORKFLOW_TOOLS`): agents call saved workflows in a fixed version as tools
   (`AgentConfig.workflow_tools`, `workflow_tools`; [docs/workflow-tools.md](docs/workflow-tools.md)). A call is a

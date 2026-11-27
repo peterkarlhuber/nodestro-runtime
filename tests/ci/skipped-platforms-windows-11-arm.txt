@@ -10,3 +10,4 @@ tests.test_trusted_integrations::test_folders_of_another_user_or_a_foreign_group
 tests.test_trusted_integrations::test_a_writable_entry_of_a_sealed_installation_is_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
 tests.test_trusted_integrations::test_a_folder_of_root_writable_by_another_group_is_a_problem  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
 tests.test_trusted_integrations::test_the_folder_holding_a_symbolic_link_on_the_path_is_checked  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)
+tests.test_trusted_integrations::test_every_link_on_the_way_to_an_entry_is_checked  # POSIX modes and owners; Windows refuses the trusted import instead (ACLs are not read)

@@ -150,7 +150,9 @@ None known.
   Windows is locked; the boundary per product is in `docs/extension-isolation.md`. Independent review 2026-11-27
   (BLOCK on #226) fixed: H1 (a foreign package in the runtime's directory whose `RECORD` lists trusted files, and
   `.pth` files with unknown code, refuse the import), M1 (a group-writable folder of root counts), L1 (the folder
-  holding a symbolic link is checked). L2 (the process's primary group counts as its own) stays documented. Open:
+  holding a symbolic link is checked). Re-review fixed N1 (only allowlisted `.pth` files), N2 (the `RECORD`s of every
+  site directory and `sys.path` folder), N3 (file identity, not names), N4 (every link hop) and N5 (zip
+  distributions refused cleanly). L2 (the process's primary group counts as its own) stays documented. Open:
   an end-to-end check of the import path inside the Local Docker and server images, ACL checks for Windows. R2: an
   earlier normal import of `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
