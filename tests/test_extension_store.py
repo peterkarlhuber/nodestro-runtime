@@ -218,11 +218,76 @@ REFUSED: dict[str, tuple[Any, str]] = {
         "manifest",
     ),
     "too large": (lambda m: b"PK" + b"\0" * MAX_WHEEL_BYTES, "too_large"),
+    # Review findings F3, F4, F6 and the intake gaps it named.
+    "file and folder of one name": (
+        lambda m: build_wheel({**m, f"{MODULE}/x": b"x = 1\n", f"{MODULE}/x/y.py": b"y = 1\n"}),
+        "unsafe_path",
+    ),
+    "file and folder of one name in another case": (
+        lambda m: build_wheel({**m, f"{MODULE}/x": b"x = 1\n", f"{MODULE}/X/y.py": b"y = 1\n"}),
+        "unsafe_path",
+    ),
+    "same name in NFC and NFD": (
+        lambda m: build_wheel({**m, f"{MODULE}/caf\u00e9.py": b"a = 1\n", f"{MODULE}/cafe\u0301.py": b"b = 1\n"}),
+        "unsafe_path",
+    ),
+    "exact duplicate entry": (lambda m: _duplicate(build_wheel(m), f"{MODULE}/__init__.py"), "unsafe_path"),
+    "deflate bomb": (lambda m: build_wheel({**m, f"{MODULE}/bomb.py": b"#" * (2 * 1024 * 1024)}), "too_large"),
+    "stated size smaller than the real one": (
+        lambda m: _lying_size(build_wheel(m), f"{MODULE}/__init__.py", 4),
+        "archive",
+    ),
+    "windows device name": (lambda m: build_wheel({**m, f"{MODULE}/aux.py": b"x = 1\n"}), "unsafe_path"),
+    "windows device folder": (lambda m: build_wheel({**m, f"{MODULE}/com1/x.py": b"x = 1\n"}), "unsafe_path"),
+    "trailing dot": (lambda m: build_wheel({**m, f"{MODULE}/x.py.": b"x = 1\n"}), "unsafe_path"),
+    "trailing space": (lambda m: build_wheel({**m, f"{MODULE}/x.py ": b"x = 1\n"}), "unsafe_path"),
+    "ntfs stream": (lambda m: build_wheel({**m, f"{MODULE}/x.py:hidden": b"x = 1\n"}), "unsafe_path"),
+    "character windows refuses": (lambda m: build_wheel({**m, f"{MODULE}/x?.py": b"x = 1\n"}), "unsafe_path"),
+    "trusted distribution name": (lambda m: _renamed(m, "nodestro-integrations"), "reserved_name"),
+    "the runtime's distribution name": (lambda m: _renamed(m, "nodestro_runtime"), "reserved_name"),
+    "a module of the runtime": (
+        lambda m: build_wheel({**m, "nodestro_runtime/__init__.py": b"x = 1\n"}),
+        "reserved_name",
+    ),
+    "a module of orkexa": (lambda m: build_wheel({**m, "Orkexa/__init__.py": b"x = 1\n"}), "reserved_name"),
+    "a standard library module": (lambda m: build_wheel({**m, "json.py": b"x = 1\n"}), "reserved_name"),
     "too many members": (
         lambda m: build_wheel({**m, **{f"{MODULE}/m{index}.py": b"" for index in range(1001)}}),
         "too_large",
     ),
 }
+
+
+def _renamed(members: dict[str, bytes], name: str) -> bytes:
+    """The wheel of ``members`` under another distribution name (folder and METADATA)."""
+    info = f"{name.replace('-', '_')}-1.0.dist-info"
+    renamed = {path.replace(INFO, info): content for path, content in members.items()}
+    renamed[f"{info}/METADATA"] = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n".encode()
+    return build_wheel(renamed)
+
+
+def _lying_size(wheel: bytes, name: str, size: int) -> bytes:
+    """``wheel`` whose central directory states ``size`` as the unpacked size of ``name``."""
+    data = bytearray(wheel)
+    start = 0
+    while (start := data.find(b"PK\x01\x02", start)) >= 0:
+        length = int.from_bytes(data[start + 28 : start + 30], "little")
+        if data[start + 46 : start + 46 + length] == name.encode():
+            data[start + 24 : start + 28] = size.to_bytes(4, "little")
+        start += 4
+    return bytes(data)
+
+
+def _duplicate(wheel: bytes, name: str) -> bytes:
+    import io
+    import warnings
+
+    out = io.BytesIO(wheel)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # zipfile warns about the duplicate name
+        with zipfile.ZipFile(out, "a") as archive:
+            archive.writestr(name, b"x = 2\n")
+    return out.getvalue()
 
 
 def _with_extra_member(wheel: bytes, name: str, content: bytes) -> bytes:
@@ -302,6 +367,144 @@ def test_an_interrupted_intake_never_leaves_a_valid_package(
     assert install(reopened, wheel)["sha256"] == sha(wheel)  # a clean retry works
 
 
+def test_a_retry_after_a_crash_between_rename_and_commit_works_without_reopening(
+    store: ExtensionStore, marker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F3: the unlisted folder of the crashed intake does not make the retry fail (it was never valid)."""
+    wheel = build_wheel(wheel_members(marker=marker))
+
+    class Crash(BaseException):
+        pass
+
+    def crash(*_args: Any, **_kwargs: Any) -> None:
+        raise Crash
+
+    monkeypatch.setattr(ExtensionStore, "_commit", crash)
+    with pytest.raises(Crash):
+        install(store, wheel)
+    monkeypatch.undo()
+    assert (store.root / sha(wheel)).is_dir() and store.listing()["packages"] == []
+    assert install(store, wheel)["sha256"] == sha(wheel)
+    assert folders(store) == [sha(wheel)]
+
+
+def test_a_failed_write_is_an_audited_refusal(
+    store: ExtensionStore, marker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F3: an operating system error while the package is written is a refusal (code and audit), not a crash."""
+    wheel = build_wheel(wheel_members(marker=marker))
+    audited: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        ExtensionStore,
+        "_audit",
+        lambda _self, action, _actor, _sha, **options: audited.append((action, options.get("code"))),
+    )
+
+    def full(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ExtensionStore, "_commit", full)
+    with pytest.raises(StoreError) as caught:
+        install(store, wheel)
+    assert (caught.value.code, caught.value.params["reason"]) == ("extension_store.refused", "storage")
+    assert audited == [("extension_package.refused", "storage")]
+    assert store.listing()["packages"] == []
+
+
+# ---- the store folder ------------------------------------------------------------------------------------------------
+
+
+def _foreign(tmp_path: Path) -> Path:
+    """A folder that is not the store's, with a file and a folder named like a package hash."""
+    foreign = tmp_path / "foreign"
+    (foreign / ("a" * 64)).mkdir(parents=True)
+    (foreign / ("a" * 64) / "keep.txt").write_text("keep")
+    (foreign / "keep.txt").write_text("keep")
+    (foreign / STAGING).mkdir()
+    (foreign / STAGING / "keep.txt").write_text("keep")
+    return foreign
+
+
+def _untouched(foreign: Path) -> None:
+    assert (foreign / ("a" * 64) / "keep.txt").read_text() == "keep"
+    assert (foreign / "keep.txt").read_text() == "keep" and (foreign / STAGING / "keep.txt").is_file()
+
+
+@pytest.mark.parametrize("case", ["symbolic link", "writable by everyone", "writable by the group", "another user"])
+def test_an_unsafe_store_folder_is_never_read_changed_or_cleaned(
+    tmp_path: Path, marker: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Review F1: the store folder must be a plain folder of this user that nobody else can write; otherwise nothing
+    of it is listed or run and nothing in it (or where a link points) is deleted."""
+    foreign = _foreign(tmp_path)
+    root = tmp_path / "data" / "extensions"
+    root.parent.mkdir()
+    if case == "symbolic link":
+        root.symlink_to(foreign, target_is_directory=True)
+    else:
+        os.rename(foreign, root)
+        foreign = root
+        if case == "writable by everyone":
+            os.chmod(root, 0o777)
+        elif case == "writable by the group":
+            os.chmod(root, 0o770)
+        else:
+            os.chmod(root, 0o700)
+            real = os.geteuid()
+            monkeypatch.setattr("nodestro_runtime.extension_store.os.geteuid", lambda: real + 1)
+    store = ExtensionStore(root)
+    assert store.packages() == []
+    _untouched(foreign)
+    with pytest.raises(StoreError) as caught:
+        store.clean()
+    assert caught.value.code == "extension_store.unreadable"
+    for change in (
+        store.listing,
+        lambda: install(store, build_wheel(wheel_members(marker=marker))),
+        lambda: store.remove("a" * 64, actor="local"),
+        lambda: store.revoke("a" * 64, actor="local"),
+    ):
+        with pytest.raises(StoreError) as caught:
+            change()
+        assert caught.value.code == "extension_store.unreadable", caught.value
+    with pytest.raises(PackageError):
+        store.check("a" * 64, "")
+    _untouched(foreign)
+    assert not (foreign / INDEX).exists()
+    nothing_imported(marker)
+
+
+def test_cleaning_deletes_only_what_the_store_made(store: ExtensionStore, marker: Path) -> None:
+    """Review F1: an unlisted folder named like a package hash goes, anything else in the folder stays."""
+    install(store, build_wheel(wheel_members(marker=marker)))
+    (store.root / "notes.txt").write_text("keep")
+    (store.root / "other").mkdir()
+    (store.root / ("b" * 64)).mkdir()
+    ExtensionStore(store.root).clean()
+    assert (store.root / "notes.txt").is_file() and (store.root / "other").is_dir()
+    assert not (store.root / ("b" * 64)).exists()
+
+
+def test_a_hash_from_the_index_never_names_a_path_outside_the_store(store: ExtensionStore, marker: Path) -> None:
+    """Review F2: removal and revocation take only a SHA-256, also when the index lists something else."""
+    install(store, build_wheel(wheel_members(marker=marker)))
+    victim = store.root.parent.parent / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep")
+    os.chmod(store.root / INDEX, 0o600)
+    index = json.loads((store.root / INDEX).read_text())
+    index["packages"]["../../victim"] = dict(next(iter(index["packages"].values())))
+    (store.root / INDEX).write_text(json.dumps(index))
+    for name in ("../../victim", "../../VICTIM"):
+        with pytest.raises(StoreError) as caught:
+            store.remove(name, actor="local")
+        assert caught.value.code == "extension_store.not_found"
+    with pytest.raises(StoreError):
+        store.revoke("../../victim", actor="local")
+    assert len(store.packages()) == 1  # the odd entry is not listed
+    assert (victim / "keep.txt").read_text() == "keep"
+
+
 # ---- tampering after intake ------------------------------------------------------------------------------------------
 
 
@@ -351,6 +554,54 @@ def test_a_package_changed_after_intake_is_never_handed_to_the_sandbox(
     assert extensions.packages_status()[0]["state"] == "locked"
     assert extensions.packages_status()[0]["reason"] == "invalid"
     assert containers.runs == []  # nothing was sent to a container
+
+
+def _open_up(folder: Path) -> None:
+    for path in [folder, *[Path(root) for root, _dirs, _files in os.walk(folder)]]:
+        os.chmod(path, 0o700)
+    for path in folder.rglob("*"):
+        if path.is_file():
+            os.chmod(path, 0o600)
+
+
+def test_a_file_changed_together_with_its_record_is_never_handed_to_the_sandbox(
+    store: ExtensionStore, marker: Path
+) -> None:
+    """The index keeps the hash of the RECORD taken in: a consistent new RECORD for a changed file does not pass."""
+    import base64
+
+    wheel = build_wheel(wheel_members(marker=marker))
+    install(store, wheel)
+    folder = store.root / sha(wheel)
+    _open_up(folder)
+    changed = b"TAMPERED = 1\n"
+    (folder / MODULE / "__init__.py").write_bytes(changed)
+    record = folder / INFO / "RECORD"
+    digest = base64.urlsafe_b64encode(hashlib.sha256(changed).digest()).decode().rstrip("=")
+    rows = [
+        f"{MODULE}/__init__.py,sha256={digest},{len(changed)}" if row.startswith(f"{MODULE}/__init__.py,") else row
+        for row in record.read_text().splitlines()
+    ]
+    record.write_text("\n".join(rows) + "\n")
+    [package] = store.packages()
+    with pytest.raises(PackageError, match="RECORD was changed"):
+        package.read_files()
+
+
+def test_the_check_before_a_call_compares_the_record_the_package_was_verified_with(
+    store: ExtensionStore, marker: Path
+) -> None:
+    wheel = build_wheel(wheel_members(marker=marker))
+    install(store, wheel)
+    [package] = store.packages()
+    assert package.check is not None
+    package.check()
+    os.chmod(store.root / INDEX, 0o600)
+    index = json.loads((store.root / INDEX).read_text())
+    index["packages"][sha(wheel)]["record_sha256"] = "0" * 64
+    (store.root / INDEX).write_text(json.dumps(index))
+    with pytest.raises(PackageError, match="no longer installed"):
+        package.check()
 
 
 # ---- removal, revocation, update ------------------------------------------------------------------------------------

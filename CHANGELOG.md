@@ -11,6 +11,13 @@
   `extension_classes.PREREQUISITES`: a class that needs a missing G-6 item (17, 18, 21) cannot be released.
   New codes `extension_store.refused` (param `reason`), `extension_store.not_found`, `extension_store.unreadable`.
   `ExtensionPackage.key` includes the store hash.
+- Security (RT-098 review findings F1 to F6): the store folder is used only while it is a plain folder of this user
+  that no group or other user can write (never through a symbolic link); cleaning deletes only unlisted folders named
+  like a package hash and the store's own scratch files; removal takes only a SHA-256; a name that is both a file and
+  a folder, Windows device names, trailing spaces or dots and `:` streams are refused; an operating system error while
+  writing is an audited refusal (`storage`) and a retry after a crash between rename and commit works; distributions
+  named like a trusted or built-in one and top-level modules of the runtime, its libraries or the standard library are
+  refused (`reserved_name`).
 - Tests (N-24, Welle 7): migration 0011 (memory origin) has its own PostgreSQL migration test, starting from 0010 with
   existing memory files. No code change.
 

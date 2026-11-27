@@ -202,8 +202,12 @@ None known.
   SHA-256, origin, size, zip safety, `RECORD` hashes, manifest and dependencies and is atomic (staging, rename, index
   commit); a package changed after intake is `invalid`; removal, revocation and update are checked before every call;
   every change is an activity event. `find_packages` only reports host packages (`HOST_INSTALLED`).
-- **Open:** the api's admin routes (API-081), the SDK methods and the studio's package view and upload; the internal
-  and the independent review (G-6 item 31; brief prepared, not run without the owner's consent); Docker Desktop and
+- **Review (Welle 7):** a review of 8433243 passed with findings F1 (symlinked or foreign-writable store folder,
+  cleaning outside it), F2 (hash not checked on removal), F3 (OS errors not refused and audited, crash retry), F4
+  (Windows-unsafe names), F5 (docs claimed the api routes) and F6 (trusted and built-in names); all fixed with tests
+  that fail on 8433243; re-review open.
+- **Open:** the api's admin routes (API-081), the SDK methods and the studio's package view and upload are in review
+  (branch `claude/w7-ext-store` in each); the independent review (G-6 item 31; brief prepared, not run without the owner's consent); Docker Desktop and
   Podman runs (G-6 items 19, 30; no real environment so far); the server and Local Docker volume docs name the
   folder.
 - **Residual risk:** in-process checks cannot catch a foreign package already in the host environment; the boundary is

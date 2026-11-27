@@ -4,8 +4,9 @@
 Foreign extension packages are never installed into the host Python environment, never put on ``sys.path`` and never
 imported in the host process. They come only from this store, as files, and their code runs only in the Docker sandbox
 (:mod:`.extension_sandbox`). The store accepts a pure-Python wheel through :meth:`ExtensionStore.install` (the only
-way in; the HTTP API's admin routes call it) and keeps it unpacked, read-only, in ``<data>/extensions/<sha256>/`` (the
-wheel's SHA-256). ``index.json`` next to the packages lists the installed packages and the revoked hashes; a package
+way in; nodestro-api's admin routes ``/api/extensions`` call it, API-081, with the signed-in administrator as the
+actor) and keeps it unpacked, read-only, in ``<data>/extensions/<sha256>/`` (the wheel's SHA-256). ``index.json``
+next to the packages lists the installed packages and the revoked hashes; a package
 counts only while the index lists it.
 
 Intake (:func:`inspect_wheel`, nothing written before it passed): the size and the SHA-256 the administrator expects,
@@ -15,6 +16,15 @@ size and total size, exactly one ``.dist-info`` whose ``RECORD`` lists every mem
 ``py3-none-any`` wheel, no ``.data`` part, no ``.pth`` file, no start-up module and no native code, metadata that
 matches the folder name, entry points only in :data:`~.extensions.ENTRY_POINT_GROUP` naming modules of the wheel, and
 no dependency the sandbox image does not provide (dependency images are G-6 item 21, not built).
+
+Names (F4, F6 of the independent review): no Windows device name (``aux.py``), no name ending in a space or a dot,
+no ``:`` (an NTFS stream) or other character Windows refuses, no file that is also a folder; no distribution that
+claims a trusted name (:data:`~.trusted_integrations.TRUSTED_DISTRIBUTIONS`) or the runtime's own, and no top-level
+module of the runtime, its libraries or the standard library.
+
+The store folder itself is used only while it is a plain folder (never a symbolic link) of this user that no group or
+other user can write (POSIX); otherwise nothing of it is listed, run, changed or deleted. Only children named like a
+package hash, the staging and trash folders' own children and the index's temporary files are ever deleted.
 
 Atomic: the files are written to ``.staging/<random>/``, made read-only, renamed to ``<sha256>/`` and only then listed
 in the index (one ``os.replace``, the commit point). A crash before the commit leaves a staging folder or a folder the
@@ -44,6 +54,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import threading
 from typing import Any
 import unicodedata
@@ -63,6 +74,7 @@ from .extensions import ENTRY_POINT_GROUP
 from .problems import NodestroError
 from .schemas import now
 from .storage import DocumentStore
+from .trusted_integrations import TRUSTED_DISTRIBUTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +96,47 @@ PROVIDED = frozenset({"nodestro-runtime", "orkexa", "pydantic", "typing-extensio
 _REFUSED_SUFFIXES = (".pth", ".so", ".pyd", ".dll", ".dylib", ".exe", ".egg-link")
 _STARTUP_MODULES = ("sitecustomize", "usercustomize")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+#: The random part of the index's temporary files (``uuid4().hex``).
+_SCRATCH = re.compile(r"^[0-9a-f]{32}$")
+#: Device names Windows reserves in every folder, with any extension (``aux.py`` is ``AUX``).
+_WINDOWS_DEVICES = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"{kind}{digit}" for kind in ("com", "lpt") for digit in [*"123456789", "\u00b9", "\u00b2", "\u00b3"]}
+)
+_WINDOWS_REFUSED = re.compile(r'[<>:"|?*]')
+#: Distributions a store package may not call itself: the trusted ones and the runtime's own stack.
+RESERVED_DISTRIBUTIONS = frozenset(
+    {
+        *TRUSTED_DISTRIBUTIONS,
+        *PROVIDED,
+        "nodestro",
+        "nodestro-api",
+        "nodestro-studio",
+        "nodestro-sdk",
+        "pip",
+        "setuptools",
+    }
+)
+#: Top-level modules a store package may not ship (the runtime, its libraries and the standard library).
+RESERVED_MODULES = frozenset(
+    {
+        "nodestro",
+        "nodestro_runtime",
+        "nodestro_integrations",
+        "nodestro_api",
+        "nodestro_studio",
+        "nodestro_sdk",
+        "orkexa",
+        "pydantic",
+        "pydantic_core",
+        "typing_extensions",
+        "pip",
+        "setuptools",
+        "_distutils_hack",
+        *sys.stdlib_module_names,
+    }
+)
+_RESERVED_FOLDED = frozenset(name.casefold() for name in RESERVED_MODULES)
 _DIST_INFO = re.compile(
     r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?)-(?P<version>[A-Za-z0-9.!+_]+)\.dist-info$"
 )
@@ -126,8 +179,16 @@ def _check_member_name(name: str) -> tuple[str, ...]:
     if not name or len(name) > 512 or "\\" in name or "\x00" in name or _CONTROL.search(name):
         raise _refused("unsafe_path", f"unsafe member name {name[:80]!r}")
     parts = tuple(name.rstrip("/").split("/"))
-    if name.startswith("/") or ":" in parts[0] or any(part in ("", ".", "..") or len(part) > 255 for part in parts):
+    if name.startswith("/") or any(part in ("", ".", "..") or len(part) > 255 for part in parts):
         raise _refused("unsafe_path", f"unsafe member name {name[:80]!r}")
+    for part in parts:
+        # Names Windows cannot keep or reads as something else: devices, a trailing space or dot, streams (":").
+        if (
+            _WINDOWS_REFUSED.search(part)
+            or part.endswith((" ", "."))
+            or part.split(".")[0].rstrip(" ").casefold() in _WINDOWS_DEVICES
+        ):
+            raise _refused("unsafe_path", f"{name[:80]!r} is not a portable file name")
     return parts
 
 
@@ -174,10 +235,14 @@ def _read_members(archive: zipfile.ZipFile) -> dict[str, bytes]:
         raise _refused("too_large", f"more than {MAX_ENTRIES} members")
     files: dict[str, bytes] = {}
     seen: set[str] = set()
+    #: Folded names of files and of the folders they need: a name may not be both (``pkg/x`` and ``pkg/x/y.py``).
+    file_names: set[str] = set()
+    folder_names: set[str] = set()
     total = 0
     for info in infos:
         parts = _check_member_name(info.filename)
-        folded = unicodedata.normalize("NFC", "/".join(parts)).casefold()
+        folded_parts = [unicodedata.normalize("NFC", part).casefold() for part in parts]
+        folded = "/".join(folded_parts)
         if folded in seen:
             raise _refused("unsafe_path", f"{info.filename[:80]!r} is in the archive twice")
         seen.add(folded)
@@ -186,7 +251,10 @@ def _read_members(archive: zipfile.ZipFile) -> dict[str, bytes]:
         if info.is_dir():
             if kind not in (0, stat.S_IFDIR):
                 raise _refused("unsafe_member", f"{info.filename[:80]!r} is not a plain folder")
+            folder_names.update("/".join(folded_parts[:end]) for end in range(1, len(folded_parts) + 1))
             continue
+        file_names.add(folded)
+        folder_names.update("/".join(folded_parts[:end]) for end in range(1, len(folded_parts)))
         if kind not in (0, stat.S_IFREG):
             raise _refused("unsafe_member", f"{info.filename[:80]!r} is a link, a device or another special file")
         if info.flag_bits & 0x1:
@@ -203,6 +271,8 @@ def _read_members(archive: zipfile.ZipFile) -> dict[str, bytes]:
         if total > MAX_UNPACKED_BYTES:
             raise _refused("too_large", f"more than {MAX_UNPACKED_BYTES} bytes unpacked")
         files["/".join(parts)] = content
+    if clash := file_names & folder_names:
+        raise _refused("unsafe_path", f"{sorted(clash)[0][:80]!r} is both a file and a folder")
     return files
 
 
@@ -291,8 +361,14 @@ def inspect_wheel(data: bytes, *, expected_sha256: str) -> Inspected:
         if size >= 0 and (hashlib.sha256(files[path]).hexdigest() != hexed or len(files[path]) != size):
             raise _refused("hash_mismatch", f"{path[:80]!r} does not match its RECORD hash")
     _metadata_checks(files, info, named["name"], named["version"])
-    entries = _entry_points(files, info)
     meta = BytesParser().parsebytes(files[f"{info}/METADATA"])
+    if normalized(str(meta.get("Name") or "")) in RESERVED_DISTRIBUTIONS:
+        raise _refused("reserved_name", "the package calls itself by the name of a trusted or built-in distribution")
+    for top in tops - {info}:
+        module = top.removesuffix(".py").split(".")[0]
+        if module.casefold() in _RESERVED_FOLDED:
+            raise _refused("reserved_name", f"the package ships the module {module[:80]!r} of the runtime or Python")
+    entries = _entry_points(files, info)
     return Inspected(
         sha256=digest,
         distribution=str(meta.get("Name")).strip(),
@@ -348,6 +424,25 @@ def _read_regular(path: Path, limit: int) -> bytes:
         return handle.read(limit + 1)
 
 
+def _folder_problem(path: Path, *, own: bool) -> str:
+    """Why ``path`` may not be used as (a folder of) the store (empty: fine, or it does not exist). Never follows a
+    link. ``own``: the store folder itself, which must belong to this user and be writable by nobody else (POSIX)."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    if stat.S_ISLNK(info.st_mode):
+        return f"{path.name} is a symbolic link"
+    if not stat.S_ISDIR(info.st_mode):
+        return f"{path.name} is not a folder"
+    if own and os.name == "posix":
+        if info.st_uid != os.geteuid():
+            return f"{path.name} belongs to another user"
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return f"{path.name} is writable by other users"
+    return ""
+
+
 class ExtensionStore:
     """The store of one data directory (see the module documentation). ``documents``: where intake, removal and
     revocation are audited (the workspace's store; ``None``: only logged)."""
@@ -391,11 +486,26 @@ class ExtensionStore:
             raise
         _fsync_dir(self.root)
 
+    def _safe_root(self) -> bool:
+        """Whether the store folder exists and may be used (raises :class:`StoreError` when it exists but may not:
+        a symbolic link, another user's folder or one others can write; nothing of it is then read or deleted)."""
+        problems = [
+            problem
+            for problem in (
+                _folder_problem(self.root, own=True),
+                _folder_problem(self.root / STAGING, own=False),
+                _folder_problem(self.root / TRASH, own=False),
+            )
+            if problem
+        ]
+        if problems:
+            raise StoreError("extension_store.unreadable", f"The extension store is not a safe folder: {problems[0]}")
+        return self.root.is_dir()
+
     def _ensure_root(self) -> None:
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        for folder in (self.root, self.root / STAGING, self.root / TRASH):
-            if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
-                raise StoreError("extension_store.unreadable", "The extension store is not a plain folder")
+        if not self._safe_root():
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._safe_root()
 
     def _audit(
         self, action: str, actor: str, sha256: str, *, outcome: activity.Outcome = "success", code: str | None = None
@@ -418,21 +528,21 @@ class ExtensionStore:
     def clean(self) -> None:
         """Remove what an interrupted change left: staging and trash folders, and package folders the index does not
         list (a crash between the rename and the commit). None of them was ever valid."""
-        if not self.root.is_dir():
-            return
         with self._lock:
+            if not self._safe_root():
+                return
             listed = set(self._index()["packages"])
             for child in self.root.iterdir():
                 if child.name in (STAGING, TRASH):
                     for item in list(child.iterdir()) if child.is_dir() and not child.is_symlink() else []:
-                        _delete(item)
-                elif child.name == INDEX:
-                    continue
-                elif child.name.startswith(f".{INDEX}."):
+                        _delete(item)  # the store's own scratch folders (checked: plain folders, not links)
+                elif child.name.startswith(f".{INDEX}.") and _SCRATCH.match(child.name.removeprefix(f".{INDEX}.")):
                     child.unlink(missing_ok=True)
-                elif child.name not in listed:
+                elif _SHA256.match(child.name) and child.name not in listed:
                     logger.warning("Extension store: %s is not listed in the index and is removed", child.name)
                     _delete(child)
+                elif child.name != INDEX and child.name not in listed:
+                    logger.warning("Extension store: %s is not the store's and is left alone", child.name[:80])
 
     # ---- the controlled interfaces ----------------------------------------------------------------------------------
 
@@ -462,11 +572,14 @@ class ExtensionStore:
                     other = str(entry.get("distribution", "")) if isinstance(entry, dict) else ""
                     if key != replaces and normalized(other) == normalized(inspected.distribution):
                         raise _refused("exists", "this distribution is installed already; update it instead")
-                entry = self._place(inspected, origin_text, actor, replaces)
-                index["packages"][inspected.sha256] = entry
-                if replaces is not None:
-                    index["packages"].pop(replaces, None)
-                self._commit(index)
+                try:
+                    entry = self._place(inspected, origin_text, actor, replaces)
+                    index["packages"][inspected.sha256] = entry
+                    if replaces is not None:
+                        index["packages"].pop(replaces, None)
+                    self._commit(index)
+                except OSError as exc:
+                    raise _refused("storage", f"the package cannot be written to the store ({exc.strerror})") from None
                 if replaces is not None:
                     self._discard(replaces)
         except StoreError as exc:
@@ -512,6 +625,9 @@ class ExtensionStore:
             # A folder moves to another parent only while it is writable (its ".." entry changes); it is made
             # read-only once it has its final name.
             final = self.root / inspected.sha256
+            # A folder of this hash that the index does not list (the caller checked) was left by a crash between
+            # the rename and the commit; it was never valid and goes first, so a retry works.
+            self._discard(inspected.sha256)
             os.rename(staging, final)
             os.chmod(final, 0o555)
             _fsync_dir(self.root)
@@ -533,8 +649,10 @@ class ExtensionStore:
 
     def _discard(self, sha256: str) -> None:
         """Delete an uncommitted or removed package folder (moved aside first, so no half-deleted folder stays)."""
+        if not _SHA256.match(sha256):
+            raise StoreError("extension_store.not_found", "The extension package is not installed")
         folder = self.root / sha256
-        if not folder.exists():
+        if not folder.exists() and not folder.is_symlink():
             return
         trash = self.root / TRASH
         trash.mkdir(mode=0o700, exist_ok=True)
@@ -549,7 +667,12 @@ class ExtensionStore:
 
     def remove(self, sha256: str, *, actor: str) -> None:
         """Remove an installed package (it may be installed again later)."""
+        sha256 = (sha256 or "").strip().lower()
+        if not _SHA256.match(sha256):
+            raise StoreError("extension_store.not_found", "The extension package is not installed")
         with self._lock:
+            if not self._safe_root():
+                raise StoreError("extension_store.not_found", "The extension package is not installed")
             index = self._index()
             if sha256 not in index["packages"]:
                 raise StoreError("extension_store.not_found", "The extension package is not installed")
@@ -574,9 +697,9 @@ class ExtensionStore:
 
     def listing(self) -> dict[str, Any]:
         """The installed packages (with their index entries) and the revoked hashes."""
-        if not self.root.is_dir():
-            return {"packages": [], "revoked": []}
         with self._lock:
+            if not self._safe_root():
+                return {"packages": [], "revoked": []}
             index = self._index()
         return {
             "packages": [{"sha256": key, **value} for key, value in sorted(index["packages"].items())],
@@ -589,6 +712,8 @@ class ExtensionStore:
         """Raise :class:`~.extension_sandbox.PackageError` unless ``sha256`` is still installed with the ``RECORD`` it
         was verified with and is not revoked (before every call of its tools)."""
         try:
+            if not self._safe_root():
+                raise PackageError("the extension store is gone")
             index = self._index()
         except StoreError as exc:
             raise PackageError(str(exc)) from None
@@ -645,9 +770,9 @@ class ExtensionStore:
     def packages(self) -> list[ExtensionPackage]:
         """Every entry point of every installed package, for :class:`~.extensions.Extensions` (nothing is imported;
         the files are read and verified only when the sandbox needs them). An unreadable index lists none."""
-        if not self.root.is_dir():
-            return []
         try:
+            if not self._safe_root():
+                return []
             self.clean()
             index = self._index()
         except (StoreError, OSError) as exc:
