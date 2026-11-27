@@ -6,7 +6,10 @@
   the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
   installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before
   them, for example a new module that a standard module imports when it exists). The data-only extension store is
-  the planned fix and must exist before any G-6 class unlock. No code change.
+  the planned fix and must exist before any G-6 class unlock. No code change. The owner decision of 2026-11-27
+  (option A: harden now, the store later as its own work package) is recorded; the "unnoticed replacement" clause is
+  met by the boundary, not by the in-process checks, and `find_packages` discovery from the host environment is
+  development-only until the store replaces it.
 
 - Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
   own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)

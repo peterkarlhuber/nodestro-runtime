@@ -171,8 +171,13 @@ None known.
   the runtime's or the integration's files) and NEW-2 (`sitecustomize`/`usercustomize`); the in-process limit is
   documented. Fourth review: NEW-4 (a foreign module imported before the checks rewrites them) is not fixed in
   process by design; the boundary is now stated plainly: the host environment holds only the shipped lock, and the
-  data-only extension store is the planned fix and a prerequisite of every G-6 class unlock (owner decision on its
-  timing pending). NEW-5 fixed in nodestro-integrations (no OCR program from a Python package's folders). L2 (the process's primary group counts as its own) stays documented. Open:
+  data-only extension store is the planned fix and a prerequisite of every G-6 class unlock (owner decision
+  2026-11-27, option A: harden now, the store later as its own work package before any G-6 unlock; `find_packages`
+  discovery from the host environment is development-only until then). NEW-5 fixed in nodestro-integrations (no OCR
+  program from a Python package's folders). Open Lows from the fourth review (OCR program lookup,
+  nodestro-integrations): another environment's `bin` on `PATH` (for example a conda environment) is not recognized
+  as a Python package's folder; a false refusal is possible when an install scheme's scripts folder is the system's
+  program folder (for example Homebrew's `bin`). L2 (the process's primary group counts as its own) stays documented. Open:
   an end-to-end check of the import path inside the Local Docker and server images, ACL checks for Windows. R2: an
   earlier normal import of `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
