@@ -279,10 +279,16 @@ def test_folders_writable_by_every_user_are_a_problem(tmp_path: Path, monkeypatc
 def test_folders_of_another_user_or_a_foreign_group_are_a_problem(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = _folder(tmp_path / "site-packages")
+    # The installation belongs to root here: this process only pretends to be another user than the owner of
+    # ``theirs``, which would also make a home in ``tmp_path`` someone else's.
+    root_home = Path(os.path.realpath("/usr"))
+    monkeypatch.setattr(trusted_integrations, "_writable", lambda path: True)
     theirs = _folder(tmp_path / "theirs")
     _foreign_owner(monkeypatch, theirs, same_user=False, same_group=True)
-    assert trusted_integrations.environment_problems(home, path=[str(theirs)]) == [f"{theirs} belongs to another user"]
+    assert trusted_integrations.environment_problems(root_home, path=[str(theirs)]) == [
+        f"{theirs} belongs to another user"
+    ]
+    home = _folder(tmp_path / "site-packages")
     group = _folder(tmp_path / "group", 0o775)
     _foreign_owner(monkeypatch, group, same_user=True, same_group=False)
     assert trusted_integrations.environment_problems(home, path=[str(group)]) == [
