@@ -575,6 +575,8 @@ class ToolLibrary:
         self.specs: dict[str, ToolSpec] = {
             name: spec for name, spec in {**(extra_specs or {}), **BUILTIN_SPECS}.items() if name in self.builtin
         }
+        #: Tools of installed integrations that run in the Docker sandbox (N-22, :meth:`add_extension_tools`).
+        self.extension_tools: frozenset[str] = frozenset()
         self._seen: _Fingerprint = ()
         self._registry = self._load(
             Path(path) if path is not None else None, sandbox or make_sandbox("subprocess", self.policy)
@@ -649,6 +651,19 @@ class ToolLibrary:
         """Built-in tool names that also have stored files under ``path`` (those files are not loaded)."""
         return frozenset(name for name in self.builtin if any((path / name).glob("v*.json")))
 
+    def add_extension_tools(self, pairs: Sequence[tuple[ToolSpec, Tool]]) -> None:
+        """Offer tools of installed integrations that run in the Docker sandbox (N-22,
+        :meth:`~nodestro_runtime.extensions.Extensions.load_packages`) like built-in tools under their spec. They are
+        listed as ``untrusted``, with the spec's capability (at least unknown)."""
+        with self._lock:
+            for spec, tool in pairs:
+                if tool.name is None or tool.name in self.builtin:
+                    raise ValueError(f"The extension tool {tool.name!r} would replace a tool of the same name")
+                self.builtin[tool.name] = tool
+                self.specs[tool.name] = spec
+            self.extension_tools = self.extension_tools | {tool.name for _spec, tool in pairs if tool.name}
+            self._registry = self._load(self._registry.path, self._registry.sandbox)
+
     def set_sandbox(self, sandbox: Sandbox) -> None:
         self.registry.sandbox = sandbox
 
@@ -663,15 +678,19 @@ class ToolLibrary:
     def _info(self, name: str) -> ToolInfo:
         record = self.registry.record(name)
         if record.kind == "trusted":
+            extension = record.name in self.extension_tools
+            spec = self.specs.get(record.name)
             return ToolInfo(
                 name=record.name,
                 kind="builtin",
-                trust="trusted",
+                trust="untrusted" if extension else "trusted",
                 description=record.description,
                 input_schema=record.input_schema,
                 created_at=record.created_at,
-                capability=capability_of(name=record.name, kind="builtin"),
-                spec=self.specs.get(record.name),
+                capability=spec.capability
+                if extension and spec is not None
+                else capability_of(name=record.name, kind="builtin"),
+                spec=spec,
             )
         kind: ToolKind = "generated" if record.requirement else "custom"
         trust = self.trust(name)

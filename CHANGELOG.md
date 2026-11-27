@@ -12,6 +12,18 @@
   parsing, OAuth issuer and resource no longer count as secrets, stdio arguments like `--api-key=...` are refused,
   imported documents have the origin `import` and the event `file.imported`, the collection check is atomic.
 
+- Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
+  ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of
+  Nodestro's own distribution, verified against their `RECORD` hashes and loaded from the verified bytes
+  (`trusted_integrations`; a name-claiming distribution is `invalid`, an editable install is not trusted); every other entry point is read as data (`find_packages`,
+  `extension_sandbox.ExtensionPackage`), so its import-time code never runs in the host. With
+  `NODESTRO_EXTENSION_TOOLS=1` (off by default) and a daemon that passed Orkexa's preflight and self-test, the tools are
+  listed and called in a new container per call (`ExtensionSandbox`, `ExtensionTool`; desktop and Nodestro Local Docker
+  only); otherwise they are locked (`Extensions.packages_status()`, reasons `off`, `not_secured`, `invalid`,
+  `LOCKED_MESSAGE`). The time limit (300 s without a spec, a stated one only lowers it) removes the container and
+  checks that it is gone; `SpecTool` waits `STOP_GRACE_SECONDS` longer for such tools. A stated capability can only
+  raise the floor `UNKNOWN` (`floor_capability`). `ToolLibrary.add_extension_tools`, `extension_tools`; such tools are
+  listed as `untrusted`. No tool class is enabled before G-6.
 - Security (RT-089d): a workflow uses a person's private memory space only after that person's explicit consent.
   Before, an editor could build a shared workflow that names Alice's space, and Alice's run of it read her memory
   into that workflow and its tools ([docs/memory-consents.md](docs/memory-consents.md)).

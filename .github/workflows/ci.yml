@@ -413,8 +413,9 @@ jobs:
         run: python scripts/check_skips.py junit-security-vectors-sync.xml tests/ci/skipped-security-vectors-sync.txt
 
   docker:
-    # Tools with libraries and local MCP servers (WP-8) in the Docker sandbox (ADR-0006 point 6): a real image is built
-    # from a hashed lock file and a tool or a stdio MCP server runs in it without network. A missing Docker fails this
+    # Tools with libraries, local MCP servers (WP-8) and tools of installed integrations (N-22) in the Docker sandbox
+    # (ADR-0006 point 6): a real image is built from a hashed lock file and a tool or a stdio MCP server runs in it
+    # without network. A missing Docker fails this
     # job instead of skipping the tests.
     runs-on: ubuntu-latest
     timeout-minutes: 15 # CI-FAST AP1: p99 3.0 min (successful runs 2026-11-01..07)
@@ -446,7 +447,8 @@ jobs:
         run: |
           pip install -c "$RUNNER_TEMP/lock.txt" -e ".[dev]"
       - run: docker info
-      - run: pytest --junitxml=junit-docker.xml tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py
+      # N-22: tools of installed integrations in the sandbox (time limit, network, host files, secrets, limits).
+      - run: pytest --junitxml=junit-docker.xml tests/test_container_images.py tests/test_sandbox_gateway.py tests/test_mcp_stdio.py tests/test_extension_isolation.py
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-docker.xml tests/ci/skipped-docker.txt
       # The dependency-resolve path (RT-038) on this engine: the pinned resolver image from ghcr.io by digest, its
