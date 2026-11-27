@@ -241,8 +241,9 @@ def _links(written: Path) -> tuple[list[tuple[Path, Path]], bool]:
 #: without a byte order mark and split by ``str.splitlines``, so a line can also end in ``\r``, ``\x0c``, U+0085 or
 #: U+2028), runs each line that starts with ``import`` and puts every other line on ``sys.path``; its content is not
 #: judged here, only its identity. The one entry is setuptools' ``distutils-precedence.pth`` (the same bytes in
-#: setuptools 70.0, 75.8 and 80.9, checked; Debian names it ``zz-distutils-precedence.pth``), which only selects
-#: setuptools' copy of ``distutils`` when that is imported. The products' environments need no other one.
+#: setuptools 65.5, 68.2, 69.5, 70.0, 72.1, 75.8, 78.1, 80.9, 80.10 and 84.2, checked; 58.1 differs and is not
+#: accepted; Debian names it ``zz-distutils-precedence.pth``), which only selects setuptools' copy of ``distutils``
+#: when that is imported. The products' environments need no other one.
 KNOWN_PTH: frozenset[str] = frozenset(
     {
         "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
