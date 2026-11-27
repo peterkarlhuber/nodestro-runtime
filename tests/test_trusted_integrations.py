@@ -713,7 +713,9 @@ def test_a_foreign_wheel_that_replaces_the_runtime_s_checks_is_named(tmp_path: P
         folders=[],
         runtime=site / "nodestro_runtime",
     )
-    assert f"acme_ext-1.0 in {site} also installed nodestro_runtime/trusted_integrations.py" in problems
+    # pip may list the compiled file first (nodestro_runtime/__pycache__/...): any file of the runtime's package counts.
+    named = [problem for problem in problems if problem.startswith(f"acme_ext-1.0 in {site} also installed ")]
+    assert len(named) == 1 and named[0].split(" also installed ")[1].startswith("nodestro_runtime/"), problems
 
 
 @pytest.mark.usefixtures("clean_imports")
