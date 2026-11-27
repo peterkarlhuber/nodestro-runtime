@@ -72,7 +72,7 @@ from .input_files import FileCatalog, InputFiles
 from .knowledge import FOLDER_SOURCE, KnowledgeBase, KnowledgeTables
 from .launcher import launch
 from .local_models import LOCAL_ASSISTANT_MODEL, LOCAL_DEFAULT_MODEL, LOCAL_EMBEDDING_MODEL, SelectionPreferences
-from .local_service import LocalModelService
+from .local_service import LocalModelService, _loopback
 from .mcp.hub import McpHub, McpLimits
 from .mcp.models import SERVERS as MCP_SERVERS
 from .mcp.models import McpServer, McpTool
@@ -694,6 +694,7 @@ class Workspace:
         # RT-089d: a memory consent covers the custom tools, connections and MCP servers an agent uses.
         self.runs.consent_means = self.consent_means
         self.runs.consent_environment = self.consent_environment
+        self.runs.local_model_server = self.local_model_server_here
         self.tester.consent_means = self.consent_means
         # Files uploaded as run inputs: own storage, never knowledge by themselves (see input_files.py).
         inputs = data_dir / "inputs"
@@ -1806,6 +1807,18 @@ class Workspace:
         if connection.provider != "ollama" and self.strict_offline():
             raise _offline_cloud_model(label, connection.provider)
         return connection
+
+    def local_model_server_here(self) -> bool:
+        """Whether the Ollama server agents reach is on this computer (N-20, review M2): a saved base URL or an external
+        server whose host is not loopback is elsewhere, so a workflow using it reaches outside. The managed server and
+        the container's (``local-container`` profile) are Nodestro's own."""
+        stored = self._providers().get("ollama", {}).get("base_url")
+        if stored:
+            return _loopback(str(stored))
+        service = self.local_models
+        if service.mode == "external":
+            return _loopback(service.ollama_url())
+        return True
 
     def provider_settings(self, provider: str) -> dict[str, Any]:
         """The stored settings of one provider (may contain its key: never return it from an endpoint)."""
