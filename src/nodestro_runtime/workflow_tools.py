@@ -12,11 +12,12 @@ budget), cancelling the agent's run cancels it, and its approval steps and tool 
 - **Arguments**: the workflow's start form (:func:`arguments_schema`; file fields are never offered) and an optional
   free text ``input``; checked like a manual start (:func:`~nodestro_runtime.forms.prepare`).
 - **Effect** (:func:`aggregate`): the highest access and reach of everything the workflow contains, at every depth: its
-  agents' tools, MCP tools and server tools, its result files (``write`` + ``internal``), its sub-workflows, teams and
-  workflow tools. Unknown counts as :data:`~nodestro_runtime.tool_policy.UNKNOWN` (``write`` + ``external``). It is
-  computed when the workflow is added (:func:`describe`, stored in the binding) and again at every call; the higher
-  one counts (:func:`effective`). The per-call gate (S-2) asks with it: a workflow tool that is not read-only is asked
-  before every start (as MCP tools are), and without the gate it is refused (fail closed).
+  agents' models (a model that is not local reaches outside), tools, MCP tools and server tools, its result files
+  (``write`` + ``internal``), its sub-workflows, teams and workflow tools. Unknown counts as
+  :data:`~nodestro_runtime.tool_policy.UNKNOWN` (``write`` + ``external``). It is computed when the workflow is
+  added (:func:`describe`, stored in the binding) and again at every call; the higher one counts
+  (:func:`effective`). The per-call gate (S-2) asks with it: a workflow tool that is not read-only is asked before
+  every start (as MCP tools are), never pre-granted, and refused without the gate (fail closed).
 - **Result**: the workflow's output and its result files (:func:`result_text`); a conversation shows the files as
   attachments of the answer and the waiting approvals of the call as cards (``conversations``).
 
@@ -36,6 +37,7 @@ from typing import Any
 from orkexa import Tool, ToolInputError
 from pydantic import BaseModel, Field
 
+from .providers import provider_of
 from .schemas import (
     AgentConfig,
     InputField,
@@ -61,6 +63,10 @@ _REACH = {"internal": 0, "external": 1}
 _FIELD_TYPES = {"text": "string", "textarea": "string", "date": "string", "number": "number", "boolean": "boolean"}
 #: A result file is data created inside Nodestro.
 _RESULT_FILES = ToolCapability(access="write", reach="internal", source="derived")
+#: A model that is not served on this computer: the step's content leaves it (review M2).
+_CLOUD_MODEL = ToolCapability(access="read", reach="external", source="derived")
+#: The provider of local models (as in :mod:`nodestro_runtime.conversations`).
+LOCAL_PROVIDER = "ollama"
 #: A persistent memory space is written for other runs (RT-089c).
 _MEMORY = ToolCapability(access="write", reach="internal", source="derived")
 
@@ -72,6 +78,13 @@ Facts = Callable[[str], ToolCapability | None]
 def workflow_tools_enabled(environ: Mapping[str, str] | None = None) -> bool:
     """Whether agents may call workflow tools (``NODESTRO_WORKFLOW_TOOLS=1``)."""
     return (environ if environ is not None else os.environ).get(WORKFLOW_TOOLS_ENV, "").strip() == "1"
+
+
+def _local(model: str) -> bool:
+    try:
+        return provider_of(model) == LOCAL_PROVIDER
+    except Exception:
+        return False
 
 
 def capability(effect: WorkflowEffect) -> ToolCapability:
@@ -148,6 +161,14 @@ def aggregate(workflow: Workflow, version: int | None, *, resolve: Resolve, fact
                     if server is None:
                         unknown.append(name)
                     result = _higher(result, server or UNKNOWN)
+                # Review M2: a model request carries the step's content to its provider; only a local model server
+                # (Ollama) stays on this computer, every other provider (also a configurable endpoint) counts as
+                # reaching outside, so an offline step never reaches a cloud model through a workflow.
+                models = [agent.model, *agent.fallbacks]
+                if agent.quality.enabled:
+                    models.append(agent.quality.judge_model)
+                if not all(_local(model) for model in models):
+                    result = _higher(result, _CLOUD_MODEL)
                 if agent.memory.mode == "persistent":
                     memory = True
                     result = _higher(result, _MEMORY)

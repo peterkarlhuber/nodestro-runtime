@@ -76,6 +76,7 @@ from orkexa import (
 )
 from orkexa.core.framing import frame_untrusted
 from orkexa.dynamic import BudgetExceededError, BudgetTracker, Sandbox
+from orkexa.memory import MEMORY_TOOL_NAME
 from orkexa.providers.base import redact
 from orkexa.usage import summarize_usage
 from pydantic import BaseModel
@@ -222,6 +223,9 @@ RUN_THREADS_ENV = "NODESTRO_RUN_THREADS"
 WORKFLOW_TOOL_WAIT_SECONDS = 24 * 3600.0
 #: How often a waiting workflow tool's call reads its child runs and their approval requests.
 WORKFLOW_TOOL_POLL_SECONDS = 0.25
+#: The id of the workflow tool call the current context makes (N-20, review L4): set right before each call, so the
+#: call's record is found by its id also when several calls of the same tool run at once.
+_WORKFLOW_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("nodestro_workflow_call", default=None)
 #: How often a conditional write of a stored run is tried again after another process wrote the run meanwhile.
 _CAS_ATTEMPTS = 5
 
@@ -1143,6 +1147,8 @@ class RunManager:
         #: thread of the manager's own pool (C-08; :data:`RUN_THREADS_ENV`). Read when the pool is first used.
         self.run_threads = run_threads()
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        #: The pools of agent steps with workflow tools, by nesting depth (N-20; see :meth:`_in_run_thread`).
+        self._workflow_executors: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
         self._executor_lock = threading.Lock()
         #: Runs whose execution in this process lost its fence (C-06), until :meth:`lost_fence` is asked.
         self._fence_lost: set[str] = set()
@@ -1990,6 +1996,8 @@ class RunManager:
             for child_id in _child_ids(run):
                 with suppress(Exception):
                     self.interrupt(child_id)
+            with suppress(Exception):
+                self._stop_workflow_tool_children(run)
             self._notify(run)
             return True
         logger.warning("Run %s changed during every attempt to mark it interrupted", run_id)
@@ -2127,6 +2135,14 @@ class RunManager:
         # N-20: a workflow tool's run waits in its agent's thread (in this process or a worker's), which reads the
         # decision itself: the top-level run is running, not paused, and nothing is continued from here.
         in_tool = self._in_workflow_tool(run)
+        if in_tool and top.status not in ("queued", "running"):
+            # Review L1: only a call that still waits reads the decision; the agent's run ended (interrupted,
+            # cancelled, failed), so nothing would continue this run and nothing is recorded.
+            raise NodestroError(
+                "workflow_tool.not_waiting",
+                "The agent that called this workflow no longer waits for it",
+                status=top.status,
+            )
         if self._contexts.get(top.id) is None and not in_tool:
             # The run continues on an event loop: refuse before anything is recorded.
             _require_loop()
@@ -2738,6 +2754,7 @@ class RunManager:
                 _interrupt(run)
                 self.store.put("runs", run.id, run)
                 self._expire_approvals(run.id)
+                self._stop_workflow_tool_children(run)
             except Exception:
                 logger.exception("Marking run %s as interrupted failed; it stays as stored", run.id)
                 continue
@@ -2857,6 +2874,9 @@ class RunManager:
         if executor is not None:
             # Agents that did not stop yet end with their next model response or tool call.
             executor.shutdown(wait=False)
+        executors, self._workflow_executors = self._workflow_executors, {}
+        for item in executors.values():
+            item.shutdown(wait=False)
 
     # ---- events --------------------------------------------------------------------
 
@@ -3116,16 +3136,29 @@ class RunManager:
         else:
             self._forget_events(run.id)
 
-    async def _in_run_thread(self, call: Callable[..., T], /, *args: Any) -> T:
-        """``asyncio.to_thread`` on this manager's own agent pool (C-08; see :attr:`run_threads`)."""
-        executor = self._executor
+    async def _in_run_thread(self, call: Callable[..., T], /, *args: Any, depth: int | None = None) -> T:
+        """``asyncio.to_thread`` on this manager's own agent pool (C-08; see :attr:`run_threads`).
+
+        ``depth``: an agent step with workflow tools (N-20) at this nesting depth. Its thread waits while the workflow
+        runs (and while it waits for a person), and the workflow's own steps need threads too, so such steps run on a
+        pool of their own per depth: a waiting call never holds a thread that the steps below it (or any other run's
+        ordinary steps) need. The depth is bounded by :data:`MAX_DEPTH`, so the deepest waiting level always has
+        threads left for the steps it waits for."""
+        executor = self._executor if depth is None else self._workflow_executors.get(depth)
         if executor is None:
             with self._executor_lock:
-                executor = self._executor
-                if executor is None:
-                    executor = self._executor = concurrent.futures.ThreadPoolExecutor(
-                        max_workers=max(1, self.run_threads), thread_name_prefix="nodestro-run"
-                    )
+                if depth is None:
+                    executor = self._executor
+                    if executor is None:
+                        executor = self._executor = concurrent.futures.ThreadPoolExecutor(
+                            max_workers=max(1, self.run_threads), thread_name_prefix="nodestro-run"
+                        )
+                else:
+                    executor = self._workflow_executors.get(depth)
+                    if executor is None:
+                        executor = self._workflow_executors[depth] = concurrent.futures.ThreadPoolExecutor(
+                            max_workers=max(1, self.run_threads), thread_name_prefix=f"nodestro-workflow-tool-{depth}"
+                        )
         context = contextvars.copy_context()
         return await asyncio.get_running_loop().run_in_executor(executor, functools.partial(context.run, call, *args))
 
@@ -3663,7 +3696,14 @@ class RunManager:
         # running, instead of a step that looks as if it was never reached.
         self._save(context)
         await self._in_run_thread(
-            self._run_agent_sync, context, node, prompt, self._feeds_from_start(run, node.id), resuming, budget_wait
+            self._run_agent_sync,
+            context,
+            node,
+            prompt,
+            self._feeds_from_start(run, node.id),
+            resuming,
+            budget_wait,
+            depth=len(context.stack) if config.workflow_tools else None,
         )
         self._save(context)
         # A paused step is logged when it ends; a step of a run another process took over (C-06), by that process.
@@ -3911,10 +3951,20 @@ class RunManager:
                 f"Workflow tools are switched off ({workflow_tools.WORKFLOW_TOOLS_ENV})",
                 node=node_label(node),
             )
-        names = {*config.tools, *(tool.name for tool in taken)}
+        # Every name another tool of the step has or could have (review L6): the library's tools, the built-in and
+        # server tools, MCP tools, the memory tool and the run's own tools.
+        names = {
+            *config.tools,
+            *config.server_tools,
+            *(tool.name for tool in taken),
+            *tool_policy.BUILTIN_CAPABILITIES,
+            *tool_policy.SERVER_TOOL_CAPABILITIES,
+            MEMORY_TOOL_NAME,
+            FILES_TOOL_NAME,
+        }
         found: list[tuple[workflow_tools.WorkflowTool, WorkflowEffect]] = []
         for binding in config.workflow_tools:
-            if binding.name in names:
+            if binding.name in names or is_mcp_tool(binding.name) or binding.name in context.env.builder.tools:
                 raise NodestroError(
                     "workflow_tool.name_taken",
                     f"The workflow tool {binding.name} has the name of another tool of {node_label(node)}",
@@ -4000,12 +4050,16 @@ class RunManager:
             parent_node_id=node.id,
             workflow_version=version,
         )
+        call_id = _WORKFLOW_CALL_ID.get()
         with context.lock:
             record = next(
                 (
                     item
                     for item in reversed(state.tool_calls)
-                    if item.name == binding.name and item.workflow is None and item.finished_at is None
+                    if item.name == binding.name
+                    and item.workflow is None
+                    and item.finished_at is None
+                    and (call_id is None or item.id == call_id)
                 ),
                 None,
             )
@@ -4047,7 +4101,11 @@ class RunManager:
             error_code=child.error_code,
         )
         if child.status == "succeeded":
-            files = self.result_files.list(child.id) if self.result_files is not None else []
+            files = [
+                item
+                for run_in_tree in self.run_tree(child.id)
+                for item in (self.result_files.list(run_in_tree.id) if self.result_files is not None else [])
+            ]
             return workflow_tools.result_text(
                 snapshot.name, version, child.output, [(item.name, item.format) for item in files]
             )
@@ -4065,14 +4123,16 @@ class RunManager:
             if context.root.resume_requested:
                 context.root.resume_requested = False  # a decision of this process (also a budget decision)
                 return True
-            if self._workflow_tool_decided(child_id, approvals):
+            if self._workflow_tool_decided(child_id, approvals, context.root.run.id):
                 return True
             time.sleep(WORKFLOW_TOOL_POLL_SECONDS)
         return False
 
-    def _workflow_tool_decided(self, child_id: str, approvals: ToolApprovals) -> bool:
+    def _workflow_tool_decided(self, child_id: str, approvals: ToolApprovals, top_id: str) -> bool:
         """Whether the paused tree below a workflow tool's call can go on: it is no longer paused, an approval step
-        has a decision, or a run paused at tool calls has none of them pending any more."""
+        has a decision, a run paused at tool calls has none of them pending any more, or a step that waits for a
+        budget decision finds none of the top-level run's budget requests pending (review M3; a decision of another
+        process counts too)."""
         queue = [child_id]
         seen: set[str] = set()
         while queue:
@@ -4093,8 +4153,42 @@ class RunManager:
                     asked = [found for found in approvals.of_run(run_id) if found.checkpointed]
                     if asked and not any(found.status == "pending" for found in asked):
                         return True
+                if state.status == "awaiting_budget":
+                    requests = run_budget.BudgetRequests(self.store).of_run(top_id)
+                    if requests and not any(found.status == "pending" for found in requests):
+                        return True
                 queue += [found for found in [state.child_run_id, *state.child_run_ids] if found]
         return False
+
+    def run_tree(self, run_id: str) -> list[Run]:
+        """A stored run and every run below it (sub-workflows, teams, workflow tools), top first (N-20, review L5)."""
+        top = self.store.get("runs", run_id, Run)
+        if top is None:
+            return []
+        found = [top]
+        seen = {top.id}
+        index = 0
+        while index < len(found):
+            parent = found[index]
+            index += 1
+            for child_id in _child_ids(parent):
+                if child_id in seen:
+                    continue
+                child = self.store.get("runs", child_id, Run)
+                if child is not None and child.parent_run_id == parent.id:
+                    seen.add(child_id)
+                    found.append(child)
+        return found
+
+    def _stop_workflow_tool_children(self, run: Run) -> None:
+        """Cancel the workflow tools' child runs an interrupted run's agent steps left waiting (review L1): no call
+        waits for them any more, so their questions must not stay open."""
+        for item in run.workflow.nodes:
+            state = run.nodes.get(item.id)
+            if item.type != "agent" or state is None:
+                continue
+            for child_id in state.child_run_ids:
+                self._cancel_stored(child_id, ("queued", "running", "paused"))
 
     def _in_workflow_tool(self, run: Run) -> bool:
         """Whether ``run`` is a workflow tool's child run or runs below one (N-20): its call waits in its agent's
@@ -5556,6 +5650,7 @@ class RunManager:
             calls[call.id] = record
             denial = None
             bind_call(None)  # every call gets its own binding (or none) from the gate below
+            _WORKFLOW_CALL_ID.set(call.id if call.name in workflow_effects else None)
             own = run_own_tool(config, call.name, extra_tools)
             # N-09: an offline step never calls a tool that is not available offline, and nobody is asked about it.
             unavailable = self._offline_tool(context, config, call.name) if not own else None

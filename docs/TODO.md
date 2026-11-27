@@ -612,6 +612,11 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P2 Medium · **Status:** In review · **Refs:** development plan N-20,
   [docs/workflow-tools.md](workflow-tools.md), `workflow_tools.py`, `tests/test_workflow_tools.py`, nodestro-api
   `GET /api/workflows/{workflow_id}/versions/{number}/tool`
+- **Done (review of the independent review):** steps with workflow tools run on a pool of their own per depth (H1);
+  no pre-grant applies to a changing workflow tool and its name never takes another tool's (M1); a model that is not
+  local reaches outside (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a
+  waiting call and an interrupted run cancels its waiting workflow runs (L1); records found by call id (L4); nested
+  result files are attachments (L5).
 - **Done:** an agent calls a saved workflow in a fixed version (`AgentConfig.workflow_tools`) as a child run of its
   run through the one engine (`_execute_child`: budget, cancel, limits); arguments from the start form; the effect is
   the highest of everything inside (unknown = write + external), stored at import and computed again at every call;
@@ -622,10 +627,11 @@ Items that need an independent or external review (an internal audit does not re
 - **Open:**
   - switching it on needs the independent review of tool approvals (RT-001): every changing workflow tool depends on
     the per-call gate;
-  - a waiting call holds an agent thread for up to 24 hours (as RT-006); a process that ends meanwhile leaves the
-    answer interrupted (continuing it asks first);
-  - a budget decision inside the workflow made by another process is read only at the next decision or the
-    deadline;
+  - a waiting call holds a thread of the workflow tool pool of its depth for up to 24 hours (never one of the
+    ordinary agent pool); with `NODESTRO_RUN_THREADS` such calls waiting at one depth, later ones wait for a thread;
+  - sub-workflows without a version inside the called workflow are pinned when their step starts, not once per call
+    (review L2): the effect is computed again at the next call;
+  - a deny for the calling agent (N-06) does not follow into the workflow's own agents (review L3; documented);
   - file fields of the start form are not offered (the conversation's files are not passed on);
   - the studio shows the cards and attachments only once its conversation view reads `tool_calls[].workflow` and
     `result_files` (studio follow-up).

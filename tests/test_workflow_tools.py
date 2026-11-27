@@ -23,6 +23,7 @@ import pytest
 
 from nodestro_runtime.agent_templates import AgentTemplates
 from nodestro_runtime.conversations import AgentChoice, ConversationIn, ConversationMessage, MessageIn
+from nodestro_runtime.local_models import LOCAL_DEFAULT_MODEL
 from nodestro_runtime.schemas import (
     AgentConfig,
     ApprovalConfig,
@@ -194,7 +195,10 @@ def test_a_persistent_memory_space_and_result_files_are_part_of_the_effect() -> 
     remembering = chain(
         "w",
         "W",
-        [Node(id="start", type="start"), agent_node("a", "A", memory=MemoryConfig(mode="persistent", space="crm"))],
+        [
+            Node(id="start", type="start"),
+            agent_node("a", "A", model=LOCAL_DEFAULT_MODEL, memory=MemoryConfig(mode="persistent", space="crm")),
+        ],
     )
     effect = aggregate(remembering, 1, resolve=lambda *_: (remembering, 1), facts=lambda _name: None)
     assert effect.memory and (effect.access, effect.reach) == ("write", "internal")
@@ -435,3 +439,216 @@ def test_a_memory_consent_covers_the_called_workflow_in_its_fixed_version(make: 
     runs = workspace.runs
     targets = consent_targets(runs.resolve_workflow, runs.pin_subworkflows, runs.consent_digest, caller.id)
     assert [(item.workflow_id, item.version) for item in targets] == [(caller.id, 1), (quote.id, 1)]
+
+
+# ---- review fixes (independent review of N-20) ------------------------------------------------------------------
+
+
+def lookup_conversation(workspace: Workspace, **agent: Any) -> tuple[str, Workflow]:
+    lookup = workspace.save_workflow(
+        WorkflowIn(
+            name="Lookup",
+            nodes=[Node(id="start", type="start"), agent_node("find", "LOOKUP", tools=["calculator"])],
+            edges=[Edge(id="e1", source="start", target="find")],
+        )
+    )
+    binding = binding_for(workspace, lookup, 1, name="workflow_lookup")
+    config = AgentConfig(name="Agent", system_prompt="AGENT", workflow_tools=[binding], **agent)
+    template = AgentTemplates(workspace.store).create(config).id
+    conversation_id = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template), model=CLOUD), owner=None
+    ).id
+    return conversation_id, lookup
+
+
+async def test_h1_a_call_never_holds_the_thread_its_workflows_agents_need(make: Make) -> None:
+    workspace = make(
+        {"AGENT": [tool_use("workflow_lookup", {"input": "ACME"}), text("Found.")], "LOOKUP": [text("Yes")]}
+    )
+    workspace.runs.run_threads = 1  # one agent thread: the workflow's agent needs it while the call waits
+    conversation_id, _lookup = lookup_conversation(workspace)
+    sent = await workspace.conversations.send(conversation_id, None, MessageIn(content="Who is ACME?"))
+    await workspace.wait(sent.assistant.run_id or "", timeout=15)
+    assert workspace.conversations.message(conversation_id, None, sent.assistant.id).status == "succeeded"
+
+
+def test_m1_no_pre_grant_lets_an_unattended_run_start_a_changing_workflow() -> None:
+    from nodestro_runtime.tool_policy import ToolPreGrant
+
+    at = datetime.now(UTC)
+    grant = ToolPreGrant(
+        id="g1", tool="crm_note", version=1, scope="schedule", scope_id="s1", granted_by="admin", granted_at=at
+    )
+    context = CallContext(
+        run_id="r", node_id="a", trigger="schedule", attended=False, pre_grants=(grant,), scope=("schedule", "s1")
+    )
+    capability = ToolCapability(access="write", reach="external", source="derived")
+    verdict = decide(
+        tool="crm_note", kind="workflow", capability=capability, binding=None, context=context, at=at, version=1
+    )
+    assert verdict.action == "deny" and verdict.code == "tool.approval_unattended"
+
+
+@pytest.mark.parametrize("name", ["calculator", "memory", "web_search", "mcp__crm__x"])
+async def test_m1_a_workflow_tool_never_takes_the_name_of_another_tool(make: Make, name: str) -> None:
+    workspace = make({"AGENT": [text("never")]})
+    quote = workspace.save_workflow(quote_workflow())
+    conversation_id = conversation(workspace, binding_for(workspace, quote, 1, name=name))
+    sent = await workspace.conversations.send(conversation_id, None, MessageIn(content="Quote please"))
+    await workspace.wait(sent.assistant.run_id or "", timeout=20)
+    answer = workspace.conversations.message(conversation_id, None, sent.assistant.id)
+    assert answer.status == "failed" and answer.error is not None and answer.error.code == "workflow_tool.name_taken"
+
+
+def test_m2_a_model_that_is_not_local_reaches_outside() -> None:
+    cloud = chain("w", "W", [Node(id="start", type="start"), agent_node("a", "A", tools=["calculator"])])
+    local = chain(
+        "w",
+        "W",
+        [Node(id="start", type="start"), agent_node("a", "A", tools=["calculator"], model=LOCAL_DEFAULT_MODEL)],
+    )
+    facts = {"calculator": READ}.get
+    assert aggregate(cloud, 1, resolve=lambda *_: (cloud, 1), facts=facts).reach == "external"
+    assert aggregate(local, 1, resolve=lambda *_: (local, 1), facts=facts).reach == "internal"
+    fallback = chain(
+        "w",
+        "W",
+        [Node(id="start", type="start"), agent_node("a", "A", model=LOCAL_DEFAULT_MODEL, fallbacks=[CLOUD])],
+    )
+    assert aggregate(fallback, 1, resolve=lambda *_: (fallback, 1), facts=facts).reach == "external"
+
+
+def paused_tree(workspace: Workspace, *, top_status: str = "running", waiting: str = "awaiting_approval") -> Any:
+    from nodestro_runtime.schemas import NodeRun, Run
+
+    child_workflow = chain("wf_child", "Child", [Node(id="start", type="start"), Node(id="check", type="approval")])
+    child = Run(
+        workflow_id="wf_child",
+        workflow_name="Child",
+        workflow=child_workflow,
+        status="paused",
+        nodes={"start": NodeRun(status="succeeded"), "check": NodeRun(status=waiting)},  # type: ignore[arg-type]
+        trigger="subworkflow",
+    )
+    top_workflow = chain("wf_top", "Top", [Node(id="start", type="start"), agent_node("agent", "AGENT")])
+    top = Run(
+        workflow_id="wf_top",
+        workflow_name="Top",
+        workflow=top_workflow,
+        status=top_status,  # type: ignore[arg-type]
+        nodes={"start": NodeRun(status="succeeded"), "agent": NodeRun(status="running", child_run_ids=[child.id])},
+    )
+    child.parent_run_id, child.parent_node_id, child.trigger_ref = top.id, "agent", top.id
+    workspace.store.put("runs", top.id, top)
+    workspace.store.put("runs", child.id, child)
+    return top, child
+
+
+async def test_m3_a_budget_decision_of_another_process_continues_the_call(make: Make) -> None:
+    from decimal import Decimal
+
+    from nodestro_runtime.run_budget import BudgetBlock, BudgetRequest, BudgetRequests
+
+    workspace = make({})
+    top, child = paused_tree(workspace, waiting="awaiting_budget")
+    requests = BudgetRequests(workspace.store)
+    asked = requests.put(
+        BudgetRequest(
+            run_id=top.id,
+            workflow_id=top.workflow_id,
+            workflow_name=top.workflow_name,
+            block=BudgetBlock(run_id=top.id),
+            limit_usd=Decimal(1),
+            spent_usd=Decimal(1),
+        )
+    )
+    approvals = ToolApprovals(workspace.store)
+    assert not workspace.runs._workflow_tool_decided(child.id, approvals, top.id)
+    requests.put(asked.model_copy(update={"status": "raised"}))
+    assert workspace.runs._workflow_tool_decided(child.id, approvals, top.id)
+
+
+async def test_l1_a_waiting_child_of_an_ended_call_takes_no_decision_and_is_cancelled_after_a_restart(
+    make: Make,
+) -> None:
+    from nodestro_runtime.problems import NodestroError
+
+    workspace = make({})
+    _top, child = paused_tree(workspace, top_status="failed")
+    with pytest.raises(NodestroError) as refused:
+        workspace.runs.decide(child.id, "check", "approved")
+    assert refused.value.code == "workflow_tool.not_waiting"
+    assert workspace.runs.get(child.id).nodes["check"].approval is None  # type: ignore[union-attr]
+
+    _top, child = paused_tree(workspace)  # the process ended while the call waited
+    assert workspace.runs.recover() >= 1
+    stopped = workspace.runs.get(child.id)
+    assert stopped is not None and stopped.status == "cancelled"
+
+
+async def test_l4_l5_parallel_calls_keep_their_own_runs_and_nested_result_files_are_attachments(make: Make) -> None:
+    from nodestro_runtime.testing import message
+
+    both = message(
+        [
+            {"type": "tool_use", "id": "call_a", "name": "workflow_wrap", "input": {"input": "ACME"}},
+            {"type": "tool_use", "id": "call_b", "name": "workflow_wrap", "input": {"input": "BETA"}},
+        ],
+        stop_reason="tool_use",
+    )
+    workspace = make({"AGENT": [both, text("Done.")], "QUOTE_V1": [text("Q")] * 2})
+    gate(workspace)
+    quote = workspace.save_workflow(quote_workflow(approval=False))
+    quote_start = quote.nodes[0].model_copy(update={"start": None})
+    plain = workspace.save_workflow(
+        WorkflowIn(name="Plain quote", nodes=[quote_start, *quote.nodes[1:]], edges=quote.edges)
+    )
+    wrap = workspace.save_workflow(
+        WorkflowIn(
+            name="Wrap",
+            nodes=[
+                Node(id="start", type="start"),
+                Node(id="sub", type="subworkflow", subworkflow=SubworkflowConfig(workflow_id=plain.id, version=1)),
+                Node(id="out", type="output"),
+            ],
+            edges=[Edge(id="e1", source="start", target="sub"), Edge(id="e2", source="sub", target="out")],
+        )
+    )
+    agent = AgentConfig(
+        name="Agent",
+        system_prompt="AGENT",
+        max_parallel_tools=2,
+        workflow_tools=[binding_for(workspace, wrap, 1, name="workflow_wrap")],
+    )
+    template = AgentTemplates(workspace.store).create(agent).id
+    conversation_id = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template), model=CLOUD), owner=None
+    ).id
+    sent = await workspace.conversations.send(conversation_id, None, MessageIn(content="Two quotes"))
+    run_id = sent.assistant.run_id or ""
+
+    def read() -> ConversationMessage:
+        return workspace.conversations.message(conversation_id, None, sent.assistant.id)
+
+    approvals = ToolApprovals(workspace.store)
+    for _ in range(2):
+        found = await until(read, lambda item: bool(item.approval_ids))
+        request = approvals.get(run_id, found.approval_ids[0])
+        assert request is not None
+        workspace.runs.decide_tool_call(run_id, request.id, approved=True, by="local", arguments=request.arguments_hash)
+        await until(read, lambda item, asked=request.id: asked not in item.approval_ids)
+    await workspace.wait(run_id, timeout=20)
+    answer = read()
+    assert answer.status == "succeeded"
+    inputs = {}
+    for call in answer.tool_calls:
+        assert call.workflow is not None
+        child = workspace.runs.get(call.workflow.run_id)
+        assert child is not None
+        inputs[call.id] = child.input
+    assert inputs == {"call_a": "ACME", "call_b": "BETA"}
+    assert len(answer.result_files) == 2 and {item.name for item in answer.result_files} == {"quote.md"}
+    assert all(
+        item.run_id not in {call.workflow.run_id for call in answer.tool_calls if call.workflow}
+        for item in answer.result_files
+    )

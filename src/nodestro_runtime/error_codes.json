@@ -839,6 +839,7 @@
   "workflow_tool.disabled": ["node"],
   "workflow_tool.missing": ["name"],
   "workflow_tool.name_taken": ["name"],
+  "workflow_tool.not_waiting": ["status"],
   "workspace.db": [],
   "workspace.in_use": ["path"]
  }

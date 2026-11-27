@@ -1387,16 +1387,10 @@ def _decide_binding(
         return ASK
     if kind == "workflow" and not capability.reads_only:
         # N-20: a workflow tool that may change something is confirmed before every start, whatever the binding says
-        # (its effect is the highest of everything it contains); an unattended run needs a pre-grant.
+        # (its effect is the highest of everything it contains). A pre-grant names a tool by name and version only,
+        # never a workflow's effect, so none applies (review M1): an unattended run cannot start it.
         if context.attended:
             return ASK
-        grant = (
-            matching_pre_grant(context.pre_grants, tool=tool, version=version, scope=context.scope, at=at)
-            if capability.access != "destructive"
-            else None
-        )
-        if grant is not None:
-            return GateDecision(action="allow", pre_grant_id=grant.id)
         return _deny(
             "tool.approval_unattended",
             f"The workflow tool {tool} needs a person's approval for each start, and nobody can answer in this run",

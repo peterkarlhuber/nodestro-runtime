@@ -1470,14 +1470,15 @@ class Conversations:
             ]
         files = [
             AnswerFile(
-                run_id=child.id,
+                run_id=run.id,
                 file_id=item.id,
                 name=item.name,
                 format=item.format,
                 media_type=item.media_type,
                 size=item.size,
             )
-            for item in self.workspace.files.list(child.id)
+            for run in self.workspace.runs.run_tree(child.id)
+            for item in self.workspace.files.list(run.id)
         ]
         error = problem(child.error_code, child.error or "", **child.error_params) if child.error_code else None
         return WorkflowCallView(

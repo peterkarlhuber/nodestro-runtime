@@ -10,7 +10,12 @@
   conversation's answer (`ToolCallView.workflow`), result files its attachments (`result_files`), newer versions are
   only reported (`workflow_tool_updates`). `graph.workflow_refs` names workflow tools, so releases, exports, memory
   consents and pre-checks follow them; `Runs.decide` records a decision inside a workflow tool's run without a
-  paused top-level run. New codes `workflow_tool.*`.
+  paused top-level run. New codes `workflow_tool.*`. Review fixes: steps with workflow tools run on a thread pool of
+  their own per nesting depth (no deadlock of the agent pool); no pre-grant applies to a changing workflow tool, and
+  its name never takes another tool's; a model that is not local counts as reaching outside; a budget decision of
+  another process continues a waiting call; a decision needs a waiting call (`workflow_tool.not_waiting`) and an
+  interrupted run cancels its waiting workflow runs; parallel calls keep their own records; nested result files are
+  attachments.
 
 - New (N-14): versioned exchange formats `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with
   one import check for all of them (`exchange`; [docs/exchange-formats.md](docs/exchange-formats.md)): size, format
