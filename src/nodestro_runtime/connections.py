@@ -650,6 +650,16 @@ class ConnectionService:
         if any(item.name.strip().lower() == wanted and item.id != except_id for item in self._all()):
             raise NodestroError("connection.name_taken", f"A connection named {name!r} exists already", name=name)
 
+    def check_new(self, data: ConnectionIn) -> ConnectionType:
+        """Raise what :meth:`create` would refuse ``data`` for, without storing anything (an import's preview,
+        :mod:`nodestro_runtime.exchange`); returns the connection's type."""
+        kind = connection_type(data.type)
+        if self.mode not in kind.modes:
+            raise NodestroError("connection.mode_unsupported", "Not available in this mode", type=kind.name)
+        self._validated(kind, data.provider, data.settings)
+        self._unique_name(data.name)
+        return kind
+
     # ---- writes --------------------------------------------------------------------------------------------------
 
     def create(self, data: ConnectionIn, *, actor: str | None = None) -> ServiceConnection:

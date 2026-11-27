@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 10 |
+| P2 Medium | 11 |
 | P3 Low | 36 |
 | P4 Optional | 15 |
 
@@ -595,6 +595,23 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
+
+### RT-095 · Exchange formats (N-14): review and follow-ups
+
+- **Priority:** P2 Medium · **Status:** In review · **Refs:** [docs/exchange-formats.md](exchange-formats.md),
+  `exchange.py`, `tests/test_exchange.py`, nodestro-api `docs/exchange.md`
+- **Done:** `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with one import check (size, format
+  and version, strict content, ZIP safety, checksums, preview, all or nothing); exports checked for secrets (also the
+  workspace's own secrets of the exported entries); imports create new entries without secrets, MCP services
+  switched off, workspace settings unchanged.
+- **Open:**
+  - the independent review of the import check and the export secret check (with the next D1 brief);
+  - the secret check of an export is a safety net: a secret typed by hand into a free text (a description) that has
+    no known shape and is not one of the workspace's stored secrets is not found;
+  - a collection export is built completely before it is sent (temporary file); very large collections could be
+    streamed instead;
+  - a document whose content the workspace has already is left in its collection (`exists`), not copied into the
+    imported one (the file store keeps one entry per content).
 
 ### RT-089 · Conversations with own agents (N-04): follow-ups
 
