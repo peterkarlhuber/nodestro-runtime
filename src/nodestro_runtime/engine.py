@@ -64,6 +64,7 @@ from orkexa import (
     Tool,
     ToolCall,
     ToolCallSuspended,
+    ToolInputError,
     ToolResultError,
     TurnSuspended,
     UsageRecord,
@@ -90,6 +91,7 @@ from . import (
     tool_checkpoints,
     tool_journal,
     tool_policy,
+    workflow_tools,
 )
 from .agent_builder import AgentBuilder, BuiltAgent, run_own_tool
 from .bedrock import redact_identity
@@ -154,6 +156,9 @@ from .schemas import (
     ToolChoice,
     Usage,
     Workflow,
+    WorkflowCall,
+    WorkflowEffect,
+    WorkflowToolConfig,
     now,
 )
 from .skill_tools import SkillSet
@@ -172,10 +177,12 @@ from .tool_approvals import (
     ToolGate,
     arguments_hash,
     bind_call,
+    bind_workflow_facts,
     bound_call,
     checkpoints_enabled,
     reclassified,
     record_refusal,
+    reset_workflow_facts,
     tool_facts,
 )
 from .tool_spec import CallCounter, ConsentGuard, RunServices, bind_consent_guard, reset_consent_guard
@@ -210,6 +217,11 @@ REJECTED_CALL = "A person rejected this call"
 #: background work (backups, uploads, a worker's lease renewal); an agent beyond the limit waits for a thread.
 DEFAULT_RUN_THREADS = 32
 RUN_THREADS_ENV = "NODESTRO_RUN_THREADS"
+#: How long a workflow tool's call waits for a person's decision in its child run at most (N-20); then the child run is
+#: cancelled and the call fails. The agent's thread waits meanwhile, as for a tool approval asked in the thread.
+WORKFLOW_TOOL_WAIT_SECONDS = 24 * 3600.0
+#: How often a waiting workflow tool's call reads its child runs and their approval requests.
+WORKFLOW_TOOL_POLL_SECONDS = 0.25
 #: How often a conditional write of a stored run is tried again after another process wrote the run meanwhile.
 _CAS_ATTEMPTS = 5
 
@@ -2112,7 +2124,10 @@ class RunManager:
             )
         top = self.root_of(run)
         refuse_imported(top)
-        if self._contexts.get(top.id) is None:
+        # N-20: a workflow tool's run waits in its agent's thread (in this process or a worker's), which reads the
+        # decision itself: the top-level run is running, not paused, and nothing is continued from here.
+        in_tool = self._in_workflow_tool(run)
+        if self._contexts.get(top.id) is None and not in_tool:
             # The run continues on an event loop: refuse before anything is recorded.
             _require_loop()
             if top.status != "paused":
@@ -2139,6 +2154,8 @@ class RunManager:
             # compare-and-set lets exactly one decision win, and this one is refused before anything is queued.
             raise NodestroError("approval.not_pending", "This approval was decided meanwhile")
         root = self.root_of(run)
+        if in_tool and self._contexts.get(root.id) is None:
+            return self.get(root.id) or root  # the waiting call reads the stored decision
         self.resume(root.id)
         return self.get(root.id) or root
 
@@ -3840,6 +3857,261 @@ class RunManager:
         )
         self._save(context)
 
+    # ---- workflow tools (N-20) ----------------------------------------------------------------------------------
+
+    def _workflow_tool_facts(self, tools: Any) -> Callable[[str], tool_policy.ToolCapability | None]:
+        """The capability of a library tool for an effect (:func:`workflow_tools.aggregate`); ``None``: not there."""
+
+        def facts(name: str) -> tool_policy.ToolCapability | None:
+            try:
+                return tools.get(name).capability  # type: ignore[no-any-return]
+            except KeyError:
+                return None
+
+        return facts
+
+    def workflow_effect(
+        self, workflow: Workflow, version: int | None, env: RunEnvironment | None = None
+    ) -> WorkflowEffect:
+        """The effect of a workflow version with everything it contains (N-20), as a run would resolve it."""
+        resolve = env.resolve_workflow if env is not None else self.resolve_workflow
+        tools = env.builder.tools if env is not None else self.builder.tools
+
+        def pinned(workflow_id: str, number: int | None) -> tuple[Workflow, int | None]:
+            found, resolved = resolve(workflow_id, number)
+            return self.pin_subworkflows(found), resolved
+
+        return workflow_tools.aggregate(
+            self.pin_subworkflows(workflow), version, resolve=pinned, facts=self._workflow_tool_facts(tools)
+        )
+
+    def describe_workflow_tool(
+        self, workflow: Workflow, version: int, *, name: str | None = None
+    ) -> workflow_tools.WorkflowToolInfo:
+        """A saved workflow version as a tool an agent may call (N-20): the binding with its effect computed now, the
+        arguments the model sees, and the newest saved version of the workflow (a newer one is only reported)."""
+        try:
+            latest = self.resolve_workflow(workflow.id, None)[1]
+        except (KeyError, NodestroError):
+            latest = None
+        return workflow_tools.describe(
+            workflow, version, effect=self.workflow_effect(workflow, version), latest=latest, name=name
+        )
+
+    def _workflow_tools(
+        self, context: _RunContext, node: Node, config: AgentConfig, taken: Sequence[Tool]
+    ) -> list[tuple[workflow_tools.WorkflowTool, WorkflowEffect]]:
+        """The workflow tools of an agent step in their fixed versions, each with its effect (the higher of the stored
+        and the current one). Refused while the switch is off, and for a name another tool of the step has."""
+        if not config.workflow_tools:
+            return []
+        if not workflow_tools.workflow_tools_enabled():
+            raise NodestroError(
+                "workflow_tool.disabled",
+                f"Workflow tools are switched off ({workflow_tools.WORKFLOW_TOOLS_ENV})",
+                node=node_label(node),
+            )
+        names = {*config.tools, *(tool.name for tool in taken)}
+        found: list[tuple[workflow_tools.WorkflowTool, WorkflowEffect]] = []
+        for binding in config.workflow_tools:
+            if binding.name in names:
+                raise NodestroError(
+                    "workflow_tool.name_taken",
+                    f"The workflow tool {binding.name} has the name of another tool of {node_label(node)}",
+                    name=binding.name,
+                )
+            names.add(binding.name)
+            try:
+                snapshot, version = context.env.resolve_workflow(binding.workflow_id, binding.version)
+            except KeyError:
+                raise NodestroError(
+                    "workflow_tool.missing",
+                    f"The workflow of the tool {binding.name} (version {binding.version}) no longer exists",
+                    name=binding.name,
+                ) from None
+            effect = workflow_tools.effective(binding.effect, self.workflow_effect(snapshot, version, context.env))
+            fixed = version or binding.version
+            call = functools.partial(self._call_workflow_tool, context, node, binding, snapshot, fixed)
+            found.append((workflow_tools.WorkflowTool(binding, snapshot, fixed, call), effect))
+        return found
+
+    def _workflow_tool_refusal(
+        self, context: _RunContext, config: AgentConfig, gate: ToolGate | None, effect: WorkflowEffect
+    ) -> tuple[str, str] | None:
+        """Why a workflow tool's call is refused before the per-call gate: an offline step and a workflow that reaches
+        outside (N-09), or a workflow that may change something while nobody can confirm it (approvals off)."""
+        if effect.reach == "external" and self.offline_scope(context, config) is not None:
+            return "offline.tool_unavailable", "This workflow reaches outside this computer, and this step is offline"
+        if gate is None and effect.access != "read":
+            return (
+                "workflow_tool.approval_required",
+                "This workflow may change something, and its start cannot be confirmed here (approvals are off)",
+            )
+        return None
+
+    def _call_workflow_tool(
+        self,
+        context: _RunContext,
+        node: Node,
+        binding: WorkflowToolConfig,
+        snapshot: Workflow,
+        version: int,
+        payload: dict[str, Any],
+    ) -> str:
+        """One call of a workflow tool, in the agent's thread: a child run of the agent's run below its step, executed
+        by this engine on the run's loop (``_execute_child``: budget, cancel and limits as for a sub-workflow). While
+        the child waits for a person (an approval step, a tool approval, at any depth) the call waits here and goes on
+        once something was decided; cancelling the agent's run cancels the child, and a child left waiting when the
+        call ends is cancelled."""
+        loop = context.root.loop or self._loop
+        if loop is None:
+            raise ToolResultError("run.no_event_loop: the workflow cannot start here")
+
+        def on_loop(call: Any) -> Any:
+            return asyncio.run_coroutine_threadsafe(call, loop).result()
+
+        context.check()
+        run = context.run
+        state = run.nodes[node.id]
+        if snapshot.id == run.workflow_id or snapshot.id in context.stack:
+            raise ToolResultError("This workflow is already running in this run, so it cannot be called again")
+        if len(context.stack) >= MAX_DEPTH:
+            raise ToolResultError("Workflows are nested too deeply to start this one")
+        target = tool_policy.AccessResource(type="workflow", id=snapshot.id)
+        if on_loop(self._site_refused(context, node.id, target)) is not None:
+            # The agent learns only that the workflow cannot start; the person sees the source (event).
+            raise ToolResultError("This workflow cannot be started for this agent")
+        text, values = workflow_tools.call_values(snapshot, payload)
+        try:
+            prepared = prepare(start_fields(snapshot), values, text, [], file_names=None)
+        except NodestroError as exc:
+            raise ToolInputError(f"{binding.name}: {exc}") from None
+        child = Run(
+            workflow_id=snapshot.id,
+            workflow_name=snapshot.name,
+            workflow=self.pin_subworkflows(snapshot),
+            input=prepared.input,
+            values=prepared.values,
+            file_ids=prepared.file_ids,
+            nodes={item.id: NodeRun(status="waiting") for item in snapshot.nodes},
+            trigger="subworkflow",
+            trigger_ref=run.id,
+            parent_run_id=run.id,
+            parent_node_id=node.id,
+            workflow_version=version,
+        )
+        with context.lock:
+            record = next(
+                (
+                    item
+                    for item in reversed(state.tool_calls)
+                    if item.name == binding.name and item.workflow is None and item.finished_at is None
+                ),
+                None,
+            )
+            if record is not None:
+                record.workflow = WorkflowCall(workflow_id=snapshot.id, version=version, run_id=child.id)
+            state.child_run_ids.append(child.id)
+        self.store.put("runs", child.id, child)
+        self._emit(context, "workflow_tool_started", node.id, name=binding.name, child_run_id=child.id, version=version)
+        deadline = time.monotonic() + WORKFLOW_TOOL_WAIT_SECONDS
+        try:
+            while True:
+                on_loop(self._execute_child(context, node, child))
+                if child.status != "paused":
+                    break
+                self._emit(context, "workflow_tool_waiting", node.id, name=binding.name, child_run_id=child.id)
+                if not self._wait_for_workflow_tool(context, child.id, deadline):
+                    raise ToolResultError("Nobody decided in time what this workflow waited for, so it was stopped")
+                child = self.get(child.id) or child
+        finally:
+            stored = self.store.get("runs", child.id, Run)
+            if (
+                stored is not None
+                and stored.status in ("queued", "running", "paused")
+                and child.id not in self._contexts
+            ):
+
+                async def stop() -> None:
+                    self._cancel_stored(child.id, ("queued", "running", "paused"))
+
+                on_loop(stop())
+        context.check()
+        self._emit(
+            context,
+            "workflow_tool_finished",
+            node.id,
+            name=binding.name,
+            child_run_id=child.id,
+            status=child.status,
+            error_code=child.error_code,
+        )
+        if child.status == "succeeded":
+            files = self.result_files.list(child.id) if self.result_files is not None else []
+            return workflow_tools.result_text(
+                snapshot.name, version, child.output, [(item.name, item.format) for item in files]
+            )
+        if child.status == "cancelled":
+            raise ToolResultError(f"The workflow was stopped: {child.error or 'cancelled'}")
+        raise ToolResultError(f"The workflow failed: {child.error or child.error_code or 'unknown error'}")
+
+    def _wait_for_workflow_tool(self, context: _RunContext, child_id: str, deadline: float) -> bool:
+        """Wait in the agent's thread until something the paused child run (or a run below it) waited for was decided
+        (``True``), or until ``deadline`` (``False``). Reads the stored runs and approval requests, so a decision made
+        by another process counts too. Cancelling the agent's run raises :class:`RunCancelled`."""
+        approvals = ToolApprovals(self.store)
+        while time.monotonic() < deadline:
+            context.check()
+            if context.root.resume_requested:
+                context.root.resume_requested = False  # a decision of this process (also a budget decision)
+                return True
+            if self._workflow_tool_decided(child_id, approvals):
+                return True
+            time.sleep(WORKFLOW_TOOL_POLL_SECONDS)
+        return False
+
+    def _workflow_tool_decided(self, child_id: str, approvals: ToolApprovals) -> bool:
+        """Whether the paused tree below a workflow tool's call can go on: it is no longer paused, an approval step
+        has a decision, or a run paused at tool calls has none of them pending any more."""
+        queue = [child_id]
+        seen: set[str] = set()
+        while queue:
+            run_id = queue.pop()
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            run = self.store.get("runs", run_id, Run)
+            if run is None or run.status != "paused":
+                return True
+            for item in run.workflow.nodes:
+                state = run.nodes.get(item.id)
+                if state is None or state.status not in WAITING_NODE_STATUSES:
+                    continue
+                if item.type == "approval" and state.approval is not None:
+                    return True
+                if item.type == "agent" and state.status == "awaiting_approval":
+                    asked = [found for found in approvals.of_run(run_id) if found.checkpointed]
+                    if asked and not any(found.status == "pending" for found in asked):
+                        return True
+                queue += [found for found in [state.child_run_id, *state.child_run_ids] if found]
+        return False
+
+    def _in_workflow_tool(self, run: Run) -> bool:
+        """Whether ``run`` is a workflow tool's child run or runs below one (N-20): its call waits in its agent's
+        thread, so a decision about it needs no paused top-level run and continues nothing itself."""
+        current = run
+        seen = {run.id}
+        while current.parent_run_id:
+            parent = self.get(current.parent_run_id)
+            if parent is None or parent.id in seen:
+                return False
+            seen.add(parent.id)
+            step = next((item for item in parent.workflow.nodes if item.id == current.parent_node_id), None)
+            if step is not None and step.type == "agent":
+                return True
+            current = parent
+        return False
+
     def _gate_call(
         self,
         context: _RunContext,
@@ -5219,6 +5491,8 @@ class RunManager:
 
         #: The step's memory consent guard once it is known (set before the first request; RT-089d, Welle 5).
         guard_box: list[ConsentGuard | None] = []
+        #: The effect of each workflow tool of the step (N-20), by tool name; filled before the first request.
+        workflow_effects: dict[str, WorkflowEffect] = {}
         trace = ReasoningTrace(text=state.thinking, phases=state.thinking_phases)
 
         def on_thinking(delta: str, kind: ReasoningKind) -> None:
@@ -5285,10 +5559,17 @@ class RunManager:
             own = run_own_tool(config, call.name, extra_tools)
             # N-09: an offline step never calls a tool that is not available offline, and nobody is asked about it.
             unavailable = self._offline_tool(context, config, call.name) if not own else None
+            flow_refusal = (
+                self._workflow_tool_refusal(context, config, gate, workflow_effects[call.name])
+                if call.name in workflow_effects and unavailable is None
+                else None
+            )
             if unavailable is not None:
                 denial = self._deny_call(
                     context, node_id, call, record, "offline.tool_unavailable", unavailable.text, {}
                 )
+            elif flow_refusal is not None:
+                denial = self._deny_call(context, node_id, call, record, flow_refusal[0], flow_refusal[1], {})
             elif gate is not None and not own:
                 if checkpointing and call.resumed:
                     denial = self._gate_resumed_call(context, node_id, config, call, record, gate, iteration, released)
@@ -5425,6 +5706,7 @@ class RunManager:
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
         guard_token = None
+        facts_token = None
         try:
             # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read;
             # RT-089d: only with its owner's consent for this workflow content (and every run above this one).
@@ -5455,6 +5737,20 @@ class RunManager:
             if scope is not None and offline.shared_memory(config):
                 # N-09: a memory space or a knowledge proposal would hand the step's content to other (cloud) agents.
                 raise offline.shared_memory_error(offline.shared_memory(config), scope)
+            # N-20: the step's workflow tools in their fixed versions, with their effect for the per-call gate.
+            flows = self._workflow_tools(context, node, config, [*extra_tools, *(skills.tools if skills else [])])
+            workflow_effects.update({tool.name or "": effect for tool, effect in flows})
+            facts_token = bind_workflow_facts(
+                {
+                    tool.binding.name: (
+                        workflow_tools.capability(effect),
+                        tool.binding.version,
+                        workflow_tools.KIND,
+                        workflow_tools.definition_hash(tool.binding, effect),
+                    )
+                    for tool, effect in flows
+                }
+            )
             interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node_id, config))
             ask = functools.partial(
                 execute_agent,
@@ -5467,7 +5763,10 @@ class RunManager:
                 extra_context=extra,
                 on_evaluation_start=lambda: self._emit(context, "evaluation_started", node_id),
                 sandbox=context.env.tool_sandbox(context.run.workflow_id),
-                extra_tools=[tool for tool in extra_tools if skills is None or tool not in skills.tools],
+                extra_tools=[
+                    *(tool for tool in extra_tools if skills is None or tool not in skills.tools),
+                    *(tool for tool, _effect in flows),
+                ],
                 skills=skills,
                 cancelled=context.cancelled.is_set,
                 attended=context.root.run.trigger not in UNATTENDED_TRIGGERS,
@@ -5542,6 +5841,8 @@ class RunManager:
             sandbox_cancel.reset(cancel_token)
             if guard_token is not None:
                 reset_consent_guard(guard_token)
+            if facts_token is not None:
+                reset_workflow_facts(facts_token)
             if budget_checkpoint is not None and not suspended:
                 tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)
             if checkpointing and not suspended:

@@ -90,11 +90,14 @@ from .schemas import (
     SourceEntry,
     TemplateRef,
     ToolCallApproval,
+    ToolCallRecord,
     Usage,
     Workflow,
     new_id,
     now,
 )
+from .tool_approvals import ToolApprovals
+from .workflow_tools import WorkflowToolUpdate, newer_versions
 
 if TYPE_CHECKING:
     from .workspace import Workspace
@@ -243,6 +246,51 @@ class MessageFile(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class WorkflowApprovalCard(BaseModel):
+    """An approval step inside a workflow tool's run that waits for a person (N-20): decided with the run routes
+    (``POST /api/runs/{run_id}/approvals/{node_id}``)."""
+
+    run_id: str
+    node_id: str
+    label: str = ""
+    instructions: str = ""
+
+
+class WorkflowToolApprovalCard(BaseModel):
+    """A tool call inside a workflow tool's run that waits for a person's approval (N-20, S-2)."""
+
+    run_id: str
+    request_id: str
+    tool: str
+
+
+class AnswerFile(BaseModel):
+    """A result file of a workflow tool's run: an attachment of the answer (N-20), downloaded with the run routes
+    (``GET /api/runs/{run_id}/files/{file_id}``)."""
+
+    run_id: str
+    file_id: str
+    name: str
+    format: str
+    media_type: str = ""
+    size: int = 0
+
+
+class WorkflowCallView(BaseModel):
+    """A workflow tool's call (N-20): the workflow in its fixed version, its run, what it waits for and its files."""
+
+    workflow_id: str
+    version: int
+    run_id: str
+    status: str
+    error: Problem | None = None
+    #: What the workflow's run waits for now (cards in the conversation).
+    approvals: list[WorkflowApprovalCard] = Field(default_factory=list)
+    tool_approvals: list[WorkflowToolApprovalCard] = Field(default_factory=list)
+    files: list[AnswerFile] = Field(default_factory=list)
+    cost_usd: float | None = None
+
+
 class ToolCallView(BaseModel):
     """One tool call of an answer: its arguments, result and duration."""
 
@@ -256,6 +304,8 @@ class ToolCallView(BaseModel):
     duration_ms: int | None = None
     #: What the per-call approval rules did with it (S-2), with the approval request while a person is asked.
     approval: ToolCallApproval | None = None
+    #: A workflow tool's call (N-20).
+    workflow: WorkflowCallView | None = None
 
 
 class ConversationMessage(BaseModel):
@@ -270,6 +320,8 @@ class ConversationMessage(BaseModel):
     tool_calls: list[ToolCallView] = Field(default_factory=list)
     #: Answers: the web sources the agent's tools saw (the run's source ledger).
     sources: list[SourceEntry] = Field(default_factory=list)
+    #: Answers: the result files of its workflow tools' runs (N-20), as attachments.
+    result_files: list[AnswerFile] = Field(default_factory=list)
     #: ``complete`` for a user message; an answer has the status of its run.
     status: MessageStatus = "complete"
     error: Problem | None = None
@@ -307,6 +359,9 @@ class AgentConversationDetail(Conversation):
     usage: Usage = Field(default_factory=Usage)
     #: The answer being written right now.
     answering: str | None = None
+    #: The agent's workflow tools whose workflow has a newer saved version (N-20): only reported, the fixed version
+    #: stays until the agent is changed.
+    workflow_tool_updates: list[WorkflowToolUpdate] = Field(default_factory=list)
 
 
 class AgentChoice(BaseModel):
@@ -693,7 +748,27 @@ class Conversations:
             messages=messages,
             usage=self._usage(conversation_id, messages),
             answering=answering,
+            workflow_tool_updates=self.workflow_tool_updates(conversation),
         )
+
+    def workflow_tool_updates(self, conversation: Conversation) -> list[WorkflowToolUpdate]:
+        """The workflow tools of the conversation's agent with a newer saved workflow version (N-20; reported only)."""
+        try:
+            _ref, config = self._agent(
+                AgentChoice(template_id=conversation.agent.template_id, version=conversation.agent.version)
+            )
+        except NodestroError:
+            return []
+        if not config.workflow_tools:
+            return []
+
+        def latest(workflow_id: str) -> int | None:
+            try:
+                return self.workspace.runs.resolve_workflow(workflow_id, None)[1]
+            except (KeyError, NodestroError):
+                return None
+
+        return newer_versions([config], latest)
 
     def usage(self, conversation_id: str, owner: str | None) -> Usage:
         """The sum of the usage of every answer's run (failed and cancelled ones included)."""
@@ -1347,8 +1422,77 @@ class Conversations:
                 self._record_files(updated, run)
         return updated
 
-    @staticmethod
-    def _from_run(message: ConversationMessage, run: Run) -> ConversationMessage:
+    def _workflow_view(self, call: ToolCallRecord) -> WorkflowCallView | None:
+        """A workflow tool's call as the conversation shows it (N-20): the state of its run, the approvals its run
+        tree waits for (cards) and the result files of its run (attachments)."""
+        if call.workflow is None:
+            return None
+        child = self.store.get("runs", call.workflow.run_id, Run)
+        if child is None:
+            return WorkflowCallView(
+                workflow_id=call.workflow.workflow_id,
+                version=call.workflow.version,
+                run_id=call.workflow.run_id,
+                status="failed",
+                error=problem("conversation.run_missing", "The workflow's run no longer exists"),
+            )
+        approvals = ToolApprovals(self.store)
+        cards: list[WorkflowApprovalCard] = []
+        asked: list[WorkflowToolApprovalCard] = []
+        queue = [child]
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current.id in seen or current.status in FINAL:
+                continue
+            seen.add(current.id)
+            for node in current.workflow.nodes:
+                state = current.nodes.get(node.id)
+                if state is None:
+                    continue
+                if node.type == "approval" and state.status == "awaiting_approval" and state.approval is None:
+                    config = node.approval
+                    cards.append(
+                        WorkflowApprovalCard(
+                            run_id=current.id,
+                            node_id=node.id,
+                            label=node.label or node.id,
+                            instructions=config.instructions if config is not None else "",
+                        )
+                    )
+                for child_id in [state.child_run_id, *state.child_run_ids]:
+                    found = self.store.get("runs", child_id, Run) if child_id else None
+                    if found is not None and found.parent_run_id == current.id:
+                        queue.append(found)
+            asked += [
+                WorkflowToolApprovalCard(run_id=current.id, request_id=item.id, tool=item.tool)
+                for item in approvals.pending(current.id)
+            ]
+        files = [
+            AnswerFile(
+                run_id=child.id,
+                file_id=item.id,
+                name=item.name,
+                format=item.format,
+                media_type=item.media_type,
+                size=item.size,
+            )
+            for item in self.workspace.files.list(child.id)
+        ]
+        error = problem(child.error_code, child.error or "", **child.error_params) if child.error_code else None
+        return WorkflowCallView(
+            workflow_id=call.workflow.workflow_id,
+            version=call.workflow.version,
+            run_id=child.id,
+            status=child.status,
+            error=error,
+            approvals=cards,
+            tool_approvals=asked,
+            files=files,
+            cost_usd=_cost(child.usage),
+        )
+
+    def _from_run(self, message: ConversationMessage, run: Run) -> ConversationMessage:
         state = run.nodes.get(AGENT_NODE)
         content = ""
         calls: list[ToolCallView] = []
@@ -1365,6 +1509,7 @@ class Conversations:
                     finished_at=call.finished_at,
                     duration_ms=_duration_ms(call.started_at, call.finished_at),
                     approval=call.approval,
+                    workflow=self._workflow_view(call),
                 )
                 for call in state.tool_calls
             ]
@@ -1380,6 +1525,7 @@ class Conversations:
                 "content": content,
                 "tool_calls": calls,
                 "sources": list(run.sources),
+                "result_files": [item for call in calls if call.workflow is not None for item in call.workflow.files],
                 "status": status,
                 "error": error,
                 "usage": run.usage,

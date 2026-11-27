@@ -835,6 +835,10 @@
   "workflow.self_loop": ["edge_id", "node_id"],
   "workflow.start_has_inputs": ["edge_id", "node_id"],
   "workflow.subworkflow_missing": [],
+  "workflow_tool.approval_required": [],
+  "workflow_tool.disabled": ["node"],
+  "workflow_tool.missing": ["name"],
+  "workflow_tool.name_taken": ["name"],
   "workspace.db": [],
   "workspace.in_use": ["path"]
  }

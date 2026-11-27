@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 11 |
+| P2 Medium | 12 |
 | P3 Low | 36 |
 | P4 Optional | 15 |
 
@@ -606,6 +606,29 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
+
+### RT-096 · Workflows as tools of an agent (N-20): activation and follow-ups
+
+- **Priority:** P2 Medium · **Status:** In review · **Refs:** development plan N-20,
+  [docs/workflow-tools.md](workflow-tools.md), `workflow_tools.py`, `tests/test_workflow_tools.py`, nodestro-api
+  `GET /api/workflows/{workflow_id}/versions/{number}/tool`
+- **Done:** an agent calls a saved workflow in a fixed version (`AgentConfig.workflow_tools`) as a child run of its
+  run through the one engine (`_execute_child`: budget, cancel, limits); arguments from the start form; the effect is
+  the highest of everything inside (unknown = write + external), stored at import and computed again at every call;
+  a changing workflow is confirmed before every start (gate kind `workflow`), refused without approvals; approval
+  steps and tool approvals inside are cards of the answer, result files its attachments; newer versions are only
+  reported; releases, exports, memory consents and pre-checks follow the binding (`graph.workflow_refs`). Behind
+  `NODESTRO_WORKFLOW_TOOLS` (default off).
+- **Open:**
+  - switching it on needs the independent review of tool approvals (RT-001): every changing workflow tool depends on
+    the per-call gate;
+  - a waiting call holds an agent thread for up to 24 hours (as RT-006); a process that ends meanwhile leaves the
+    answer interrupted (continuing it asks first);
+  - a budget decision inside the workflow made by another process is read only at the next decision or the
+    deadline;
+  - file fields of the start form are not offered (the conversation's files are not passed on);
+  - the studio shows the cards and attachments only once its conversation view reads `tool_calls[].workflow` and
+    `result_files` (studio follow-up).
 
 ### RT-095 · Exchange formats (N-14): review and follow-ups
 
