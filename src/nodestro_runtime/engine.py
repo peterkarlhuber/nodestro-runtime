@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 import concurrent.futures
 from contextlib import suppress
 import contextvars
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import functools
@@ -104,7 +104,7 @@ from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, f
 from .input_files import InputFiles
 from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .memory_consents import agent_digest, with_children, workflow_digest
+from .memory_consents import agent_digest, with_children, with_environment, workflow_digest
 from .memory_spaces import NOBODY, consent_required
 from .notifications import RunNotifier
 from .orchestrator import (
@@ -172,6 +172,7 @@ from .tool_approvals import (
     ToolGate,
     arguments_hash,
     bind_call,
+    bound_call,
     checkpoints_enabled,
     reclassified,
     record_refusal,
@@ -1068,6 +1069,9 @@ class RunManager:
         self.consent_means: Callable[[AgentConfig], Any] = lambda config: [
             self.tool_marker(name) for name in sorted(set(config.tools))
         ]
+        #: The approved Python environment a workflow's tools run in (its lock's digest; ``None``: none), for the same
+        #: digest; the workspace hands in :meth:`~nodestro_runtime.workspace.Workspace.consent_environment`.
+        self.consent_environment: Callable[[str], str | None] = lambda _workflow_id: None
         #: The files a run can reference by id: name, or :class:`~nodestro_runtime.forms.FileRef` with format and size
         #: (checks the file fields of input forms).
         self.file_names: Callable[[], Mapping[str, str] | Mapping[str, FileRef]] | None = None
@@ -1527,6 +1531,27 @@ class RunManager:
                 raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
         return True
 
+    def _consent_guard(self, config: AgentConfig) -> Callable[[str], None]:
+        """The check before each connection a step reads after it opened a person's memory space under their consent
+        (RT-089d, Welle 5): the consent covered the connections' settings as they were at the step's check
+        (:attr:`consent_means`); a connection edited while the step runs (another address, another secret) would
+        otherwise get the memory under the old consent. Such a call is refused (fail closed); the next run needs a
+        new consent."""
+        checked = self.consent_means(config)
+
+        def check(name: str) -> None:
+            try:
+                same = self.consent_means(config) == checked
+            except Exception:  # cannot tell: refuse
+                same = False
+            if not same:
+                raise ToolResultError(
+                    f"Error: the connection of {name} changed since the memory consent was checked; the call was not "
+                    "made (memory.consent_required)"
+                )
+
+        return check
+
     def check_memory_flow(self, context: _RunContext) -> None:
         """Before a run executes in a tree that already used a person's memory space (RT-089d): a sub-workflow's or a
         team's run, a paused run that continues, a continued failed run. Its workflow needs the owner's consent for
@@ -1789,7 +1814,7 @@ class RunManager:
         return self._consent_digest(workflow, frozenset())
 
     def _consent_digest(self, workflow: Workflow, seen: frozenset[str]) -> str:
-        own = workflow_digest(workflow, self.consent_means)
+        own = with_environment(workflow_digest(workflow, self.consent_means), self.consent_environment(workflow.id))
         seen = seen | {workflow.id}
         refs = [ref for node in workflow.nodes for ref in graph.workflow_refs(node)]
         unsaved = {ref.workflow_id for ref in refs if ref.version is None}
@@ -4205,16 +4230,24 @@ class RunManager:
         return None
 
     def _audit_released(
-        self, context: _RunContext, gate: ToolGate, call: ToolCall, request: ToolApprovalRequest, is_error: bool
+        self,
+        context: _RunContext,
+        gate: ToolGate,
+        call: ToolCall,
+        request: ToolApprovalRequest,
+        is_error: bool,
+        *,
+        refused: bool = False,
     ) -> None:
         """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
         after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
-        (``tool.changed``), not ``executed``. The request stays ``executed``, so the call never runs later."""
-        tools = context.env.builder.tools
-        if is_error and _current_hash(tools, call) != request.arguments_hash:
-            gate.approvals.audit("stale", request, outcome="tool.changed")
-        elif is_error and reclassified(request.capability, tool_facts(tools, call.name)[0]):
-            gate.approvals.audit("stale", request, outcome="tool.reclassified")
+        (``tool.changed``), not ``executed``; so is a call the MCP service refused right before the send
+        (``refused``). The request stays ``executed``, so the call never runs later."""
+        stale = _stale_outcome(context.env.builder.tools, call, request) if is_error else None
+        if stale is None and refused:
+            stale = "refused_at_send"
+        if stale is not None:
+            gate.approvals.audit("stale", request, outcome=stale)
         else:
             gate.approvals.audit("executed", request)
 
@@ -5153,6 +5186,8 @@ class RunManager:
         node_id = node.id
         calls: dict[str, ToolCallRecord] = {}
         released: dict[str, ToolApprovalRequest] = {}
+        #: The binding each gated call runs under (the MCP service notes a refusal at its last check there).
+        bindings: dict[str, CallBinding] = {}
         #: The problem code of each call the gate refused, for its activity event.
         denied: dict[str, str | None] = {}
         gate = self.tool_gate
@@ -5246,6 +5281,9 @@ class RunManager:
                     denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
             elif call.resumed:
                 pass  # an own tool never waits, so it is never resumed
+            binding = bound_call(call.name) if denial is None else None
+            if binding is not None:
+                bindings[call.id] = binding
             if denial is None and not own:
                 # Asked after the gate (a person may have decided long after the call was asked for): a worker that
                 # lost the run's job meanwhile never makes the call (M11).
@@ -5263,9 +5301,21 @@ class RunManager:
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             request = released.pop(call.id, None)
-            if request is not None and gate is not None:
-                self._audit_released(context, gate, call, request, is_error)
+            binding = bindings.pop(call.id, None)
+            # The MCP service refused the call at its last check right before the send (the tool was reclassified or
+            # approved differently after the gate let it run): it did not run, like a refusal at the gate.
+            refused_at_send = is_error and binding is not None and bool(binding.refused)
             record = calls.get(call.id)
+            if request is not None and gate is not None:
+                self._audit_released(context, gate, call, request, is_error, refused=refused_at_send)
+            elif refused_at_send and gate is not None and record is not None and record.approval is not None:
+                asked = record.approval.request_id
+                found = gate.approvals.get(context.run.id, asked) if asked else None
+                if found is not None:
+                    stale = _stale_outcome(context.env.builder.tools, call, found) or "refused_at_send"
+                    gate.approvals.audit("stale", found, outcome=stale)
+            if refused_at_send and record is not None and record.approval is not None and record.approval.code is None:
+                record.approval = record.approval.model_copy(update={"code": "tool.approval_stale"})
             if record is not None:
                 record.output = content[:20_000]
                 record.is_error = is_error
@@ -5356,9 +5406,13 @@ class RunManager:
         try:
             # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read;
             # RT-089d: only with its owner's consent for this workflow content (and every run above this one).
+            consented = False
             if config.memory.mode == "persistent":
                 consented = self.check_memory_consent(context, config.memory.space)
                 self.mark_memory_owner(context, config.memory.space if consented else None)
+            services = self._run_services(context, node_id, config.name)
+            if consented:
+                services = replace(services, connection_check=self._consent_guard(config))
             # N-08: what the step gets before its first request (attached files, knowledge in the context).
             for source in start_sources(config, extra):
                 self.mark_granted(context, node_id, source)
@@ -5394,7 +5448,7 @@ class RunManager:
                 refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
-                services=self._run_services(context, node_id, config.name),
+                services=services,
                 judge_hooks={"on_request": on_judge_request},
                 # RT-089c: a persistent memory space is the person's who started the run (its owner); a run that
                 # acts for no person (a schedule, an API key) uses none where spaces have owners.
@@ -5825,6 +5879,16 @@ def _decision_code(final: ToolApprovalRequest) -> str | None:
     if final.status == "expired" and final.closed_because == RECLASSIFIED:
         return "tool.approval_stale"
     return {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+
+
+def _stale_outcome(tools: Any, call: ToolCall, request: ToolApprovalRequest) -> str | None:
+    """Why an approved call that failed did not run as approved: the tool changed (``tool.changed``) or was
+    classified differently (``tool.reclassified``) since the request; ``None`` when neither."""
+    if _current_hash(tools, call) != request.arguments_hash:
+        return "tool.changed"
+    if reclassified(request.capability, tool_facts(tools, call.name)[0]):
+        return "tool.reclassified"
+    return None
 
 
 def _current_hash(tools: Any, call: ToolCall) -> str:

@@ -10,8 +10,12 @@ exactly this content (:class:`~nodestro_runtime.memory_spaces.MemoryConsent`):
   version it will run (:meth:`~nodestro_runtime.engine.RunManager.pin_subworkflows`), and of what its agents use
   outside the workflow (``means``, :meth:`~nodestro_runtime.engine.RunManager.consent_means`): the version and code of
   each custom tool, the settings of each bound connection, the configuration of each MCP server and the definition of
-  each MCP tool. A change of any of these (a new version of a custom tool, a connection that now sends elsewhere, an
-  edited agent, edge or sub-workflow version) changes the digest; a consent never applies to changed content.
+  each MCP tool, the address of each model server with a configurable address and the lock of the approved Python
+  environment the workflow's tools run in (the library versions they import). A change of any of these (a new version
+  of a custom tool, a connection that now sends elsewhere, another model server, other library versions, an edited
+  agent, edge or sub-workflow version) changes the digest; a consent never applies to changed content. A step also
+  checks its bound connections again at each call (a connection edited while the step runs is refused,
+  ``memory.consent_stale``).
 - **Every run that can see the memory.** A step that opens a space needs a consent for its own run's workflow and
   for every run above it (their steps get the step's output). Once a run used a space (``Run.memory_spaces`` of the
   top-level run), every run that executes afterwards in the same tree (a sub-workflow, a team, a continued paused
@@ -74,6 +78,12 @@ def with_children(digest: str, children: dict[str, str]) -> str:
     return _digest({"own": digest, "children": children}) if children else digest
 
 
+def with_environment(digest: str, environment: str | None) -> str:
+    """``digest`` together with the digest of the approved Python environment the workflow's tools run in (the exact
+    library versions they import); ``digest`` itself when there is none."""
+    return _digest({"own": digest, "environment": environment}) if environment else digest
+
+
 class ConsentTarget(BaseModel):
     """One workflow a consent covers, as it would run now."""
 
@@ -131,5 +141,6 @@ __all__ = [
     "combined_digest",
     "consent_targets",
     "with_children",
+    "with_environment",
     "workflow_digest",
 ]

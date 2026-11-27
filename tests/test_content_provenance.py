@@ -24,6 +24,7 @@ import itertools
 import json
 from pathlib import Path
 import socket
+import threading
 from typing import Any
 
 from folder_support import grant_base
@@ -1562,6 +1563,53 @@ def test_a_reindex_for_a_server_elsewhere_drops_the_folder_index_and_stores_none
     state = index.sync(folder_id)
     assert state is not None and state.state == "ready" and state.chunks
     assert any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    assert not any(SECRET in item for item in model.documents)
+
+
+def test_a_failed_removal_of_the_folder_indexes_before_a_reindex_leaves_nothing_stuck(
+    make: Make, docs: Path, network: Network
+) -> None:
+    """N-12 (Welle 5): a reindex for a model that may not embed folder text removes every folder index first. When
+    that removal failed, the reindex stayed marked as running and the folder index refused every chunk
+    (``FolderIndexBusy``) until a restart. Now the reindex does not start (fail closed: folder chunks may be left, and
+    it would embed them), nothing stays marked, the folder index keeps working and the next reindex tries again."""
+    from nodestro_runtime.knowledge import FOLDER_SOURCE
+
+    workspace = make()
+    model = _semantic(workspace, "hybrid")
+    folder_id = _grant_indexed(workspace, docs)
+    _model_server(workspace, "https://gpu.example.com/v1")
+    knowledge = workspace.knowledge
+    knowledge.folder_embedding_allowed = lambda address: not address or "gpu.example.com" not in address
+    AccessRules(workspace.store).grant(
+        resource=AccessResource(type="cloud_provider", id="ollama"),
+        actions=["submit"],
+        duration="until_revoked",
+        by=PERSON,
+    )
+    real_reset = knowledge.folder_reset
+
+    def failing() -> object:
+        raise OSError("disk I/O error")
+
+    knowledge.folder_reset = failing
+    model.documents.clear()
+    with pytest.raises(NodestroError) as failed:
+        knowledge.start_reindex()
+    assert failed.value.code == "knowledge.reindex_failed"
+    assert not knowledge.reindexing() and knowledge._reindex_folders
+    assert model.documents == []  # nothing was embedded
+    job = knowledge.execute_reindex("counted:1", cancel=threading.Event())  # a server worker's job
+    assert (job.state, job.error_code) == ("failed", "knowledge.reindex_failed")
+    assert knowledge._reindex_folders and model.documents == []
+    index = workspace.folder_index
+    assert index is not None
+    state = index.sync(folder_id)  # the folder index is not held back
+    assert state is not None and state.state == "ready"
+    knowledge.folder_reset = real_reset
+    knowledge.start_reindex()  # tried again: it removes the folder index first, then runs
+    assert not any(source.startswith(FOLDER_SOURCE) for source in knowledge.chunk_sources())
+    _wait_for_reindex(workspace)
     assert not any(SECRET in item for item in model.documents)
 
 

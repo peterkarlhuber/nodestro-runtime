@@ -25,6 +25,12 @@ its tools. Now:
     or a new secret, is other content; a deleted connection too;
   - each **MCP tool**: its server's address, transport, command and sign-in kind and the tool's definition (not its
     status or check times);
+  - the address of each **model server** the agent sends to, for providers whose address is a setting
+    (`compatible`, `ollama`, `vllm`; also the quality judge's when it is on), keyed `model:<provider>`: another
+    server is other content (Welle 5). Other providers add nothing, so their digests did not change;
+  - the **approved Python environment** the workflow's tools run in (`Workspace.consent_environment`: the SHA-256 of
+    its lock, the exact library versions the tools import; `memory_consents.with_environment`): approving other
+    versions with the same tool code is other content (Welle 5). A workflow without one adds nothing;
   - each sub-workflow or team **without a saved version**: it runs its current content, so that content's digest is
     part of the parent's (recursively).
 
@@ -39,6 +45,11 @@ its tools. Now:
   a paused run that continues (so a revoked consent stops it), and a continued failed run (it takes over the earlier
   run's results, stays private to the same owner and inherits `memory_owner` and `memory_spaces`). A run marked for a
   person without recorded spaces (from before RT-089d) fails closed.
+- **During a step.** The consent is checked when the step opens the space; its tools read their connection at each
+  call. So that a connection edited while the step runs (another address, a new secret) never gets the memory under
+  the old consent, each call of such a step that reads a connection checks the step's means again
+  (`RunServices.connection_check`, `RunManager._consent_guard`) and is refused when anything changed (the tool result
+  names `memory.consent_required`; nothing is sent). The next run needs a new consent (Welle 5).
 - **Agent tests** need a consent for the digest of the tested configuration with its means
   (`RunManager.agent_consent_digest`, `memory_consents.agent_digest`).
 - **Denial.** Without a matching consent the step (or the run) fails with `memory.consent_required` (`space`,

@@ -51,6 +51,9 @@ None known.
   runs above the step and runs after it in the same tree need it too; a revoked consent stops paused and continued
   runs; a continued run and a refused run stay private. Private runs notify their owner only (local inbox, server
   inbox; budget questions by their top-level run) and every run above the step is marked and gets `memory_private`.
+  Done (Welle 5): the digest also covers the address of each model server with a configurable address and the lock
+  of the workflow's approved Python environment; a connection edited while a step under a consent runs is refused at
+  the step's next call (fail closed).
 - **Open:**
   - name squatting: a space name is its first writer's (writing a file or giving a consent claims it). Proposed:
     per-person namespaces in the interface, or an operator reservation; never an automatic reassignment;
@@ -713,7 +716,12 @@ Items that need an independent or external review (an internal audit does not re
     modification and change time (a file rewritten within one timestamp tick with the same size is found at the
     next change); a rebuild of the semantic index for a model that may not embed folder text drops every folder index
     first (judged by its model's address, also with no folder indexed yet), and it is rebuilt (without vectors) at
-    the indexer's next run, up to 5 minutes later; copies made before a migration hold no folder index; the folder
+    the indexer's next run, up to 5 minutes later; copies made before a migration hold no folder index. Done
+    (Welle 5, all fail closed): a failed removal before such a rebuild no longer leaves the rebuild marked as running
+    and the folder index held back (the rebuild does not start; the next one tries again); a legacy vector table
+    that cannot be cleaned leaves a copy completely (no broken table in a backup); a copy whose folder chunks cannot
+    be removed loses its whole search index instead of failing the migration; copies an older release made before a
+    migration lose their folder index at the next start. The folder
     budgets (400 chunks per file, 50,000 chunks and 512 MiB per folder) are constants, not grant settings;
   - the run event `folder_file_read` names a run's sources live; a stored list of sources per answer is not built
     yet (the tool results name them);

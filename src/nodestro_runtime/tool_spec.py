@@ -378,6 +378,10 @@ class RunServices:
     #: reach the embedding model at the given address (the one it really sends to,
     #: :meth:`~nodestro_runtime.knowledge.KnowledgeBase.views`); ``None``: no check.
     embedding_check: Callable[[str | None], None] | None = None
+    #: RT-089d (Welle 5): asked with the tool's name before each call resolves its connection, in a step that opened a
+    #: person's memory space under their consent; raises :class:`ToolResultError` when the connection (or anything
+    #: else the consent covers) changed since the step's check. ``None``: no check.
+    connection_check: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -545,7 +549,8 @@ def bind_tool(
     services: RunServices | None = None,
 ) -> SpecTool:
     """``tool`` under ``spec`` with an agent's ``settings``. The connection is resolved at each call (a changed secret
-    applies to the next call), through ``resolve(connection_id, connection_type)``."""
+    applies to the next call), through ``resolve(connection_id, connection_type)``, after the services'
+    ``connection_check`` (a step under a memory consent refuses a connection changed since its check)."""
     connection_id = settings.connection_id if settings is not None else None
 
     def connection() -> ResolvedConnection | None:
@@ -555,6 +560,8 @@ def bind_tool(
             raise ToolResultError(
                 f"Error: {tool.name} has no {spec.connection_type} connection (check.connection_missing)"
             )
+        if services is not None and services.connection_check is not None:
+            services.connection_check(tool.name or "")  # before the connection is read (a refusal raises)
         try:
             return resolve(connection_id, spec.connection_type)
         except Exception as exc:  # the code only: a service message could carry an address or a secret

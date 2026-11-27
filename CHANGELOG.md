@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Security (Welle 5, small follow-ups; every switch stays off by default):
+  - RT-089d: a memory consent's digest also covers the address of each model server with a configurable address
+    (`compatible`, `ollama`, `vllm`, also the quality judge's) and the lock of the workflow's approved Python
+    environment (`Workspace.consent_environment`, `memory_consents.with_environment`); a connection edited while a step
+    under a consent runs is refused at its next call (`RunServices.connection_check`). Digests of workflows without
+    either are unchanged.
+  - N-12: a failed removal of the folder indexes before a rebuild no longer leaves the rebuild marked as running and
+    the folder index held back; copies hold no broken legacy vector table (`storage.strip_index_sources`); a copy
+    whose folder chunks cannot be removed loses its whole search index instead of failing the migration
+    (`storage.drop_search_index`); older copies before a migration are stripped at the start
+    (`workspace.strip_migration_copies`).
+  - Tool approvals: a call the MCP service refuses right before the send gets `tool.approval_stale` on its record and
+    its request is audited `stale` (also when the run waited in a thread; `CallBinding.refused`).
+
 - Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
   ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of
   Nodestro's own distribution, verified against their `RECORD` hashes and loaded from the verified bytes

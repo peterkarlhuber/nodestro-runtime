@@ -224,7 +224,14 @@ access log names the grant, and the run is marked as holding granted content (N-
 - **Copies.** The copy of the database made before a schema migration (`<data dir>/backups/pre-migration-*.db`)
   holds no folder index (`storage.strip_copy`, review L-b); backups, the safety backup before a restore and the data
   export leave it out in the API (its `docs/backup.md`). The index is built again from the folder while the grant
-  holds.
+  holds. Fail closed without blocking (Welle 5): a legacy `vec0` vector table that cannot be cleaned leaves the copy
+  with its storage tables and its schema entry (no broken table stays); when a folder's chunks cannot be removed one
+  by one, the copy loses its whole search index instead (`storage.drop_search_index`; the knowledge files stay) and
+  the migration goes on; copies an older release made before a migration lose their folder index at the next start
+  (`workspace.strip_migration_copies`).
+- **A failed removal before a rebuild.** When removing the folder indexes before a rebuild of the semantic index fails,
+  the rebuild does not start (`knowledge.reindex_failed`; it would embed what is left) and nothing stays marked: the
+  folder indexes keep working and the next rebuild tries again (Welle 5).
 - **Switch.** The index exists only while `NODESTRO_FOLDER_GRANTS=1` and never in the server profile. With the switch
   off, the workspace removes every folder index at its start.
 
@@ -247,7 +254,8 @@ access log names the grant, and the run is marked as holding granted content (N-
   and provenance switches (review H-1), a server on this computer embeds it in every combination, and a rebuild for a
   server elsewhere drops the folder indexes first, a folder indexed for the first time while such a rebuild runs is
   not embedded in any combination (review H-1b), and the rebuild's model stops at a folder chunk from any route.
-  `tests/test_folder_index.py` also covers the copy before a migration and the legacy vector table.
+  `tests/test_folder_index.py` also covers the copy before a migration, the legacy vector table, a copy that cannot
+  be stripped and older copies; `tests/test_content_provenance.py` a failed removal before a rebuild.
 
 ## Not in this step
 

@@ -622,7 +622,8 @@ def strip_index_sources(connection: sqlite3.Connection, prefix: str, collections
     removed (the caller then commits and runs ``VACUUM`` with ``secure_delete`` on, so nothing stays in a free page).
 
     The legacy vector table (``index_vec``, ``vec0``: ``embedder=`` callables, which Nodestro never uses) is cleaned
-    when its module is loaded; else its storage tables are dropped (fail closed: its vectors are derived data)."""
+    when its module is loaded; else it is removed with its storage tables (fail closed: its vectors are derived data),
+    so the copy holds no broken virtual table either (Welle 5)."""
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     removed = False
     if "nodestro_documents" in tables and collections:
@@ -643,8 +644,7 @@ def strip_index_sources(connection: sqlite3.Connection, prefix: str, collections
         try:
             connection.execute(f"DELETE FROM index_vec WHERE rowid IN ({chunk_ids})", values)
         except sqlite3.OperationalError:
-            for name in sorted(table for table in tables if table.startswith("index_vec_")):
-                connection.execute(f'DROP TABLE "{name}"')
+            _drop_legacy_vectors(connection, tables)
     connection.execute(f"DELETE FROM index_chunks WHERE {matching}", values)
     if "index_fts" in tables:
         # The full-text index reads its text from index_chunks: rebuilt, it holds no term of the removed text.
@@ -652,14 +652,70 @@ def strip_index_sources(connection: sqlite3.Connection, prefix: str, collections
     return True
 
 
-def strip_copy(database: Path, prefix: str, collections: tuple[str, ...]) -> None:
-    """:func:`strip_index_sources` on the SQLite database file ``database`` (a copy nothing else has open)."""
+def _drop_table(connection: sqlite3.Connection, name: str) -> None:
+    """Drop the table ``name`` of a copy; a virtual table whose module this connection has not loaded (the legacy
+    ``vec0`` table) cannot be dropped, so its schema entry is removed instead (its storage tables are dropped by
+    name). Only for copies nothing else has open."""
+    try:
+        connection.execute(f'DROP TABLE IF EXISTS "{name}"')
+    except sqlite3.OperationalError:
+        connection.execute("PRAGMA writable_schema = ON")
+        try:
+            connection.execute("DELETE FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+        finally:
+            connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute("PRAGMA writable_schema = RESET")
+
+
+def _drop_legacy_vectors(connection: sqlite3.Connection, tables: set[str]) -> None:
+    """Remove the legacy vector table (``index_vec``) and its storage tables from a copy."""
+    for name in sorted(table for table in tables if table.startswith("index_vec_")):
+        connection.execute(f'DROP TABLE IF EXISTS "{name}"')
+    if "index_vec" in tables:
+        _drop_table(connection, "index_vec")
+
+
+def drop_search_index(connection: sqlite3.Connection, collections: tuple[str, ...]) -> None:
+    """Remove the whole search index (every ``index_`` table: chunks, vectors, full-text index, the legacy vector
+    table) and every document of ``collections`` from a copy: the fail-closed fallback of :func:`strip_copy` when a
+    granted folder's chunks cannot be removed one by one. The knowledge files stay; their index is derived data."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "nodestro_documents" in tables and collections:
+        marks = ", ".join("?" for _ in collections)
+        connection.execute(f"DELETE FROM nodestro_documents WHERE collection IN ({marks})", collections)
+    _drop_legacy_vectors(connection, tables)
+    if "index_fts" in tables:
+        _drop_table(connection, "index_fts")  # also its own storage tables
+    left = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    for name in sorted(table for table in left if table.startswith("index_")):
+        _drop_table(connection, name)
+
+
+def strip_copy(database: Path, prefix: str, collections: tuple[str, ...]) -> bool:
+    """:func:`strip_index_sources` on the SQLite database file ``database`` (a copy nothing else has open).
+
+    Fail closed without blocking the caller (Welle 5): when the chunks cannot be removed one by one (a damaged
+    full-text or vector table), the copy loses its whole search index instead (:func:`drop_search_index`); only
+    when that fails too does it raise. Returns whether anything was removed."""
     connection = sqlite3.connect(database)
     try:
         connection.execute("PRAGMA secure_delete = ON")
-        if strip_index_sources(connection, prefix, collections):
+        try:
+            removed = strip_index_sources(connection, prefix, collections)
+        except sqlite3.Error as exc:
+            connection.rollback()
+            logger.warning(
+                "A granted folder's index could not be removed from %s (%s); the copy's whole search index is "
+                "removed instead",
+                database.name,
+                type(exc).__name__,
+            )
+            drop_search_index(connection, collections)
+            removed = True
+        if removed:
             connection.commit()
             connection.execute("VACUUM")
+        return removed
     finally:
         connection.close()
 
@@ -1158,6 +1214,7 @@ __all__ = [
     "RawDocuments",
     "SQLiteStore",
     "Store",
+    "drop_search_index",
     "stopped_documents",
     "strip_copy",
     "strip_index_sources",

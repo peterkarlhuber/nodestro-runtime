@@ -25,7 +25,18 @@ from nodestro_runtime.memory_consents import MAX_TARGETS, combined_digest, conse
 from nodestro_runtime.memory_spaces import CONSENTS, NOBODY
 from nodestro_runtime.notifications import LocalInbox, RunNotifier
 from nodestro_runtime.problems import NodestroError
-from nodestro_runtime.schemas import AgentConfig, MemoryConfig, NotificationRules, Run, RunIn, ToolSettings, Workflow
+from nodestro_runtime.python_envs import PythonEnvironment, scope_of
+from nodestro_runtime.schemas import (
+    AgentConfig,
+    MemoryConfig,
+    NotificationRules,
+    QualityConfig,
+    Run,
+    RunIn,
+    SettingsIn,
+    ToolSettings,
+    Workflow,
+)
 from nodestro_runtime.testing import ScriptedClient, text, tool_use
 from nodestro_runtime.tool_library import CUSTOM_TESTS_TEMPLATE, CUSTOM_TOOL_TEMPLATE
 from nodestro_runtime.workspace import Workspace
@@ -409,6 +420,80 @@ def test_a_changed_mcp_server_or_tool_makes_the_consent_stale(make: Make) -> Non
     assert workspace.runs.consent_digest(flow) == before
     workspace.store.put(TOOLS, tool.key, tool.model_copy(update={"hash": "0" * 64}))
     assert workspace.runs.consent_digest(flow) != before
+
+
+def test_another_model_server_makes_the_consent_stale(make: Make) -> None:
+    """Welle 5: an agent of a provider with a configurable address (an OpenAI-compatible server, Ollama, vLLM) sends
+    its whole context to the server the settings name. Before, the digest left that address out, so an administrator
+    could point the provider at another server under Alice's consent. Now another address makes the consent stale
+    (the API's grant answers ``409 memory.consent_stale`` for the digest shown before); the address of a provider
+    without one (Anthropic) is not part of the digest."""
+    workspace = make({})
+    workspace.update_settings(SettingsIn(providers={"compatible": {"base_url": "https://models.example.com/v1"}}))
+    agent = _agent().model_copy(update={"model": "compatible:my-model"})
+    flow = workspace.save_workflow(_flow("wf_endpoint", _agent_node("a", agent)))
+    plain = workspace.save_workflow(_flow("wf_plain", _agent_node("a", _agent())))
+    _allow(workspace, flow.id)
+    _allow(workspace, plain.id)
+    tested = workspace.runs.agent_consent_digest(agent)
+    before = _digest(workspace, plain)
+    assert _consented(workspace, flow) and _consented(workspace, plain)
+    workspace.update_settings(SettingsIn(providers={"compatible": {"base_url": "https://elsewhere.example.com/v1"}}))
+    assert not _consented(workspace, flow)
+    assert workspace.runs.agent_consent_digest(agent) != tested  # an agent test's consent too
+    assert _consented(workspace, plain) and _digest(workspace, plain) == before
+    # The quality judge's server counts too, when the agent uses one.
+    judged = _agent().model_copy(
+        update={"quality": QualityConfig(enabled=True, criteria=[], judge_model="compatible:judge")}
+    )
+    judge_before = workspace.runs.agent_consent_digest(judged)
+    workspace.update_settings(SettingsIn(providers={"compatible": {"base_url": "https://third.example.com/v1"}}))
+    assert workspace.runs.agent_consent_digest(judged) != judge_before
+
+
+def test_other_approved_library_versions_make_the_consent_stale(make: Make) -> None:
+    """Welle 5: a workflow's custom tools import the libraries of its approved Python environment, in the versions
+    of its lock. The digest covers the lock, so approving other versions (same tool code) makes the consent stale;
+    a workflow without an environment keeps its digest."""
+    workspace = make({})
+    flow = workspace.save_workflow(_flow("wf_libs", _agent_node("a", _agent())))
+    without = _digest(workspace, flow)
+    scope = scope_of("workflow", flow.id)
+    environment = PythonEnvironment(scope=scope, kind="workflow", ref=flow.id, lock="pandas==2.2.0\n")
+    workspace.python._put(environment)
+    _allow(workspace, flow.id)
+    assert _consented(workspace, flow) and _digest(workspace, flow) != without
+    workspace.python._put(environment.model_copy(update={"lock": "pandas==2.2.1\n"}))
+    assert not _consented(workspace, flow)
+
+
+async def test_a_connection_edited_while_the_step_runs_is_not_used(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Welle 5: a step checks Alice's consent once, before it opens her space; its tools read their connection at
+    each call. A connection edited while the step runs (here: a new secret between two searches) would get her
+    memory under the old consent. Now each call of a step under a consent checks again and refuses a changed
+    connection (fail closed); the call before the edit ran as consented."""
+    monkeypatch.setenv("NODESTRO_VAULT_KEY", "a" * 44)
+    search = tool_use("search_web", {"query": "weather"}, call_id="t1")
+    workspace = make({})
+    hook = workspace.connections.create(ConnectionIn(type="search", name="Search", provider="test"))
+    workspace.connections.set_secret(hook.id, "a token")
+
+    def edited_then_search(_request: Any) -> Any:
+        workspace.connections.set_secret(hook.id, "another token")
+        return tool_use("search_web", {"query": "weather again"}, call_id="t2")
+
+    workspace.client.messages.script["MEM"] = [VIEW, search, edited_then_search, text("done")]  # type: ignore[attr-defined]
+    _seed(workspace)
+    bound = {"search_web": ToolSettings(connection_id=hook.id)}
+    agent = _agent().model_copy(update={"tools": ["search_web"], "tool_settings": bound})
+    flow = workspace.save_workflow(_flow("wf_edit", _agent_node("a", agent)))
+    _allow(workspace, flow.id)
+    done = await _start(workspace, flow)
+    assert done.status == "succeeded", done.error
+    calls = {call.id: call for call in done.nodes["a"].tool_calls}
+    assert not calls["t1"].is_error, calls["t1"].output
+    assert calls["t2"].is_error and "memory.consent_required" in (calls["t2"].output or "")
+    assert not _consented(workspace, flow)  # and the next run needs a new consent
 
 
 async def test_a_sub_workflow_without_saved_versions_is_covered_by_its_content(make: Make) -> None:

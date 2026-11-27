@@ -473,6 +473,110 @@ def test_the_copy_before_a_migration_holds_no_folder_index(workspace: Workspace,
     assert _folder_chunks(workspace)  # the live index is untouched
 
 
+def _legacy_copy(path: Path) -> None:
+    """A copy with a folder chunk, a knowledge chunk and a real legacy ``vec0`` table (its schema entry as sqlite-vec
+    writes it, and its storage tables) that this connection cannot load."""
+    import sqlite3
+
+    database = sqlite3.connect(path)
+    database.executescript(
+        "CREATE TABLE index_chunks (id INTEGER PRIMARY KEY, namespace TEXT, source TEXT, title TEXT, file_id TEXT,"
+        " metadata TEXT, text TEXT);"
+        "INSERT INTO index_chunks VALUES (1, 'nodestro', 'folder:fg_1/plan.txt', 'plan', NULL, '{}', 'harbour secret');"
+        "INSERT INTO index_chunks VALUES (2, 'nodestro', 'file_1', 'returns', 'file_1', '{}', 'refund');"
+        "CREATE TABLE index_vec_chunks (rowid INTEGER, vectors BLOB);"
+        "INSERT INTO index_vec_chunks VALUES (1, x'c0ffee00c0ffee00');"
+        "CREATE TABLE index_vec_rowids (rowid INTEGER, id INTEGER);"
+    )
+    database.execute("PRAGMA writable_schema = ON")
+    database.execute(
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', 'index_vec', 'index_vec', 0,"
+        " 'CREATE VIRTUAL TABLE index_vec USING vec0(namespace TEXT partition key, embedding float[4])')"
+    )
+    database.commit()
+    database.close()
+
+
+def test_a_copy_holds_no_broken_legacy_vector_table(tmp_path: Path) -> None:
+    """N-12 (Welle 5): when the legacy ``vec0`` table cannot be cleaned, its storage tables were dropped but its
+    schema entry stayed, so a backup or a copy held a broken virtual table (any reader with sqlite-vec failed on it).
+    Now the table goes with its storage; the copy is whole and keeps the knowledge chunks."""
+    import sqlite3
+
+    from nodestro_runtime.storage import strip_copy
+
+    copy = tmp_path / "copy.db"
+    _legacy_copy(copy)
+    assert strip_copy(copy, FOLDER_SOURCE, (FILES, STATES))
+    with sqlite3.connect(copy) as connection:
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+        assert not any(name.startswith("index_vec") for name in names)
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert [row[0] for row in connection.execute("SELECT source FROM index_chunks")] == ["file_1"]
+    data = copy.read_bytes()
+    assert b"harbour secret" not in data and b"\xc0\xff\xee\x00" not in data
+
+
+def test_a_copy_that_cannot_be_stripped_loses_its_search_index_and_the_migration_goes_on(
+    workspace: Workspace, docs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-12 (Welle 5): a failure while removing a folder's chunks from the copy before a migration (a damaged
+    full-text table) failed the copy and with it the migration. Now the copy loses its whole search index instead
+    (fail closed: the knowledge files stay, nothing of the folder), and the copy is made."""
+    import sqlite3
+
+    from nodestro_runtime import storage
+    from nodestro_runtime.workspace import backup_migrated_database
+
+    workspace.knowledge.add(b"Customers get a refund within thirty days.", name="returns.md")
+    folder = _grant(workspace, docs)
+    _index(workspace).sync(folder.id)
+
+    def damaged(*_args: Any) -> bool:
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(storage, "strip_index_sources", damaged)
+    copy = backup_migrated_database(workspace.sqlite_store, tmp_path / "backups", 1, 2)
+    assert copy.exists() and b"harbour project" not in copy.read_bytes()
+    with sqlite3.connect(copy) as connection:
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert not any(name.startswith("index_") for name in names)
+        assert "stored_files" in names  # the knowledge files stay
+        collections = {row[0] for row in connection.execute("SELECT DISTINCT collection FROM nodestro_documents")}
+        assert not collections & {FILES, STATES}
+    assert _folder_chunks(workspace)  # the live index is untouched
+
+
+def test_copies_made_before_the_fix_lose_their_folder_index_at_the_start(base: Path, docs: Path) -> None:
+    """N-12 (Welle 5): copies an older release made before a migration (``backups/pre-migration-*.db``) still held a
+    folder's text, which outlives the grant. A workspace removes it from them at its start and leaves other copies
+    and the knowledge in them as they are."""
+    import shutil
+    import sqlite3
+
+    first = _open(base)
+    try:
+        first.knowledge.add(b"Customers get a refund within thirty days.", name="returns.md")
+        folder = _grant(first, docs)
+        _index(first).sync(folder.id)
+        backups = first.data_dir / "backups"
+        backups.mkdir(exist_ok=True)
+        old = backups / "pre-migration-1-to-2-20260101T000000000000Z.db"
+        first.sqlite_store.snapshot(old)  # as a release before the fix wrote it: with the folder's index
+        other = backups / "notes.db"
+        shutil.copy(old, other)
+    finally:
+        first.close()
+    assert b"harbour project" in old.read_bytes()
+    second = _open(base)
+    second.close()
+    assert b"harbour project" not in old.read_bytes()
+    with sqlite3.connect(old) as connection:
+        sources = [row[0] for row in connection.execute("SELECT source FROM index_chunks")]
+        assert sources and not any(source.startswith(FOLDER_SOURCE) for source in sources)
+    assert b"harbour project" in other.read_bytes()  # not a copy before a migration: not touched
+
+
 def test_a_legacy_vector_table_that_cannot_be_cleaned_loses_its_storage(tmp_path: Path) -> None:
     """N-12 review L-a: fail closed. When the legacy ``vec0`` table cannot be cleaned (its module is not loaded), its
     storage tables are dropped instead of keeping vectors of a folder's text."""

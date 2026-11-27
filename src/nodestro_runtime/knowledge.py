@@ -692,12 +692,12 @@ class KnowledgeBase:
         with self._lock:
             if self._job is not None and self._job.state == "running":
                 raise NodestroError("knowledge.reindex_running", "The semantic index is already being built")
+            if not folders:
+                self._reset_folders()
             job = ReindexJob(model=name)
             cancel = threading.Event()
             self._job, self._job_cancel = job, cancel
             self._reindex_folders = folders
-            if not folders:
-                self.folder_reset()
         threading.Thread(
             target=self._build, args=(job, model, cancel, None), name="nodestro-reindex", daemon=True
         ).start()
@@ -721,11 +721,30 @@ class KnowledgeBase:
             return job
         folders = self._folders_embeddable(model)
         with self._lock:
-            self._reindex_folders = folders
             if not folders:
-                self.folder_reset()
+                try:
+                    self._reset_folders()
+                except NodestroError as exc:
+                    job.state, job.error_code, job.error = "failed", exc.code, str(exc)
+                    job.finished_at = datetime.now(UTC)
+                    return job
+            self._reindex_folders = folders
         self._build(job, model, cancel, progress)
         return job
+
+    def _reset_folders(self) -> None:
+        """Remove every folder index before a reindex whose model may not embed folder text (:attr:`folder_reset`).
+        Fail closed and recoverable (Welle 5): when the removal fails, the reindex does not start (folder chunks may
+        be left, and it would embed them) and nothing stays marked, so folder indexes keep working and the next
+        reindex tries again. Called with the lock held, before the reindex is marked as running."""
+        try:
+            self.folder_reset()
+        except Exception as exc:
+            logger.exception("Removing the folder indexes before a reindex failed")
+            raise NodestroError(
+                "knowledge.reindex_failed",
+                "The folder indexes could not be removed before building the semantic index; try again",
+            ) from exc
 
     def _build(
         self,

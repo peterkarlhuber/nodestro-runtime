@@ -658,6 +658,8 @@ class McpService:
         elif gated and tool.access != "read":
             stale = True
         if stale:
+            if binding is not None:
+                binding.refused.append("tool.approval_stale")  # the engine records and audits it (CallBinding)
             raise NodestroError(
                 "tool.approval_stale",
                 f"{tool_name} was classified or approved differently since the gate checked this call; it was not made",
@@ -680,6 +682,7 @@ class McpService:
         both here and again right before the request is sent (after listing the server's tools on the same
         connection). A change that lands after the request was sent applies from the next call on."""
         server, tool = self._usable_as_bound(tool_name, gated=gated)
+        binding = bound_call(tool_name)
         credential = self.credential(server)
 
         def confirm() -> bool:
@@ -702,6 +705,8 @@ class McpService:
         finally:
             self._keep_refreshed(server, credential)
         if result.refused:
+            if binding is not None and not binding.refused:
+                binding.refused.append("tool.approval_stale")
             raise NodestroError(
                 "tool.approval_stale",
                 f"{tool_name} was classified or approved differently right before the call; it was not made",
