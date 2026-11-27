@@ -96,4 +96,6 @@ def place_runtime(monkeypatch: pytest.MonkeyPatch, site: Path) -> Path:
     monkeypatch.setattr(trusted_integrations, "environment_problems", lambda *_args, **_options: [])
     # The site directories and ``sys.path`` folders of this interpreter are the environment's, not the test's.
     monkeypatch.setattr(trusted_integrations, "_scan_folders", lambda home: ([home], [home]))
+    # So is a ``sitecustomize`` of the interpreter running the tests (startup_hook_problems has tests of its own).
+    monkeypatch.setattr(trusted_integrations, "startup_hook_problems", lambda *_args, **_options: [])
     return real

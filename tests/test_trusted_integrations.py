@@ -365,8 +365,16 @@ def test_a_foreign_distribution_that_replaced_the_trusted_files_is_refused(
     assert not marker.exists() and TOP + ".ocr" not in sys.modules
 
 
-def _wheel(folder: Path, name: str, files: dict[str, str], *, data: dict[str, str] | None = None) -> Path:
-    """A minimal wheel: ``files`` at the top, ``data`` under ``<name>-1.0.data/purelib/``."""
+def _wheel(
+    folder: Path,
+    name: str,
+    files: dict[str, str],
+    *,
+    data: dict[str, str] | None = None,
+    entry_points: str | None = None,
+) -> Path:
+    """A minimal wheel of ``name`` 1.0: ``files`` at the top, ``data`` under ``<name>-1.0.data/purelib/``, and
+    ``entry_points`` (the text of ``entry_points.txt``) in its own ``.dist-info``."""
     import base64
     import hashlib
     import zipfile
@@ -375,6 +383,8 @@ def _wheel(folder: Path, name: str, files: dict[str, str], *, data: dict[str, st
     contents = {**files, **{f"{name}-1.0.data/purelib/{path}": text for path, text in (data or {}).items()}}
     contents[f"{info}/METADATA"] = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
     contents[f"{info}/WHEEL"] = "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    if entry_points is not None:
+        contents[f"{info}/entry_points.txt"] = entry_points
     record = ""
     for path, text in contents.items():
         digest = base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
@@ -641,3 +651,115 @@ def test_every_link_on_the_way_to_an_entry_is_checked(tmp_path: Path) -> None:
         ]
     finally:
         shared.chmod(0o755)
+
+
+# ---- review NEW-1 and NEW-2: a foreign wheel that replaces any module, or runs code at start -----------------------
+
+
+def _pip_target(site: Path, wheel: Path) -> None:
+    import subprocess
+
+    command = [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-index", "--upgrade", "--target"]
+    subprocess.run([*command, str(site), str(wheel)], check=True, capture_output=True)
+
+
+def _genuine_wheels(tmp_path: Path) -> list[Path]:
+    """The runtime's package, a dependency and the trusted integration, each as its own wheel."""
+    entry = "[nodestro.integrations]\ntesseract-ocr = nodestro_integrations.ocr:integration\n"
+    return [
+        _wheel(
+            tmp_path / "w-runtime",
+            "nodestro_runtime",
+            {"nodestro_runtime/__init__.py": "", "nodestro_runtime/trusted_integrations.py": "GENUINE = True\n"},
+        ),
+        _wheel(tmp_path / "w-dependency", "libdep", {"libdep/__init__.py": "SAFE = True\n"}),
+        _wheel(
+            tmp_path / "w-integration",
+            "nodestro_integrations",
+            {f"{TOP}/__init__.py": "", f"{TOP}/ocr.py": OCR_SOURCE},
+            entry_points=entry,
+        ),
+    ]
+
+
+def _installed(tmp_path: Path) -> Path:
+    site = Path(os.path.realpath(tmp_path)) / "site"
+    for wheel in _genuine_wheels(tmp_path):
+        _pip_target(site, wheel)
+    return site
+
+
+def test_genuine_wheels_installed_by_pip_have_no_problem(tmp_path: Path) -> None:
+    site = _installed(tmp_path)
+    info = "nodestro_integrations-1.0.dist-info"
+    runtime = site / "nodestro_runtime"
+    assert (
+        trusted_integrations.installation_problems(site, own=info, top=TOP, sites=[], folders=[], runtime=runtime) == []
+    )
+
+
+def test_a_foreign_wheel_that_replaces_the_runtime_s_checks_is_named(tmp_path: Path) -> None:
+    """NEW-1 with real pip: a wheel brings a neutered ``nodestro_runtime/trusted_integrations.py`` in its
+    ``.data/purelib``. Its RECORD names a file of the runtime's package: refused. (In a real attack the replaced
+    module would do this checking itself, see the docs: that case needs the environment closed.)"""
+    site = _installed(tmp_path)
+    neutered = {"nodestro_runtime/trusted_integrations.py": "def installation_problems(*a, **k):\n    return []\n"}
+    _pip_target(site, _wheel(tmp_path / "w-acme", "acme_ext", {"acme_ext/__init__.py": ""}, data=neutered))
+    problems = trusted_integrations.installation_problems(
+        site,
+        own="nodestro_integrations-1.0.dist-info",
+        top=TOP,
+        sites=[],
+        folders=[],
+        runtime=site / "nodestro_runtime",
+    )
+    assert f"acme_ext-1.0 in {site} also installed nodestro_runtime/trusted_integrations.py" in problems
+
+
+@pytest.mark.usefixtures("clean_imports")
+def test_a_foreign_wheel_that_replaces_a_dependency_refuses_the_trusted_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-1: any module the host imports can be replaced the same way (orkexa, pydantic …): one file, two RECORDs."""
+    site = _installed(tmp_path)
+    replaced = {"libdep/__init__.py": "SAFE = False\n"}
+    _pip_target(site, _wheel(tmp_path / "w-acme", "acme_ext", {"acme_ext/__init__.py": ""}, data=replaced))
+    place_runtime(monkeypatch, site)
+    info = site / "nodestro_integrations-1.0.dist-info"
+    assert discover(trusted_entries(info)) == []
+    [package] = find_packages(trusted_entries(info))
+    assert f"libdep-1.0 in {site} and acme_ext-1.0 in {site} both installed libdep/__init__.py" in package.rejected
+    assert TOP + ".ocr" not in sys.modules
+
+
+def _tree(folder: Path) -> dict[str, str]:
+    return {
+        path.relative_to(folder).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(folder.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("name", ["sitecustomize", "usercustomize"])
+def test_a_startup_module_on_the_path_is_refused(tmp_path: Path, name: str) -> None:
+    """NEW-2 with real pip: a wheel that ships only a top-level ``sitecustomize.py`` (or ``usercustomize.py``)."""
+    site = Path(os.path.realpath(tmp_path)) / "site"
+    _pip_target(site, _wheel(tmp_path / "w", "acme_ext", {f"{name}.py": "print('ran at start')\n"}))
+    assert trusted_integrations.startup_hook_problems(path=[str(site)], modules={}) == [
+        f"{name} ({site / (name + '.py')}) runs at every interpreter start"
+    ]
+    assert trusted_integrations.startup_hook_problems(path=[str(tmp_path / "w")], modules={}) == []
+
+
+def test_a_loaded_or_unreadable_startup_module_is_refused(tmp_path: Path) -> None:
+    import types
+
+    loaded = types.ModuleType("sitecustomize")
+    loaded.__file__ = str(tmp_path / "gone" / "sitecustomize.py")
+    assert trusted_integrations.startup_hook_problems(path=[], modules={"sitecustomize": loaded}) == [
+        f"sitecustomize ({loaded.__file__}) runs at every interpreter start"
+    ]
+    (tmp_path / "usercustomize").mkdir()  # a namespace folder: nothing to compare
+    assert trusted_integrations.startup_hook_problems(path=[str(tmp_path)], modules={}) == [
+        "usercustomize ((a namespace folder)) runs at every interpreter start"
+    ]

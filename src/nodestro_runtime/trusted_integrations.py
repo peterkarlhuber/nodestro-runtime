@@ -19,7 +19,10 @@ A distribution's name is its own statement, so it never decides trust by itself.
    either. Where these permissions cannot be read (Windows ACLs) the host import is refused;
 6. no other distribution in a site directory or a folder of ``sys.path`` has put files into the trusted package or
    its metadata (its ``RECORD`` names them, compared by file identity), no legacy installation is there, and every
-   ``.pth`` file of a site directory is a known one (:func:`installation_problems`, reviews H1 and N1 to N3);
+   ``.pth`` file of a site directory is a known one, and no file is named by two distributions' ``RECORD``s
+   (:func:`installation_problems`, reviews H1, N1 to N3 and NEW-1);
+7. no ``sitecustomize`` or ``usercustomize`` module that is not a known one is loaded or importable
+   (:func:`startup_hook_problems`, review NEW-2);
 
 and the import itself runs from exactly those verified bytes (:class:`_VerifiedFinder`, first on ``sys.meta_path``):
 no cached bytecode, no other copy of the package on ``sys.path``, no file the ``RECORD`` does not list. Anything that
@@ -294,6 +297,14 @@ def _scan_folders(home: Path) -> tuple[list[Path], list[Path]]:
     return sites, _real_folders([*sites, *entries])
 
 
+def _runtime_package() -> Path | None:
+    """The folder of the running ``nodestro_runtime`` package (real path)."""
+    import nodestro_runtime
+
+    location = getattr(nodestro_runtime, "__file__", None)
+    return Path(os.path.realpath(location)).parent if location else None
+
+
 def installation_problems(
     home: Path,
     *,
@@ -301,49 +312,90 @@ def installation_problems(
     top: str,
     sites: Sequence[Path] | None = None,
     folders: Sequence[Path] | None = None,
+    runtime: Path | None = None,
 ) -> list[str]:
-    """Why the files of the trusted distribution in ``home`` may not be its own (reviews H1, N1 to N3; empty: none).
+    """Why the files of the trusted distribution in ``home`` may not be its own (reviews H1, N1 to N3, NEW-1; empty:
+    none).
 
     ``own`` is its ``.dist-info`` folder, ``top`` its top-level package; ``sites`` and ``folders`` default to
-    :func:`_scan_folders`. Every installer records the files it put in place in its distribution's ``RECORD``, also
-    those a wheel brings in its ``.data`` folder (``purelib``, ``platlib``, ``data`` …, relative to the ``RECORD``'s
-    folder, with ``..`` where they lie elsewhere). So in every scanned folder:
+    :func:`_scan_folders`, ``runtime`` to the running ``nodestro_runtime`` package when it lies in ``home``. Every
+    installer records the files it put in place in its distribution's ``RECORD``, also those a wheel brings in its
+    ``.data`` folder (``purelib``, ``platlib``, ``data`` …, relative to the ``RECORD``'s folder, with ``..`` where they
+    lie elsewhere). Paths are compared by file identity (device and inode), never by name: another case on a
+    case-insensitive file system, a symbolic link or ``..`` reach the same file (N3). In every scanned folder:
 
-    - a ``.dist-info`` whose ``RECORD`` names a file in ``home/top`` or in ``home/own`` is refused. Paths are compared
-      by file identity, not by name: another case on a case-insensitive file system (macOS), a symbolic link or
-      ``..`` reach the same folder and count (N3);
+    - one file named by the ``RECORD``s of two distributions is refused: the later install replaced the earlier one's
+      file (NEW-1: any module the host imports, the runtime's, a dependency's or the integration's);
+    - a ``RECORD`` that names a file in the trusted package or its metadata folder, or in the running runtime's
+      package or its metadata folder, is refused unless it is that distribution's own;
     - a ``.dist-info`` without a readable ``RECORD``, and a legacy installation (``.egg-info``, ``.egg``,
-      ``.egg-link``) whose files cannot be told, are refused;
-    - ``home`` holds no other metadata folder of a trusted name;
+      ``.egg-link``) whose files cannot be told, are refused; so is a second metadata folder of the trusted name or
+      of the runtime next to the runtime;
 
     and every ``.pth`` file of a site directory must be one of :data:`KNOWN_PTH` (N1).
+
+    What this cannot see: a replaced copy of this module itself (or of a module imported before it) does the checking,
+    so it says what its author wants; files written without any installer. Both need write access to the runtime's
+    environment, which R1 leaves to trusted people and processes (``docs/extension-isolation.md``).
     """
     if sites is None or folders is None:
         default_sites, default_folders = _scan_folders(home)
         sites = default_sites if sites is None else sites
         folders = default_folders if folders is None else folders
+    if runtime is None:
+        package = _runtime_package()
+        runtime = package if package is not None and _identity(package.parent) == _identity(home) else None
     trusted = {normalized(name) for name in TRUSTED_DISTRIBUTIONS}
-    guarded = {identity for identity in (_identity(home / top), _identity(home / own)) if identity is not None}
     problems: list[str] = []
+    home_identity = _identity(home)
+    runtime_infos = sorted(
+        child.name
+        for child in (home.iterdir() if home.is_dir() else ())
+        if child.name.endswith(".dist-info") and normalized(child.name.split("-", 1)[0]) == "nodestro-runtime"
+    )
+    #: file system identity of a guarded folder -> the label of the one distribution that may name files in it.
+    areas: dict[tuple[int, int], str] = {}
+
+    def label(folder: Path, info: str) -> str:
+        return f"{info.removesuffix('.dist-info')} in {folder}"
+
+    for folder_path, owner in ((home / top, own), (home / own, own)):
+        identity = _identity(folder_path)
+        if identity is not None:
+            areas[identity] = label(Path(home), owner)
+    if runtime is not None:
+        if len(runtime_infos) != 1:
+            problems.append(f"{home} holds {len(runtime_infos)} metadata folders of nodestro-runtime, not one")
+        for info in runtime_infos[:1]:
+            for folder_path in (runtime, home / info):
+                identity = _identity(folder_path)
+                if identity is not None:
+                    areas[identity] = label(Path(home), info)
     known: dict[str, tuple[int, int] | None] = {}
 
-    def guards(target: Path) -> bool:
+    def area_of(target: Path) -> str | None:
         for folder in target.parents:
             key = str(folder)
             if key not in known:
                 known[key] = _identity(folder)
-            if known[key] in guarded:
-                return True
-        return False
+            found = known[key]
+            if found is not None and found in areas:
+                return areas[found]
+        return None
 
-    home_identity = _identity(home)
+    claims: dict[tuple[int, int], str] = {}
+    scanned: set[tuple[int, int] | None] = set()
     for folder in [Path(home), *(Path(entry) for entry in folders)]:
+        folder_identity = _identity(folder)
+        if folder_identity in scanned:
+            continue  # the same folder again, under another name
+        scanned.add(folder_identity)
         try:
             children = sorted(folder.iterdir())
         except OSError as exc:
             problems.append(f"cannot list {folder}: {exc.strerror}")
             continue
-        in_home = _identity(folder) == home_identity
+        in_home = folder_identity == home_identity
         for child in children:
             name = child.name
             if name.endswith((".egg-info", ".egg", ".egg-link")):
@@ -351,17 +403,26 @@ def installation_problems(
                 continue
             if not name.endswith(".dist-info"):
                 continue
-            if normalized(name.split("-", 1)[0]) in trusted:
-                if in_home and name != own:
-                    problems.append(f"{home} holds another metadata folder of a trusted name, {name}")
-                continue  # the trusted one, or a copy elsewhere (refused by its own checks)
+            if in_home and normalized(name.split("-", 1)[0]) in trusted and name != own:
+                problems.append(f"{home} holds another metadata folder of a trusted name, {name}")
+                continue
             listed = _record_paths(child)
             if listed is None:
                 problems.append(f"{name} in {folder} has no readable RECORD")
                 continue
+            mine = label(folder, name)
             for item in listed:
-                if guards(Path(os.path.join(folder, item))):
-                    problems.append(f"{name.removesuffix('.dist-info')} in {folder} also installed {item}")
+                target = Path(os.path.join(folder, item))
+                area_owner = area_of(target)
+                if area_owner is not None and area_owner != mine:
+                    problems.append(f"{mine} also installed {item}")
+                    break
+                identity = _identity(target)
+                if identity is None:
+                    continue
+                first = claims.setdefault(identity, mine)
+                if first != mine:
+                    problems.append(f"{mine} and {first} both installed {item}")
                     break
     for folder in dict.fromkeys(Path(entry) for entry in [home, *sites]):
         try:
@@ -377,6 +438,49 @@ def installation_problems(
             if hashlib.sha256(data).hexdigest() not in KNOWN_PTH:
                 problems.append(f"{pth} is not a known .pth file (the interpreter reads it at every start)")
     return list(dict.fromkeys(problems))
+
+
+#: The only ``sitecustomize`` and ``usercustomize`` modules accepted, by the SHA-256 of their exact bytes (review
+#: NEW-2). ``site`` imports them from ``sys.path`` at every interpreter start. The products have none (the desktop's
+#: python-build-standalone interpreter and the images' ``python:3.13-slim`` with a virtual environment), so the list
+#: is empty.
+KNOWN_STARTUP_MODULES: frozenset[str] = frozenset()
+STARTUP_MODULES = ("sitecustomize", "usercustomize")
+
+
+def startup_hook_problems(path: Sequence[str] | None = None, modules: dict[str, Any] | None = None) -> list[str]:
+    """Why code may run at every interpreter start (review NEW-2; empty: none): a ``sitecustomize`` or
+    ``usercustomize`` module that this process imported (``modules``, default :data:`sys.modules`) or that a search
+    of ``path`` (default ``sys.path``) finds, whose bytes are not in :data:`KNOWN_STARTUP_MODULES`. A package or a
+    module without a source file (a namespace folder, a compiled module) is refused, it cannot be compared."""
+    import importlib.machinery
+
+    loaded = sys.modules if modules is None else modules
+    search = list(sys.path if path is None else path)
+    problems: list[str] = []
+    for name in STARTUP_MODULES:
+        origins: list[str] = []
+        module = loaded.get(name)
+        if module is not None:
+            origins.append(str(getattr(module, "__file__", None) or "(no file)"))
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(name, search)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None:
+            origins.append(str(spec.origin or "(a namespace folder)"))
+        for origin in dict.fromkeys(origins):
+            try:
+                data = _read(Path(os.path.realpath(origin)))
+            except (OSError, UntrustedError, ValueError):
+                data = None
+            if (
+                data is None
+                or not origin.endswith(".py")
+                or hashlib.sha256(data).hexdigest() not in KNOWN_STARTUP_MODULES
+            ):
+                problems.append(f"{name} ({origin}) runs at every interpreter start")
+    return problems
 
 
 def verify(entry: metadata.EntryPoint, *, data_dir: str | Path | None = None) -> tuple[str, Path, dict[str, bytes]]:
@@ -409,6 +513,9 @@ def verify(entry: metadata.EntryPoint, *, data_dir: str | Path | None = None) ->
     problems = installation_problems(home, own=expected, top=top)
     if problems:
         raise UntrustedError("its installation is not its own: " + "; ".join(problems[:3]))
+    problems = startup_hook_problems()
+    if problems:
+        raise UntrustedError("code runs at every interpreter start: " + "; ".join(problems[:3]))
     sources: dict[str, bytes] = {}
     for item in dist.files or ():
         parts = item.parts
@@ -503,5 +610,6 @@ __all__ = [
     "installation_home",
     "installation_problems",
     "load",
+    "startup_hook_problems",
     "verify",
 ]
