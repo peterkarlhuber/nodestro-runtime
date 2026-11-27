@@ -189,6 +189,48 @@ def test_a_later_migration_backs_up_first(database: PostgresDatabase) -> None:
     assert database.schema_version == POSTGRES_SCHEMA_VERSION + 1
 
 
+def test_migration_0011_adds_the_memory_origin_and_keeps_the_files_written_before(database: PostgresDatabase) -> None:
+    """N-24 (Welle 7 check): a database at 0010 with memory files is migrated with a backup first; every old file keeps
+    its content and time and has no origin (NULL), a new write records its origin, and migrating again does nothing."""
+    from nodestro_runtime.memory_spaces import ORIGIN_USER, MemorySpaces
+    from nodestro_runtime.postgres_tables import PostgresMemoryTables
+
+    shipped = postgres_migrations()
+    assert shipped[11][0] == "0011_memory_origin.sql"
+    assert database.migrate(migrations={v: step for v, step in shipped.items() if v <= 10}) == 0
+    postgres_support.owner_of(database)._write(
+        "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content, updated_at)"
+        " VALUES (%s, %s, %s, %s, %s)",
+        ("local", "nodestro:Team", "old.md", "from before", "2026-01-02T03:04:05+00:00"),
+    )
+    columns = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s"
+    assert "origin" not in {row[0] for row in database._query(columns, (database.schema, "nodestro_memory_files"))}
+
+    calls: list[tuple[int, int]] = []
+    assert database.migrate(before_migration=lambda current, target: calls.append((current, target))) == 10
+    assert calls == [(10, POSTGRES_SCHEMA_VERSION)] and database.schema_version == POSTGRES_SCHEMA_VERSION
+    database.require_current_schema()
+    [(nullable, default)] = database._query(
+        "SELECT is_nullable, column_default FROM information_schema.columns"
+        " WHERE table_schema = %s AND table_name = 'nodestro_memory_files' AND column_name = 'origin'",
+        (database.schema,),
+    )
+    assert (nullable, default) == ("YES", None)
+
+    space = MemorySpaces(PostgresMemoryTables(database, "local")).open("Team")
+    [old] = space.entries()
+    assert (old.path, old.origin) == ("/memories/old.md", None)
+    assert old.updated_at is not None and old.updated_at.isoformat() == "2026-01-02T03:04:05+00:00"
+    assert space.read("/memories/old.md") == "from before"
+    space.write("/memories/new.md", "now")
+    assert {entry.path: entry.origin for entry in space.entries()} == {
+        "/memories/new.md": ORIGIN_USER,
+        "/memories/old.md": None,
+    }
+    assert database.migrate(before_migration=lambda *a: calls.append(a)) == POSTGRES_SCHEMA_VERSION
+    assert len(calls) == 1 and len(space.entries()) == 2
+
+
 def test_a_later_migration_without_a_backup_is_refused(database: PostgresDatabase) -> None:
     database.migrate()
     newer = _steps((POSTGRES_SCHEMA_VERSION + 1, ("next_extra.sql", "CREATE TABLE nodestro_extra (id text)")))

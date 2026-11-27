@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Tests (N-24, Welle 7): migration 0011 (memory origin) has its own PostgreSQL migration test, starting from 0010 with
+  existing memory files. No code change.
+
 - Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
   containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
   by the sandbox gateway exactly; tool classes and grants are modelled (`extension_classes`, nothing released, every
