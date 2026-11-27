@@ -45,13 +45,15 @@ None known.
 
 - **Priority:** P3 Low · **Status:** Open · **Refs:** [docs/memory-entries.md](memory-entries.md),
   `MemorySpaces`, `BrowsableMemory.entries`, migration `0011_memory_origin.sql`, Orkexa `MemoryBackend.list_entries`
-- **Done:** entries with time, origin (`tool`, `user`, `import`) and `scope` (`user`) on SQLite and PostgreSQL;
+- **Done:** entries with time, origin (`tool`, `user`, `import`, `assistant`) and `scope` (`user`) on SQLite and PostgreSQL;
   manual remembering only by a person's explicit write; owner rules of RT-089c unchanged.
 - **Open:**
   - the origin names the kind of writer, not which agent, run or workflow wrote (one shared connection per space;
     Orkexa's `execute(origin=)` would take a finer value);
   - the scopes `project` and `agent` are reserved names only: no space of a project or an agent exists yet;
-  - no creation time per entry (only the last write).
+  - no creation time per entry (only the last write);
+  - no paging: `BrowsableMemory.entries` returns every file of a space at once (N-24 review L3);
+  - on SQLite, listing entries takes Orkexa's write lock (`BEGIN IMMEDIATE`) like `view` (N-24 review L4).
 - **Next step:** owner decision whether the origin should name the run or agent.
 
 ### RT-089d · Private memory spaces: the owner's consent, private runs in every channel, open name questions

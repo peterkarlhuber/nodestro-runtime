@@ -13,7 +13,7 @@ and the entries come from Orkexa's `MemoryBackend.list_entries`.
 | `path` | the file below `/memories` |
 | `size` | its size in bytes |
 | `updated_at` | when it was last written (UTC) |
-| `origin` | who wrote it last: `tool` (an agent's memory tool), `user` (a person, by an explicit action), `import` (the memory seed of an imported project), `null` (unknown: written before origins were kept) |
+| `origin` | who wrote it last: `tool` (an agent's memory tool), `user` (a person, by an explicit action), `import` (the memory seed of an imported project), `assistant` (a person saved the memory assistant's proposal: model output), `null` (unknown: written before origins were kept) |
 | `scope` | whose space it is: today always `user` (one person's space); `project` and `agent` are reserved |
 
 A rename keeps the origin; an edit by the person makes it `user`. `MemorySpaceInfo` names the space's `scope` too.

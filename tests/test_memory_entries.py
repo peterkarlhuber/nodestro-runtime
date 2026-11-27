@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 
-from nodestro_runtime.memory_spaces import ORIGIN_IMPORT, ORIGIN_USER, MemorySpaces
+from nodestro_runtime.memory_spaces import ORIGIN_ASSISTANT, ORIGIN_IMPORT, ORIGIN_USER, ORIGINS, MemorySpaces
 
 
 def test_a_space_written_before_origins_were_kept_keeps_working(tmp_path: Path) -> None:
@@ -35,16 +35,19 @@ def test_a_space_written_before_origins_were_kept_keeps_working(tmp_path: Path) 
         assert space.read("/memories/old.md") == "from before"
         space.write("/memories/new.md", "now")
         space.write("/memories/seed.md", "seeded", origin=ORIGIN_IMPORT)
+        space.write("/memories/proposal.md", "proposed", origin=ORIGIN_ASSISTANT)
         assert {entry.path: entry.origin for entry in space.entries()} == {
             "/memories/new.md": ORIGIN_USER,
             "/memories/old.md": None,
+            "/memories/proposal.md": "assistant",
             "/memories/seed.md": ORIGIN_IMPORT,
         }
+        assert {"tool", "user", "import", "assistant"} == ORIGINS
     finally:
         spaces.close()
     # A second opening finds the column and changes nothing.
     reopened = MemorySpaces(database)
     try:
-        assert len(reopened.open("Team").entries()) == 3
+        assert len(reopened.open("Team").entries()) == 4
     finally:
         reopened.close()

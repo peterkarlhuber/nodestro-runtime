@@ -22,8 +22,9 @@ time. Without a consent the step fails with ``memory.consent_required`` (fail cl
 Entries (N-24): every file of a space is an entry the owner sees, edits and deletes (:meth:`BrowsableMemory.entries`,
 :meth:`~BrowsableMemory.write`, :meth:`~BrowsableMemory.remove`), with the time and origin of its last write from the
 Orkexa backend (:meth:`orkexa.memory.MemoryBackend.list_entries`): ``tool`` when an agent's memory tool wrote it,
-:data:`ORIGIN_USER` when a person wrote it by an explicit action (the HTTP API), ``None`` when unknown (written before
-origins were kept). Only an explicit action of a person writes with :data:`ORIGIN_USER`; no model tool does. Each
+:data:`ORIGIN_USER` when a person wrote it by an explicit action (the HTTP API), :data:`ORIGIN_ASSISTANT` when a
+person saved the memory assistant's proposal, :data:`ORIGIN_IMPORT` for an imported seed, ``None`` when unknown (written
+before origins were kept). Only an explicit action of a person writes with :data:`ORIGIN_USER`; no model tool does. Each
 entry and space names its ``scope``: today every space is one person's (``user``); ``project`` and ``agent`` are
 reserved for spaces of a project or of one agent.
 """
@@ -39,7 +40,7 @@ import threading
 from typing import Literal, Protocol
 
 from orkexa import SQLiteMemory
-from orkexa.memory import MEMORY_ROOT, MemoryBackend
+from orkexa.memory import MEMORY_ROOT, ORIGIN_TOOL, MemoryBackend
 from pydantic import BaseModel, Field
 
 from .problems import NodestroError
@@ -58,6 +59,10 @@ MemoryScope = Literal["user", "project", "agent"]
 ORIGIN_USER = "user"
 #: The origin of a file that came with an imported project (the memory seed of a standalone workflow).
 ORIGIN_IMPORT = "import"
+#: The origin of a file a person saved from the memory assistant's proposal: model output, not the person's own text.
+ORIGIN_ASSISTANT = "assistant"
+#: Every origin Nodestro writes (``None``, unknown, aside).
+ORIGINS = frozenset({ORIGIN_TOOL, ORIGIN_USER, ORIGIN_IMPORT, ORIGIN_ASSISTANT})
 
 
 class MemoryFile(BaseModel):
@@ -67,7 +72,7 @@ class MemoryFile(BaseModel):
     size: int
     #: When it was last written; ``None`` when the storage keeps no time.
     updated_at: datetime | None = None
-    #: Who wrote it last: ``tool`` (an agent's memory tool), ``user`` (a person, explicitly), ``None`` (unknown).
+    #: Who wrote it last: one of :data:`ORIGINS` (``tool``, ``user``, ``import``, ``assistant``) or ``None`` (unknown).
     origin: str | None = None
     scope: MemoryScope = "user"
 
