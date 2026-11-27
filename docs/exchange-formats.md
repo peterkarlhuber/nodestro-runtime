@@ -41,7 +41,7 @@ Every import runs the same steps, in this order, before anything is stored:
 
 1. **Size** before parsing: a JSON file at most 1 MB (`MAX_JSON_BYTES`); a collection file at most 256 MiB
    (`MAX_COLLECTION_BYTES`) with its manifest at most 2 MiB.
-2. **Nesting and syntax**: objects and lists nest at most 32 levels, counted before parsing (`MAX_DEPTH`,
+2. **Nesting and syntax**: objects and lists nest at most 32 levels, counted before parsing in linear time (`MAX_DEPTH`,
    `exchange.content_invalid` with the problem `too_deep`); valid JSON (`exchange.invalid_json`), an object.
 3. **Format and version** (`format_version`): `exchange.format_invalid` (not an exchange file),
    `exchange.format_mismatch` (another format), `exchange.version_newer`.
@@ -51,7 +51,8 @@ Every import runs the same steps, in this order, before anything is stored:
 5. **Archive** (collections only, `open_collection`): at most 501 entries, checked in the ZIP end record before
    zipfile reads the central directory: the declared count, and the directory's size (at most 256 bytes per declared
    entry, so at most about 125 KiB; `exchange.too_many_entries`), which must agree with the count and lie before the
-   end record, and no ZIP64 (`exchange.zip_invalid`); only `manifest.json` and `documents/<nnnn>` (`exchange.unsafe_path`
+   end record; the end record must be the last 22 bytes (no ZIP comment, which an export never writes and which could
+   hide a ZIP64 locator), and no ZIP64 (`exchange.zip_invalid`); only `manifest.json` and `documents/<nnnn>` (`exchange.unsafe_path`
    for absolute paths, `..`, backslashes, drive letters, links and duplicates; `exchange.unexpected_file` for any other
    name); no encrypted entries or other compression methods (`exchange.zip_invalid`); an entry over 1 MiB may expand
    at most 100 times (`exchange.zip_bomb`); at most 512 MiB unpacked and 50 MiB per document (`exchange.too_large`);

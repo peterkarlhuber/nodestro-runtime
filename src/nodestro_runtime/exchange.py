@@ -104,7 +104,10 @@ _SECRET_SHAPE = re.compile(
 )
 #: A command-line option that passes a secret (``--api-key=...``, or ``--token`` followed by the value).
 _SECRET_ARG = re.compile(r"^--?[A-Za-z0-9_.-]*(token|key|secret|passw|auth|credential)[A-Za-z0-9_.-]*(=.*)?$", re.I)
-_JSON_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"', re.S)
+#: An escape (removed first) and a string without escapes: both scanned once, so the count stays linear.
+_JSON_ESCAPE = re.compile(rb"\\.", re.S)
+_JSON_STRING = re.compile(rb'"[^"]*"')
+_NOT_BRACKETS = bytes(char for char in range(256) if char not in b"[]{}")
 
 
 class ExchangeError(NodestroError):
@@ -141,9 +144,10 @@ def format_version(value: object, expected: str) -> int:
 
 
 def json_depth(raw: bytes) -> int:
-    """How deeply objects and lists nest in the JSON text ``raw`` (counted before it is parsed)."""
-    brackets = [1 if char in b"[{" else -1 for char in _JSON_STRING.sub(b"", raw) if char in b"[]{}"]
-    return max(accumulate(brackets), default=0)
+    """How deeply objects and lists nest in the JSON text ``raw`` (counted before it is parsed, in linear time:
+    escapes are removed first, then strings, then everything but brackets)."""
+    brackets = _JSON_STRING.sub(b"", _JSON_ESCAPE.sub(b"", raw)).translate(None, _NOT_BRACKETS)
+    return max(accumulate(1 if char in b"[{" else -1 for char in brackets), default=0)
 
 
 def read_json(raw: bytes, expected: str, *, max_bytes: int = MAX_JSON_BYTES) -> dict[str, Any]:
@@ -513,15 +517,16 @@ def export_collection(knowledge: KnowledgeBase, name: str, target: IO[bytes]) ->
 
 def _check_directory(source: IO[bytes], size: int) -> None:
     """Check the end record of a ZIP file before zipfile reads its central directory (which zipfile reads whole, at the
-    size the end record names): the entry count and the directory's size must be small and agree, the directory must
-    lie before the end record, and ZIP64 (not needed for a collection's size) is refused."""
-    tail = min(size, 65_557)
+    size the end record names): the end record must be the file's last 22 bytes (no ZIP comment: an export writes
+    none, and a comment could hide a ZIP64 locator from this check), the entry count and the directory's size must be
+    small and agree, the directory must lie before the end record, and ZIP64 (not needed for a collection's size) is
+    refused."""
+    tail = min(size, 42)
     source.seek(size - tail)
     data = source.read(tail)
-    # The end record without a comment, else the last one in the tail: the one zipfile takes.
-    at = len(data) - 22 if data[-22:-18] == b"PK\x05\x06" and data[-2:] == b"\0\0" else data.rfind(b"PK\x05\x06")
-    if at < 0 or len(data) < at + 22:
-        raise ExchangeError("exchange.zip_invalid", "The file is not a readable ZIP file")
+    at = len(data) - 22
+    if at < 0 or data[at : at + 4] != b"PK\x05\x06" or data[-2:] != b"\0\0":
+        raise ExchangeError("exchange.zip_invalid", "The file is not a ZIP file without a comment")
     entries = int.from_bytes(data[at + 10 : at + 12], "little")
     directory_size = int.from_bytes(data[at + 12 : at + 16], "little")
     directory_offset = int.from_bytes(data[at + 16 : at + 20], "little")
@@ -530,7 +535,7 @@ def _check_directory(source: IO[bytes], size: int) -> None:
         raise ExchangeError("exchange.zip_invalid", "ZIP64 files are not read", name="ZIP64")
     if entries > MAX_DOCUMENTS + 1 or directory_size > (MAX_DOCUMENTS + 1) * _DIRECTORY_RECORD_MAX:
         raise ExchangeError("exchange.too_many_entries", "The file has too many entries", limit=MAX_DOCUMENTS + 1)
-    end = size - tail + at
+    end = size - 22
     if (
         not entries * _DIRECTORY_RECORD_MIN <= directory_size <= entries * _DIRECTORY_RECORD_MAX
         or directory_offset + directory_size > end

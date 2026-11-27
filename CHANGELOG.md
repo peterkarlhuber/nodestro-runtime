@@ -11,6 +11,8 @@
   is checked before zipfile reads it, the preview keeps no document in memory, JSON nesting is limited before
   parsing, OAuth issuer and resource no longer count as secrets, stdio arguments like `--api-key=...` are refused,
   imported documents have the origin `import` and the event `file.imported`, the collection check is atomic.
+  Re-check: the nesting count is linear (no backtracking pattern), and a ZIP comment is refused (it could hide a
+  ZIP64 locator from the end record check).
 
 - Security (N-22): tools of installed integrations run only in the Docker sandbox, never in the host process
   ([docs/extension-isolation.md](docs/extension-isolation.md)). `extensions.discover` imports only pinned entry points of

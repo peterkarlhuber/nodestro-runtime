@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 import tracemalloc
 from typing import Any
 import zipfile
@@ -90,6 +91,19 @@ def test_json_files_are_checked_for_size_syntax_and_shape_first() -> None:
     nested = b'{"format": "nodestro-mcp/1", "x": ' + b"[" * exchange.MAX_DEPTH + b"]" * exchange.MAX_DEPTH + b"}"
     assert code(lambda: exchange.read_json(nested, "nodestro-mcp")) == "exchange.content_invalid"
     assert exchange.read_json(nested.replace(b"[", b"", 1).replace(b"]", b"", 1), "nodestro-mcp")
+
+
+def test_the_nesting_count_is_linear_and_skips_strings() -> None:
+    # An unterminated string full of escaped quotes made a backtracking pattern quadratic (re-check F1).
+    for hostile in (b'"' + b'\\"' * 500_000, b'"' * 1_000_000, b'"\\' * 500_000, b"[" * 1_000_000):
+        started = time.perf_counter()
+        exchange.json_depth(hostile)
+        assert time.perf_counter() - started < 0.5
+    # Not JSON (the string never ends): its brackets may count, the parser refuses it anyway.
+    assert exchange.json_depth(b'"' + b'\\"' * 10 + b"[[") == 2
+    assert exchange.json_depth(b'["\\\\", ["]"], [[{"x": "\\"{"}]]]') == 4
+    assert exchange.json_depth(b'{"a": [1, {"b": []}], "c": "{{{{"}') == 4
+    assert exchange.json_depth(b"[]" * 1000) == 1
     assert code(lambda: exchange.read_json(b"[]", "nodestro-mcp")) == "exchange.format_invalid"
     with pytest.raises(NodestroError) as invalid:
         exchange.parse(
@@ -454,6 +468,28 @@ def test_a_large_central_directory_is_refused_before_zipfile_reads_it(
     assert code(lambda: exchange.import_collection(knowledge, io.BytesIO(package), dry_run=True)) == (
         "exchange.too_many_entries"
     )
+
+
+def test_a_zip_comment_or_zip64_locator_is_refused_before_zipfile_reads_it(
+    knowledge: KnowledgeBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Re-check F2: a 65535-byte comment puts the end record at the start of the last 64 KiB and the ZIP64 locator
+    # before it, where a check of the tail alone missed it; zipfile would take the ZIP64 directory size from there.
+    plain = lying_count(3, 3)
+    zipfile.ZipFile(io.BytesIO(plain)).close()  # the base file is a valid ZIP
+    at = plain.rfind(b"PK\x05\x06")
+    locator = b"PK\x06\x07" + b"\0" * 16
+    commented = plain[:at] + locator + plain[at : at + 20] + (65_535).to_bytes(2, "little") + b"c" * 65_535
+    short_comment = plain[:at] + plain[at : at + 20] + b"\x02\0hi"
+    with_locator = plain[:at] + locator + plain[at:]
+
+    def never(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("zipfile must not read this file")
+
+    monkeypatch.setattr(exchange.zipfile, "ZipFile", never)
+    for package in (commented, short_comment, with_locator):
+        answer = code(lambda package=package: exchange.import_collection(knowledge, io.BytesIO(package), dry_run=True))
+        assert answer == "exchange.zip_invalid"
 
 
 def test_the_preview_of_a_collection_keeps_no_document_in_memory(knowledge: KnowledgeBase) -> None:
