@@ -275,6 +275,31 @@ class FakeContainer:
         return done.returncode, BoundedOutput(stdout=done.stdout, stderr=done.stderr[-4096:], overflow=False)
 
 
+@pytest.fixture(autouse=True)
+def docker_cli(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A docker CLI for :class:`FakeContainer`: the sandbox confirms a stopped container's removal with ``docker ps``
+    (and ``docker rm``), which must not reach a real CLI or daemon (review L3). It lists no container and records each
+    call in the returned log, one line per call."""
+    folder = tmp_path_factory.mktemp("docker-cli")
+    log = folder / "calls.log"
+    script = folder / "docker.py"
+    script.write_text(
+        "import sys\n"
+        f"with open({str(log)!r}, 'a', encoding='utf-8') as out:\n"
+        "    out.write(' '.join(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        cli = folder / "docker.cmd"
+        cli.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+    else:
+        cli = folder / "docker"
+        cli.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+        cli.chmod(0o755)
+    monkeypatch.setattr(FakeContainer, "docker", str(cli))
+    return log
+
+
 class Containers:
     """The factory a workspace hands to :class:`ExtensionSandbox`, recording each sandbox it made."""
 
@@ -540,8 +565,9 @@ def test_each_call_runs_under_its_spec_time_limit(
         assert [made.timeout for made in containers.made][-2:] == [7.0, HOST_TOOL_TIMEOUT_SECONDS]
 
 
-def test_the_run_waits_for_the_containers_own_timeout(package: tuple[Path, Path]) -> None:
-    """At the limit the container's timeout answers (its container removed), not the abandoned-thread timeout."""
+def test_the_run_waits_for_the_containers_own_timeout(package: tuple[Path, Path], docker_cli: Path) -> None:
+    """At the limit the container's timeout answers (its container removed), not the abandoned-thread timeout. The
+    removal is confirmed through the fake docker CLI only (review L3: self-contained, no daemon needed)."""
     site, _marker = package
     [found] = find_packages(entry_points_of(next(site.glob("*.dist-info"))))
     containers = Containers()
@@ -553,6 +579,8 @@ def test_the_run_waits_for_the_containers_own_timeout(package: tuple[Path, Path]
     with pytest.raises(ToolExecutionError, match="Timed out after 2 seconds"):
         bound.execute({"seconds": -1})
     assert time.monotonic() - started < 2 + 10
+    [run] = containers.runs
+    assert docker_cli.read_text(encoding="utf-8").splitlines() == [f"ps -aq --filter name=^/?{run['name']}$"]
 
 
 # ---- the host side checks what comes back ---------------------------------------------------------------------------

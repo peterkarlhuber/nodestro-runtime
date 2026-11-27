@@ -8,6 +8,12 @@
   data directory, nothing writable by other users or foreign groups, nothing writable in a sealed installation).
   On Windows the host import is locked (ACLs are not checked), so OCR is unavailable there. `discover` and
   `find_packages` take `data_dir`. Trust boundary per product in `docs/extension-isolation.md`.
+  Independent review fixes: a foreign distribution in the runtime's directory whose `RECORD` lists files of the
+  trusted package or its metadata (also from a wheel's `.data/purelib`), a `.dist-info` there without `RECORD`, a
+  second metadata folder of the trusted name, a legacy `.egg-info`/`.egg`/`.egg-link`, or a `.pth` file with code
+  that is not a known one refuses the import (H1, `trusted_integrations.installation_problems`, tested with real
+  pip); a folder of root writable by a foreign group is refused (M1); the folder holding a symbolic link on the way
+  to an entry is checked (L1).
 
 - New (N-14): versioned exchange formats `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with
   one import check for all of them (`exchange`; [docs/exchange-formats.md](docs/exchange-formats.md)): size, format

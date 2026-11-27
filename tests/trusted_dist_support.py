@@ -94,4 +94,6 @@ def place_runtime(monkeypatch: pytest.MonkeyPatch, site: Path) -> Path:
     real = Path(os.path.realpath(site))
     monkeypatch.setattr(trusted_integrations, "installation_home", lambda: real)
     monkeypatch.setattr(trusted_integrations, "environment_problems", lambda *_args, **_options: [])
+    # The ``.pth`` files of this interpreter's own site directories are the environment's, not the test's.
+    monkeypatch.setattr(trusted_integrations.site, "getsitepackages", lambda: [])
     return real

@@ -147,9 +147,12 @@ None known.
   and the release per tool class after the internal and the independent review (gate G-6). The trust exception
   (WZ-8) is not implemented on purpose. R1 (owner decision 2026-11, accepted provisionally for internal
   development): only the copy next to the runtime, on a closed import path, is imported (`environment_problems`);
-  Windows is locked; the boundary per product is in `docs/extension-isolation.md`. Open: an end-to-end check of the
-  import path inside the Local Docker and server images, ACL checks for Windows. R2: an earlier normal import of
-  `nodestro_integrations` by host code is accepted by its real path.
+  Windows is locked; the boundary per product is in `docs/extension-isolation.md`. Independent review 2026-11-27
+  (BLOCK on #226) fixed: H1 (a foreign package in the runtime's directory whose `RECORD` lists trusted files, and
+  `.pth` files with unknown code, refuse the import), M1 (a group-writable folder of root counts), L1 (the folder
+  holding a symbolic link is checked). L2 (the process's primary group counts as its own) stays documented. Open:
+  an end-to-end check of the import path inside the Local Docker and server images, ACL checks for Windows. R2: an
+  earlier normal import of `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)

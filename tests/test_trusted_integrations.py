@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import sys
 from typing import Any
 
@@ -327,3 +328,194 @@ def test_without_readable_permissions_the_host_import_is_refused(
     assert trusted_integrations.environment_problems(tmp_path, path=[]) == [
         "the permissions of the import path cannot be checked on this system"
     ]
+
+
+# ---- review H1: another distribution in the same directory must not replace the trusted files ----------------------
+
+
+def _foreign_record(site: Path, name: str, paths: list[str]) -> Path:
+    """A foreign distribution's ``.dist-info`` whose ``RECORD`` lists ``paths`` (as pip writes it for a wheel that
+    brings them, also from its ``.data/purelib`` folder)."""
+    info = site / f"{name}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name.split('-')[0]}\nVersion: 1.0\n", encoding="utf-8"
+    )
+    (info / "RECORD").write_text("".join(f"{path},,\n" for path in [*paths, f"{info.name}/RECORD"]), encoding="utf-8")
+    return info
+
+
+@pytest.mark.usefixtures("clean_imports")
+def test_a_foreign_distribution_that_replaced_the_trusted_files_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's H1 case: a self-consistent forgery next to the runtime (hashes match its own RECORD), whose files
+    another distribution's RECORD lists. Without the check it is imported."""
+    site = tmp_path / "site"
+    place_runtime(monkeypatch, site)
+    marker = tmp_path / "imported-in-host.txt"
+    evil = OCR_SOURCE.replace("GENUINE = True", f"GENUINE = False\nopen({str(marker)!r}, 'w').write('x')")
+    info = write_distribution(site, files={f"{TOP}/__init__.py": "", f"{TOP}/ocr.py": evil})
+    _foreign_record(site, "acme_ext-1.0", [f"{TOP}/__init__.py", f"{TOP}/ocr.py", f"{info.name}/RECORD"])
+    assert discover(trusted_entries(info)) == []
+    [package] = find_packages(trusted_entries(info))
+    assert "its installation is not its own: acme_ext-1.0 also installed nodestro_integrations/__init__.py" in (
+        package.rejected
+    )
+    assert not marker.exists() and TOP + ".ocr" not in sys.modules
+
+
+def _wheel(folder: Path, name: str, files: dict[str, str], *, data: dict[str, str] | None = None) -> Path:
+    """A minimal wheel: ``files`` at the top, ``data`` under ``<name>-1.0.data/purelib/``."""
+    import base64
+    import hashlib
+    import zipfile
+
+    info = f"{name}-1.0.dist-info"
+    contents = {**files, **{f"{name}-1.0.data/purelib/{path}": text for path, text in (data or {}).items()}}
+    contents[f"{info}/METADATA"] = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    contents[f"{info}/WHEEL"] = "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    record = ""
+    for path, text in contents.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
+        record += f"{path},sha256={digest},{len(text.encode())}\n"
+    contents[f"{info}/RECORD"] = record + f"{info}/RECORD,,\n"
+    wheel = folder / f"{name}-1.0-py3-none-any.whl"
+    folder.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in contents.items():
+            archive.writestr(path, text)
+    return wheel
+
+
+@pytest.mark.usefixtures("clean_imports")
+def test_a_foreign_wheel_installed_by_pip_over_the_trusted_files_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1 with the real installer: a foreign wheel brings the trusted package and a matching ``.dist-info`` in its
+    ``.data/purelib`` folder; pip puts them next to the runtime and lists them in the foreign RECORD."""
+    import subprocess
+
+    site = tmp_path / "site"
+    marker = tmp_path / "imported-in-host.txt"
+    evil = OCR_SOURCE.replace("GENUINE = True", f"GENUINE = False\nopen({str(marker)!r}, 'w').write('x')")
+    forged = tmp_path / "forged"
+    trusted = write_distribution(forged, files={f"{TOP}/__init__.py": "", f"{TOP}/ocr.py": evil})
+    data = {
+        str(path.relative_to(forged).as_posix()): path.read_text(encoding="utf-8")
+        for path in sorted(forged.rglob("*"))
+        if path.is_file()
+    }
+    wheel = _wheel(tmp_path / "wheels", "acme_ext", {"acme_ext/__init__.py": ""}, data=data)
+    command = [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-index", "--target", str(site)]
+    subprocess.run([*command, str(wheel)], check=True, capture_output=True)
+    installed = site / trusted.name
+    assert (site / TOP / "ocr.py").read_text(encoding="utf-8") == evil and installed.is_dir()
+    place_runtime(monkeypatch, site)
+    entry = trusted_entries(installed)
+    assert discover(entry) == []
+    [package] = find_packages(entry)
+    assert "its installation is not its own: acme_ext-1.0 also installed nodestro_integrations" in package.rejected
+    assert not marker.exists() and TOP + ".ocr" not in sys.modules
+
+
+@pytest.mark.usefixtures("clean_imports")
+def test_the_genuine_installation_next_to_other_distributions_is_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = tmp_path / "site"
+    place_runtime(monkeypatch, site)
+    info = write_distribution(site)
+    _foreign_record(site, "acme_ext-1.0", ["acme_ext/__init__.py", "../../bin/acme", "nodestro_integrations_extra.py"])
+    (site / "paths.pth").write_text("# a folder only\n/opt/somewhere\n", encoding="utf-8")
+    (site / "distutils-precedence.pth").write_text(
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; "
+        "enabled and __import__('_distutils_hack').add_shim(); \n",
+        encoding="utf-8",
+    )
+    [found] = discover(trusted_entries(info))
+    assert found.name == "tesseract-ocr" and sys.modules[TOP + ".ocr"].GENUINE is True
+
+
+@pytest.mark.parametrize("change", ["no-record", "egg-info", "second-metadata", "metadata-replaced", "pth-code"])
+def test_every_installation_check_names_its_problem(tmp_path: Path, change: str) -> None:
+    site = Path(os.path.realpath(tmp_path)) / "site"  # macOS: /private/var, Windows: long names
+    info = write_distribution(site)
+    expected = {
+        "no-record": f"acme_ext-1.0.dist-info in {site} has no readable RECORD",
+        "egg-info": f"acme_ext-1.0.egg-info in {site} is a legacy installation whose files cannot be told",
+        "second-metadata": (
+            f"{site} holds another metadata folder of a trusted name, nodestro_integrations-0.1.0.dist-info"
+        ),
+        "metadata-replaced": f"acme_ext-1.0 also installed {info.name}/entry_points.txt",
+        "pth-code": f"{site / 'acme.pth'} runs code at every interpreter start",
+    }[change]
+    if change == "no-record":
+        (site / "acme_ext-1.0.dist-info").mkdir()
+    elif change == "egg-info":
+        (site / "acme_ext-1.0.egg-info").mkdir()
+    elif change == "second-metadata":
+        (site / "nodestro_integrations-0.1.0.dist-info").mkdir()
+    elif change == "metadata-replaced":
+        _foreign_record(site, "acme_ext-1.0", [f"{info.name}/entry_points.txt"])
+    else:
+        (site / "acme.pth").write_text("import acme_ext; acme_ext.start()\n", encoding="utf-8")
+    problems = trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[])
+    assert problems == [expected]
+    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[]) == problems
+
+
+def test_pth_files_of_the_site_directories_are_checked_too(tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    info = write_distribution(site)
+    other = _folder(tmp_path / "base-site")
+    (other / "a1_tool.pth").write_text("import sys; exec('print(1)')\n", encoding="utf-8")
+    assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, site_dirs=[str(other)]) == [
+        f"{other / 'a1_tool.pth'} runs code at every interpreter start"
+    ]
+
+
+# ---- review M1 and L1: a group of root's folder, and the folder that holds a symbolic link --------------------------
+
+
+@posix_only
+def test_a_folder_of_root_writable_by_another_group_is_a_problem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``root:staff 0775`` (gid 50): the members of that group can change it, owner root or not."""
+    home = _folder(tmp_path / "site-packages")
+    shared = _folder(tmp_path / "shared", 0o775)
+    real = trusted_integrations._status
+
+    def status(path: Path) -> os.stat_result:
+        info = real(path)
+        if path != shared:
+            return info
+        values = list(info)
+        values[stat.ST_UID], values[stat.ST_GID] = 0, 50
+        return os.stat_result(values)
+
+    monkeypatch.setattr(trusted_integrations, "_ids", lambda: (os.stat(home).st_uid, 4242))
+    monkeypatch.setattr(trusted_integrations, "_status", status)
+    monkeypatch.setattr(trusted_integrations, "_writable", lambda path: True)
+    assert trusted_integrations.environment_problems(home, path=[str(shared)]) == [
+        f"{shared} is writable by a group of other users"
+    ]
+    shared.chmod(0o755)
+    assert trusted_integrations.environment_problems(home, path=[str(shared)]) == []
+
+
+@posix_only
+def test_the_folder_holding_a_symbolic_link_on_the_path_is_checked(tmp_path: Path) -> None:
+    """Whoever can write the folder that holds the link can repoint the entry (review L1)."""
+    home = _folder(tmp_path / "site-packages")
+    target = _folder(tmp_path / "closed" / "lib")
+    shared = _folder(tmp_path / "shared", 0o777)
+    try:
+        (shared / "lib").symlink_to(target, target_is_directory=True)
+        assert trusted_integrations.environment_problems(home, path=[str(shared / "lib")]) == [
+            f"{shared} is writable by every user"
+        ]
+        assert trusted_integrations.environment_problems(home, path=[str(target)]) == []
+    finally:
+        shared.chmod(0o755)
