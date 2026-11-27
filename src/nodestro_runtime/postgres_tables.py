@@ -240,7 +240,7 @@ def require_knowledge_schema(database: PostgresDatabase) -> SchemaReport:
             "storage.schema_mismatch",
             "The knowledge and memory tables of the PostgreSQL database are not the ones this release reads:\n"
             + report.summary()
-            + "\nNothing was changed. Restore the tables of migrations 0001-0010 (see the server RUNBOOK)",
+            + "\nNothing was changed. Restore the tables of migrations 0001-0011 (see the server RUNBOOK)",
             problems=[str(problem) for problem in report.problems],
         )
     return report

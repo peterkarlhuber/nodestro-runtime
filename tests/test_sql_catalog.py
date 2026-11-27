@@ -89,6 +89,7 @@ EXPECTED: dict[str, bool] = {
     "memory_read": True,
     "memory_write": True,
     "memory_files": True,
+    "memory_entries": True,  # N-24: the entries with their time and origin
     "memory_delete": True,
     "memory_rename": True,
     "memory_clear": True,

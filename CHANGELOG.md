@@ -33,6 +33,14 @@
   (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
   process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
 
+- New (N-24): memory entries with their time and origin ([docs/memory-entries.md](docs/memory-entries.md)).
+  `MemoryFile` gains `updated_at`, `origin` (`tool`, `user`, `import`, `assistant` for a saved proposal of the memory
+  assistant, or `null` when unknown; `ORIGINS` lists them) and `scope` (`user`;
+  `project` and `agent` reserved), `MemorySpaceInfo` gains `scope`; `BrowsableMemory.write` records a person's
+  explicit write as `user`. Migration `0011_memory_origin.sql` adds the nullable column `origin` to
+  `nodestro_memory_files` (Orkexa's PostgreSQL schema version 2); older files list no origin. The desktop import to
+  PostgreSQL carries the origin.
+
 - New (N-20, off by default: `NODESTRO_WORKFLOW_TOOLS`): agents call saved workflows in a fixed version as tools
   (`AgentConfig.workflow_tools`, `workflow_tools`; [docs/workflow-tools.md](docs/workflow-tools.md)). A call is a
   child run of the agent's run through the one engine (budget, cancel and limits as a sub-workflow); its effect is

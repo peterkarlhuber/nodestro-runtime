@@ -12,6 +12,7 @@
     "0007_axentra_links.sql": "5cdbd4f63be6813a0ccd25c469e865aaaf3f73f5b5bece23402051fb6758b97e",
     "0008_tenant_status.sql": "afd8f83c39c8d82e1b91b099e5d737843008ecd1055077b580c921a46f53b3a8",
     "0009_created_order.sql": "bada36a3af623fb6b4a08e317c3e92cc4b275d8c56db6710c9bf6f2d4661e8ba",
-    "0010_knowledge_vectors.sql": "aadda58e1c14e6654bca42394e058ae85ad44309b2f017d9ec2f15409a6732f5"
+    "0010_knowledge_vectors.sql": "aadda58e1c14e6654bca42394e058ae85ad44309b2f017d9ec2f15409a6732f5",
+    "0011_memory_origin.sql": "452daf9055a1134b2a5b7d5284a5bcdde2c27c7d59043a9c941f129e2b581efd"
   }
 }
