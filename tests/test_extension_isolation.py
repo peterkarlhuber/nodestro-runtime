@@ -259,7 +259,7 @@ class FakeContainer:
         return ["docker", "run", "--name", name, image_id]
 
     def run_container(self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int) -> tuple[int, Any]:
-        if name.startswith("nodestro-ext-probe-"):
+        if name.startswith("nodestro-sandbox-ext-probe-"):
             self.probes += 1
             return 0, BoundedOutput(stdout=_probed(self.seccomp, args), stderr=b"", overflow=False)
         command = args[args.index("python") :]
@@ -433,6 +433,28 @@ def test_every_extension_container_runs_under_the_seccomp_profile(
         assert run["args"][option + 1] == security_option() and run["args"][-1] != security_option()
     # proven once per daemon and image, not per call
     assert sum(made.probes for made in containers.made) == 1
+
+
+def test_extension_container_names_pass_the_sandbox_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, package: tuple[Path, Path]
+) -> None:
+    """Nodestro Local Docker's gateway accepts only its sandbox name prefixes: the probe and every package container
+    use one (``nodestro-ext-...`` was refused there)."""
+    from nodestro_runtime.sandbox_gateway import NAME
+
+    site, _marker = package
+    containers = Containers()
+    names: list[str] = []
+    original = FakeContainer.run_container
+
+    def recorded(self: FakeContainer, args: list[str], name: str, data: bytes = b"", **options: Any) -> Any:
+        names.append(name)
+        return original(self, args, name, data, **options)
+
+    monkeypatch.setattr(FakeContainer, "run_container", recorded)
+    with _workspace(tmp_path, monkeypatch, site, containers, switch="1") as workspace:
+        assert workspace.tools.builtin["echo_text"].execute({"text": "x"}) == "x"
+    assert len(names) == 3 and all(NAME.fullmatch(name) for name in names), names
 
 
 def test_the_extension_seccomp_profile_is_stricter_than_the_default() -> None:
@@ -648,7 +670,7 @@ class Answer:
         return ["docker", "run", name, image_id]
 
     def run_container(self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int) -> tuple[int, Any]:
-        if name.startswith("nodestro-ext-probe-"):
+        if name.startswith("nodestro-sandbox-ext-probe-"):
             return 0, BoundedOutput(stdout=_probed(True, args), stderr=b"", overflow=False)
         return 0, BoundedOutput(stdout=self.stdout, stderr=b"", overflow=False)
 
@@ -870,7 +892,7 @@ def test_a_container_left_by_a_crashed_host_is_reaped(real: Real) -> None:
     from orkexa.dynamic.docker import reap
 
     sandbox = real.sandbox._sandbox(30.0)
-    name = f"nodestro-ext-crash-{uuid.uuid4().hex[:8]}"
+    name = f"nodestro-sandbox-ext-crash-{uuid.uuid4().hex[:8]}"
     args = [*sandbox.shaped_run(name, sandbox.ready_image()), "python", "-I", "-c", "import time; time.sleep(600)"]
     client = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -903,7 +925,7 @@ def test_the_extension_seccomp_profile_is_applied_by_the_real_engine(real: Real)
 
     real.sandbox.ready()
     sandbox = real.sandbox._sandbox(60.0)
-    name = f"nodestro-ext-plain-{uuid.uuid4().hex[:8]}"
+    name = f"nodestro-sandbox-ext-plain-{uuid.uuid4().hex[:8]}"
     code, output = sandbox.run_container(
         [*sandbox.shaped_run(name, sandbox.ready_image()), *probe_command()], name, b"", max_stdout=4096
     )

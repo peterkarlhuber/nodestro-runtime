@@ -262,7 +262,7 @@ class ExtensionSandbox:
         with self._lock:
             if key in self._proven:
                 return
-        name = f"nodestro-ext-probe-{uuid.uuid4().hex[:12]}"
+        name = f"nodestro-sandbox-ext-probe-{uuid.uuid4().hex[:12]}"
         try:
             code, output = sandbox.run_container(
                 [*self._shaped(sandbox, name, image), *extension_seccomp.probe_command()], name, b"", max_stdout=4096
@@ -272,7 +272,8 @@ class ExtensionSandbox:
             raise SandboxUnavailable(f"the seccomp probe failed: {exc}") from None
         problems = extension_seccomp.check_probes(output.stdout.decode("utf-8", "replace"))
         if code != 0 or problems:
-            detail = problems[0] if problems else output.stderr.decode("utf-8", "replace")[-300:]
+            stderr = output.stderr.decode("utf-8", "replace").strip()[-300:]
+            detail = "; ".join(item for item in (problems[0] if problems else "", stderr) if item)
             raise SandboxUnavailable(f"the seccomp probe failed (exit code {code}): {detail}")
         with self._lock:
             self._proven.add(key)
@@ -293,7 +294,7 @@ class ExtensionSandbox:
         data = json.dumps(
             {"runner": _contract_files(), "files": self._package_files(package), "request": request}
         ).encode("utf-8")
-        name = f"nodestro-ext-{uuid.uuid4().hex[:12]}"
+        name = f"nodestro-sandbox-ext-{uuid.uuid4().hex[:12]}"
         args = [*self._shaped(sandbox, name, image), "python", "-I", "-B", "-c", BOOTSTRAP]
         try:
             code, output = sandbox.run_container(args, name, data, max_stdout=response_limit(MAX_RESULT_CHARS))
