@@ -47,6 +47,11 @@ None known.
   `MemorySpaces`, `BrowsableMemory.entries`, migration `0011_memory_origin.sql`, Orkexa `MemoryBackend.list_entries`
 - **Done:** entries with time, origin (`tool`, `user`, `import`, `assistant`) and `scope` (`user`) on SQLite and PostgreSQL;
   manual remembering only by a person's explicit write; owner rules of RT-089c unchanged.
+- **Done (Welle 7, migration check):** migration 0011 is verified by the migration tests: PostgreSQL from 0010 with
+  existing memory files (backup first, old files keep content and time with no origin, the column is nullable
+  without a default, new writes record theirs, migrating again does nothing; `tests/test_storage_postgres.py`, and
+  the FX-PG-0 fixture in `tests/test_legacy_fixtures.py`) and SQLite (`tests/test_memory_entries.py`). PostgreSQL
+  migrations run forward only (no downgrade).
 - **Open:**
   - the origin names the kind of writer, not which agent, run or workflow wrote (one shared connection per space;
     Orkexa's `execute(origin=)` would take a finer value);

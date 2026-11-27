@@ -11,6 +11,8 @@
   `extension_classes.PREREQUISITES`: a class that needs a missing G-6 item (17, 18, 21) cannot be released.
   New codes `extension_store.refused` (param `reason`), `extension_store.not_found`, `extension_store.unreadable`.
   `ExtensionPackage.key` includes the store hash.
+- Tests (N-24, Welle 7): migration 0011 (memory origin) has its own PostgreSQL migration test, starting from 0010 with
+  existing memory files. No code change.
 
 - Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
   containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
