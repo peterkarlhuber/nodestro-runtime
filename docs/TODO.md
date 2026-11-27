@@ -132,14 +132,18 @@ None known.
 
 ### RT-083 · Extension tools in the Docker sandbox (N-22)
 
-- **Priority:** P2 Medium · **Status:** Open (platform plan, phase N-B) · **Refs:** `extensions.py`
-  (`EXTENSION_TOOLS_ENV`, `Extensions.locked`), security review 2026-11 (phase 0R) findings S1 to S3, owner decision
-  E-0R-2 A (2026-11-20)
-- **What:** tools of installed integrations are locked since W0-2 (no host-process fallback); their stated capability
-  counts as unknown. Open: the execution path through `DockerSandbox` (JSON over stdin and stdout, no network without a
-  grant, the time limit stops the container), showing locked tools in the studio, and the release per tool class only
-  after the evidence and an independent review (gate G-6). Until then `NODESTRO_EXTENSION_TOOLS=1` unlocks nothing.
-- **Next step:** with N-22 in phase N-B; nothing to do before.
+- **Priority:** P2 Medium · **Status:** Needs external review · **Refs:** `extensions.py`, `extension_sandbox.py`,
+  `tests/test_extension_isolation.py`, `docs/extension-isolation.md`, security review 2026-11 (phase 0R) findings S1
+  to S3, owner decision E-0R-2 A (2026-11-20)
+- **What:** foreign installed integrations are never imported into the host; their tools run only in the Docker
+  sandbox (JSON over stdin and stdout, no network, no host files or secrets, the time limit removes the container) and
+  only with `NODESTRO_EXTENSION_TOOLS=1` and a proven daemon, else "locked, not sufficiently secured". Their capability
+  is at least unknown. Open (G-6 items 16 to 22 in the docs): a cancel test on a real container, network and folder
+  grants for extension tools, the checks on Docker Desktop (macOS, Windows), an own seccomp profile and user
+  namespace remapping, package dependencies as hashed images, showing the package states in the API and the studio,
+  and the release per tool class after the internal and the independent review (gate G-6). The trust exception
+  (WZ-8) is not implemented on purpose.
+- **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)
 

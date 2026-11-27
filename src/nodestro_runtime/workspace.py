@@ -61,7 +61,8 @@ from .cost_tracking import PricedTracker, PriceMode
 from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import EMBEDDING_PROVIDER, RunManager
-from .extensions import Extensions, Integration, discover
+from .extension_sandbox import ExtensionSandbox
+from .extensions import Extensions, Integration, discover, find_packages
 from .folder_index import FILES as FOLDER_INDEX_FILES
 from .folder_index import STATES as FOLDER_INDEX_STATES
 from .folder_index import FolderIndex, FolderIndexer
@@ -148,7 +149,7 @@ from .tool_approvals import (
 )
 from .tool_drafts import ToolDrafts
 from .tool_legacy import LegacyReport, keep_only_inherited, stamp_workflow
-from .tool_library import ToolLibrary, make_sandbox
+from .tool_library import RESERVED_NAMES, ToolLibrary, make_sandbox
 from .tool_provenance import StoredProvenance
 from .usage_log import UsageLog
 from .versions import WorkflowVersion, WorkflowVersions
@@ -380,10 +381,13 @@ class Workspace:
         self._directory_lock: DataDirectoryLock | None = DataDirectoryLock(data_dir) if storage is None else None
         # Installed integrations are optional: one that does not fit is left out (and logged) instead
         # of stopping the runtime; integrations passed explicitly must fit.
+        # Foreign installed integrations are never imported here (N-22): their tools run only in the Docker sandbox
+        # (loaded below, once the Python environments exist), and only while the extension tools switch is on.
         self.extensions = Extensions(
             discover() if integrations is None else integrations,
             strict=integrations is not None,
             installed=integrations is None,
+            packages=find_packages() if integrations is None else (),
             reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *FOLDER_TOOLS) if tool.name},
         )
         self.store: DocumentStore
@@ -633,6 +637,12 @@ class Workspace:
         self.docker_monitor.start_reaper(remove_all_first=storage is None)
         self.docker_monitor.status()
         self.tools.dependencies = EnvironmentGate(self.python)
+        self.tools.add_extension_tools(
+            self.extensions.load_packages(
+                ExtensionSandbox(self._extension_sandbox),
+                reserved={*self.tools.builtin, *self.tools.registry.names(), *RESERVED_NAMES},
+            )
+        )
         self.tool_drafts.python = self.python
         self.runs.tool_sandbox = self.python.workflow_sandbox
         self.tester.tool_sandbox = self.python.workflow_sandbox
@@ -853,6 +863,16 @@ class Workspace:
         return RuntimeImageSandbox(
             lambda: self.python.runtime_image(),
             timeout=15.0,
+            environ=ContainerImages()._cli_environment(),
+            owner=self.sandbox_owner,
+        )
+
+    def _extension_sandbox(self, timeout: float) -> RuntimeImageSandbox:
+        """The container sandbox for tools of installed integrations (N-22): Nodestro's runtime image, this
+        installation's owner label, the call's time limit."""
+        return RuntimeImageSandbox(
+            lambda: self.python.runtime_image(),
+            timeout=timeout,
             environ=ContainerImages()._cli_environment(),
             owner=self.sandbox_owner,
         )

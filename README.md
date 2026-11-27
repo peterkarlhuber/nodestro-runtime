@@ -245,14 +245,17 @@ always in the prompt or loaded on demand with the run's own tools `load_skill` a
 instructions only; they never grant tools or permissions, and their scripts are never run. Releases freeze the
 versions they use. Details: [docs/skills.md](docs/skills.md).
 
-**Tools of installed integrations are locked.** An integration installed through the entry point group
-`nodestro.integrations` keeps its OCR engine, but its tools are not offered: they would run in the host process, which
-sees the environment, the unlocked vault and the whole file system, and a time limit does not stop them. Foreign code
-runs only in the Docker sandbox (owner decision 2026-11-20), and extension tools cannot use it yet (TODO RT-083).
-`NODESTRO_EXTENSION_TOOLS=1` is the switch that path will honour; today it unlocks nothing and only changes the reason
-(`Extensions.locked`: `off` or `isolation_unavailable`, also in `Extensions.summary()`). A capability an installed
-integration states for its tools counts as unknown (write, external), never as the author's word. Integrations passed
-explicitly (`Workspace(integrations=[...])`) are the embedding application's own code and keep their tools.
+**Tools of installed integrations run only in the Docker sandbox (N-22).** Only Nodestro's own distribution
+(`nodestro-integrations`) is imported into the backend, for its OCR engine; every other integration installed through
+the entry point group `nodestro.integrations` is never imported: not even its import-time code runs in the host
+process. Its tools are listed and called in a new container of Orkexa's sandbox shape (no network, no host files, no
+environment, limits; the time limit removes the container), and only while `NODESTRO_EXTENSION_TOOLS=1` (a development
+switch, off by default) and the Docker sandbox passed its checks; otherwise they are "locked, not sufficiently
+secured" (`Extensions.packages_status()`: `off`, `not_secured` or `invalid`), and nothing runs anywhere else. Their
+capability counts at least as unknown (write, external): a package's own statement can only raise it. No tool class is
+enabled by default before the security evidence G-6. Integrations passed explicitly (`Workspace(integrations=[...])`)
+are the embedding application's own code and keep their tools. Details and the G-6 checklist:
+[docs/extension-isolation.md](docs/extension-isolation.md).
 
 **Sandbox policy (ADR-0006).** Every stored tool has a trust class (`ToolInfo.trust`): `trusted` (built in or passed
 explicitly as an integration), `user-authored` (every version of it was written by a person in the tool editor) or

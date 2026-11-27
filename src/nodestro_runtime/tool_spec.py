@@ -274,6 +274,9 @@ def offered(spec: ToolSpec, mode: str, environ: Mapping[str, str] | None = None)
 #: The time limit of an integration's tool without a spec (contract 1): generous, since such tools (e.g. recognising a
 #: scanned document) may take a while, but a hanging one no longer holds the run.
 HOST_TOOL_TIMEOUT_SECONDS = 300.0
+#: How much longer the run waits for a tool that ends its own execution at the time limit (an extension tool in the
+#: Docker sandbox removes its container, N-22), so its answer is that timeout and not an abandoned thread.
+STOP_GRACE_SECONDS = 30.0
 
 
 def host_tool_spec(name: str) -> ToolSpec | None:
@@ -505,12 +508,15 @@ class SpecTool(Tool):
                 return self.inner.execute(payload)
 
         # A host-process tool cannot be stopped from outside: after the time limit the run goes on without its result
-        # and the worker thread ends when the function returns (built-in tools are short and side-effect free).
+        # and the worker thread ends when the function returns (built-in tools are short and side-effect free). A tool
+        # that stops itself (an extension tool, whose container is removed at the limit) gets a little longer, so its
+        # own timeout answers.
+        wait = self.spec.timeout_seconds + (STOP_GRACE_SECONDS if getattr(self.inner, "stops_itself", False) else 0)
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{self.spec.id}")
         try:
             future = pool.submit(snapshot.run, call)
             try:
-                return future.result(timeout=self.spec.timeout_seconds)
+                return future.result(timeout=wait)
             except FutureTimeout:
                 raise self._timed_out() from None
         finally:
@@ -578,6 +584,7 @@ __all__ = [
     "READ_FILE_SPEC",
     "SEARCH_FILES_SPEC",
     "SEARCH_WEB_SPEC",
+    "STOP_GRACE_SECONDS",
     "WEB_TOOLS_SERVER_ENV",
     "CallCounter",
     "RunServices",

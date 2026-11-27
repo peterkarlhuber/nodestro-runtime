@@ -20,29 +20,42 @@ Every integration states the contract version it was written for (:data:`CONTRAC
 for another version is refused with a clear message instead of failing later. Nothing here
 starts a service or opens a network connection: an integration is code the runtime calls.
 
-Tools of *installed* integrations are locked (security review 2026-11 (phase 0R), finding S1; owner decision
-E-0R-2 A): such code would run in the host process, which sees the environment, the unlocked vault and the whole
-file system, and the time
-limit does not stop it. Foreign code may only run in the Docker sandbox, and that path does not exist yet (N-22), so
-:data:`EXTENSION_TOOLS_ENV` cannot unlock them either: it is the switch N-22 will honour, and today it only changes the
-reason a locked tool reports. The integrations' OCR engines are not affected. Integrations passed explicitly
-(``Workspace(integrations=[...])``) are the embedding application's own code and keep their tools. A capability that
-an installed integration states for its tools is never taken as given: it counts as :data:`~nodestro_runtime.
-tool_policy.UNKNOWN` (finding S3), so a tool cannot pass the approval gate by calling itself read-only.
+Only Nodestro's own distribution (:data:`TRUSTED_DISTRIBUTIONS`) is imported into the host process, for its OCR
+engine; its tools stay locked (``isolation_unavailable``): they would run in the host process, which sees the
+environment, the unlocked vault and the whole file system, and the time limit does not stop them. Every other entry
+point is never imported (N-22; security review 2026-11 (phase 0R), findings S1 to S3; owner decision E-0R-2 A):
+:func:`find_packages` reads it as data, and its tools run only in the Docker sandbox
+(:mod:`nodestro_runtime.extension_sandbox`), and only while :data:`EXTENSION_TOOLS_ENV` is ``1`` (off by default) and
+the daemon passed its checks. Otherwise they are locked with the reason ``off`` or ``not_secured`` ("locked, not
+sufficiently secured"); there is no host-process fallback. Integrations passed explicitly
+(``Workspace(integrations=[...])``) are the embedding application's own code and keep their tools. A capability that an
+installed integration states for its tools is never taken as given: it counts at least as :data:`~nodestro_runtime.
+tool_policy.UNKNOWN` (finding S3) and can only be raised, so a tool cannot pass the approval gate by calling itself
+read-only. See ``docs/extension-isolation.md``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 import logging
 import os
+import re
 from typing import Literal, Protocol, runtime_checkable
 
 from orkexa import Tool
 
 from .documents import OcrResult
+from .extension_sandbox import (
+    ExtensionPackage,
+    ExtensionSandbox,
+    ExtensionTool,
+    PackageError,
+    SandboxUnavailable,
+    extension_spec,
+    package_of,
+)
 from .problems import NodestroError
 from .tool_policy import UNKNOWN
 from .tool_spec import ToolSpec
@@ -57,19 +70,29 @@ ENTRY_POINT_GROUP = "nodestro.integrations"
 CONTRACT = 2
 #: Every contract version the runtime still accepts.
 SUPPORTED_CONTRACTS: frozenset[int] = frozenset({1, 2})
-#: The switch for the tools of installed integrations (N-22). Off by default; on, it still unlocks nothing until the
-#: Docker sandbox path for extension tools exists (owner decision E-0R-2 A: no host-process fallback).
+#: The switch for the tools of installed integrations (N-22), a development switch: off by default in every profile.
+#: On, the tools of foreign packages run in the Docker sandbox once the daemon passed its checks; no tool class is
+#: enabled by default before the security evidence G-6 (``docs/extension-isolation.md``).
 EXTENSION_TOOLS_ENV = "NODESTRO_EXTENSION_TOOLS"
+#: The distributions whose entry points are imported into the host process (Nodestro's own; for their OCR engines).
+TRUSTED_DISTRIBUTIONS: frozenset[str] = frozenset({"nodestro-integrations"})
+#: What a locked package or tool shows.
+LOCKED_MESSAGE = "locked, not sufficiently secured"
 
-#: Why the tools of installed integrations are locked: ``off`` (the switch is off) or ``isolation_unavailable`` (the
-#: switch is on, but no isolated way to run them exists yet).
-LockReason = Literal["off", "isolation_unavailable"]
+#: Why tools of installed integrations are locked: ``off`` (the switch is off), ``isolation_unavailable`` (a tool of
+#: the trusted distribution, which is imported into the host and has no isolated path), ``not_secured`` (the switch
+#: is on, but no Docker sandbox passed its checks) or ``invalid`` (the package could not be listed in the sandbox).
+LockReason = Literal["off", "isolation_unavailable", "not_secured", "invalid"]
+
+
+def extension_tools_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether :data:`EXTENSION_TOOLS_ENV` is ``1``."""
+    return (environ if environ is not None else os.environ).get(EXTENSION_TOOLS_ENV, "").strip() == "1"
 
 
 def extension_tools_lock() -> LockReason:
-    """Why tools of installed integrations are locked; every value locks them today (see the module docs)."""
-    requested = os.environ.get(EXTENSION_TOOLS_ENV, "").strip() == "1"
-    return "isolation_unavailable" if requested else "off"
+    """Why tools of the trusted distribution's integrations are locked (they are imported into the host process)."""
+    return "isolation_unavailable" if extension_tools_enabled() else "off"
 
 
 @runtime_checkable
@@ -168,22 +191,43 @@ def _load(entry: metadata.EntryPoint) -> Integration:
     return value
 
 
+def _trusted(entry: metadata.EntryPoint) -> bool:
+    dist = getattr(entry, "dist", None)
+    name = dist.metadata["Name"] if dist is not None else None
+    return bool(name) and re.sub(r"[-_.]+", "-", str(name)).lower() in TRUSTED_DISTRIBUTIONS
+
+
+def _listed(entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None) -> list[metadata.EntryPoint]:
+    return list(entry_points() if entry_points is not None else metadata.entry_points(group=ENTRY_POINT_GROUP))
+
+
 def discover(
     entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
 ) -> list[Integration]:
-    """The integrations installed in this environment, sorted by name.
+    """The integrations of the trusted distributions (:data:`TRUSTED_DISTRIBUTIONS`) installed in this environment,
+    sorted by name. Only these are imported; every other entry point is left to :func:`find_packages`.
 
     A broken integration is logged and left out: an optional extension never stops the
     runtime from starting.
     """
     found: list[Integration] = []
-    listed = entry_points() if entry_points is not None else metadata.entry_points(group=ENTRY_POINT_GROUP)
-    for entry in listed:
+    for entry in _listed(entry_points):
+        if not _trusted(entry):
+            continue
         try:
             found.append(_load(entry))
         except Exception:
             logger.exception("Integration %r could not be loaded", entry.name)
     return sorted(found, key=lambda item: item.name)
+
+
+def find_packages(
+    entry_points: Callable[[], Iterable[metadata.EntryPoint]] | None = None,
+) -> list[ExtensionPackage]:
+    """The installed integrations of every other distribution, as data: nothing of them is imported (N-22)."""
+    return sorted(
+        (package_of(entry) for entry in _listed(entry_points) if not _trusted(entry)), key=lambda item: item.name
+    )
 
 
 class Extensions:
@@ -194,6 +238,9 @@ class Extensions:
     never stops the runtime. ``reserved`` names tools the runtime already has (the built-in tools).
     ``installed``: the integrations came from entry points (:func:`discover`); their tools are locked (see the module
     documentation) and listed in :attr:`locked` with the reason.
+
+    ``packages`` are the foreign installed integrations (:func:`find_packages`): never imported, locked (``off``) until
+    :meth:`load_packages` lists their tools in the Docker sandbox; :meth:`packages_status` says how each one stands.
     """
 
     def __init__(
@@ -203,11 +250,19 @@ class Extensions:
         strict: bool = True,
         reserved: Iterable[str] = (),
         installed: bool = False,
+        packages: Iterable[ExtensionPackage] = (),
     ) -> None:
         self.integrations: list[Integration] = []
         self.installed = installed
         #: Tool name -> why it is locked (installed integrations only).
         self.locked: dict[str, LockReason] = {}
+        self.packages: list[ExtensionPackage] = list(packages)
+        #: Package name -> (``None`` when its tools run in the sandbox, else why they are locked, a detail).
+        self._package_state: dict[str, tuple[LockReason | None, str]] = {
+            package.name: ("off", "") for package in self.packages
+        }
+        #: Package name -> the names of its tools offered from the sandbox.
+        self._package_tools: dict[str, list[str]] = {}
         taken = set(reserved)
         names: dict[str, str] = {}
         for item in integrations:
@@ -225,12 +280,77 @@ class Extensions:
             self.locked = dict.fromkeys(names, reason)
             for name, owner in names.items():
                 logger.warning(
-                    "Tool %r of the installed integration %r is locked (%s): foreign tools run only in the Docker "
-                    "sandbox, which extension tools cannot use yet",
+                    "Tool %r of the installed integration %r is locked (%s): it is imported into the host process, "
+                    "and tools of installed integrations run only in the Docker sandbox",
                     name,
                     owner,
                     reason,
                 )
+
+    def load_packages(
+        self, sandbox: ExtensionSandbox, reserved: Iterable[str], environ: Mapping[str, str] | None = None
+    ) -> list[tuple[ToolSpec, ExtensionTool]]:
+        """The tools of :attr:`packages` as listed in the Docker sandbox, with their specs (:func:`~nodestro_runtime.
+        extension_sandbox.extension_spec`); none while the switch is off (no container starts) or while the sandbox
+        has not passed its checks (``not_secured``: nothing runs anywhere else). A package that cannot be listed, or
+        whose tool names clash with ``reserved`` or another package's, is locked (``invalid``)."""
+        if not self.packages:
+            return []
+        if not extension_tools_enabled(environ):
+            for package in self.packages:
+                self._package_state[package.name] = ("off", "")
+            return []
+        try:
+            sandbox.ready()
+        except Exception as exc:  # SandboxUnavailable, or an image that cannot be built
+            detail = str(exc)[:500]
+            logger.warning("Tools of installed integrations stay locked (%s): %s", LOCKED_MESSAGE, detail)
+            for package in self.packages:
+                self._package_state[package.name] = ("not_secured", detail)
+            return []
+        taken = set(reserved) | set(self.locked)
+        found: list[tuple[ToolSpec, ExtensionTool]] = []
+        for package in self.packages:
+            try:
+                described = sandbox.describe(package)
+                names = [str(item["name"]) for item in described]
+                clash = sorted({name for name in names if name in taken or names.count(name) > 1})
+                if clash:
+                    raise PackageError(f"tool names already taken: {', '.join(clash)}")
+            except SandboxUnavailable as exc:
+                self._package_state[package.name] = ("not_secured", str(exc)[:500])
+                continue
+            except Exception as exc:  # the package's files or answers
+                logger.warning("The installed integration %r is locked: %s", package.name, exc)
+                self._package_state[package.name] = ("invalid", str(exc)[:500])
+                continue
+            taken.update(names)
+            for item in described:
+                spec = extension_spec(str(item["name"]), item["stated"])
+                found.append((spec, ExtensionTool(package, item, spec, sandbox)))
+            self._package_state[package.name] = (None, "")
+            self._package_tools[package.name] = names
+        return found
+
+    def packages_status(self) -> list[dict[str, object]]:
+        """Each foreign installed integration: name, distribution, version, ``state`` (``sandboxed`` or ``locked``),
+        ``reason`` and ``message`` (when locked), ``detail`` and its tools offered from the sandbox."""
+        result: list[dict[str, object]] = []
+        for package in self.packages:
+            reason, detail = self._package_state.get(package.name, ("off", ""))
+            result.append(
+                {
+                    "name": package.name,
+                    "distribution": package.distribution,
+                    "version": package.version,
+                    "state": "locked" if reason else "sandboxed",
+                    "reason": reason,
+                    "message": LOCKED_MESSAGE if reason else None,
+                    "detail": detail or None,
+                    "tools": list(self._package_tools.get(package.name, [])),
+                }
+            )
+        return result
 
     def _pairs(self) -> list[tuple[ToolSpec | None, Tool]]:
         """The usable tools with their specs: none of an installed integration (they are locked)."""
@@ -253,8 +373,9 @@ class Extensions:
         return None
 
     def summary(self) -> list[dict[str, object]]:
-        """Name, version and contributions of every integration (for diagnostics)."""
-        return [
+        """Name, version and contributions of every integration (for diagnostics), then the foreign installed
+        integrations (:meth:`packages_status`, with ``"sandbox": True``)."""
+        found: list[dict[str, object]] = [
             {
                 "name": item.name,
                 "version": item.version,
@@ -269,3 +390,4 @@ class Extensions:
             }
             for item in self.integrations
         ]
+        return found + [{**status, "sandbox": True} for status in self.packages_status()]
