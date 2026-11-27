@@ -105,7 +105,8 @@ class KnowledgeFile(BaseModel):
     #: The collection the file belongs to (empty: none).
     collection: str = ""
     #: Where it came from: ``upload`` (knowledge page), ``input_file``, ``result_file``, ``agent_result`` or
-    #: ``proposal`` (taken over from a run after a person confirmed it).
+    #: ``proposal`` (taken over from a run after a person confirmed it), ``import`` (an imported collection,
+    #: ``nodestro-collection/1``; ``provenance`` names the format and producer).
     origin: str = "upload"
     #: The workflow, step, run, source files, time and kind of content of a file taken over from a run.
     provenance: dict[str, str] = {}
@@ -444,6 +445,8 @@ class KnowledgeBase:
         collection: str = "",
         extra: dict[str, str] | None = None,
         actor: str | None = None,
+        converted_from: Literal["docx", "xlsx"] | None = None,
+        action: Literal["file.uploaded", "file.imported"] = "file.uploaded",
     ) -> KnowledgeFile:
         """Store a file and index its text (``actor``: who uploaded it, for the activity log).
 
@@ -451,11 +454,22 @@ class KnowledgeBase:
         Markdown first (see :mod:`nodestro_runtime.documents`); a scanned PDF is recognised by
         local OCR when that is switched on and installed. Images are only stored.
         ``collection`` groups the file; ``extra`` is kept as metadata (origin of adopted files).
+        ``converted_from``: ``data`` is already the Markdown text of a converted DOCX or XLSX file (UTF-8), as a
+        collection export holds it (:mod:`nodestro_runtime.exchange`); it is stored like a fresh conversion.
+        ``action``: the activity event (``file.imported`` for a document of an imported collection).
         """
         metadata: dict[str, str] = dict(extra or {})
         if collection.strip():
             metadata["collection"] = collection.strip()[:120]
-        converted = documents.convert(data, name)
+        if converted_from is not None:
+            try:
+                converted: documents.Converted | None = documents.Converted(data.decode("utf-8"), converted_from)
+            except UnicodeDecodeError:
+                raise documents.DocumentError(
+                    "document.unreadable", f"{name} is not the text of a converted document", name=name
+                ) from None
+        else:
+            converted = documents.convert(data, name)
         # A PDF's text is read before anything is stored and outside the lock, in a separate process within the PDF
         # limits (MUP-ONA A1): a PDF over a limit is refused (document.too_complex) and leaves nothing behind.
         pdf = _PdfText(documents.read_pdf(data, name)) if converted is None and _is_pdf(name, media_type) else None
@@ -472,7 +486,7 @@ class KnowledgeBase:
                 # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
                 self._delete(entry.id)
                 raise
-        self._activity("file.uploaded", entry.id, actor)
+        self._activity(action, entry.id, actor)
         return self.get(entry.id)
 
     def _index_new(

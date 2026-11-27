@@ -209,6 +209,17 @@ class McpService:
                 "mcp.oauth_token_input", "An OAuth server gets its tokens from the sign-in, not from a pasted token"
             )
 
+    def check_new(self, data: McpServerIn, *, adding: int = 1) -> None:
+        """Raise what :meth:`add` would refuse ``data`` for (``adding`` servers at once), without storing anything:
+        an import's preview (:mod:`nodestro_runtime.exchange`) applies the same rules as adding a server by hand."""
+        self._check_input(data)
+        if len(self.servers()) + adding > self.hub.limits.max_servers:
+            raise NodestroError(
+                "mcp.too_many_servers",
+                f"At most {self.hub.limits.max_servers} MCP servers can be connected",
+                limit=self.hub.limits.max_servers,
+            )
+
     def _check_stdio(self, data: McpServerIn) -> None:
         if data.stdio is None:
             raise NodestroError("mcp.stdio_invalid", "A stdio server needs a command (packages and module)")
