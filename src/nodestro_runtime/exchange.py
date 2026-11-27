@@ -42,6 +42,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 import hashlib
+from itertools import accumulate
 import json
 import re
 import stat
@@ -83,6 +84,12 @@ MAX_UNPACKED_BYTES = 512 * MIB
 MAX_DOCUMENTS = 500
 MAX_DOCUMENT_BYTES = 50 * MIB
 MAX_MANIFEST_BYTES = 2 * MIB
+#: The deepest nesting of objects and lists in a JSON exchange file or manifest (the formats need fewer than 10).
+MAX_DEPTH = 32
+#: The most bytes one central directory record of a collection may take (46 bytes, the name and extra fields).
+_DIRECTORY_RECORD_MAX = 256
+_DIRECTORY_RECORD_MIN = 46
+_CHUNK = MIB
 #: An entry larger than 1 MiB may expand at most this many times (a "ZIP bomb" expands far more).
 MAX_RATIO = 100
 _RATIO_FLOOR = MIB
@@ -95,6 +102,9 @@ _SECRET_SHAPE = re.compile(
     r"|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----|bearer\s+[A-Za-z0-9._~+/=-]{20,})",
     re.I,
 )
+#: A command-line option that passes a secret (``--api-key=...``, or ``--token`` followed by the value).
+_SECRET_ARG = re.compile(r"^--?[A-Za-z0-9_.-]*(token|key|secret|passw|auth|credential)[A-Za-z0-9_.-]*(=.*)?$", re.I)
+_JSON_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"', re.S)
 
 
 class ExchangeError(NodestroError):
@@ -130,11 +140,23 @@ def format_version(value: object, expected: str) -> int:
     return version
 
 
+def json_depth(raw: bytes) -> int:
+    """How deeply objects and lists nest in the JSON text ``raw`` (counted before it is parsed)."""
+    brackets = [1 if char in b"[{" else -1 for char in _JSON_STRING.sub(b"", raw) if char in b"[]{}"]
+    return max(accumulate(brackets), default=0)
+
+
 def read_json(raw: bytes, expected: str, *, max_bytes: int = MAX_JSON_BYTES) -> dict[str, Any]:
-    """The checked JSON object of an exchange file: size, JSON, format and version (not yet the content)."""
+    """The checked JSON object of an exchange file: size, nesting, JSON, format and version (not yet the content)."""
     if len(raw) > max_bytes:
         raise ExchangeError(
             "exchange.too_large", f"An exchange file may have at most {max_bytes} bytes", limit=max_bytes
+        )
+    if json_depth(raw) > MAX_DEPTH:
+        raise ExchangeError(
+            "exchange.content_invalid",
+            f"The file nests deeper than {MAX_DEPTH} levels",
+            problems=[{"field": "file", "reason": "too_deep"}],
         )
     try:
         document = json.loads(raw)
@@ -172,7 +194,8 @@ def parse(model: type[_M], document: dict[str, Any]) -> _M:
 
 def secret_findings(document: Any, known: Iterable[str] = ()) -> list[str]:
     """Where ``document`` holds something secret-like: a non-empty field with a secret's name, an address with
-    credentials or a key in it, a value shaped like a well-known key, or one of the ``known`` secrets (also inside a
+    credentials or a key in it, a value shaped like a well-known key, a command-line option of ``args`` that passes a
+    secret (``--api-key=...``, or ``--token`` and the value after it), or one of the ``known`` secrets (also inside a
     longer text). The places are field paths (``servers[0].url``); a known secret found is ``(known secret)``."""
     found: list[str] = []
 
@@ -184,6 +207,8 @@ def secret_findings(document: Any, known: Iterable[str] = ()) -> list[str]:
                     found.append(where)
                 walk(item, where)
         elif isinstance(value, list):
+            if path == "args" or path.endswith(".args"):
+                found.extend(f"{path}[{index}]" for index in _secret_args(value))
             for index, item in enumerate(value):
                 walk(item, f"{path}[{index}]")
         elif isinstance(value, str) and (
@@ -201,6 +226,23 @@ def secret_findings(document: Any, known: Iterable[str] = ()) -> list[str]:
     return sorted(set(found))
 
 
+def _secret_args(args: list[Any]) -> list[int]:
+    """The positions of command-line arguments that pass a secret: ``--api-key=value``, or the value after
+    ``--token``."""
+    places = []
+    for index, arg in enumerate(args):
+        found = _SECRET_ARG.fullmatch(arg) if isinstance(arg, str) else None
+        if found is None:
+            continue
+        if found.group(2) not in (None, "="):
+            places.append(index)
+        elif found.group(2) is None and index + 1 < len(args):
+            following = args[index + 1]
+            if isinstance(following, str) and following and not following.startswith("-"):
+                places.append(index + 1)
+    return places
+
+
 def ensure_no_secrets(document: Any, known: Iterable[str] = ()) -> None:
     """Refuse an export that would hold a secret (``exchange.secret_detected``, naming the places only)."""
     places = secret_findings(document, known)
@@ -210,29 +252,6 @@ def ensure_no_secrets(document: Any, known: Iterable[str] = ()) -> None:
             "The export would contain a secret, so it was not written",
             places=places[:20],
         )
-
-
-def secret_values(value: str | None) -> list[str]:
-    """A stored secret and, for a stored JSON document (OAuth credentials), every longer text in it."""
-    if not value:
-        return []
-    values = [value]
-    try:
-        parsed = json.loads(value)
-    except ValueError:
-        return values
-
-    def walk(item: Any) -> Iterator[str]:
-        if isinstance(item, str) and len(item) >= 8:
-            yield item
-        elif isinstance(item, dict):
-            for inner in item.values():
-                yield from walk(inner)
-        elif isinstance(item, list):
-            for inner in item:
-                yield from walk(inner)
-
-    return values + list(walk(parsed))
 
 
 # ---- reports ---------------------------------------------------------------------------------------------------------
@@ -346,8 +365,7 @@ def export_connections(service: ConnectionService, connection_ids: Iterable[str]
         "connections": [connection_entry(item).model_dump(mode="json") for item in items],
     }
     # The secrets themselves (in memory only) and their sealed form: neither may be in the file.
-    known = [value for item in items for value in secret_values(service._secret(item))]
-    known += [item.secret_sealed for item in items if item.secret_sealed]
+    known = [value for item in items for value in (service._secret(item), item.secret_sealed) if value]
     ensure_no_secrets(document, known)
     return document
 
@@ -493,15 +511,31 @@ def export_collection(knowledge: KnowledgeBase, name: str, target: IO[bytes]) ->
     return manifest
 
 
-def _declared_entries(source: IO[bytes], size: int) -> int | None:
-    """The entry count the end record of a ZIP file declares (read before zipfile indexes every entry)."""
+def _check_directory(source: IO[bytes], size: int) -> None:
+    """Check the end record of a ZIP file before zipfile reads its central directory (which zipfile reads whole, at the
+    size the end record names): the entry count and the directory's size must be small and agree, the directory must
+    lie before the end record, and ZIP64 (not needed for a collection's size) is refused."""
     tail = min(size, 65_557)
     source.seek(size - tail)
     data = source.read(tail)
-    at = data.rfind(b"PK\x05\x06")
-    if at < 0 or len(data) < at + 12:
-        return None
-    return int.from_bytes(data[at + 10 : at + 12], "little")
+    # The end record without a comment, else the last one in the tail: the one zipfile takes.
+    at = len(data) - 22 if data[-22:-18] == b"PK\x05\x06" and data[-2:] == b"\0\0" else data.rfind(b"PK\x05\x06")
+    if at < 0 or len(data) < at + 22:
+        raise ExchangeError("exchange.zip_invalid", "The file is not a readable ZIP file")
+    entries = int.from_bytes(data[at + 10 : at + 12], "little")
+    directory_size = int.from_bytes(data[at + 12 : at + 16], "little")
+    directory_offset = int.from_bytes(data[at + 16 : at + 20], "little")
+    zip64 = at >= 20 and data[at - 20 : at - 16] == b"PK\x06\x07"
+    if zip64 or entries == 0xFFFF or 0xFFFFFFFF in (directory_size, directory_offset):
+        raise ExchangeError("exchange.zip_invalid", "ZIP64 files are not read", name="ZIP64")
+    if entries > MAX_DOCUMENTS + 1 or directory_size > (MAX_DOCUMENTS + 1) * _DIRECTORY_RECORD_MAX:
+        raise ExchangeError("exchange.too_many_entries", "The file has too many entries", limit=MAX_DOCUMENTS + 1)
+    end = size - tail + at
+    if (
+        not entries * _DIRECTORY_RECORD_MIN <= directory_size <= entries * _DIRECTORY_RECORD_MAX
+        or directory_offset + directory_size > end
+    ):
+        raise ExchangeError("exchange.zip_invalid", "The ZIP file's directory does not match its end record")
 
 
 @contextmanager
@@ -521,6 +555,10 @@ def _read(archive: zipfile.ZipFile, name: str, limit: int) -> bytes:
         return handle.read(limit + 1)
 
 
+def _damaged(document: CollectionDocument) -> ExchangeError:
+    return ExchangeError("exchange.checksum", f"{document.path} is damaged (checksum mismatch)", name=document.path)
+
+
 def open_collection(source: IO[bytes]) -> tuple[zipfile.ZipFile, CollectionManifest]:
     """Check a ``nodestro-collection/1`` file completely (size, entries, paths, ZIP bomb, format and version, content,
     the files against the manifest) and return the open archive with its manifest. The documents' checksums are
@@ -528,9 +566,7 @@ def open_collection(source: IO[bytes]) -> tuple[zipfile.ZipFile, CollectionManif
     size = source.seek(0, 2)
     if size > MAX_COLLECTION_BYTES:
         raise ExchangeError("exchange.too_large", "A collection file is too large", limit=MAX_COLLECTION_BYTES)
-    declared = _declared_entries(source, size)
-    if declared is not None and declared > MAX_DOCUMENTS + 1:
-        raise ExchangeError("exchange.too_many_entries", "The file has too many entries", limit=MAX_DOCUMENTS + 1)
+    _check_directory(source, size)
     source.seek(0)
     try:
         archive = zipfile.ZipFile(source)
@@ -590,11 +626,22 @@ def _check_archive(archive: zipfile.ZipFile) -> CollectionManifest:
     return manifest
 
 
+def check_document(archive: zipfile.ZipFile, document: CollectionDocument) -> None:
+    """Check a document against its size and SHA-256 in the manifest, reading it in pieces and keeping nothing."""
+    digest, size = hashlib.sha256(), 0
+    with _reading(document.path), archive.open(document.path) as handle:
+        while size <= document.size and (chunk := handle.read(min(_CHUNK, document.size + 1 - size))):
+            digest.update(chunk)
+            size += len(chunk)
+    if size != document.size or digest.hexdigest() != document.sha256:
+        raise _damaged(document)
+
+
 def read_document(archive: zipfile.ZipFile, document: CollectionDocument) -> bytes:
     """A document's bytes, checked against its size and SHA-256 in the manifest."""
     data = _read(archive, document.path, document.size)
     if len(data) != document.size or hashlib.sha256(data).hexdigest() != document.sha256:
-        raise ExchangeError("exchange.checksum", f"{document.path} is damaged (checksum mismatch)", name=document.path)
+        raise _damaged(document)
     return data
 
 
@@ -634,50 +681,68 @@ def import_collection(
         # The file store keeps one entry per content: storing a document it has already would rename and move that
         # file (and undoing a failed import would delete it), so such a document is left out and named.
         present = {entry.sha256: entry.id for entry in knowledge.store.list()}
-        contents: dict[int, bytes] = {}
+        wanted: list[int] = []
         for number, document in enumerate(manifest.documents):
             item = ImportItem(kind="document", name=document.name)
             try:
-                data = read_document(archive, document)
+                check_document(archive, document)
             except NodestroError as exc:
                 refuse_item(item, exc)
             else:
                 if document.sha256 in present:
                     item.status, item.id = "exists", present[document.sha256] or None
                 else:
-                    contents[number] = data
+                    wanted.append(number)
                     present[document.sha256] = ""
             report.items.append(item)
         if dry_run:
             return report
         require_no_refusals(report)
-        if report.collection_exists:
-            raise ExchangeError(
-                "exchange.collection_exists", f"The collection {target!r} has files already", name=target
-            )
-        known = {entry.id for entry in knowledge.store.list()}
-        added: list[str] = []
-        try:
-            for number, data in contents.items():
-                item, document = report.items[number], manifest.documents[number]
-                stored = knowledge.add(
-                    data,
-                    name=document.name,
-                    description=document.description,
-                    media_type=document.media_type,
-                    collection=target,
-                    extra={f"note_{key}": value for key, value in document.notes.items()},
-                    actor=actor,
-                    converted_from=document.source_format,
+        # Under the write lock: no other import fills the collection between the check and the last document.
+        with knowledge.writing():
+            if _collection_files(knowledge, target):
+                raise ExchangeError(
+                    "exchange.collection_exists", f"The collection {target!r} has files already", name=target
                 )
-                if stored.id in known:  # converted on upload into a content this workspace has already
-                    item.status, item.id = "exists", stored.id
-                    continue
-                known.add(stored.id)
-                added.append(stored.id)
-                item.status, item.id = "created", stored.id
-        except BaseException:
-            for file_id in added:
-                knowledge.delete(file_id, actor=actor)
-            raise
+            _store_documents(knowledge, archive, manifest, report, wanted, target=target, actor=actor)
         return report
+
+
+def _store_documents(
+    knowledge: KnowledgeBase,
+    archive: zipfile.ZipFile,
+    manifest: CollectionManifest,
+    report: ImportReport,
+    wanted: list[int],
+    *,
+    target: str,
+    actor: str | None,
+) -> None:
+    """Store the checked documents (each read again and checked again just before it is stored), all or none."""
+    known = {entry.id for entry in knowledge.store.list()}
+    origin = {"origin": "import", "origin_format": manifest.format, "origin_producer": manifest.producer}
+    added: list[str] = []
+    try:
+        for number in wanted:
+            item, document = report.items[number], manifest.documents[number]
+            stored = knowledge.add(
+                read_document(archive, document),
+                name=document.name,
+                description=document.description,
+                media_type=document.media_type,
+                collection=target,
+                extra={**{f"note_{key}": value for key, value in document.notes.items()}, **origin},
+                actor=actor,
+                converted_from=document.source_format,
+                action="file.imported",
+            )
+            if stored.id in known:  # converted on upload into a content this workspace has already
+                item.status, item.id = "exists", stored.id
+                continue
+            known.add(stored.id)
+            added.append(stored.id)
+            item.status, item.id = "created", stored.id
+    except BaseException:
+        for file_id in added:
+            knowledge.delete(file_id, actor=actor)
+        raise

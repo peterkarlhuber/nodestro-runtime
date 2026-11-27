@@ -25,9 +25,12 @@ reader refuses a newer version instead of guessing (`exchange.version_newer` wit
   `_keepable` are not even needed: an import always creates new entries). An export is checked before it is written
   (`ensure_no_secrets`): a non-empty field with a secret-like name (`token`, `secret`, `password`, `api_key`, ...), an
   address with credentials or a key in it (`has_credentials`, `url_secret_problem`), a value shaped like a well-known
-  key (`sk-...`, `ghp_...`, `AKIA...`, a private key block, `Bearer ...`), or **any secret the workspace holds for one
-  of the exported entries** (the opened token or connection secret, every longer text of stored OAuth credentials,
-  the sealed value) refuses the export with `exchange.secret_detected`; `places` names the fields, never the values.
+  key (`sk-...`, `ghp_...`, `AKIA...`, a private key block, `Bearer ...`), a command-line option of a stdio server
+  that passes a secret (`--api-key=...`, or the value after `--token`; any option naming a token, key, secret,
+  password, auth or credential), or **any secret the workspace holds for one of the exported entries** (the opened
+  token or connection secret; of stored OAuth credentials the tokens and the client secret, not the issuer or
+  resource, which are the server's address; the sealed values) refuses the export with `exchange.secret_detected`;
+  `places` names the fields, never the values.
 - **State of this workspace.** Ids, `enabled`, tool approvals and discovered tools, OAuth state, check results, the
   reachable hosts of a connection (derived again from type, provider and settings), audit events, provenance of
   knowledge files and vectors.
@@ -38,19 +41,23 @@ Every import runs the same steps, in this order, before anything is stored:
 
 1. **Size** before parsing: a JSON file at most 1 MB (`MAX_JSON_BYTES`); a collection file at most 256 MiB
    (`MAX_COLLECTION_BYTES`) with its manifest at most 2 MiB.
-2. **Syntax**: valid JSON (also nesting deeper than the parser's limit is `exchange.invalid_json`), an object.
+2. **Nesting and syntax**: objects and lists nest at most 32 levels, counted before parsing (`MAX_DEPTH`,
+   `exchange.content_invalid` with the problem `too_deep`); valid JSON (`exchange.invalid_json`), an object.
 3. **Format and version** (`format_version`): `exchange.format_invalid` (not an exchange file),
    `exchange.format_mismatch` (another format), `exchange.version_newer`.
 4. **Content** against strict models: unknown fields anywhere are refused (`exchange.content_invalid`, with
    `problems` as field names and reasons, never values), every value within the limits of the stored models, at most
    100 entries per JSON file (`MAX_ITEMS`).
-5. **Archive** (collections only, `open_collection`): at most 501 entries (checked in the ZIP end record before the
-   archive is indexed, `exchange.too_many_entries`); only `manifest.json` and `documents/<nnnn>` (`exchange.unsafe_path`
+5. **Archive** (collections only, `open_collection`): at most 501 entries, checked in the ZIP end record before
+   zipfile reads the central directory: the declared count, and the directory's size (at most 256 bytes per declared
+   entry, so at most about 125 KiB; `exchange.too_many_entries`), which must agree with the count and lie before the
+   end record, and no ZIP64 (`exchange.zip_invalid`); only `manifest.json` and `documents/<nnnn>` (`exchange.unsafe_path`
    for absolute paths, `..`, backslashes, drive letters, links and duplicates; `exchange.unexpected_file` for any other
    name); no encrypted entries or other compression methods (`exchange.zip_invalid`); an entry over 1 MiB may expand
    at most 100 times (`exchange.zip_bomb`); at most 512 MiB unpacked and 50 MiB per document (`exchange.too_large`);
    the files must be exactly the manifest's (`exchange.incomplete`), each with its declared size and SHA-256
-   (`exchange.checksum`; a read never goes past the declared size).
+   (`exchange.checksum`; a read never goes past the declared size). The preview reads each document in pieces of
+   1 MiB and keeps none of it; applying reads each document again just before it is stored and checks it again.
 6. **Rules of the target**: each entry is checked by the rules of adding it by hand. An MCP service by
    `McpService.check_new` (address rules, `mcp.url_secret`, loopback only for this computer, `mcp.too_many_servers`,
    and a stdio server only with the Docker sandbox: `sandbox.isolation_required`); a connection by
@@ -97,8 +104,12 @@ documents/0001       the stored bytes of the document (for a converted DOCX or X
   embedding model when its semantic index is on. `embedding.matches` says whether both identities are the same model
   build; when they differ, nothing else is needed (the documents are embedded here anyway), and the knowledge index
   status shows whether the workspace's own index needs a reindex.
+- **Origin.** An imported document has the origin `import`, with the format and producer of the file in its
+  provenance (`origin_format`, `origin_producer`), and the activity event `file.imported` (an upload's is
+  `file.uploaded`).
 - **Target.** The documents go to a new collection: the manifest's name or the one given; a collection that has files
-  already is refused (`exchange.collection_exists`). A document whose content the workspace has already stays as it
+  already is refused (`exchange.collection_exists`; checked and filled under the knowledge write lock, so two imports
+  cannot fill the same collection). A document whose content the workspace has already stays as it
   is (`exists`): the file store keeps one entry per content, so storing it again would rename or move that file.
 
 ## Limits

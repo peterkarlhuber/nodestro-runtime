@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import stat
+import tracemalloc
 from typing import Any
 import zipfile
 
 import pytest
 
-from nodestro_runtime import exchange
+from nodestro_runtime import activity, exchange
 from nodestro_runtime.connections import ConnectionIn, ConnectionService
 from nodestro_runtime.knowledge import KnowledgeBase
 from nodestro_runtime.mcp import exchange as mcp_exchange
 from nodestro_runtime.mcp.hub import McpHub
 from nodestro_runtime.mcp.models import McpServerIn, StdioCommand
 from nodestro_runtime.mcp.netguard import EgressPolicy
+from nodestro_runtime.mcp.oauth import OAuthCredentials
 from nodestro_runtime.mcp.service import McpService
 from nodestro_runtime.mcp.vault import TokenVault
 from nodestro_runtime.problems import NodestroError
@@ -77,12 +80,16 @@ def test_json_files_are_checked_for_size_syntax_and_shape_first() -> None:
     big = raw({"format": "nodestro-mcp/1", "servers": [], "pad": "x" * exchange.MAX_JSON_BYTES})
     assert code(lambda: exchange.read_json(big, "nodestro-mcp")) == "exchange.too_large"
     assert code(lambda: exchange.read_json(b"{not json", "nodestro-mcp")) == "exchange.invalid_json"
-    # Deep nesting: refused as JSON where the parser has a recursion limit, else by the content check (Python 3.14).
+    # Deep nesting is refused before the JSON is parsed; brackets inside strings do not count.
     deep = b'{"format": "nodestro-mcp/1", "servers": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
-    assert code(lambda: exchange.parse(exchange.Envelope, exchange.read_json(deep, "nodestro-mcp"))) in (
-        "exchange.invalid_json",
-        "exchange.content_invalid",
-    )
+    with pytest.raises(NodestroError) as too_deep:
+        exchange.read_json(deep, "nodestro-mcp")
+    assert too_deep.value.code == "exchange.content_invalid"
+    assert too_deep.value.params["problems"] == [{"field": "file", "reason": "too_deep"}]
+    assert exchange.json_depth(b'{"a": "[[[[{{", "b": [{"c": "\\"]]"}]}') == 3
+    nested = b'{"format": "nodestro-mcp/1", "x": ' + b"[" * exchange.MAX_DEPTH + b"]" * exchange.MAX_DEPTH + b"}"
+    assert code(lambda: exchange.read_json(nested, "nodestro-mcp")) == "exchange.content_invalid"
+    assert exchange.read_json(nested.replace(b"[", b"", 1).replace(b"]", b"", 1), "nodestro-mcp")
     assert code(lambda: exchange.read_json(b"[]", "nodestro-mcp")) == "exchange.format_invalid"
     with pytest.raises(NodestroError) as invalid:
         exchange.parse(
@@ -106,6 +113,10 @@ def test_the_secret_check_finds_names_addresses_shapes_and_known_secrets() -> No
     with pytest.raises(NodestroError) as refused:
         exchange.ensure_no_secrets({"description": CANARY}, [CANARY])
     assert refused.value.code == "exchange.secret_detected" and CANARY not in json.dumps(refused.value.params)
+    # Command-line options that pass a secret: with "=" or as the next argument (that value is the place).
+    args = ["--port", "8080", f"--api-key={CANARY}", "--token", CANARY, "--auth-mode=", "--no-auth", "--verbose"]
+    assert exchange.secret_findings({"stdio": {"args": args}}) == ["stdio.args[2]", "stdio.args[4]"]
+    assert exchange.secret_findings({"stdio": {"args": ["--port", "8080", "--secret", "--x"]}}) == []
 
 
 # ---- nodestro-mcp/1 --------------------------------------------------------------------------------------------------
@@ -178,6 +189,41 @@ def test_an_mcp_export_with_a_secret_in_its_address_is_refused(store: SQLiteStor
     assert refused.value.code == "exchange.secret_detected" and CANARY not in json.dumps(refused.value.params)
     stdio = StdioCommand(requirements=["mcp-demo==1.0"], module="mcp_demo")
     assert stdio.address() == "stdio:mcp_demo"
+
+
+def test_a_stdio_server_with_a_secret_argument_is_not_exported(store: SQLiteStore) -> None:
+    service = mcp_service(store)
+    server = service.add(McpServerIn(name="Docs", url="https://docs.example.com/mcp"))
+    stdio = StdioCommand(requirements=["mcp-demo==1.0"], module="mcp_demo", args=["--token", CANARY])
+    store.put("mcp_servers", server.id, server.model_copy(update={"transport": "stdio", "url": "", "stdio": stdio}))
+    with pytest.raises(NodestroError) as refused:
+        mcp_exchange.export_mcp(service)
+    assert refused.value.code == "exchange.secret_detected"
+    assert refused.value.params["places"] == ["servers[0].stdio.args[1]"]
+
+
+def test_a_signed_in_oauth_server_is_exported_without_its_tokens(store: SQLiteStore) -> None:
+    service = mcp_service(store)
+    url = "https://docs.example.com/mcp"
+    server = service.add(McpServerIn(name="Docs", url=url, auth="oauth"))
+    credentials = OAuthCredentials(
+        issuer="https://docs.example.com",
+        resource=url,
+        metadata={"issuer": "https://docs.example.com", "token_endpoint": "https://docs.example.com/token"},
+        client={"client_id": "nodestro-client-1", "client_secret": f"{CANARY}-client"},
+        redirect_uri="https://nodestro.example.com/api/mcp/oauth/callback",
+        tokens={"access_token": CANARY, "refresh_token": f"{CANARY}-refresh", "token_type": "Bearer"},
+        scope="mcp",
+    )
+    service._set_token(server, credentials.dumps())
+    store.put("mcp_servers", server.id, server)
+    # The issuer and resource are the server's address: they are no secret, so the export is written.
+    exported = mcp_exchange.export_mcp(service)
+    assert exported["servers"][0]["url"] == url and exported["servers"][0]["auth"] == "oauth"
+    assert CANARY not in json.dumps(exported)
+    # A token that ended up in the configuration is still found.
+    store.put("mcp_servers", server.id, service.server(server.id).model_copy(update={"name": f"{CANARY}-refresh"}))
+    assert code(lambda: mcp_exchange.export_mcp(service)) == "exchange.secret_detected"
 
 
 # ---- nodestro-connection/1 -------------------------------------------------------------------------------------------
@@ -264,9 +310,12 @@ def manifest_of(data: bytes) -> dict[str, Any]:
         return json.loads(archive.read("manifest.json"))  # type: ignore[no-any-return]
 
 
-def test_a_collection_round_trips_and_is_indexed_again(knowledge: KnowledgeBase, tmp_path: Path) -> None:
+def test_a_collection_round_trips_and_is_indexed_again(
+    knowledge: KnowledgeBase, store: SQLiteStore, tmp_path: Path
+) -> None:
     data = exported_collection(knowledge)
     target = KnowledgeBase(tmp_path / "target.db")
+    target.activity = store
     try:
         preview = exchange.import_collection(target, io.BytesIO(data), dry_run=True)
         assert preview.collection == "Policies" and not preview.collection_exists and target.files() == []
@@ -276,6 +325,8 @@ def test_a_collection_round_trips_and_is_indexed_again(knowledge: KnowledgeBase,
         assert {item.name for item in target.files()} == {"hr.md", "travel.docx"}
         travel = next(item for item in target.files() if item.name == "travel.docx")
         assert travel.source_format == "docx" and travel.searchable and travel.collection == "Policies"
+        assert travel.origin == "import" and travel.provenance["format"] == "nodestro-collection/1"
+        assert travel.provenance["producer"].startswith("nodestro-runtime ")
         assert target.search("vacation", k=1)[0].file_id is not None
         again = io.BytesIO()
         exchange.export_collection(target, "Policies", again)
@@ -289,6 +340,8 @@ def test_a_collection_round_trips_and_is_indexed_again(knowledge: KnowledgeBase,
         copy = exchange.import_collection(target, io.BytesIO(data), dry_run=False, collection="Copy")
         assert copy.collection == "Copy" and [item.status for item in copy.items] == ["exists", "exists"]
         assert {item.collection for item in target.files()} == {"Policies"} and len(target.files()) == 2
+        logged = activity.query(store, resource_type="knowledge_file")
+        assert sorted(event.action for event in logged) == ["file.imported", "file.imported"]
     finally:
         target.close()
 
@@ -368,11 +421,69 @@ def test_tampered_and_oversized_collections_are_refused(
             for number in range(exchange.MAX_DOCUMENTS + 2):
                 archive.writestr(f"documents/{number:04d}", b"")
         assert refused(crowded.getvalue()) == "exchange.too_many_entries"
+        assert refused(lying_count(5000, 1)) == "exchange.too_many_entries"
+        assert refused(lying_count(10, 1)) == "exchange.zip_invalid"
         monkeypatch.setattr(exchange, "MAX_COLLECTION_BYTES", len(data) - 1)
         assert refused(data) == "exchange.too_large"
         assert target.files() == []
     finally:
         target.close()
+
+
+def lying_count(entries: int, declared: int) -> bytes:
+    """A ZIP file of ``entries`` empty entries whose end record declares ``declared``."""
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w") as archive:
+        for number in range(entries):
+            archive.writestr(f"documents/{number:04d}", b"")
+    data = bytearray(target.getvalue())
+    at = data.rfind(b"PK\x05\x06")
+    data[at + 8 : at + 12] = declared.to_bytes(2, "little") * 2
+    return bytes(data)
+
+
+def test_a_large_central_directory_is_refused_before_zipfile_reads_it(
+    knowledge: KnowledgeBase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = lying_count(5000, 1)
+
+    def never(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("zipfile must not read this file")
+
+    monkeypatch.setattr(exchange.zipfile, "ZipFile", never)
+    assert code(lambda: exchange.import_collection(knowledge, io.BytesIO(package), dry_run=True)) == (
+        "exchange.too_many_entries"
+    )
+
+
+def test_the_preview_of_a_collection_keeps_no_document_in_memory(knowledge: KnowledgeBase) -> None:
+    content = os.urandom(8 * exchange.MIB)
+    manifest = {
+        "format": "nodestro-collection/1",
+        "name": "Big",
+        "documents": [
+            {
+                "path": "documents/0001",
+                "name": "big.bin",
+                "media_type": "application/octet-stream",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        ],
+    }
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        archive.writestr("documents/0001", content)
+    package = io.BytesIO(target.getvalue())
+    tracemalloc.start()
+    try:
+        preview = exchange.import_collection(knowledge, package, dry_run=True)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert [item.status for item in preview.items] == ["ready"]
+    assert peak < 3 * exchange.MIB
 
 
 def test_a_collection_with_a_damaged_document_stores_nothing(knowledge: KnowledgeBase, tmp_path: Path) -> None:

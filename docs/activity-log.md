@@ -39,7 +39,7 @@ Identifiers and names must be printable single-line text of at most 200 characte
 | `tool_call` | `tool.called` | `engine` (`after_tool`, next to the tool journal note) | tool call of a run, also a refused one (`denied`, with its code) or a failed one (`failure`) |
 | `agent` | `agent.finished` | `engine`, when an agent step ends | execution of an agent step (a step that pauses for a person is logged when it ends) |
 | `workflow` | `workflow.started`, `workflow.finished` | `engine` | run (also a sub-workflow's run); `finished` when the run ends, not when it pauses |
-| `file` | `file.uploaded`, `file.deleted` | `input_files.InputFiles.add` / `delete`, `knowledge.KnowledgeBase.add` / `delete` | upload or deletion; the cleanup deletes as `system` |
+| `file` | `file.uploaded`, `file.imported`, `file.deleted` | `input_files.InputFiles.add` / `delete`, `knowledge.KnowledgeBase.add` / `delete` | upload, a document of an imported collection (`exchange.import_collection`) or deletion; the cleanup deletes as `system` |
 | `file` | `folder.listed`, `folder.read`, `folder.searched` | `folders.FolderReader` (N-10, [folders.md](folders.md)) | call of `list_folder`, `read_file` or `search_files`, also a refused one (`denied`, with its code); resource `folder_grant` with the grant's id, never a path or a file name |
 | `tool_approval` | `tool_approval.<kind>` | `tool_approvals.record_audit` | approval audit event |
 | `mcp` | `mcp.<kind>` | `mcp.service.McpService.event` | MCP event |

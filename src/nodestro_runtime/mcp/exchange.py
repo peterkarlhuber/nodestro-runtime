@@ -23,10 +23,10 @@ from ..exchange import (
     read_json,
     refuse_item,
     require_no_refusals,
-    secret_values,
 )
 from ..problems import NodestroError
 from .models import AuthKind, McpServer, McpServerIn, StdioCommand, Transport
+from .oauth import OAuthCredentials
 
 if TYPE_CHECKING:
     from .service import McpService
@@ -80,10 +80,23 @@ def export_mcp(service: McpService, server_ids: Iterable[str] | None = None) -> 
         **envelope("nodestro-mcp"),
         "servers": [mcp_entry(server).model_dump(mode="json") for server in servers],
     }
-    known = [value for server in servers for value in secret_values(service.token(server))]
-    known += [value for server in servers for value in secret_values(server.token_sealed)]
+    known = [value for server in servers for value in _secrets(service, server)]
     ensure_no_secrets(document, known)
     return document
+
+
+def _secrets(service: McpService, server: McpServer) -> list[str]:
+    """What of a server must never be in its export: the token or, for a signed-in OAuth server, its tokens and
+    client secret (never the issuer or resource, which are its address), and the sealed blobs."""
+    token = service.token(server)
+    values = [server.token_sealed, server.oauth_pending_sealed]
+    credentials = OAuthCredentials.loads(token) if token and server.auth == "oauth" else None
+    if credentials is None:
+        values.append(token)
+    else:
+        values += [value for key, value in credentials.tokens.items() if key not in ("token_type", "scope")]
+        values.append(credentials.client.get("client_secret"))
+    return [value for value in values if isinstance(value, str) and value]
 
 
 def _mcp_input(entry: McpServerEntry) -> McpServerIn:

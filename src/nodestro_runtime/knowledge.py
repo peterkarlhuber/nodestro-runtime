@@ -105,7 +105,8 @@ class KnowledgeFile(BaseModel):
     #: The collection the file belongs to (empty: none).
     collection: str = ""
     #: Where it came from: ``upload`` (knowledge page), ``input_file``, ``result_file``, ``agent_result`` or
-    #: ``proposal`` (taken over from a run after a person confirmed it).
+    #: ``proposal`` (taken over from a run after a person confirmed it), ``import`` (an imported collection,
+    #: ``nodestro-collection/1``; ``provenance`` names the format and producer).
     origin: str = "upload"
     #: The workflow, step, run, source files, time and kind of content of a file taken over from a run.
     provenance: dict[str, str] = {}
@@ -445,6 +446,7 @@ class KnowledgeBase:
         extra: dict[str, str] | None = None,
         actor: str | None = None,
         converted_from: Literal["docx", "xlsx"] | None = None,
+        action: Literal["file.uploaded", "file.imported"] = "file.uploaded",
     ) -> KnowledgeFile:
         """Store a file and index its text (``actor``: who uploaded it, for the activity log).
 
@@ -454,6 +456,7 @@ class KnowledgeBase:
         ``collection`` groups the file; ``extra`` is kept as metadata (origin of adopted files).
         ``converted_from``: ``data`` is already the Markdown text of a converted DOCX or XLSX file (UTF-8), as a
         collection export holds it (:mod:`nodestro_runtime.exchange`); it is stored like a fresh conversion.
+        ``action``: the activity event (``file.imported`` for a document of an imported collection).
         """
         metadata: dict[str, str] = dict(extra or {})
         if collection.strip():
@@ -483,7 +486,7 @@ class KnowledgeBase:
                 # A file that cannot be indexed is not kept: no half-stored entry, no stray chunks.
                 self._delete(entry.id)
                 raise
-        self._activity("file.uploaded", entry.id, actor)
+        self._activity(action, entry.id, actor)
         return self.get(entry.id)
 
     def _index_new(

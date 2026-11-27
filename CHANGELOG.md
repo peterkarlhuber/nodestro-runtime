@@ -7,7 +7,10 @@
   and version (`exchange.version_newer`), strict content, ZIP safety, preview and all-or-nothing apply. Exports never
   hold a secret and are checked for one before they are written (`exchange.secret_detected`); imports create new
   entries without secrets, MCP services switched off. New: `McpService.check_new`, `ConnectionService.check_new`,
-  `KnowledgeBase.add(converted_from=...)`, the `exchange.*` codes.
+  `KnowledgeBase.add(converted_from=..., action=...)`, the `exchange.*` codes. Review fixes: the ZIP directory size
+  is checked before zipfile reads it, the preview keeps no document in memory, JSON nesting is limited before
+  parsing, OAuth issuer and resource no longer count as secrets, stdio arguments like `--api-key=...` are refused,
+  imported documents have the origin `import` and the event `file.imported`, the collection check is atomic.
 
 - Security (RT-089d): a workflow uses a person's private memory space only after that person's explicit consent.
   Before, an editor could build a shared workflow that names Alice's space, and Alice's run of it read her memory
