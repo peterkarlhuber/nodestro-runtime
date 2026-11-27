@@ -71,7 +71,13 @@ jobs:
         run: python -c "import platform, sys; print(sys.platform, platform.machine(), platform.platform())"
       - name: Import the workspace (the path that failed on macOS)
         run: python -c "import nodestro_runtime.workspace as w; print('imported', w.__name__)"
-      - run: pytest -v --junitxml=junit-platforms.xml tests/test_platform_start.py tests/test_folders.py tests/test_folder_index.py
+      # N-22: the trust checks of Nodestro's own integration and the package file checks compare real paths, which
+      # differ on Windows (short names, case) and macOS (/private).
+      - run: >-
+          pytest -v --junitxml=junit-platforms.xml tests/test_platform_start.py tests/test_folders.py
+          tests/test_folder_index.py tests/test_trusted_integrations.py
+          tests/test_extension_isolation.py::test_only_the_distributions_own_regular_files_are_read
+          tests/test_extension_isolation.py::test_a_linked_package_folder_is_refused
       # MUP-ONA A0: the skipped tests of each system as listed in its expectation file (scripts/check_skips.py).
       - name: Skipped tests as expected
         run: python scripts/check_skips.py junit-platforms.xml "tests/ci/skipped-platforms-${{ matrix.os }}.txt"

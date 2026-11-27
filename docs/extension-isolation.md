@@ -71,6 +71,14 @@ locked package.
   are both `invalid`. Listing runs one container per package, one after the other (up to 60 s each) while the
   workspace opens with the switch on. Descriptions lose control and bidi characters but stay untrusted text that a
   user interface must escape.
+- Residual risk R1 (open, for G-6): a complete, self-consistent forged copy of `nodestro-integrations` (its own
+  `.dist-info` folder and a `RECORD` whose hashes match its own files) placed ahead on `sys.path` still passes the
+  checks and runs in the host. Placing it needs write access to the environment or control of `PYTHONPATH`: the same
+  position as a `.pth` file or a modified runtime. Closing it needs file hashes of each trusted integration release
+  pinned in the runtime, which ties runtime releases to integration releases; that is an open owner decision.
+- Residual risk R2: a module `nodestro_integrations` that host code imported normally before `discover()` is accepted
+  when its real path is the verified one (its bytes were not loaded through the verified finder). Only host code can
+  cause that import; no extension can.
 - Residual risk: whoever can write into the backend's Python environment can already run code there at every start
   (for example through a `.pth` file) or change a trusted file between its check and its import. Installing a package
   is a trust decision of whoever controls that environment; the rules above protect against a package's tools, its
@@ -107,6 +115,8 @@ open.
 | 20 | own seccomp profile, user namespace remapping | decided and, if chosen, enforced by the preflight | open |
 | 21 | dependencies of a package | built as a hashed image like tool environments, never in the host | open |
 | 22 | per-class enabling and the trust exception (WZ-8) | designed, reviewed | open: not implemented on purpose |
+| 23 | a forged, self-consistent copy of the trusted integration ahead on the path (R1) | refused (release-pinned file hashes) | open: owner decision |
+| 24 | trust checks on Windows and macOS paths (short names, case, `/private`) | same verdicts | Platforms workflow: `test_trusted_integrations.py` |
 
 The checks with "Docker:" run in the CI job `docker` of this repository (`NODESTRO_REQUIRE_DOCKER=1`: a daemon that
 does not pass Orkexa's preflight fails them instead of skipping them).

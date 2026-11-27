@@ -142,7 +142,11 @@ None known.
   grants for extension tools, the checks on Docker Desktop (macOS, Windows), an own seccomp profile and user
   namespace remapping, package dependencies as hashed images, showing the package states in the API and the studio,
   and the release per tool class after the internal and the independent review (gate G-6). The trust exception
-  (WZ-8) is not implemented on purpose.
+  (WZ-8) is not implemented on purpose. Residual R1 (re-review of #221): a complete, self-consistent
+  forged copy of `nodestro-integrations` ahead on `sys.path` still runs in the host (needs write access to the
+  environment or `PYTHONPATH`, like a `.pth` file); closing it needs per-release pinned file hashes of the trusted
+  integration in the runtime, an owner decision listed for G-6. R2: an earlier normal import of
+  `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)
