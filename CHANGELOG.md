@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix (RT-096, N-20 H1 leftover; workflow tools stay off by default): a workflow tool's call that waits for a person
+  (the start confirmation, an approval step, a tool approval or a budget decision inside) no longer holds back the
+  steps with workflow tools of the same depth. Per depth, at most `NODESTRO_RUN_THREADS` such steps work at once
+  (unchanged); a waiting step moves to one of four times as many waiting slots and takes a working slot again when it
+  goes on (`step_slots`). The depth's pool has both together as threads, so threads stay bounded.
+
 - Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
   containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
   by the sandbox gateway exactly; tool classes and grants are modelled (`extension_classes`, nothing released, every

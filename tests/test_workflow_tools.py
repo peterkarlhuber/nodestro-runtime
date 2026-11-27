@@ -691,3 +691,132 @@ async def test_l4_l5_parallel_calls_keep_their_own_runs_and_nested_result_files_
         item.run_id not in {call.workflow.run_id for call in answer.tool_calls if call.workflow}
         for item in answer.result_files
     )
+
+
+# ---- RT-096: a waiting call frees its working slot ------------------------------------------------------------------
+
+
+def quote_and_lookup(workspace: Workspace) -> tuple[str, str]:
+    """Conversation A calls the quote workflow (a confirmation and an approval step: it waits for a person twice),
+    conversation B a reading lookup workflow; both agents' steps have workflow tools at depth 0."""
+    gate(workspace)
+    quote = workspace.save_workflow(quote_workflow())
+    first = conversation(workspace, binding_for(workspace, quote, 1))
+    lookup = workspace.save_workflow(
+        WorkflowIn(
+            name="Lookup",
+            nodes=[Node(id="start", type="start"), agent_node("find", "LOOKUP", tools=["calculator"])],
+            edges=[Edge(id="e1", source="start", target="find")],
+        )
+    )
+    agent = AgentConfig(
+        name="Agent B",
+        system_prompt="SEARCHER",
+        workflow_tools=[binding_for(workspace, lookup, 1, name="workflow_lookup")],
+    )
+    template = AgentTemplates(workspace.store).create(agent).id
+    second = workspace.conversations.create(
+        ConversationIn(agent=AgentChoice(template_id=template), model=CLOUD), owner=None
+    ).id
+    return first, second
+
+
+def quote_script() -> dict[str, list[Any]]:
+    return {
+        "AGENT": [tool_use("workflow_quote", {"customer": "ACME", "amount": 5}), text("Quote ready.")],
+        "QUOTE_V1": [text("Quote for ACME")],
+        "SEARCHER": [tool_use("workflow_lookup", {"input": "ACME"}), text("Found.")] * 2,
+        "LOOKUP": [text("ACME is a customer")] * 2,
+    }
+
+
+async def lookup_finishes(workspace: Workspace, conversation_id: str) -> None:
+    """A step with workflow tools of the same depth runs to its end while the other call waits."""
+    sent = await workspace.conversations.send(conversation_id, None, MessageIn(content="Who is ACME?"))
+    await workspace.wait(sent.assistant.run_id or "", timeout=15)
+    found = workspace.conversations.message(conversation_id, None, sent.assistant.id)
+    assert found.status == "succeeded", found.model_dump_json()[:3000]
+    assert "ACME is a customer" in (found.tool_calls[0].result or "")
+
+
+def slots_free(workspace: Workspace) -> bool:
+    return all(item.working == 0 and item.waiting == 0 for item in workspace.runs._workflow_slots.values())
+
+
+async def test_rt096_a_call_waiting_for_a_person_never_holds_back_a_step_of_the_same_depth(make: Make) -> None:
+    workspace = make(quote_script())
+    workspace.runs.run_threads = 1  # one working slot per depth: before RT-096 the waiting call held it
+    first, second = quote_and_lookup(workspace)
+    sent = await workspace.conversations.send(first, None, MessageIn(content="A quote for ACME"))
+    run_id = sent.assistant.run_id or ""
+
+    def read() -> ConversationMessage:
+        return workspace.conversations.message(first, None, sent.assistant.id)
+
+    # 1. The call waits for the confirmation of the workflow's start (a tool approval in the agent's thread).
+    waiting = await until(read, lambda found: bool(found.approval_ids))
+    await lookup_finishes(workspace, second)
+    request = ToolApprovals(workspace.store).get(run_id, waiting.approval_ids[0])
+    assert request is not None
+    workspace.runs.decide_tool_call(run_id, request.id, approved=True, by="local", arguments=request.arguments_hash)
+
+    # 2. The workflow waits at its approval step (the call waits in the agent's thread for up to a day).
+    paused = await until(
+        read,
+        lambda found: bool(
+            found.tool_calls and found.tool_calls[0].workflow and found.tool_calls[0].workflow.approvals
+        ),
+    )
+    await lookup_finishes(workspace, second)
+    [slots] = workspace.runs._workflow_slots.values()
+    assert (slots.working, slots.waiting) == (0, 1)
+
+    # 3. The decision lets the call go on: it takes a working slot again and the answer ends.
+    card = paused.tool_calls[0].workflow.approvals[0]  # type: ignore[union-attr]
+    workspace.runs.decide(card.run_id, card.node_id, "approved")
+    await workspace.wait(run_id, timeout=20)
+    assert read().status == "succeeded"
+    assert slots_free(workspace)
+
+
+@pytest.mark.parametrize("end", ["cancel", "time_limit"])
+async def test_rt096_a_cancelled_or_timed_out_waiting_call_gives_its_slot_back(
+    make: Make, monkeypatch: pytest.MonkeyPatch, end: str
+) -> None:
+    from nodestro_runtime import engine
+
+    workspace = make(quote_script())
+    workspace.runs.run_threads = 1
+    first, second = quote_and_lookup(workspace)
+    if end == "time_limit":
+        monkeypatch.setattr(engine, "WORKFLOW_TOOL_WAIT_SECONDS", 1.0)
+    sent = await workspace.conversations.send(first, None, MessageIn(content="A quote for ACME"))
+    run_id = sent.assistant.run_id or ""
+
+    def read() -> ConversationMessage:
+        return workspace.conversations.message(first, None, sent.assistant.id)
+
+    waiting = await until(read, lambda found: bool(found.approval_ids))
+    request = ToolApprovals(workspace.store).get(run_id, waiting.approval_ids[0])
+    assert request is not None
+    workspace.runs.decide_tool_call(run_id, request.id, approved=True, by="local", arguments=request.arguments_hash)
+    paused = await until(
+        read,
+        lambda found: bool(
+            found.tool_calls and found.tool_calls[0].workflow and found.tool_calls[0].workflow.approvals
+        ),
+    )
+    child_id = paused.tool_calls[0].workflow.run_id  # type: ignore[union-attr]
+    if end == "cancel":
+        workspace.conversations.cancel(first, None, sent.assistant.id)
+    await workspace.wait(run_id, timeout=20)
+    answer = read()
+    if end == "cancel":
+        assert answer.status == "cancelled"
+    else:
+        assert answer.status == "succeeded" and "Nobody decided in time" in (answer.tool_calls[0].result or "")
+    child = workspace.runs.get(child_id)
+    assert child is not None and child.status == "cancelled"
+    assert slots_free(workspace)
+    await lookup_finishes(workspace, second)
+    assert slots_free(workspace)
