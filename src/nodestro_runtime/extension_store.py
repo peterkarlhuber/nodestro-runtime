@@ -507,8 +507,13 @@ class ExtensionStore:
                 os.chmod(target, 0o444)
             for folder in sorted(folders, key=lambda item: len(item.parts), reverse=True):
                 _fsync_dir(folder)
-                os.chmod(folder, 0o555)
-            os.rename(staging, self.root / inspected.sha256)
+                if folder != staging:
+                    os.chmod(folder, 0o555)
+            # A folder moves to another parent only while it is writable (its ".." entry changes); it is made
+            # read-only once it has its final name.
+            final = self.root / inspected.sha256
+            os.rename(staging, final)
+            os.chmod(final, 0o555)
             _fsync_dir(self.root)
         except BaseException:
             _delete(staging)
@@ -535,6 +540,8 @@ class ExtensionStore:
         trash.mkdir(mode=0o700, exist_ok=True)
         aside = trash / uuid.uuid4().hex
         try:
+            if not folder.is_symlink():
+                os.chmod(folder, 0o700)  # writable, so it can move to the trash folder
             os.rename(folder, aside)
         except OSError:
             aside = folder

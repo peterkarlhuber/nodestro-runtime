@@ -292,8 +292,10 @@ def test_an_interrupted_intake_never_leaves_a_valid_package(
     monkeypatch.undo()
     # A crash that even skipped the cleanup: a folder named by the hash but not listed, and a staging folder.
     (store.root / STAGING / "left-over").mkdir(parents=True, exist_ok=True)
-    (store.root / sha(wheel)).mkdir(exist_ok=True)
-    (store.root / sha(wheel) / "half.py").write_text("x = 1\n")
+    if where == "while writing":  # before the commit the renamed (read-only) folder is there already
+        (store.root / sha(wheel)).mkdir()
+        (store.root / sha(wheel) / "half.py").write_text("x = 1\n")
+    assert (store.root / sha(wheel)).is_dir()
     reopened = ExtensionStore(store.root)
     assert reopened.packages() == [] and reopened.listing()["packages"] == []
     assert folders(reopened) == []
