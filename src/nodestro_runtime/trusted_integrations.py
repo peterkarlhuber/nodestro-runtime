@@ -17,6 +17,9 @@ A distribution's name is its own statement, so it never decides trust by itself.
    it, no entry lies in the data directory, no entry or parent directory is writable by another user or a foreign
    group, and when this process cannot write its own installation, it cannot write any entry of the import path
    either. Where these permissions cannot be read (Windows ACLs) the host import is refused;
+6. no other distribution installed in that directory has put files into the trusted package or its metadata (its
+   ``RECORD`` lists them, also from a wheel's ``.data`` folder), no legacy installation is there, and no ``.pth``
+   file with unknown code runs at interpreter start (:func:`installation_problems`, review H1);
 
 and the import itself runs from exactly those verified bytes (:class:`_VerifiedFinder`, first on ``sys.meta_path``):
 no cached bytecode, no other copy of the package on ``sys.path``, no file the ``RECORD`` does not list. Anything that
@@ -110,6 +113,10 @@ def _ids() -> tuple[int, int]:
     return os.geteuid(), os.getegid()
 
 
+def _status(path: Path) -> os.stat_result:
+    return os.stat(path)
+
+
 def _writable(path: Path) -> bool:
     return os.access(path, os.W_OK)
 
@@ -125,12 +132,12 @@ def _unsafe(folder: Path, *, own: bool) -> str:
     """Why another user could change ``folder`` (empty: nobody but root and this user). ``own``: ``folder`` is the
     entry itself, not a parent (a parent writable by everyone with the sticky bit, like ``/tmp``, is fine)."""
     euid, egid = _ids()
-    info = os.stat(folder)
+    info = _status(folder)
     if info.st_uid not in (0, euid):
         return f"{folder} belongs to another user"
     if info.st_mode & stat.S_IWOTH and (own or not info.st_mode & stat.S_ISVTX):
         return f"{folder} is writable by every user"
-    if info.st_mode & stat.S_IWGRP and info.st_uid != 0 and info.st_gid not in (0, egid):
+    if info.st_mode & stat.S_IWGRP and info.st_gid not in (0, egid):  # also for a folder of root (review M1)
         return f"{folder} is writable by a group of other users"
     return ""
 
@@ -151,10 +158,17 @@ def environment_problems(
     entries = list(sys.path if path is None else path)
     cwd = Path(os.getcwd())
     folders: list[Path] = []
+    holders: list[Path] = []  # the folders that hold a symbolic link on the way to an entry (review L1)
     for entry in [str(home), *entries]:
-        folder = Path(os.path.realpath(cwd / entry if entry else cwd))
+        written = Path(os.path.normpath(cwd / entry if entry else cwd))
+        folder = Path(os.path.realpath(written))
         if not any(_same(folder, seen) for seen in folders):
             folders.append(folder)
+        if not _same(folder, written):
+            for parent in written.parents:
+                holder = Path(os.path.realpath(parent))
+                if not any(_same(holder, seen) for seen in holders):
+                    holders.append(holder)
     problems: list[str] = []
     if site.ENABLE_USER_SITE:
         user_site = Path(os.path.realpath(site.getusersitepackages()))
@@ -177,6 +191,94 @@ def environment_problems(
             if reason:
                 problems.append(reason)
                 break
+    for holder in holders:  # whoever can change the link can point the entry elsewhere
+        existing = _existing(holder)
+        for parent in [existing, *existing.parents]:
+            reason = _unsafe(parent, own=False)
+            if reason:
+                problems.append(reason)
+                break
+    return list(dict.fromkeys(problems))
+
+
+#: ``.pth`` files whose code is known exactly (SHA-256 of the whole file), from well-known installation tooling:
+#: setuptools' ``distutils-precedence.pth`` (the same bytes in setuptools 70.0, 75.8 and 80.9, checked; Debian names it
+#: ``zz-distutils-precedence.pth``). It only selects setuptools' copy of ``distutils`` when that is imported.
+KNOWN_PTH_CODE: frozenset[str] = frozenset(
+    {
+        "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
+    }
+)
+_PTH_CODE = re.compile(rb"^import[ \t]", re.MULTILINE)
+
+
+def _record_paths(info: Path) -> list[str] | None:
+    """The paths a ``.dist-info`` folder's ``RECORD`` lists (``None``: no readable ``RECORD``)."""
+    import csv
+
+    try:
+        text = _read(info / "RECORD").decode("utf-8")
+    except (OSError, UntrustedError, UnicodeDecodeError):
+        return None
+    return [row[0] for row in csv.reader(text.splitlines()) if row and row[0]]
+
+
+def installation_problems(home: Path, *, own: str, top: str, site_dirs: Sequence[str] | None = None) -> list[str]:
+    """Why the files of the trusted distribution in ``home`` may not be its own (review H1; empty: none).
+
+    ``own`` is its ``.dist-info`` folder, ``top`` its top-level package. Every installer records the files it put
+    in place in its distribution's ``RECORD``, also those a wheel brings in its ``.data/purelib`` folder; so
+
+    - another ``.dist-info`` in ``home`` whose ``RECORD`` lists a path in ``top`` or in a ``.dist-info`` of the
+      trusted name (it replaced or added to the trusted files), or that has no readable ``RECORD``;
+    - a legacy installation in ``home`` (``.egg-info``, ``.egg``, ``.egg-link``), whose files cannot be told;
+    - a ``.pth`` file with code (a line starting with ``import``, run by every interpreter start) in ``home`` or a
+      site directory (``site_dirs``, default :func:`site.getsitepackages`) whose bytes are not in
+      :data:`KNOWN_PTH_CODE`; a ``.pth`` line that only names a folder puts it on ``sys.path``, which
+      :func:`environment_problems` checks.
+    """
+    trusted = {normalized(name) for name in TRUSTED_DISTRIBUTIONS}
+    guarded = [home / top]
+    problems: list[str] = []
+    try:
+        children = sorted(home.iterdir())
+    except OSError as exc:
+        return [f"cannot list {home}: {exc.strerror}"]
+    for child in children:
+        name = child.name
+        if name.endswith(".dist-info") and normalized(name.split("-", 1)[0]) in trusted:
+            guarded.append(child)
+            if name != own:
+                problems.append(f"{home} holds another metadata folder of a trusted name, {name}")
+    for child in children:
+        name = child.name
+        if name.endswith((".egg-info", ".egg", ".egg-link")):
+            problems.append(f"{name} in {home} is a legacy installation whose files cannot be told")
+        if not name.endswith(".dist-info") or any(child == folder for folder in guarded):
+            continue
+        listed = _record_paths(child)
+        if listed is None:
+            problems.append(f"{name} in {home} has no readable RECORD")
+            continue
+        for item in listed:
+            target = os.path.normpath(home / item)
+            if any(_inside(Path(target), folder) for folder in guarded):
+                problems.append(f"{name.removesuffix('.dist-info')} also installed {item}")
+                break
+    dirs = [str(home), *(site.getsitepackages() if site_dirs is None else site_dirs)]
+    for folder in dict.fromkeys(os.path.realpath(entry) for entry in dirs):
+        try:
+            pth_files = sorted(Path(folder).glob("*.pth"))
+        except OSError:
+            continue
+        for pth in pth_files:
+            try:
+                data = _read(Path(os.path.realpath(pth)))
+            except (OSError, UntrustedError):
+                problems.append(f"{pth} cannot be read")
+                continue
+            if _PTH_CODE.search(data) and hashlib.sha256(data).hexdigest() not in KNOWN_PTH_CODE:
+                problems.append(f"{pth} runs code at every interpreter start")
     return list(dict.fromkeys(problems))
 
 
@@ -205,6 +307,9 @@ def verify(entry: metadata.EntryPoint, *, data_dir: str | Path | None = None) ->
         raise UntrustedError("the import path is not closed: " + "; ".join(problems[:3]))
     module = entry.value.split(":")[0]
     top = module.split(".")[0]
+    problems = installation_problems(home, own=expected, top=top)
+    if problems:
+        raise UntrustedError("its installation is not its own: " + "; ".join(problems[:3]))
     sources: dict[str, bytes] = {}
     for item in dist.files or ():
         parts = item.parts
@@ -297,6 +402,7 @@ __all__ = [
     "claims_trusted",
     "environment_problems",
     "installation_home",
+    "installation_problems",
     "load",
     "verify",
 ]

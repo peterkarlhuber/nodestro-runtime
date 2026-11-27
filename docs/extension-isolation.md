@@ -98,8 +98,9 @@ locked package.
   user interface must escape.
 - Residual risk R1 (provisionally accepted by the owner for internal development, see below): a complete,
   self-consistent forged copy of `nodestro-integrations` is imported only when it replaces the genuine files in the
-  runtime's own installation directory. A copy anywhere else on `sys.path` is refused. Replacing files there needs the
-  same write access as replacing `nodestro_runtime` itself; release-pinned file hashes are not used (owner decision).
+  runtime's own installation directory without any installer recording it (a foreign package installed there that
+  lists them is refused). A copy anywhere else on `sys.path` is refused. Writing files there by hand needs the same
+  write access as replacing `nodestro_runtime` itself; release-pinned file hashes are not used (owner decision).
 - Residual risk R2: a module `nodestro_integrations` that host code imported normally before `discover()` is accepted
   when its real path is the verified one (its bytes were not loaded through the verified finder). Only host code can
   cause that import; no extension can.
@@ -121,13 +122,19 @@ The runtime enforces the part it can check and refuses the host import otherwise
 | a forged copy ahead on `sys.path` (`PYTHONPATH`, working directory, script directory, a `.pth` entry) | only the copy in the runtime's own directory is accepted | `::test_a_forged_self_consistent_copy_ahead_on_the_path_is_refused`, `::test_a_verified_copy_away_from_the_running_runtime_is_refused` |
 | the user's site-packages (`~/.local`, `pip install --user`, its `.pth` files and `usercustomize`) | refused while it is on `sys.path` (off with `-I`, `-s` and in a virtual environment without system site packages) | `::test_the_user_site_packages_on_the_path_is_a_problem` |
 | an entry, or the installation, in the data directory (where approved Python environments, tool images and uploads live) | refused | `::test_the_data_directory_on_the_path_is_a_problem`, `::test_the_workspace_hands_its_data_directory_to_the_checks` |
-| an entry or a parent directory writable by every user (sticky parents like `/tmp` excepted), owned by another user than root and this one, or writable by a foreign group; the working directory for an empty or relative entry | refused | `::test_folders_writable_by_every_user_are_a_problem`, `::test_folders_of_another_user_or_a_foreign_group_are_a_problem` |
+| an entry or a parent directory writable by every user (sticky parents like `/tmp` excepted), owned by another user than root and this one, or writable by a group other than root's (gid 0) and this process's own, also when root owns it (`root:staff 0775` is refused, review M1; macOS's `admin` group is not exempted: its members need a password to become root but can write such a folder directly); the working directory for an empty or relative entry | refused | `::test_folders_writable_by_every_user_are_a_problem`, `::test_folders_of_another_user_or_a_foreign_group_are_a_problem`, `::test_a_folder_of_root_writable_by_another_group_is_a_problem` |
+| a symbolic link on the way to an entry, in a folder another user can write (they could repoint it) | every folder that holds such a link, and its parents, is checked like an entry's parents (review L1) | `::test_the_folder_holding_a_symbolic_link_on_the_path_is_checked` |
+| a foreign package installed into the runtime's own directory that replaces or adds to the trusted files, also from its wheel's `.data/purelib` folder (pip and uv list every such file in that distribution's `RECORD`) | refused when any other `.dist-info` there lists a path in `nodestro_integrations/` or in a `.dist-info` of the trusted name, has no readable `RECORD`, when a second metadata folder of the trusted name or a legacy installation (`.egg-info`, `.egg`, `.egg-link`) is there (review H1) | `::test_a_foreign_distribution_that_replaced_the_trusted_files_is_refused`, `::test_a_foreign_wheel_installed_by_pip_over_the_trusted_files_is_refused` (real pip), `::test_every_installation_check_names_its_problem`, `::test_the_genuine_installation_next_to_other_distributions_is_imported` |
+| a `.pth` file with code (a line starting with `import`, run at every interpreter start) in the runtime's directory or a site directory | refused unless its bytes are a known one (`KNOWN_PTH_CODE`: setuptools' `distutils-precedence.pth`); a `.pth` line that only names a folder puts it on `sys.path`, which the checks above cover | `::test_every_installation_check_names_its_problem[pth-code]`, `::test_pth_files_of_the_site_directories_are_checked_too` |
 | a sealed installation (the process cannot write it) with an entry the process can write (its data volume as working directory, a writable `PYTHONPATH` entry) | refused | `::test_a_writable_entry_of_a_sealed_installation_is_a_problem` |
 | permissions that cannot be read (Windows: ACLs) | refused: not proven | `::test_without_readable_permissions_the_host_import_is_refused` |
 | `sitecustomize`, `PYTHONHOME`, `PYTHONSTARTUP` | `sitecustomize` and `PYTHONHOME` act through `sys.path` entries (checked above); `PYTHONSTARTUP` runs only in an interactive interpreter | as above |
 
 The checks run when the workspace opens, after the interpreter started: code that a writable location already ran at
 start (a `.pth` file, `sitecustomize`) is not undone, but the trusted import is refused and the reason is shown.
+An environment with coverage.py 7.13 or later (its `a1_coverage.pth` runs code) or another tool that installs such a
+file therefore refuses the trusted import; the products ship neither, and no CI job that discovers the integration
+installs one.
 Approved Python environments of workflows and tools are separate virtual environments in `<data>/python/envs` (or
 container images), created without system site packages; local MCP servers and extension tools run only in
 containers; nothing in Nodestro installs into its own environment (the products ship without pip).

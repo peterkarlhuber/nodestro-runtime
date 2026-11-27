@@ -228,6 +228,48 @@ class SkillBinding(_Model):
     group_id: str | None = Field(default=None, max_length=64)
 
 
+#: The name a workflow tool has for the model (as every tool name: letters, digits, ``_`` and ``-``).
+WORKFLOW_TOOL_NAME = r"^[a-zA-Z0-9_-]{1,64}$"
+#: Most workflow tools of one agent (N-20).
+MAX_WORKFLOW_TOOLS = 20
+
+
+class WorkflowEffect(_Model):
+    """What a workflow may do as a whole (N-20): the highest ``access`` and ``reach`` of everything it contains (its
+    agents' tools, MCP tools and server tools, its result files, its sub-workflows, teams and workflow tools, at every
+    depth). Something unknown (a tool that is not there, a team chosen at run time, a workflow that cannot be read)
+    counts as ``write`` + ``external`` (:data:`~nodestro_runtime.tool_policy.UNKNOWN`) and is named in ``unknown``.
+    See :mod:`nodestro_runtime.workflow_tools`."""
+
+    access: Literal["read", "write", "destructive"] = "write"
+    reach: Literal["internal", "external"] = "external"
+    #: A step at some depth uses a persistent memory space (RT-089c/RT-089d: the owner's consent is needed).
+    memory: bool = False
+    #: Approval steps at every depth (each pauses the call until a person decides).
+    approvals: int = 0
+    #: Every workflow it contains, as ``workflow_id@version``, itself first.
+    workflows: list[str] = Field(default_factory=list)
+    #: What counted as unknown (tool names, ``workflow_id@version``, ``team selection``).
+    unknown: list[str] = Field(default_factory=list)
+
+
+class WorkflowToolConfig(_Model):
+    """A saved workflow in one fixed version that an agent may call as a tool (N-20).
+
+    The version never changes by itself: a newer version of the workflow is only reported
+    (:func:`~nodestro_runtime.workflow_tools.newer_versions`). The arguments are the workflow's start form; the
+    result is its output and its result files. ``effect`` is what the workflow may do, computed when it was added
+    (:func:`~nodestro_runtime.workflow_tools.describe`); every call computes it again and the higher one counts."""
+
+    workflow_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    #: The tool's name for the model.
+    name: str = Field(pattern=WORKFLOW_TOOL_NAME)
+    #: Shown to the model besides the workflow's own description (empty: only that).
+    description: str = Field(default="", max_length=2000)
+    effect: WorkflowEffect | None = None
+
+
 class AgentConfig(_Model):
     """Everything about one agent node; mirrors the arguments of ``orkexa.Agent``.
 
@@ -283,6 +325,11 @@ class AgentConfig(_Model):
     origin: TemplateRef | None = None
     #: Skills of the skill library in fixed versions (NAL-B3). They add instructions, never tools or permissions.
     skills: list[SkillBinding] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
+    #: Saved workflows in fixed versions it may call as tools (N-20, behind ``NODESTRO_WORKFLOW_TOOLS``). Left out of
+    #: the stored record while empty, so agents and workflows stay byte-identical.
+    workflow_tools: list[WorkflowToolConfig] = Field(
+        default_factory=list, max_length=MAX_WORKFLOW_TOOLS, exclude_if=lambda value: not value
+    )
     #: Offline (N-09): the strict offline mode's rules for this agent only, checked at every call (see
     #: :mod:`nodestro_runtime.offline`): local models only, no server tools, no tool with external reach. Left out of
     #: the stored record while off, so agents and workflows stay byte-identical.
@@ -889,6 +936,14 @@ class ToolCallApproval(_Model):
     access_source: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
+class WorkflowCall(_Model):
+    """The run of a workflow tool's call (N-20): a child run of the agent's run, below the agent's step."""
+
+    workflow_id: str
+    version: int
+    run_id: str
+
+
 class ToolCallRecord(_Model):
     id: str
     name: str
@@ -903,6 +958,8 @@ class ToolCallRecord(_Model):
     #: The per-call approval rules' verdict (S-2); ``None`` when no rule applied (approvals off, or Nodestro's own
     #: run tools).
     approval: ToolCallApproval | None = None
+    #: A workflow tool's call (N-20): the workflow, its fixed version and the child run that executes it.
+    workflow: WorkflowCall | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SourceEntry(_Model):

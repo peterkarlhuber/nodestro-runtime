@@ -1385,6 +1385,16 @@ def _decide_binding(
         # MCP is strict (D10c): a changing MCP call is asked every time, whatever the binding says. No ``never`` and
         # no legacy exemption applies, because such calls were refused outright before per-call approvals existed.
         return ASK
+    if kind == "workflow" and not capability.reads_only:
+        # N-20: a workflow tool that may change something is confirmed before every start, whatever the binding says
+        # (its effect is the highest of everything it contains). A pre-grant names a tool by name and version only,
+        # never a workflow's effect, so none applies (review M1): an unattended run cannot start it.
+        if context.attended:
+            return ASK
+        return _deny(
+            "tool.approval_unattended",
+            f"The workflow tool {tool} needs a person's approval for each start, and nobody can answer in this run",
+        )
     if not wants_question(capability, binding, version=version):
         return ALLOW
     if context.attended:

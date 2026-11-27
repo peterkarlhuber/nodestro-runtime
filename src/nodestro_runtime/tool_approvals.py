@@ -25,7 +25,7 @@ compare-and-set), and only within :data:`EXECUTION_WINDOW` after the decision.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
@@ -887,9 +887,30 @@ class ToolGate:
         )
 
 
+#: The facts of the workflow tools of the agent step running in this context (N-20), by tool name.
+_WORKFLOW_FACTS: ContextVar[Mapping[str, tuple[ToolCapability, int | None, str, str | None]] | None] = ContextVar(
+    "nodestro_workflow_tool_facts", default=None
+)
+
+
+def bind_workflow_facts(facts: Mapping[str, tuple[ToolCapability, int | None, str, str | None]] | None) -> Token[Any]:
+    """Bind the facts of an agent step's workflow tools (capability = the workflow's effect, its fixed version, kind
+    ``workflow``, the hash its approvals are bound to) for :func:`tool_facts`; reset with
+    :func:`reset_workflow_facts`."""
+    return _WORKFLOW_FACTS.set(facts)
+
+
+def reset_workflow_facts(token: Token[Any]) -> None:
+    _WORKFLOW_FACTS.reset(token)
+
+
 def tool_facts(tools: Any, name: str) -> tuple[ToolCapability, int | None, str, str | None]:
     """Capability, version, kind and MCP definition hash of the tool ``name`` in a tool registry; a tool that is
-    not there counts as an unknown own tool (:data:`~nodestro_runtime.tool_policy.UNKNOWN`)."""
+    not there counts as an unknown own tool (:data:`~nodestro_runtime.tool_policy.UNKNOWN`). A workflow tool of the
+    agent step running now (N-20) has the facts bound for it (:func:`bind_workflow_facts`)."""
+    workflow = _WORKFLOW_FACTS.get()
+    if workflow is not None and name in workflow:
+        return workflow[name]
     try:
         info = tools.get(name)
     except KeyError:

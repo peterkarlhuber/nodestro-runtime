@@ -35,18 +35,31 @@ import json
 from typing import Any, Literal
 
 from .conditions import APPROVED, DEFAULT_BRANCH, REJECTED
-from .schemas import Edge, Node, NodeRun, OrchestratorMember, SubworkflowConfig, Workflow, WorkflowIn
+from .schemas import (
+    Edge,
+    Node,
+    NodeRun,
+    OrchestratorMember,
+    SubworkflowConfig,
+    Workflow,
+    WorkflowIn,
+    WorkflowToolConfig,
+)
 
 
-def workflow_refs(node: Node) -> list[SubworkflowConfig | OrchestratorMember]:
-    """The references to other workflows in ``node`` (a sub-workflow, or an orchestrator's teams).
+def workflow_refs(node: Node) -> list[SubworkflowConfig | OrchestratorMember | WorkflowToolConfig]:
+    """The references to other workflows in ``node`` (a sub-workflow, an orchestrator's teams, or an agent's
+    workflow tools, N-20).
 
-    Each has ``workflow_id`` and ``version``; changing ``version`` pins the reference.
+    Each has ``workflow_id`` and ``version``; changing ``version`` pins the reference (a workflow tool always names
+    its version). Releases, exports, memory consents and the pre-checks follow every one of them.
     """
     if node.type == "subworkflow" and node.subworkflow is not None and node.subworkflow.workflow_id:
         return [node.subworkflow]
     if node.type == "orchestrator" and node.orchestrator is not None:
         return [member for member in node.orchestrator.members if member.workflow_id]
+    if node.type == "agent" and node.agent is not None:
+        return list(node.agent.workflow_tools)
     return []
 
 
