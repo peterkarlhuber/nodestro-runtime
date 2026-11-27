@@ -2880,8 +2880,9 @@ class RunManager:
         if executor is not None:
             # Agents that did not stop yet end with their next model response or tool call.
             executor.shutdown(wait=False)
-        executors, self._workflow_executors = self._workflow_executors, {}
-        self._workflow_slots = {}
+        with self._executor_lock:
+            executors, self._workflow_executors = self._workflow_executors, {}
+            self._workflow_slots = {}
         for item in executors.values():
             item.shutdown(wait=False)
 
@@ -3150,6 +3151,7 @@ class RunManager:
         *args: Any,
         depth: int | None = None,
         check: Callable[[], None] | None = None,
+        owner: tuple[str, str] | None = None,
     ) -> T:
         """``asyncio.to_thread`` on this manager's own agent pool (C-08; see :attr:`run_threads`).
 
@@ -3159,7 +3161,8 @@ class RunManager:
         ordinary steps) need. The depth is bounded by :data:`MAX_DEPTH`, so the deepest waiting level always has
         threads left for the steps it waits for. Within a depth, at most :attr:`run_threads` such steps work at once;
         a step whose call waits for a person frees its working slot meanwhile (RT-096,
-        :mod:`nodestro_runtime.step_slots`; ``check`` raises once the step's run is cancelled)."""
+        :mod:`nodestro_runtime.step_slots`; ``check`` raises once the step's run is cancelled, ``owner`` is the step's
+        run and node). Every other thread runs without a step's slot, so nothing below a step acts on it."""
         executor = self._executor if depth is None else self._workflow_executors.get(depth)
         slots = None if depth is None else self._workflow_slots.get(depth)
         if executor is None or (depth is not None and slots is None):
@@ -3181,7 +3184,11 @@ class RunManager:
         context = contextvars.copy_context()
         work: Callable[[], T] = functools.partial(call, *args)
         if slots is not None:
-            work = functools.partial(step_slots.run_in_slot, slots, check or (lambda: None), work)
+            if owner is None:
+                raise ValueError("a step with workflow tools needs its owner")
+            work = functools.partial(step_slots.run_in_slot, slots, check or (lambda: None), owner, work)
+        else:
+            work = functools.partial(step_slots.without_slot, work)
         return await asyncio.get_running_loop().run_in_executor(executor, functools.partial(context.run, work))
 
     def _activity(self, context: _RunContext, source: activity.Source, action: str, **fields: Any) -> None:
@@ -3727,6 +3734,7 @@ class RunManager:
             budget_wait,
             depth=len(context.stack) if config.workflow_tools else None,
             check=context.check,
+            owner=(context.run.id, node.id),
         )
         self._save(context)
         # A paused step is logged when it ends; a step of a run another process took over (C-06), by that process.
@@ -4045,7 +4053,8 @@ class RunManager:
             raise ToolResultError("run.no_event_loop: the workflow cannot start here")
 
         def on_loop(call: Any) -> Any:
-            return asyncio.run_coroutine_threadsafe(call, loop).result()
+            # The child run's coroutine starts without the step's slot (RT-096): its steps never act on it.
+            return step_slots.without_slot(asyncio.run_coroutine_threadsafe, call, loop).result()
 
         context.check()
         run = context.run
@@ -4102,7 +4111,7 @@ class RunManager:
                 if child.status != "paused":
                     break
                 self._emit(context, "workflow_tool_waiting", node.id, name=binding.name, child_run_id=child.id)
-                with step_slots.waiting_for_person(context.check) as retry:
+                with step_slots.waiting_for_person(context.check, (run.id, node.id)) as retry:
                     decided = self._wait_for_workflow_tool(context, child.id, deadline, retry)
                 if not decided:
                     raise ToolResultError("Nobody decided in time what this workflow waited for, so it was stopped")
@@ -4346,7 +4355,7 @@ class RunManager:
             self._save(context)
             try:
                 # A step with workflow tools frees its working slot while it waits (RT-096).
-                with step_slots.waiting_for_person(context.check) as retry:
+                with step_slots.waiting_for_person(context.check, (run_id, node_id)) as retry:
 
                     def check() -> None:
                         retry()
@@ -5622,6 +5631,8 @@ class RunManager:
             state.text += delta
             self._emit(context, "text", node_id, delta=delta)
 
+        #: The step's run and node: its slot of its depth's pool, if it has workflow tools (RT-096, step_slots).
+        owner = (context.run.id, node_id)
         #: The step's memory consent guard once it is known (set before the first request; RT-089d, Welle 5).
         guard_box: list[ConsentGuard | None] = []
         #: The effect of each workflow tool of the step (N-20), by tool name; filled before the first request.
@@ -5654,6 +5665,8 @@ class RunManager:
                 self._emit(context, "reasoning_reduced", node_id, reason="output_limit")
 
         def on_request(_args: dict[str, Any]) -> None:
+            # A step with workflow tools works only on a working slot of its depth (RT-096).
+            step_slots.require_working(owner, context.check)
             self._check_owned(context)
             context.tracker.check()
             # N-08: granted content may have entered this turn after it connected (a folder read): every request
@@ -5677,6 +5690,15 @@ class RunManager:
 
         def before_tool(call: ToolCall) -> Denial | None:
             context.check()
+            # The call works: a step with workflow tools holds a working slot of its depth (RT-096).
+            step_slots.call_started(owner, call.id, context.check)
+            try:
+                return asked(call)
+            except BaseException:
+                step_slots.call_finished(owner, call.id)  # no after_tool follows (a suspended or failed call)
+                raise
+
+        def asked(call: ToolCall) -> Denial | None:
             # A resumed call keeps the record it got when it was asked about.
             record = next((item for item in state.tool_calls if item.id == call.id), None) if call.resumed else None
             if record is None:
@@ -5730,6 +5752,12 @@ class RunManager:
             )
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
+            try:
+                finished(call, content, is_error)
+            finally:
+                step_slots.call_finished(owner, call.id)
+
+        def finished(call: ToolCall, content: str, is_error: bool) -> None:
             request = released.pop(call.id, None)
             binding = bindings.pop(call.id, None)
             # The MCP service refused the call at its last check right before the send (the tool was reclassified or

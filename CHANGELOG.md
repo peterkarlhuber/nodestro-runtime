@@ -5,8 +5,9 @@
 - Fix (RT-096, N-20 H1 leftover; workflow tools stay off by default): a workflow tool's call that waits for a person
   (the start confirmation, an approval step, a tool approval or a budget decision inside) no longer holds back the
   steps with workflow tools of the same depth. Per depth, at most `NODESTRO_RUN_THREADS` such steps work at once
-  (unchanged); a waiting step moves to one of four times as many waiting slots and takes a working slot again when it
-  goes on (`step_slots`). The depth's pool has both together as threads, so threads stay bounded.
+  (unchanged); a step all of whose running calls wait moves to one of four times as many waiting slots and takes a
+  working slot again (first come, first served) when it goes on (`step_slots`). The depth's pool has both together as
+  threads, so threads stay bounded. A slot belongs to its step only: child runs never act on it.
 
 - Tests (N-24, Welle 7): migration 0011 (memory origin) has its own PostgreSQL migration test, starting from 0010 with
   existing memory files. No code change.
