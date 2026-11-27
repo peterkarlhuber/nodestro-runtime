@@ -468,8 +468,16 @@ def test_every_installation_check_names_its_problem(tmp_path: Path, change: str)
     assert problems == [expected]
 
 
-#: Lines that ``site.addpackage`` runs although they do not follow a ``\n`` (review N1): it decodes UTF-8 with or
-#: without a byte order mark and splits with ``str.splitlines``.
+#: Lines that ``site.addpackage`` runs although they do not follow a ``\n`` (review N1). Python 3.13 decodes UTF-8 with
+#: or without a byte order mark and splits with ``str.splitlines``; 3.11 and 3.12 read text lines (universal
+#: newlines), so there only ``\r`` hides code. Refused on every version either way.
+HIDDEN_CODE_RUNS_FROM = {
+    "carriage-return": (3, 0),
+    "byte-order-mark": (3, 13),
+    "form-feed": (3, 13),
+    "next-line": (3, 13),
+    "line-separator": (3, 13),
+}
 HIDDEN_CODE = {
     "carriage-return": b"# a folder\rimport sys; sys.stdout.write('ran')\r",
     "byte-order-mark": b"\xef\xbb\xbfimport sys; sys.stdout.write('ran')\n",
@@ -486,13 +494,13 @@ def test_a_pth_file_is_refused_however_its_code_is_hidden(tmp_path: Path, varian
     site = Path(os.path.realpath(tmp_path)) / "site"
     info = write_distribution(site)
     (site / "hidden.pth").write_bytes(HIDDEN_CODE[variant])
-    # The interpreter runs it: the case is real.
+    # The interpreter runs it where this version splits lines so: the case is real.
     ran = subprocess.run(
         [sys.executable, "-I", "-S", "-c", f"import site; site.addsitedir({str(site)!r})"],
         capture_output=True,
         check=True,
     )
-    assert ran.stdout == b"ran"
+    assert (ran.stdout == b"ran") is (sys.version_info >= HIDDEN_CODE_RUNS_FROM[variant])
     assert trusted_integrations.installation_problems(site, own=info.name, top=TOP, sites=[], folders=[]) == [
         f"{site / 'hidden.pth'} is not a known .pth file (the interpreter reads it at every start)"
     ]
