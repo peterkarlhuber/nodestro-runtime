@@ -3,6 +3,7 @@
 tests.test_knowledge_memory_backends::test_postgres_memory_refuses_nul_characters[sqlite]  # a PostgreSQL-only check (the SQLite parametrization)
 tests.test_knowledge_memory_backends::test_tenants_have_separate_knowledge[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
 tests.test_knowledge_memory_backends::test_tenants_have_separate_memory[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
+tests.test_knowledge_memory_backends::test_tenants_have_separate_memory_entries[sqlite]  # tenants exist on PostgreSQL only (the SQLite parametrization)
 tests.test_knowledge_retrieval::test_a_failed_or_cancelled_reindex_keeps_the_current_vectors[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
 tests.test_knowledge_retrieval::test_a_rebuilt_embedding_model_needs_a_reindex_but_uploads_keep_working[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)
 tests.test_knowledge_retrieval::test_a_weak_full_text_hit_no_longer_outranks_the_vector_hit[postgres-pgvector]  # the pg-a service postgres:17 has no pgvector (runs in pg-b)

@@ -103,11 +103,11 @@
     },
     "schema_mismatch": {
       "code": "storage.schema_mismatch",
-      "message": "The PostgreSQL database has schema version 1; this release needs 10. Run the migration first",
+      "message": "The PostgreSQL database has schema version 1; this release needs 11. Run the migration first",
       "message_has_canary": false,
       "params": {
         "found": 1,
-        "supported": 10
+        "supported": 11
       },
       "problem_fields": [
         "code",

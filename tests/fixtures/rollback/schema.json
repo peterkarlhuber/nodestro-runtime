@@ -58,6 +58,11 @@
       "checksum": "aadda58e1c14e6654bca42394e058ae85ad44309b2f017d9ec2f15409a6732f5",
       "name": "0010_knowledge_vectors.sql",
       "version": 10
+    },
+    {
+      "checksum": "452daf9055a1134b2a5b7d5284a5bcdde2c27c7d59043a9c941f129e2b581efd",
+      "name": "0011_memory_origin.sql",
+      "version": 11
     }
   ],
   "relations": {
@@ -947,6 +952,14 @@
           "name": "updated_at",
           "not_null": true,
           "type": "timestamp with time zone"
+        },
+        {
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "origin",
+          "not_null": false,
+          "type": "text"
         }
       ],
       "constraints": [

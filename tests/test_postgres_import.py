@@ -94,6 +94,9 @@ def test_a_desktop_database_moves_into_an_empty_tenant(desktop: Path, server: Po
     assert [hit.source for hit in knowledge.search("cafe")] == [contract.id]
     memory = MemorySpaces(PostgresMemoryTables(server, "acme"))
     assert memory.open("Team").read("/memories/notes/a.md") == "Peter mag Tee"
+    # N-24: the file keeps who wrote it (the person, by an explicit write) and when.
+    [entry] = memory.open("Team").entries()
+    assert (entry.path, entry.origin) == ("/memories/notes/a.md", "user") and entry.updated_at is not None
     assert [(info.name, info.files) for info in memory.all()] == [("Team", 1)]
 
     # Nothing reached another tenant.

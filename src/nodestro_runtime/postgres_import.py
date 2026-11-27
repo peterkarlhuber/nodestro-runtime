@@ -245,13 +245,21 @@ def _copy_chunks(sqlite: sqlite3.Connection, db: Any, report: ImportReport) -> N
 def _copy_memory(sqlite: sqlite3.Connection, db: Any, report: ImportReport) -> None:
     if not _has_table(sqlite, "memory_files"):
         return
-    cursor = sqlite.execute("SELECT namespace, path, content, updated_at FROM memory_files ORDER BY namespace, path")
+    # N-24: the origin of each file where the desktop's table has one (an older table has none: NULL, unknown).
+    has_origin = any(row[1] == "origin" for row in sqlite.execute("PRAGMA table_info(memory_files)"))
+    origin = "origin" if has_origin else "NULL"
+    cursor = sqlite.execute(
+        f"SELECT namespace, path, content, updated_at, {origin} FROM memory_files ORDER BY namespace, path"
+    )
     for rows in _batches(cursor):
         with db.cursor() as out:
             out.executemany(
-                "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content, updated_at)"
-                " VALUES (%s, %s, %s, %s, %s::timestamptz)",
-                [(report.tenant_id, ns, _text(p), _text(content), updated) for ns, p, content, updated in rows],
+                "INSERT INTO nodestro_memory_files (tenant_id, namespace, path, content, updated_at, origin)"
+                " VALUES (%s, %s, %s, %s, %s::timestamptz, %s)",
+                [
+                    (report.tenant_id, ns, _text(p), _text(content), updated, None if who is None else _text(who))
+                    for ns, p, content, updated, who in rows
+                ],
             )
         report.memory_files += len(rows)
 

@@ -55,8 +55,8 @@ def test_restored_fixture_passes_the_migration_check_and_keeps_its_data(restored
         assert [row[0] for row in recorded] == list(range(1, 11))
         for _version, name, checksum in recorded:
             assert checksum == listed[name], name
-        # The runner's own check: migrating applies only migrations newer than 0010 (none on the baseline) and
-        # refuses a database whose recorded checksums differ (storage.migration_changed).
+        # The runner's own check: migrating applies only migrations newer than 0010 (N-24: 0011, the memory files'
+        # origin) and refuses a database whose recorded checksums differ (storage.migration_changed).
         assert database.migrate(before_migration=lambda current, target: None) == 10
         database.require_current_schema()
 
@@ -81,6 +81,10 @@ def test_restored_fixture_passes_the_migration_check_and_keeps_its_data(restored
             memory = MemorySpaces(PostgresMemoryTables(database, tenant)).open("fixture-notes")
             assert "The heron is blue." in memory.view("/memories/notes.md")
             assert f"Only {tenant}" in memory.view(f"/memories/{tenant}.md")
+            # N-24: the files from before 0011 list their time and no origin; a new write records its origin.
+            entries = {entry.path: entry for entry in memory.entries()}
+            assert entries["/memories/notes.md"].origin is None and entries["/memories/notes.md"].updated_at
+            assert {entry.scope for entry in entries.values()} == {"user"}
         # The same file ids in both tenants (content-addressed), and one zero vector per tenant.
         ids = database._query(
             "SELECT tenant_id, array_agg(id ORDER BY id) FROM nodestro_files WHERE id IN"
