@@ -365,7 +365,7 @@ are written exactly as before, and the usage dashboard reads them. The mirrors a
   mirrored only when it is complete; an unknown or partial cost is never billed as the whole cost.
 - **Activity log** (N-13, [activity-log.md](activity-log.md)): the activity events of tool calls, agent steps, runs
   and files (`nodestro.tool.called`, `nodestro.agent.finished`, `nodestro.workflow.started` / `.finished`,
-  `nodestro.file.uploaded` / `.deleted`), with ids, outcome and code; reconciled like the other audit events. The
+  `nodestro.file.uploaded` / `.imported` / `.deleted`), with ids, outcome and code; reconciled like the other audit events. The
   activity events of approval, MCP and connection events are not mirrored a second time.
 - **Workflow runs** are mirrored only with `NODESTRO_AXENTRA_RUN_USAGE=1` (see
   [Usage](#usage-end-state-and-run-usage)); otherwise their usage stays in the stored runs only. No limit is

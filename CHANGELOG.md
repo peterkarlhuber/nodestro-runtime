@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- New (N-14): versioned exchange formats `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with
+  one import check for all of them (`exchange`; [docs/exchange-formats.md](docs/exchange-formats.md)): size, format
+  and version (`exchange.version_newer`), strict content, ZIP safety, preview and all-or-nothing apply. Exports never
+  hold a secret and are checked for one before they are written (`exchange.secret_detected`); imports create new
+  entries without secrets, MCP services switched off. New: `McpService.check_new`, `ConnectionService.check_new`,
+  `KnowledgeBase.add(converted_from=..., action=...)`, the `exchange.*` codes. Review fixes: the ZIP directory size
+  is checked before zipfile reads it, the preview keeps no document in memory, JSON nesting is limited before
+  parsing, OAuth issuer and resource no longer count as secrets, stdio arguments like `--api-key=...` are refused,
+  imported documents have the origin `import` and the event `file.imported`, the collection check is atomic.
+  Re-check: the nesting count is linear (no backtracking pattern), and a ZIP comment is refused (it could hide a
+  ZIP64 locator from the end record check).
+
 - Tests (N-22 follow-up): the trust tests set aside an installed `nodestro_integrations` that an earlier test of the
   same worker imported (and its verified finder) and restore it afterwards. Before, the studio's components job (which
   installs the real package) failed `test_discovery_skips_broken_entry_points` with "another nodestro_integrations is
