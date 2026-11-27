@@ -8,6 +8,13 @@
   grant refused). New Docker tests: a cancelled run and a crashed host leave no container. Fix: extension containers are named
   `nodestro-sandbox-ext-*`, which Nodestro Local Docker's sandbox gateway accepts (`nodestro-ext-*` was refused there).
 
+- Security (owner decision 2026-11-27, binding): a foreign extension package found in the host environment is
+  refused as `invalid`, "installed in the host environment" (`extensions.HOST_INSTALLED`), whatever
+  `NODESTRO_EXTENSION_TOOLS` says: only its metadata is read; it is never offered, imported, read or sent to the
+  sandbox. The sandbox stays for the data-only extension store (RT-098, a binding G-6 prerequisite; its acceptance
+  criteria and the residual risk are in `docs/extension-isolation.md`). README: never install extensions into the
+  backend's environment.
+
 - Docs (N-22 fourth review, NEW-4): `docs/extension-isolation.md` states the boundary of the host import plainly:
   the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
   installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before
@@ -41,6 +48,10 @@
   wheel replacing any module); so does a `sitecustomize` or `usercustomize` that is loaded or importable
   (`startup_hook_problems`, allowlist `KNOWN_STARTUP_MODULES` empty). The docs state the limit: the checks run in the
   process they check, so a foreign package in the host environment is excluded by R1's condition, not by them.
+
+- Tests: `test_a_worker_killed_during_a_model_call_never_has_the_call_repeated` waited for the call record's file to
+  exist; `open()` creates it before the write, so a kill in between left it empty (`assert 0 == 1`, pg-a and pg-b,
+  2026-11-27). It now waits until the call is recorded in the file.
 
 - New (N-24): memory entries with their time and origin ([docs/memory-entries.md](docs/memory-entries.md)).
   `MemoryFile` gains `updated_at`, `origin` (`tool`, `user`, `import`, `assistant` for a saved proposal of the memory

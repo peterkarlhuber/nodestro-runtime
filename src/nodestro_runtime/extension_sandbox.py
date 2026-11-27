@@ -2,7 +2,9 @@
 
 An installed integration that is not Nodestro's own is never imported into the host process
 (:func:`nodestro_runtime.extensions.find_packages`): it is an :class:`ExtensionPackage`, the entry point's
-``module:attribute`` and the Python files its distribution lists. Listing its tools (:meth:`ExtensionSandbox.describe`)
+``module:attribute`` and the Python files its distribution lists. Since the owner decision of 2026-11-27 a package
+found in the host environment is refused before it gets here (``HOST_INSTALLED``); this module stays for the
+separate extension store, which will feed it. Listing its tools (:meth:`ExtensionSandbox.describe`)
 and every call (:meth:`ExtensionSandbox.call`) run in a new container of Orkexa's one sandbox shape, started through a
 :class:`~nodestro_runtime.container_images.StreamedSandbox` only after the daemon passed the preflight and the
 in-container self-test. The files, Orkexa's runner modules, the contract module (:mod:`._extension_contract`) and one
@@ -127,15 +129,22 @@ class ExtensionPackage:
 
 
 def package_of(entry: metadata.EntryPoint, *, rejected: str = "") -> ExtensionPackage:
-    """``entry`` as an :class:`ExtensionPackage` (nothing of it is imported)."""
+    """``entry`` as an :class:`ExtensionPackage` (nothing of it is imported). A ``rejected`` package's files are never
+    read: only its metadata (name, entry point, distribution, version) is kept, to report it."""
     dist = entry.dist
+
+    def read_files() -> dict[str, str]:
+        if rejected:
+            raise PackageError(rejected)
+        return distribution_files(dist, entry.value)
+
     return ExtensionPackage(
         rejected=rejected,
         name=entry.name,
         entry=entry.value,
         distribution=dist.metadata["Name"] if dist is not None else "",
         version=dist.version if dist is not None else "",
-        read_files=lambda: distribution_files(dist, entry.value),
+        read_files=read_files,
     )
 
 

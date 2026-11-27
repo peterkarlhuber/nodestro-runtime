@@ -7,6 +7,41 @@ and a time limit did not stop them (security review 2026-11, phase 0R, findings 
 tools of installed integrations run now, what locks them and what the security evidence G-6 still has to show before
 any class of them may be enabled by default.
 
+## Architecture decision (owner, 2026-11-27, binding)
+
+1. Foreign extension packages are never installed into the host Python environment, by pip or any other way.
+2. Foreign extensions are never loaded through the host import path or run in the host process.
+3. The trusted OCR integration (`nodestro-integrations`) stays usable, provided its origin and integrity are verified
+   and no user-writable path can bypass the check (rule 1 below and
+   [Trust boundary of the host import](#trust-boundary-of-the-host-import-r1)).
+4. The separate extension store `<data>/extensions` is a binding work package before any G-6 release (RT-098).
+5. The store is strictly separate from the host Python environment; its packages run only in the Docker sandbox.
+6. Until the store is built and has passed its security review, foreign extension tools stay locked by default.
+
+What this change does about it: a foreign package that `find_packages()` finds in the host environment (any entry
+point other than the pinned trusted one) is refused as `invalid` with the detail "installed in the host environment"
+(`extensions.HOST_INSTALLED`), whatever `NODESTRO_EXTENSION_TOOLS` says. Only its metadata (entry point name,
+`module:attribute`, distribution name and version) is read to report it; it is never offered, imported or read, and
+nothing of it is sent to the sandbox (`test_extension_isolation.py::test_a_foreign_package_in_the_host_environment_is_refused`).
+The sandbox code and its tests stay: the store will feed it (the tests use a stand-in for the store,
+`store_packages`).
+
+**Acceptance criteria of the extension store** (all needed before any class is unlocked):
+
+- data only: each package unpacked read-only into `<data>/extensions/<sha256>/` (the wheel's SHA-256), never on
+  `sys.path` (the data directory is already refused there, `environment_problems`);
+- wheel checks before unpacking: zip safety (no absolute or `..` paths, no links, no device files), every file's
+  `RECORD` hash, limits on file count, file size and total size; no `.pth` file, script or `.data` part is ever run;
+- upload and removal by an administrator only, both audited;
+- execution only in the Docker sandbox, with the existing bounds (rules 2 to 7 below);
+- discovery from the store only (`find_packages` no longer reads the host environment's entry points);
+- an independent security review of the store before any class is unlocked.
+
+**Residual risk.** The checks run inside the process they check, so they cannot catch a foreign package that is already
+in the host environment (its code can run before them and change them, review NEW-4). The boundary is therefore
+enforced by the environment, not by these checks: the host Python environment holds only the shipped lock, and the
+products ship without pip. Installing anything else into it is outside the trust boundary.
+
 ## Rules
 
 1. **No foreign code in the host process.** Only pinned entry points of Nodestro's own distribution
@@ -22,9 +57,9 @@ any class of them may be enabled by default.
    The distribution must also be installed in the directory the running `nodestro_runtime` package was imported from
    (`trusted_integrations.installation_home`), and the import path must be closed (`environment_problems`, see
    [Trust boundary of the host import](#trust-boundary-of-the-host-import-r1)); otherwise it is `invalid` with the reason.
-   Every other entry point is read as data only (`extensions.find_packages`): its name, its `module:attribute`, the
-   name and version of its distribution and the Python files the distribution's `RECORD` lists for that module (no
-   symbolic link anywhere on the path). It is never imported, so import-time code never runs in the host. Tools of the
+   Every other entry point is refused as installed in the host environment (`extensions.find_packages`, owner
+   decision above): only its name, its `module:attribute` and the name and version of its distribution are read, to
+   report it. It is never imported, so import-time code never runs in the host, and its files are never read. Tools of the
    trusted distribution stay locked as before (`isolation_unavailable`): they are imported into the host and have no
    isolated path.
 2. **One execution path: the Docker sandbox.** Listing a package's tools and every call run in a new container of
@@ -50,8 +85,10 @@ any class of them may be enabled by default.
 6. **No network, no host files, no secrets.** The container has only the loopback interface; there is no network
    grant for extension tools yet. It sees no host path, no vault, no connection secret and no provider key: the only
    input is the call's JSON arguments.
-7. **Off by default.** `NODESTRO_EXTENSION_TOOLS=1` is a development switch: without it (the default in every
-   profile) installed packages are listed as locked with the reason `off` and no container is started. With it, the
+7. **Off by default.** `NODESTRO_EXTENSION_TOOLS=1` is a development switch. A package found in the host environment
+   is refused with or without it (`invalid`, "installed in the host environment"). For packages from the store (not
+   built yet): without the switch (the default in every profile) they are listed as locked with the reason `off` and
+   no container is started. With it, the
    runtime lists the packages' tools in the sandbox when the workspace opens and offers them on the desktop and in
    Nodestro Local Docker (never in the server profile: there no listing container starts). Turning it on is not a release: no tool class is enabled
    until G-6 (below) is passed, and nothing in this change enables one.
@@ -102,7 +139,7 @@ locked package.
   lists them is refused). A copy anywhere else on `sys.path` is refused. Writing files there by hand needs the same
   write access as replacing `nodestro_runtime` itself; release-pinned file hashes are not used (owner decision).
   This holds only while no foreign package is installed into the host environment at all (see "The boundary"
-  below); the data-only extension store is the planned fix and a G-6 prerequisite.
+  below); the data-only extension store (RT-098) is a binding G-6 prerequisite.
 - Residual risk R2: a module `nodestro_integrations` that host code imported normally before `discover()` is accepted
   when its real path is the verified one (its bytes were not loaded through the verified finder). Only host code can
   cause that import; no extension can.
@@ -116,17 +153,17 @@ locked package.
 **The boundary.** The host Python environment must contain only the shipped lock; the products have no pip.
 Installing any foreign package there (an extension package included) is outside the trust boundary, and the checks
 below cannot detect it reliably: a foreign package's code can run before them and change them (review NEW-4, for
-example a new module such as `winreg.py` that a standard module imports when it exists). The planned fix is a
-data-only extension store (foreign packages kept as files outside every import path and only ever handed to the
-sandbox, never installed into the host environment); it must exist before any tool class is unlocked under G-6.
-Until then, discovering extension packages from the host environment (`extensions.find_packages`) is for
-development only and outside the trust boundary; the data-only store replaces it.
+example a new module such as `winreg.py` that a standard module imports when it exists). The fix decided by the
+owner is the data-only extension store (foreign packages kept as files outside every import path and only ever handed
+to the sandbox, never installed into the host environment); it must exist before any tool class is unlocked under G-6.
+Discovering extension packages from the host environment (`extensions.find_packages`) now only reports and refuses
+them (architecture decision above); the data-only store replaces it.
 
 Owner decision on R1: the residual risk is accepted provisionally for internal development only if the Python
 installation can be changed exclusively by trusted people and processes; user-writable search paths, working
 directories and foreign package installs must not replace the trusted integration unnoticed. Owner decision of
-2026-11-27 (option A): harden now; the data-only extension store follows later as its own work package, before any
-G-6 unlock. The boundary is the one above: the host Python environment holds only the shipped lock, and foreign
+2026-11-27 (binding, see [Architecture decision](#architecture-decision-owner-2026-11-27-binding)): harden now; the
+data-only extension store follows as its own work package, before any G-6 unlock. The boundary is the one above: the host Python environment holds only the shipped lock, and foreign
 packages are never installed into it. The "unnoticed replacement" clause is met by that boundary, not by the
 in-process checks below. This is no G-6 release.
 The runtime enforces the part it can check and refuses the host import otherwise (`invalid`, with the reason, in
@@ -193,11 +230,16 @@ item below passed for that class on the real engines (Linux CI Docker, Docker De
 internal review and the independent review (gate G-6). Items marked with a test name are covered now; the others are
 open.
 
-Prerequisite for every class: the data-only extension store (see "Trust boundary of the host import (R1)"), so that
-no foreign package is installed into the host environment. Until it exists no class is unlocked.
+Mandatory prerequisite for every class (owner decision 2026-11-27): the data-only extension store, built to the
+acceptance criteria in [Architecture decision](#architecture-decision-owner-2026-11-27-binding) and passed by its
+independent security review, so that no foreign package is installed into the host environment. Until then foreign
+extension tools stay locked by default and no class is unlocked. Residual risk carried into G-6: in-process checks
+cannot catch a foreign package already in the host environment; the boundary is the environment (only the shipped
+lock, no pip in the products).
 
 | # | Check | Expected | Covered by |
 |---|---|---|---|
+| 0 | a foreign package installed in the host environment, switch on or off | refused (`invalid`, "installed in the host environment"): never offered, imported, read or sent to the sandbox | `test_extension_isolation.py::test_a_foreign_package_in_the_host_environment_is_refused` |
 | 1 | switch missing or off | no tool offered, no container, no import of the package | `test_extension_isolation.py::test_switch_off_*` |
 | 2 | import-time code of a package, also one that claims to be `nodestro-integrations` | never runs in the host (switch off and on) | `::test_import_time_code_never_runs_in_the_host`, `::test_a_distribution_that_claims_the_trusted_name_is_never_imported`, `::test_every_trust_check_refuses_the_import`, `::test_a_copy_earlier_on_the_path_neither_hides_nor_replaces_the_verified_one`, Docker: `::test_import_time_code_runs_only_in_the_container` |
 | 3 | no Docker, failed preflight or self-test | locked `not_secured`, no host fallback | `::test_without_a_proven_sandbox_the_tools_stay_locked`, `::test_a_missing_docker_cli_locks_the_tools_with_the_real_sandbox` |
