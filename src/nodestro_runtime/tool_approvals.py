@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -115,11 +115,16 @@ class CallBinding:
     The run engine binds it in the tool call's own context right before the call runs; an MCP tool checks it again
     against the stored tool right before the request is sent (:meth:`~nodestro_runtime.mcp.service.McpService.call`),
     so a reclassification between the gate and the call refuses the call instead of running it under the old
-    decision."""
+    decision.
+
+    ``refused`` is where the MCP service notes that it refused the call at that last check (``tool.approval_stale``):
+    the engine then records the code on the call and audits the request ``stale``, as for a refusal at its own gate.
+    It is shared with the copies of the call's context the tool runs in (a thread)."""
 
     tool: str
     capability: ToolCapability
     definition_hash: str | None = None
+    refused: list[str] = field(default_factory=list, compare=False, repr=False)
 
 
 _BINDING: ContextVar[CallBinding | None] = ContextVar("nodestro_tool_call_binding", default=None)

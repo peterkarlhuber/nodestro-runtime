@@ -14,6 +14,25 @@
   Re-check: the nesting count is linear (no backtracking pattern), and a ZIP comment is refused (it could hide a
   ZIP64 locator from the end record check).
 
+- Security (Welle 5, small follow-ups; every switch stays off by default):
+  - RT-089d: a memory consent's digest also covers the address of each model server with a configurable address
+    (`compatible`, `ollama`, `vllm`, also the quality judge's) and the lock of the workflow's approved Python
+    environment (`Workspace.consent_environment`, `memory_consents.with_environment`) and of a local MCP server's
+    `mcp:` environment. Every step of a run tree that uses a person's space checks what the consent covered before
+    each connection it reads (and the connection read), each MCP call and each model request
+    (`tool_spec.ConsentGuard`); a change refuses them with `memory.consent_required`. An orchestrator's model
+    server is covered too and its decision requests are guarded the same way; an approved call refused this way is
+    audited `stale` with `memory.consent_required` (not `executed`). The means are read only for a step with a
+    persistent space or a step of a private tree. Digests of workflows without those means are unchanged.
+  - N-12: a failed removal of the folder indexes before a rebuild no longer leaves the rebuild marked as running and
+    the folder index held back; copies hold no broken legacy vector table (`storage.strip_index_sources`); a copy
+    whose folder chunks cannot be removed loses its whole search index instead of failing the migration
+    (`storage.drop_search_index`); older copies before a migration are stripped at the start, deleted when they cannot
+    be stripped, and leftovers of an interrupted copy are removed (`workspace.strip_migration_copies`).
+  - Tool approvals: a call the MCP service refuses right before the send gets `tool.approval_stale` on its record and
+    its request is audited `stale` (also when the run waited in a thread; `CallBinding.refused`). An allowed read
+    tool has no request, so its refusal sets the code but writes no `stale` audit event.
+
 - Tests (N-22 follow-up): the trust tests set aside an installed `nodestro_integrations` that an earlier test of the
   same worker imported (and its verified finder) and restore it afterwards. Before, the studio's components job (which
   installs the real package) failed `test_discovery_skips_broken_entry_points` with "another nodestro_integrations is

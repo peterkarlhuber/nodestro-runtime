@@ -106,7 +106,7 @@ from .providers import (
     qualify,
     verification_key,
 )
-from .python_envs import PythonEnvironments, installation_id
+from .python_envs import PythonEnvironments, installation_id, scope_of
 from .python_tools import EnvironmentGate
 from .reports import ResultFiles
 from .resume import PublishedRuns
@@ -275,6 +275,46 @@ def backup_migrated_database(store: SQLiteStore, directory: Path, current: int, 
         partial.unlink(missing_ok=True)
         raise
     return target_path
+
+
+def strip_migration_copies(directory: Path) -> list[Path]:
+    """Remove every granted folder's index from the copies made before schema migrations in ``directory`` (Welle 5):
+    copies written by a release before N-12 review L-b still hold folder text, which outlives the grant. Runs at each
+    start of a workspace on its own database (no migration copy is being written then); a copy without folder index
+    is opened and left as it is. Fail closed: a copy that cannot be stripped at all is deleted (its folder text must
+    not outlive the grant), and so are leftovers of an interrupted copy (``*.db.partial`` and the temporary files of
+    the snapshot next to it). Returns the copies changed or deleted. Never raises."""
+    changed: list[Path] = []
+    try:
+        if not directory.is_dir():
+            return changed
+        copies = sorted(directory.glob("pre-migration-*.db"))
+        leftovers = sorted(directory.glob("pre-migration-*.db.partial*"))
+    except OSError:
+        logger.exception("The copies made before migrations could not be listed")
+        return changed
+    for path in leftovers:
+        try:
+            if not path.is_dir():
+                path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("A leftover of an interrupted copy before a migration could not be removed")
+    for path in copies:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if strip_copy(path, FOLDER_SOURCE, (FOLDER_INDEX_FILES, FOLDER_INDEX_STATES)):
+                changed.append(path)
+        except Exception:  # never stops the others or the start
+            logger.exception("A copy before a migration could not be stripped of folder indexes; it is deleted")
+            try:
+                path.unlink(missing_ok=True)
+                changed.append(path)
+            except OSError:
+                logger.exception("A copy before a migration that may hold folder text could not be deleted")
+    if changed:
+        logger.info("Removed granted folders' indexes from %d copies made before migrations", len(changed))
+    return changed
 
 
 #: The tenant of a workspace on its own SQLite database (the desktop).
@@ -653,6 +693,7 @@ class Workspace:
         self.runs.tool_marker = self.tool_marker
         # RT-089d: a memory consent covers the custom tools, connections and MCP servers an agent uses.
         self.runs.consent_means = self.consent_means
+        self.runs.consent_environment = self.consent_environment
         self.tester.consent_means = self.consent_means
         # Files uploaded as run inputs: own storage, never knowledge by themselves (see input_files.py).
         inputs = data_dir / "inputs"
@@ -707,6 +748,8 @@ class Workspace:
                     ).purge()
             except Exception:  # housekeeping; it never stops Nodestro from starting
                 logging.getLogger(__name__).exception("Reconciling the folder indexes failed")
+            # N-12 (Welle 5): copies an older release made before a migration may still hold folder text.
+            strip_migration_copies(self.data_dir / "backups")
         # Uploads nobody used (e.g. a run dialog that was closed) are removed after a day.
         try:
             self.inputs.cleanup()
@@ -1606,8 +1649,39 @@ class Workspace:
             if is_mcp_tool(name):
                 server_tool = self.mcp.find(name)
                 entry["mcp"] = None if server_tool is None else _mcp_marker(*server_tool)
+                if server_tool is not None and server_tool[0].transport == "stdio":
+                    # Welle 5: a local server's approved packages (the lock of its ``mcp:`` environment) too.
+                    lock = self._lock_digest(scope_of("mcp", server_tool[0].id))
+                    if lock is not None:
+                        entry["mcp"]["environment"] = lock
             found[name] = entry
+        # Welle 5 (RT-089d): the address of every model server the agent sends to, for providers with a configurable
+        # one (an OpenAI-compatible server, Ollama, vLLM): content allowed for one server never reaches another. Keyed
+        # ``model:<provider>`` (no tool name has a colon), only for such providers, so other digests stay the same.
+        models = [config.model, *([config.quality.judge_model] if config.quality.enabled else [])]
+        stored = self._providers(sealed=True)
+        for model in models:
+            try:
+                provider = provider_of(model)
+            except NodestroError:
+                continue
+            info = PROVIDERS.get(provider)
+            if info is not None and info.base_url:
+                found[f"model:{provider}"] = {"endpoint": (stored.get(provider, {}).get("base_url") or None)}
         return found
+
+    def consent_environment(self, workflow_id: str) -> str | None:
+        """The approved Python environment a workflow's custom tools run in, for the digest of a memory consent
+        (RT-089d, Welle 5): the SHA-256 of its lock (the exact versions of the libraries the tools import), ``None``
+        when the workflow has none. Approving other library versions makes a consent stale."""
+        return self._lock_digest(scope_of("workflow", workflow_id))
+
+    def _lock_digest(self, scope: str) -> str | None:
+        """The SHA-256 of the approved lock of a Python environment (``None``: none)."""
+        env = self.python.get(scope)
+        if env is None or not env.lock:
+            return None
+        return hashlib.sha256(f"{env.python_version}\n{env.lock}".encode()).hexdigest()
 
     # ---- running ----------------------------------------------------------------------
 

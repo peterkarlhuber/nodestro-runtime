@@ -323,6 +323,11 @@ async def test_a_reclassification_right_before_the_send_stops_the_request(
         assert not armed.is_set(), "the change was not made inside the call"
         assert call.is_error and "tool.approval_stale" in (call.output or "")
         assert sent(server) == 0
+        # Welle 5 (api #180 follow-up): the record and the audit say so, as for a refusal at the engine's own gate.
+        assert call.approval.status == "approved" and call.approval.code == "tool.approval_stale"
+        stale = [e for e in audit_events(workspace.store) if e.kind == "stale" and e.request_id == request.id]
+        assert [e.outcome for e in stale] == ["tool.reclassified"]
+        assert not [e for e in audit_events(workspace.store) if e.kind == "executed"]
     finally:
         workspace.close()
 
@@ -344,7 +349,7 @@ async def test_a_read_tool_reclassified_after_the_gate_allowed_it_is_not_called(
     try:
         done = await finished(workspace, await started(workspace, SEARCH))
         call = the_call(done)
-        assert call.approval.status == "allowed"
+        assert call.approval.status == "allowed" and call.approval.code == "tool.approval_stale"
         assert call.is_error and "tool.approval_stale" in (call.output or "")
         assert sent(server, "search") == 0
     finally:
@@ -555,5 +560,6 @@ async def test_a_paused_call_reclassified_right_before_the_send_is_not_made(
         assert sent(server) == 0
         outcomes = [e.outcome for e in audit_events(workspace.store) if e.kind == "stale"]
         assert "tool.reclassified" in outcomes
+        assert call.approval.code == "tool.approval_stale"
     finally:
         workspace.close()

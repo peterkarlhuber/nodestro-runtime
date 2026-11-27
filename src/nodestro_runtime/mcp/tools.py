@@ -17,6 +17,8 @@ from typing import Any
 from orkexa import Tool, ToolExecutionError, ToolInputError, ToolResultError
 
 from ..problems import NodestroError
+from ..tool_approvals import bound_call
+from ..tool_spec import consent_guard
 from .models import McpServer, McpTool
 from .service import McpService
 
@@ -112,6 +114,13 @@ class McpAgentTool(Tool):
 
     def execute(self, payload: dict[str, Any]) -> Any:
         self._validate(payload)
+        guard = consent_guard()
+        if guard is not None and not guard.holds():
+            # RT-089d (Welle 5): what the consent covered changed; an approval of this call is audited stale.
+            binding = bound_call(self.tool_name)
+            if binding is not None and not binding.refused:
+                binding.refused.append("memory.consent_required")
+            guard.check(self.name or "")
         try:
             server, _tool, result = self.service.call(
                 self.tool_name, payload, cancelled=self.cancelled, gated=self.gated

@@ -25,6 +25,12 @@ its tools. Now:
     or a new secret, is other content; a deleted connection too;
   - each **MCP tool**: its server's address, transport, command and sign-in kind and the tool's definition (not its
     status or check times);
+  - the address of each **model server** the agent sends to, for providers whose address is a setting
+    (`compatible`, `ollama`, `vllm`; also the quality judge's when it is on), keyed `model:<provider>`: another
+    server is other content (Welle 5). Other providers add nothing, so their digests did not change;
+  - the **approved Python environment** the workflow's tools run in (`Workspace.consent_environment`: the SHA-256 of
+    its lock, the exact library versions the tools import; `memory_consents.with_environment`): approving other
+    versions with the same tool code is other content (Welle 5). A workflow without one adds nothing;
   - each sub-workflow or team **without a saved version**: it runs its current content, so that content's digest is
     part of the parent's (recursively).
 
@@ -39,6 +45,19 @@ its tools. Now:
   a paused run that continues (so a revoked consent stops it), and a continued failed run (it takes over the earlier
   run's results, stays private to the same owner and inherits `memory_owner` and `memory_spaces`). A run marked for a
   person without recorded spaces (from before RT-089d) fails closed.
+- **During a step.** The consent is checked when a step opens the space (and when a run of the tree starts); its
+  tools read their connection at each call. So that nothing changed while a step runs (another address, a new
+  secret, another tool or MCP server, another model server) gets the memory under the old consent, every step of a
+  run tree that uses a person's space takes its means before its check (`RunManager._consent_guard`, which asks
+  `check_memory_flow` again for later steps) and compares them before each connection it reads and with the
+  connection read, before each MCP call (and again right before the send) and before each model request
+  (`tool_spec.ConsentGuard`). A change refuses the call (the tool result names `memory.consent_required`; nothing is
+  sent) and fails the step at its next model request with `memory.consent_required`. The next run needs a new
+  consent (Welle 5). An approved call refused this way is audited `stale` with outcome `memory.consent_required`.
+  An orchestrator's model server is part of the digest, and its decision requests in such a tree are guarded the
+  same way. A step that has no persistent space and is not in a private tree reads no means.
+- **Local MCP servers.** A local (stdio) MCP server's entry also covers the lock of its approved `mcp:`
+  environment.
 - **Agent tests** need a consent for the digest of the tested configuration with its means
   (`RunManager.agent_consent_digest`, `memory_consents.agent_digest`).
 - **Denial.** Without a matching consent the step (or the run) fails with `memory.consent_required` (`space`,

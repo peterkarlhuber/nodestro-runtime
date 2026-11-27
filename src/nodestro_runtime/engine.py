@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 import concurrent.futures
 from contextlib import suppress
 import contextvars
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import functools
@@ -104,7 +104,7 @@ from .graph import BRANCHING, TRANSPARENT, WORKING, data_sources, edge_active, f
 from .input_files import InputFiles
 from .mail import MAX_MESSAGE_BYTES, Attachment, DraftError
 from .mcp_access import UNATTENDED_TRIGGERS, is_mcp_tool
-from .memory_consents import agent_digest, with_children, workflow_digest
+from .memory_consents import agent_digest, with_children, with_environment, workflow_digest
 from .memory_spaces import NOBODY, consent_required
 from .notifications import RunNotifier
 from .orchestrator import (
@@ -172,12 +172,13 @@ from .tool_approvals import (
     ToolGate,
     arguments_hash,
     bind_call,
+    bound_call,
     checkpoints_enabled,
     reclassified,
     record_refusal,
     tool_facts,
 )
-from .tool_spec import CallCounter, RunServices
+from .tool_spec import CallCounter, ConsentGuard, RunServices, bind_consent_guard, reset_consent_guard
 from .value_checks import Unverified, checked_fields, computing_call, correction_prompt, unverified_fields
 
 logger = logging.getLogger(__name__)
@@ -1068,6 +1069,9 @@ class RunManager:
         self.consent_means: Callable[[AgentConfig], Any] = lambda config: [
             self.tool_marker(name) for name in sorted(set(config.tools))
         ]
+        #: The approved Python environment a workflow's tools run in (its lock's digest; ``None``: none), for the same
+        #: digest; the workspace hands in :meth:`~nodestro_runtime.workspace.Workspace.consent_environment`.
+        self.consent_environment: Callable[[str], str | None] = lambda _workflow_id: None
         #: The files a run can reference by id: name, or :class:`~nodestro_runtime.forms.FileRef` with format and size
         #: (checks the file fields of input forms).
         self.file_names: Callable[[], Mapping[str, str] | Mapping[str, FileRef]] | None = None
@@ -1527,6 +1531,23 @@ class RunManager:
                 raise consent_required(space, workflow_id=run.workflow_id, workflow_name=run.workflow_name)
         return True
 
+    def _consent_guard(
+        self, context: _RunContext, config: AgentConfig, checked: Any, consented: bool
+    ) -> ConsentGuard | None:
+        """The guard of a step under a memory consent (RT-089d, Welle 5;
+        :class:`~nodestro_runtime.tool_spec.ConsentGuard`): for the step that opened a person's space (``consented``)
+        and for every later step of a run tree that used one (the same condition as :meth:`check_memory_flow`, which
+        is asked again here: the consent must still hold for the means as they are now). ``checked`` are the step's
+        means taken before its consent was checked, so a change after the check is never covered. ``None`` where
+        nothing is private."""
+        top = context.root.run
+        private_tree = top.memory_owner not in (None, NOBODY) and bool(top.memory_spaces)
+        if checked is None or not (consented or private_tree):
+            return None
+        if not consented:
+            self.check_memory_flow(context)
+        return ConsentGuard(checked, lambda: self.consent_means(config))
+
     def check_memory_flow(self, context: _RunContext) -> None:
         """Before a run executes in a tree that already used a person's memory space (RT-089d): a sub-workflow's or a
         team's run, a paused run that continues, a continued failed run. Its workflow needs the owner's consent for
@@ -1789,7 +1810,7 @@ class RunManager:
         return self._consent_digest(workflow, frozenset())
 
     def _consent_digest(self, workflow: Workflow, seen: frozenset[str]) -> str:
-        own = workflow_digest(workflow, self.consent_means)
+        own = with_environment(workflow_digest(workflow, self.consent_means), self.consent_environment(workflow.id))
         seen = seen | {workflow.id}
         refs = [ref for node in workflow.nodes for ref in graph.workflow_refs(node)]
         unsaved = {ref.workflow_id for ref in refs if ref.version is None}
@@ -4205,16 +4226,23 @@ class RunManager:
         return None
 
     def _audit_released(
-        self, context: _RunContext, gate: ToolGate, call: ToolCall, request: ToolApprovalRequest, is_error: bool
+        self,
+        context: _RunContext,
+        gate: ToolGate,
+        call: ToolCall,
+        request: ToolApprovalRequest,
+        is_error: bool,
+        *,
+        refused: str | None = None,
     ) -> None:
         """Audit what became of a released call of a resumed turn. A call that failed because the tool changed
         after its release (a pinned tool refuses to run another version) did not run: it is audited ``stale``
-        (``tool.changed``), not ``executed``. The request stays ``executed``, so the call never runs later."""
-        tools = context.env.builder.tools
-        if is_error and _current_hash(tools, call) != request.arguments_hash:
-            gate.approvals.audit("stale", request, outcome="tool.changed")
-        elif is_error and reclassified(request.capability, tool_facts(tools, call.name)[0]):
-            gate.approvals.audit("stale", request, outcome="tool.reclassified")
+        (``tool.changed``), not ``executed``; so is a call the MCP service refused right before the send
+        (``refused``: its reason, e.g. ``memory.consent_required``). The request stays ``executed``, so the call never
+        runs later."""
+        stale = _refusal_outcome(context.env.builder.tools, call, request, refused) if is_error else None
+        if stale is not None:
+            gate.approvals.audit("stale", request, outcome=stale)
         else:
             gate.approvals.audit("executed", request)
 
@@ -4825,11 +4853,21 @@ class RunManager:
         config = node.orchestrator
         assert config is not None
 
+        # RT-089d (Welle 5, review L3): in a run tree that uses a person's memory space the decision's model server
+        # is part of the consent (its address, :func:`memory_consents.workflow_digest`); its requests stop once it
+        # changed.
+        guard: ConsentGuard | None = None
+        if getattr(context.env.builder.memory_spaces, "owners", None) is not None:
+            means = AgentConfig(name=node_label(node), model=config.model)
+            guard = self._consent_guard(context, means, self.consent_means(means), False)
+
         def on_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
             context.tracker.check()
             # N-08: a team's result may have brought granted content since the decision connected.
             self._check_egress(context, node.id, config.model)
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
 
         interruptible = _Interruptible(context.cancelled, self._checked_connect(context, node.id))
         try:
@@ -5153,6 +5191,8 @@ class RunManager:
         node_id = node.id
         calls: dict[str, ToolCallRecord] = {}
         released: dict[str, ToolApprovalRequest] = {}
+        #: The binding each gated call runs under (the MCP service notes a refusal at its last check there).
+        bindings: dict[str, CallBinding] = {}
         #: The problem code of each call the gate refused, for its activity event.
         denied: dict[str, str | None] = {}
         gate = self.tool_gate
@@ -5177,6 +5217,8 @@ class RunManager:
             state.text += delta
             self._emit(context, "text", node_id, delta=delta)
 
+        #: The step's memory consent guard once it is known (set before the first request; RT-089d, Welle 5).
+        guard_box: list[ConsentGuard | None] = []
         trace = ReasoningTrace(text=state.thinking, phases=state.thinking_phases)
 
         def on_thinking(delta: str, kind: ReasoningKind) -> None:
@@ -5210,9 +5252,17 @@ class RunManager:
             # N-08: granted content may have entered this turn after it connected (a folder read): every request
             # that would carry it to a cloud model, or to a server tool that reaches outside, needs a grant.
             self._check_egress(context, node_id, config.model, config.server_tools)
+            # RT-089d (Welle 5): a step under a memory consent sends nothing once what it covered changed (another
+            # model server address, connection, tool or MCP server): the step fails closed.
+            guard = guard_box[-1] if guard_box else None
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
 
         def on_judge_request(_args: dict[str, Any]) -> None:
             self._check_owned(context)
+            guard = guard_box[-1] if guard_box else None
+            if guard is not None and not guard.holds():
+                raise consent_required("", workflow_id=context.run.workflow_id, workflow_name=context.run.workflow_name)
             context.tracker.check()
             # N-08: the quality judge connected when the step started, maybe before the step held granted content,
             # and its model may run at another provider than the agent's: each of its requests checks its own model.
@@ -5246,6 +5296,9 @@ class RunManager:
                     denial = self._gate_call(context, node_id, config, call, record, gate, suspend=checkpointing)
             elif call.resumed:
                 pass  # an own tool never waits, so it is never resumed
+            binding = bound_call(call.name) if denial is None else None
+            if binding is not None:
+                bindings[call.id] = binding
             if denial is None and not own:
                 # Asked after the gate (a person may have decided long after the call was asked for): a worker that
                 # lost the run's job meanwhile never makes the call (M11).
@@ -5263,9 +5316,27 @@ class RunManager:
 
         def after_tool(call: ToolCall, content: str, is_error: bool) -> None:
             request = released.pop(call.id, None)
-            if request is not None and gate is not None:
-                self._audit_released(context, gate, call, request, is_error)
+            binding = bindings.pop(call.id, None)
+            # The MCP service refused the call at its last check right before the send (the tool was reclassified or
+            # approved differently after the gate let it run): it did not run, like a refusal at the gate.
+            # Also a call refused because what a memory consent covered changed (``memory.consent_required``).
+            reason = binding.refused[0] if is_error and binding is not None and binding.refused else None
             record = calls.get(call.id)
+            if request is not None and gate is not None:
+                self._audit_released(context, gate, call, request, is_error, refused=reason)
+            elif reason is not None and gate is not None and record is not None and record.approval is not None:
+                asked = record.approval.request_id
+                found = gate.approvals.get(context.run.id, asked) if asked else None
+                if found is not None:
+                    outcome = _refusal_outcome(context.env.builder.tools, call, found, reason)
+                    gate.approvals.audit("stale", found, outcome=outcome)
+            if (
+                reason is not None
+                and record is not None
+                and record.approval is not None
+                and record.approval.code is None
+            ):
+                record.approval = record.approval.model_copy(update={"code": reason})
             if record is not None:
                 record.output = content[:20_000]
                 record.is_error = is_error
@@ -5353,12 +5424,27 @@ class RunManager:
         interruptible: _Interruptible | None = None
         # Cancelling the run also stops a sandboxed call that is running (audit B-03, :mod:`.sandbox_cancel`).
         cancel_token = sandbox_cancel.bind(context.cancelled.is_set)
+        guard_token = None
         try:
             # RT-089c: a step with a persistent memory space makes the run its owner's alone, before anything is read;
             # RT-089d: only with its owner's consent for this workflow content (and every run above this one).
+            # Welle 5: the means a consent covers, taken before it is checked (review 3: nothing changed after the
+            # check is ever covered); only where spaces have owners.
+            owners = getattr(context.env.builder.memory_spaces, "owners", None) is not None
+            top = context.root.run
+            private_tree = top.memory_owner not in (None, NOBODY) and bool(top.memory_spaces)
+            needed = owners and (config.memory.mode == "persistent" or private_tree)  # review L1: only then
+            checked = self.consent_means(config) if needed else None
+            consented = False
             if config.memory.mode == "persistent":
                 consented = self.check_memory_consent(context, config.memory.space)
                 self.mark_memory_owner(context, config.memory.space if consented else None)
+            guard = self._consent_guard(context, config, checked, consented)
+            guard_box.append(guard)
+            guard_token = bind_consent_guard(guard)  # MCP tools ask it (reset with the cancel check below)
+            services = self._run_services(context, node_id, config.name)
+            if guard is not None:
+                services = replace(services, connection_check=guard)
             # N-08: what the step gets before its first request (attached files, knowledge in the context).
             for source in start_sources(config, extra):
                 self.mark_granted(context, node_id, source)
@@ -5394,7 +5480,7 @@ class RunManager:
                 refinement=budget_checkpoint.refinement if budget_checkpoint is not None else None,
                 suspendable=context.budget_gate is not None,
                 on_built=lambda built: self._note_reasoning(context, node_id, state, built),
-                services=self._run_services(context, node_id, config.name),
+                services=services,
                 judge_hooks={"on_request": on_judge_request},
                 # RT-089c: a persistent memory space is the person's who started the run (its owner); a run that
                 # acts for no person (a schedule, an API key) uses none where spaces have owners.
@@ -5454,6 +5540,8 @@ class RunManager:
             if interruptible is not None:
                 interruptible.close()
             sandbox_cancel.reset(cancel_token)
+            if guard_token is not None:
+                reset_consent_guard(guard_token)
             if budget_checkpoint is not None and not suspended:
                 tool_checkpoints.delete(self.store, context.run.id, node_id, iteration)
             if checkpointing and not suspended:
@@ -5825,6 +5913,25 @@ def _decision_code(final: ToolApprovalRequest) -> str | None:
     if final.status == "expired" and final.closed_because == RECLASSIFIED:
         return "tool.approval_stale"
     return {"rejected": "tool.approval_rejected", "expired": "tool.approval_timeout"}.get(final.status)
+
+
+def _stale_outcome(tools: Any, call: ToolCall, request: ToolApprovalRequest) -> str | None:
+    """Why an approved call that failed did not run as approved: the tool changed (``tool.changed``) or was
+    classified differently (``tool.reclassified``) since the request; ``None`` when neither."""
+    if _current_hash(tools, call) != request.arguments_hash:
+        return "tool.changed"
+    if reclassified(request.capability, tool_facts(tools, call.name)[0]):
+        return "tool.reclassified"
+    return None
+
+
+def _refusal_outcome(tools: Any, call: ToolCall, request: ToolApprovalRequest, refused: str | None) -> str | None:
+    """The ``stale`` audit outcome of an approved call that failed: a memory consent that no longer holds
+    (``memory.consent_required``), else :func:`_stale_outcome`, else ``refused_at_send`` when the MCP service refused it
+    right before the send; ``None`` when it ran."""
+    if refused is not None and refused != "tool.approval_stale":
+        return refused
+    return _stale_outcome(tools, call, request) or ("refused_at_send" if refused else None)
 
 
 def _current_hash(tools: Any, call: ToolCall) -> str:

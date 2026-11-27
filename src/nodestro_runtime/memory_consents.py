@@ -10,8 +10,14 @@ exactly this content (:class:`~nodestro_runtime.memory_spaces.MemoryConsent`):
   version it will run (:meth:`~nodestro_runtime.engine.RunManager.pin_subworkflows`), and of what its agents use
   outside the workflow (``means``, :meth:`~nodestro_runtime.engine.RunManager.consent_means`): the version and code of
   each custom tool, the settings of each bound connection, the configuration of each MCP server and the definition of
-  each MCP tool. A change of any of these (a new version of a custom tool, a connection that now sends elsewhere, an
-  edited agent, edge or sub-workflow version) changes the digest; a consent never applies to changed content.
+  each MCP tool (with a local server's approved packages), the address of each model server with a configurable
+  address and the lock of the approved Python environment the workflow's tools run in (the library versions they
+  import). A change of any of these (a new version of a custom tool, a connection that now sends elsewhere, another
+  model server, other library versions, an edited agent, edge or sub-workflow version) changes the digest; a consent
+  never applies to changed content. Every step of a run tree that uses a person's space also checks these again
+  before each connection it reads, each MCP call and each model request
+  (:class:`~nodestro_runtime.tool_spec.ConsentGuard`): a change while the step runs refuses them with
+  ``memory.consent_required`` (fail closed).
 - **Every run that can see the memory.** A step that opens a space needs a consent for its own run's workflow and
   for every run above it (their steps get the step's output). Once a run used a space (``Run.memory_spaces`` of the
   top-level run), every run that executes afterwards in the same tree (a sub-workflow, a team, a continued paused
@@ -59,6 +65,13 @@ def workflow_digest(workflow: Workflow, means: Means) -> str:
     fields = set(WorkflowIn.model_fields) | {"id"}
     data = workflow.model_dump(mode="json", include=fields - _NOT_CONTENT)
     used = {node.id: means(node.agent) for node in workflow.nodes if node.agent is not None}
+    for node in workflow.nodes:
+        # Welle 5 (review L3): an orchestrator's own model server (its address), only where it adds something, so
+        # other digests stay the same.
+        if node.orchestrator is not None and node.id not in used:
+            found = means(AgentConfig(name=node.id, model=node.orchestrator.model))
+            if found:
+                used[node.id] = found
     return _digest({"workflow": data, "means": used})
 
 
@@ -72,6 +85,12 @@ def with_children(digest: str, children: dict[str, str]) -> str:
     """``digest`` together with the digests of the sub-workflows and teams it runs without a saved version (they run
     their current content, which the workflow's own content does not pin); ``digest`` itself without any."""
     return _digest({"own": digest, "children": children}) if children else digest
+
+
+def with_environment(digest: str, environment: str | None) -> str:
+    """``digest`` together with the digest of the approved Python environment the workflow's tools run in (the exact
+    library versions they import); ``digest`` itself when there is none."""
+    return _digest({"own": digest, "environment": environment}) if environment else digest
 
 
 class ConsentTarget(BaseModel):
@@ -131,5 +150,6 @@ __all__ = [
     "combined_digest",
     "consent_targets",
     "with_children",
+    "with_environment",
     "workflow_digest",
 ]
