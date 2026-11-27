@@ -79,6 +79,8 @@ locked package.
   runtime's own installation directory without any installer recording it (a foreign package installed there that
   lists them is refused). A copy anywhere else on `sys.path` is refused. Writing files there by hand needs the same
   write access as replacing `nodestro_runtime` itself; release-pinned file hashes are not used (owner decision).
+  This holds only while no foreign package is installed into the host environment at all (see "The boundary"
+  below); the data-only extension store is the planned fix and a G-6 prerequisite.
 - Residual risk R2: a module `nodestro_integrations` that host code imported normally before `discover()` is accepted
   when its real path is the verified one (its bytes were not loaded through the verified finder). Only host code can
   cause that import; no extension can.
@@ -88,6 +90,13 @@ locked package.
   import-time code and a package that claims to be Nodestro's own, not against a compromised environment.
 
 ## Trust boundary of the host import (R1)
+
+**The boundary.** The host Python environment must contain only the shipped lock; the products have no pip.
+Installing any foreign package there (an extension package included) is outside the trust boundary, and the checks
+below cannot detect it reliably: a foreign package's code can run before them and change them (review NEW-4, for
+example a new module such as `winreg.py` that a standard module imports when it exists). The planned fix is a
+data-only extension store (foreign packages kept as files outside every import path and only ever handed to the
+sandbox, never installed into the host environment); it must exist before any tool class is unlocked under G-6.
 
 Owner decision on R1: the residual risk is accepted provisionally for internal development only if the Python
 installation can be changed exclusively by trusted people and processes; user-writable search paths, working
@@ -125,7 +134,7 @@ No layout needed a lock of its own: purelib and platlib (`lib` and `lib64`) are 
 
 **What these checks cannot do.** They run inside the process whose environment they check. A foreign package
 installed into that environment has already won before they run: a replaced `nodestro_runtime/trusted_integrations.py`
-(or any module imported before it) does the checking itself and says what its author wants, and a `.pth` file or a
+(or any module imported before it, also a new module a standard module imports only when it exists, review NEW-4) does the checking itself and says what its author wants, and a `.pth` file or a
 `sitecustomize` ran its code at interpreter start. The checks turn installer-recorded and start-up changes into a
 visible refusal while the checking code is still the genuine one; they are not a boundary against a foreign package
 in the host environment. That boundary is R1's condition: only trusted people and processes change the installation,
@@ -155,6 +164,9 @@ A class is a combination of `access` × `reach` (for example read + internal). E
 item below passed for that class on the real engines (Linux CI Docker, Docker Desktop on macOS and Windows), an
 internal review and the independent review (gate G-6). Items marked with a test name are covered now; the others are
 open.
+
+Prerequisite for every class: the data-only extension store (see "Trust boundary of the host import (R1)"), so that
+no foreign package is installed into the host environment. Until it exists no class is unlocked.
 
 | # | Check | Expected | Covered by |
 |---|---|---|---|

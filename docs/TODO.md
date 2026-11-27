@@ -154,8 +154,10 @@ None known.
   site directory and `sys.path` folder), N3 (file identity, not names), N4 (every link hop) and N5 (zip
   distributions refused cleanly). Third review fixed NEW-1 (one file in two `RECORD`s, or a foreign `RECORD` naming
   the runtime's or the integration's files) and NEW-2 (`sitecustomize`/`usercustomize`); the in-process limit is
-  documented. Open decision: keep untrusted extension packages out of the host environment altogether (a data-only
-  package store mounted into the sandbox). L2 (the process's primary group counts as its own) stays documented. Open:
+  documented. Fourth review: NEW-4 (a foreign module imported before the checks rewrites them) is not fixed in
+  process by design; the boundary is now stated plainly: the host environment holds only the shipped lock, and the
+  data-only extension store is the planned fix and a prerequisite of every G-6 class unlock (owner decision on its
+  timing pending). NEW-5 fixed in nodestro-integrations (no OCR program from a Python package's folders). L2 (the process's primary group counts as its own) stays documented. Open:
   an end-to-end check of the import path inside the Local Docker and server images, ACL checks for Windows. R2: an
   earlier normal import of `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.

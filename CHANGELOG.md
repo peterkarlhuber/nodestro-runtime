@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Docs (N-22 fourth review, NEW-4): `docs/extension-isolation.md` states the boundary of the host import plainly:
+  the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
+  installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before
+  them, for example a new module that a standard module imports when it exists). The data-only extension store is
+  the planned fix and must exist before any G-6 class unlock. No code change.
+
 - Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
   own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)
   and only on a closed import path (`trusted_integrations.environment_problems`: no user site-packages, nothing in the
