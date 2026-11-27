@@ -247,12 +247,17 @@ versions they use. Details: [docs/skills.md](docs/skills.md).
 
 **Tools of installed integrations run only in the Docker sandbox (N-22).** Only Nodestro's own distribution
 (`nodestro-integrations`) is imported into the backend, for its OCR engine, and only a wheel install whose files match
-the hashes in its `RECORD` (an editable install or a package that only uses that name is not imported); every other integration installed through
-the entry point group `nodestro.integrations` is never imported: not even its import-time code runs in the host
-process. Its tools are listed and called in a new container of Orkexa's sandbox shape (no network, no host files, no
-environment, limits; the time limit removes the container), and only while `NODESTRO_EXTENSION_TOOLS=1` (a development
-switch, off by default) and the Docker sandbox passed its checks; otherwise they are "locked, not sufficiently
-secured" (`Extensions.packages_status()`: `off`, `not_secured` or `invalid`), and nothing runs anywhere else. Their
+the hashes in its `RECORD` (an editable install or a package that only uses that name is not imported). **Never
+install an extension package into the backend's Python environment** (owner decision 2026-11-27): it holds only the
+shipped lock, and the products have no pip. Every other integration found there through the entry point group
+`nodestro.integrations` is refused as "installed in the host environment" (`invalid`), whatever
+`NODESTRO_EXTENSION_TOOLS` says: it is never imported (not even its import-time code runs in the host process), never
+offered and never sent to the sandbox; only its metadata is read to report it. Foreign extensions will come only from
+the separate, data-only extension store (`<data>/extensions`, a G-6 prerequisite, not built yet) and will run only in
+a new container of Orkexa's sandbox shape (no network, no host files, no environment, limits; the time limit removes
+the container), only while `NODESTRO_EXTENSION_TOOLS=1` (a development switch, off by default) and the Docker sandbox
+passed its checks; otherwise they are "locked, not sufficiently secured" (`Extensions.packages_status()`: `off`,
+`not_secured` or `invalid`), and nothing runs anywhere else. Their
 capability counts at least as unknown (write, external): a package's own statement can only raise it. No tool class is
 enabled by default before the security evidence G-6. Integrations passed explicitly (`Workspace(integrations=[...])`)
 are the embedding application's own code and keep their tools. Details and the G-6 checklist:

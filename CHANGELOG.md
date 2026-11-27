@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Security (owner decision 2026-11-27, binding): a foreign extension package found in the host environment is
+  refused as `invalid`, "installed in the host environment" (`extensions.HOST_INSTALLED`), whatever
+  `NODESTRO_EXTENSION_TOOLS` says: only its metadata is read; it is never offered, imported, read or sent to the
+  sandbox. The sandbox stays for the data-only extension store (RT-098, a binding G-6 prerequisite; its acceptance
+  criteria and the residual risk are in `docs/extension-isolation.md`). README: never install extensions into the
+  backend's environment.
+
 - Docs (N-22 fourth review, NEW-4): `docs/extension-isolation.md` states the boundary of the host import plainly:
   the host Python environment must contain only the shipped lock (the products have no pip); any foreign package
   installed there is outside the trust boundary and the checks cannot detect it reliably (its code can run before

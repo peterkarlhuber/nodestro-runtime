@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 12 |
+| P2 Medium | 13 |
 | P3 Low | 37 |
 | P4 Optional | 15 |
 
@@ -171,16 +171,40 @@ None known.
   the runtime's or the integration's files) and NEW-2 (`sitecustomize`/`usercustomize`); the in-process limit is
   documented. Fourth review: NEW-4 (a foreign module imported before the checks rewrites them) is not fixed in
   process by design; the boundary is now stated plainly: the host environment holds only the shipped lock, and the
-  data-only extension store is the planned fix and a prerequisite of every G-6 class unlock (owner decision
-  2026-11-27, option A: harden now, the store later as its own work package before any G-6 unlock; `find_packages`
-  discovery from the host environment is development-only until then). NEW-5 fixed in nodestro-integrations (no OCR
-  program from a Python package's folders). Open Lows from the fourth review (OCR program lookup,
-  nodestro-integrations): another environment's `bin` on `PATH` (for example a conda environment) is not recognized
-  as a Python package's folder; a false refusal is possible when an install scheme's scripts folder is the system's
-  program folder (for example Homebrew's `bin`). L2 (the process's primary group counts as its own) stays documented. Open:
+  data-only extension store (RT-098) is a binding prerequisite of every G-6 class unlock. NEW-5 fixed in
+  nodestro-integrations (no OCR program from a Python package's folders).
+  **Owner decision 2026-11-27 (binding):** foreign extension packages are never installed into the host environment
+  and never loaded or run in the host process; the trusted OCR integration stays, verified; the store
+  `<data>/extensions` (RT-098) is a binding work package before any G-6 release, strictly separate from the host
+  environment, its packages run only in the Docker sandbox; foreign extension tools stay locked by default until it
+  is built and reviewed. Done: `find_packages` refuses every foreign package found in the host environment as
+  `invalid`, "installed in the host environment" (`HOST_INSTALLED`), switch or not; only metadata is read, nothing is
+  offered, imported, read or sent to the sandbox (`test_a_foreign_package_in_the_host_environment_is_refused`); the
+  sandbox tests get their packages from a store stand-in. nodestro-integrations: the OCR programs come only from
+  root-owned chains without group or other write (closes the fourth review's Low on another environment's `bin`; the
+  Low on a false refusal when a scheme's scripts folder is the system's program folder stays documented there).
+  Residual risk: in-process checks cannot catch a foreign package already in the host environment; the boundary is
+  the environment (only the shipped lock, no pip in the products). L2 (the process's primary group counts as its own) stays documented. Open:
   an end-to-end check of the import path inside the Local Docker and server images, ACL checks for Windows. R2: an
   earlier normal import of `nodestro_integrations` by host code is accepted by its real path.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
+
+### RT-098 · Data-only extension store `<data>/extensions` (owner decision 2026-11-27)
+
+- **Priority:** P2 Medium · **Status:** Open (binding before any G-6 release) · **Refs:** `docs/extension-isolation.md`
+  ("Architecture decision", G-6 prerequisite), RT-083, `extensions.find_packages`, `extension_sandbox.py`
+- **What:** foreign extension packages come only from a store strictly separate from the host Python environment and
+  run only in the Docker sandbox. Acceptance criteria: data only, each package read-only in
+  `<data>/extensions/<sha256>/`, never on `sys.path`; wheel checks (zip safety, every `RECORD` hash, file count and
+  size limits; no `.pth`, script or `.data` part ever run); upload and removal by an administrator only, audited;
+  execution only in the Docker sandbox with the existing bounds; discovery from the store only (`find_packages` stops
+  reading the host's entry points); an independent security review of the store before any class is unlocked.
+- **Touches:** this repository (store, discovery), nodestro-api (admin upload, list and remove endpoints, audit,
+  OpenAPI), nodestro-sdk (client methods), nodestro-studio (package states and upload in the UI), the server and Local
+  Docker volume docs. Estimate from the N-22 analysis: 8 to 11 development days plus review.
+- **Residual risk:** in-process checks cannot catch a foreign package already in the host environment; the boundary is
+  enforced by the environment (only the shipped lock, no pip in the products).
+- **Next step:** its own work package after N-22; until it is built and reviewed, foreign extension tools stay locked.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)
 
@@ -1262,6 +1286,7 @@ PR that completes its package. They are tracked by the plan's execution status a
 
 | This repo item | Other repo | Other item | Relation |
 |---|---|---|---|
+| RT-098 (open, owner decision 2026-11-27) | nodestro-api, nodestro-sdk, nodestro-studio, nodestro-integrations | the store's upload, list and remove endpoints, client methods and UI; integrations INT-007 | The data-only extension store is a binding G-6 prerequisite; until it exists every foreign package in the host environment is refused (`HOST_INSTALLED`) and foreign extension tools stay locked |
 | (in review 2026-11-26, W3-S) | nodestro-api, nodestro-sdk | the same step in their `nightly.yml` (job `report`) | Lock-lag label for the nightly (criteria.md K4): the report job lists every commit of `LOCK_COMPONENTS` that the studio master's lock pins behind its master, in the job summary and in the "Nightly failed" comment. It only labels: a red night stays red (runtime, api and sdk were 0/4 during the 22.–25.11. pause, all lock lag). An API error gives "Lock lag unknown" and never stops the issue step |
 | (done 2026-11-08) | tabrion, axentra | TABRION QA-18 (AC-3), MIG-NOD-3..6 | `tests/test_optional_edges.py`: one blocked-module test per K-33 edge (every module imports without `axentra`, without `tabrion.postgres`, without psycopg) with a mutation probe each; the MIG-NOD steps keep it green, and the mandatory `tabrion` core (since MIG-NOD-3) may not pull `tabrion[postgres]` into the base dependencies (meta test) |
 | (done 2026-11-14, TABRION QA-17) | nodestro-studio | ST-061 (dependency policy K-33) | `dependency-policy.json` is a copy of nodestro-runtime's edges (`--copy nodestro-runtime`), `scripts/check_dependency_policy.py` the unchanged checker; `tests/test_dependency_policy.py` checks both against `scripts/DEPENDENCY_POLICY_SOURCE.md` and the manifest against the copy. A K-33 change in nodestro-studio needs a new copy here; the CI `lint` step waits for the workflow review |

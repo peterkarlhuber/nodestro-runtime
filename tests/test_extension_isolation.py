@@ -36,8 +36,16 @@ from nodestro_runtime.extension_sandbox import (
     distribution_files,
     extension_spec,
     floor_capability,
+    package_of,
 )
-from nodestro_runtime.extensions import EXTENSION_TOOLS_ENV, LOCKED_MESSAGE, Extensions, discover, find_packages
+from nodestro_runtime.extensions import (
+    EXTENSION_TOOLS_ENV,
+    HOST_INSTALLED,
+    LOCKED_MESSAGE,
+    Extensions,
+    discover,
+    find_packages,
+)
 from nodestro_runtime.profile import RuntimeProfile
 from nodestro_runtime.tool_policy import UNKNOWN
 from nodestro_runtime.tool_spec import HOST_TOOL_TIMEOUT_SECONDS, CallCounter, bind_tool, offered
@@ -233,6 +241,12 @@ def entry_points_of(info: Path) -> Callable[[], list[metadata.EntryPoint]]:
     return lambda: list(dist.entry_points)
 
 
+def store_packages(info: Path) -> list[ExtensionPackage]:
+    """The package at ``info`` as the extension store will hand it to the sandbox (owner decision 2026-11-27: a
+    package found in the host environment is refused, so the sandbox tests below get theirs from this stand-in)."""
+    return [package_of(entry) for entry in entry_points_of(info)()]
+
+
 class FakeContainer:
     """Stands in for :class:`~nodestro_runtime.container_images.RuntimeImageSandbox`: ``run_container`` runs the
     command after the image (``python -I -B -c BOOTSTRAP``) as a child process with an empty environment, in a fresh
@@ -341,9 +355,7 @@ def _workspace(
     else:
         monkeypatch.setenv(EXTENSION_TOOLS_ENV, switch)
     info = next(site.glob("*.dist-info"))
-    monkeypatch.setattr(
-        "nodestro_runtime.workspace.find_packages", lambda **_options: find_packages(entry_points_of(info))
-    )
+    monkeypatch.setattr("nodestro_runtime.workspace.find_packages", lambda **_options: store_packages(info))
     monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: discover(entry_points_of(info)))
     monkeypatch.setattr(Workspace, "_extension_sandbox", lambda _self, timeout: containers(timeout))
     return Workspace(profile=RuntimeProfile(kind=kind, data_dir=tmp_path / "data"))  # type: ignore[arg-type]
@@ -360,8 +372,44 @@ def test_import_time_code_never_runs_in_the_host(package: tuple[Path, Path]) -> 
     assert [(item.name, item.entry, item.distribution, item.version) for item in found] == [
         ("acme", f"{MODULE}:integration", "acme-ext", "1.0")
     ]
-    assert list(found[0].read_files()) == [f"{MODULE}/__init__.py"]
+    assert found[0].rejected == HOST_INSTALLED  # owner decision 2026-11-27: reported from its metadata only
+    with pytest.raises(PackageError, match="installed in the host environment"):
+        found[0].read_files()
+    assert list(store_packages(next(site.glob("*.dist-info")))[0].read_files()) == [f"{MODULE}/__init__.py"]
     assert not marker.exists() and MODULE not in sys.modules
+
+
+@pytest.mark.parametrize("switch", [None, "1"])
+def test_a_foreign_package_in_the_host_environment_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, package: tuple[Path, Path], switch: str | None
+) -> None:
+    """Owner decision 2026-11-27: a foreign extension package found in the host environment is refused as "installed
+    in the host environment", also with the switch on and a proven sandbox: never offered, imported, read or sent to
+    the sandbox (no container starts)."""
+    site, marker = package
+    if switch is None:
+        monkeypatch.delenv(EXTENSION_TOOLS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(EXTENSION_TOOLS_ENV, switch)
+    info = next(site.glob("*.dist-info"))
+    monkeypatch.setattr(
+        "nodestro_runtime.workspace.find_packages", lambda **options: find_packages(entry_points_of(info), **options)
+    )
+    monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: discover(entry_points_of(info)))
+    containers = Containers()
+    monkeypatch.setattr(Workspace, "_extension_sandbox", lambda _self, timeout: containers(timeout))
+    read: list[str] = []
+    monkeypatch.setattr("nodestro_runtime.extension_sandbox.distribution_files", lambda *args: read.append("x") or {})
+    profile = RuntimeProfile(kind="desktop", data_dir=tmp_path / "data")  # type: ignore[arg-type]
+    with Workspace(profile=profile) as workspace:
+        assert containers.made == [] and containers.runs == []
+        assert not ({"echo_text", "probe_sandbox"} & set(workspace.tools.builtin))
+        assert workspace.tools.extension_tools == frozenset()
+        [status] = workspace.extensions.packages_status()
+        assert (status["name"], status["distribution"], status["version"]) == ("acme", "acme-ext", "1.0")
+        assert (status["state"], status["reason"], status["detail"]) == ("locked", "invalid", HOST_INSTALLED)
+        assert status["tools"] == []
+    assert read == [] and not marker.exists() and MODULE not in sys.modules
 
 
 @pytest.mark.parametrize("switch", [None, "0", "true", "yes"])
@@ -487,9 +535,7 @@ def test_a_server_never_starts_extension_containers(
     site, marker = package
     monkeypatch.setenv(EXTENSION_TOOLS_ENV, "1")
     info = next(site.glob("*.dist-info"))
-    monkeypatch.setattr(
-        "nodestro_runtime.workspace.find_packages", lambda **_options: find_packages(entry_points_of(info))
-    )
+    monkeypatch.setattr("nodestro_runtime.workspace.find_packages", lambda **_options: store_packages(info))
     monkeypatch.setattr("nodestro_runtime.workspace.discover", lambda **_options: discover(entry_points_of(info)))
     containers = Containers()
     monkeypatch.setattr(Workspace, "_extension_sandbox", lambda _self, timeout: containers(timeout))
@@ -569,7 +615,7 @@ def test_the_run_waits_for_the_containers_own_timeout(package: tuple[Path, Path]
     """At the limit the container's timeout answers (its container removed), not the abandoned-thread timeout. The
     removal is confirmed through the fake docker CLI only (review L3: self-contained, no daemon needed)."""
     site, _marker = package
-    [found] = find_packages(entry_points_of(next(site.glob("*.dist-info"))))
+    [found] = store_packages(next(site.glob("*.dist-info")))
     containers = Containers()
     sandbox = ExtensionSandbox(containers)
     spec = extension_spec("spin_loop", {"timeout_seconds": 2.0})
@@ -749,7 +795,7 @@ class Real:
         ]
         site = tmp_path / "site"
         info = install_package(site, marker=self.marker, paths=self.host_paths)
-        [self.package] = find_packages(entry_points_of(info))
+        [self.package] = store_packages(info)
         self.sandbox = ExtensionSandbox(lambda timeout: images.sandbox(tag, timeout=timeout, memory_mb=512))
 
     def call(self, tool: str, payload: dict[str, Any], timeout: float = 60.0) -> str:
@@ -849,7 +895,7 @@ def test_a_missing_docker_cli_locks_the_tools_with_the_real_sandbox(
 
     site, marker = package
     monkeypatch.setenv(EXTENSION_TOOLS_ENV, "1")
-    found = find_packages(entry_points_of(next(site.glob("*.dist-info"))))
+    found = store_packages(next(site.glob("*.dist-info")))
     missing = str(tmp_path / "no-docker")
     sandbox = ExtensionSandbox(lambda timeout: StreamedSandbox(image="nodestro-env:x", timeout=timeout, docker=missing))
     extensions = Extensions(installed=True, packages=found)
