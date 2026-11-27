@@ -15,6 +15,22 @@
   pip); a folder of root writable by a foreign group is refused (M1); the folder holding a symbolic link on the way
   to an entry is checked (L1).
 
+- New (N-20, off by default: `NODESTRO_WORKFLOW_TOOLS`): agents call saved workflows in a fixed version as tools
+  (`AgentConfig.workflow_tools`, `workflow_tools`; [docs/workflow-tools.md](docs/workflow-tools.md)). A call is a
+  child run of the agent's run through the one engine (budget, cancel and limits as a sub-workflow); its effect is
+  the highest of everything inside (unknown = write + external), and a changing workflow is confirmed before every
+  start (gate kind `workflow`; refused without approvals). Approval steps and tool approvals inside are cards of a
+  conversation's answer (`ToolCallView.workflow`), result files its attachments (`result_files`), newer versions are
+  only reported (`workflow_tool_updates`). `graph.workflow_refs` names workflow tools, so releases, exports, memory
+  consents and pre-checks follow them; `Runs.decide` records a decision inside a workflow tool's run without a
+  paused top-level run. New codes `workflow_tool.*`. Review fixes: steps with workflow tools run on a thread pool of
+  their own per nesting depth (no deadlock of the agent pool); no pre-grant applies to a changing workflow tool, and
+  its name never takes another tool's; a model that is not local counts as reaching outside (an orchestrator's own
+  model included, and Ollama on a host that is not loopback, `Runs.local_model_server`); a budget decision of
+  another process continues a waiting call; a decision needs a waiting call (`workflow_tool.not_waiting`) and an
+  interrupted run cancels its waiting workflow runs; parallel calls keep their own records; nested result files are
+  attachments.
+
 - New (N-14): versioned exchange formats `nodestro-mcp/1`, `nodestro-connection/1` and `nodestro-collection/1` with
   one import check for all of them (`exchange`; [docs/exchange-formats.md](docs/exchange-formats.md)): size, format
   and version (`exchange.version_newer`), strict content, ZIP safety, preview and all-or-nothing apply. Exports never

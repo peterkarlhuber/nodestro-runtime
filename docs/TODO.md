@@ -11,7 +11,7 @@
 |---|---|
 | P0 Critical | 0 |
 | P1 High | 1 |
-| P2 Medium | 11 |
+| P2 Medium | 12 |
 | P3 Low | 36 |
 | P4 Optional | 15 |
 
@@ -609,6 +609,37 @@ Items that need an independent or external review (an internal audit does not re
 - **Next step:** Only if long workflows matter: save node state incrementally.
 
 ## Features and enhancements
+
+### RT-096 · Workflows as tools of an agent (N-20): activation and follow-ups
+
+- **Priority:** P2 Medium · **Status:** In review · **Refs:** development plan N-20,
+  [docs/workflow-tools.md](workflow-tools.md), `workflow_tools.py`, `tests/test_workflow_tools.py`, nodestro-api
+  `GET /api/workflows/{workflow_id}/versions/{number}/tool`
+- **Done (review of the independent review):** steps with workflow tools run on a pool of their own per depth (H1);
+  no pre-grant applies to a changing workflow tool and its name never takes another tool's (M1); a model that is not
+  local reaches outside, an orchestrator's model and a remote Ollama host included (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a
+  waiting call and an interrupted run cancels its waiting workflow runs (L1); records found by call id (L4); nested
+  result files are attachments (L5).
+- **Done:** an agent calls a saved workflow in a fixed version (`AgentConfig.workflow_tools`) as a child run of its
+  run through the one engine (`_execute_child`: budget, cancel, limits); arguments from the start form; the effect is
+  the highest of everything inside (unknown = write + external), stored at import and computed again at every call;
+  a changing workflow is confirmed before every start (gate kind `workflow`), refused without approvals; approval
+  steps and tool approvals inside are cards of the answer, result files its attachments; newer versions are only
+  reported; releases, exports, memory consents and pre-checks follow the binding (`graph.workflow_refs`). Behind
+  `NODESTRO_WORKFLOW_TOOLS` (default off).
+- **Open:**
+  - switching it on needs the independent review of tool approvals (RT-001): every changing workflow tool depends on
+    the per-call gate;
+  - H1 leftover (a stall, not a deadlock): a waiting call holds a thread of the workflow tool pool of its depth for
+    up to 24 hours (never one of the ordinary agent pool); with `NODESTRO_RUN_THREADS` (default 32) calls waiting on
+    approvals at one depth, every later step with workflow tools of that depth waits for a thread until one of them
+    is decided, cancelled or times out;
+  - sub-workflows without a version inside the called workflow are pinned when their step starts, not once per call
+    (review L2): the effect is computed again at the next call;
+  - a deny for the calling agent (N-06) does not follow into the workflow's own agents (review L3; documented);
+  - file fields of the start form are not offered (the conversation's files are not passed on);
+  - the studio shows the cards and attachments only once its conversation view reads `tool_calls[].workflow` and
+    `result_files` (studio follow-up).
 
 ### RT-095 · Exchange formats (N-14): review and follow-ups
 

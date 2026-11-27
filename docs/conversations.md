@@ -30,7 +30,8 @@ The Nodestro Assistant may move onto this object later (ECO-4); it is not part o
 |---|---|
 | `role`, `content`, `seq` | `user` or `assistant`, the text, the order |
 | `attachments` | User messages: the files sent with it and how the model received them (`mode`, as the run's `ProvidedFile`) |
-| `tool_calls` | Answers: `id`, `name`, `arguments`, `result`, `is_error`, `started_at`, `finished_at`, `duration_ms`, `approval` |
+| `tool_calls` | Answers: `id`, `name`, `arguments`, `result`, `is_error`, `started_at`, `finished_at`, `duration_ms`, `approval`, `workflow` (N-20: a workflow tool's run, the approval cards it waits for and its files; [workflow-tools.md](workflow-tools.md)) |
+| `result_files` | Answers: the result files of its workflow tools' runs, as attachments (N-20) |
 | `sources` | Answers: the web sources the agent's tools saw (the run's source ledger) |
 | `status`, `error` | `complete` for a user message; an answer has the status of its run |
 | `agent`, `model` | Answers: the agent version and model that answered |
