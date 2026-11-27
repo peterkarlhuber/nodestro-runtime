@@ -68,8 +68,30 @@ locked package.
   `ToolCapability` as plain values; a spec is read only for a stated capability (to raise it) and a lower time limit.
   OCR engines of foreign packages are not used.
 - Each call starts a new container (about a second of overhead); state does not survive between calls.
-- The Docker sandbox shares the kernel with the host (or Docker Desktop's VM) and uses the daemon's default seccomp
-  profile (see [docker-sandbox.md](docker-sandbox.md)).
+- The Docker sandbox shares the kernel with the host (or Docker Desktop's VM). Extension containers run under
+  Nodestro's own seccomp profile (`extension_seccomp.json`: Moby's default profile `moby/profiles` `seccomp/v0.1.0`
+  without its capability rules and without `ptrace`, `process_vm_readv`/`writev`, `memfd_create`, `execveat`,
+  `personality`, `kcmp`, `pidfd_getfd`, NUMA and file handle calls; `extension_seccomp.EXTRA_BLOCKED`). The docker
+  CLI sends the file's content, so it works with a remote daemon, Docker Desktop's VM and through Nodestro Local
+  Docker's sandbox gateway, which accepts exactly this profile and no other. A probe container of the same shape
+  without package code proves once per daemon and image that the profile is applied (`ptrace`, `memfd_create`,
+  `execveat`, ... refused), or the tools stay `not_secured`. Podman with this option is not tested.
+- User namespaces: whether the daemon remaps container users (`userns-remap`, rootless engines) is detected and
+  reported (`orkexa` `DockerHost.userns_remap`, in the self-test facts). It is not required: the container user is
+  `nobody` without capabilities and with `no-new-privileges` either way, and requiring it would lock every default
+  Docker installation. Decision for G-6: recommended in the operating guide, not enforced.
+- Dependencies: the runtime image extension tools run in is built from a hashed lock (`pip install --no-index
+  --require-hashes`, nothing fetched at run time, run by its image id). A package's own dependencies are not
+  installed; a package that needs one fails its listing (`invalid`). Design for later: the package's requirements as an
+  approved, hashed environment image like a local MCP server's (`container_images`), never installed in the host.
+- Tool classes: designed in `extension_classes.py`, nothing released. A package's statement cannot lower its
+  capability, so a class follows from the container's grants instead (no grant: `read` with reach `internal`; a
+  folder grant: `read`/`write`, `internal`; a network grant: `external`). A class counts with that capability and is
+  offered without the development switch only once it is listed in `extension_classes.RELEASES` with the G-6 evidence,
+  the internal and the independent review; `RELEASES` is empty. Every grant is refused (`require_supported`): there is
+  no network or folder grant path for extension tools yet (default no access). Planned shape: folders only through
+  `orkexa.fs` on the host and a `FolderGrant` (never a mount), network only to granted hosts through the egress
+  guard.
 - Packages are told apart by distribution, entry point name and `module:attribute`; two that cannot be told apart
   are both `invalid`. Listing runs one container per package, one after the other (up to 60 s each) while the
   workspace opens with the switch on. Descriptions lose control and bidi characters but stay untrusted text that a
@@ -148,13 +170,13 @@ open.
 | 13 | huge, broken or non-JSON output, line over the limit | clean error, host memory bounded | `::test_broken_responses_fail_cleanly`, Docker: `::test_huge_output_fails_cleanly` |
 | 14 | product profiles without the switch | no extension tool callable | `::test_no_extension_tool_in_a_product_profile_without_the_switch` |
 | 15 | image tag moved after the check | only the checked image id runs | Orkexa / `StreamedSandbox` (calls run the image id) |
-| 16 | run cancelled during a call | container removed | open: test through `sandbox_cancel` with a real container |
-| 17 | network grant for a class with `reach=external` | only the granted host, through the egress guard | open: no grant path exists yet |
-| 18 | folder grant for a class that reads files | only through `orkexa.fs` and a grant | open: no grant path exists yet |
-| 19 | Docker Desktop (macOS, Windows) | items 5 to 12 pass there | open |
-| 20 | own seccomp profile, user namespace remapping | decided and, if chosen, enforced by the preflight | open |
-| 21 | dependencies of a package | built as a hashed image like tool environments, never in the host | open |
-| 22 | per-class enabling and the trust exception (WZ-8) | designed, reviewed | open: not implemented on purpose |
+| 16 | run cancelled during a call; host process killed during a call | container removed; a left-over container removed by the reaper (all of the installation's at start, expired ones by deadline) | Docker: `::test_a_cancelled_run_removes_the_container`, `::test_a_container_left_by_a_crashed_host_is_reaped` |
+| 17 | network grant for a class with `reach=external` | only the granted host, through the egress guard | default no access proven (item 9); every grant refused: `::test_no_tool_class_is_released_and_no_grant_exists`; grant path designed, not implemented |
+| 18 | folder grant for a class that reads files | only through `orkexa.fs` and a grant | default no access proven (items 10, 11); every grant refused (as 17); grant path designed, not implemented |
+| 19 | Docker Desktop (macOS, Windows) | items 5 to 12 pass there | NOT tested: no CI runner offers Docker Desktop (licensing, nested virtualization); Orkexa's experimental colima macOS job covers only Orkexa's own sandbox; needs a manual run on real machines before G-6 |
+| 20 | own seccomp profile, user namespace remapping | profile shipped, applied and proven by a probe; remapping reported, not required | `::test_without_the_seccomp_profile_applied_the_tools_stay_locked`, `::test_every_extension_container_runs_under_the_seccomp_profile`, `::test_the_extension_seccomp_profile_is_stricter_than_the_default`, Docker: `::test_the_extension_seccomp_profile_is_applied_by_the_real_engine`, gateway: `test_sandbox_gateway.py::test_only_the_extension_seccomp_profile_is_accepted_as_a_seccomp_option`; Orkexa `test_docker_host.py::test_user_namespace_remapping_is_reported` |
+| 21 | dependencies of a package | built as a hashed image like tool environments, never in the host | partly: the runtime image is hashed and offline at run time; packages with dependencies are refused (`invalid`); the dependency image is designed, not implemented |
+| 22 | per-class enabling and the trust exception (WZ-8) | designed, reviewed | designed and locked (`extension_classes.py`, `RELEASES` empty): `::test_a_class_counts_with_its_capability_only_once_released`; review open; WZ-8 not implemented on purpose |
 | 23 | a forged, self-consistent copy of the trusted integration ahead on the path (R1), an open import path | refused (only the copy next to the runtime; closed import path) | `test_trusted_integrations.py::test_a_forged_self_consistent_copy_ahead_on_the_path_is_refused` and the path checks above; replacing the copy next to the runtime is the accepted residual |
 | 24 | trust checks on Windows and macOS paths (short names, case, `/private`) | same verdicts | Platforms workflow: `test_trusted_integrations.py` |
 

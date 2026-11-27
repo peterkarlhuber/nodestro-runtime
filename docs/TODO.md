@@ -139,17 +139,15 @@ None known.
   `tests/test_extension_isolation.py`, `docs/extension-isolation.md`, security review 2026-11 (phase 0R) findings S1
   to S3, owner decision E-0R-2 A (2026-11-20)
 - **What:** foreign installed integrations are never imported into the host; their tools run only in the Docker
-  sandbox (JSON over stdin and stdout, no network, no host files or secrets, the time limit removes the container) and
-  only with `NODESTRO_EXTENSION_TOOLS=1` and a proven daemon, else "locked, not sufficiently secured". Their capability
-  is at least unknown. Open (G-6 items 16 to 22 in the docs): a cancel test on a real container, network and folder
-  grants for extension tools, the checks on Docker Desktop (macOS, Windows), an own seccomp profile and user
-  namespace remapping, package dependencies as hashed images, showing the package states in the API and the studio,
-  and the release per tool class after the internal and the independent review (gate G-6). The trust exception
-  (WZ-8) is not implemented on purpose. R1 (owner decision 2026-11, accepted provisionally for internal
-  development): only the copy next to the runtime, on a closed import path, is imported (`environment_problems`);
-  Windows is locked; the boundary per product is in `docs/extension-isolation.md`. Open: an end-to-end check of the
-  import path inside the Local Docker and server images, ACL checks for Windows. R2: an earlier normal import of
-  `nodestro_integrations` by host code is accepted by its real path.
+  sandbox (JSON over stdin and stdout, no network, no host files or secrets, the time limit or a cancelled run removes
+  the container, the reaper removes a crashed host's) under Nodestro's own seccomp profile (proven by a probe), and only
+  with `NODESTRO_EXTENSION_TOOLS=1` and a proven daemon, else "locked, not sufficiently secured". Their capability is
+  at least unknown; tool classes are modelled by grants and none is released (`extension_classes.RELEASES` empty).
+  R1 (owner decision 2026-11, accepted provisionally): only the copy next to the runtime and only on a closed import
+  path is imported; per product in `docs/extension-isolation.md`. Open for G-6: Docker Desktop on macOS and Windows
+  (not tested), Podman with the profile (not tested), network and folder grant paths and package dependency images
+  (designed, not implemented), an end-to-end check of the import path inside the images, showing the package states in
+  the API and the studio, the internal and the independent review. WZ-8 is not implemented on purpose. R2 unchanged.
 - **Next step:** internal security review of N-22, then the G-6 brief; no class is enabled before it is passed.
 
 ### RT-082 · Independent review of the local data directory key (LD-020)

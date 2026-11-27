@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from typing import Any
 import uuid
@@ -241,10 +242,13 @@ class FakeContainer:
     docker = "docker"
     environ: dict[str, str] | None = None
 
-    def __init__(self, timeout: float, *, ready: bool = True) -> None:
+    def __init__(self, timeout: float, *, ready: bool = True, seccomp: bool = True) -> None:
         self.timeout = timeout
         self.is_ready = ready
+        #: Whether the engine applies the extension seccomp profile (the probe's answer).
+        self.seccomp = seccomp
         self.runs: list[dict[str, Any]] = []
+        self.probes = 0
 
     def ready_image(self) -> str:
         if not self.is_ready:
@@ -255,8 +259,11 @@ class FakeContainer:
         return ["docker", "run", "--name", name, image_id]
 
     def run_container(self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int) -> tuple[int, Any]:
+        if name.startswith("nodestro-ext-probe-"):
+            self.probes += 1
+            return 0, BoundedOutput(stdout=_probed(self.seccomp, args), stderr=b"", overflow=False)
         command = args[args.index("python") :]
-        self.runs.append({"name": name, "request": json.loads(data)["request"]})
+        self.runs.append({"name": name, "request": json.loads(data)["request"], "args": list(args)})
         with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as tmp:
             try:
                 done = subprocess.run(
@@ -275,15 +282,25 @@ class FakeContainer:
         return done.returncode, BoundedOutput(stdout=done.stdout, stderr=done.stderr[-4096:], overflow=False)
 
 
+def _probed(applied: bool, args: list[str]) -> bytes:
+    """What the seccomp probe prints in a fake container: every call refused when the profile is ``applied`` and
+    named in ``args``."""
+    from nodestro_runtime.extension_seccomp import PROBES, security_option
+
+    refused = applied and security_option() in args
+    return json.dumps({name: "refused" if refused else "allowed" for name, *_rest in PROBES}).encode()
+
+
 class Containers:
     """The factory a workspace hands to :class:`ExtensionSandbox`, recording each sandbox it made."""
 
-    def __init__(self, *, ready: bool = True) -> None:
+    def __init__(self, *, ready: bool = True, seccomp: bool = True) -> None:
         self.ready = ready
+        self.seccomp = seccomp
         self.made: list[FakeContainer] = []
 
     def __call__(self, timeout: float) -> FakeContainer:
-        made = FakeContainer(timeout, ready=self.ready)
+        made = FakeContainer(timeout, ready=self.ready, seccomp=self.seccomp)
         self.made.append(made)
         return made
 
@@ -384,6 +401,63 @@ def test_without_a_proven_sandbox_the_tools_stay_locked(
         assert (status["state"], status["reason"], status["message"]) == ("locked", "not_secured", LOCKED_MESSAGE)
         assert "self-test" in str(status["detail"])
     assert not marker.exists() and MODULE not in sys.modules  # no host fallback
+
+
+def test_without_the_seccomp_profile_applied_the_tools_stay_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, package: tuple[Path, Path]
+) -> None:
+    """G-6 item 20: an engine that ignores the extension seccomp profile (the probe's calls get through) runs no
+    package container; the tools stay locked ``not_secured``."""
+    site, marker = package
+    containers = Containers(seccomp=False)
+    with _workspace(tmp_path, monkeypatch, site, containers, switch="1") as workspace:
+        assert containers.runs == [] and sum(made.probes for made in containers.made) == 1
+        [status] = workspace.extensions.packages_status()
+        assert (status["state"], status["reason"]) == ("locked", "not_secured")
+        assert "seccomp profile is not applied" in str(status["detail"])
+    assert not marker.exists()
+
+
+def test_every_extension_container_runs_under_the_seccomp_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, package: tuple[Path, Path]
+) -> None:
+    from nodestro_runtime.extension_seccomp import security_option
+
+    site, _marker = package
+    containers = Containers()
+    with _workspace(tmp_path, monkeypatch, site, containers, switch="1") as workspace:
+        assert workspace.tools.builtin["echo_text"].execute({"text": "hello"}) == "hello"
+    assert [run["request"]["mode"] for run in containers.runs] == ["describe", "call"]
+    for run in containers.runs:
+        option = run["args"].index("--security-opt", run["args"].index(run["name"]))
+        assert run["args"][option + 1] == security_option() and run["args"][-1] != security_option()
+    # proven once per daemon and image, not per call
+    assert sum(made.probes for made in containers.made) == 1
+
+
+def test_the_extension_seccomp_profile_is_stricter_than_the_default() -> None:
+    from nodestro_runtime import extension_seccomp
+
+    profile = extension_seccomp.profile()
+    assert profile["defaultAction"] == "SCMP_ACT_ERRNO"
+    allowed = {name for rule in profile["syscalls"] if rule["action"] == "SCMP_ACT_ALLOW" for name in rule["names"]}
+    assert not allowed & set(extension_seccomp.EXTRA_BLOCKED)
+    assert {name for name, *_rest in extension_seccomp.PROBES} <= set(extension_seccomp.EXTRA_BLOCKED)
+    assert not [rule for rule in profile["syscalls"] if (rule.get("includes") or {}).get("caps")]
+    assert {"read", "write", "openat", "execve", "futex", "exit_group"} <= allowed  # Python still starts
+    moby = {
+        "defaultAction": "SCMP_ACT_ERRNO",
+        "syscalls": [
+            {"names": ["read", "ptrace", "memfd_create"], "action": "SCMP_ACT_ALLOW"},
+            {"names": ["mount"], "action": "SCMP_ACT_ALLOW", "includes": {"caps": ["CAP_SYS_ADMIN"]}},
+            {"names": ["ptrace"], "action": "SCMP_ACT_ALLOW", "includes": {"minKernel": "4.8"}},
+        ],
+    }
+    assert extension_seccomp.derive(moby)["syscalls"] == [{"names": ["read"], "action": "SCMP_ACT_ALLOW"}]
+    with pytest.raises(ValueError):
+        extension_seccomp.derive({"defaultAction": "SCMP_ACT_ALLOW", "syscalls": []})
+    assert extension_seccomp.check_probes('{"ptrace": "refused"}') != []
+    assert extension_seccomp.check_probes("") == ["the seccomp probe printed no result"]
 
 
 def test_the_switch_and_a_proven_sandbox_offer_the_tools_from_the_container(
@@ -574,6 +648,8 @@ class Answer:
         return ["docker", "run", name, image_id]
 
     def run_container(self, args: list[str], name: str, data: bytes = b"", *, max_stdout: int) -> tuple[int, Any]:
+        if name.startswith("nodestro-ext-probe-"):
+            return 0, BoundedOutput(stdout=_probed(True, args), stderr=b"", overflow=False)
         return 0, BoundedOutput(stdout=self.stdout, stderr=b"", overflow=False)
 
 
@@ -767,6 +843,75 @@ def test_an_endless_loop_is_killed_and_the_container_removed(real: Real) -> None
     assert real.call("echo_text", {"text": "after"}) == "after"  # the host is free
 
 
+def test_a_cancelled_run_removes_the_container(real: Real) -> None:
+    """G-6 item 16: cancelling the run (the engine's check, bound as for a run) kills and removes the call's
+    container long before its time limit; the host is free afterwards."""
+    from nodestro_runtime import sandbox_cancel
+
+    cancelled = threading.Event()
+    timer = threading.Timer(3.0, cancelled.set)
+    token = sandbox_cancel.bind(cancelled.is_set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(ToolExecutionError):
+            real.call("spin_loop", {"seconds": -1}, timeout=120.0)
+    finally:
+        sandbox_cancel.reset(token)
+        timer.cancel()
+    assert cancelled.is_set() and time.monotonic() - started < 3 + 20
+    assert real.containers() == []
+    assert real.call("echo_text", {"text": "after"}) == "after"
+
+
+def test_a_container_left_by_a_crashed_host_is_reaped(real: Real) -> None:
+    """A host process killed during a call (the docker client dies with it) leaves its container running; the reaper
+    removes it, all of this installation's containers when a process starts and expired ones by their deadline."""
+    from orkexa.dynamic.docker import reap
+
+    sandbox = real.sandbox._sandbox(30.0)
+    name = f"nodestro-ext-crash-{uuid.uuid4().hex[:8]}"
+    args = [*sandbox.shaped_run(name, sandbox.ready_image()), "python", "-I", "-c", "import time; time.sleep(600)"]
+    client = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 60
+        while not real.containers() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        client.kill()  # the host process and its client die; nothing stops the container
+        client.wait(timeout=30)
+        assert len(real.containers()) == 1
+        assert reap(owner=real.owner, now=time.time()) == 0  # not expired yet, and no process start
+        assert reap(owner=real.owner, now=time.time() + 31 + 60) == 1  # its deadline passed
+        assert real.containers() == []
+        client = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 60
+        while not real.containers() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        client.kill()
+        client.wait(timeout=30)
+        assert reap(owner=real.owner, remove_all=True) == 1  # a new host process removes all of its own
+        assert real.containers() == []
+    finally:
+        if client.poll() is None:
+            client.kill()
+
+
+def test_the_extension_seccomp_profile_is_applied_by_the_real_engine(real: Real) -> None:
+    """G-6 item 20: the probe passes in the extension shape, and the same probe in Orkexa's plain shape (the engine's
+    default profile) gets through, so the refusals are the profile's."""
+    from nodestro_runtime.extension_seccomp import check_probes, probe_command
+
+    real.sandbox.ready()
+    sandbox = real.sandbox._sandbox(60.0)
+    name = f"nodestro-ext-plain-{uuid.uuid4().hex[:8]}"
+    code, output = sandbox.run_container(
+        [*sandbox.shaped_run(name, sandbox.ready_image()), *probe_command()], name, b"", max_stdout=4096
+    )
+    assert code == 0 and check_probes(output.stdout.decode()) != []
+    assert real.call("echo_text", {"text": "under the profile"}) == "under the profile"
+    assert real.containers() == []
+
+
 def test_no_network_without_a_grant(real: Real) -> None:
     found = real.probe("network")
     for check in ("tcp", "dns", "udp", "metadata", "ipv6"):
@@ -830,3 +975,39 @@ def test_a_missing_docker_cli_locks_the_tools_with_the_real_sandbox(
     assert (status["reason"], status["message"]) == ("not_secured", LOCKED_MESSAGE)
     assert "not installed" in str(status["detail"])
     assert not marker.exists() and MODULE not in sys.modules
+
+
+# ---- tool classes: designed, nothing released (G-6 items 17, 18, 22) -----------------------------------------------
+
+
+def test_no_tool_class_is_released_and_no_grant_exists() -> None:
+    from nodestro_runtime import extension_classes as classes
+
+    assert classes.RELEASES == ()
+    assert classes.NO_GRANTS.none and classes.effective_class(classes.NO_GRANTS) == ("read", "internal")
+    for stated in ({}, {"access": "read", "reach": "internal"}, {"access": "write"}):
+        assert classes.class_capability(stated) == UNKNOWN  # the isolated class is not released: unknown
+    assert classes.class_capability({"access": "destructive"}).access == "destructive"
+    for grants in (classes.Grants(network=("example.com",)), classes.Grants(folders=(("folder-1", "read"),))):
+        with pytest.raises(ValueError, match="no network or folder grant"):
+            classes.class_capability({}, grants)
+
+
+def test_a_class_counts_with_its_capability_only_once_released() -> None:
+    """The mechanism a later release uses (a reviewed change of ``RELEASES``, never a setting): the class follows from
+    the container's grants, not from the package's statement, and a stated ``destructive`` still raises it."""
+    from nodestro_runtime import extension_classes as classes
+
+    with pytest.raises(ValueError, match="independent review"):
+        classes.ClassRelease(("read", "internal"), evidence="G-6 run", internal_review="IR-1", independent_review="")
+    release = classes.ClassRelease(
+        ("read", "internal"), evidence="G-6 run", internal_review="IR-1", independent_review="IR-2"
+    )
+    found = classes.class_capability({"access": "write"}, releases=[release])
+    assert (found.access, found.reach, found.source) == ("read", "internal", "nodestro")
+    assert classes.class_capability({"access": "destructive"}, releases=[release]).access == "destructive"
+    assert classes.effective_class(classes.Grants(network=("a.example",), folders=(("f", "write"),))) == (
+        "write",
+        "external",
+    )
+    assert classes.released(("write", "external"), [release]) is None

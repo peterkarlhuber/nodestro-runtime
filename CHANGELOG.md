@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Security (N-22, Welle 6; nothing enabled, the switch stays off): extension
+  containers run under Nodestro's own seccomp profile (`extension_seccomp`), proven by a probe container and accepted
+  by the sandbox gateway exactly; tool classes and grants are modelled (`extension_classes`, nothing released, every
+  grant refused). New Docker tests: a cancelled run and a crashed host leave no container.
+
 - Security (N-22 R1, owner decision; nothing enabled): the trusted integration is imported only from the runtime's
   own installation directory (a forged, self-consistent copy elsewhere on `sys.path` is refused and listed `invalid`)
   and only on a closed import path (`trusted_integrations.environment_problems`: no user site-packages, nothing in the

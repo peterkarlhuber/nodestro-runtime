@@ -70,6 +70,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import uuid
 
+from . import extension_seccomp
 from .image_limits import BUILD_BUSY, GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGES_GB, GIB, IMAGE_REPOSITORY, LOCK_LABEL
 
 logger = logging.getLogger("nodestro.sandbox_gateway")
@@ -221,6 +222,15 @@ def _split(path: str) -> tuple[str, str]:
     return path[match.end() :], match.group(0)
 
 
+def _same_security(found: Any, wanted: list[str]) -> bool:
+    """Whether a created container's security options (read back from the daemon) are exactly the requested ones:
+    ``no-new-privileges`` and, for an extension container, exactly Nodestro's extension seccomp profile."""
+    items = list(found or [])
+    if len(items) != len(wanted) or items[:1] != ["no-new-privileges"]:
+        return False
+    return all(extension_seccomp.is_profile(item) for item in items[1:])
+
+
 def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConfig) -> tuple[dict[str, str], bytes]:
     """The container the gateway creates for a ``POST /containers/create`` request: its query and JSON body.
 
@@ -342,8 +352,12 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
     ulimits = _ulimits(host.get("Ulimits"))
     if host.get("NetworkMode") not in (None, "", "none"):
         raise Refused("A sandbox container has no network (NetworkMode none)")
-    if any(not isinstance(item, str) or item != "no-new-privileges" for item in host.get("SecurityOpt") or []):
-        raise Refused("Only the security option no-new-privileges is allowed")
+    security = host.get("SecurityOpt") or []
+    profiles = [item for item in security if extension_seccomp.is_profile(item)]
+    if len(profiles) > 1 or any(
+        not isinstance(item, str) or (item != "no-new-privileges" and item not in profiles) for item in security
+    ):
+        raise Refused("Only the security option no-new-privileges and Nodestro's extension seccomp profile are allowed")
     if any(item.upper() != "ALL" for item in host.get("CapDrop") or []):
         raise Refused("A sandbox container drops every capability")
     tmpfs = host.get("Tmpfs") or {}
@@ -380,7 +394,8 @@ def plan_create(query: dict[str, str], body: dict[str, Any], config: GatewayConf
             "NetworkMode": "none",
             "ReadonlyRootfs": True,
             "CapDrop": ["ALL"],
-            "SecurityOpt": ["no-new-privileges"],
+            # The extension tools' stricter seccomp profile (N-22) when the request names it, never another one.
+            "SecurityOpt": ["no-new-privileges", *profiles],
             "Privileged": False,
             # Stated rather than left to the daemon's defaults, which an administrator can change.
             "IpcMode": "private",
@@ -1180,7 +1195,7 @@ class Gateway:
             differences.append("Privileged")
         if {str(item).upper() for item in host.get("CapDrop") or []} != {"ALL"} or host.get("CapAdd"):
             differences.append("capabilities")
-        if list(host.get("SecurityOpt") or []) != ["no-new-privileges"]:
+        if not _same_security(host.get("SecurityOpt"), wanted["SecurityOpt"]):
             differences.append("SecurityOpt")
         if dict(host.get("Tmpfs") or {}) != wanted["Tmpfs"]:
             differences.append("Tmpfs")

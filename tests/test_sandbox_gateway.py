@@ -211,6 +211,25 @@ def test_missing_isolation_flags_are_added_not_trusted() -> None:
     assert created["HostConfig"]["PidsLimit"] == CONFIG.max_pids
 
 
+def test_only_the_extension_seccomp_profile_is_accepted_as_a_seccomp_option() -> None:
+    """N-22: the containers of extension tools ask for Nodestro's own stricter seccomp profile (as the docker CLI sends
+    it: the file's content); the gateway passes exactly that profile on and refuses any other, changed or twice."""
+    from nodestro_runtime import extension_seccomp
+
+    option = "seccomp=" + json.dumps(extension_seccomp.profile(), separators=(",", ":"))
+    _query, raw = plan_create({}, body(host={"SecurityOpt": ["no-new-privileges", option]}), CONFIG)
+    assert json.loads(raw)["HostConfig"]["SecurityOpt"] == ["no-new-privileges", option]
+    weaker = extension_seccomp.profile()
+    weaker["syscalls"].append({"names": ["ptrace"], "action": "SCMP_ACT_ALLOW"})
+    for security in (
+        ["no-new-privileges", "seccomp=" + json.dumps(weaker)],
+        ["no-new-privileges", option, option],
+        ["no-new-privileges", "seccomp=not json"],
+    ):
+        with pytest.raises(Refused, match="extension seccomp profile"):
+            plan_create({}, body(host={"SecurityOpt": security}), CONFIG)
+
+
 IMAGE_ID = "sha256:" + "ab" * 32
 #: What Orkexa's ``run_args`` (StreamedSandbox, docker 29) adds to the request: private IPC, /dev/shm, ulimits, no
 #: logging, its labels, nodev tmpfs; the image by its id.
@@ -927,6 +946,12 @@ def _seccomp(found: dict[str, Any]) -> None:
     found["HostConfig"]["SecurityOpt"] = ["no-new-privileges", "seccomp=unconfined"]
 
 
+def _seccomp_added(found: dict[str, Any]) -> None:
+    from nodestro_runtime import extension_seccomp
+
+    found["HostConfig"]["SecurityOpt"] = ["no-new-privileges", f"seccomp={json.dumps(extension_seccomp.profile())}"]
+
+
 def _tmpfs(found: dict[str, Any]) -> None:
     found["HostConfig"]["Tmpfs"] = {"/tmp": "rw,exec"}
 
@@ -960,6 +985,7 @@ def _image(found: dict[str, Any]) -> None:
         (_privileged, "Privileged"),
         (_caps, "capabilities"),
         (_seccomp, "SecurityOpt"),
+        (_seccomp_added, "SecurityOpt"),  # a profile the request did not ask for
         (_tmpfs, "Tmpfs"),
         (_ulimit, "Ulimits"),
         (_network, "NetworkMode"),
@@ -1195,6 +1221,11 @@ def test_tools_run_through_the_gateway_and_escapes_are_refused(real_gateway: dic
             "    return ' '.join(found)\n"
         )
         assert sandbox.call(code, "probe", {"host": "1.1.1.1"}) == "1.17.0 65534 no-network read-only no-socket"
+        # N-22: an extension container's shape (Nodestro's own seccomp profile) passes the gateway, and the probe
+        # proves the profile applied behind it.
+        from nodestro_runtime.extension_sandbox import ExtensionSandbox
+
+        ExtensionSandbox(lambda timeout: images.sandbox(tag, timeout=timeout)).ready()
 
         def docker(*args: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(["docker", *args], env=real_gateway, capture_output=True, text=True, timeout=60)
