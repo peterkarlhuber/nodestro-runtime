@@ -428,10 +428,9 @@ def test_the_genuine_installation_next_to_other_distributions_is_imported(
     info = write_distribution(site)
     _foreign_record(site, "acme_ext-1.0", ["acme_ext/__init__.py", "../../bin/acme", "nodestro_integrations_extra.py"])
     (site / "paths.pth").write_text("# a folder only\n/opt/somewhere\n", encoding="utf-8")
-    (site / "distutils-precedence.pth").write_text(
-        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; "
-        "enabled and __import__('_distutils_hack').add_shim(); \n",
-        encoding="utf-8",
+    (site / "distutils-precedence.pth").write_bytes(  # setuptools' exact bytes (no newline translation on Windows)
+        b"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; "
+        b"enabled and __import__('_distutils_hack').add_shim(); \n"
     )
     [found] = discover(trusted_entries(info))
     assert found.name == "tesseract-ocr" and sys.modules[TOP + ".ocr"].GENUINE is True
