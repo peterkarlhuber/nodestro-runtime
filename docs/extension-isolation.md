@@ -119,10 +119,16 @@ below cannot detect it reliably: a foreign package's code can run before them an
 example a new module such as `winreg.py` that a standard module imports when it exists). The planned fix is a
 data-only extension store (foreign packages kept as files outside every import path and only ever handed to the
 sandbox, never installed into the host environment); it must exist before any tool class is unlocked under G-6.
+Until then, discovering extension packages from the host environment (`extensions.find_packages`) is for
+development only and outside the trust boundary; the data-only store replaces it.
 
 Owner decision on R1: the residual risk is accepted provisionally for internal development only if the Python
 installation can be changed exclusively by trusted people and processes; user-writable search paths, working
-directories and foreign package installs must not replace the trusted integration unnoticed. This is no G-6 release.
+directories and foreign package installs must not replace the trusted integration unnoticed. Owner decision of
+2026-11-27 (option A): harden now; the data-only extension store follows later as its own work package, before any
+G-6 unlock. The boundary is the one above: the host Python environment holds only the shipped lock, and foreign
+packages are never installed into it. The "unnoticed replacement" clause is met by that boundary, not by the
+in-process checks below. This is no G-6 release.
 The runtime enforces the part it can check and refuses the host import otherwise (`invalid`, with the reason, in
 `Extensions.packages_status()`; OCR is then unavailable, nothing else changes):
 
