@@ -64,10 +64,18 @@ what the workflow may do now.
    paused top-level run (`Runs.decide`), but a running one: once the agent's run ended, the decision is refused
    (`workflow_tool.not_waiting`). After `WORKFLOW_TOOL_WAIT_SECONDS` (24 hours) without a decision the workflow's run
    is cancelled and the call fails.
-   **Threads:** an agent step with workflow tools runs on a thread pool of its own per nesting depth
-   (`NODESTRO_RUN_THREADS` threads each), never on the pool of ordinary steps. A waiting call therefore never holds a
-   thread that the workflow's own steps (or any other run's ordinary steps) need; at most that many steps with
-   workflow tools of one depth run at once, later ones wait for a thread.
+   **Threads:** an agent step with workflow tools runs on a thread pool of its own per nesting depth,
+   never on the pool of ordinary steps. A waiting call therefore never holds a thread that the workflow's own steps
+   (or any other run's ordinary steps) need. Within one depth, at most `NODESTRO_RUN_THREADS` such steps *work* at
+   once; later ones wait for a working slot, first come, first served. A step all of whose running calls wait for a
+   person (the start confirmation, an approval step, a tool approval or a budget decision inside) frees its working
+   slot and moves to one of four times as many waiting slots, so it never holds back another step of its depth; as
+   soon as one of its calls works again (or a new one starts), and before its next model request, it takes a working
+   slot again (RT-096, `step_slots`). The pool of a depth has working plus waiting slots as threads, so the number of
+   threads stays bounded. Only when all waiting slots of a depth are taken does a waiting step keep its working slot
+   (and try again while it waits). A slot belongs to its step alone: a child run never acts on its caller's slot, so
+   a step whose workflow runs (also one whose child waits in its own thread for a tool approval) keeps its working
+   slot. Waiting for a slot ends when the run is cancelled or reaches its time limit.
 4. **The result.** The workflow's output and the names and formats of its result files, as JSON the model reads as
    data. A failed or stopped workflow is an error result for the agent.
 5. **Cancel and errors.** Cancelling the agent's run (a conversation's answer) cancels the workflow's run; a

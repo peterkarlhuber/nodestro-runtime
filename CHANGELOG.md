@@ -5,6 +5,13 @@
 - Tests (RT-098): `test_the_workspace_offers_store_packages_only_through_the_sandbox` looks only at the store
   package's status; the studio's component jobs have a (refused) `nodestro-integrations` in the host environment too.
   No code change.
+- Fix (RT-096, N-20 H1 leftover; workflow tools stay off by default): a workflow tool's call that waits for a person
+  (the start confirmation, an approval step, a tool approval or a budget decision inside) no longer holds back the
+  steps with workflow tools of the same depth. Per depth, at most `NODESTRO_RUN_THREADS` such steps work at once
+  (unchanged); a step all of whose running calls wait moves to one of four times as many waiting slots and takes a
+  working slot again (first come, first served) when it goes on (`step_slots`). The depth's pool has both together as
+  threads, so threads stay bounded. A slot belongs to its step only: child runs never act on it.
+
 - Security (RT-098, Welle 7; nothing enabled, the switch stays off, no class released): the data-only extension
   store `<data>/extensions/<sha256>/` (`extension_store.ExtensionStore`, `Workspace.extension_store`, desktop and
   Nodestro Local Docker only). Intake checks the expected SHA-256, the origin, size and zip safety (links, devices,
