@@ -58,8 +58,17 @@ COLLECTION = "activity_log"
 RETENTION_ENV = "NODESTRO_ACTIVITY_RETENTION_DAYS"
 DEFAULT_RETENTION_DAYS = 90
 
-Source = Literal["tool_call", "tool_approval", "mcp", "connection", "workflow", "agent", "file"]
-SOURCES: tuple[str, ...] = ("tool_call", "tool_approval", "mcp", "connection", "workflow", "agent", "file")
+Source = Literal["tool_call", "tool_approval", "mcp", "connection", "workflow", "agent", "file", "extension"]
+SOURCES: tuple[str, ...] = (
+    "tool_call",
+    "tool_approval",
+    "mcp",
+    "connection",
+    "workflow",
+    "agent",
+    "file",
+    "extension",
+)
 #: Sources whose own record is mirrored into the platform backend already: their activity events are not mirrored.
 MIRRORED_BY_SOURCE: frozenset[str] = frozenset({"tool_approval", "mcp", "connection"})
 #: Axentra's audit outcomes.
@@ -111,7 +120,8 @@ class ActivityEvent(BaseModel):
     #: The agent that acted (its configured name), for tool calls and agent steps.
     agent: str | None = None
     #: What the action concerned: ``tool``, ``run``, ``workflow``, ``node``, ``input_file``, ``knowledge_file``,
-    #: ``mcp_server``, ``mcp_tool``, ``service_connection``, ``tool_pre_grant``, ``folder_grant``.
+    #: ``mcp_server``, ``mcp_tool``, ``service_connection``, ``tool_pre_grant``, ``folder_grant``, ``extension_package``
+    #: (its SHA-256).
     resource_type: str = ""
     #: The resource's Nodestro id or name (never a file path or file name).
     resource_id: str = ""

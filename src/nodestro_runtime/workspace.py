@@ -62,6 +62,7 @@ from .docker_status import DockerMonitorLike, DockerStatus
 from .draft_tools import DRAFT_TOOLS
 from .engine import EMBEDDING_PROVIDER, RunManager
 from .extension_sandbox import EXTENSION_MODES, ExtensionSandbox
+from .extension_store import STORE_DIR, ExtensionStore
 from .extensions import Extensions, Integration, discover, find_packages
 from .folder_index import FILES as FOLDER_INDEX_FILES
 from .folder_index import STATES as FOLDER_INDEX_STATES
@@ -423,11 +424,23 @@ class Workspace:
         # of stopping the runtime; integrations passed explicitly must fit.
         # Foreign installed integrations are never imported here (N-22): their tools run only in the Docker sandbox
         # (loaded below, once the Python environments exist), and only while the extension tools switch is on.
+        # Foreign packages come only from the data-only extension store (RT-098), on this computer only: never from
+        # the host environment (find_packages reports those as refused), never on a server.
+        #: The data-only extension store ``<data>/extensions`` (``None`` on a server). With explicit integrations it
+        #: can be changed, but its packages are not listed (the embedding application chose its integrations).
+        self.extension_store: ExtensionStore | None = (
+            ExtensionStore(data_dir / STORE_DIR) if storage is None and profile.kind in EXTENSION_MODES else None
+        )
         self.extensions = Extensions(
             discover(data_dir=self.data_dir) if integrations is None else integrations,
             strict=integrations is not None,
             installed=integrations is None,
-            packages=find_packages(data_dir=self.data_dir) if integrations is None else (),
+            packages=[
+                *find_packages(data_dir=self.data_dir),
+                *(self.extension_store.packages() if self.extension_store is not None else ()),
+            ]
+            if integrations is None
+            else (),
             reserved={tool.name for tool in (*BUILTIN_TOOLS, *NOTIFY_TOOLS, *DRAFT_TOOLS, *FOLDER_TOOLS) if tool.name},
         )
         self.store: DocumentStore
@@ -482,6 +495,8 @@ class Workspace:
             # RT-089c: on a server every memory space has one owner (the tenant's store records them).
             self.memory = MemorySpaces(storage.memory, owners=storage.store)
         self.knowledge.activity = self.store  # uploads and deletions go to the activity log
+        if self.extension_store is not None:
+            self.extension_store.documents = self.store  # intake, removal and revocation go to the activity log
         # N-12: only an installation on this computer can index granted folders; its knowledge search stays limited
         # to the knowledge files.
         self._folders_here = storage is None and self.profile.kind != "server"
