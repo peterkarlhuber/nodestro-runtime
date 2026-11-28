@@ -80,9 +80,15 @@ class StepSlot:
         self.active: set[str] = set()
         #: How many of them wait for a person right now.
         self.calls_waiting = 0
+        #: How many of its calls wait in :meth:`take_working` right now (they share one place in the queue).
+        self._takers = 0
 
     def take_working(self, check: Callable[[], None]) -> None:
-        """Hold a working slot: at once if the step holds one, else in turn once one is free."""
+        """Hold a working slot: at once if the step holds one, else in turn once one is free.
+
+        Several calls of one step may wait here at once (parallel calls whose waits ended together): the step has one
+        place in the queue, shared by them, and the first to get the slot takes it for the step; the others see that
+        the step holds it and return."""
         slots = self.slots
         with slots._changed:
             if self.holds == "working":
@@ -90,15 +96,21 @@ class StepSlot:
             if self.holds == "waiting":
                 slots.waiting -= 1
                 self.holds = None
-            slots._queue.append(self)
+            if self._takers == 0:
+                slots._queue.append(self)
+            self._takers += 1
             try:
-                while slots._queue[0] is not self or slots.working >= slots.working_limit:
+                while self.holds != "working":
+                    if slots._queue[0] is self and slots.working < slots.working_limit:
+                        slots.working += 1
+                        self.holds = "working"
+                        break
                     check()
                     slots._changed.wait(POLL_SECONDS)
-                slots.working += 1
-                self.holds = "working"
             finally:
-                slots._queue.remove(self)
+                self._takers -= 1
+                if (self.holds == "working" or self._takers == 0) and self in slots._queue:
+                    slots._queue.remove(self)
                 slots._changed.notify_all()
 
     def _park_locked(self) -> None:
@@ -142,6 +154,9 @@ class StepSlot:
             self.holds = None
             slots._changed.notify_all()
 
+    # A call that Orkexa abandons after its tool timeout would leave its thread inside ``waiting_for_person`` (its
+    # wait still counted) until that wait ends by itself; the runtime sets no tool timeout for agent steps, so this
+    # cannot happen today. A tool timeout for steps with workflow tools must first end the abandoned call's wait.
     @contextmanager
     def waiting_for_person(self, check: Callable[[], None]) -> Iterator[None]:
         """Around a call's wait for a person: the step may park meanwhile (see :meth:`park`, which the wait calls

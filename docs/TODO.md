@@ -674,7 +674,7 @@ Items that need an independent or external review (an internal audit does not re
   `tests/test_step_slots.py`, `test_rt096_*`). Independent review of the fix: a slot belongs to its step only, never
   to a child run's steps (H1); a step parks only while every running call waits, and works again on a working slot
   after any end of a wait except its run's cancel (M1); first come, first served, ending at a cancel or the time
-  limit (L1); the shutdown resets the slots under the pool lock (L2).
+  limit, with one place in the queue per step shared by its parallel calls (L1, re-review); the shutdown resets the slots under the pool lock (L2).
 - **Done (review of the independent review):** steps with workflow tools run on a pool of their own per depth (H1);
   no pre-grant applies to a changing workflow tool and its name never takes another tool's (M1); a model that is not
   local reaches outside, an orchestrator's model and a remote Ollama host included (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a

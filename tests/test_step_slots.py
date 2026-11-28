@@ -6,6 +6,7 @@ from collections.abc import Callable
 import contextvars
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -167,6 +168,44 @@ def test_parallel_calls_of_one_step_park_it_once_and_it_goes_on_after_the_first(
     step.call_finished("a")
     assert step.holds == "working"
     step.leave()
+    assert free(slots)
+
+
+@pytest.mark.parametrize("working", [1, 2])
+def test_two_waits_of_one_step_that_end_together_share_its_place_in_the_queue(working: int) -> None:
+    """Re-review: both parallel calls of a parked step end their wait while every working slot is taken. The step
+    waits once in the queue, the first call to get the slot takes it for the step, the other one returns too; the
+    slot is counted once and given back once (before: a second queue entry, a call that waited forever for a slot
+    its own step held, or a slot counted twice)."""
+    slots = DepthSlots(working, 4)
+    others = [slots.enter(never, (f"other_{n}", "a")) for n in range(working - 1)]
+    step = slots.enter(never, STEP)
+    step.call_started("a", never)
+    step.call_started("b", never)
+    waits = [step.waiting_for_person(never) for _ in "ab"]
+    for item in waits:
+        item.__enter__()
+    assert step.holds == "waiting"
+    blocker = slots.enter(never, OTHER)  # takes the freed working slot
+    ended: list[str] = []
+
+    def end(item: Any, name: str) -> None:
+        item.__exit__(None, None, None)
+        ended.append(name)
+
+    threads = [in_thread(lambda item=item, name=name: end(item, name)) for item, name in zip(waits, "ab", strict=True)]
+    time.sleep(0.3)  # both calls wait for the step's working slot
+    assert not ended
+    blocker.leave()
+    for thread in threads:
+        thread.join(5)
+    assert sorted(ended) == ["a", "b"]
+    assert step.holds == "working" and slots.working == working and not slots._queue
+    step.call_finished("a")
+    step.call_finished("b")
+    step.leave()
+    for other in others:
+        other.leave()
     assert free(slots)
 
 
