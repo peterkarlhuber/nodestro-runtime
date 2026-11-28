@@ -702,6 +702,12 @@ def _workspace(
     return Workspace(profile=RuntimeProfile(kind=kind, data_dir=tmp_path / "data"))  # type: ignore[arg-type]
 
 
+def _store_statuses(workspace: Workspace, wheel: bytes) -> list[dict[str, Any]]:
+    """The statuses of the store's package ``wheel`` (the host environment may hold others, such as a refused
+    ``nodestro-integrations`` in the studio's component jobs)."""
+    return [item for item in workspace.extensions.packages_status() if item.get("sha256") == sha(wheel)]
+
+
 def test_the_workspace_offers_store_packages_only_through_the_sandbox(
     tmp_path: Path, marker: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -712,19 +718,19 @@ def test_the_workspace_offers_store_packages_only_through_the_sandbox(
     workspace = _workspace(tmp_path, monkeypatch, containers, switch=False)
     try:
         assert workspace.extension_store is not None and workspace.extension_store.root == store.root
-        [status] = workspace.extensions.packages_status()
+        [status] = _store_statuses(workspace, wheel)
         assert (status["state"], status["reason"]) == ("locked", "off") and containers.runs == []
     finally:
         workspace.close()
     workspace = _workspace(tmp_path, monkeypatch, Containers(ready=False), switch=True)
     try:
-        [status] = workspace.extensions.packages_status()
+        [status] = _store_statuses(workspace, wheel)
         assert (status["state"], status["reason"]) == ("locked", "not_secured")
     finally:
         workspace.close()
     workspace = _workspace(tmp_path, monkeypatch, containers, switch=True)
     try:
-        [status] = workspace.extensions.packages_status()
+        [status] = _store_statuses(workspace, wheel)
         assert status["state"] == "sandboxed" and "echo_text" in status["tools"] and status["sha256"] == sha(wheel)
         assert {run["request"]["mode"] for run in containers.runs} == {"describe"}
     finally:

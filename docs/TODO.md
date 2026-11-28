@@ -205,7 +205,8 @@ None known.
 - **Review (Welle 7):** a review of 8433243 passed with findings F1 (symlinked or foreign-writable store folder,
   cleaning outside it), F2 (hash not checked on removal), F3 (OS errors not refused and audited, crash retry), F4
   (Windows-unsafe names), F5 (docs claimed the api routes) and F6 (trusted and built-in names); all fixed with tests
-  that fail on 8433243; re-review open.
+  that fail on 8433243; the re-review of e576a83 passed; merged as 9cf9d9c (#232). A store test now looks only at the
+  store package's status, so it also holds in the studio's component jobs (host `nodestro-integrations`).
 - **Open:** the api's admin routes (API-081), the SDK methods and the studio's package view and upload are in review
   (branch `claude/w7-ext-store` in each); the independent review (G-6 item 31; brief prepared, not run without the owner's consent); Docker Desktop and
   Podman runs (G-6 items 19, 30; no real environment so far); the server and Local Docker volume docs name the
