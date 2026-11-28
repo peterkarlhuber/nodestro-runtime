@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Docs: G-6 item 31 states that the store's internal re-review passed (runtime; api with two informational findings)
+  and that the independent G-6 review is prepared, not run.
 - Tests (RT-098): `test_the_workspace_offers_store_packages_only_through_the_sandbox` looks only at the store
   package's status; the studio's component jobs have a (refused) `nodestro-integrations` in the host environment too.
   No code change.
