@@ -121,11 +121,18 @@ class ExtensionPackage:
     #: Why the package is never used, not even in the sandbox (it claims to be Nodestro's own and failed the checks of
     #: :mod:`nodestro_runtime.trusted_integrations`); empty otherwise.
     rejected: str = ""
+    #: The SHA-256 of the store package this entry point belongs to (``<data>/extensions/<sha256>``); empty for a
+    #: package that did not come from the store.
+    sha256: str = ""
+    #: Raises :class:`PackageError` when the package may no longer run (removed, revoked, replaced); called before
+    #: every container of a call, so a call never starts after its package became invalid.
+    check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        """What tells two packages apart: distribution, entry point name, ``module:attribute``."""
-        return (self.distribution, self.name, self.entry)
+    def key(self) -> tuple[str, str, str, str]:
+        """What tells two packages apart: distribution, entry point name, ``module:attribute`` and the store hash (a
+        refused copy in the host environment never shares the state of the store's)."""
+        return (self.distribution, self.name, self.entry, self.sha256)
 
 
 def package_of(entry: metadata.EntryPoint, *, rejected: str = "") -> ExtensionPackage:
@@ -237,7 +244,7 @@ class ExtensionSandbox:
     def __init__(self, sandbox: SandboxFactory) -> None:
         self._make = sandbox
         self._sandboxes: dict[float, Any] = {}
-        self._files: dict[tuple[str, str, str], dict[str, str]] = {}
+        self._files: dict[tuple[str, str, str, str], dict[str, str]] = {}
         #: (docker, its environment, image id) for which the seccomp probe passed.
         self._proven: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
@@ -288,10 +295,12 @@ class ExtensionSandbox:
             self._proven.add(key)
 
     def _package_files(self, package: ExtensionPackage) -> dict[str, str]:
+        """The package's files as read (and, for a store package, verified) once; later calls send these bytes."""
+        key = package.key
         with self._lock:
-            if package.key not in self._files:
-                self._files[package.key] = package.read_files()
-            return self._files[package.key]
+            if key not in self._files:
+                self._files[key] = package.read_files()
+            return self._files[key]
 
     def _run(self, package: ExtensionPackage, request: dict[str, Any], timeout: float) -> dict[str, Any]:
         sandbox = self._sandbox(timeout)
@@ -300,9 +309,10 @@ class ExtensionSandbox:
         except SandboxError as exc:
             raise SandboxUnavailable(str(exc)) from None
         self._prove(sandbox, image)
-        data = json.dumps(
-            {"runner": _contract_files(), "files": self._package_files(package), "request": request}
-        ).encode("utf-8")
+        files = self._package_files(package)
+        if package.check is not None:  # removed, revoked or replaced since it was listed: never started again
+            package.check()
+        data = json.dumps({"runner": _contract_files(), "files": files, "request": request}).encode("utf-8")
         name = f"nodestro-sandbox-ext-{uuid.uuid4().hex[:12]}"
         args = [*self._shaped(sandbox, name, image), "python", "-I", "-B", "-c", BOOTSTRAP]
         try:

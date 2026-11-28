@@ -10,8 +10,11 @@ limits, the time limit removing it) is tested on a real engine at the end (``NOD
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Iterator
+import hashlib
 from importlib import metadata
+import io
 import json
 import os
 from pathlib import Path
@@ -23,6 +26,7 @@ import threading
 import time
 from typing import Any
 import uuid
+import zipfile
 
 from orkexa import Tool, ToolResultError
 from orkexa.dynamic import BoundedOutput, SandboxError
@@ -39,6 +43,7 @@ from nodestro_runtime.extension_sandbox import (
     floor_capability,
     package_of,
 )
+from nodestro_runtime.extension_store import ExtensionStore
 from nodestro_runtime.extensions import (
     EXTENSION_TOOLS_ENV,
     HOST_INSTALLED,
@@ -191,6 +196,15 @@ def _probe(check):
             "mknod": _try(lambda: os.mknod("/tmp/node", 0o600 | 0o060000, os.makedev(8, 0))),
             "fork": _try(fork),
         }}
+    if check == "modules":
+        import importlib
+        import sys
+
+        names = ("nodestro_runtime.workspace", "nodestro_runtime.local_vault", "nodestro_runtime.extension_store")
+        return {{
+            "modules": {{name: _try(lambda name=name: importlib.import_module(name).__name__) for name in names}},
+            "path": list(sys.path),
+        }}
     if check == "memory":
         return {{"memory": _try(lambda: len(bytearray(4 * 1024 * 1024 * 1024)))}}
     if check == "huge":
@@ -235,6 +249,66 @@ def install_package(root: Path, *, marker: Path, paths: list[str] | None = None,
         encoding="utf-8",
     )
     return info
+
+
+def wheel_members(
+    *,
+    marker: Path,
+    paths: list[str] | None = None,
+    name: str = "acme-ext",
+    version: str = "1.0",
+    metadata_extra: str = "",
+    wheel: str = "Root-Is-Purelib: true\nTag: py3-none-any\n",
+    entry_points: str | None = None,
+    files: dict[str, bytes] | None = None,
+) -> dict[str, bytes]:
+    """The members of a pure-Python wheel of the foreign package (``RECORD`` not yet added, see :func:`build_wheel`)."""
+    info = f"{name.replace('-', '_')}-{version}.dist-info"
+    source = textwrap.dedent(PACKAGE_SOURCE).format(marker=str(marker), paths=paths or [])
+    return {
+        f"{MODULE}/__init__.py": source.encode("utf-8"),
+        **(files or {}),
+        f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{metadata_extra}".encode(),
+        f"{info}/WHEEL": f"Wheel-Version: 1.0\nGenerator: tests\n{wheel}".encode(),
+        f"{info}/entry_points.txt": (
+            entry_points if entry_points is not None else f"[nodestro.integrations]\nacme = {MODULE}:integration\n"
+        ).encode(),
+    }
+
+
+def build_wheel(
+    members: dict[str, bytes],
+    *,
+    special: list[tuple[zipfile.ZipInfo, bytes]] = (),
+    record: bool = True,  # type: ignore[assignment]
+) -> bytes:
+    """A wheel of ``members`` plus ``special`` members (links, devices, odd names), with a ``RECORD`` that lists every
+    member with its SHA-256 and size (``record=False``: no ``RECORD``)."""
+    info = next(path.split("/")[0] for path in members if path.split("/")[0].endswith(".dist-info"))
+    rows = [
+        f"{path},sha256={base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip('=')},{len(content)}"
+        for path, content in [*members.items(), *((item.filename, content) for item, content in special)]
+    ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, content in members.items():
+            archive.writestr(path, content)
+        for item, content in special:
+            archive.writestr(item, content)
+        if record:
+            archive.writestr(f"{info}/RECORD", "\n".join([*rows, f"{info}/RECORD,,"]) + "\n")
+    return buffer.getvalue()
+
+
+def stored_package(
+    data: Path, *, marker: Path, paths: list[str] | None = None
+) -> tuple[ExtensionStore, ExtensionPackage]:
+    """The foreign package taken into a real extension store below ``data`` (RT-098), as the workspace lists it."""
+    store = ExtensionStore(data / "extensions")
+    wheel = build_wheel(wheel_members(marker=marker, paths=paths))
+    store.install(wheel, sha256=hashlib.sha256(wheel).hexdigest(), origin="tests", actor="local")
+    [found] = store.packages()
+    return store, found
 
 
 def entry_points_of(info: Path) -> Callable[[], list[metadata.EntryPoint]]:
@@ -891,9 +965,12 @@ class Real:
             str(Path(__file__).resolve()),
             "/var/run/docker.sock",
         ]
-        site = tmp_path / "site"
-        info = install_package(site, marker=self.marker, paths=self.host_paths)
-        [self.package] = store_packages(info)
+        import nodestro_runtime
+
+        # The host's own modules and the store's folder are no more visible than the rest of the host (RT-098).
+        self.host_paths += [str(Path(nodestro_runtime.__file__).resolve().parent), str(self.data / "extensions")]
+        # The package comes from a real extension store (RT-098), as the workspace hands it to the sandbox.
+        self.store, self.package = stored_package(self.data, marker=self.marker, paths=self.host_paths)
         self.sandbox = ExtensionSandbox(lambda timeout: images.sandbox(tag, timeout=timeout, memory_mb=512))
 
     def call(self, tool: str, payload: dict[str, Any], timeout: float = 60.0) -> str:
@@ -1021,6 +1098,16 @@ def test_host_files_and_secrets_are_not_visible(real: Real) -> None:
     environment = real.probe("environment")
     assert real.secret not in json.dumps(environment)
     assert not ({"NODESTRO_VAULT_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"} & set(environment["environ"]))
+
+
+def test_host_modules_are_not_reachable(real: Real) -> None:
+    """RT-098: the host's own modules (the workspace, the vault, the store) cannot be imported in the container, and no
+    folder of the host (its site-packages, the data directory, the store) is on the container's import path."""
+    found = real.probe("modules")
+    for name, outcome in found["modules"].items():
+        assert outcome["ok"] is False, (name, outcome)
+    assert not [entry for entry in found["path"] if any(entry.startswith(path) for path in real.host_paths)]
+    assert real.containers() == []
 
 
 def test_forbidden_resources_are_refused(real: Real) -> None:

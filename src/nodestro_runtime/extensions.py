@@ -89,7 +89,7 @@ LOCKED_MESSAGE = "locked, not sufficiently secured"
 #: separate extension store, in the Docker sandbox.
 HOST_INSTALLED = (
     "installed in the host environment: foreign extension packages are never loaded from the host's Python "
-    "environment; they run only from the extension store, which does not exist yet"
+    "environment; they run only from the extension store"
 )
 
 #: Why tools of installed integrations are locked: ``off`` (the switch is off), ``isolation_unavailable`` (a tool of
@@ -300,8 +300,8 @@ class Extensions:
         self.locked: dict[str, LockReason] = {}
         self.packages: list[ExtensionPackage] = list(packages)
         #: Package key -> (``None`` when its tools run in the sandbox, else why they are locked, a detail).
-        self._package_state: dict[tuple[str, str, str], tuple[LockReason | None, str]] = {}
-        keys = [package.key for package in self.packages]
+        self._package_state: dict[tuple[str, str, str, str], tuple[LockReason | None, str]] = {}
+        keys = [package.key for package in self.packages if not package.rejected]
         for package in self.packages:
             if package.rejected:
                 self._package_state[package.key] = ("invalid", package.rejected)
@@ -310,7 +310,7 @@ class Extensions:
             else:
                 self._package_state[package.key] = ("off", "")
         #: Package key -> the names of its tools offered from the sandbox.
-        self._package_tools: dict[tuple[str, str, str], list[str]] = {}
+        self._package_tools: dict[tuple[str, str, str, str], list[str]] = {}
         taken = set(reserved)
         names: dict[str, str] = {}
         for item in integrations:
@@ -380,14 +380,16 @@ class Extensions:
         return found
 
     def packages_status(self) -> list[dict[str, object]]:
-        """Each foreign installed integration: name, distribution, version, ``state`` (``sandboxed`` or ``locked``),
-        ``reason`` and ``message`` (when locked), ``detail`` and its tools offered from the sandbox."""
+        """Each foreign installed integration: name, store hash (``None`` outside the store), distribution, version,
+        ``state`` (``sandboxed`` or ``locked``), ``reason`` and ``message`` (when locked), ``detail`` and its tools
+        offered from the sandbox."""
         result: list[dict[str, object]] = []
         for package in self.packages:
             reason, detail = self._package_state.get(package.key, ("off", ""))
             result.append(
                 {
                     "name": package.name,
+                    "sha256": package.sha256 or None,
                     "distribution": package.distribution,
                     "version": package.version,
                     "state": "locked" if reason else "sandboxed",

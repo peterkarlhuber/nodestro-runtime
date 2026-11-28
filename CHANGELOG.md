@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Security (RT-098, Welle 7; nothing enabled, the switch stays off, no class released): the data-only extension
+  store `<data>/extensions/<sha256>/` (`extension_store.ExtensionStore`, `Workspace.extension_store`, desktop and
+  Nodestro Local Docker only). Intake checks the expected SHA-256, the origin, size and zip safety (links, devices,
+  traversal, duplicates), every `RECORD` hash, the manifest and the dependencies, refuses `.pth`, `.data`, scripts and
+  native code, and is atomic; every call of a store tool checks that its package is still installed and not revoked,
+  and runs the verified bytes. Intake, update, removal and revocation are activity events (new source `extension`).
+  `extension_classes.PREREQUISITES`: a class that needs a missing G-6 item (17, 18, 21) cannot be released.
+  New codes `extension_store.refused` (param `reason`), `extension_store.not_found`, `extension_store.unreadable`.
+  `ExtensionPackage.key` includes the store hash.
+- Security (RT-098 review findings F1 to F6): the store folder is used only while it is a plain folder of this user
+  that no group or other user can write (never through a symbolic link); cleaning deletes only unlisted folders named
+  like a package hash and the store's own scratch files; removal takes only a SHA-256; a name that is both a file and
+  a folder, Windows device names, trailing spaces or dots and `:` streams are refused; an operating system error while
+  writing is an audited refusal (`storage`) and a retry after a crash between rename and commit works; distributions
+  named like a trusted or built-in one and top-level modules of the runtime, its libraries or the standard library are
+  refused (`reserved_name`).
 - Tests (N-24, Welle 7): migration 0011 (memory origin) has its own PostgreSQL migration test, starting from 0010 with
   existing memory files. No code change.
 

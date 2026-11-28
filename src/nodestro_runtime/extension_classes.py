@@ -53,6 +53,19 @@ def effective_class(grants: Grants) -> ToolClass:
     return access, reach
 
 
+#: The G-6 catalog items (``docs/extension-isolation.md``) each class needs beyond the common ones: 17 the network
+#: grant, 18 the folder grant. A package with dependencies of its own needs item 21 (a dependency image) whatever its
+#: class; the store refuses such packages (:data:`~.extension_store.PROVIDED`).
+PREREQUISITES: dict[ToolClass, frozenset[int]] = {
+    ("read", "internal"): frozenset(),
+    ("write", "internal"): frozenset({18}),
+    ("read", "external"): frozenset({17}),
+    ("write", "external"): frozenset({17, 18}),
+}
+#: The items not implemented: a class that needs one of them cannot be released (:class:`ClassRelease`).
+MISSING_ITEMS: frozenset[int] = frozenset({17, 18, 21})
+
+
 @dataclass(frozen=True)
 class ClassRelease:
     """The release of one class after gate G-6; every reference is required."""
@@ -66,6 +79,9 @@ class ClassRelease:
     def __post_init__(self) -> None:
         if not all(part.strip() for part in (self.evidence, self.internal_review, self.independent_review)):
             raise ValueError("a class release needs the G-6 evidence, the internal and the independent review")
+        missing = sorted(PREREQUISITES.get(self.tool_class, MISSING_ITEMS) & MISSING_ITEMS)
+        if missing:
+            raise ValueError(f"the class {self.tool_class} needs G-6 item(s) {missing}, which are not implemented")
 
 
 #: The released classes: none. Adding one is a reviewed change after gate G-6, never a setting.
@@ -102,7 +118,9 @@ def class_capability(
 
 
 __all__ = [
+    "MISSING_ITEMS",
     "NO_GRANTS",
+    "PREREQUISITES",
     "RELEASES",
     "ClassRelease",
     "Grants",
