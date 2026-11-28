@@ -676,6 +676,13 @@ Items that need an independent or external review (an internal audit does not re
 - **Priority:** P2 Medium · **Status:** In review · **Refs:** development plan N-20,
   [docs/workflow-tools.md](workflow-tools.md), `workflow_tools.py`, `tests/test_workflow_tools.py`, nodestro-api
   `GET /api/workflows/{workflow_id}/versions/{number}/tool`
+- **Done (Welle 7, H1 leftover):** a call that waits for a person (start confirmation, approval step, tool
+  approval, budget decision) frees its working slot of its depth's pool, so it no longer holds back other steps with
+  workflow tools of the same depth (`step_slots`: working slots as before, waiting slots, bounded threads;
+  `tests/test_step_slots.py`, `test_rt096_*`). Independent review of the fix: a slot belongs to its step only, never
+  to a child run's steps (H1); a step parks only while every running call waits, and works again on a working slot
+  after any end of a wait except its run's cancel (M1); first come, first served, ending at a cancel or the time
+  limit, with one place in the queue per step shared by its parallel calls (L1, re-review); the shutdown resets the slots under the pool lock (L2).
 - **Done (review of the independent review):** steps with workflow tools run on a pool of their own per depth (H1);
   no pre-grant applies to a changing workflow tool and its name never takes another tool's (M1); a model that is not
   local reaches outside, an orchestrator's model and a remote Ollama host included (M2); budget decisions of other processes continue a waiting call (M3); a decision needs a
@@ -691,10 +698,12 @@ Items that need an independent or external review (an internal audit does not re
 - **Open:**
   - switching it on needs the independent review of tool approvals (RT-001): every changing workflow tool depends on
     the per-call gate;
-  - H1 leftover (a stall, not a deadlock): a waiting call holds a thread of the workflow tool pool of its depth for
-    up to 24 hours (never one of the ordinary agent pool); with `NODESTRO_RUN_THREADS` (default 32) calls waiting on
-    approvals at one depth, every later step with workflow tools of that depth waits for a thread until one of them
-    is decided, cancelled or times out;
+  - beyond `NODESTRO_RUN_THREADS` working and four times as many waiting steps with workflow tools at one depth,
+    a further waiting step keeps its working slot until a waiting slot is free (bounded threads by design; the H1
+    leftover itself is fixed, see Done);
+  - a step whose workflow is running keeps its working slot, also while an ordinary step inside the child run waits
+    in its own thread for a tool approval (no checkpoints, or a quality judge with criteria): only the step's own
+    waits free its slot (review H1 of the fix: a child never acts on its caller's slot);
   - sub-workflows without a version inside the called workflow are pinned when their step starts, not once per call
     (review L2): the effect is computed again at the next call;
   - a deny for the calling agent (N-06) does not follow into the workflow's own agents (review L3; documented);
